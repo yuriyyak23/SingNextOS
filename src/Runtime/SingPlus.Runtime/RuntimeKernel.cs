@@ -11,12 +11,14 @@ public sealed partial class RuntimeKernel
         Domains = new DomainRegistry();
         CapabilityAuthority = new CapabilityAuthority();
         Regions = new RegionAuthority();
+        Channels = new ChannelRegistry(CapabilityAuthority, Regions);
     }
 
     public ProcessRegistry Processes { get; }
     public DomainRegistry Domains { get; }
     public CapabilityAuthority CapabilityAuthority { get; }
     public RegionAuthority Regions { get; }
+    public ChannelRegistry Channels { get; }
 
     public KernelResult<SingProcess> CreateProcess(SingProcessManifestV1 manifest)
     {
@@ -33,16 +35,11 @@ public sealed partial class RuntimeKernel
         if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
         var process = resolved.Value!;
         if (process.State != ProcessState.Created) return InvalidTransition(process.State, ProcessState.Admitted);
-
         foreach (var requirement in process.Manifest.RequiredCapabilities)
         {
-            var satisfied = CapabilityAuthority.SnapshotForDomain(process.DomainId).Any(c =>
-                c.Generation == process.Generation && c.ResourceKind == requirement.ResourceKind &&
-                string.Equals(c.ResourceId, requirement.ResourceId, StringComparison.Ordinal) &&
-                (c.Rights & requirement.Rights) == requirement.Rights);
+            var satisfied = CapabilityAuthority.SnapshotForDomain(process.DomainId).Any(c => c.Generation == process.Generation && c.ResourceKind == requirement.ResourceKind && string.Equals(c.ResourceId, requirement.ResourceId, StringComparison.Ordinal) && (c.Rights & requirement.Rights) == requirement.Rights);
             if (!satisfied) return KernelResult.Fail(KernelError.MissingCapability, $"Missing capability {requirement.ResourceKind}:{requirement.ResourceId} ({requirement.Rights}).");
         }
-
         process.SetState(ProcessState.Admitted);
         return KernelResult.Ok();
     }
@@ -139,6 +136,7 @@ public sealed partial class RuntimeKernel
         {
             CapabilityAuthority.RevokeAllForDomain(process.DomainId);
             Regions.ReclaimAllForDomain(process.DomainId);
+            Channels.CloseAllForDomain(process.DomainId);
         }
         process.ClearRuntimeResources();
     }
