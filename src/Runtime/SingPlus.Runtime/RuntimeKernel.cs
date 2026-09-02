@@ -5,13 +5,9 @@ namespace SingPlus.Runtime;
 
 public sealed class RuntimeKernel
 {
-    public SingProcess CreateProcess(SingProcessManifest manifest)
+    public SingProcess CreateProcess(SingProcessManifestV1 manifest)
     {
-        if (manifest.ProcessId.Value == 0 || manifest.DomainId.Value == 0)
-        {
-            throw new ArgumentException("Process and domain identifiers must be non-zero.", nameof(manifest));
-        }
-
-        return new SingProcess(manifest);
+        ArgumentNullException.ThrowIfNull(manifest);
+        return SingProcess.CreateForRuntime(manifest);
     }
 }

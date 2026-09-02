@@ -2,9 +2,12 @@ namespace SingPlus.Kernel;
 
 public static class KernelConsole
 {
-    public static void Write(string message)
+    private static IKernelConsole? _console;
+
+    public static void Configure(IKernelConsole console) => _console = console;
+
+    public static void Write(ReadOnlySpan<char> text)
     {
-        ArgumentNullException.ThrowIfNull(message);
-        Console.Write(message);
+        _console?.Write(text);
     }
 }

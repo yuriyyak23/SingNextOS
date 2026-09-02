@@ -2,11 +2,18 @@ using SingPlus.Contracts;
 
 namespace SingPlus.Sip;
 
-public sealed class CapabilitySet
+public sealed class CapabilityView
 {
-    private readonly HashSet<CapabilityId> _capabilities = [];
+    private readonly CapabilityId[] _capabilities;
 
-    public bool Contains(CapabilityId capability) => _capabilities.Contains(capability);
+    internal CapabilityView(IEnumerable<CapabilityId> capabilities) => _capabilities = capabilities.OrderBy(static id => id.Value).ToArray();
 
-    public void Grant(CapabilityId capability) => _capabilities.Add(capability);
+    public IReadOnlyList<CapabilityId> Items => _capabilities;
+    public bool Contains(CapabilityId capability) => Array.BinarySearch(_capabilities, capability, CapabilityIdComparer.Instance) >= 0;
+
+    private sealed class CapabilityIdComparer : IComparer<CapabilityId>
+    {
+        internal static readonly CapabilityIdComparer Instance = new();
+        public int Compare(CapabilityId x, CapabilityId y) => x.Value.CompareTo(y.Value);
+    }
 }
