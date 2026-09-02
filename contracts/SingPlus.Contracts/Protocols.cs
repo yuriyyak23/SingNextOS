@@ -9,21 +9,91 @@ public enum OwnershipPayloadKind
     OwnedRegion = 2
 }
 
-public sealed class BoundedPayloadDescriptorV1
+public enum RequestPayloadKind
 {
-    public BoundedPayloadDescriptorV1(string parameterName, string typeName, int maxBytes)
+    None = 0,
+    Primitive = 1,
+    Enum = 2,
+    Bounded = 3,
+    Ownership = 4
+}
+
+public sealed class RequestPayloadDescriptorV1
+{
+    private static readonly HashSet<string> PrimitiveTypeNames = new(StringComparer.Ordinal)
     {
-        if (string.IsNullOrWhiteSpace(parameterName)) throw new ArgumentException("Bounded payload parameter name is required.", nameof(parameterName));
-        if (string.IsNullOrWhiteSpace(typeName)) throw new ArgumentException("Bounded payload type name is required.", nameof(typeName));
-        if (maxBytes <= 0) throw new ArgumentOutOfRangeException(nameof(maxBytes), "Bounded payload limit must be positive.");
+        typeof(byte).FullName!,
+        typeof(sbyte).FullName!,
+        typeof(short).FullName!,
+        typeof(ushort).FullName!,
+        typeof(int).FullName!,
+        typeof(uint).FullName!,
+        typeof(long).FullName!,
+        typeof(ulong).FullName!,
+        typeof(float).FullName!,
+        typeof(double).FullName!,
+        typeof(bool).FullName!,
+        typeof(char).FullName!,
+        typeof(decimal).FullName!
+    };
+
+    public RequestPayloadDescriptorV1(
+        RequestPayloadKind kind,
+        string? parameterName = null,
+        string? typeName = null,
+        int maxBytes = 0,
+        OwnershipPayloadKind ownershipPayloadKind = OwnershipPayloadKind.None)
+    {
+        Kind = kind;
+
+        if (kind == RequestPayloadKind.None)
+        {
+            if (!string.IsNullOrEmpty(parameterName) || !string.IsNullOrEmpty(typeName) || maxBytes != 0 || ownershipPayloadKind != OwnershipPayloadKind.None)
+                throw new ArgumentException("A None request payload cannot carry parameter, type, bounds, or ownership metadata.");
+            ParameterName = string.Empty;
+            TypeName = string.Empty;
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(parameterName)) throw new ArgumentException("Request payload parameter name is required.", nameof(parameterName));
+        if (string.IsNullOrWhiteSpace(typeName)) throw new ArgumentException("Request payload type name is required.", nameof(typeName));
+
         ParameterName = parameterName;
         TypeName = typeName;
-        MaxBytes = maxBytes;
+
+        switch (kind)
+        {
+            case RequestPayloadKind.Primitive:
+                if (!PrimitiveTypeNames.Contains(typeName)) throw new ArgumentException($"'{typeName}' is not a supported primitive request payload type.", nameof(typeName));
+                if (maxBytes != 0 || ownershipPayloadKind != OwnershipPayloadKind.None) throw new ArgumentException("Primitive request payloads cannot carry bounds or ownership metadata.");
+                break;
+            case RequestPayloadKind.Enum:
+                if (maxBytes != 0 || ownershipPayloadKind != OwnershipPayloadKind.None) throw new ArgumentException("Enum request payloads cannot carry bounds or ownership metadata.");
+                break;
+            case RequestPayloadKind.Bounded:
+                if (maxBytes <= 0) throw new ArgumentOutOfRangeException(nameof(maxBytes), "Bounded request payload limit must be positive.");
+                if (ownershipPayloadKind != OwnershipPayloadKind.None) throw new ArgumentException("Bounded request payloads cannot carry ownership metadata.", nameof(ownershipPayloadKind));
+                MaxBytes = maxBytes;
+                break;
+            case RequestPayloadKind.Ownership:
+                if (maxBytes != 0) throw new ArgumentException("Ownership request payloads cannot carry bounded payload metadata.", nameof(maxBytes));
+                if (ownershipPayloadKind == OwnershipPayloadKind.None) throw new ArgumentException("Ownership request payloads require a concrete ownership kind.", nameof(ownershipPayloadKind));
+                var expectedType = ownershipPayloadKind == OwnershipPayloadKind.OwnedBuffer ? "SingPlus.Sip.OwnedBuffer" : "SingPlus.Sip.OwnedRegion";
+                if (!string.Equals(typeName, expectedType, StringComparison.Ordinal)) throw new ArgumentException($"Ownership payload type '{typeName}' does not match {ownershipPayloadKind}.", nameof(typeName));
+                OwnershipPayloadKind = ownershipPayloadKind;
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(kind));
+        }
     }
 
+    public static RequestPayloadDescriptorV1 None { get; } = new(RequestPayloadKind.None);
+
+    public RequestPayloadKind Kind { get; }
     public string ParameterName { get; }
     public string TypeName { get; }
     public int MaxBytes { get; }
+    public OwnershipPayloadKind OwnershipPayloadKind { get; }
 }
 
 public sealed class ProtocolMessageDescriptorV1
@@ -39,9 +109,8 @@ public sealed class ProtocolMessageDescriptorV1
         IEnumerable<string>? consumes = null,
         IEnumerable<string>? borrows = null,
         bool returnsOwnership = false,
-        OwnershipPayloadKind ownershipPayloadKind = OwnershipPayloadKind.None,
         OwnershipPayloadKind returnOwnershipPayloadKind = OwnershipPayloadKind.None,
-        BoundedPayloadDescriptorV1? boundedPayload = null)
+        RequestPayloadDescriptorV1? requestPayload = null)
     {
         if (messageId == 0) throw new ArgumentOutOfRangeException(nameof(messageId));
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Message name is required.", nameof(name));
@@ -56,18 +125,21 @@ public sealed class ProtocolMessageDescriptorV1
         if (_consumes.Length != 0 && _borrows.Length != 0)
             throw new ArgumentException("A single ownership-bearing payload cannot be both consumed and borrowed.");
 
+        RequestPayload = requestPayload ?? RequestPayloadDescriptorV1.None;
         var hasOwnershipInput = _consumes.Length + _borrows.Length == 1;
-        if (hasOwnershipInput != (ownershipPayloadKind != OwnershipPayloadKind.None))
-            throw new ArgumentException("Ownership payload metadata must declare exactly one concrete payload kind when Consumes or Borrows is present.", nameof(ownershipPayloadKind));
+        if (hasOwnershipInput != (RequestPayload.Kind == RequestPayloadKind.Ownership))
+            throw new ArgumentException("Consumes/Borrows lifecycle metadata must correspond exactly to an Ownership request payload.", nameof(requestPayload));
+        if (hasOwnershipInput)
+        {
+            var lifecycleParameter = _consumes.Length == 1 ? _consumes[0] : _borrows[0];
+            if (!string.Equals(lifecycleParameter, RequestPayload.ParameterName, StringComparison.Ordinal))
+                throw new ArgumentException("Ownership lifecycle metadata must name the request payload parameter.", nameof(requestPayload));
+        }
         if (returnsOwnership != (returnOwnershipPayloadKind != OwnershipPayloadKind.None))
             throw new ArgumentException("ReturnsOwnership metadata must declare a concrete returned ownership payload kind.", nameof(returnOwnershipPayloadKind));
-        if (hasOwnershipInput && boundedPayload is not null)
-            throw new ArgumentException("The current channel transport has one payload slot and cannot combine ownership and bounded value payload metadata.", nameof(boundedPayload));
 
         ReturnsOwnership = returnsOwnership;
-        OwnershipPayloadKind = ownershipPayloadKind;
         ReturnOwnershipPayloadKind = returnOwnershipPayloadKind;
-        BoundedPayload = boundedPayload;
     }
 
     public uint MessageId { get; }
@@ -76,9 +148,9 @@ public sealed class ProtocolMessageDescriptorV1
     public IReadOnlyList<string> Consumes => _consumes;
     public IReadOnlyList<string> Borrows => _borrows;
     public bool ReturnsOwnership { get; }
-    public OwnershipPayloadKind OwnershipPayloadKind { get; }
+    public OwnershipPayloadKind OwnershipPayloadKind => RequestPayload.OwnershipPayloadKind;
     public OwnershipPayloadKind ReturnOwnershipPayloadKind { get; }
-    public BoundedPayloadDescriptorV1? BoundedPayload { get; }
+    public RequestPayloadDescriptorV1 RequestPayload { get; }
 
     private static string[] NormalizeOwnershipNames(IEnumerable<string>? names, string parameterName)
     {

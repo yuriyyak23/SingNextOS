@@ -72,28 +72,35 @@ public sealed class ProtocolRuntimeTests
     [Fact]
     public void DescriptorRejectsMalformedOwnershipCardinality()
     {
+        var bufferRequest = OwnershipRequest("first", OwnershipPayloadKind.OwnedBuffer);
         Assert.Throws<ArgumentException>(() => new ProtocolMessageDescriptorV1(
             10,
             "TooMany",
             consumes: new[] { "first", "second" },
-            ownershipPayloadKind: OwnershipPayloadKind.OwnedBuffer));
+            requestPayload: bufferRequest));
 
         Assert.Throws<ArgumentException>(() => new ProtocolMessageDescriptorV1(
             11,
             "Both",
             consumes: new[] { "data" },
             borrows: new[] { "data" },
-            ownershipPayloadKind: OwnershipPayloadKind.OwnedBuffer));
+            requestPayload: OwnershipRequest("data", OwnershipPayloadKind.OwnedBuffer)));
 
         Assert.Throws<ArgumentException>(() => new ProtocolMessageDescriptorV1(
             12,
-            "MissingKind",
+            "MissingRequest",
             consumes: new[] { "data" }));
 
         Assert.Throws<ArgumentException>(() => new ProtocolMessageDescriptorV1(
             13,
-            "SpuriousKind",
-            ownershipPayloadKind: OwnershipPayloadKind.OwnedRegion));
+            "SpuriousRequest",
+            requestPayload: OwnershipRequest("data", OwnershipPayloadKind.OwnedRegion)));
+
+        Assert.Throws<ArgumentException>(() => new ProtocolMessageDescriptorV1(
+            14,
+            "WrongParameter",
+            consumes: new[] { "data" },
+            requestPayload: OwnershipRequest("other", OwnershipPayloadKind.OwnedBuffer)));
     }
 
     [Fact]
@@ -351,6 +358,9 @@ public sealed class ProtocolRuntimeTests
         Assert.Equal(KernelError.WrongEndpointOwner, result.Error);
     }
 
+    private static RequestPayloadDescriptorV1 OwnershipRequest(string parameterName, OwnershipPayloadKind kind) =>
+        new(RequestPayloadKind.Ownership, parameterName, kind == OwnershipPayloadKind.OwnedBuffer ? "SingPlus.Sip.OwnedBuffer" : "SingPlus.Sip.OwnedRegion", ownershipPayloadKind: kind);
+
     private static void Activate(RuntimeKernel kernel, ProcessHandle left, ProcessHandle right, (ChannelEndpointHandle Left, ChannelEndpointHandle Right) endpoints)
     {
         var start = kernel.Send(left, right, endpoints.Left, 1);
@@ -382,13 +392,13 @@ public sealed class ProtocolRuntimeTests
                 "Write",
                 new[] { new CapabilityRequirementV1(ResourceKind.Device, "console0", CapabilityRights.Write) },
                 consumes: new[] { "data" },
-                ownershipPayloadKind: OwnershipPayloadKind.OwnedBuffer),
+                requestPayload: OwnershipRequest("data", OwnershipPayloadKind.OwnedBuffer)),
             new ProtocolMessageDescriptorV1(3, "Finish"),
             new ProtocolMessageDescriptorV1(
                 4,
                 "Peek",
                 borrows: new[] { "data" },
-                ownershipPayloadKind: OwnershipPayloadKind.OwnedBuffer)
+                requestPayload: OwnershipRequest("data", OwnershipPayloadKind.OwnedBuffer))
         },
         new[]
         {

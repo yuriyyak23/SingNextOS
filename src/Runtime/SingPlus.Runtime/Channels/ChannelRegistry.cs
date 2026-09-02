@@ -76,11 +76,8 @@ public sealed class ChannelRegistry
         if (!record.Protocol.TryTransition(record.State, messageId, out var transition)) return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidProtocolTransition, $"Message {messageId} is illegal in state '{record.State}'.");
         var capabilityValidation = ValidateCapabilities(sender, message, capabilityIds);
         if (!capabilityValidation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(capabilityValidation.Error, capabilityValidation.Message!);
-        if (!IsSupportedPayload(payload)) return KernelResult<ChannelEnvelope>.Fail(KernelError.UnsupportedPayload, "Payload must be primitive, enum, bounded payload, or declared owned region data.");
-        var ownershipValidation = ValidateOwnershipPayload(message, payload);
-        if (!ownershipValidation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(ownershipValidation.Error, ownershipValidation.Message!);
-        var boundedValidation = ValidateBoundedPayload(message, payload);
-        if (!boundedValidation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(boundedValidation.Error, boundedValidation.Message!);
+        var payloadValidation = ValidateRequestPayload(message.RequestPayload, payload);
+        if (!payloadValidation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(payloadValidation.Error, payloadValidation.Message!);
 
         object? queuedPayload = payload;
         if (message.Borrows.Count != 0)
@@ -176,53 +173,51 @@ public sealed class ChannelRegistry
         return KernelResult.Ok();
     }
 
-    private static KernelResult ValidateOwnershipPayload(ProtocolMessageDescriptorV1 message, object? payload)
+    private static KernelResult ValidateRequestPayload(RequestPayloadDescriptorV1 expected, object? payload)
     {
-        var declaresOwnership = message.Consumes.Count + message.Borrows.Count == 1;
-        if (!declaresOwnership)
+        switch (expected.Kind)
         {
-            return payload is ITransferableOwnedPayload
-                ? KernelResult.Fail(KernelError.UnsupportedPayload, "Owned payloads require an explicit Consumes or Borrows contract declaration.")
-                : KernelResult.Ok();
+            case RequestPayloadKind.None:
+                return payload is null
+                    ? KernelResult.Ok()
+                    : KernelResult.Fail(KernelError.UnsupportedPayload, "Message does not declare a request payload.");
+
+            case RequestPayloadKind.Primitive:
+                if (payload is null) return KernelResult.Fail(KernelError.UnsupportedPayload, "Message requires a primitive request payload.");
+                var primitiveTypeName = payload.GetType().FullName ?? payload.GetType().Name;
+                return string.Equals(primitiveTypeName, expected.TypeName, StringComparison.Ordinal)
+                    ? KernelResult.Ok()
+                    : KernelResult.Fail(KernelError.UnsupportedPayload, $"Expected primitive payload type {expected.TypeName}, got {primitiveTypeName}.");
+
+            case RequestPayloadKind.Enum:
+                if (payload is not Enum) return KernelResult.Fail(KernelError.UnsupportedPayload, "Message requires the declared enum request payload.");
+                var enumTypeName = payload.GetType().FullName ?? payload.GetType().Name;
+                return string.Equals(enumTypeName, expected.TypeName, StringComparison.Ordinal)
+                    ? KernelResult.Ok()
+                    : KernelResult.Fail(KernelError.UnsupportedPayload, $"Expected enum payload type {expected.TypeName}, got {enumTypeName}.");
+
+            case RequestPayloadKind.Bounded:
+                if (payload is not IBoundedPayload bounded) return KernelResult.Fail(KernelError.UnsupportedPayload, "Message requires the declared bounded request payload.");
+                var boundedTypeName = payload.GetType().FullName ?? payload.GetType().Name;
+                if (!string.Equals(boundedTypeName, expected.TypeName, StringComparison.Ordinal))
+                    return KernelResult.Fail(KernelError.UnsupportedPayload, $"Expected bounded payload type {expected.TypeName}, got {boundedTypeName}.");
+                if (bounded.PayloadSize < 0)
+                    return KernelResult.Fail(KernelError.UnsupportedPayload, "Bounded payload size cannot be negative.");
+                if (bounded.MaxPayloadSize != expected.MaxBytes)
+                    return KernelResult.Fail(KernelError.UnsupportedPayload, $"Bounded payload self-reported limit {bounded.MaxPayloadSize} does not match contract MaxBytes {expected.MaxBytes}.");
+                if (bounded.PayloadSize > expected.MaxBytes)
+                    return KernelResult.Fail(KernelError.UnsupportedPayload, $"Bounded payload size {bounded.PayloadSize} exceeds contract MaxBytes {expected.MaxBytes}.");
+                return KernelResult.Ok();
+
+            case RequestPayloadKind.Ownership:
+                if (payload is not ITransferableOwnedPayload owned)
+                    return KernelResult.Fail(KernelError.UnsupportedPayload, "Message requires the declared ownership request payload.");
+                return owned.PayloadKind == expected.OwnershipPayloadKind
+                    ? KernelResult.Ok()
+                    : KernelResult.Fail(KernelError.UnsupportedPayload, $"Expected ownership payload kind {expected.OwnershipPayloadKind}, got {owned.PayloadKind}.");
+
+            default:
+                return KernelResult.Fail(KernelError.UnsupportedPayload, "Request payload kind is not supported.");
         }
-
-        if (payload is not ITransferableOwnedPayload owned)
-            return KernelResult.Fail(KernelError.UnsupportedPayload, "Ownership-bearing messages require the declared owned payload shape.");
-        if (owned.PayloadKind != message.OwnershipPayloadKind)
-            return KernelResult.Fail(KernelError.UnsupportedPayload, $"Expected ownership payload kind {message.OwnershipPayloadKind}, got {owned.PayloadKind}.");
-        return KernelResult.Ok();
-    }
-
-    private static KernelResult ValidateBoundedPayload(ProtocolMessageDescriptorV1 message, object? payload)
-    {
-        var expected = message.BoundedPayload;
-        if (expected is null)
-        {
-            return payload is IBoundedPayload
-                ? KernelResult.Fail(KernelError.UnsupportedPayload, "Bounded payloads require an explicit contract declaration with type and MaxBytes.")
-                : KernelResult.Ok();
-        }
-
-        if (payload is not IBoundedPayload bounded)
-            return KernelResult.Fail(KernelError.UnsupportedPayload, "Message requires the declared bounded payload shape.");
-
-        var actualTypeName = payload.GetType().FullName ?? payload.GetType().Name;
-        if (!string.Equals(actualTypeName, expected.TypeName, StringComparison.Ordinal))
-            return KernelResult.Fail(KernelError.UnsupportedPayload, $"Expected bounded payload type {expected.TypeName}, got {actualTypeName}.");
-        if (bounded.PayloadSize < 0)
-            return KernelResult.Fail(KernelError.UnsupportedPayload, "Bounded payload size cannot be negative.");
-        if (bounded.MaxPayloadSize != expected.MaxBytes)
-            return KernelResult.Fail(KernelError.UnsupportedPayload, $"Bounded payload self-reported limit {bounded.MaxPayloadSize} does not match contract MaxBytes {expected.MaxBytes}.");
-        if (bounded.PayloadSize > expected.MaxBytes)
-            return KernelResult.Fail(KernelError.UnsupportedPayload, $"Bounded payload size {bounded.PayloadSize} exceeds contract MaxBytes {expected.MaxBytes}.");
-        return KernelResult.Ok();
-    }
-
-    private static bool IsSupportedPayload(object? payload)
-    {
-        if (payload is null) return true;
-        if (payload is ITransferableOwnedPayload) return true;
-        if (payload is IBoundedPayload) return true;
-        return payload is byte or sbyte or short or ushort or int or uint or long or ulong or float or double or bool or char or decimal or Enum;
     }
 }
