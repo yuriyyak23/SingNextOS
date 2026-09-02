@@ -3,6 +3,8 @@ using SingPlus.Sip;
 
 namespace SingPlus.Runtime;
 
+internal readonly record struct BorrowLeaseGrant(BorrowLeaseHandle Handle, BorrowLeaseLifetime Lifetime);
+
 public sealed class RegionAuthority
 {
     private sealed class RegionRecord
@@ -14,6 +16,8 @@ public sealed class RegionAuthority
         public required string ElementType { get; init; }
         public required RegionState State { get; set; }
         public RegionOwner? Borrower { get; set; }
+        public BorrowLeaseGeneration BorrowGeneration { get; set; }
+        public BorrowLeaseLifetime? BorrowLifetime { get; set; }
         public ITransferableOwnedPayload? Payload { get; set; }
     }
 
@@ -31,7 +35,8 @@ public sealed class RegionAuthority
             Owner = owner,
             ByteLength = byteLength,
             ElementType = elementType,
-            State = RegionState.Allocated
+            State = RegionState.Allocated,
+            BorrowGeneration = new BorrowLeaseGeneration(0)
         };
         _regions.Add(id, record);
         record.State = RegionState.Owned;
@@ -47,33 +52,54 @@ public sealed class RegionAuthority
         return KernelResult<RegionDescriptor>.Ok(Descriptor(record));
     }
 
-    public KernelResult Loan(RegionHandle handle, RegionOwner owner, RegionOwner borrower)
+    public KernelResult<BorrowLeaseHandle> Loan(RegionHandle handle, RegionOwner owner, RegionOwner borrower)
     {
-        if (owner == borrower) return KernelResult.Fail(KernelError.InvalidRegionState, "A region cannot be loaned to its owner.");
-        var validation = Validate(handle, owner);
-        if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
-        var record = _regions[handle.RegionId];
-        record.Borrower = borrower;
-        record.State = RegionState.Loaned;
-        return KernelResult.Ok();
+        var acquired = AcquireLoan(handle, owner, borrower);
+        return acquired.IsSuccess
+            ? KernelResult<BorrowLeaseHandle>.Ok(acquired.Value!.Handle)
+            : KernelResult<BorrowLeaseHandle>.Fail(acquired.Error, acquired.Message!);
     }
 
-    public KernelResult ReturnLoan(RegionHandle handle, RegionOwner owner, RegionOwner borrower)
+    internal KernelResult<BorrowLeaseGrant> AcquireLoan(RegionHandle handle, RegionOwner owner, RegionOwner borrower)
     {
-        if (!_regions.TryGetValue(handle.RegionId, out var record)) return KernelResult.Fail(KernelError.RegionNotFound, "Region was not found.");
-        if (record.Generation != handle.Generation) return KernelResult.Fail(KernelError.StaleGeneration, "Region generation is stale.");
-        if (record.Owner != owner || record.Borrower != borrower || record.State != RegionState.Loaned) return KernelResult.Fail(KernelError.InvalidRegionState, "Region is not loaned to the specified borrower.");
+        if (owner == borrower) return KernelResult<BorrowLeaseGrant>.Fail(KernelError.InvalidRegionState, "A region cannot be loaned to its owner.");
+        var validation = Validate(handle, owner);
+        if (!validation.IsSuccess) return KernelResult<BorrowLeaseGrant>.Fail(validation.Error, validation.Message!);
+        var record = _regions[handle.RegionId];
+        if (record.BorrowGeneration.Value == ulong.MaxValue) return KernelResult<BorrowLeaseGrant>.Fail(KernelError.CapacityExhausted, "Borrow lease generation is exhausted.");
+
+        var generation = new BorrowLeaseGeneration(record.BorrowGeneration.Value + 1);
+        var lifetime = new BorrowLeaseLifetime();
+        var lease = new BorrowLeaseHandle(new RegionHandle(record.Id, record.Generation), generation);
+        record.BorrowGeneration = generation;
+        record.Borrower = borrower;
+        record.BorrowLifetime = lifetime;
+        record.State = RegionState.Loaned;
+        return KernelResult<BorrowLeaseGrant>.Ok(new BorrowLeaseGrant(lease, lifetime));
+    }
+
+    public KernelResult ReturnLoan(BorrowLeaseHandle lease, RegionOwner borrower)
+    {
+        if (!_regions.TryGetValue(lease.Region.RegionId, out var record)) return KernelResult.Fail(KernelError.RegionNotFound, "Region was not found.");
+        if (record.Generation != lease.Region.Generation) return KernelResult.Fail(KernelError.StaleGeneration, "Region generation is stale.");
+        if (record.BorrowGeneration != lease.Generation) return KernelResult.Fail(KernelError.StaleGeneration, "Borrow lease generation is stale.");
+        if (record.State != RegionState.Loaned || record.Borrower != borrower || record.BorrowLifetime is null) return KernelResult.Fail(KernelError.InvalidRegionState, "Borrow lease is not active for the specified borrower.");
+        record.BorrowLifetime.InvalidateForRuntime();
+        record.BorrowLifetime = null;
         record.Borrower = null;
         record.State = RegionState.Owned;
         return KernelResult.Ok();
     }
 
-    public KernelResult RevokeLoan(RegionHandle handle, RegionOwner owner)
+    public KernelResult RevokeLoan(BorrowLeaseHandle lease, RegionOwner owner)
     {
-        if (!_regions.TryGetValue(handle.RegionId, out var record)) return KernelResult.Fail(KernelError.RegionNotFound, "Region was not found.");
-        if (record.Generation != handle.Generation) return KernelResult.Fail(KernelError.StaleGeneration, "Region generation is stale.");
+        if (!_regions.TryGetValue(lease.Region.RegionId, out var record)) return KernelResult.Fail(KernelError.RegionNotFound, "Region was not found.");
+        if (record.Generation != lease.Region.Generation) return KernelResult.Fail(KernelError.StaleGeneration, "Region generation is stale.");
+        if (record.BorrowGeneration != lease.Generation) return KernelResult.Fail(KernelError.StaleGeneration, "Borrow lease generation is stale.");
         if (record.Owner != owner) return KernelResult.Fail(KernelError.WrongRegionOwner, "Region owner does not match.");
-        if (record.State != RegionState.Loaned || record.Borrower is null) return KernelResult.Fail(KernelError.InvalidRegionState, "Region does not have an active loan.");
+        if (record.State != RegionState.Loaned || record.Borrower is null || record.BorrowLifetime is null) return KernelResult.Fail(KernelError.InvalidRegionState, "Region does not have an active borrow lease.");
+        record.BorrowLifetime.InvalidateForRuntime();
+        record.BorrowLifetime = null;
         record.Borrower = null;
         record.State = RegionState.Owned;
         return KernelResult.Ok();
@@ -118,6 +144,8 @@ public sealed class RegionAuthority
         foreach (var record in _regions.Values.Where(r => r.State == RegionState.Loaned && r.Borrower?.DomainId == borrowerDomainId))
         {
             returned.Add(new RegionHandle(record.Id, record.Generation));
+            record.BorrowLifetime?.InvalidateForRuntime();
+            record.BorrowLifetime = null;
             record.Borrower = null;
             record.State = RegionState.Owned;
         }
@@ -130,6 +158,8 @@ public sealed class RegionAuthority
         foreach (var record in _regions.Values.Where(r => r.Owner.DomainId == domainId && r.State is RegionState.Owned or RegionState.Loaned))
         {
             reclaimed.Add(new RegionHandle(record.Id, record.Generation));
+            record.BorrowLifetime?.InvalidateForRuntime();
+            record.BorrowLifetime = null;
             record.Payload?.InvalidateForRuntime();
             record.Payload = null;
             record.Borrower = null;

@@ -117,7 +117,8 @@ public sealed class OwnershipTests
         var ownerIdentity = new RegionOwner(new DomainId(10), owner.Generation);
         var borrowerIdentity = new RegionOwner(new DomainId(20), borrower.Generation);
 
-        Assert.True(kernel.Regions.Loan(buffer.Handle, ownerIdentity, borrowerIdentity).IsSuccess);
+        var loan = kernel.Regions.Loan(buffer.Handle, ownerIdentity, borrowerIdentity);
+        Assert.True(loan.IsSuccess, loan.Message);
 
         var release = kernel.ReleaseRegion(owner, buffer);
         var transfer = kernel.TransferRegion(owner, borrower, buffer);
@@ -139,10 +140,11 @@ public sealed class OwnershipTests
         var buffer = kernel.AllocateBuffer<int>(owner, 1).Value!;
         var ownerIdentity = new RegionOwner(new DomainId(10), owner.Generation);
         var borrowerIdentity = new RegionOwner(new DomainId(20), borrower.Generation);
-        Assert.True(kernel.Regions.Loan(buffer.Handle, ownerIdentity, borrowerIdentity).IsSuccess);
+        var loan = kernel.Regions.Loan(buffer.Handle, ownerIdentity, borrowerIdentity);
+        Assert.True(loan.IsSuccess, loan.Message);
 
-        var revoked = kernel.Regions.RevokeLoan(buffer.Handle, ownerIdentity);
-        var lateReturn = kernel.Regions.ReturnLoan(buffer.Handle, ownerIdentity, borrowerIdentity);
+        var revoked = kernel.Regions.RevokeLoan(loan.Value, ownerIdentity);
+        var lateReturn = kernel.Regions.ReturnLoan(loan.Value, borrowerIdentity);
 
         Assert.True(revoked.IsSuccess, revoked.Message);
         Assert.False(lateReturn.IsSuccess);
@@ -160,9 +162,10 @@ public sealed class OwnershipTests
         var buffer = kernel.AllocateBuffer<int>(owner, 1).Value!;
         var ownerIdentity = new RegionOwner(new DomainId(10), owner.Generation);
         var borrowerIdentity = new RegionOwner(new DomainId(20), borrower.Generation);
-        Assert.True(kernel.Regions.Loan(buffer.Handle, ownerIdentity, borrowerIdentity).IsSuccess);
+        var loan = kernel.Regions.Loan(buffer.Handle, ownerIdentity, borrowerIdentity);
+        Assert.True(loan.IsSuccess, loan.Message);
 
-        var revoked = kernel.Regions.RevokeLoan(buffer.Handle, borrowerIdentity);
+        var revoked = kernel.Regions.RevokeLoan(loan.Value, borrowerIdentity);
 
         Assert.False(revoked.IsSuccess);
         Assert.Equal(KernelError.WrongRegionOwner, revoked.Error);
@@ -179,7 +182,8 @@ public sealed class OwnershipTests
         buffer.Span[0] = 77;
         var ownerIdentity = new RegionOwner(new DomainId(10), owner.Generation);
         var borrowerIdentity = new RegionOwner(new DomainId(20), borrower.Generation);
-        Assert.True(kernel.Regions.Loan(buffer.Handle, ownerIdentity, borrowerIdentity).IsSuccess);
+        var loan = kernel.Regions.Loan(buffer.Handle, ownerIdentity, borrowerIdentity);
+        Assert.True(loan.IsSuccess, loan.Message);
 
         var terminated = kernel.TerminateProcess(borrower);
 
@@ -200,7 +204,8 @@ public sealed class OwnershipTests
         var buffer = kernel.AllocateBuffer<int>(owner, 1).Value!;
         var ownerIdentity = new RegionOwner(new DomainId(10), owner.Generation);
         var borrowerIdentity = new RegionOwner(new DomainId(20), borrowerA.Generation);
-        Assert.True(kernel.Regions.Loan(buffer.Handle, ownerIdentity, borrowerIdentity).IsSuccess);
+        var loan = kernel.Regions.Loan(buffer.Handle, ownerIdentity, borrowerIdentity);
+        Assert.True(loan.IsSuccess, loan.Message);
 
         Assert.True(kernel.TerminateProcess(borrowerA).IsSuccess);
         Assert.Equal(RegionState.Loaned, Assert.Single(kernel.Regions.Snapshot()).State);
@@ -219,10 +224,11 @@ public sealed class OwnershipTests
         var buffer = kernel.AllocateBuffer<int>(owner, 1).Value!;
         var ownerIdentity = new RegionOwner(new DomainId(10), owner.Generation);
         var borrowerIdentity = new RegionOwner(new DomainId(20), borrower.Generation);
-        Assert.True(kernel.Regions.Loan(buffer.Handle, ownerIdentity, borrowerIdentity).IsSuccess);
+        var loan = kernel.Regions.Loan(buffer.Handle, ownerIdentity, borrowerIdentity);
+        Assert.True(loan.IsSuccess, loan.Message);
 
         var terminated = kernel.TerminateProcess(owner);
-        var lateReturn = kernel.Regions.ReturnLoan(buffer.Handle, ownerIdentity, borrowerIdentity);
+        var lateReturn = kernel.Regions.ReturnLoan(loan.Value, borrowerIdentity);
 
         Assert.True(terminated.IsSuccess, terminated.Message);
         Assert.Equal(RegionState.Released, Assert.Single(kernel.Regions.Snapshot()).State);

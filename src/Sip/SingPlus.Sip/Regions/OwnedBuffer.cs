@@ -7,15 +7,41 @@ internal interface ITransferableOwnedPayload
     RegionHandle Handle { get; }
     bool IsValidForRuntime { get; }
     object TransferForRuntime(RegionHandle newHandle);
+    object CreateBorrowLeaseForRuntime(BorrowLeaseHandle handle, BorrowLeaseLifetime lifetime);
     void InvalidateForRuntime();
+}
+
+internal sealed class BorrowLeaseLifetime
+{
+    private int _active = 1;
+
+    internal bool IsActive => Volatile.Read(ref _active) != 0;
+
+    internal void InvalidateForRuntime() => Interlocked.Exchange(ref _active, 0);
 }
 
 public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanaged
 {
-    private sealed class Storage(T[] data)
+    internal sealed class Storage(T[] data)
     {
+        private BorrowLeaseLifetime? _borrowLifetime;
+
         public T[] Data { get; } = data;
-        public bool IsAlive { get; set; } = true;
+        public bool IsAlive { get; private set; } = true;
+        public bool IsBorrowed => _borrowLifetime?.IsActive == true;
+
+        internal void BeginBorrow(BorrowLeaseLifetime lifetime)
+        {
+            if (!IsAlive) throw new InvalidOperationException("OwnedBuffer backing storage has been reclaimed.");
+            if (IsBorrowed) throw new InvalidOperationException("OwnedBuffer already has an active runtime borrow lease.");
+            _borrowLifetime = lifetime;
+        }
+
+        internal void Invalidate()
+        {
+            IsAlive = false;
+            _borrowLifetime?.InvalidateForRuntime();
+        }
     }
 
     private readonly Storage _storage;
@@ -47,20 +73,20 @@ public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanag
     {
         get
         {
-            EnsureValid();
+            EnsureOwnerAccess();
             return _storage.Data.AsSpan();
         }
     }
 
     public BorrowedSpan<T> Borrow()
     {
-        EnsureValid();
+        EnsureOwnerAccess();
         return new BorrowedSpan<T>(this);
     }
 
     public OwnedBuffer<T> Move()
     {
-        EnsureValid();
+        EnsureOwnerAccess();
         var moved = new OwnedBuffer<T>(Handle, _storage);
         _valid = false;
         return moved;
@@ -68,7 +94,7 @@ public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanag
 
     internal Span<T> GetBorrowedSpan()
     {
-        EnsureValid();
+        EnsureOwnerAccess();
         return _storage.Data.AsSpan();
     }
 
@@ -76,21 +102,34 @@ public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanag
 
     object ITransferableOwnedPayload.TransferForRuntime(RegionHandle newHandle)
     {
-        EnsureValid();
+        EnsureOwnerAccess();
         var transferred = new OwnedBuffer<T>(newHandle, _storage);
         _valid = false;
         return transferred;
     }
 
+    object ITransferableOwnedPayload.CreateBorrowLeaseForRuntime(BorrowLeaseHandle handle, BorrowLeaseLifetime lifetime)
+    {
+        EnsureValid();
+        _storage.BeginBorrow(lifetime);
+        return new BorrowLease<T>(handle, _storage, lifetime);
+    }
+
     void ITransferableOwnedPayload.InvalidateForRuntime()
     {
         _valid = false;
-        _storage.IsAlive = false;
+        _storage.Invalidate();
     }
 
     private void EnsureValid()
     {
         if (!IsValid) throw new InvalidOperationException("OwnedBuffer has been moved, transferred, released, or reclaimed.");
+    }
+
+    private void EnsureOwnerAccess()
+    {
+        EnsureValid();
+        if (_storage.IsBorrowed) throw new InvalidOperationException("OwnedBuffer is temporarily inaccessible while a runtime borrow lease is active.");
     }
 }
 
