@@ -2,22 +2,36 @@
 
 ## Goal
 
-Этот раздел задаёт dependency order для SingNextOS после текущего SIP protocol hardening. Он не является обещанием реализовать все подсистемы сразу. Его задача — не позволить проекту уйти в filesystem/network/GUI/legacy-VM детали до того, как сформирован корректный HybridCPU platform boundary.
+Этот раздел задаёт dependency order для SingNextOS после текущего SIP protocol hardening и local Platform Authority Bridge v1. Он не обещает одновременную реализацию всех системных services. Его задача — не позволить filesystem/network/GUI/compatibility work создать параллельные низкоуровневые security/memory mechanisms в обход capability, ownership и platform authority boundaries.
+
+## Current baseline delta
+
+На baseline `af791aba4e25615cef09b3933f34efca62296304` уже реализована часть предыдущего roadmap:
+
+- local `SingPlus.Platform` abstraction contract;
+- host `IPlatformAuthorityProvider`;
+- neutral local domain binding;
+- direct owned-region mapping abstraction;
+- local/provider generation separation;
+- capability-before-provider validation;
+- region mapping reservation that blocks incompatible ownership lifecycle.
+
+Это закрывает **local/host-backed foundation**, но не закрывает `EXT-HCPU-003`/`004`: реального HybridCPU provider, IOMMU/DMA/rebind/coherence semantics в репозитории нет.
 
 ## Architecture target
 
 ```text
-Application / System API
+.NET-like Application / System API
   -> generated typed SIP client
   -> service SIP
   -> capability + ownership IPC runtime
   -> privileged kernel authority
   -> Platform Authority Bridge
-  -> HybridCPU neutral runtime domains
-  -> ISE execution/memory/compute/device planes
+  -> HybridCPU neutral runtime domains/providers
+  -> execution/memory/compute/device planes
 ```
 
-The system should preserve four independent proof layers:
+The system preserves independent proof layers:
 
 ```text
 static producer proof
@@ -28,120 +42,122 @@ publication/commit authority
 
 No layer substitutes for another.
 
-## Track A — finish the SIP transport contract
+## Track A — complete SIP response/publication semantics
 
-### Why first
+### Status
 
-HybridCPU integration will produce more hardware-backed responses, staged results, ownership returns and evidence objects. The current SingNextOS request path is already fail-closed and C4 prepared response metadata, but response transport/publication must be as strict as request admission before hardware services are added.
+**Foundation present; completion remains priority.** Request-side shape/capability/ownership validation is already fail-closed and generated response metadata exists. Response transport/publication must reach the same precision before hardware-backed services become broad.
 
 ### Required outcomes
 
-- complete typed response payload transport;
-- enforce response shape/cardinality against generated metadata;
-- implement ownership-return response transfer with generation/lifetime rules;
-- define response publication and cancellation semantics;
-- make malformed service response fail closed before client-visible publication;
-- keep deterministic protocol digests/manifests.
+- typed response payload transport;
+- response shape/cardinality validation;
+- ownership-return response transfer with generation/lifetime rules;
+- explicit response publication/cancellation semantics;
+- malformed service response fails before client-visible publication;
+- deterministic protocol digests/manifests remain stable.
 
-### Why this matches HybridCPU
+## Track B — Platform Authority Bridge local v1
 
-It mirrors the ISE rule that backend result, completion and retire/publication are separate authority boundaries.
+### Status
 
-## Track B — local platform abstraction contracts
+**Partially implemented/current.**
 
-### Goal
+Current v1 exposes:
 
-Introduce local interfaces/DTOs that express only semantic OS needs:
+```text
+NeutralDomainBinding
+DirectOwnedRegionMapping
+```
 
-- execution-domain lifecycle;
-- memory-domain binding;
-- I/O-domain binding;
-- exact owned-region mapping;
-- feature discovery;
-- typed external result/rejection vocabulary.
+and a deterministic host provider.
 
-### Constraints
+### Next local evolution
 
-- host implementation first for tests;
+Add new bridge families only when concrete external/use-case requirements exist. Avoid pre-creating broad abstractions for every ISE feature.
+
+Potential future local contracts:
+
+- explicit execution/memory/I/O-domain distinctions where a real provider requires them;
+- DMA submission/drain/completion;
+- compute provider discovery;
+- classified evidence;
+- surface/display presentation provider;
+- virtualization/secure-domain providers when externally positive.
+
+Constraints remain:
+
 - no HybridCPU internal type references;
-- no raw lane/opcode API;
-- no VMCS manager;
-- no external handle leakage to SIPs;
-- every stateful binding generation-bound.
+- no raw lanes/opcodes;
+- no VMCS authority store;
+- no provider token leakage to SIPs;
+- every stateful binding generation/lifetime-bound.
 
-This track can be implemented entirely inside SingNextOS while external integration remains blocked.
+## Track C — real HybridCPU domain binding
 
-## Track C — bind domain lifecycle to platform leases
+### Status
 
-### Goal
+**External Blocked.** Local domain binding is current; HybridCPU-backed provider is not.
 
-Evolve local `DomainRegistry` without turning it into a HybridCPU state mirror.
+### Required outcomes
 
-Create a separate kernel authority that associates a SingNextOS `DomainId` lifecycle with opaque platform execution/memory/I/O bindings.
+- bind a SingNextOS principal to real neutral platform authority;
+- distinguish unsupported/denied/stale/revoked states;
+- preserve `DomainId != raw platform handle`;
+- termination closes external work before local reclaim;
+- no VMX compatibility object becomes authoritative local state.
 
-### Invariants
+Tracked by `EXT-HCPU-003`.
 
-- local domain can exist without platform lease in host tests;
-- required platform profile must fail admission if binding is unavailable;
-- termination closes new platform work before local region/capability reclaim;
-- stale lease/generation cannot be reused;
-- platform denial does not mutate local process state as successful.
+## Track D — hardware-backed owned-region mapping
 
-## Track D — owned-region platform memory binding
+### Status
 
-### Goal
+**Local abstraction current; external direct mapping blocked.**
 
-Make `OwnedRegion<T>`/`OwnedBuffer<T>` the unit of hardware-visible resource mapping.
+Current local mapping requires exact `MemoryRegion` capability and current region ownership, then reserves the region against transfer/loan/release.
 
-### First supported shape
+### Required external closure
 
-Prefer a deliberately narrow v1:
+- exact range/access mapping;
+- revoke/unmap;
+- stale binding rejection;
+- drain/cancel before ownership rebind/reclaim;
+- truthful coherence/direct-access capability statement.
 
-- exact whole-region or exact range mapping;
-- one owner domain;
-- read/write direction;
-- explicit map/unmap;
-- no implicit shared mutable mapping;
-- no universal coherency promise;
-- no SecureCompute private memory claim.
+Do not infer page remap, IOMMU or cache behavior from the local interface.
 
-### Important distinction
+Tracked by `EXT-HCPU-004`.
 
-Implement **zero-copy ownership rebinding** separately from **DSC offloaded copy**. Tests should make the difference explicit.
+## Track E — first narrow ISE compute provider
 
-## Track E — first ISE compute provider: choose one narrow contour
+Choose one provider based on an actual stable external interface, not breadth.
 
-The first real compute integration should be selected by available external ABI, not by marketing breadth.
+Candidates remain:
 
-### Candidate 1: DSC1 BulkCompute
+### DSC1 BulkCompute
 
-Strong fit with owned regions and all-or-none staged commit.
+Strong fit for owned regions and all-or-none semantics:
 
-Minimal operations:
+```text
+Copy / Add / Mul / Fma / Reduce
+```
 
-- Copy;
-- Add;
-- Mul;
-- Fma;
-- Reduce.
+Do not claim DSC2 queues or coherent async overlap.
 
-No DSC2/queue/coherent async claim.
+### MatrixTile v1
 
-### Candidate 2: MatrixTile v1
+Strong fit for AI/HPC but needs typed shape/numeric/layout contracts and owned-region ingress/egress.
 
-Strong fit for AI/HPC but requires typed matrix descriptor/numeric/layout API and region ingress/egress.
+### Scoped L7-SDC accelerator
 
-### Candidate 3: L7-SDC scoped accelerator
+Strong device story, but memory ordering/coherence requires explicit provider contract.
 
-Strong device story but memory conflict/global coherence is currently a larger integration caveat.
-
-### Selection rule
-
-Choose the provider with the smallest stable external surface and clearest conformance path. Do not implement all three simultaneously.
+Tracked by `EXT-HCPU-005`.
 
 ## Track F — scheduler/event integration
 
-After domain bindings are stable, consume existing platform scheduler/event facilities where a binding exists:
+After real execution-domain binding exists, consume platform event/scheduler facilities behind high-level abstractions:
 
 - yield;
 - event wait/signal;
@@ -149,42 +165,32 @@ After domain bindings are stable, consume existing platform scheduler/event faci
 - timer/interrupt delivery;
 - execution budget/priority hints.
 
-Public API stays at Task/ValueTask/event/channel level.
+Public API remains `Task`/`ValueTask`/cancellation/event/channel-oriented. Do not expose `WFE`, `SEV`, VT IDs or lane placement as native ABI.
 
-Do not expose `WFE`, `SEV`, VT IDs or lane placement directly.
+## Track G — evidence and replay diagnostics
 
-## Track G — platform evidence and replay diagnostics
+Expose external evidence only after a classified provider contract exists.
 
-### Goal
+Potential service outputs:
 
-Expose HybridCPU evidence without turning it into authority.
-
-A read-only service can project:
-
-- legality rejects;
-- replay invalidation summaries;
-- typed-slot utilization;
+- legality/reject summaries;
+- replay diagnostics;
 - compute/device completion diagnostics;
 - permitted measurements.
 
-### Security rules
+Security rules:
 
-- explicit evidence capability;
+- explicit evidence-read authority;
 - visibility classes;
-- no host-private topology by default;
-- no evidence object accepted by capability/ownership APIs;
-- stable DTO schema with digest/version.
+- no host topology leakage by default;
+- evidence objects never accepted as capabilities/grants.
 
-This is especially useful for performance engineering and reproducibility.
+## Track H — neutral virtualization
 
-## Track H — neutral virtualization service
-
-Only after execution/memory/I/O domain bindings exist should the OS expose VM lifecycle.
-
-### Order
+Only after execution/memory/I/O domain bindings exist:
 
 ```text
-neutral child execution domain
+child execution domain
  -> memory domain
  -> I/O/device assignment
  -> trap/event service
@@ -192,56 +198,106 @@ neutral child execution domain
  -> optional VMX compatibility projection
 ```
 
-Do not start with VMXON/VMCS APIs.
+Do not start from VMXON/VMCS APIs.
 
-## Track I — SecureCompute integration gate
+## Track I — SecureCompute gate
 
-SecureCompute should have a hard feature gate.
+Open production implementation only when an external provider proves:
 
-Open implementation only when all of the following are externally proven:
-
-- stable secure-domain binding;
-- canonical lifecycle owner;
-- operation-bound admission/grant;
+- secure-domain lifecycle owner;
+- operation-bound admission/grants;
 - private/shared memory enforcement;
 - evidence publication class;
 - backend execution owner;
 - completion/publication semantics;
-- negative conformance tests;
+- negative conformance;
 - explicit production activation status.
 
-Until then only API shape/rejection tests may exist.
+Until then confidential-domain API may exist only as a target shape that reports unavailable/fails closed.
 
-## Track J — richer system services
+## Track J — native system services
 
-Filesystems, networking, GUI/compositor, driver factory and compatibility stacks should build on the platform/domain/ownership substrate rather than create parallel low-level mechanisms.
+Filesystem, networking, process management, GUI/compositor, richer device services and compatibility stacks build on the same substrate.
 
-Examples:
+The normative native API/UI model is defined in [`12_NATIVE_API_AND_UI_CONTRACTS.md`](12_NATIVE_API_AND_UI_CONTRACTS.md).
 
-### Network service
+### Native API rule
+
+```text
+.NET-like ergonomics
+ -> generated typed SIP contract
+ -> explicit capability + ownership
+ -> kernel authority only where required
+```
+
+High-level functions are not added as a huge kernel syscall surface.
+
+### Filesystem/storage
+
+Prefer capability-backed file/session objects and owned regions for large I/O where supported. Copy/sanitization remains valid when required.
+
+### Network
 
 Prefer:
 
 ```text
-NIC capability
+NIC/device capability
 + owned packet region/ring
-+ I/O-domain binding
-+ direct mapping if supported
++ I/O-domain mapping when available
 ```
 
-not hidden kernel bounce buffers by default.
+not ambient device access or implicit global shared buffers.
 
-### Filesystem/storage service
+### UI/GUI
 
-Use owned regions for large I/O and device DMA where supported, but preserve explicit copy/sanitization paths for security and compatibility.
+UI is a standard target Sing+ subsystem, not a KDE/GNOME ABI.
 
-### Graphics/AI service
+Separate target service roles:
 
-Use MatrixTile/L7 providers through `System.Compute`/`System.Device` abstractions and ownership transfer, not a separate trusted GPU memory manager inside kernel.
+```text
+Display
+Compositor
+Window Manager
+Input
+Clipboard
+Font/Text
+Accessibility
+Notification
+Shell
+```
+
+Implementation order may be incremental, but no GUI implementation should bypass capability/ownership rules with a privileged global shared framebuffer or ambient global-input authority.
+
+### Surface presentation
+
+Target semantics:
+
+```text
+APP exclusive-write
+ -> Present / transfer or controlled grant
+ -> compositor read
+ -> device/display read where available
+ -> completion/fence
+ -> APP reacquires write authority
+```
+
+This is a software contract target. Concrete GPU DMA/remap/coherence remains external/future until provider evidence exists.
+
+## Track K — compatibility personalities
+
+Win32/POSIX/Wine support is optional downstream compatibility work.
+
+```text
+legacy API
+ -> compatibility/personality SIP
+ -> native Sing+ service contracts
+```
+
+Compatibility must not redefine native process, filesystem, network, GUI, capability or ownership semantics.
 
 ## Driver strategy
 
-The old “driver factory from UHDL” should not block practical drivers.
+The old universal “driver factory from UHDL” does not block practical drivers.
 
 Recommended progression:
 
@@ -249,63 +305,29 @@ Recommended progression:
 2. generated SIP stub/state metadata;
 3. declarative register/queue descriptors for repeated device families;
 4. generated validation/access code;
-5. only later consider richer hardware-manifest DSL or HDL generation.
-
-This lets the architecture get real device coverage without creating a new compiler/toolchain project prematurely.
+5. richer hardware-manifest DSL only when real device families justify it.
 
 ## Real-time research track
 
-HybridCPU's typed-slot/replay/evidence model makes real-time research attractive, but a hard real-time product profile must be separate and proof-driven.
+HybridCPU typed-slot/replay/evidence properties make real-time research attractive, but exact-cycle hard real-time is not a current OS guarantee.
 
-A future RT profile needs explicit contracts for:
+Future RT profile requires explicit contracts for:
 
 - bounded execution budget;
-- memory/cache/SRF latency envelope;
+- memory/cache latency envelope;
 - interrupt/timer latency;
 - SMT interference;
 - DMA/device completion bounds;
-- WCET analysis;
-- schedulability admission;
+- WCET/schedulability proof;
 - fail-closed overload behavior.
-
-Do not infer those guarantees from deterministic lane choice alone.
 
 ## Assist research track
 
-Current assists are bounded warming only. The first OS use should therefore be prefetch policy, not GC/security execution.
-
-Potential safe progression:
-
-```text
-read-only assist telemetry
- -> explicit prefetch hints for known owned regions
- -> service-level warming policy
- -> research on GC/object-layout prefetch hints
-```
-
-Any future assist that mutates memory, scans confidential data or publishes state would be a new authority class and must not be called an “assist” merely to bypass normal checks.
-
-## API direction
-
-Preserve the old WhiteBook's .NET-like user ergonomics, but align APIs with real ownership/domain semantics.
-
-Conceptual namespaces:
-
-```text
-System.Compute.Matrix
-System.Compute.Bulk
-System.Device.Acceleration
-System.Device.Dma
-System.Virtualization
-System.Security.Confidential
-System.Diagnostics.PlatformEvidence
-```
-
-Objects should be typed capabilities or owned/session resources, not integer handles.
+Current assists are bounded warming mechanisms. First OS use should remain prefetch/warming policy. GC/security memory mutation or scanning is a different authority class and cannot be inferred from assist existence.
 
 ## Definition of Done for a hardware-backed service
 
-A service is not “HybridCPU integrated” merely because a host test passes or an opcode exists.
+A service is not “HybridCPU integrated” because a host provider or opcode exists.
 
 Required closure:
 
@@ -315,20 +337,25 @@ local contract shape proven
 + external feature discovery positive
 + external denial/stale tests
 + exact domain/range binding
-+ staged execution result
++ execution result semantics
 + explicit publication/commit proof
 + cleanup/revocation proof
 + deterministic integration artifact
 ```
 
-If one piece is absent, classify the feature honestly as host-only, external-blocked, policy-only, projection-only or future-gated.
+If any piece is missing, classify honestly as local/host-backed, external-blocked, code-confirmed, projection-only or future-gated.
 
-## Highest-value next implementation after this audit
+## Priority decision
 
-Given the current repository state, the next code iteration should remain small and foundation-focused:
+Near-term implementation should preserve the current dependency order:
 
-> **finish response publication/ownership transport semantics before introducing any HybridCPU platform service.**
+```text
+1. response transport/publication closure
+2. qualify real domain/region platform provider
+3. prove revoke/drain/rebind semantics
+4. add one narrow hardware-backed service
+5. build richer filesystem/network/UI services on that substrate
+6. add compatibility personalities only downstream
+```
 
-After that, the first HybridCPU-facing code should be a local platform abstraction + host test provider, not a direct ISE/VMX implementation.
-
-This ordering preserves all C1–C4 fail-closed protocol work and prepares the OS for real external authority without premature platform coupling.
+The UI/API architecture is specified now so later services converge on one ABI, but specification does not imply current implementation.

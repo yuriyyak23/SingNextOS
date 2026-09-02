@@ -1,283 +1,304 @@
 # 07. Platform Bridge And External Contracts
 
+## Current status at SingNextOS `af791aba...`
+
+Platform Authority Bridge больше не является только proposed abstraction. В текущем SingNextOS реализован **local/host-backed v1 contour**:
+
+```text
+src/Platform/SingPlus.Platform.Abstractions/PlatformAuthorityContracts.cs
+src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.cs
+src/Runtime/SingPlus.Runtime/Platform/RuntimeKernel.Platform.cs
+src/Platform/SingPlus.Platform.Host/HostPlatformAuthorityProvider.cs
+```
+
+Этот contour подтверждает архитектурную границу между local OS authority и external provider authority, но **не является HybridCPU hardware integration**.
+
+Current feature discovery содержит только:
+
+```text
+NeutralDomainBinding
+DirectOwnedRegionMapping
+```
+
+Current provider operations:
+
+```text
+BindDomain
+RevokeDomain
+MapOwnedRegion
+RevokeRegionMapping
+```
+
+Current statuses:
+
+```text
+Success
+Unavailable
+Unsupported
+Denied
+Stale
+Revoked
+WrongDomain
+Faulted
+```
+
+Следовательно, claims о DMA/IOMMU, compute, virtualization, evidence, SecureCompute, GPU/display и coherence по-прежнему требуют отдельного external provider contract.
+
 ## Why a bridge is required
 
-SingNextOS deliberately treats HybridCPU-v2 compiler/runtime/ISE/ISA as an external black box. This remains the correct boundary after the audit.
+SingNextOS treats HybridCPU compiler/runtime/ISE/ISA as an external black box. OS code must not depend on internal HybridCPU types, physical lane IDs, raw MicroOps, VMCS state stores, host pointers or backend-specific tokens.
 
-The OS should not reference internal HybridCPU types such as:
-
-- `DomainRuntimeContext`;
-- `CapabilityDescriptorSet`;
-- `DmaStreamComputeMicroOp`;
-- `MatrixTileMicroOp`;
-- lane IDs;
-- `TrapDecision`;
-- `Vmcs*` projection types;
-- accelerator native token stores.
-
-Those are implementation/runtime authority details of the external platform.
-
-Instead SingNextOS needs a small **typed Platform Authority Bridge** whose contracts are semantic and stable enough for OS policy.
-
-## Placement
-
-Recommended layering:
+Correct layering:
 
 ```text
-public .NET-like API
- -> generated SIP client
- -> typed SIP service
- -> SingNextOS kernel authority
- -> SingPlus.Platform.Abstractions        [local contracts]
- -> HybridCPU platform binding            [external/integration assembly]
- -> existing HybridCPU runtime / ISE
+.NET-like public API
+ -> generated typed SIP client
+ -> typed service SIP
+ -> capability + ownership IPC
+ -> privileged SingNextOS kernel authority
+ -> SingPlus.Platform abstractions
+ -> provider binding
+ -> existing HybridCPU runtime / ISE when such provider exists
 ```
 
-Only the kernel/platform binding layer may hold external opaque handles.
+Only privileged kernel/platform integration may correlate local OS principals/regions with external opaque leases.
 
-SIP/driver code sees only local capabilities, owned regions and generated service contracts.
+## Local authority and provider authority remain separate
 
-## Bridge design principles
-
-### 1. Opaque handles
-
-External platform identities must be represented as opaque values with no semantic interpretation in ordinary SingNextOS code.
-
-Examples:
+Current bridge deliberately preserves two namespaces of identity:
 
 ```text
-PlatformExecutionLease
-PlatformMemoryLease
-PlatformIoLease
-PlatformComputeLease
-PlatformVirtualizationLease
-PlatformEvidenceLease
-PlatformSecureLease
+local:
+  PlatformDomainBindingId
+  PlatformDomainBindingGeneration
+  PlatformRegionMappingId
+  PlatformRegionMappingGeneration
+
+provider:
+  PlatformProviderDomainLeaseId
+  PlatformProviderRegionMappingId
+  PlatformProviderLeaseGeneration
 ```
 
-These names are conceptual. Exact types depend on the actual external API.
+This is normative. A local `CapabilityId` is not passed into `IPlatformAuthorityProvider`, and a provider lease is not published as a process-visible Sing+ capability.
 
-### 2. Generation-bound
-
-Every externally stateful binding must either expose or be wrapped by a local generation/epoch so stale leases can fail closed after:
-
-- process/domain termination;
-- mapping change;
-- checkpoint/restore;
-- device reset;
-- capability revocation;
-- external runtime restart.
-
-### 3. No raw pointers as authority
-
-Bridge methods receive local region handles/validated ranges and internally bind them to external memory mappings. They do not expose physical addresses as capabilities.
-
-### 4. Semantic operations
-
-Bridge operations express intent:
+Hardware-backed effect follows:
 
 ```text
-BindExecutionDomain
-BindMemoryDomain
-BindIoDomain
+local SingNextOS capability/ownership validation
+        AND
+live provider/platform grant
+        -> effect may proceed
+```
+
+Neither half substitutes for the other.
+
+## Current domain binding semantics
+
+`RuntimeKernel.BindPlatformDomain(ProcessHandle)` resolves the live process and binds the provider subject as:
+
+```text
+PlatformDomainIdentity(
+    DomainId,
+    ProcessGeneration)
+```
+
+The bridge rejects duplicate active bindings, stale generations, wrong subjects and revoked bindings. Provider-returned subject identity is checked before the local binding is published.
+
+Current v1 does **not** split execution/memory/I/O leases into three separately implemented local types. `NeutralDomainBinding` is a deliberately narrow generic local seam. The richer split documented elsewhere remains a target for the point where a real external API requires it.
+
+## Current direct owned-region mapping semantics
+
+`RuntimeKernel.MapPlatformOwnedRegion` enforces the local side before calling the provider:
+
+1. resolve the live owner process;
+2. validate platform domain binding against `DomainId + ProcessGeneration`;
+3. derive required local rights from requested `PlatformMemoryAccess`;
+4. validate a live capability for the caller generation;
+5. require that the capability has `ResourceKind.MemoryRegion` and identifies the exact `RegionId`;
+6. validate current region owner/generation;
+7. reserve the region against incompatible ownership operations;
+8. call the provider;
+9. release the reservation if provider mapping fails.
+
+For a read mapping, local capability requires `Map | Read`; for write, `Map | Write`; read/write requires all relevant bits.
+
+The bridge also validates that the returned provider mapping refers to the same provider domain lease, exact region identity and requested access.
+
+## Current region/platform interlock
+
+`RegionAuthority` contains `PlatformMappingReserved`. While set, the current runtime blocks:
+
+- ownership transfer;
+- borrow/loan;
+- release;
+- domain reclaim.
+
+Process termination/fault also fails while active platform authority exists. The provider mapping must first be revoked and the local reservation released.
+
+This is an important current property: local ownership cannot silently move while an external mapping is still considered active.
+
+What it does **not** prove is how a future HybridCPU provider drains hardware queues, revokes an IOMMU mapping, performs TLB/cache maintenance or waits for DMA/GPU fences. Those are provider-specific external semantics.
+
+## Host provider status
+
+`HostPlatformAuthorityProvider` is a deterministic reference/test provider. It implements the two current feature bits and rejects wrong-domain, stale/revoked and duplicate active mappings.
+
+Its purpose is to prove SingNextOS-owned semantics:
+
+- local validation happens before provider call;
+- provider identity is opaque;
+- stale/revoked state fails closed;
+- external unsupported/denied result does not publish a successful local ownership transition;
+- active mapping blocks incompatible region lifecycle.
+
+It must never be presented as HybridCPU IOMMU/DMA or hardware zero-copy evidence.
+
+## What is still external-blocked
+
+### HybridCPU provider binding
+
+No current repository code proves an `IPlatformAuthorityProvider` implementation backed by real HybridCPU neutral runtime owners.
+
+`EXT-HCPU-003` and `EXT-HCPU-004` therefore remain valid: SingNextOS still needs a stable external binding for real domain and owned-region mapping authority.
+
+### DMA and I/O domains
+
+Current `DmaCapability` is a local semantic capability, not an external DMA grant. Current v1 platform provider has no DMA submit/drain/fence API.
+
+Future flow must remain:
+
+```text
+Device/Dma capability
++ live owned region generation
++ live platform domain/mapping
++ exact direction/range
++ provider operation grant
++ completion/publication
+```
+
+### Coherence
+
+`DirectOwnedRegionMapping` does not mean universal coherent shared memory. A provider must truthfully state any memory-ordering/cache/coherence requirements. When such a contract is absent, SingNextOS must copy, serialize access, perform an explicitly supported maintenance protocol, or fail closed.
+
+### Compute
+
+MatrixTile, DSC1 and L7-SDC are integration candidates described in chapters 04–05 and `EXT-HCPU-005`. No current `IPlatformAuthorityProvider` method exposes them.
+
+### Virtualization, evidence and SecureCompute
+
+These remain future/external provider families under `EXT-HCPU-006`. VMX compatibility cannot become the bridge authority model, and SecureCompute remains feature-gated until production-positive externally.
+
+### GUI/display/GPU
+
+The native UI architecture is defined in [`12_NATIVE_API_AND_UI_CONTRACTS.md`](12_NATIVE_API_AND_UI_CONTRACTS.md). There is no current display/compositor/GPU provider path in the bridge. Future surface presentation must reuse the same capability/ownership/provider principles rather than inventing a privileged shared framebuffer API.
+
+## Target bridge evolution
+
+New feature families should be added only when a concrete use case and external interface exist. They must remain semantic; no raw lane/opcode topology belongs in public/SIP APIs.
+
+Potential target families:
+
+### Execution-domain service
+
+- execution lifecycle/budget intent;
+- park/resume/terminate or provider equivalents;
+- stale/revoked domain detection;
+- event/wait integration when available.
+
+### Memory-domain service
+
+- exact owned-region mapping;
+- explicit access direction;
+- rebind/revoke/drain semantics;
+- optional region protection classes only when enforceable.
+
+### I/O-domain and DMA service
+
+- device/IOMMU scope;
+- exact region/range mapping;
+- submit/revoke/drain/completion;
+- no raw physical addresses in SIP messages.
+
+### Bulk/Matrix/Accelerator providers
+
+- semantic operations over owned/borrowed regions;
+- explicit capability and provider feature discovery;
+- staged result/publication;
+- no raw lane allocation.
+
+### Virtualization/evidence/secure providers
+
+- neutral child-domain composition;
+- classified read-only evidence;
+- optional secure-domain support only when production-positive;
+- compatibility projections downstream.
+
+## Provider contract rules
+
+Every future provider extension must preserve the following invariants.
+
+### Opaque external identities
+
+External IDs/tokens are stored behind the privileged bridge and have independent generation/lifetime. Ordinary SIP code never treats them as authority.
+
+### Semantic operations
+
+Good:
+
+```text
 MapOwnedRegion
-SubmitBulkCompute
-SubmitMatrixOperation
-SubmitAcceleratorCommand
+BindIoDomain
+SubmitBulkTransform
+PresentSurface
 CreateChildDomain
 ReadPlatformEvidence
 ```
 
-They do not express lane/opcode selection.
-
-### 5. Explicit stage/result vocabulary
-
-Hardware-backed operations should return typed stage/result states rather than one ambiguous boolean:
+Bad:
 
 ```text
-Unsupported
-Denied
-Admitted
-Staged
-Completed
-Published
-Cancelled
-Stale
-Faulted
+SelectLane6
+VMWRITE(field)
+UsePhysicalAddressAsCapability
+SubmitRawHostPointer
 ```
 
-Not every operation needs every state, but the contract must prevent `Admitted == Published` inference.
+### Explicit failure vocabulary
 
-### 6. No external self-mint
+Unsupported, denied, stale, revoked and faulted conditions must stay distinguishable. A future operation may additionally need staged/completed/published/cancelled states, but `provider returned success` must never be silently widened into a stronger publication guarantee than the contract defines.
 
-An external platform result never directly becomes a process-visible SingNextOS capability. Kernel policy decides whether to mint/delegate a local capability after platform binding succeeds.
+### No self-mint
 
-## Proposed local abstraction families
+A provider result cannot mint a process-visible local capability by itself. Kernel policy decides which local authority exists.
 
-These are architecture targets, not a request to implement them in this audit PR.
+### Rollback before publication
 
-### Execution domain bridge
+If provider staging succeeds but local commit fails, external state must be revoked/cancelled before caller-visible success. Conversely provider failure must not leave local ownership pretending that the external transition completed.
 
-Responsibilities:
+## Ownership transfer with an active platform mapping
 
-- create/adopt process execution binding;
-- configure semantic scheduling policy/budget;
-- park/resume/terminate domain execution;
-- observe domain generation/termination;
-- optionally expose event/wait/barrier primitives.
+Current v1 takes the conservative path: transfer is denied while a mapping reservation is active.
 
-Must not expose:
-
-- physical lane assignment;
-- scheduler internals;
-- raw rename/commit state;
-- replay certificate authority.
-
-### Memory domain bridge
-
-Responsibilities:
-
-- bind an OS domain to external address-space authority;
-- map/unmap exact owned-region ranges;
-- protect/rebind mappings;
-- expose invalidation/drain semantics;
-- optionally classify private/shared/measured regions when externally supported.
-
-Must not expose:
-
-- page-table pointers as capabilities;
-- VMCS EPT aliases as memory authority;
-- host physical pointers to SIPs.
-
-### I/O domain bridge
-
-Responsibilities:
-
-- bind device/IOMMU scope;
-- map owned/shared regions for device access;
-- issue/revoke DMA grants;
-- signal/wait IRQ/event channels;
-- drain/cancel before ownership transfer or domain termination.
-
-Must keep MMIO/IRQ/DMA capabilities as local semantic permissions.
-
-### Bulk compute bridge
-
-Potential providers:
-
-- ordinary CPU/vector path;
-- DSC1;
-- future platform provider.
-
-The provider selection can be platform-owned or policy-owned, but the API is based on operation shape and owned-region access.
-
-### Matrix bridge
-
-Responsibilities:
-
-- create a bounded matrix compute session;
-- load from owned/borrowed region;
-- execute supported operations;
-- store to owned region;
-- report supported numeric/layout profiles.
-
-No architectural tile register handles escape to SIPs.
-
-### Accelerator bridge
-
-Responsibilities:
-
-- query scoped accelerator capabilities;
-- submit typed descriptor + owned memory footprints;
-- poll/wait/cancel/fence;
-- publish results only after platform commit.
-
-No assumption of universal coherence or universal device ABI.
-
-### Virtualization bridge
-
-Responsibilities:
-
-- create execution/memory/I/O child domain composition;
-- map guest memory;
-- attach bounded devices;
-- receive neutral events/traps;
-- optional compatibility projection.
-
-VMX is downstream compatibility only.
-
-### Evidence bridge
-
-Responsibilities:
-
-- return explicitly classified platform evidence;
-- separate guest-visible/debug/host-only classes;
-- expose deterministic versioned DTOs;
-- never return authority tokens.
-
-### Secure domain bridge
-
-Future-gated responsibilities:
-
-- feature discovery;
-- bind secure domain;
-- create private/shared/measured regions;
-- measurement/evidence export;
-- secure checkpoint contract.
-
-Current expected production result may legitimately be `Unsupported` until HybridCPU closes the positive contour.
-
-## Failure and rollback model
-
-The bridge must preserve atomicity between local OS authority and external platform state.
-
-### Example: map region for device
-
-Wrong order:
+A future hardware-backed zero-copy rebind may support:
 
 ```text
-local capability published
- -> local owner state changed
- -> external mapping attempted
- -> mapping fails
-```
-
-Correct staged order:
-
-```text
-validate local capability + owner generation
- -> ask platform to stage binding
- -> validate returned binding identity/generation
- -> commit local mapping record
- -> publish operation capability/result
-```
-
-If local commit fails, platform stage must cancel/revoke.
-
-### Example: ownership transfer with active compute
-
-```text
-close new hardware submissions for old owner
- -> drain/cancel outstanding operations
- -> revoke external mapping/grants
- -> external rebind to target if required
- -> increment local RegionGeneration
+close new external use
+ -> drain/cancel outstanding device/compute work
+ -> revoke old mapping/grant
+ -> stage mapping for target domain
+ -> advance local region generation/owner
  -> publish receiver ownership
 ```
 
-No partially transferred region is visible.
+This is **target semantics**, not current implementation. Until an external provider proves atomic/recoverable rebind, conservative revoke-before-transfer remains correct.
 
 ## Feature discovery
 
-Platform capability discovery must be versioned and truth-preserving.
-
-Suggested semantic capability set:
+Current feature bits are intentionally small. Future discovery may add semantic features such as:
 
 ```text
-ExecutionDomains
-MemoryDomains
-IoDomains
-DirectOwnedRegionMapping
+IoDomainBinding
 DmaMapping
 BulkComputeDsc1
 MatrixTileV1
@@ -286,98 +307,53 @@ VirtualizationDomains
 NestedDomains
 PlatformEvidence
 SecureDomains
-SecureMigration
-GlobalMemoryConflictCoherence
+SurfacePresentation
 ```
 
-Discovery result only says that a provider claims the interface. A feature can still be denied for a particular domain/request.
-
-This is analogous to HybridCPU's own rule that support metadata is not runtime authority.
-
-## Local policy versus platform policy
-
-The bridge must never silently widen policy.
-
-Example:
-
-```text
-Platform says MatrixTile supported
-SingNextOS process has no Matrix compute capability
-=> denied locally; no call forwarded
-```
-
-and:
-
-```text
-SingNextOS process has DmaCapability
-Platform I/O domain refuses range/direction
-=> denied externally; local capability remains but no effect occurs
-```
+A feature bit only advertises provider support for a contract family. It is never a grant for a particular domain/request.
 
 ## Existing external requirements
 
-Current `EXT-HCPU-001` and `EXT-HCPU-002` already correctly state two boundaries:
+The current external requirement split remains authoritative:
 
-- external AOT/image/ISE qualification;
-- external console/timer/MMIO/IRQ/DMA binding.
+- `EXT-HCPU-001` — AOT/image/ISE qualification;
+- `EXT-HCPU-002` — console/timer/MMIO/IRQ/DMA HAL bindings;
+- `EXT-HCPU-003` — neutral domain binding;
+- `EXT-HCPU-004` — owned-region mapping/revocation/direct access;
+- `EXT-HCPU-005` — scoped compute providers;
+- `EXT-HCPU-006` — virtualization/nested/evidence/SecureCompute discovery.
 
-The audit identifies additional external contracts that should be tracked separately rather than hidden inside one generic HAL requirement.
+The presence of local v1 implementations does not close external requirements 003–006. It closes only the SingNextOS-owned **abstraction and host conformance** portion.
 
-## New requirement split recommended by this audit
+## Non-goals
 
-### EXT-HCPU-003 — neutral domain binding
-
-Existing external interface must provide a way to bind SingNextOS principals to neutral execution/memory/I/O domain authority without VMX/VMCS becoming the state owner.
-
-### EXT-HCPU-004 — owned-region mapping and revocation
-
-Existing external interface must allow exact range mapping/unmapping/rebinding for owned regions with domain/generation/lifetime semantics sufficient for DMA and zero-copy ownership transfer.
-
-### EXT-HCPU-005 — scoped compute providers
-
-Existing external interface must expose, where already available, semantic bindings for MatrixTile, DSC1 bulk compute and scoped L7 accelerator commands without requiring SingNextOS to emit raw physical lanes/opcodes as its authority API.
-
-### EXT-HCPU-006 — virtualization/evidence/secure feature discovery
-
-Existing external interface must expose neutral virtualization/nested/evidence capability discovery and must report SecureCompute positive availability truthfully. Unsupported/future-gated contours must be distinguishable from production-positive ones.
-
-These requirements request **bindings to existing platform behavior**, not modifications to HybridCPU-v2.
-
-## What SingNextOS must not require externally
-
-This audit does not request:
+This bridge does not request or imply:
 
 - new ISA instructions;
-- HybridCPU scheduler changes;
-- VMX backend redesign;
-- compiler/backend modifications;
-- loader changes;
+- HybridCPU compiler/backend changes;
+- a VMCS manager;
 - SecureCompute activation;
 - global coherence implementation;
-- DSC2 implementation;
-- new accelerator protocol;
-- CHERI/tagged memory;
-- Bartok/Sing# language changes.
+- DSC2;
+- raw physical addresses in public APIs;
+- a universal GPU ABI;
+- a special GUI authority system.
 
-If an external capability does not exist, SingNextOS remains correct by keeping that service unavailable.
+## Conformance direction
 
-## Bridge conformance tests
+A real provider integration must preserve current negative properties and add hardware-backed evidence for:
 
-When a real binding appears, integration qualification should include at least:
-
-- stale domain lease rejection;
-- local capability denial before platform call;
-- external denial does not mutate local ownership/state;
-- region generation mismatch denied;
-- active borrow blocks incompatible mapping/transfer;
-- revocation closes new DMA/compute work;
-- termination drains/cancels then reclaims;
-- unsupported compute/secure feature reports unavailable;
-- evidence cannot be used as authority;
-- compatibility VMX projection cannot mutate neutral owner state;
-- malformed external result fails closed;
-- deterministic feature/ABI manifest digest.
+- stale domain/mapping denial;
+- exact owner/range/access checks;
+- local capability denial before external effect;
+- external denial without local state publication;
+- drain/revoke before transfer/reclaim;
+- unsupported feature truthfulness;
+- completion/publication semantics;
+- no authority leakage through provider tokens/evidence.
 
 ## Decision
 
-The Platform Authority Bridge is the architectural seam that lets SingNextOS use the full HybridCPU runtime without coupling its public/kernel object model to HybridCPU internals. It should be narrow, typed, opaque, generation-bound and testable; everything else stays behind it.
+The current repository now proves the **local shape** of the Platform Authority Bridge: narrow semantic contracts, opaque provider leases, generation checks, local capability validation and owned-region mapping interlocks.
+
+The next claim boundary is external. Until a real HybridCPU-backed provider is present and tested, documentation must say **local/host-backed**, not “HybridCPU DMA/remap/coherent zero-copy implemented”.
