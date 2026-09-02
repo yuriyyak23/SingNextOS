@@ -16,6 +16,7 @@ public sealed partial class RuntimeKernel
         var bytes = checked((long)length * Unsafe.SizeOf<T>());
         var descriptor = Regions.Allocate(new RegionOwner(resolved.Value.DomainId, owner.Generation), bytes, typeof(T).FullName ?? typeof(T).Name);
         var buffer = new OwnedBuffer<T>(descriptor.Handle, new T[length]);
+        Regions.RegisterPayload(descriptor.Handle, buffer);
         resolved.Value.AddRegion(descriptor.Handle);
         return KernelResult<OwnedBuffer<T>>.Ok(buffer);
     }
@@ -28,6 +29,7 @@ public sealed partial class RuntimeKernel
             return KernelResult<OwnedRegion<T>>.Fail(KernelError.InvalidRegionState, "Region limit exceeded.");
         var descriptor = Regions.Allocate(new RegionOwner(resolved.Value.DomainId, owner.Generation), Unsafe.SizeOf<T>(), typeof(T).FullName ?? typeof(T).Name);
         var region = new OwnedRegion<T>(descriptor.Handle, initialValue);
+        Regions.RegisterPayload(descriptor.Handle, region);
         resolved.Value.AddRegion(descriptor.Handle);
         return KernelResult<OwnedRegion<T>>.Ok(region);
     }
@@ -44,6 +46,7 @@ public sealed partial class RuntimeKernel
         var transfer = Regions.Transfer(oldHandle, new RegionOwner(sourceProcess.Value!.DomainId, source.Generation), new RegionOwner(targetProcess.Value!.DomainId, target.Generation));
         if (!transfer.IsSuccess) return KernelResult<OwnedBuffer<T>>.Fail(transfer.Error, transfer.Message!);
         var moved = (OwnedBuffer<T>)transferable.TransferForRuntime(transfer.Value);
+        Regions.ReplacePayload(oldHandle, transfer.Value, moved);
         sourceProcess.Value.RemoveRegion(oldHandle);
         targetProcess.Value.AddRegion(transfer.Value);
         return KernelResult<OwnedBuffer<T>>.Ok(moved);
@@ -75,6 +78,7 @@ public sealed partial class RuntimeKernel
         var transfer = Regions.Transfer(oldHandle, new RegionOwner(sourceProcess.Value!.DomainId, source.Generation), new RegionOwner(targetProcess.Value!.DomainId, target.Generation));
         if (!transfer.IsSuccess) return KernelResult<OwnedRegion<T>>.Fail(transfer.Error, transfer.Message!);
         var moved = (OwnedRegion<T>)transferable.TransferForRuntime(transfer.Value);
+        Regions.ReplacePayload(oldHandle, transfer.Value, moved);
         sourceProcess.Value.RemoveRegion(oldHandle);
         targetProcess.Value.AddRegion(transfer.Value);
         return KernelResult<OwnedRegion<T>>.Ok(moved);

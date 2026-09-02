@@ -96,6 +96,7 @@ public sealed class ChannelRegistry
             var transfer = _regions.Transfer(oldHandle, owner, new RegionOwner(receiver.DomainId, receiver.Generation));
             if (!transfer.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(transfer.Error, transfer.Message!);
             queuedPayload = owned.TransferForRuntime(transfer.Value);
+            _regions.ReplacePayload(oldHandle, transfer.Value, (ITransferableOwnedPayload)queuedPayload);
             sender.RemoveRegion(oldHandle);
             receiver.AddRegion(transfer.Value);
         }

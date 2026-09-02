@@ -1,4 +1,5 @@
 using SingPlus.Contracts;
+using SingPlus.Sip;
 
 namespace SingPlus.Runtime;
 
@@ -13,6 +14,7 @@ public sealed class RegionAuthority
         public required string ElementType { get; init; }
         public required RegionState State { get; set; }
         public RegionOwner? Borrower { get; set; }
+        public ITransferableOwnedPayload? Payload { get; set; }
     }
 
     private readonly Dictionary<RegionId, RegionRecord> _regions = [];
@@ -81,8 +83,21 @@ public sealed class RegionAuthority
     {
         var validation = Validate(handle, owner);
         if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
-        _regions[handle.RegionId].State = RegionState.Released;
+        var record = _regions[handle.RegionId];
+        record.State = RegionState.Released;
+        record.Payload = null;
         return KernelResult.Ok();
+    }
+
+    internal void RegisterPayload(RegionHandle handle, ITransferableOwnedPayload payload) =>
+        _regions[handle.RegionId].Payload = payload;
+
+    internal void ReplacePayload(RegionHandle oldHandle, RegionHandle newHandle, ITransferableOwnedPayload payload)
+    {
+        var record = _regions[newHandle.RegionId];
+        if (record.Generation != newHandle.Generation || oldHandle.RegionId != newHandle.RegionId)
+            throw new InvalidOperationException("Region payload handle does not match the authoritative record.");
+        record.Payload = payload;
     }
 
     internal IReadOnlyList<RegionHandle> ReclaimAllForDomain(DomainId domainId)
@@ -91,6 +106,8 @@ public sealed class RegionAuthority
         foreach (var record in _regions.Values.Where(r => r.Owner.DomainId == domainId && r.State is RegionState.Owned or RegionState.Loaned))
         {
             reclaimed.Add(new RegionHandle(record.Id, record.Generation));
+            record.Payload?.InvalidateForRuntime();
+            record.Payload = null;
             record.Borrower = null;
             record.State = RegionState.Released;
         }
