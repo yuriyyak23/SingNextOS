@@ -13,7 +13,7 @@ public sealed class HybridCpuOwnedRegionMappingTests
         var kernel = new RuntimeKernel(new HybridCpuPlatformAuthorityProvider(runtime));
         var (_, owner) = HybridCpuPlatformAuthorityProviderTests.CreateProcess(kernel, 41, 410, 1);
         var (_, target) = HybridCpuPlatformAuthorityProviderTests.CreateProcess(kernel, 42, 420, 1);
-        var region = kernel.AllocateRegion(owner, 4096).Value!;
+        var region = kernel.AllocateBuffer<byte>(owner, 4096).Value!;
         var binding = kernel.BindPlatformDomain(owner).Value!;
         var capability = MintRegionCapability(
             kernel,
@@ -110,7 +110,7 @@ public sealed class HybridCpuOwnedRegionMappingTests
         var runtime = new NeutralDomainRuntimeFacade();
         var kernel = new RuntimeKernel(new HybridCpuPlatformAuthorityProvider(runtime));
         var (process, owner) = HybridCpuPlatformAuthorityProviderTests.CreateProcess(kernel, 44, 440, 1);
-        var region = kernel.AllocateRegion(owner, 1024).Value!;
+        var region = kernel.AllocateBuffer<byte>(owner, 1024).Value!;
         var binding = kernel.BindPlatformDomain(owner).Value!;
         var capability = MintRegionCapability(
             kernel,
