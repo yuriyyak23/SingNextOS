@@ -38,8 +38,10 @@ public sealed class ProcessTeardownLifecycleTests
         Assert.False(terminate.IsSuccess);
         Assert.Equal(KernelError.PlatformBindingDraining, terminate.Error);
         Assert.Equal(ProcessState.Exiting, responderProcess.State);
-        Assert.True(pending.IsCompleted);
+        Assert.True(provider.LastRegionRevocationOperation.HasValue);
 
+        // This await completes while the provider operation is deliberately still Draining,
+        // proving channel/waiter cancellation precedes external closure.
         var cancelled = await pending;
         Assert.Equal(ResponsePublicationStatus.Cancelled, cancelled.Status);
 
@@ -93,7 +95,6 @@ public sealed class ProcessTeardownLifecycleTests
         Assert.False(loanWhileDraining.IsSuccess);
         Assert.Equal(KernelError.PlatformBindingActive, loanWhileDraining.Error);
 
-        Assert.True(provider.LastRegionRevocationOperation.HasValue);
         var close = provider.CompleteRegionMappingRevocation(
             provider.LastRegionRevocationOperation.Value);
         Assert.True(close.IsSuccess, close.Message);
@@ -211,7 +212,7 @@ public sealed class ProcessTeardownLifecycleTests
 
     [Fact]
     [Trait("Category", "Runtime")]
-    public void ProcessExitReclaimsOnlyExactProcessResourcesWhileSiblingKeepsDomainAlive()
+    public void ProcessExitClosesExactChannelsButPreservesSharedDomainRegionsUntilFinalMember()
     {
         var kernel = new RuntimeKernel();
         var (leftProcess, left) = TestFixtures.Create(kernel, 531, 560);
@@ -228,9 +229,9 @@ public sealed class ProcessTeardownLifecycleTests
         var leftChannel = kernel.CreateChannel(left, peer, SimpleProtocol(), 1).Value!;
         var siblingChannel = kernel.CreateChannel(sibling, peer, SimpleProtocol(), 1).Value!;
 
-        var terminate = kernel.TerminateProcess(left);
+        var terminateLeft = kernel.TerminateProcess(left);
 
-        Assert.True(terminate.IsSuccess, terminate.Message);
+        Assert.True(terminateLeft.IsSuccess, terminateLeft.Message);
         Assert.Equal(ProcessState.Exited, leftProcess.State);
         Assert.True(kernel.Domains.Contains(new DomainId(560)));
         Assert.Equal(KernelError.StaleHandle, kernel.Processes.Resolve(left).Error);
@@ -242,13 +243,25 @@ public sealed class ProcessTeardownLifecycleTests
         Assert.False(kernel.Channels.GetEndpoint(leftChannel.Left).IsSuccess);
         Assert.True(kernel.Channels.GetEndpoint(siblingChannel.Left).IsSuccess);
 
-        var regions = kernel.Regions.Snapshot();
-        Assert.Equal(
-            RegionState.Released,
-            regions.Single(r => r.Handle.RegionId == leftRegion.Handle.RegionId).State);
+        var whileSiblingLives = kernel.Regions.Snapshot();
         Assert.Equal(
             RegionState.Owned,
-            regions.Single(r => r.Handle.RegionId == siblingRegion.Handle.RegionId).State);
+            whileSiblingLives.Single(r => r.Handle.RegionId == leftRegion.Handle.RegionId).State);
+        Assert.Equal(
+            RegionState.Owned,
+            whileSiblingLives.Single(r => r.Handle.RegionId == siblingRegion.Handle.RegionId).State);
+
+        var terminateSibling = kernel.TerminateProcess(sibling);
+        Assert.True(terminateSibling.IsSuccess, terminateSibling.Message);
+        Assert.False(kernel.Domains.Contains(new DomainId(560)));
+
+        var afterFinalMember = kernel.Regions.Snapshot();
+        Assert.Equal(
+            RegionState.Released,
+            afterFinalMember.Single(r => r.Handle.RegionId == leftRegion.Handle.RegionId).State);
+        Assert.Equal(
+            RegionState.Released,
+            afterFinalMember.Single(r => r.Handle.RegionId == siblingRegion.Handle.RegionId).State);
     }
 
     private static CapabilityId MintRegionCapability(
