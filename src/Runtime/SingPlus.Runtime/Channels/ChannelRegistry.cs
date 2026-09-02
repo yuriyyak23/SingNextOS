@@ -77,15 +77,30 @@ public sealed class ChannelRegistry
         var capabilityValidation = ValidateCapabilities(sender, message, capabilityIds);
         if (!capabilityValidation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(capabilityValidation.Error, capabilityValidation.Message!);
         if (!IsSupportedPayload(payload)) return KernelResult<ChannelEnvelope>.Fail(KernelError.UnsupportedPayload, "Payload must be primitive, enum, bounded payload, or owned region data.");
+        if (message.Borrows.Count != 0 && message.Consumes.Count != 0) return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidMessage, "A single payload cannot be both borrowed and consumed.");
 
+        object? queuedPayload = payload;
         if (message.Borrows.Count != 0)
         {
             if (payload is not ITransferableOwnedPayload borrowed || !borrowed.IsValidForRuntime) return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidRegionState, "Borrowing messages require a valid owned payload.");
-            var borrowValidation = _regions.Validate(borrowed.Handle, new RegionOwner(sender.DomainId, sender.Generation));
+            var owner = new RegionOwner(sender.DomainId, sender.Generation);
+            var borrower = new RegionOwner(receiver.DomainId, receiver.Generation);
+            var borrowValidation = _regions.Validate(borrowed.Handle, owner);
             if (!borrowValidation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(borrowValidation.Error, borrowValidation.Message!);
+            var acquired = _regions.AcquireLoan(borrowed.Handle, owner, borrower);
+            if (!acquired.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(acquired.Error, acquired.Message!);
+            var grant = acquired.Value!;
+            try
+            {
+                queuedPayload = borrowed.CreateBorrowLeaseForRuntime(grant.Handle, grant.Lifetime);
+            }
+            catch (InvalidOperationException exception)
+            {
+                _ = _regions.RevokeLoan(grant.Handle, owner);
+                return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidRegionState, exception.Message);
+            }
         }
 
-        object? queuedPayload = payload;
         if (message.Consumes.Count != 0)
         {
             if (payload is not ITransferableOwnedPayload owned || !owned.IsValidForRuntime) return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidRegionState, "Consuming messages require a valid owned payload.");
