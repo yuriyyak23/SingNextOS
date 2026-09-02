@@ -2,7 +2,11 @@
 
 ## Status
 
-**Core integration phase.** Depends on Phases 1–3 and corresponds mainly to `EXT-HCPU-004`.
+**In progress.** Phases 1–3 are complete in SingNextOS. This iteration implements the first real Phase-4 vertical slice: one exact Sing-owned region slice can be mapped into the neutral HybridCPU runtime, prepared with explicit non-coherent visibility semantics, and revoked through the existing completion-gated Phase-2 reclaim path.
+
+Full Phase 4 is **not** complete yet. Two-domain MOVE/borrow handoff, external-producer acquire semantics, and copy fallback remain later Phase-4 work.
+
+The cross-repository integration gate pins the exact HybridCPU neutral mapping dependency commit `79131c89d686a03636f17cd27fdecf818b12c8c0`.
 
 ## Goal
 
@@ -18,111 +22,174 @@ device access         -> explicit bounded mapping/grant
 completion            -> revoke/unmap/acquire/return authority
 ```
 
-`MOVE` promises exclusive authority transfer. It must **not** promise atomic page-table remap or physical no-copy.
+`MOVE` promises exclusive authority transfer. It does **not** promise atomic page-table remap or physical no-copy.
 
-## Current state
+## Current implemented slice
 
-SingNextOS already has:
+### 1. Exact region-slice identity
 
-- generation-bound `RegionHandle`;
-- `OwnedRegion<T>` / `OwnedBuffer<T>`;
-- MOVE transfer that invalidates old ownership views;
-- borrow/loan generation and lifetime checks;
-- `PlatformMappingReserved`, which blocks transfer/loan/release while a platform mapping is active;
-- exact capability/resource checks before host-backed `MapOwnedRegion`.
-
-HybridCPU-v2 has code-confirmed bounded memory/address-space authority, translation/invalidation machinery, domain generations/epochs and explicit non-coherent fence requirements in DMA authority paths. The audit found **no proof of a generic atomic ownership remap primitive** and no basis for assuming universal CPU/device coherence.
-
-## Refactoring tasks
-
-### 1. Map exact region slices, not only whole logical regions
-
-Introduce a semantic slice type such as:
+SingNextOS now has a versioned semantic v2 mapping contract:
 
 ```text
 PlatformRegionSlice
-  RegionHandle          // includes region generation
-  ExpectedOwner
+  PlatformRegionIdentity
+    RegionHandle         // includes exact region generation
+    RegionOwner          // DomainId + process generation
+    ByteLength
   Offset
   Length
   Access
 ```
 
-Validate overflow, region bounds, owner, generation and local capability rights before any provider call.
+Before any exact-provider call, `RuntimeKernel.MapPlatformOwnedRegionSlice(...)` validates:
 
-A provider lease must echo/commit the exact slice and access. Mismatched results are provider faults and must be closed before returning failure.
+- live process generation;
+- exact platform-domain binding;
+- local memory-region capability and required `Map` / `Read` / `Write` rights;
+- exact capability resource identity;
+- exact `RegionAuthority` owner and region generation;
+- non-negative offset;
+- positive length;
+- overflow-free containment within the region;
+- `Read`, `Write`, or `Read|Write` access only.
 
-### 2. Separate ownership from mapping
+Invalid bounds, owner, generation, capability, or access fail before external mapping materialization.
 
-Keep `RegionAuthority` as the OS owner of:
+The provider returns `PlatformProviderOwnedRegionMapping`, which combines the existing opaque provider mapping lease with the exact requested `PlatformRegionSlice`. The bridge treats mismatched domain lease, generation, region, range, or access as malformed provider evidence and fails closed.
 
-- exclusive owner;
+### 2. Ownership remains exclusively in Sing
+
+`RegionAuthority` remains authoritative for:
+
+- owner identity;
 - region generation;
 - borrow state;
-- payload lifetime.
+- payload lifetime;
+- MOVE/release legality.
 
-The provider owns only external visibility/mapping authority. Do not create a second HybridCPU-backed `OwnedRegion` type that competes with Sing ownership.
+The HybridCPU provider owns only external mapping lifetime. It never creates or replaces a Sing `OwnedRegion<T>` / `OwnedBuffer<T>`.
 
-### 3. Add explicit publish/acquire operations
+The existing conservative `PlatformMappingReserved` interlock remains whole-region scoped in this slice. While any exact external slice mapping exists, Sing blocks:
 
-For CPU → device/accelerator/display handoff, define a provider operation such as:
+- MOVE/ownership transfer;
+- CPU borrow/loan;
+- local region release.
+
+This is intentionally conservative. Multiple independently reservable subranges are not claimed yet.
+
+### 3. Real neutral HybridCPU mapping owner
+
+The narrow `HybridCPU_NeutralRuntime` dependency adds an opaque mapping owner with independent identity spaces:
 
 ```text
-PrepareForConsumer(mapping, consumerClass, visibilityRequirement)
+NeutralDomainBindingHandle / Epoch
+  != NeutralOwnedRegionMappingHandle / Epoch
+  != PlatformProviderDomainLeaseId / generation
+  != PlatformProviderRegionMappingId / generation
+  != RegionHandle / generation
 ```
 
-For external producer → CPU reacquisition:
+The external neutral mapping commits only:
+
+- exact offset;
+- exact length;
+- exact read/write access;
+- exact neutral-domain lease;
+- explicit `NonCoherent` coherence model.
+
+No physical address, PTE/page-table identity, cache-line identity, DMA/IOMMU token, VMX/VMCS state, lane ID, or opcode crosses this provider-facing surface.
+
+### 4. Explicit mapping-bound memory visibility
+
+`PlatformRegionVisibilityRequest` binds visibility evidence to the exact provider mapping ID/generation and exact region slice.
+
+The real neutral mapping in this slice is explicitly **non-coherent**. It supports:
 
 ```text
-AcquireFromConsumer(mapping, completionReceipt)
+ExternalExecutionDomain + PublicationFence
+  -> PublicationFenceSatisfied
 ```
 
-The outcome must say whether coherence was inherent, a fence was satisfied, explicit cache maintenance was performed, or the mode is unsupported.
-
-Do not expose cache-line sizes/topology or a global `FlushAllCaches()` ABI unless a concrete platform contract genuinely requires it.
-
-### 4. Model transfer with existing mappings conservatively
-
-Default hardware-visible MOVE sequence:
+It deliberately does **not** claim:
 
 ```text
-block new external submissions
-  -> old mapping/grants Draining
-  -> wait completion/publication
-  -> revoke old mapping/IOMMU/device authority
-  -> acquire/maintenance if required
+CoherentAccess
+CacheMaintenance
+```
+
+Those requirements return semantic `Unsupported`; the Sing bridge returns `PlatformUnsupported` instead of publishing false ready/coherent evidence.
+
+There is no global `FlushCaches`, no cache-line topology ABI, and no ambient coherence assumption.
+
+### 5. Completion-backed exact revoke and reclaim
+
+The existing Phase-2 lifecycle is reused rather than duplicated:
+
+```text
+local mapping authority live
+  -> BeginRegionMappingRevocation
+  -> HybridCPU exact mapping close
+  -> provider PlatformOperationIdentity
+  -> exact Closed completion receipt
+  -> bridge validates operation/domain/mapping generations
+  -> local RegionAuthority owner/generation revalidated
+  -> PlatformMappingReserved released
+  -> mapping metadata forgotten
+  -> MOVE/loan/release may proceed
+```
+
+The neutral owner can close this mapping synchronously, so the provider emits a `Closed` receipt only after exact external close succeeds. The Sing lifecycle nevertheless treats the receipt as evidence, not authority, and still performs all local generation/ownership revalidation before reclaim.
+
+A stale receipt, wrong operation/domain, malformed mapping result, faulted closure, or non-terminal completion cannot release the local reservation.
+
+Once revocation begins and the bridge is `Draining`, the mapping cannot produce new visibility evidence.
+
+### 6. Compatibility boundary
+
+The legacy whole-region provider lease remains available as a compatibility projection. Exact v2 mappings carry offset/length in a separate semantic wrapper while reusing the already-proven Phase-2 base mapping lifecycle.
+
+This avoids rewriting the legacy host mapping path and does not weaken its existing reclaim guarantees.
+
+## What this slice does not prove
+
+This iteration does **not** claim:
+
+- physical zero-copy transfer;
+- atomic page-table remap;
+- universal CPU/HybridCPU coherence;
+- multi-domain mapping handoff;
+- external-producer → CPU acquire/cache-maintenance semantics;
+- device grants;
+- DMA/IOMMU authority;
+- multiple simultaneous independently reservable slices from one Sing region.
+
+`OwnedRegionMapping v2 = Executable` means this concrete exact mapping operation is real. It does not mean every Phase-4 transfer/coherence mode exists.
+
+## Remaining Phase-4 work
+
+### Two-domain MOVE / borrow orchestration
+
+The next slice should prove at least one cross-domain ownership handoff using the completed primitives:
+
+```text
+old owner blocks new external use
+  -> old exact mappings drain and close
+  -> required producer-side publication/acquire evidence
   -> RegionAuthority.Transfer()
        owner := target
        region generation++
-  -> optional map/grant for target
-  -> publish receiver ownership
+  -> old RegionHandle becomes stale
+  -> optional exact mapping for target generation
+  -> receiver publication
 ```
 
-This sequence is semantically sufficient even if physical pages are copied or remapped non-atomically.
+CPU `BorrowLease<T>` remains distinct from an external mapping/grant. A later external shared-read grant must be bridge-private and explicitly revoked before the borrow ends.
 
-A future provider may advertise a faster rebind optimization, but the SIP/kernel contract must not depend on it.
+### Acquire and copy fallback
 
-### 5. Define borrow vs device grant explicitly
+A future external-producer path must model `AcquireFromConsumer` or equivalent semantic evidence when the CPU regains ownership. If direct mapping/visibility is unsupported, bounded copy or serialized service access remains legal.
 
-A CPU/SIP `BorrowLease<T>` is a local ownership/lifetime construct. A device or accelerator needs a **separate bridge-private external grant** derived from the borrow/region authority.
-
-Never equate:
-
-```text
-BorrowLeaseId == provider mapping/token
-```
-
-For shared read access, materialize bounded read-only external authority and revoke it when the borrow ends. For mutable access, prefer exclusive MOVE or a protocol-specific single-writer lease rather than ambient shared mutable memory.
-
-### 6. Keep copy fallback legal
-
-If the provider cannot satisfy direct mapping/coherence for a request, valid outcomes include:
-
-- bounded copy through a kernel/service-owned region;
-- serialized access through a service;
-- explicit `Unsupported`.
-
-The high-level ownership contract remains unchanged.
+The high-level MOVE contract must remain unchanged regardless of whether bytes were copied or backing was remapped.
 
 ## Zero-copy interpretation
 
@@ -133,42 +200,37 @@ Use these terms precisely:
 - **physical zero-copy transfer**: ownership changes without moving bytes;
 - **direct device access**: device/IOMMU mapping reaches the region backing.
 
-Only claim the stronger form when the provider proves it.
+Only claim the stronger form when a provider proves it.
 
-## HybridCPU-v2 changes expected
+## Tests for this slice
 
-Prefer an exported bounded memory integration facade over existing memory-domain/address-space/invalidation mechanisms. It may need to expose:
-
-- exact map/unmap;
-- access permissions;
-- domain/mapping epochs;
-- terminal revoke completion;
-- memory-visibility/fence/cache-maintenance outcome.
-
-Do not add atomic ownership remap or global coherence solely to satisfy SingNextOS.
-
-## Tests
-
-Required tests include:
+Sing-focused coverage proves:
 
 - out-of-range slice rejected before provider call;
-- wrong owner/generation rejected;
+- wrong owner and stale region generation rejected before provider call;
+- exact offset/length/access/owner are committed by the provider result;
 - mapped region cannot MOVE/loan/release;
-- draining mapping rejects new external use;
-- stale completion cannot release reservation;
-- non-coherent requirement without satisfied fence fails closed;
-- copy fallback preserves MOVE semantics;
-- target receives a new region generation and old owner handle is stale;
-- provider says direct access unsupported → no false zero-copy claim is published.
+- `CoherentAccess` on the non-coherent mapping fails closed;
+- exact `PublicationFence` succeeds;
+- draining mapping rejects new visibility work before provider call;
+- stale completion cannot release the region reservation;
+- forged exact offset/length is rejected;
+- after exact `Closed` + local revalidation, MOVE succeeds with a new region generation;
+- public v2 surfaces contain no hardware-shaped authority identifiers.
+
+Cross-repository coverage additionally proves real HybridCPU mapping materialization, independent identity spaces, explicit non-coherent fence behavior, exact revoke, process-teardown ordering, and zero active external mappings before domain close/local exit.
 
 ## Acceptance criteria
 
-Phase 4 is complete when two real isolated domains can transfer or borrow an owned region while preserving Sing-local ownership and proving all external mappings are revoked/acquired before the old authority can be reused or reclaimed.
+This first Phase-4 slice is complete when the pinned cross-repository gate proves exact map → publication fence → exact close/Closed receipt → Sing reservation release on the real neutral HybridCPU mapping owner.
+
+**Full Phase 4** remains complete only when two real isolated domains can transfer or borrow an owned region while preserving Sing-local ownership and proving all external mappings are revoked/acquired before old authority can be reused or reclaimed.
 
 ## Do not do
 
 - no global shared-memory premise;
 - no atomic-remap semantic requirement;
-- no raw PTE/page-table/IOMMU identifiers in SIPs;
-- no mutable shared region without an explicit single-writer/visibility protocol;
-- no unconditional “zero-copy” API guarantee.
+- no raw physical/PTE/page-table/IOMMU identifiers in SIPs;
+- no mutable shared region without explicit single-writer/visibility protocol;
+- no unconditional “zero-copy” API guarantee;
+- no DMA implementation in this slice.
