@@ -17,6 +17,7 @@ public readonly record struct CapabilityId(ulong Value)
 
 public readonly record struct RegionId(ulong Value);
 public readonly record struct RegionGeneration(ulong Value);
+public readonly record struct BorrowLeaseGeneration(ulong Value);
 public readonly record struct ChannelId(ulong Value);
 public readonly record struct EndpointId(ulong Value);
 
@@ -84,4 +85,5 @@ public readonly record struct ResourceLimitsV1(
 
 public readonly record struct ProcessHandle(ProcessId ProcessId, ulong Generation);
 public readonly record struct RegionHandle(RegionId RegionId, RegionGeneration Generation);
+public readonly record struct BorrowLeaseHandle(RegionHandle Region, BorrowLeaseGeneration Generation);
 public readonly record struct ChannelEndpointHandle(ChannelId ChannelId, EndpointId EndpointId, ulong Generation);
