@@ -6,17 +6,25 @@
 
 ## Current baseline delta
 
-На baseline `af791aba4e25615cef09b3933f34efca62296304` уже реализована часть предыдущего roadmap:
+Текущий roadmap baseline перед Phase 0 implementation — `faafa6848d832e2ddd3ac1cdb82ec518f8dd5cb3`. Он включает Track A merge `7977043e98db50673d4d7053c6ddcb9f1beea91b` и local Platform Authority Bridge work из PR #12/#13.
 
+На этом baseline уже реализованы:
+
+- typed SIP response transport/publication and generated client runtime adapters;
+- exact correlated async response waiting;
+- deterministic cancellation of pending response waiters on channel teardown;
+- process-level channel teardown even when another process keeps the same domain alive;
+- committed response preservation when peer teardown happens after publication;
 - local `SingPlus.Platform` abstraction contract;
 - host `IPlatformAuthorityProvider`;
 - neutral local domain binding;
 - direct owned-region mapping abstraction;
 - local/provider generation separation;
 - capability-before-provider validation;
-- region mapping reservation that blocks incompatible ownership lifecycle.
+- region mapping reservation that blocks incompatible ownership lifecycle;
+- capability revocation cascade into platform mapping drain/revoke.
 
-Это закрывает **local/host-backed foundation**, но не закрывает `EXT-HCPU-003`/`004`: реального HybridCPU provider, IOMMU/DMA/rebind/coherence semantics в репозитории нет.
+Это закрывает **Track A как Current local foundation** и сохраняет Platform Authority Bridge как **CurrentModelBound**. Оно не закрывает `EXT-HCPU-003`/`004`: реального HybridCPU provider, IOMMU/DMA/rebind/coherence semantics в репозитории нет.
 
 ## Architecture target
 
@@ -46,22 +54,25 @@ No layer substitutes for another.
 
 ### Status
 
-**Foundation present; completion remains priority.** Request-side shape/capability/ownership validation is already fail-closed and generated response metadata exists. Response transport/publication must reach the same precision before hardware-backed services become broad.
+**Current / completed local foundation.** PR #14 closes typed response publication and PR #15 closes generated client/runtime adapter plus teardown semantics. Later platform completion work must compose with this response model rather than introduce a second publication authority.
 
-### Required outcomes
+### Current outcomes
 
 - typed response payload transport;
-- response shape/cardinality validation;
+- response shape/cardinality validation before publication;
 - ownership-return response transfer with generation/lifetime rules;
 - explicit response publication/cancellation semantics;
 - malformed service response fails before client-visible publication;
-- deterministic protocol digests/manifests remain stable.
+- deterministic protocol digests/manifests remain stable;
+- exact correlated async response waiting without polling;
+- deterministic channel/process teardown cancellation;
+- already-published responses remain committed across later peer teardown.
 
 ## Track B — Platform Authority Bridge local v1
 
 ### Status
 
-**Partially implemented/current.**
+**CurrentModelBound.** The local/host-backed bridge is current, but its current feature-bit and synchronous revoke surface needs Platform Contract vNext lifecycle/completion before real HybridCPU integration.
 
 Current v1 exposes:
 
@@ -76,14 +87,15 @@ and a deterministic host provider.
 
 Add new bridge families only when concrete external/use-case requirements exist. Avoid pre-creating broad abstractions for every ISE feature.
 
-Potential future local contracts:
+Immediate next work is the phased roadmap sequence:
 
-- explicit execution/memory/I/O-domain distinctions where a real provider requires them;
-- DMA submission/drain/completion;
-- compute provider discovery;
-- classified evidence;
-- surface/display presentation provider;
-- virtualization/secure-domain providers when externally positive.
+```text
+Platform Contract vNext
+ -> explicit revocation/completion lifecycle
+ -> real neutral HybridCPU domain binding
+ -> exact non-coherent-safe region mapping
+ -> bounded DMA vertical slice
+```
 
 Constraints remain:
 
@@ -97,7 +109,7 @@ Constraints remain:
 
 ### Status
 
-**External Blocked.** Local domain binding is current; HybridCPU-backed provider is not.
+**ExternalBlocked.** Local domain binding is current; HybridCPU-backed provider is not.
 
 ### Required outcomes
 
@@ -113,7 +125,7 @@ Tracked by `EXT-HCPU-003`.
 
 ### Status
 
-**Local abstraction current; external direct mapping blocked.**
+**CurrentModelBound locally; ExternalBlocked for real direct mapping.**
 
 Current local mapping requires exact `MemoryRegion` capability and current region ownership, then reserves the region against transfer/loan/release.
 
@@ -131,7 +143,7 @@ Tracked by `EXT-HCPU-004`.
 
 ## Track E — first narrow ISE compute provider
 
-Choose one provider based on an actual stable external interface, not breadth.
+**BridgeRequired after Phases 1–5.** Choose one provider based on an actual stable external interface, not breadth.
 
 Candidates remain:
 
@@ -157,7 +169,7 @@ Tracked by `EXT-HCPU-005`.
 
 ## Track F — scheduler/event integration
 
-After real execution-domain binding exists, consume platform event/scheduler facilities behind high-level abstractions:
+**BridgeRequired after real execution-domain binding.** Consume platform event/scheduler facilities behind high-level abstractions:
 
 - yield;
 - event wait/signal;
@@ -169,7 +181,7 @@ Public API remains `Task`/`ValueTask`/cancellation/event/channel-oriented. Do no
 
 ## Track G — evidence and replay diagnostics
 
-Expose external evidence only after a classified provider contract exists.
+**BridgeRequired.** Expose external evidence only after a classified provider contract exists.
 
 Potential service outputs:
 
@@ -187,7 +199,7 @@ Security rules:
 
 ## Track H — neutral virtualization
 
-Only after execution/memory/I/O domain bindings exist:
+**BridgeRequired; VMX remains ProjectionOnly.** Only after execution/memory/I/O domain bindings exist:
 
 ```text
 child execution domain
@@ -202,7 +214,9 @@ Do not start from VMXON/VMCS APIs.
 
 ## Track I — SecureCompute gate
 
-Open production implementation only when an external provider proves:
+### Status
+
+**FutureGated.** Open production implementation only when an external provider proves:
 
 - secure-domain lifecycle owner;
 - operation-bound admission/grants;
@@ -217,7 +231,7 @@ Until then confidential-domain API may exist only as a target shape that reports
 
 ## Track J — native system services
 
-Filesystem, networking, process management, GUI/compositor, richer device services and compatibility stacks build on the same substrate.
+**BridgeRequired downstream.** Filesystem, networking, process management, GUI/compositor, richer device services and compatibility stacks build on the same substrate.
 
 The normative native API/UI model is defined in [`12_NATIVE_API_AND_UI_CONTRACTS.md`](12_NATIVE_API_AND_UI_CONTRACTS.md).
 
@@ -285,7 +299,7 @@ This is a software contract target. Concrete GPU DMA/remap/coherence remains ext
 
 ## Track K — compatibility personalities
 
-Win32/POSIX/Wine support is optional downstream compatibility work.
+**ProjectionOnly / optional downstream compatibility.** Win32/POSIX/Wine support is optional downstream compatibility work.
 
 ```text
 legacy API
@@ -343,19 +357,21 @@ local contract shape proven
 + deterministic integration artifact
 ```
 
-If any piece is missing, classify honestly as local/host-backed, external-blocked, code-confirmed, projection-only or future-gated.
+If any piece is missing, classify honestly as `CurrentModelBound`, `BridgeRequired`, `ExternalBlocked`, `ProjectionOnly` or `FutureGated` as appropriate.
 
 ## Priority decision
 
-Near-term implementation should preserve the current dependency order:
+Near-term implementation now starts after completed Track A and follows the roadmap dependency order:
 
 ```text
-1. response transport/publication closure
-2. qualify real domain/region platform provider
-3. prove revoke/drain/rebind semantics
-4. add one narrow hardware-backed service
-5. build richer filesystem/network/UI services on that substrate
-6. add compatibility personalities only downstream
+1. Platform Contract vNext feature/completion model
+2. explicit revoke/drain/closed lifecycle and reclaim proof
+3. real neutral HybridCPU domain binding
+4. exact non-coherent-safe owned-region mapping
+5. one bounded DMA vertical slice
+6. scheduler/events and one narrow compute provider
+7. richer filesystem/network/UI services on that substrate
+8. compatibility personalities only downstream
 ```
 
 The UI/API architecture is specified now so later services converge on one ABI, but specification does not imply current implementation.

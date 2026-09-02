@@ -34,7 +34,7 @@ public sealed class HostPlatformAuthorityProvider : IPlatformAuthorityProvider
             throw new ArgumentOutOfRangeException(nameof(regionRevocationFailure));
 
         _regionRevocationFailure = regionRevocationFailure;
-        Descriptor = new PlatformProviderDescriptor("host-test", 2, features);
+        Descriptor = new PlatformProviderDescriptor(new PlatformProviderId("host-test"), 2, features);
     }
 
     public PlatformProviderDescriptor Descriptor { get; }

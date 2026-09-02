@@ -42,6 +42,7 @@ public readonly record struct PlatformRegionIdentity(
     RegionOwner Owner,
     long ByteLength);
 
+public readonly record struct PlatformProviderId(string Value);
 public readonly record struct PlatformProviderDomainLeaseId(ulong Value);
 public readonly record struct PlatformProviderRegionMappingId(ulong Value);
 public readonly record struct PlatformProviderLeaseGeneration(ulong Value);
@@ -59,7 +60,7 @@ public readonly record struct PlatformProviderRegionMappingLease(
     PlatformMemoryAccess Access);
 
 public sealed record PlatformProviderDescriptor(
-    string ProviderId,
+    PlatformProviderId ProviderId,
     uint ContractVersion,
     PlatformAuthorityFeatures Features);
 
