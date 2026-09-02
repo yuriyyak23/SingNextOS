@@ -547,10 +547,35 @@ public sealed class PlatformAuthorityBridge
                 KernelError.StaleGeneration,
                 "The platform region mapping generation is stale.");
 
-        if (record.Mapping != mapping)
+        if (record.Mapping.DomainBinding.BindingId != mapping.DomainBinding.BindingId)
             return KernelResult.Fail(
                 KernelError.WrongPlatformDomain,
-                "The platform region mapping identity does not match the active mapping.");
+                "The platform region mapping refers to a different local platform binding.");
+
+        if (record.Mapping.DomainBinding.Generation != mapping.DomainBinding.Generation)
+            return KernelResult.Fail(
+                KernelError.StaleGeneration,
+                "The platform region mapping domain-binding generation is stale.");
+
+        if (record.Mapping.DomainBinding.Subject != mapping.DomainBinding.Subject)
+            return KernelResult.Fail(
+                KernelError.WrongPlatformDomain,
+                "The platform region mapping domain subject does not match the active mapping.");
+
+        if (record.Mapping.Region.RegionId != mapping.Region.RegionId)
+            return KernelResult.Fail(
+                KernelError.WrongPlatformDomain,
+                "The platform region mapping refers to a different local region.");
+
+        if (record.Mapping.Region.Generation != mapping.Region.Generation)
+            return KernelResult.Fail(
+                KernelError.StaleGeneration,
+                "The platform region mapping region generation is stale.");
+
+        if (record.Mapping.Access != mapping.Access)
+            return KernelResult.Fail(
+                KernelError.PlatformDenied,
+                "The platform region mapping access does not match the active mapping.");
 
         return ValidateDomain(record.Mapping.DomainBinding, expectedSubject);
     }
