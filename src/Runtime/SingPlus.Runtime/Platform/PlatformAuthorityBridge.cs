@@ -20,15 +20,26 @@ public readonly record struct PlatformRegionMapping(
     RegionHandle Region,
     PlatformMemoryAccess Access);
 
+public enum PlatformExternalClosureState
+{
+    Active = 0,
+    Draining,
+    Closed,
+    Faulted
+}
+
+public readonly record struct PlatformRegionMappingLifecycle(
+    PlatformRegionMapping Mapping,
+    bool LocalAuthorizationRevoked,
+    PlatformExternalClosureState PlatformClosure,
+    bool LocalReservationReleased)
+{
+    public bool LocalReclaimAllowed =>
+        PlatformClosure == PlatformExternalClosureState.Closed && LocalReservationReleased;
+}
+
 public sealed class PlatformAuthorityBridge
 {
-    private enum MappingState
-    {
-        Active = 0,
-        Draining,
-        Revoked
-    }
-
     private sealed class DomainRecord(
         PlatformDomainBinding binding,
         PlatformProviderDomainLease providerLease)
@@ -46,7 +57,17 @@ public sealed class PlatformAuthorityBridge
         public PlatformRegionMapping Mapping { get; } = mapping;
         public PlatformProviderRegionMappingLease ProviderLease { get; } = providerLease;
         public CapabilityId AuthorityCapabilityId { get; } = authorityCapabilityId;
-        public MappingState State { get; set; } = MappingState.Active;
+        public bool LocalAuthorizationRevoked { get; set; }
+        public PlatformExternalClosureState ClosureState { get; set; } =
+            PlatformExternalClosureState.Active;
+        public PlatformOperationIdentity? ClosureOperation { get; set; }
+        public bool LocalReservationReleased { get; set; }
+
+        public PlatformRegionMappingLifecycle Lifecycle => new(
+            Mapping,
+            LocalAuthorizationRevoked,
+            ClosureState,
+            LocalReservationReleased);
     }
 
     private readonly IPlatformAuthorityProvider? _provider;
@@ -123,12 +144,12 @@ public sealed class PlatformAuthorityBridge
         if (!validation.IsSuccess) return validation;
 
         if (_mappings.Values.Any(m =>
-                m.State != MappingState.Revoked &&
+                !m.LocalReservationReleased &&
                 m.Mapping.DomainBinding.BindingId == binding.BindingId))
         {
             return KernelResult.Fail(
                 KernelError.PlatformBindingActive,
-                "Active or draining platform region mappings must be closed before the domain binding.");
+                "Platform region mappings must reach verified closure and release their local reservation before the domain binding.");
         }
 
         var record = _domains[binding.BindingId];
@@ -236,36 +257,222 @@ public sealed class PlatformAuthorityBridge
         return KernelResult<PlatformRegionMapping>.Ok(mapping);
     }
 
-    internal KernelResult RevokeRegionMapping(
+    internal KernelResult<PlatformRegionMappingLifecycle> BeginRegionMappingRevocation(
         PlatformRegionMapping mapping,
         PlatformDomainIdentity expectedSubject,
         PlatformRegionRevocationPolicy policy)
     {
         var validation = ValidateMappingIdentity(mapping, expectedSubject);
+        if (!validation.IsSuccess)
+            return KernelResult<PlatformRegionMappingLifecycle>.Fail(
+                validation.Error,
+                validation.Message!);
+
+        var record = _mappings[mapping.MappingId];
+        if (record.LocalReservationReleased ||
+            record.ClosureState == PlatformExternalClosureState.Closed)
+        {
+            return KernelResult<PlatformRegionMappingLifecycle>.Fail(
+                KernelError.PlatformBindingRevoked,
+                "The platform region mapping has already reached verified closure.");
+        }
+
+        if (record.ClosureState == PlatformExternalClosureState.Faulted)
+        {
+            return KernelResult<PlatformRegionMappingLifecycle>.Fail(
+                KernelError.PlatformFaulted,
+                "The platform region mapping closure is faulted and remains non-reclaimable.");
+        }
+
+        if (record.ClosureState == PlatformExternalClosureState.Draining &&
+            record.ClosureOperation is not null)
+        {
+            return ObserveRegionMappingRevocation(mapping, expectedSubject);
+        }
+
+        record.ClosureState = PlatformExternalClosureState.Draining;
+
+        if (_provider is not IPlatformRegionRevocationProvider revocationProvider)
+        {
+            var legacyResult = _provider!.RevokeRegionMapping(record.ProviderLease, policy);
+            if (!legacyResult.IsSuccess)
+            {
+                if (legacyResult.Status == PlatformAuthorityStatus.Faulted)
+                    record.ClosureState = PlatformExternalClosureState.Faulted;
+
+                return FromProviderFailure<PlatformRegionMappingLifecycle>(
+                    legacyResult.Status,
+                    legacyResult.Message);
+            }
+
+            return KernelResult<PlatformRegionMappingLifecycle>.Fail(
+                KernelError.PlatformUnsupported,
+                "The provider does not expose a completion-backed region-revocation contract; local reclaim remains pinned despite synchronous provider revocation.");
+        }
+
+        var beginResult = revocationProvider.BeginRegionMappingRevocation(
+            record.ProviderLease,
+            policy);
+        if (!beginResult.IsSuccess)
+        {
+            if (beginResult.Status == PlatformAuthorityStatus.Faulted)
+                record.ClosureState = PlatformExternalClosureState.Faulted;
+
+            return FromProviderFailure<PlatformRegionMappingLifecycle>(
+                beginResult.Status,
+                beginResult.Message);
+        }
+
+        var ticket = beginResult.Value!;
+        var ticketValidation = PlatformRegionRevocationContract.ValidateTicket(
+            record.ProviderLease,
+            ticket);
+        if (!ticketValidation.IsSuccess)
+        {
+            record.ClosureState = PlatformExternalClosureState.Faulted;
+            return KernelResult<PlatformRegionMappingLifecycle>.Fail(
+                KernelError.PlatformFaulted,
+                ticketValidation.Message ?? "The provider returned a malformed region-revocation ticket.");
+        }
+
+        record.ClosureOperation = ticket.Operation;
+        return ObserveRegionMappingRevocation(mapping, expectedSubject);
+    }
+
+    internal KernelResult<PlatformRegionMappingLifecycle> ObserveRegionMappingRevocation(
+        PlatformRegionMapping mapping,
+        PlatformDomainIdentity expectedSubject)
+    {
+        var validation = ValidateMappingIdentity(mapping, expectedSubject);
+        if (!validation.IsSuccess)
+            return KernelResult<PlatformRegionMappingLifecycle>.Fail(
+                validation.Error,
+                validation.Message!);
+
+        var record = _mappings[mapping.MappingId];
+        if (record.ClosureState == PlatformExternalClosureState.Active)
+        {
+            return KernelResult<PlatformRegionMappingLifecycle>.Fail(
+                KernelError.PlatformDenied,
+                "Platform region mapping revocation has not started.");
+        }
+
+        if (record.ClosureState == PlatformExternalClosureState.Faulted)
+        {
+            return KernelResult<PlatformRegionMappingLifecycle>.Fail(
+                KernelError.PlatformFaulted,
+                "The platform region mapping closure is faulted and remains non-reclaimable.");
+        }
+
+        if (record.ClosureState == PlatformExternalClosureState.Closed)
+            return KernelResult<PlatformRegionMappingLifecycle>.Ok(record.Lifecycle);
+
+        if (record.ClosureOperation is not { } operation)
+        {
+            return KernelResult<PlatformRegionMappingLifecycle>.Fail(
+                KernelError.PlatformBindingDraining,
+                "The platform region mapping is draining without a completion-capable operation; local reclaim remains pinned.");
+        }
+
+        if (_provider is not IPlatformCompletionProvider completionProvider)
+        {
+            record.ClosureState = PlatformExternalClosureState.Faulted;
+            return KernelResult<PlatformRegionMappingLifecycle>.Fail(
+                KernelError.PlatformFaulted,
+                "The provider returned a revocation operation but cannot observe its completion.");
+        }
+
+        var observed = completionProvider.ObserveCompletion(operation);
+        if (!observed.IsSuccess)
+        {
+            if (observed.Status == PlatformAuthorityStatus.Faulted)
+                record.ClosureState = PlatformExternalClosureState.Faulted;
+
+            return FromProviderFailure<PlatformRegionMappingLifecycle>(
+                observed.Status,
+                observed.Message);
+        }
+
+        var receipt = observed.Value!;
+        var receiptValidation = PlatformCompletionContract.ValidateReceiptIdentity(operation, receipt);
+        if (!receiptValidation.IsSuccess)
+        {
+            if (receiptValidation.Status == PlatformAuthorityStatus.Faulted)
+                record.ClosureState = PlatformExternalClosureState.Faulted;
+
+            return FromProviderFailure<PlatformRegionMappingLifecycle>(
+                receiptValidation.Status,
+                receiptValidation.Message);
+        }
+
+        switch (receipt.State)
+        {
+            case PlatformCompletionState.Closed:
+                record.ClosureState = PlatformExternalClosureState.Closed;
+                return KernelResult<PlatformRegionMappingLifecycle>.Ok(record.Lifecycle);
+            case PlatformCompletionState.Faulted:
+                record.ClosureState = PlatformExternalClosureState.Faulted;
+                return KernelResult<PlatformRegionMappingLifecycle>.Fail(
+                    KernelError.PlatformFaulted,
+                    "The provider reported a faulted region-revocation operation; local reclaim remains pinned.");
+            default:
+                record.ClosureState = PlatformExternalClosureState.Draining;
+                return KernelResult<PlatformRegionMappingLifecycle>.Ok(record.Lifecycle);
+        }
+    }
+
+    internal KernelResult<PlatformRegionMappingLifecycle> QueryRegionMappingLifecycle(
+        PlatformRegionMapping mapping,
+        PlatformDomainIdentity expectedSubject)
+    {
+        var validation = ValidateMappingIdentity(mapping, expectedSubject);
+        if (!validation.IsSuccess)
+            return KernelResult<PlatformRegionMappingLifecycle>.Fail(
+                validation.Error,
+                validation.Message!);
+
+        return KernelResult<PlatformRegionMappingLifecycle>.Ok(
+            _mappings[mapping.MappingId].Lifecycle);
+    }
+
+    internal KernelResult MarkRegionReservationReleased(
+        PlatformRegionMapping mapping,
+        PlatformDomainIdentity expectedSubject)
+    {
+        var validation = ValidateMappingIdentity(mapping, expectedSubject);
         if (!validation.IsSuccess) return validation;
 
         var record = _mappings[mapping.MappingId];
-        if (record.State == MappingState.Revoked)
-            return KernelResult.Fail(
-                KernelError.PlatformBindingRevoked,
-                "The platform region mapping has been revoked.");
-
-        record.State = MappingState.Draining;
-
-        var providerResult = _provider!.RevokeRegionMapping(record.ProviderLease, policy);
-        if (!providerResult.IsSuccess)
+        if (record.ClosureState != PlatformExternalClosureState.Closed)
         {
-            if (providerResult.Status == PlatformAuthorityStatus.Revoked)
-            {
-                record.State = MappingState.Revoked;
-                return KernelResult.Ok();
-            }
-
-            return FromProviderFailure(providerResult.Status, providerResult.Message);
+            return KernelResult.Fail(
+                KernelError.PlatformBindingDraining,
+                "Local region reservation cannot be released before verified platform closure.");
         }
 
-        record.State = MappingState.Revoked;
+        record.LocalReservationReleased = true;
         return KernelResult.Ok();
+    }
+
+    internal KernelResult RevokeRegionMapping(
+        PlatformRegionMapping mapping,
+        PlatformDomainIdentity expectedSubject,
+        PlatformRegionRevocationPolicy policy)
+    {
+        var lifecycle = BeginRegionMappingRevocation(mapping, expectedSubject, policy);
+        if (!lifecycle.IsSuccess)
+            return KernelResult.Fail(lifecycle.Error, lifecycle.Message!);
+
+        return lifecycle.Value!.PlatformClosure switch
+        {
+            PlatformExternalClosureState.Closed => KernelResult.Ok(),
+            PlatformExternalClosureState.Faulted => KernelResult.Fail(
+                KernelError.PlatformFaulted,
+                "The platform region mapping closure faulted."),
+            _ => KernelResult.Fail(
+                KernelError.PlatformBindingDraining,
+                "The platform region mapping is still draining.")
+        };
     }
 
     internal KernelResult ValidateMapping(
@@ -276,15 +483,25 @@ public sealed class PlatformAuthorityBridge
         if (!validation.IsSuccess) return validation;
 
         var record = _mappings[mapping.MappingId];
-        return record.State switch
+        if (record.LocalAuthorizationRevoked)
         {
-            MappingState.Active => KernelResult.Ok(),
-            MappingState.Draining => KernelResult.Fail(
+            return KernelResult.Fail(
+                KernelError.PlatformBindingRevoked,
+                "The local authorization backing this platform mapping has been revoked.");
+        }
+
+        return record.ClosureState switch
+        {
+            PlatformExternalClosureState.Active => KernelResult.Ok(),
+            PlatformExternalClosureState.Draining => KernelResult.Fail(
                 KernelError.PlatformBindingDraining,
                 "The platform region mapping is draining and cannot authorize new effects."),
+            PlatformExternalClosureState.Faulted => KernelResult.Fail(
+                KernelError.PlatformFaulted,
+                "The platform region mapping closure faulted and cannot authorize new effects."),
             _ => KernelResult.Fail(
                 KernelError.PlatformBindingRevoked,
-                "The platform region mapping has been revoked.")
+                "The platform region mapping has reached verified closure.")
         };
     }
 
@@ -293,15 +510,12 @@ public sealed class PlatformAuthorityBridge
         var affected = _mappings.Values
             .Where(m =>
                 m.AuthorityCapabilityId == capabilityId &&
-                m.State != MappingState.Revoked)
+                !m.LocalReservationReleased)
             .OrderBy(static m => m.Mapping.MappingId.Value)
             .ToArray();
 
         foreach (var record in affected)
-        {
-            if (record.State == MappingState.Active)
-                record.State = MappingState.Draining;
-        }
+            record.LocalAuthorizationRevoked = true;
 
         return affected.Select(static m => m.Mapping).ToArray();
     }
@@ -312,12 +526,12 @@ public sealed class PlatformAuthorityBridge
          !domain.Revoked) ||
         _mappings.Values.Any(
             m =>
-                m.State != MappingState.Revoked &&
+                !m.LocalReservationReleased &&
                 m.Mapping.DomainBinding.Subject == subject);
 
     internal bool HasActiveMapping(RegionHandle region) =>
         _mappings.Values.Any(
-            m => m.State != MappingState.Revoked && m.Mapping.Region == region);
+            m => !m.LocalReservationReleased && m.Mapping.Region == region);
 
     private KernelResult ValidateMappingIdentity(
         PlatformRegionMapping mapping,
