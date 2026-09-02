@@ -22,6 +22,8 @@
     <ProjectReference Include="../../sdk/SingPlus.Sip.Sdk/SingPlus.Sip.Sdk.csproj" />
     <ProjectReference Include="../../src/Kernel/SingPlus.Kernel/SingPlus.Kernel.csproj" />
     <ProjectReference Include="../../src/Kernel/Hal/SingPlus.Kernel.Hal.Host/SingPlus.Kernel.Hal.Host.csproj" />
+    <ProjectReference Include="../../src/Platform/SingPlus.Platform.Abstractions/SingPlus.Platform.Abstractions.csproj" />
+    <ProjectReference Include="../../src/Platform/SingPlus.Platform.Host/SingPlus.Platform.Host.csproj" />
     <ProjectReference Include="../../src/Sip/SingPlus.Sip/SingPlus.Sip.csproj" />
     <ProjectReference Include="../../src/Runtime/SingPlus.Runtime/SingPlus.Runtime.csproj" />
     <ProjectReference Include="../../src/Drivers/SingPlus.Drivers/SingPlus.Drivers.csproj" />

@@ -2,6 +2,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\..\contracts\SingPlus.Contracts\SingPlus.Contracts.csproj" />
+    <ProjectReference Include="..\..\Platform\SingPlus.Platform.Abstractions\SingPlus.Platform.Abstractions.csproj" />
     <ProjectReference Include="..\..\Sip\SingPlus.Sip\SingPlus.Sip.csproj" />
   </ItemGroup>
 
