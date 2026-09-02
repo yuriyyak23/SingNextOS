@@ -146,8 +146,10 @@ public sealed class PlatformRevocationLifecycleTests
         var lifecycle = kernel.QueryPlatformRegionMappingLifecycle(owner, mapping);
         if (mutation == ReceiptMutation.MalformedState)
         {
-            Assert.False(lifecycle.IsSuccess);
-            Assert.Equal(KernelError.PlatformFaulted, lifecycle.Error);
+            Assert.True(lifecycle.IsSuccess, lifecycle.Message);
+            Assert.Equal(PlatformExternalClosureState.Faulted, lifecycle.Value!.PlatformClosure);
+            Assert.False(lifecycle.Value.LocalReservationReleased);
+            Assert.False(lifecycle.Value.LocalReclaimAllowed);
         }
         else
         {
