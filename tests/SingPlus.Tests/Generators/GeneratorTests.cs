@@ -15,6 +15,14 @@ using SingPlus.Contracts;
 using SingPlus.Sip;
 using SingPlus.Sip.Sdk;
 namespace GeneratedTest;
+
+[BoundedPayload(64)]
+public readonly struct ConsolePacket : IBoundedPayload
+{
+    public int PayloadSize => 8;
+    public int MaxPayloadSize => 64;
+}
+
 [SipContract, InitialState("Ready"), TerminalState("Closed")]
 public interface IConsoleService
 {
@@ -23,13 +31,16 @@ public interface IConsoleService
 
     [Message(2), ReturnsOwnership]
     OwnedRegion<int> Acquire();
+
+    [Message(3), Transition("Ready", "Ready")]
+    void Configure(ConsolePacket packet);
 }
 """;
 
     [Fact]
     [Trait("Category", "Generators")]
     [Trait("Category", "Determinism")]
-    public void GeneratorProducesFourDeterministicArtifactsWithOwnershipShape()
+    public void GeneratorProducesFourDeterministicArtifactsWithPayloadShapes()
     {
         var first = RunValid(ContractSource);
         var second = RunValid(ContractSource);
@@ -41,6 +52,9 @@ public interface IConsoleService
         Assert.Contains(first.Keys, x => x.EndsWith(".Capabilities.g.cs", StringComparison.Ordinal));
         Assert.Contains(first.Values, text => text.Contains("OwnershipPayloadKind)1", StringComparison.Ordinal));
         Assert.Contains(first.Values, text => text.Contains("ReturnKind=2", StringComparison.Ordinal));
+        Assert.Contains(first.Values, text => text.Contains("BoundedPayloadDescriptorV1(\"packet\", \"GeneratedTest.ConsolePacket\", 64)", StringComparison.Ordinal));
+        Assert.Contains(first.Values, text => text.Contains("Parameter=packet;Type=GeneratedTest.ConsolePacket;MaxBytes=64", StringComparison.Ordinal));
+        Assert.Contains(first.Values, text => text.Contains("bounded=3|packet|GeneratedTest.ConsolePacket|64", StringComparison.Ordinal));
         Assert.Contains(first.Values, text => text.Contains("ContractDigest", StringComparison.Ordinal));
     }
 
@@ -89,6 +103,90 @@ public interface IBadContract
         var diagnostics = RunDiagnostics(source);
 
         Assert.Contains(diagnostics, diagnostic => diagnostic.Id == "SINGGEN003" && diagnostic.Severity == DiagnosticSeverity.Error);
+    }
+
+    [Theory]
+    [InlineData(0, true)]
+    [InlineData(-1, true)]
+    [InlineData(32, false)]
+    [Trait("Category", "Generators")]
+    public void InvalidBoundedPayloadShapeFailsClosed(int maxBytes, bool implementInterface)
+    {
+        var interfaceClause = implementInterface ? " : IBoundedPayload" : string.Empty;
+        var members = implementInterface ? "public int PayloadSize => 1; public int MaxPayloadSize => " + maxBytes + ";" : string.Empty;
+        var source = $$"""
+using SingPlus.Contracts;
+using SingPlus.Sip.Sdk;
+namespace GeneratedTest;
+[BoundedPayload({{maxBytes}})]
+public readonly struct Packet{{interfaceClause}}
+{
+    {{members}}
+}
+[SipContract]
+public interface IBadContract
+{
+    [Message(1)]
+    void Bad(Packet packet);
+}
+""";
+
+        var diagnostics = RunDiagnostics(source);
+
+        Assert.Contains(diagnostics, diagnostic => diagnostic.Id == "SINGGEN005" && diagnostic.Severity == DiagnosticSeverity.Error);
+    }
+
+    [Fact]
+    [Trait("Category", "Generators")]
+    public void BoundedInterfaceWithoutAttributeFailsClosed()
+    {
+        const string source = """
+using SingPlus.Contracts;
+using SingPlus.Sip.Sdk;
+namespace GeneratedTest;
+public readonly struct Packet : IBoundedPayload
+{
+    public int PayloadSize => 1;
+    public int MaxPayloadSize => 32;
+}
+[SipContract]
+public interface IBadContract
+{
+    [Message(1)]
+    void Bad(Packet packet);
+}
+""";
+
+        var diagnostics = RunDiagnostics(source);
+
+        Assert.Contains(diagnostics, diagnostic => diagnostic.Id == "SINGGEN005" && diagnostic.Severity == DiagnosticSeverity.Error);
+    }
+
+    [Fact]
+    [Trait("Category", "Generators")]
+    public void BoundedPayloadMustOccupyTheSingleMessagePayloadSlot()
+    {
+        const string source = """
+using SingPlus.Contracts;
+using SingPlus.Sip.Sdk;
+namespace GeneratedTest;
+[BoundedPayload(32)]
+public readonly struct Packet : IBoundedPayload
+{
+    public int PayloadSize => 1;
+    public int MaxPayloadSize => 32;
+}
+[SipContract]
+public interface IBadContract
+{
+    [Message(1)]
+    void Bad(int code, Packet packet);
+}
+""";
+
+        var diagnostics = RunDiagnostics(source);
+
+        Assert.Contains(diagnostics, diagnostic => diagnostic.Id == "SINGGEN006" && diagnostic.Severity == DiagnosticSeverity.Error);
     }
 
     private static Dictionary<string, string> RunValid(string source)
