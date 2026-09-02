@@ -50,6 +50,7 @@ public sealed class PlatformAuthorityBridge
     }
 
     private readonly IPlatformAuthorityProvider? _provider;
+    private readonly PlatformFeatureManifest _featureManifest;
     private readonly Dictionary<PlatformDomainBindingId, DomainRecord> _domains = [];
     private readonly Dictionary<PlatformRegionMappingId, MappingRecord> _mappings = [];
     private readonly Dictionary<PlatformDomainIdentity, PlatformDomainBindingId> _activeSubjects = [];
@@ -59,9 +60,18 @@ public sealed class PlatformAuthorityBridge
     internal PlatformAuthorityBridge(IPlatformAuthorityProvider? provider)
     {
         _provider = provider;
+        _featureManifest = provider switch
+        {
+            null => PlatformFeatureManifest.Empty,
+            IPlatformFeatureProvider featureProvider =>
+                featureProvider.QueryFeatures() ?? PlatformFeatureManifest.Empty,
+            _ => PlatformFeatureManifest.FromLegacy(provider.Descriptor.Features)
+        };
     }
 
     public PlatformProviderDescriptor? ProviderDescriptor => _provider?.Descriptor;
+
+    public PlatformFeatureManifest FeatureManifest => _featureManifest;
 
     public bool IsAvailable => _provider is not null;
 

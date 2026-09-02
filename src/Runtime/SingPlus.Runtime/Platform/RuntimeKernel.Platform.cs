@@ -5,6 +5,8 @@ namespace SingPlus.Runtime;
 
 public sealed partial class RuntimeKernel
 {
+    public PlatformFeatureManifest QueryPlatformFeatures() => PlatformAuthority.FeatureManifest;
+
     public KernelResult<PlatformDomainBinding> BindPlatformDomain(ProcessHandle subject)
     {
         var resolved = Processes.Resolve(subject);
