@@ -28,6 +28,17 @@ internal sealed class ResponseRegistry
         public PendingState State { get; set; } = PendingState.Queued;
     }
 
+    private sealed class CompletionRecord(
+        ProcessHandle requester,
+        EndpointId requesterEndpoint)
+    {
+        public ProcessHandle Requester { get; } = requester;
+        public EndpointId RequesterEndpoint { get; } = requesterEndpoint;
+        public TaskCompletionSource<ResponseEnvelope> Source { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public bool Waiting { get; set; }
+    }
+
     private sealed class ChannelRecord(
         ResponseProtocolDefinitionV1 protocol,
         ProcessHandle leftOwner,
@@ -39,6 +50,7 @@ internal sealed class ResponseRegistry
         public ProcessHandle RightOwner { get; } = rightOwner;
         public int Capacity { get; } = capacity;
         public Dictionary<ulong, PendingRecord> Pending { get; } = [];
+        public Dictionary<ulong, CompletionRecord> Completions { get; } = [];
         public Queue<ResponseEnvelope> LeftResponses { get; } = new();
         public Queue<ResponseEnvelope> RightResponses { get; } = new();
     }
@@ -46,9 +58,10 @@ internal sealed class ResponseRegistry
     private readonly RegionAuthority _regions;
     private readonly Dictionary<ChannelId, ChannelRecord> _channels = [];
 
-    internal ResponseRegistry(RegionAuthority regions)
+    internal ResponseRegistry(RegionAuthority regions, ChannelRegistry channels)
     {
         _regions = regions;
+        channels.ChannelClosed += CloseChannel;
     }
 
     internal static KernelResult ValidateProtocol(
@@ -131,6 +144,9 @@ internal sealed class ResponseRegistry
         channel.Pending.Add(
             request.Sequence,
             new PendingRecord(request.Sequence, response, requester, requesterEndpoint, responder, responderEndpoint));
+        channel.Completions.Add(
+            request.Sequence,
+            new CompletionRecord(requester, requesterEndpoint));
     }
 
     internal void MarkDelivered(
@@ -214,8 +230,7 @@ internal sealed class ResponseRegistry
             pending.Response.MessageId,
             ResponsePublicationStatus.Published,
             publishedPayload);
-        ResponseQueue(channel, pending.RequesterEndpoint).Enqueue(envelope);
-        channel.Pending.Remove(requestSequence);
+        Complete(channel, pending, envelope);
         return KernelResult<ResponseEnvelope>.Ok(envelope);
     }
 
@@ -238,8 +253,7 @@ internal sealed class ResponseRegistry
             pending.Response.MessageId,
             ResponsePublicationStatus.Cancelled,
             null);
-        ResponseQueue(channel, pending.RequesterEndpoint).Enqueue(envelope);
-        channel.Pending.Remove(requestSequence);
+        Complete(channel, pending, envelope);
         return KernelResult<ResponseEnvelope>.Ok(envelope);
     }
 
@@ -255,13 +269,105 @@ internal sealed class ResponseRegistry
             return KernelResult<ResponseEnvelope>.Fail(KernelError.WrongEndpointOwner, "Endpoint is not owned by the response receiver.");
 
         var queue = ResponseQueue(channel, endpoint.EndpointId);
-        return queue.Count == 0
-            ? KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseNotAvailable, "No published or cancelled response is available.")
-            : KernelResult<ResponseEnvelope>.Ok(queue.Dequeue());
+        if (queue.Count == 0)
+            return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseNotAvailable, "No published or cancelled response is available.");
+
+        var next = queue.Peek();
+        if (channel.Completions.TryGetValue(next.RequestSequence, out var completion) && completion.Waiting)
+            return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseNotAvailable, "The next response is reserved by a correlated runtime waiter.");
+
+        var envelope = queue.Dequeue();
+        channel.Completions.Remove(envelope.RequestSequence);
+        return KernelResult<ResponseEnvelope>.Ok(envelope);
+    }
+
+    internal async ValueTask<KernelResult<ResponseEnvelope>> WaitAsync(
+        ProcessHandle requester,
+        ChannelEndpointHandle endpoint,
+        ulong requestSequence)
+    {
+        if (!_channels.TryGetValue(endpoint.ChannelId, out var channel))
+            return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseProtocolUnavailable, "The channel was not created with response protocol metadata.");
+
+        var expectedOwner = endpoint.EndpointId.Value == 1 ? channel.LeftOwner : channel.RightOwner;
+        if (expectedOwner != requester)
+            return KernelResult<ResponseEnvelope>.Fail(KernelError.WrongEndpointOwner, "Endpoint is not owned by the response waiter.");
+        if (!channel.Completions.TryGetValue(requestSequence, out var completion))
+            return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseNotAvailable, "The correlated response is no longer pending or available.");
+        if (completion.Requester != requester || completion.RequesterEndpoint != endpoint.EndpointId)
+            return KernelResult<ResponseEnvelope>.Fail(KernelError.WrongEndpointOwner, "The correlated response does not belong to this endpoint.");
+        if (completion.Waiting)
+            return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseNotAvailable, "A runtime waiter is already registered for this response.");
+
+        completion.Waiting = true;
+        var envelope = await completion.Source.Task.ConfigureAwait(false);
+
+        if (_channels.TryGetValue(endpoint.ChannelId, out var activeChannel) &&
+            ReferenceEquals(activeChannel, channel) &&
+            channel.Completions.TryGetValue(requestSequence, out var activeCompletion) &&
+            ReferenceEquals(activeCompletion, completion))
+        {
+            RemoveQueuedResponse(ResponseQueue(channel, endpoint.EndpointId), requestSequence);
+            channel.Completions.Remove(requestSequence);
+        }
+
+        return KernelResult<ResponseEnvelope>.Ok(envelope);
+    }
+
+    private static void Complete(
+        ChannelRecord channel,
+        PendingRecord pending,
+        ResponseEnvelope envelope)
+    {
+        if (!channel.Completions.TryGetValue(pending.RequestSequence, out var completion))
+            throw new InvalidOperationException("Pending response completion state disappeared before publication.");
+
+        if (!completion.Waiting)
+            ResponseQueue(channel, pending.RequesterEndpoint).Enqueue(envelope);
+
+        channel.Pending.Remove(pending.RequestSequence);
+        if (!completion.Source.TrySetResult(envelope))
+            throw new InvalidOperationException("Pending response completion was already finalized.");
+    }
+
+    private void CloseChannel(ChannelId channelId)
+    {
+        if (!_channels.Remove(channelId, out var channel)) return;
+
+        foreach (var pending in channel.Pending.Values.OrderBy(static pending => pending.RequestSequence))
+        {
+            if (!channel.Completions.TryGetValue(pending.RequestSequence, out var completion)) continue;
+            _ = completion.Source.TrySetResult(new ResponseEnvelope(
+                pending.RequestSequence,
+                pending.Response.MessageId,
+                ResponsePublicationStatus.Cancelled,
+                null));
+        }
+
+        channel.Pending.Clear();
+        channel.LeftResponses.Clear();
+        channel.RightResponses.Clear();
+        channel.Completions.Clear();
     }
 
     private static Queue<ResponseEnvelope> ResponseQueue(ChannelRecord channel, EndpointId endpoint) =>
         endpoint.Value == 1 ? channel.LeftResponses : channel.RightResponses;
+
+    private static void RemoveQueuedResponse(Queue<ResponseEnvelope> queue, ulong requestSequence)
+    {
+        var count = queue.Count;
+        var removed = false;
+        for (var index = 0; index < count; index++)
+        {
+            var envelope = queue.Dequeue();
+            if (!removed && envelope.RequestSequence == requestSequence)
+            {
+                removed = true;
+                continue;
+            }
+            queue.Enqueue(envelope);
+        }
+    }
 
     private static KernelResult ValidatePayload(ResponsePayloadDescriptorV1 expected, object? payload)
     {
