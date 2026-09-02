@@ -22,6 +22,13 @@ public readonly record struct PlatformRegionMapping(
 
 public sealed class PlatformAuthorityBridge
 {
+    private enum MappingState
+    {
+        Active = 0,
+        Draining,
+        Revoked
+    }
+
     private sealed class DomainRecord(
         PlatformDomainBinding binding,
         PlatformProviderDomainLease providerLease)
@@ -33,11 +40,13 @@ public sealed class PlatformAuthorityBridge
 
     private sealed class MappingRecord(
         PlatformRegionMapping mapping,
-        PlatformProviderRegionMappingLease providerLease)
+        PlatformProviderRegionMappingLease providerLease,
+        CapabilityId authorityCapabilityId)
     {
         public PlatformRegionMapping Mapping { get; } = mapping;
         public PlatformProviderRegionMappingLease ProviderLease { get; } = providerLease;
-        public bool Revoked { get; set; }
+        public CapabilityId AuthorityCapabilityId { get; } = authorityCapabilityId;
+        public MappingState State { get; set; } = MappingState.Active;
     }
 
     private readonly IPlatformAuthorityProvider? _provider;
@@ -103,10 +112,14 @@ public sealed class PlatformAuthorityBridge
         var validation = ValidateDomain(binding, expectedSubject);
         if (!validation.IsSuccess) return validation;
 
-        if (_mappings.Values.Any(m => !m.Revoked && m.Mapping.DomainBinding.BindingId == binding.BindingId))
+        if (_mappings.Values.Any(m =>
+                m.State != MappingState.Revoked &&
+                m.Mapping.DomainBinding.BindingId == binding.BindingId))
+        {
             return KernelResult.Fail(
                 KernelError.PlatformBindingActive,
-                "Active platform region mappings must be revoked before the domain binding.");
+                "Active or draining platform region mappings must be closed before the domain binding.");
+        }
 
         var record = _domains[binding.BindingId];
         var providerResult = _provider!.RevokeDomain(record.ProviderLease);
@@ -152,6 +165,7 @@ public sealed class PlatformAuthorityBridge
     internal KernelResult<PlatformRegionMapping> MapOwnedRegion(
         PlatformDomainBinding binding,
         PlatformDomainIdentity expectedSubject,
+        CapabilityId authorityCapabilityId,
         PlatformRegionIdentity region,
         PlatformMemoryAccess access)
     {
@@ -191,7 +205,9 @@ public sealed class PlatformAuthorityBridge
             providerLease.Region != region ||
             providerLease.Access != access)
         {
-            _ = _provider.RevokeRegionMapping(providerLease);
+            _ = _provider.RevokeRegionMapping(
+                providerLease,
+                PlatformRegionRevocationPolicy.DrainBeforeRevoke);
             return KernelResult<PlatformRegionMapping>.Fail(
                 KernelError.PlatformFaulted,
                 "The platform provider returned a mapping identity that does not match the request.");
@@ -204,32 +220,96 @@ public sealed class PlatformAuthorityBridge
             region.Handle,
             access);
 
-        _mappings.Add(mapping.MappingId, new MappingRecord(mapping, providerLease));
+        _mappings.Add(
+            mapping.MappingId,
+            new MappingRecord(mapping, providerLease, authorityCapabilityId));
         return KernelResult<PlatformRegionMapping>.Ok(mapping);
     }
 
     internal KernelResult RevokeRegionMapping(
         PlatformRegionMapping mapping,
-        PlatformDomainIdentity expectedSubject)
+        PlatformDomainIdentity expectedSubject,
+        PlatformRegionRevocationPolicy policy)
     {
-        var validation = ValidateMapping(mapping, expectedSubject);
+        var validation = ValidateMappingIdentity(mapping, expectedSubject);
         if (!validation.IsSuccess) return validation;
 
         var record = _mappings[mapping.MappingId];
-        var providerResult = _provider!.RevokeRegionMapping(record.ProviderLease);
+        if (record.State == MappingState.Revoked)
+            return KernelResult.Fail(
+                KernelError.PlatformBindingRevoked,
+                "The platform region mapping has been revoked.");
+
+        record.State = MappingState.Draining;
+
+        var providerResult = _provider!.RevokeRegionMapping(record.ProviderLease, policy);
         if (!providerResult.IsSuccess)
         {
-            if (providerResult.Status is PlatformAuthorityStatus.Revoked or PlatformAuthorityStatus.Stale)
-                record.Revoked = true;
+            if (providerResult.Status == PlatformAuthorityStatus.Revoked)
+            {
+                record.State = MappingState.Revoked;
+                return KernelResult.Ok();
+            }
 
             return FromProviderFailure(providerResult.Status, providerResult.Message);
         }
 
-        record.Revoked = true;
+        record.State = MappingState.Revoked;
         return KernelResult.Ok();
     }
 
     internal KernelResult ValidateMapping(
+        PlatformRegionMapping mapping,
+        PlatformDomainIdentity expectedSubject)
+    {
+        var validation = ValidateMappingIdentity(mapping, expectedSubject);
+        if (!validation.IsSuccess) return validation;
+
+        var record = _mappings[mapping.MappingId];
+        return record.State switch
+        {
+            MappingState.Active => KernelResult.Ok(),
+            MappingState.Draining => KernelResult.Fail(
+                KernelError.PlatformBindingDraining,
+                "The platform region mapping is draining and cannot authorize new effects."),
+            _ => KernelResult.Fail(
+                KernelError.PlatformBindingRevoked,
+                "The platform region mapping has been revoked.")
+        };
+    }
+
+    internal IReadOnlyList<PlatformRegionMapping> BeginCapabilityRevocation(CapabilityId capabilityId)
+    {
+        var affected = _mappings.Values
+            .Where(m =>
+                m.AuthorityCapabilityId == capabilityId &&
+                m.State != MappingState.Revoked)
+            .OrderBy(static m => m.Mapping.MappingId.Value)
+            .ToArray();
+
+        foreach (var record in affected)
+        {
+            if (record.State == MappingState.Active)
+                record.State = MappingState.Draining;
+        }
+
+        return affected.Select(static m => m.Mapping).ToArray();
+    }
+
+    internal bool HasActiveAuthority(PlatformDomainIdentity subject) =>
+        (_activeSubjects.TryGetValue(subject, out var id) &&
+         _domains.TryGetValue(id, out var domain) &&
+         !domain.Revoked) ||
+        _mappings.Values.Any(
+            m =>
+                m.State != MappingState.Revoked &&
+                m.Mapping.DomainBinding.Subject == subject);
+
+    internal bool HasActiveMapping(RegionHandle region) =>
+        _mappings.Values.Any(
+            m => m.State != MappingState.Revoked && m.Mapping.Region == region);
+
+    private KernelResult ValidateMappingIdentity(
         PlatformRegionMapping mapping,
         PlatformDomainIdentity expectedSubject)
     {
@@ -248,26 +328,8 @@ public sealed class PlatformAuthorityBridge
                 KernelError.WrongPlatformDomain,
                 "The platform region mapping identity does not match the active mapping.");
 
-        var domainValidation = ValidateDomain(record.Mapping.DomainBinding, expectedSubject);
-        if (!domainValidation.IsSuccess) return domainValidation;
-
-        if (record.Revoked)
-            return KernelResult.Fail(
-                KernelError.PlatformBindingRevoked,
-                "The platform region mapping has been revoked.");
-
-        return KernelResult.Ok();
+        return ValidateDomain(record.Mapping.DomainBinding, expectedSubject);
     }
-
-    internal bool HasActiveAuthority(PlatformDomainIdentity subject) =>
-        (_activeSubjects.TryGetValue(subject, out var id) &&
-         _domains.TryGetValue(id, out var domain) &&
-         !domain.Revoked) ||
-        _mappings.Values.Any(
-            m => !m.Revoked && m.Mapping.DomainBinding.Subject == subject);
-
-    internal bool HasActiveMapping(RegionHandle region) =>
-        _mappings.Values.Any(m => !m.Revoked && m.Mapping.Region == region);
 
     private void MarkDomainRevoked(DomainRecord record)
     {

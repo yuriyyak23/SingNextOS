@@ -97,6 +97,7 @@ public sealed partial class RuntimeKernel
         var mapping = PlatformAuthority.MapOwnedRegion(
             binding,
             identity,
+            capabilityId,
             platformRegion,
             access);
 
@@ -118,15 +119,36 @@ public sealed partial class RuntimeKernel
 
         var process = resolved.Value!;
         var identity = new PlatformDomainIdentity(process.DomainId, owner.Generation);
-        var validation = PlatformAuthority.ValidateMapping(mapping, identity);
-        if (!validation.IsSuccess) return validation;
-
-        var revoke = PlatformAuthority.RevokeRegionMapping(mapping, identity);
+        var revoke = PlatformAuthority.RevokeRegionMapping(
+            mapping,
+            identity,
+            PlatformRegionRevocationPolicy.DrainBeforeRevoke);
         if (!revoke.IsSuccess) return revoke;
 
         return Regions.ReleasePlatformMappingReservation(
             mapping.Region,
             new RegionOwner(process.DomainId, owner.Generation));
+    }
+
+    internal KernelResult CascadePlatformCapabilityRevocation(CapabilityId capabilityId)
+    {
+        var mappings = PlatformAuthority.BeginCapabilityRevocation(capabilityId);
+        foreach (var mapping in mappings)
+        {
+            var subject = mapping.DomainBinding.Subject;
+            var revoke = PlatformAuthority.RevokeRegionMapping(
+                mapping,
+                subject,
+                PlatformRegionRevocationPolicy.DrainBeforeRevoke);
+            if (!revoke.IsSuccess) return revoke;
+
+            var release = Regions.ReleasePlatformMappingReservation(
+                mapping.Region,
+                new RegionOwner(subject.DomainId, subject.ProcessGeneration));
+            if (!release.IsSuccess) return release;
+        }
+
+        return KernelResult.Ok();
     }
 
     private static bool IsValidPlatformAccess(PlatformMemoryAccess access) =>

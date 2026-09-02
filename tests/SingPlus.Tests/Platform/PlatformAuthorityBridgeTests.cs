@@ -298,6 +298,9 @@ public sealed class PlatformAuthorityBridgeTests
         Assert.False(second.IsSuccess);
         Assert.Equal(KernelError.PlatformBindingRevoked, second.Error);
         Assert.Equal(1, provider.RevokeRegionMappingCallCount);
+        Assert.Equal(
+            PlatformRegionRevocationPolicy.DrainBeforeRevoke,
+            provider.LastRegionRevocationPolicy);
     }
 
     [Fact]
@@ -329,6 +332,146 @@ public sealed class PlatformAuthorityBridgeTests
 
         Assert.True(kernel.RevokePlatformRegionMapping(owner, mapping).IsSuccess);
         Assert.True(kernel.RevokePlatformDomain(owner, binding).IsSuccess);
+    }
+
+    [Fact]
+    [Trait("Category", "Runtime")]
+    public void CapabilityRevocationDrainsAndRevokesItsPlatformMapping()
+    {
+        var provider = new HostPlatformAuthorityProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, owner) = TestFixtures.Create(kernel, 1, 10);
+        var (_, target) = TestFixtures.Create(kernel, 2, 20);
+        var region = kernel.AllocateRegion(owner, 123).Value!;
+        var binding = kernel.BindPlatformDomain(owner).Value!;
+        var capability = MintRegionCapability(
+            kernel,
+            owner,
+            region.Handle,
+            CapabilityRights.Map | CapabilityRights.Read);
+        var mapping = kernel.MapPlatformOwnedRegion(
+            owner,
+            binding,
+            capability,
+            region.Handle,
+            PlatformMemoryAccess.Read).Value!;
+
+        var revoke = kernel.RevokeCapability(capability);
+        var localValidation = kernel.ValidateCapability(
+            owner,
+            capability,
+            CapabilityRights.Map | CapabilityRights.Read);
+        var staleMappingRevoke = kernel.RevokePlatformRegionMapping(owner, mapping);
+        var remap = kernel.MapPlatformOwnedRegion(
+            owner,
+            binding,
+            capability,
+            region.Handle,
+            PlatformMemoryAccess.Read);
+        var transfer = kernel.TransferRegion(owner, target, region);
+
+        Assert.True(revoke.IsSuccess, revoke.Message);
+        Assert.False(localValidation.IsSuccess);
+        Assert.Equal(KernelError.CapabilityRevoked, localValidation.Error);
+        Assert.Equal(1, provider.RevokeRegionMappingCallCount);
+        Assert.Equal(
+            PlatformRegionRevocationPolicy.DrainBeforeRevoke,
+            provider.LastRegionRevocationPolicy);
+        Assert.False(staleMappingRevoke.IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingRevoked, staleMappingRevoke.Error);
+        Assert.False(remap.IsSuccess);
+        Assert.Equal(KernelError.CapabilityRevoked, remap.Error);
+        Assert.Equal(1, provider.MapOwnedRegionCallCount);
+        Assert.True(transfer.IsSuccess, transfer.Message);
+    }
+
+    [Fact]
+    [Trait("Category", "Runtime")]
+    public void RevokingUnrelatedCapabilityDoesNotClosePlatformMapping()
+    {
+        var provider = new HostPlatformAuthorityProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, owner) = TestFixtures.Create(kernel, 1, 10);
+        var (_, target) = TestFixtures.Create(kernel, 2, 20);
+        var region = kernel.AllocateRegion(owner, 123).Value!;
+        var binding = kernel.BindPlatformDomain(owner).Value!;
+        var mappingCapability = MintRegionCapability(
+            kernel,
+            owner,
+            region.Handle,
+            CapabilityRights.Map | CapabilityRights.Read);
+        var unrelated = kernel.MintCapability(
+            new DomainId(10),
+            owner,
+            ResourceKind.Device,
+            "test-device",
+            CapabilityRights.Read).Value!.CapabilityId;
+        var mapping = kernel.MapPlatformOwnedRegion(
+            owner,
+            binding,
+            mappingCapability,
+            region.Handle,
+            PlatformMemoryAccess.Read).Value!;
+
+        var revoke = kernel.RevokeCapability(unrelated);
+        var transfer = kernel.TransferRegion(owner, target, region);
+
+        Assert.True(revoke.IsSuccess, revoke.Message);
+        Assert.Equal(0, provider.RevokeRegionMappingCallCount);
+        Assert.False(transfer.IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingActive, transfer.Error);
+        Assert.True(kernel.RevokePlatformRegionMapping(owner, mapping).IsSuccess);
+    }
+
+    [Fact]
+    [Trait("Category", "Runtime")]
+    public void FailedDrainLeavesCapabilityRevokedAndMappingFailClosed()
+    {
+        var provider = new HostPlatformAuthorityProvider(
+            regionRevocationFailure: PlatformAuthorityStatus.Denied);
+        var kernel = new RuntimeKernel(provider);
+        var (_, owner) = TestFixtures.Create(kernel, 1, 10);
+        var (_, target) = TestFixtures.Create(kernel, 2, 20);
+        var region = kernel.AllocateRegion(owner, 123).Value!;
+        var binding = kernel.BindPlatformDomain(owner).Value!;
+        var capability = MintRegionCapability(
+            kernel,
+            owner,
+            region.Handle,
+            CapabilityRights.Map | CapabilityRights.Read);
+        _ = kernel.MapPlatformOwnedRegion(
+            owner,
+            binding,
+            capability,
+            region.Handle,
+            PlatformMemoryAccess.Read).Value!;
+
+        var revoke = kernel.RevokeCapability(capability);
+        var localValidation = kernel.ValidateCapability(
+            owner,
+            capability,
+            CapabilityRights.Map | CapabilityRights.Read);
+        var remap = kernel.MapPlatformOwnedRegion(
+            owner,
+            binding,
+            capability,
+            region.Handle,
+            PlatformMemoryAccess.Read);
+        var transfer = kernel.TransferRegion(owner, target, region);
+
+        Assert.False(revoke.IsSuccess);
+        Assert.Equal(KernelError.PlatformDenied, revoke.Error);
+        Assert.False(localValidation.IsSuccess);
+        Assert.Equal(KernelError.CapabilityRevoked, localValidation.Error);
+        Assert.Equal(1, provider.RevokeRegionMappingCallCount);
+        Assert.Equal(
+            PlatformRegionRevocationPolicy.DrainBeforeRevoke,
+            provider.LastRegionRevocationPolicy);
+        Assert.False(remap.IsSuccess);
+        Assert.Equal(KernelError.CapabilityRevoked, remap.Error);
+        Assert.Equal(1, provider.MapOwnedRegionCallCount);
+        Assert.False(transfer.IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingActive, transfer.Error);
     }
 
     private static CapabilityId MintRegionCapability(

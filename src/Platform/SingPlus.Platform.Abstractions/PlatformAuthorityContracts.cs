@@ -30,6 +30,11 @@ public enum PlatformMemoryAccess
     Write = 1 << 1
 }
 
+public enum PlatformRegionRevocationPolicy
+{
+    DrainBeforeRevoke = 0
+}
+
 public readonly record struct PlatformDomainIdentity(DomainId DomainId, ulong ProcessGeneration);
 
 public readonly record struct PlatformRegionIdentity(
@@ -107,5 +112,7 @@ public interface IPlatformAuthorityProvider
         PlatformRegionIdentity region,
         PlatformMemoryAccess access);
 
-    PlatformAuthorityResult RevokeRegionMapping(PlatformProviderRegionMappingLease mapping);
+    PlatformAuthorityResult RevokeRegionMapping(
+        PlatformProviderRegionMappingLease mapping,
+        PlatformRegionRevocationPolicy policy);
 }
