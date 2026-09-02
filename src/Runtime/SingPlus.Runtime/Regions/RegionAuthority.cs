@@ -49,6 +49,7 @@ public sealed class RegionAuthority
 
     public KernelResult Loan(RegionHandle handle, RegionOwner owner, RegionOwner borrower)
     {
+        if (owner == borrower) return KernelResult.Fail(KernelError.InvalidRegionState, "A region cannot be loaned to its owner.");
         var validation = Validate(handle, owner);
         if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
         var record = _regions[handle.RegionId];
@@ -62,6 +63,17 @@ public sealed class RegionAuthority
         if (!_regions.TryGetValue(handle.RegionId, out var record)) return KernelResult.Fail(KernelError.RegionNotFound, "Region was not found.");
         if (record.Generation != handle.Generation) return KernelResult.Fail(KernelError.StaleGeneration, "Region generation is stale.");
         if (record.Owner != owner || record.Borrower != borrower || record.State != RegionState.Loaned) return KernelResult.Fail(KernelError.InvalidRegionState, "Region is not loaned to the specified borrower.");
+        record.Borrower = null;
+        record.State = RegionState.Owned;
+        return KernelResult.Ok();
+    }
+
+    public KernelResult RevokeLoan(RegionHandle handle, RegionOwner owner)
+    {
+        if (!_regions.TryGetValue(handle.RegionId, out var record)) return KernelResult.Fail(KernelError.RegionNotFound, "Region was not found.");
+        if (record.Generation != handle.Generation) return KernelResult.Fail(KernelError.StaleGeneration, "Region generation is stale.");
+        if (record.Owner != owner) return KernelResult.Fail(KernelError.WrongRegionOwner, "Region owner does not match.");
+        if (record.State != RegionState.Loaned || record.Borrower is null) return KernelResult.Fail(KernelError.InvalidRegionState, "Region does not have an active loan.");
         record.Borrower = null;
         record.State = RegionState.Owned;
         return KernelResult.Ok();
@@ -98,6 +110,18 @@ public sealed class RegionAuthority
         if (record.Generation != newHandle.Generation || oldHandle.RegionId != newHandle.RegionId)
             throw new InvalidOperationException("Region payload handle does not match the authoritative record.");
         record.Payload = payload;
+    }
+
+    internal IReadOnlyList<RegionHandle> ReturnAllLoansForBorrowerDomain(DomainId borrowerDomainId)
+    {
+        var returned = new List<RegionHandle>();
+        foreach (var record in _regions.Values.Where(r => r.State == RegionState.Loaned && r.Borrower?.DomainId == borrowerDomainId))
+        {
+            returned.Add(new RegionHandle(record.Id, record.Generation));
+            record.Borrower = null;
+            record.State = RegionState.Owned;
+        }
+        return returned.OrderBy(static h => h.RegionId.Value).ToArray();
     }
 
     internal IReadOnlyList<RegionHandle> ReclaimAllForDomain(DomainId domainId)

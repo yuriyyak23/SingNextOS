@@ -108,6 +108,130 @@ public sealed class OwnershipTests
     }
 
     [Fact]
+    public void ActiveLoanBlocksOwnerTransferAndRelease()
+    {
+        var kernel = new RuntimeKernel();
+        var (_, owner) = TestFixtures.Create(kernel, 1, 10);
+        var (_, borrower) = TestFixtures.Create(kernel, 2, 20);
+        var buffer = kernel.AllocateBuffer<int>(owner, 1).Value!;
+        var ownerIdentity = new RegionOwner(new DomainId(10), owner.Generation);
+        var borrowerIdentity = new RegionOwner(new DomainId(20), borrower.Generation);
+
+        Assert.True(kernel.Regions.Loan(buffer.Handle, ownerIdentity, borrowerIdentity).IsSuccess);
+
+        var release = kernel.ReleaseRegion(owner, buffer);
+        var transfer = kernel.TransferRegion(owner, borrower, buffer);
+
+        Assert.False(release.IsSuccess);
+        Assert.Equal(KernelError.InvalidRegionState, release.Error);
+        Assert.False(transfer.IsSuccess);
+        Assert.Equal(KernelError.InvalidRegionState, transfer.Error);
+        Assert.True(buffer.IsValid);
+        Assert.Equal(RegionState.Loaned, Assert.Single(kernel.Regions.Snapshot()).State);
+    }
+
+    [Fact]
+    public void OwnerCanRevokeLoanAndLateReturnIsRejected()
+    {
+        var kernel = new RuntimeKernel();
+        var (_, owner) = TestFixtures.Create(kernel, 1, 10);
+        var (_, borrower) = TestFixtures.Create(kernel, 2, 20);
+        var buffer = kernel.AllocateBuffer<int>(owner, 1).Value!;
+        var ownerIdentity = new RegionOwner(new DomainId(10), owner.Generation);
+        var borrowerIdentity = new RegionOwner(new DomainId(20), borrower.Generation);
+        Assert.True(kernel.Regions.Loan(buffer.Handle, ownerIdentity, borrowerIdentity).IsSuccess);
+
+        var revoked = kernel.Regions.RevokeLoan(buffer.Handle, ownerIdentity);
+        var lateReturn = kernel.Regions.ReturnLoan(buffer.Handle, ownerIdentity, borrowerIdentity);
+
+        Assert.True(revoked.IsSuccess, revoked.Message);
+        Assert.False(lateReturn.IsSuccess);
+        Assert.Equal(KernelError.InvalidRegionState, lateReturn.Error);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
+        Assert.True(kernel.ReleaseRegion(owner, buffer).IsSuccess);
+    }
+
+    [Fact]
+    public void WrongOwnerCannotRevokeActiveLoan()
+    {
+        var kernel = new RuntimeKernel();
+        var (_, owner) = TestFixtures.Create(kernel, 1, 10);
+        var (_, borrower) = TestFixtures.Create(kernel, 2, 20);
+        var buffer = kernel.AllocateBuffer<int>(owner, 1).Value!;
+        var ownerIdentity = new RegionOwner(new DomainId(10), owner.Generation);
+        var borrowerIdentity = new RegionOwner(new DomainId(20), borrower.Generation);
+        Assert.True(kernel.Regions.Loan(buffer.Handle, ownerIdentity, borrowerIdentity).IsSuccess);
+
+        var revoked = kernel.Regions.RevokeLoan(buffer.Handle, borrowerIdentity);
+
+        Assert.False(revoked.IsSuccess);
+        Assert.Equal(KernelError.WrongRegionOwner, revoked.Error);
+        Assert.Equal(RegionState.Loaned, Assert.Single(kernel.Regions.Snapshot()).State);
+    }
+
+    [Fact]
+    public void BorrowerDomainTerminationAutomaticallyReturnsLoan()
+    {
+        var kernel = new RuntimeKernel();
+        var (_, owner) = TestFixtures.Create(kernel, 1, 10);
+        var (_, borrower) = TestFixtures.Create(kernel, 2, 20);
+        var buffer = kernel.AllocateBuffer<int>(owner, 1).Value!;
+        buffer.Span[0] = 77;
+        var ownerIdentity = new RegionOwner(new DomainId(10), owner.Generation);
+        var borrowerIdentity = new RegionOwner(new DomainId(20), borrower.Generation);
+        Assert.True(kernel.Regions.Loan(buffer.Handle, ownerIdentity, borrowerIdentity).IsSuccess);
+
+        var terminated = kernel.TerminateProcess(borrower);
+
+        Assert.True(terminated.IsSuccess, terminated.Message);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
+        Assert.True(kernel.Regions.Validate(buffer.Handle, ownerIdentity).IsSuccess);
+        Assert.True(buffer.IsValid);
+        Assert.Equal(77, buffer.Span[0]);
+    }
+
+    [Fact]
+    public void SharedBorrowerDomainReturnsLoansOnlyAfterLastProcessTerminates()
+    {
+        var kernel = new RuntimeKernel();
+        var (_, owner) = TestFixtures.Create(kernel, 1, 10);
+        var (_, borrowerA) = TestFixtures.Create(kernel, 2, 20);
+        var (_, borrowerB) = TestFixtures.Create(kernel, 3, 20, identity: "borrower-b");
+        var buffer = kernel.AllocateBuffer<int>(owner, 1).Value!;
+        var ownerIdentity = new RegionOwner(new DomainId(10), owner.Generation);
+        var borrowerIdentity = new RegionOwner(new DomainId(20), borrowerA.Generation);
+        Assert.True(kernel.Regions.Loan(buffer.Handle, ownerIdentity, borrowerIdentity).IsSuccess);
+
+        Assert.True(kernel.TerminateProcess(borrowerA).IsSuccess);
+        Assert.Equal(RegionState.Loaned, Assert.Single(kernel.Regions.Snapshot()).State);
+
+        Assert.True(kernel.TerminateProcess(borrowerB).IsSuccess);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
+        Assert.True(kernel.Regions.Validate(buffer.Handle, ownerIdentity).IsSuccess);
+    }
+
+    [Fact]
+    public void OwnerTerminationReclaimsActiveLoanAndRejectsLateReturn()
+    {
+        var kernel = new RuntimeKernel();
+        var (_, owner) = TestFixtures.Create(kernel, 1, 10);
+        var (_, borrower) = TestFixtures.Create(kernel, 2, 20);
+        var buffer = kernel.AllocateBuffer<int>(owner, 1).Value!;
+        var ownerIdentity = new RegionOwner(new DomainId(10), owner.Generation);
+        var borrowerIdentity = new RegionOwner(new DomainId(20), borrower.Generation);
+        Assert.True(kernel.Regions.Loan(buffer.Handle, ownerIdentity, borrowerIdentity).IsSuccess);
+
+        var terminated = kernel.TerminateProcess(owner);
+        var lateReturn = kernel.Regions.ReturnLoan(buffer.Handle, ownerIdentity, borrowerIdentity);
+
+        Assert.True(terminated.IsSuccess, terminated.Message);
+        Assert.Equal(RegionState.Released, Assert.Single(kernel.Regions.Snapshot()).State);
+        Assert.False(buffer.IsValid);
+        Assert.False(lateReturn.IsSuccess);
+        Assert.Equal(KernelError.InvalidRegionState, lateReturn.Error);
+    }
+
+    [Fact]
     public void TerminatingLastProcessBulkReclaimsOwnedRegions()
     {
         var kernel = new RuntimeKernel();

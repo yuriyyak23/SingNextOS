@@ -135,6 +135,7 @@ public sealed partial class RuntimeKernel
         if (domainEnded)
         {
             CapabilityAuthority.RevokeAllForDomain(process.DomainId);
+            Regions.ReturnAllLoansForBorrowerDomain(process.DomainId);
             Regions.ReclaimAllForDomain(process.DomainId);
             Channels.CloseAllForDomain(process.DomainId);
         }
