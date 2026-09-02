@@ -26,7 +26,16 @@ public enum KernelError
     InvalidMessage,
     InvalidProtocolTransition,
     CapacityExhausted,
-    UnsupportedPayload
+    UnsupportedPayload,
+    WrongCapabilityResource,
+    PlatformUnavailable,
+    PlatformUnsupported,
+    PlatformDenied,
+    PlatformBindingNotFound,
+    PlatformBindingRevoked,
+    PlatformBindingActive,
+    WrongPlatformDomain,
+    PlatformFaulted
 }
 
 public readonly record struct KernelResult(bool IsSuccess, KernelError Error, string? Message)

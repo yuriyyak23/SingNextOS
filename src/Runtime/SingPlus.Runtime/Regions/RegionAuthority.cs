@@ -19,6 +19,7 @@ public sealed class RegionAuthority
         public BorrowLeaseGeneration BorrowGeneration { get; set; }
         public BorrowLeaseLifetime? BorrowLifetime { get; set; }
         public ITransferableOwnedPayload? Payload { get; set; }
+        public bool PlatformMappingReserved { get; set; }
     }
 
     private readonly Dictionary<RegionId, RegionRecord> _regions = [];
@@ -66,6 +67,7 @@ public sealed class RegionAuthority
         var validation = Validate(handle, owner);
         if (!validation.IsSuccess) return KernelResult<BorrowLeaseGrant>.Fail(validation.Error, validation.Message!);
         var record = _regions[handle.RegionId];
+        if (record.PlatformMappingReserved) return KernelResult<BorrowLeaseGrant>.Fail(KernelError.PlatformBindingActive, "An owned region with an active platform mapping cannot be loaned.");
         if (record.BorrowGeneration.Value == ulong.MaxValue) return KernelResult<BorrowLeaseGrant>.Fail(KernelError.CapacityExhausted, "Borrow lease generation is exhausted.");
 
         var generation = new BorrowLeaseGeneration(record.BorrowGeneration.Value + 1);
@@ -105,11 +107,32 @@ public sealed class RegionAuthority
         return KernelResult.Ok();
     }
 
+    internal KernelResult ReservePlatformMapping(RegionHandle handle, RegionOwner owner)
+    {
+        var validation = Validate(handle, owner);
+        if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
+        var record = _regions[handle.RegionId];
+        if (record.PlatformMappingReserved) return KernelResult.Fail(KernelError.PlatformBindingActive, "The owned region already has an active platform mapping.");
+        record.PlatformMappingReserved = true;
+        return KernelResult.Ok();
+    }
+
+    internal KernelResult ReleasePlatformMappingReservation(RegionHandle handle, RegionOwner owner)
+    {
+        var validation = Validate(handle, owner);
+        if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
+        var record = _regions[handle.RegionId];
+        if (!record.PlatformMappingReserved) return KernelResult.Fail(KernelError.PlatformBindingNotFound, "The owned region does not have an active platform mapping.");
+        record.PlatformMappingReserved = false;
+        return KernelResult.Ok();
+    }
+
     internal KernelResult<RegionHandle> Transfer(RegionHandle handle, RegionOwner source, RegionOwner target)
     {
         var validation = Validate(handle, source);
         if (!validation.IsSuccess) return KernelResult<RegionHandle>.Fail(validation.Error, validation.Message!);
         var record = _regions[handle.RegionId];
+        if (record.PlatformMappingReserved) return KernelResult<RegionHandle>.Fail(KernelError.PlatformBindingActive, "An owned region with an active platform mapping cannot be transferred.");
         record.State = RegionState.Transferred;
         record.Owner = target;
         record.Generation = new RegionGeneration(record.Generation.Value + 1);
@@ -122,6 +145,7 @@ public sealed class RegionAuthority
         var validation = Validate(handle, owner);
         if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
         var record = _regions[handle.RegionId];
+        if (record.PlatformMappingReserved) return KernelResult.Fail(KernelError.PlatformBindingActive, "An owned region with an active platform mapping cannot be released.");
         record.State = RegionState.Released;
         record.Payload = null;
         return KernelResult.Ok();
@@ -157,6 +181,7 @@ public sealed class RegionAuthority
         var reclaimed = new List<RegionHandle>();
         foreach (var record in _regions.Values.Where(r => r.Owner.DomainId == domainId && r.State is RegionState.Owned or RegionState.Loaned))
         {
+            if (record.PlatformMappingReserved) throw new InvalidOperationException("Platform-mapped regions must be revoked before domain reclaim.");
             reclaimed.Add(new RegionHandle(record.Id, record.Generation));
             record.BorrowLifetime?.InvalidateForRuntime();
             record.BorrowLifetime = null;

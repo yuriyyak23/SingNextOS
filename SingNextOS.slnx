@@ -21,6 +21,10 @@
   <Folder Name="/src/Kernel/Boot/">
     <Project Path="src/Kernel/Boot/SingPlus.Boot/SingPlus.Boot.csproj" />
   </Folder>
+  <Folder Name="/src/Platform/">
+    <Project Path="src/Platform/SingPlus.Platform.Abstractions/SingPlus.Platform.Abstractions.csproj" />
+    <Project Path="src/Platform/SingPlus.Platform.Host/SingPlus.Platform.Host.csproj" />
+  </Folder>
   <Folder Name="/src/Runtime/">
     <Project Path="src/Runtime/SingPlus.Runtime/SingPlus.Runtime.csproj" />
   </Folder>

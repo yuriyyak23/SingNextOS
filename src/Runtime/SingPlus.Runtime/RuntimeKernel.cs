@@ -1,4 +1,5 @@
 using SingPlus.Contracts;
+using SingPlus.Platform;
 using SingPlus.Sip;
 
 namespace SingPlus.Runtime;
@@ -6,12 +7,18 @@ namespace SingPlus.Runtime;
 public sealed partial class RuntimeKernel
 {
     public RuntimeKernel()
+        : this(null)
+    {
+    }
+
+    public RuntimeKernel(IPlatformAuthorityProvider? platformProvider)
     {
         Processes = new ProcessRegistry();
         Domains = new DomainRegistry();
         CapabilityAuthority = new CapabilityAuthority();
         Regions = new RegionAuthority();
         Channels = new ChannelRegistry(CapabilityAuthority, Regions);
+        PlatformAuthority = new PlatformAuthorityBridge(platformProvider);
     }
 
     public ProcessRegistry Processes { get; }
@@ -19,6 +26,7 @@ public sealed partial class RuntimeKernel
     public CapabilityAuthority CapabilityAuthority { get; }
     public RegionAuthority Regions { get; }
     public ChannelRegistry Channels { get; }
+    public PlatformAuthorityBridge PlatformAuthority { get; }
 
     public KernelResult<SingProcess> CreateProcess(SingProcessManifestV1 manifest)
     {
@@ -64,6 +72,8 @@ public sealed partial class RuntimeKernel
         if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
         var process = resolved.Value!;
         if (process.State is ProcessState.Exited or ProcessState.Faulted) return InvalidTransition(process.State, ProcessState.Exiting);
+        if (PlatformAuthority.HasActiveAuthority(new PlatformDomainIdentity(process.DomainId, handle.Generation)))
+            return KernelResult.Fail(KernelError.PlatformBindingActive, "Platform bindings must be revoked before process termination.");
         process.SetState(ProcessState.Exiting);
         CleanupProcess(process);
         process.SetState(ProcessState.Exited);
@@ -77,6 +87,8 @@ public sealed partial class RuntimeKernel
         if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
         var process = resolved.Value!;
         if (process.State is ProcessState.Exited or ProcessState.Faulted) return InvalidTransition(process.State, ProcessState.Faulted);
+        if (PlatformAuthority.HasActiveAuthority(new PlatformDomainIdentity(process.DomainId, handle.Generation)))
+            return KernelResult.Fail(KernelError.PlatformBindingActive, "Platform bindings must be revoked before local fault cleanup.");
         CleanupProcess(process);
         process.SetState(ProcessState.Faulted);
         Processes.Retire(process);
