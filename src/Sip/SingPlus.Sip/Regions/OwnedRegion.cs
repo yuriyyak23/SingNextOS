@@ -26,6 +26,7 @@ public sealed class OwnedRegion<T> : ITransferableOwnedPayload where T : unmanag
 
     public OwnedRegion<T> Move() => new(_buffer.Move());
 
+    OwnershipPayloadKind ITransferableOwnedPayload.PayloadKind => OwnershipPayloadKind.OwnedRegion;
     bool ITransferableOwnedPayload.IsValidForRuntime => _buffer.IsValid;
     object ITransferableOwnedPayload.TransferForRuntime(RegionHandle newHandle) => new OwnedRegion<T>((OwnedBuffer<T>)((ITransferableOwnedPayload)_buffer).TransferForRuntime(newHandle));
     object ITransferableOwnedPayload.CreateBorrowLeaseForRuntime(BorrowLeaseHandle handle, BorrowLeaseLifetime lifetime) => ((ITransferableOwnedPayload)_buffer).CreateBorrowLeaseForRuntime(handle, lifetime);
