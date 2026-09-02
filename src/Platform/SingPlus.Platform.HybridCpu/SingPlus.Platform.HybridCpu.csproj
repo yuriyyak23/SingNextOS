@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <HybridCpuRepositoryRoot Condition="'$(HybridCpuRepositoryRoot)' == ''">$(MSBuildThisFileDirectory)../../../../HybridCPU-v2</HybridCpuRepositoryRoot>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../SingPlus.Platform.Abstractions/SingPlus.Platform.Abstractions.csproj" />
+    <ProjectReference Include="$(HybridCpuRepositoryRoot)/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.csproj" />
+  </ItemGroup>
+</Project>

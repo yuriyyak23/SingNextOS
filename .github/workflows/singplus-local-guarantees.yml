@@ -51,6 +51,42 @@ jobs:
       - name: Property tests
         run: dotnet test tests/SingPlus.Tests/SingPlus.Tests.csproj --configuration Release --no-build --filter "Category=Property"
 
-# HybridCPU source repositories are intentionally not checked out or built here.
-# A future black-box integration job may consume a prebuilt external toolchain,
-# but it is not part of the SingNextOS local-guarantees gate.
+  hybridcpu-domain-integration:
+    name: HybridCPU neutral domain integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout SingNextOS
+        uses: actions/checkout@v4
+        with:
+          path: SingNextOS
+
+      - name: Checkout pinned HybridCPU neutral-domain facade
+        uses: actions/checkout@v4
+        with:
+          repository: yuriyyak23/HybridCPU-v2
+          ref: e09147e5c2e9f5d463884d3f46cb45bd9ceeda6b
+          path: HybridCPU-v2
+
+      - name: Setup .NET from SingNextOS global.json
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: SingNextOS/global.json
+
+      - name: Restore Sing HybridCPU integration tests
+        working-directory: SingNextOS
+        run: dotnet restore tests/SingPlus.Platform.HybridCpu.Tests/SingPlus.Platform.HybridCpu.Tests.csproj
+
+      - name: Build Sing HybridCPU provider and integration tests
+        working-directory: SingNextOS
+        run: dotnet build tests/SingPlus.Platform.HybridCpu.Tests/SingPlus.Platform.HybridCpu.Tests.csproj --configuration Release --no-restore
+
+      - name: Run Sing HybridCPU provider integration tests
+        working-directory: SingNextOS
+        run: dotnet test tests/SingPlus.Platform.HybridCpu.Tests/SingPlus.Platform.HybridCpu.Tests.csproj --configuration Release --no-build
+
+      - name: Run HybridCPU neutral facade tests
+        run: dotnet test HybridCPU-v2/HybridCPU_NeutralRuntime.Tests/HybridCPU_NeutralRuntime.Tests.csproj --configuration Release
+
+# The normal local-guarantees job remains independent of HybridCPU source.
+# Phase-3 cross-repository binding is verified only by the pinned narrow integration job above.
