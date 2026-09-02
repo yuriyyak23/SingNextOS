@@ -106,7 +106,7 @@ public interface IBadContract
         return generatorDiagnostics.Concat(driver.GetRunResult().Results.SelectMany(static result => result.Diagnostics)).ToArray();
     }
 
-    private static (GeneratorDriver Driver, Compilation OutputCompilation, ImmutableArray<Diagnostic> GeneratorDiagnostics) Run(string source)
+    private static (GeneratorDriver Driver, Compilation OutputCompilation, IReadOnlyList<Diagnostic> GeneratorDiagnostics) Run(string source)
     {
         var references = AnalyzerTests.PlatformReferences().ToList();
         references.Add(MetadataReference.CreateFromFile(typeof(SingProcessManifestV1).Assembly.Location));
