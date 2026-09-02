@@ -2,7 +2,10 @@ using SingPlus.Platform;
 
 namespace SingPlus.Platform.Host;
 
-public sealed class HostPlatformAuthorityProvider : IPlatformAuthorityProvider, IPlatformFeatureProvider
+public sealed class HostPlatformAuthorityProvider :
+    IPlatformAuthorityProvider,
+    IPlatformFeatureProvider,
+    IPlatformCompletionProvider
 {
     private sealed class DomainRecord(PlatformProviderDomainLease lease)
     {
@@ -16,14 +19,28 @@ public sealed class HostPlatformAuthorityProvider : IPlatformAuthorityProvider, 
         public bool Revoked { get; set; }
     }
 
+    private sealed class OperationRecord(PlatformOperationIdentity operation)
+    {
+        public PlatformOperationIdentity Operation { get; } = operation;
+        public PlatformCompletionState State { get; set; } = PlatformCompletionState.Staged;
+
+        public PlatformCompletionReceipt Receipt => new(
+            Operation.OperationId,
+            Operation.Generation,
+            Operation.DomainLease,
+            State);
+    }
+
     private readonly Dictionary<PlatformProviderDomainLeaseId, DomainRecord> _domains = [];
     private readonly Dictionary<PlatformProviderRegionMappingId, MappingRecord> _mappings = [];
+    private readonly Dictionary<PlatformOperationId, OperationRecord> _operations = [];
     private readonly Dictionary<PlatformDomainIdentity, PlatformProviderDomainLeaseId> _activeSubjects = [];
     private readonly Dictionary<PlatformRegionIdentity, PlatformProviderRegionMappingId> _activeRegions = [];
     private readonly PlatformAuthorityStatus? _regionRevocationFailure;
     private readonly PlatformFeatureManifest _featureManifest;
     private ulong _nextDomainId = 1;
     private ulong _nextMappingId = 1;
+    private ulong _nextOperationId = 1;
 
     public HostPlatformAuthorityProvider(
         PlatformAuthorityFeatures features =
@@ -53,6 +70,89 @@ public sealed class HostPlatformAuthorityProvider : IPlatformAuthorityProvider, 
     public PlatformRegionRevocationPolicy? LastRegionRevocationPolicy { get; private set; }
 
     public PlatformFeatureManifest QueryFeatures() => _featureManifest;
+
+    public PlatformAuthorityResult<PlatformOperationIdentity> StageOperation(
+        PlatformProviderDomainLease domainLease)
+    {
+        var domainValidation = ValidateDomain(domainLease);
+        if (!domainValidation.IsSuccess)
+            return PlatformAuthorityResult<PlatformOperationIdentity>.Fail(
+                domainValidation.Status,
+                domainValidation.Message!);
+
+        var operation = new PlatformOperationIdentity(
+            new PlatformOperationId(_nextOperationId++),
+            new PlatformOperationGeneration(1),
+            domainLease);
+
+        _operations.Add(operation.OperationId, new OperationRecord(operation));
+        return PlatformAuthorityResult<PlatformOperationIdentity>.Ok(operation);
+    }
+
+    public PlatformAuthorityResult<PlatformCompletionReceipt> AdvanceOperation(
+        PlatformOperationIdentity operation,
+        PlatformCompletionState nextState)
+    {
+        var operationValidation = ValidateOperation(operation);
+        if (!operationValidation.IsSuccess)
+            return PlatformAuthorityResult<PlatformCompletionReceipt>.Fail(
+                operationValidation.Status,
+                operationValidation.Message!);
+
+        if (!Enum.IsDefined(nextState))
+        {
+            return PlatformAuthorityResult<PlatformCompletionReceipt>.Fail(
+                PlatformAuthorityStatus.Denied,
+                "The requested completion state is undefined.");
+        }
+
+        var record = _operations[operation.OperationId];
+        if (!CanTransition(record.State, nextState))
+        {
+            return PlatformAuthorityResult<PlatformCompletionReceipt>.Fail(
+                PlatformAuthorityStatus.Denied,
+                $"Completion transition {record.State} -> {nextState} is not allowed.");
+        }
+
+        record.State = nextState;
+        return PlatformAuthorityResult<PlatformCompletionReceipt>.Ok(record.Receipt);
+    }
+
+    public PlatformAuthorityResult<PlatformCompletionReceipt> ObserveCompletion(
+        PlatformOperationIdentity operation)
+    {
+        var validation = ValidateOperation(operation);
+        if (!validation.IsSuccess)
+            return PlatformAuthorityResult<PlatformCompletionReceipt>.Fail(
+                validation.Status,
+                validation.Message!);
+
+        return PlatformAuthorityResult<PlatformCompletionReceipt>.Ok(
+            _operations[operation.OperationId].Receipt);
+    }
+
+    public PlatformAuthorityResult ValidateCompletionReceipt(
+        PlatformOperationIdentity expectedOperation,
+        PlatformCompletionReceipt receipt)
+    {
+        var operationValidation = ValidateOperation(expectedOperation);
+        if (!operationValidation.IsSuccess) return operationValidation;
+
+        var identityValidation = PlatformCompletionContract.ValidateReceiptIdentity(
+            expectedOperation,
+            receipt);
+        if (!identityValidation.IsSuccess) return identityValidation;
+
+        var record = _operations[expectedOperation.OperationId];
+        if (record.State != receipt.State)
+        {
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.Stale,
+                "The completion receipt no longer matches the current operation state.");
+        }
+
+        return PlatformAuthorityResult.Ok();
+    }
 
     public PlatformAuthorityResult<PlatformProviderDomainLease> BindDomain(PlatformDomainIdentity subject)
     {
@@ -197,6 +297,53 @@ public sealed class HostPlatformAuthorityProvider : IPlatformAuthorityProvider, 
         return PlatformAuthorityResult.Ok();
     }
 
+    private PlatformAuthorityResult ValidateOperation(PlatformOperationIdentity operation)
+    {
+        if (operation.OperationId.Value == 0 || operation.Generation.Value == 0)
+        {
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.Faulted,
+                "Platform operation identities must use non-zero IDs and generations.");
+        }
+
+        if (!_operations.TryGetValue(operation.OperationId, out var record))
+        {
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.Denied,
+                "The platform operation does not exist.");
+        }
+
+        if (record.Operation.Generation != operation.Generation)
+        {
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.Stale,
+                "The platform operation generation is stale.");
+        }
+
+        if (record.Operation.DomainLease.LeaseId != operation.DomainLease.LeaseId)
+        {
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.WrongDomain,
+                "The platform operation belongs to a different domain lease.");
+        }
+
+        if (record.Operation.DomainLease.Generation != operation.DomainLease.Generation)
+        {
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.Stale,
+                "The platform operation domain-lease generation is stale.");
+        }
+
+        if (record.Operation.DomainLease.Subject != operation.DomainLease.Subject)
+        {
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.WrongDomain,
+                "The platform operation domain subject does not match the active operation.");
+        }
+
+        return ValidateDomain(record.Operation.DomainLease);
+    }
+
     private PlatformAuthorityResult ValidateDomain(PlatformProviderDomainLease lease)
     {
         if (!_domains.TryGetValue(lease.LeaseId, out var record))
@@ -221,6 +368,34 @@ public sealed class HostPlatformAuthorityProvider : IPlatformAuthorityProvider, 
 
         return PlatformAuthorityResult.Ok();
     }
+
+    private static bool CanTransition(
+        PlatformCompletionState current,
+        PlatformCompletionState next) =>
+        current switch
+        {
+            PlatformCompletionState.Staged =>
+                next is PlatformCompletionState.Pending or
+                    PlatformCompletionState.Cancelled or
+                    PlatformCompletionState.Faulted,
+            PlatformCompletionState.Pending =>
+                next is PlatformCompletionState.Draining or
+                    PlatformCompletionState.Completed or
+                    PlatformCompletionState.Cancelled or
+                    PlatformCompletionState.Faulted,
+            PlatformCompletionState.Draining =>
+                next is PlatformCompletionState.Completed or
+                    PlatformCompletionState.Cancelled or
+                    PlatformCompletionState.Closed or
+                    PlatformCompletionState.Faulted,
+            PlatformCompletionState.Completed =>
+                next is PlatformCompletionState.Closed or PlatformCompletionState.Faulted,
+            PlatformCompletionState.Cancelled =>
+                next is PlatformCompletionState.Draining or
+                    PlatformCompletionState.Closed or
+                    PlatformCompletionState.Faulted,
+            _ => false
+        };
 
     private bool Supports(PlatformAuthorityFeatures feature) =>
         (Descriptor.Features & feature) == feature;
