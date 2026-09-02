@@ -12,6 +12,10 @@
     <Project Path="sdk/SingPlus.Sip.Sdk/SingPlus.Sip.Sdk.csproj" />
   </Folder>
   <Folder Name="/src/" />
+  <Folder Name="/src/Platform/">
+    <Project Path="src/Platform/SingPlus.Platform.Abstractions/SingPlus.Platform.Abstractions.csproj" />
+    <Project Path="src/Platform/SingPlus.Platform.Host/SingPlus.Platform.Host.csproj" />
+  </Folder>
   <Folder Name="/src/Drivers/">
     <Project Path="src/Drivers/SingPlus.Drivers/SingPlus.Drivers.csproj" />
   </Folder>
