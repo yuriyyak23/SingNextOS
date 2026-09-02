@@ -66,39 +66,18 @@ public sealed partial class RuntimeKernel
     public KernelResult ParkProcess(ProcessHandle handle) => Transition(handle, ProcessState.Running, ProcessState.Parked);
     public KernelResult ResumeProcess(ProcessHandle handle) => Transition(handle, ProcessState.Parked, ProcessState.Running);
 
-    public KernelResult TerminateProcess(ProcessHandle handle)
-    {
-        var resolved = Processes.Resolve(handle);
-        if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
-        var process = resolved.Value!;
-        if (process.State is ProcessState.Exited or ProcessState.Faulted) return InvalidTransition(process.State, ProcessState.Exiting);
-        if (PlatformAuthority.HasActiveAuthority(new PlatformDomainIdentity(process.DomainId, handle.Generation)))
-            return KernelResult.Fail(KernelError.PlatformBindingActive, "Platform bindings must be revoked before process termination.");
-        process.SetState(ProcessState.Exiting);
-        CleanupProcess(process);
-        process.SetState(ProcessState.Exited);
-        Processes.Retire(process);
-        return KernelResult.Ok();
-    }
+    public KernelResult TerminateProcess(ProcessHandle handle) =>
+        BeginOrAdvanceProcessTeardown(handle, ProcessState.Exited);
 
-    public KernelResult FaultProcess(ProcessHandle handle)
-    {
-        var resolved = Processes.Resolve(handle);
-        if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
-        var process = resolved.Value!;
-        if (process.State is ProcessState.Exited or ProcessState.Faulted) return InvalidTransition(process.State, ProcessState.Faulted);
-        if (PlatformAuthority.HasActiveAuthority(new PlatformDomainIdentity(process.DomainId, handle.Generation)))
-            return KernelResult.Fail(KernelError.PlatformBindingActive, "Platform bindings must be revoked before local fault cleanup.");
-        CleanupProcess(process);
-        process.SetState(ProcessState.Faulted);
-        Processes.Retire(process);
-        return KernelResult.Ok();
-    }
+    public KernelResult FaultProcess(ProcessHandle handle) =>
+        BeginOrAdvanceProcessTeardown(handle, ProcessState.Faulted);
 
     public KernelResult<CapabilityDescriptorV1> MintCapability(DomainId issuerDomain, ProcessHandle subject, ResourceKind resourceKind, string resourceId, CapabilityRights rights)
     {
         var resolved = Processes.Resolve(subject);
         if (!resolved.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(resolved.Error, resolved.Message!);
+        var effect = EnsureProcessAcceptsNewEffects(resolved.Value!);
+        if (!effect.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(effect.Error, effect.Message!);
         if (!Domains.Contains(issuerDomain)) return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.DomainNotFound, $"Issuer domain {issuerDomain} is not active.");
         var descriptor = CapabilityAuthority.Mint(issuerDomain, resolved.Value!.DomainId, resourceKind, resourceId, rights, subject.Generation);
         resolved.Value.AddCapability(descriptor.CapabilityId);
@@ -109,8 +88,14 @@ public sealed partial class RuntimeKernel
     {
         var sourceProcess = Processes.Resolve(delegator);
         if (!sourceProcess.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(sourceProcess.Error, sourceProcess.Message!);
+        var sourceEffect = EnsureProcessAcceptsNewEffects(sourceProcess.Value!);
+        if (!sourceEffect.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(sourceEffect.Error, sourceEffect.Message!);
+
         var targetProcess = Processes.Resolve(target);
         if (!targetProcess.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(targetProcess.Error, targetProcess.Message!);
+        var targetEffect = EnsureProcessAcceptsNewEffects(targetProcess.Value!);
+        if (!targetEffect.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(targetEffect.Error, targetEffect.Message!);
+
         var delegated = CapabilityAuthority.Delegate(sourceCapability, sourceProcess.Value!.DomainId, targetProcess.Value!.DomainId, rights, target.Generation);
         if (delegated.IsSuccess) targetProcess.Value!.AddCapability(delegated.Value!.CapabilityId);
         return delegated;
@@ -145,19 +130,23 @@ public sealed partial class RuntimeKernel
         return KernelResult.Ok();
     }
 
-    private void CleanupProcess(SingProcess process)
+    private static KernelResult EnsureProcessAcceptsNewEffects(SingProcess process)
     {
-        Channels.CloseAllForProcess(new ProcessHandle(process.ProcessId, process.Generation));
-        process.ClearCapabilities();
-        var domainEnded = Domains.Remove(process);
-        if (domainEnded)
+        if (process.State == ProcessState.Exiting)
         {
-            CapabilityAuthority.RevokeAllForDomain(process.DomainId);
-            Regions.ReturnAllLoansForBorrowerDomain(process.DomainId);
-            Regions.ReclaimAllForDomain(process.DomainId);
-            Channels.CloseAllForDomain(process.DomainId);
+            return KernelResult.Fail(
+                KernelError.InvalidTransition,
+                "Process is Exiting and cannot authorize new effects.");
         }
-        process.ClearRuntimeResources();
+
+        if (process.State is ProcessState.Exited or ProcessState.Faulted)
+        {
+            return KernelResult.Fail(
+                KernelError.InvalidTransition,
+                $"Terminal process state {process.State} cannot authorize new effects.");
+        }
+
+        return KernelResult.Ok();
     }
 
     private static KernelResult InvalidTransition(ProcessState actual, ProcessState requested) => KernelResult.Fail(KernelError.InvalidTransition, $"Cannot transition from {actual} to {requested}.");

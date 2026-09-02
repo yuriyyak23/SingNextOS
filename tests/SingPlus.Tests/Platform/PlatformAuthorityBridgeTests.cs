@@ -224,11 +224,11 @@ public sealed class PlatformAuthorityBridgeTests
 
     [Fact]
     [Trait("Category", "Runtime")]
-    public void ActiveMappingBlocksTransferLoanReleaseAndTerminationUntilRevoked()
+    public void ActiveMappingBlocksOwnershipMutationButTerminationOrchestratesClosure()
     {
         var provider = new HostPlatformAuthorityProvider();
         var kernel = new RuntimeKernel(provider);
-        var (_, owner) = TestFixtures.Create(kernel, 1, 10);
+        var (ownerProcess, owner) = TestFixtures.Create(kernel, 1, 10);
         var (_, target) = TestFixtures.Create(kernel, 2, 20);
         var region = kernel.AllocateRegion(owner, 123).Value!;
         var binding = kernel.BindPlatformDomain(owner).Value!;
@@ -237,7 +237,7 @@ public sealed class PlatformAuthorityBridgeTests
             owner,
             region.Handle,
             CapabilityRights.Map | CapabilityRights.Read);
-        var mapping = kernel.MapPlatformOwnedRegion(
+        _ = kernel.MapPlatformOwnedRegion(
             owner,
             binding,
             capability,
@@ -250,7 +250,7 @@ public sealed class PlatformAuthorityBridgeTests
             new RegionOwner(new DomainId(10), owner.Generation),
             new RegionOwner(new DomainId(20), target.Generation));
         var releaseWhileMapped = kernel.ReleaseRegion(owner, region);
-        var terminateWhileBound = kernel.TerminateProcess(owner);
+        var terminate = kernel.TerminateProcess(owner);
 
         Assert.False(transferWhileMapped.IsSuccess);
         Assert.Equal(KernelError.PlatformBindingActive, transferWhileMapped.Error);
@@ -258,16 +258,14 @@ public sealed class PlatformAuthorityBridgeTests
         Assert.Equal(KernelError.PlatformBindingActive, loanWhileMapped.Error);
         Assert.False(releaseWhileMapped.IsSuccess);
         Assert.Equal(KernelError.PlatformBindingActive, releaseWhileMapped.Error);
-        Assert.False(terminateWhileBound.IsSuccess);
-        Assert.Equal(KernelError.PlatformBindingActive, terminateWhileBound.Error);
-
-        var revokeMapping = kernel.RevokePlatformRegionMapping(owner, mapping);
-        var revokeDomain = kernel.RevokePlatformDomain(owner, binding);
-        var transferAfterRevoke = kernel.TransferRegion(owner, target, region);
-
-        Assert.True(revokeMapping.IsSuccess, revokeMapping.Message);
-        Assert.True(revokeDomain.IsSuccess, revokeDomain.Message);
-        Assert.True(transferAfterRevoke.IsSuccess, transferAfterRevoke.Message);
+        Assert.True(terminate.IsSuccess, terminate.Message);
+        Assert.Equal(ProcessState.Exited, ownerProcess.State);
+        Assert.Equal(1, provider.RevokeRegionMappingCallCount);
+        Assert.Equal(1, provider.RevokeDomainCallCount);
+        Assert.Equal(KernelError.StaleHandle, kernel.Processes.Resolve(owner).Error);
+        Assert.Equal(
+            RegionState.Released,
+            kernel.Regions.Snapshot().Single(r => r.Handle.RegionId == region.Handle.RegionId).State);
     }
 
     [Fact]

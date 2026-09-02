@@ -11,6 +11,8 @@ public sealed partial class RuntimeKernel
         if (length <= 0) return KernelResult<OwnedBuffer<T>>.Fail(KernelError.InvalidRegionState, "Buffer length must be positive.");
         var resolved = Processes.Resolve(owner);
         if (!resolved.IsSuccess) return KernelResult<OwnedBuffer<T>>.Fail(resolved.Error, resolved.Message!);
+        var effect = EnsureProcessAcceptsNewEffects(resolved.Value!);
+        if (!effect.IsSuccess) return KernelResult<OwnedBuffer<T>>.Fail(effect.Error, effect.Message!);
         if (resolved.Value!.Regions.Count >= resolved.Value.Manifest.ResourceLimits.MaxRegions)
             return KernelResult<OwnedBuffer<T>>.Fail(KernelError.InvalidRegionState, "Region limit exceeded.");
         var bytes = checked((long)length * Unsafe.SizeOf<T>());
@@ -25,6 +27,8 @@ public sealed partial class RuntimeKernel
     {
         var resolved = Processes.Resolve(owner);
         if (!resolved.IsSuccess) return KernelResult<OwnedRegion<T>>.Fail(resolved.Error, resolved.Message!);
+        var effect = EnsureProcessAcceptsNewEffects(resolved.Value!);
+        if (!effect.IsSuccess) return KernelResult<OwnedRegion<T>>.Fail(effect.Error, effect.Message!);
         if (resolved.Value!.Regions.Count >= resolved.Value.Manifest.ResourceLimits.MaxRegions)
             return KernelResult<OwnedRegion<T>>.Fail(KernelError.InvalidRegionState, "Region limit exceeded.");
         var descriptor = Regions.Allocate(new RegionOwner(resolved.Value.DomainId, owner.Generation), Unsafe.SizeOf<T>(), typeof(T).FullName ?? typeof(T).Name);
@@ -38,8 +42,12 @@ public sealed partial class RuntimeKernel
     {
         var sourceProcess = Processes.Resolve(source);
         if (!sourceProcess.IsSuccess) return KernelResult<OwnedBuffer<T>>.Fail(sourceProcess.Error, sourceProcess.Message!);
+        var sourceEffect = EnsureProcessAcceptsNewEffects(sourceProcess.Value!);
+        if (!sourceEffect.IsSuccess) return KernelResult<OwnedBuffer<T>>.Fail(sourceEffect.Error, sourceEffect.Message!);
         var targetProcess = Processes.Resolve(target);
         if (!targetProcess.IsSuccess) return KernelResult<OwnedBuffer<T>>.Fail(targetProcess.Error, targetProcess.Message!);
+        var targetEffect = EnsureProcessAcceptsNewEffects(targetProcess.Value!);
+        if (!targetEffect.IsSuccess) return KernelResult<OwnedBuffer<T>>.Fail(targetEffect.Error, targetEffect.Message!);
         var transferable = (ITransferableOwnedPayload)buffer;
         if (!transferable.IsValidForRuntime) return KernelResult<OwnedBuffer<T>>.Fail(KernelError.InvalidRegionState, "Source ownership token has already been consumed.");
         var oldHandle = buffer.Handle;
@@ -56,6 +64,8 @@ public sealed partial class RuntimeKernel
     {
         var resolved = Processes.Resolve(owner);
         if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+        var effect = EnsureProcessAcceptsNewEffects(resolved.Value!);
+        if (!effect.IsSuccess) return effect;
         var transferable = (ITransferableOwnedPayload)buffer;
         if (!transferable.IsValidForRuntime) return KernelResult.Fail(KernelError.InvalidRegionState, "Ownership token has already been consumed.");
         var handle = buffer.Handle;
@@ -70,8 +80,12 @@ public sealed partial class RuntimeKernel
     {
         var sourceProcess = Processes.Resolve(source);
         if (!sourceProcess.IsSuccess) return KernelResult<OwnedRegion<T>>.Fail(sourceProcess.Error, sourceProcess.Message!);
+        var sourceEffect = EnsureProcessAcceptsNewEffects(sourceProcess.Value!);
+        if (!sourceEffect.IsSuccess) return KernelResult<OwnedRegion<T>>.Fail(sourceEffect.Error, sourceEffect.Message!);
         var targetProcess = Processes.Resolve(target);
         if (!targetProcess.IsSuccess) return KernelResult<OwnedRegion<T>>.Fail(targetProcess.Error, targetProcess.Message!);
+        var targetEffect = EnsureProcessAcceptsNewEffects(targetProcess.Value!);
+        if (!targetEffect.IsSuccess) return KernelResult<OwnedRegion<T>>.Fail(targetEffect.Error, targetEffect.Message!);
         var transferable = (ITransferableOwnedPayload)region;
         if (!transferable.IsValidForRuntime) return KernelResult<OwnedRegion<T>>.Fail(KernelError.InvalidRegionState, "Source ownership token has already been consumed.");
         var oldHandle = region.Handle;
@@ -88,6 +102,8 @@ public sealed partial class RuntimeKernel
     {
         var resolved = Processes.Resolve(owner);
         if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+        var effect = EnsureProcessAcceptsNewEffects(resolved.Value!);
+        if (!effect.IsSuccess) return effect;
         var transferable = (ITransferableOwnedPayload)region;
         if (!transferable.IsValidForRuntime) return KernelResult.Fail(KernelError.InvalidRegionState, "Ownership token has already been consumed.");
         var handle = region.Handle;
@@ -102,6 +118,8 @@ public sealed partial class RuntimeKernel
     {
         var resolved = Processes.Resolve(borrower);
         if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+        var effect = EnsureProcessAcceptsNewEffects(resolved.Value!);
+        if (!effect.IsSuccess) return effect;
         return Regions.ReturnLoan(lease, new RegionOwner(resolved.Value!.DomainId, borrower.Generation));
     }
 
@@ -109,6 +127,8 @@ public sealed partial class RuntimeKernel
     {
         var resolved = Processes.Resolve(owner);
         if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+        var effect = EnsureProcessAcceptsNewEffects(resolved.Value!);
+        if (!effect.IsSuccess) return effect;
         return Regions.RevokeLoan(lease, new RegionOwner(resolved.Value!.DomainId, owner.Generation));
     }
 }

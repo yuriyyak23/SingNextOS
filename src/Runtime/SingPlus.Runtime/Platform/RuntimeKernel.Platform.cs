@@ -13,8 +13,15 @@ public sealed partial class RuntimeKernel
         if (!resolved.IsSuccess)
             return KernelResult<PlatformDomainBinding>.Fail(resolved.Error, resolved.Message!);
 
+        var effect = EnsureProcessAcceptsNewEffects(resolved.Value!);
+        if (!effect.IsSuccess)
+            return KernelResult<PlatformDomainBinding>.Fail(effect.Error, effect.Message!);
+
         var identity = new PlatformDomainIdentity(resolved.Value!.DomainId, subject.Generation);
-        return PlatformAuthority.BindDomain(identity);
+        var binding = PlatformAuthority.BindDomain(identity);
+        if (binding.IsSuccess)
+            TrackPlatformBinding(subject, binding.Value!);
+        return binding;
     }
 
     public KernelResult RevokePlatformDomain(
@@ -25,7 +32,10 @@ public sealed partial class RuntimeKernel
         if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
 
         var identity = new PlatformDomainIdentity(resolved.Value!.DomainId, subject.Generation);
-        return PlatformAuthority.RevokeDomain(binding, identity);
+        var revoke = PlatformAuthority.RevokeDomain(binding, identity);
+        if (revoke.IsSuccess)
+            UntrackPlatformBinding(subject, binding);
+        return revoke;
     }
 
     public KernelResult<PlatformRegionMapping> MapPlatformOwnedRegion(
@@ -45,6 +55,10 @@ public sealed partial class RuntimeKernel
             return KernelResult<PlatformRegionMapping>.Fail(resolved.Error, resolved.Message!);
 
         var process = resolved.Value!;
+        var effect = EnsureProcessAcceptsNewEffects(process);
+        if (!effect.IsSuccess)
+            return KernelResult<PlatformRegionMapping>.Fail(effect.Error, effect.Message!);
+
         var identity = new PlatformDomainIdentity(process.DomainId, owner.Generation);
 
         var bindingValidation = PlatformAuthority.ValidateDomain(binding, identity);
@@ -109,6 +123,7 @@ public sealed partial class RuntimeKernel
             return mapping;
         }
 
+        TrackPlatformMapping(owner, mapping.Value!);
         return mapping;
     }
 
@@ -215,7 +230,10 @@ public sealed partial class RuntimeKernel
         }
 
         if (lifecycle.LocalReservationReleased)
+        {
+            UntrackPlatformMapping(mapping);
             return KernelResult.Ok();
+        }
 
         var bindingValidation = PlatformAuthority.ValidateDomain(
             mapping.DomainBinding,
@@ -237,6 +255,7 @@ public sealed partial class RuntimeKernel
             return markReleased;
         }
 
+        UntrackPlatformMapping(mapping);
         return KernelResult.Ok();
     }
 
