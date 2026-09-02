@@ -43,6 +43,22 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
         DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
+    private static readonly DiagnosticDescriptor BoundedPayloadDiagnostic = new(
+        "SINGGEN005",
+        "Invalid bounded payload shape",
+        "{0}",
+        "SingPlus.Contracts",
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    private static readonly DiagnosticDescriptor BoundedPayloadCardinalityDiagnostic = new(
+        "SINGGEN006",
+        "Unsupported bounded payload cardinality",
+        "{0}",
+        "SingPlus.Contracts",
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
         var contracts = context.SyntaxProvider.ForAttributeWithMetadataName(
@@ -61,7 +77,7 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
 
     private static void EmitContract(SourceProductionContext output, INamedTypeSymbol contract)
     {
-        if (!ValidateOwnershipContract(output, contract)) return;
+        if (!ValidatePayloadContract(output, contract)) return;
         var model = ContractModel.Create(contract);
         var hint = Sanitize(contract.ToDisplayString()) + ".";
         output.AddSource(hint + "Protocol.g.cs", SourceText.From(GenerateProtocol(model), Encoding.UTF8));
@@ -70,17 +86,18 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
         output.AddSource(hint + "Capabilities.g.cs", SourceText.From(GenerateCapabilities(model), Encoding.UTF8));
     }
 
-    private static bool ValidateOwnershipContract(SourceProductionContext output, INamedTypeSymbol contract)
+    private static bool ValidatePayloadContract(SourceProductionContext output, INamedTypeSymbol contract)
     {
         var valid = true;
         foreach (var method in contract.GetMembers().OfType<IMethodSymbol>().Where(static m => m.MethodKind == MethodKind.Ordinary))
         {
             var ownershipParameterCount = 0;
+            var boundedParameterCount = 0;
             foreach (var parameter in method.Parameters)
             {
                 var consumes = HasAttribute(parameter, "ConsumesAttribute");
                 var borrows = HasAttribute(parameter, "BorrowsAttribute");
-                var kind = OwnershipKind(parameter.Type, unwrapAsync: false);
+                var ownershipKind = OwnershipKind(parameter.Type, unwrapAsync: false);
 
                 if (consumes || borrows)
                 {
@@ -90,7 +107,7 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
                         Report(output, OwnershipCardinalityDiagnostic, parameter, $"Parameter '{parameter.Name}' cannot be both Consumes and Borrows.");
                         valid = false;
                     }
-                    if (kind == 0)
+                    if (ownershipKind == 0)
                     {
                         Report(output, OwnershipTypeDiagnostic, parameter, $"Ownership annotation on '{parameter.Name}' requires OwnedBuffer<T> or OwnedRegion<T>.");
                         valid = false;
@@ -101,9 +118,42 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
                         valid = false;
                     }
                 }
-                else if (kind != 0)
+                else if (ownershipKind != 0)
                 {
                     Report(output, OwnershipAnnotationDiagnostic, parameter, $"Ownership parameter '{parameter.Name}' must declare exactly one of Consumes or Borrows.");
+                    valid = false;
+                }
+
+                var boundedAttribute = BoundedPayloadAttribute(parameter.Type);
+                var implementsBoundedPayload = ImplementsBoundedPayload(parameter.Type);
+                if (boundedAttribute is not null)
+                {
+                    boundedParameterCount++;
+                    var maxBytes = BoundedPayloadMaxBytes(boundedAttribute);
+                    if (maxBytes <= 0)
+                    {
+                        Report(output, BoundedPayloadDiagnostic, parameter, $"Bounded payload '{parameter.Name}' must declare a positive MaxBytes value.");
+                        valid = false;
+                    }
+                    if (!implementsBoundedPayload)
+                    {
+                        Report(output, BoundedPayloadDiagnostic, parameter, $"Bounded payload '{parameter.Name}' must implement SingPlus.Contracts.IBoundedPayload.");
+                        valid = false;
+                    }
+                    if (parameter.RefKind != RefKind.None)
+                    {
+                        Report(output, BoundedPayloadDiagnostic, parameter, $"Bounded payload '{parameter.Name}' cannot use ref, in, or out passing.");
+                        valid = false;
+                    }
+                    if (parameter.Type is not INamedTypeSymbol namedBounded || !HasStableRuntimeTypeName(namedBounded))
+                    {
+                        Report(output, BoundedPayloadDiagnostic, parameter, $"Bounded payload '{parameter.Name}' must be a non-generic named value type so runtime shape identity is stable.");
+                        valid = false;
+                    }
+                }
+                else if (implementsBoundedPayload)
+                {
+                    Report(output, BoundedPayloadDiagnostic, parameter, $"IBoundedPayload parameter '{parameter.Name}' must declare BoundedPayload(MaxBytes) on its value type.");
                     valid = false;
                 }
             }
@@ -111,6 +161,22 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
             if (ownershipParameterCount > 1)
             {
                 Report(output, OwnershipCardinalityDiagnostic, method, $"Message '{method.Name}' has {ownershipParameterCount} ownership-bearing parameters, but the current channel transport supports exactly one payload slot.");
+                valid = false;
+            }
+
+            if (boundedParameterCount > 1)
+            {
+                Report(output, BoundedPayloadCardinalityDiagnostic, method, $"Message '{method.Name}' has {boundedParameterCount} bounded payload parameters, but the current channel transport supports exactly one payload slot.");
+                valid = false;
+            }
+            if (boundedParameterCount == 1 && method.Parameters.Length != 1)
+            {
+                Report(output, BoundedPayloadCardinalityDiagnostic, method, $"Bounded payload message '{method.Name}' must have exactly one parameter because the current channel transport has one payload slot.");
+                valid = false;
+            }
+            if (boundedParameterCount != 0 && ownershipParameterCount != 0)
+            {
+                Report(output, BoundedPayloadCardinalityDiagnostic, method, $"Message '{method.Name}' cannot combine bounded and ownership-bearing payload parameters in one channel payload slot.");
                 valid = false;
             }
 
@@ -153,8 +219,50 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
         return 0;
     }
 
+    private static AttributeData? BoundedPayloadAttribute(ITypeSymbol type) =>
+        type.GetAttributes().FirstOrDefault(static a => a.AttributeClass?.Name == "BoundedPayloadAttribute" && a.AttributeClass.ContainingNamespace.ToDisplayString() == "SingPlus.Sip.Sdk");
+
+    private static int BoundedPayloadMaxBytes(AttributeData attribute) =>
+        attribute.ConstructorArguments.Length == 0 || attribute.ConstructorArguments[0].Value is null
+            ? 0
+            : Convert.ToInt32(attribute.ConstructorArguments[0].Value, CultureInfo.InvariantCulture);
+
+    private static bool ImplementsBoundedPayload(ITypeSymbol type) =>
+        type.AllInterfaces.Any(static i => i.Name == "IBoundedPayload" && i.ContainingNamespace.ToDisplayString() == "SingPlus.Contracts");
+
+    private static bool HasStableRuntimeTypeName(INamedTypeSymbol type)
+    {
+        for (INamedTypeSymbol? current = type; current is not null; current = current.ContainingType)
+        {
+            if (current.Arity != 0) return false;
+        }
+        return true;
+    }
+
+    private static string RuntimeTypeName(INamedTypeSymbol type)
+    {
+        var names = new Stack<string>();
+        for (INamedTypeSymbol? current = type; current is not null; current = current.ContainingType) names.Push(current.MetadataName);
+        var namespaceName = type.ContainingNamespace.IsGlobalNamespace ? string.Empty : type.ContainingNamespace.ToDisplayString();
+        return (string.IsNullOrEmpty(namespaceName) ? string.Empty : namespaceName + ".") + string.Join("+", names);
+    }
+
     private static void AppendOwnershipKind(StringBuilder builder, int kind) =>
         builder.Append("(global::SingPlus.Contracts.OwnershipPayloadKind)").Append(kind.ToString(CultureInfo.InvariantCulture));
+
+    private static void AppendBoundedPayload(StringBuilder builder, BoundedPayloadModel? boundedPayload)
+    {
+        if (boundedPayload is null)
+        {
+            builder.Append("null");
+            return;
+        }
+
+        builder.Append("new global::SingPlus.Contracts.BoundedPayloadDescriptorV1(")
+            .Append(Literal(boundedPayload.ParameterName)).Append(", ")
+            .Append(Literal(boundedPayload.TypeName)).Append(", ")
+            .Append(boundedPayload.MaxBytes.ToString(CultureInfo.InvariantCulture)).Append(')');
+    }
 
     private static string GenerateProtocol(ContractModel model)
     {
@@ -183,6 +291,8 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
             AppendOwnershipKind(b, message.OwnershipPayloadKind);
             b.Append(", ");
             AppendOwnershipKind(b, message.ReturnOwnershipPayloadKind);
+            b.Append(", ");
+            AppendBoundedPayload(b, message.BoundedPayload);
             b.AppendLine("),");
         }
         b.AppendLine("        },");
@@ -245,6 +355,8 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
             var canonical = string.Join(";", message.Capabilities.Select(static c => c.Kind + ":" + c.ResourceId + ":" + c.Rights));
             b.Append("    public const string ").Append(message.Name).Append(" = ").Append(Literal(canonical)).AppendLine(";");
             b.Append("    public const string ").Append(message.Name).Append("_Ownership = ").Append(Literal("Consumes=" + string.Join(",", message.Consumes) + ";Borrows=" + string.Join(",", message.Borrows) + ";InputKind=" + message.OwnershipPayloadKind.ToString(CultureInfo.InvariantCulture) + ";Returns=" + (message.ReturnsOwnership ? "1" : "0") + ";ReturnKind=" + message.ReturnOwnershipPayloadKind.ToString(CultureInfo.InvariantCulture))).AppendLine(";");
+            var bounded = message.BoundedPayload;
+            b.Append("    public const string ").Append(message.Name).Append("_BoundedPayload = ").Append(Literal(bounded is null ? string.Empty : "Parameter=" + bounded.ParameterName + ";Type=" + bounded.TypeName + ";MaxBytes=" + bounded.MaxBytes.ToString(CultureInfo.InvariantCulture))).AppendLine(";");
         }
         b.AppendLine("}");
         return b.ToString();
@@ -308,6 +420,8 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
                 lines.Add("message=" + m.Id.ToString(CultureInfo.InvariantCulture) + "|" + m.Name + "|" + m.ReturnType + "|" + string.Join(",", m.Parameters.Select(static p => p.Type + " " + p.Name)));
                 lines.Add("cap=" + m.Id.ToString(CultureInfo.InvariantCulture) + "|" + string.Join(";", m.Capabilities.Select(static c => c.Kind + ":" + c.ResourceId + ":" + c.Rights)));
                 lines.Add("ownership=" + m.Id.ToString(CultureInfo.InvariantCulture) + "|" + string.Join(",", m.Consumes) + "|" + string.Join(",", m.Borrows) + "|" + m.OwnershipPayloadKind.ToString(CultureInfo.InvariantCulture) + "|" + (m.ReturnsOwnership ? "1" : "0") + "|" + m.ReturnOwnershipPayloadKind.ToString(CultureInfo.InvariantCulture));
+                var bounded = m.BoundedPayload;
+                lines.Add("bounded=" + m.Id.ToString(CultureInfo.InvariantCulture) + "|" + (bounded is null ? "||0" : bounded.ParameterName + "|" + bounded.TypeName + "|" + bounded.MaxBytes.ToString(CultureInfo.InvariantCulture)));
             }
             lines.AddRange(transitions.Select(static t => "transition=" + t.MessageId.ToString(CultureInfo.InvariantCulture) + "|" + t.From + "|" + t.To));
             return string.Join("\n", lines);
@@ -326,6 +440,7 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
         public bool ReturnsOwnership { get; private set; }
         public int OwnershipPayloadKind { get; private set; }
         public int ReturnOwnershipPayloadKind { get; private set; }
+        public BoundedPayloadModel? BoundedPayload { get; private set; }
         public IReadOnlyList<TransitionModel> Transitions { get; private set; } = Array.Empty<TransitionModel>();
 
         public static MessageModel Create(IMethodSymbol method, string initial)
@@ -342,6 +457,19 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
             var consumes = method.Parameters.Where(static p => p.GetAttributes().Any(static a => a.AttributeClass?.Name == "ConsumesAttribute")).Select(static p => p.Name).OrderBy(static p => p, StringComparer.Ordinal).ToArray();
             var borrows = method.Parameters.Where(static p => p.GetAttributes().Any(static a => a.AttributeClass?.Name == "BorrowsAttribute")).Select(static p => p.Name).OrderBy(static p => p, StringComparer.Ordinal).ToArray();
             var ownershipParameter = method.Parameters.FirstOrDefault(static p => p.GetAttributes().Any(static a => a.AttributeClass?.Name is "ConsumesAttribute" or "BorrowsAttribute"));
+            BoundedPayloadModel? boundedPayload = null;
+            foreach (var parameter in method.Parameters)
+            {
+                var boundedAttribute = BoundedPayloadAttribute(parameter.Type);
+                if (boundedAttribute is null || parameter.Type is not INamedTypeSymbol boundedType) continue;
+                boundedPayload = new BoundedPayloadModel
+                {
+                    ParameterName = parameter.Name,
+                    TypeName = RuntimeTypeName(boundedType),
+                    MaxBytes = BoundedPayloadMaxBytes(boundedAttribute)
+                };
+                break;
+            }
             var transitionAttributes = method.GetAttributes().Where(static a => a.AttributeClass?.Name == "TransitionAttribute").ToArray();
             var transitions = transitionAttributes.Length == 0 ? new[] { new TransitionModel { MessageId = id, From = initial, To = initial } } : transitionAttributes.Select(a => new TransitionModel { MessageId = id, From = (string?)a.ConstructorArguments[0].Value ?? initial, To = (string?)a.ConstructorArguments[1].Value ?? initial }).ToArray();
             return new MessageModel
@@ -356,6 +484,7 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
                 ReturnsOwnership = method.GetAttributes().Any(static a => a.AttributeClass?.Name == "ReturnsOwnershipAttribute"),
                 OwnershipPayloadKind = ownershipParameter is null ? 0 : OwnershipKind(ownershipParameter.Type, unwrapAsync: false),
                 ReturnOwnershipPayloadKind = OwnershipKind(method.ReturnType, unwrapAsync: true),
+                BoundedPayload = boundedPayload,
                 Transitions = transitions
             };
         }
@@ -363,6 +492,7 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
 
     private sealed class ParameterModel { public string Name { get; set; } = string.Empty; public string Type { get; set; } = string.Empty; }
     private sealed class CapabilityModel { public int Kind { get; set; } public string ResourceId { get; set; } = string.Empty; public int Rights { get; set; } }
+    private sealed class BoundedPayloadModel { public string ParameterName { get; set; } = string.Empty; public string TypeName { get; set; } = string.Empty; public int MaxBytes { get; set; } }
     private sealed class TransitionModel { public uint MessageId { get; set; } public string From { get; set; } = string.Empty; public string To { get; set; } = string.Empty; }
 
     private static string? AttributeString(INamedTypeSymbol symbol, string attributeName)
