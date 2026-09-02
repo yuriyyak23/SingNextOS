@@ -319,7 +319,7 @@ public sealed class PlatformRevocationLifecycleTests
         return capability.Value!.CapabilityId;
     }
 
-    private enum ReceiptMutation
+    public enum ReceiptMutation
     {
         None = 0,
         StaleGeneration,
