@@ -33,6 +33,7 @@ public enum KernelError
     PlatformDenied,
     PlatformBindingNotFound,
     PlatformBindingRevoked,
+    PlatformBindingDraining,
     PlatformBindingActive,
     WrongPlatformDomain,
     PlatformFaulted

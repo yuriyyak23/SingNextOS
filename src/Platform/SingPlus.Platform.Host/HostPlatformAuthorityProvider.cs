@@ -20,15 +20,21 @@ public sealed class HostPlatformAuthorityProvider : IPlatformAuthorityProvider
     private readonly Dictionary<PlatformProviderRegionMappingId, MappingRecord> _mappings = [];
     private readonly Dictionary<PlatformDomainIdentity, PlatformProviderDomainLeaseId> _activeSubjects = [];
     private readonly Dictionary<PlatformRegionIdentity, PlatformProviderRegionMappingId> _activeRegions = [];
+    private readonly PlatformAuthorityStatus? _regionRevocationFailure;
     private ulong _nextDomainId = 1;
     private ulong _nextMappingId = 1;
 
     public HostPlatformAuthorityProvider(
         PlatformAuthorityFeatures features =
             PlatformAuthorityFeatures.NeutralDomainBinding |
-            PlatformAuthorityFeatures.DirectOwnedRegionMapping)
+            PlatformAuthorityFeatures.DirectOwnedRegionMapping,
+        PlatformAuthorityStatus? regionRevocationFailure = null)
     {
-        Descriptor = new PlatformProviderDescriptor("host-test", 1, features);
+        if (regionRevocationFailure == PlatformAuthorityStatus.Success)
+            throw new ArgumentOutOfRangeException(nameof(regionRevocationFailure));
+
+        _regionRevocationFailure = regionRevocationFailure;
+        Descriptor = new PlatformProviderDescriptor("host-test", 2, features);
     }
 
     public PlatformProviderDescriptor Descriptor { get; }
@@ -37,6 +43,7 @@ public sealed class HostPlatformAuthorityProvider : IPlatformAuthorityProvider
     public int RevokeDomainCallCount { get; private set; }
     public int MapOwnedRegionCallCount { get; private set; }
     public int RevokeRegionMappingCallCount { get; private set; }
+    public PlatformRegionRevocationPolicy? LastRegionRevocationPolicy { get; private set; }
 
     public PlatformAuthorityResult<PlatformProviderDomainLease> BindDomain(PlatformDomainIdentity subject)
     {
@@ -139,9 +146,17 @@ public sealed class HostPlatformAuthorityProvider : IPlatformAuthorityProvider
         return PlatformAuthorityResult<PlatformProviderRegionMappingLease>.Ok(lease);
     }
 
-    public PlatformAuthorityResult RevokeRegionMapping(PlatformProviderRegionMappingLease mapping)
+    public PlatformAuthorityResult RevokeRegionMapping(
+        PlatformProviderRegionMappingLease mapping,
+        PlatformRegionRevocationPolicy policy)
     {
         RevokeRegionMappingCallCount++;
+        LastRegionRevocationPolicy = policy;
+
+        if (policy != PlatformRegionRevocationPolicy.DrainBeforeRevoke)
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.Unsupported,
+                "The host provider only supports drain-before-revoke semantics.");
 
         if (!_mappings.TryGetValue(mapping.MappingId, out var record))
             return PlatformAuthorityResult.Fail(
@@ -162,6 +177,11 @@ public sealed class HostPlatformAuthorityProvider : IPlatformAuthorityProvider
             return PlatformAuthorityResult.Fail(
                 PlatformAuthorityStatus.Revoked,
                 "The platform mapping has already been revoked.");
+
+        if (_regionRevocationFailure is { } failure)
+            return PlatformAuthorityResult.Fail(
+                failure,
+                "The host provider was configured to fail region drain/revocation.");
 
         record.Revoked = true;
         _activeRegions.Remove(record.Lease.Region);

@@ -126,8 +126,13 @@ public sealed partial class RuntimeKernel
     public KernelResult RevokeCapability(CapabilityId capabilityId)
     {
         var result = CapabilityAuthority.Revoke(capabilityId);
-        if (result.IsSuccess) foreach (var process in Processes.Snapshot()) process.RemoveCapability(capabilityId);
-        return result;
+        if (!result.IsSuccess) return result;
+
+        foreach (var process in Processes.Snapshot())
+            process.RemoveCapability(capabilityId);
+
+        var cascade = CascadePlatformCapabilityRevocation(capabilityId);
+        return cascade.IsSuccess ? result : cascade;
     }
 
     private KernelResult Transition(ProcessHandle handle, ProcessState from, ProcessState to)
