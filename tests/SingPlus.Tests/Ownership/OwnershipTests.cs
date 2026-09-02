@@ -138,4 +138,41 @@ public sealed class OwnershipTests
         Assert.Equal(RegionState.Released, Assert.Single(kernel.Regions.Snapshot()).State);
         Assert.Throws<InvalidOperationException>(() => _ = buffer.Length);
     }
+
+    [Fact]
+    public void TerminationInvalidatesBufferMovedLocallyWithinDomain()
+    {
+        var kernel = new RuntimeKernel();
+        var (_, owner) = TestFixtures.Create(kernel, 1, 10);
+        var buffer = kernel.AllocateBuffer<int>(owner, 1).Value!;
+        buffer.Span[0] = 99;
+        var moved = buffer.Move();
+
+        Assert.True(moved.IsValid);
+        Assert.Equal(99, moved.Span[0]);
+
+        var terminated = kernel.TerminateProcess(owner);
+
+        Assert.True(terminated.IsSuccess, terminated.Message);
+        Assert.False(moved.IsValid);
+        Assert.Throws<InvalidOperationException>(() => _ = moved.Length);
+    }
+
+    [Fact]
+    public void TerminationInvalidatesRegionMovedLocallyWithinDomain()
+    {
+        var kernel = new RuntimeKernel();
+        var (_, owner) = TestFixtures.Create(kernel, 1, 10);
+        var region = kernel.AllocateRegion(owner, 123).Value!;
+        var moved = region.Move();
+
+        Assert.True(moved.IsValid);
+        Assert.Equal(123, moved.Value);
+
+        var terminated = kernel.TerminateProcess(owner);
+
+        Assert.True(terminated.IsSuccess, terminated.Message);
+        Assert.False(moved.IsValid);
+        Assert.Throws<InvalidOperationException>(() => _ = moved.Value);
+    }
 }

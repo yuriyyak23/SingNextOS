@@ -15,6 +15,7 @@ public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanag
     private sealed class Storage(T[] data)
     {
         public T[] Data { get; } = data;
+        public bool IsAlive { get; set; } = true;
     }
 
     private readonly Storage _storage;
@@ -32,7 +33,7 @@ public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanag
     }
 
     public RegionHandle Handle { get; private set; }
-    public bool IsValid => _valid;
+    public bool IsValid => _valid && _storage.IsAlive;
     public int Length
     {
         get
@@ -71,7 +72,7 @@ public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanag
         return _storage.Data.AsSpan();
     }
 
-    bool ITransferableOwnedPayload.IsValidForRuntime => _valid;
+    bool ITransferableOwnedPayload.IsValidForRuntime => IsValid;
 
     object ITransferableOwnedPayload.TransferForRuntime(RegionHandle newHandle)
     {
@@ -81,11 +82,15 @@ public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanag
         return transferred;
     }
 
-    void ITransferableOwnedPayload.InvalidateForRuntime() => _valid = false;
+    void ITransferableOwnedPayload.InvalidateForRuntime()
+    {
+        _valid = false;
+        _storage.IsAlive = false;
+    }
 
     private void EnsureValid()
     {
-        if (!_valid) throw new InvalidOperationException("OwnedBuffer has been moved, transferred, released, or reclaimed.");
+        if (!IsValid) throw new InvalidOperationException("OwnedBuffer has been moved, transferred, released, or reclaimed.");
     }
 }
 
