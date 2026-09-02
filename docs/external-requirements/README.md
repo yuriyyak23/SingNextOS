@@ -14,4 +14,17 @@ Each requirement uses this format:
 - **SingNextOS component blocked**
 - **Fallback/mock used**
 
+## Current requirements
+
+| ID | Scope |
+|---|---|
+| [`EXT-HCPU-001`](EXT-HCPU-001.md) | external HybridCPU AOT/image/ISE qualification |
+| [`EXT-HCPU-002`](EXT-HCPU-002.md) | platform console/timer/MMIO/IRQ/DMA HAL bindings |
+| [`EXT-HCPU-003`](EXT-HCPU-003.md) | neutral execution/memory/I/O domain binding |
+| [`EXT-HCPU-004`](EXT-HCPU-004.md) | owned-region mapping, revocation and DMA/direct-access binding |
+| [`EXT-HCPU-005`](EXT-HCPU-005.md) | scoped MatrixTile/DSC1/L7 compute provider bindings |
+| [`EXT-HCPU-006`](EXT-HCPU-006.md) | virtualization/nested/evidence/SecureCompute feature discovery |
+
+The architecture rationale for `EXT-HCPU-003` through `EXT-HCPU-006` is documented in `docs/whitebook/hybridcpu-ise/`.
+
 Local Definition of Done remains limited to SingNextOS architecture + contracts + verifier + runtime semantics. End-to-end `SingNextOS -> HybridCPU AOT -> HybridCPU image -> ISE` qualification is a separate integration stage.

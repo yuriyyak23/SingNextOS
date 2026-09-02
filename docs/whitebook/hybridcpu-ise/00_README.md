@@ -12,7 +12,7 @@
 
 ## Source corpus
 
-Аудит выполнен по фактическим `master`-состояниям двух репозиториев и по прежней приложенной Белой книге Singularity+.
+Аудит выполнен по фактическим `master`-состояниям двух репозиториев, по прежней приложенной Белой книге Singularity+ и по дополнительному внешнему архитектурному аудиту идей zero-copy/SMT/Assist/L7.
 
 HybridCPU-v2 источники:
 
@@ -32,6 +32,8 @@ SingNextOS источники:
 - `docs/external-requirements/**`
 
 Исторический источник идей: приложенная пользователем 7-страничная Белая книга Singularity+, где исходное видение объединяло ownership, SIP, capability security, firmware-level hypervisor, manifest-driven drivers, heterogeneous compute и .NET-подобный API. Этот документ используется как vision-source, но не как описание текущего состояния кода.
+
+Дополнительный внешний аудит используется как research input. Его сильные утверждения сверяются с текущими HybridCPU docs; unsupported claims не импортируются как present-tense факты.
 
 ## Status vocabulary
 
@@ -55,6 +57,7 @@ SingNextOS источники:
 8. [`08_DELTA_FROM_PREVIOUS_WHITEBOOK.md`](08_DELTA_FROM_PREVIOUS_WHITEBOOK.md)
 9. [`09_DEVELOPMENT_DIRECTION.md`](09_DEVELOPMENT_DIRECTION.md)
 10. [`10_SOURCE_AND_TRACEABILITY.md`](10_SOURCE_AND_TRACEABILITY.md)
+11. [`11_EXTERNAL_AUDIT_CLAIM_REVIEW.md`](11_EXTERNAL_AUDIT_CLAIM_REVIEW.md)
 
 ## Normative architectural rules
 
