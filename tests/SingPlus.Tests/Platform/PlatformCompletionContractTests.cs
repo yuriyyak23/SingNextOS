@@ -138,16 +138,32 @@ public sealed class PlatformCompletionContractTests
 
     [Fact]
     [Trait("Category", "Runtime")]
+    public void StaleReceiptGenerationCannotValidateForOperation()
+    {
+        var provider = new HostPlatformAuthorityProvider();
+        var operation = provider.StageOperation(Bind(provider, 10, 1)).Value!;
+        var current = provider.ObserveCompletion(operation).Value!;
+        var stale = current with
+        {
+            Generation = new PlatformOperationGeneration(current.Generation.Value + 1)
+        };
+
+        var validation = provider.ValidateCompletionReceipt(operation, stale);
+
+        Assert.False(validation.IsSuccess);
+        Assert.Equal(PlatformAuthorityStatus.Stale, validation.Status);
+    }
+
+    [Fact]
+    [Trait("Category", "Runtime")]
     public void WrongDomainReceiptCannotValidateForOperation()
     {
         var provider = new HostPlatformAuthorityProvider();
         var leftLease = Bind(provider, 10, 1);
         var rightLease = Bind(provider, 20, 2);
         var operation = provider.StageOperation(leftLease).Value!;
-        var receipt = provider.ObserveCompletion(operation).Value! with
-        {
-            DomainLease = rightLease
-        };
+        var current = provider.ObserveCompletion(operation).Value!;
+        var receipt = current with { DomainLease = rightLease };
 
         var validation = provider.ValidateCompletionReceipt(operation, receipt);
 
