@@ -1,17 +1,23 @@
-using SingPlus.Contracts;
-using SingPlus.Runtime;
+using SingPlus.Kernel;
+using SingPlus.Kernel.Hal;
 
 namespace SingPlus.Tests;
 
 public sealed class ArchitectureTests
 {
     [Fact]
-    public void RuntimeCreatesProcessFromManifest()
+    [Trait("Category", "Runtime")]
+    public void KernelBusinessLogicUsesHalContract()
     {
-        var manifest = new SingProcessManifest(new ProcessId(1), new DomainId(1), MemoryProfile.SipRegion);
+        var console = new RecordingConsole();
+        KernelConsole.Configure(console);
+        Assert.Equal(0, KernelEntryPoint.Run());
+        Assert.Equal("Sing+\r\n", console.Text);
+    }
 
-        var process = new RuntimeKernel().CreateProcess(manifest);
-
-        Assert.Equal(manifest, process.Manifest);
+    private sealed class RecordingConsole : IKernelConsole
+    {
+        public string Text { get; private set; } = string.Empty;
+        public void Write(ReadOnlySpan<char> text) => Text += text.ToString();
     }
 }

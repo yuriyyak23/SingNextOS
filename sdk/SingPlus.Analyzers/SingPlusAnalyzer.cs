@@ -11,18 +11,19 @@ namespace SingPlus.Analyzers;
 public sealed class SingPlusAnalyzer : DiagnosticAnalyzer
 {
     private static readonly DiagnosticDescriptor ManagedAllocation = Rule("SING1001", "Managed allocation is forbidden", "'{0}' performs a managed allocation under KernelNoHeap", "Profile/NoHeap");
-    private static readonly DiagnosticDescriptor CapturingClosure = Rule("SING1002", "Capturing closure is forbidden", "Capturing lambdas or local functions are forbidden under KernelNoHeap", "Profile/NoHeap");
+    private static readonly DiagnosticDescriptor CapturingClosure = Rule("SING1002", "Capturing closure is forbidden", "Capturing lambdas or closures are forbidden under KernelNoHeap", "Profile/NoHeap");
     private static readonly DiagnosticDescriptor DynamicCode = Rule("SING1003", "dynamic is forbidden", "dynamic dispatch is forbidden under KernelNoHeap", "Profile/NoHeap");
     private static readonly DiagnosticDescriptor ForbiddenApi = Rule("SING1004", "Runtime/host API is forbidden", "API '{0}' is forbidden under KernelNoHeap", "Profile/NoHeap");
     private static readonly DiagnosticDescriptor Boxing = Rule("SING1005", "Boxing is forbidden", "Boxing conversion to '{0}' is forbidden under KernelNoHeap", "Profile/NoHeap");
-    private static readonly DiagnosticDescriptor BorrowEscape = Rule("SING2001", "Borrow may escape its owner", "BorrowedSpan values must not be returned from a method", "Ownership");
+    private static readonly DiagnosticDescriptor BorrowEscape = Rule("SING2001", "Borrow may escape its owner", "BorrowedSpan values must not escape through return", "Ownership");
     private static readonly DiagnosticDescriptor UseAfterMove = Rule("SING2002", "Ownership token used after move", "'{0}' is referenced after Move() consumed its ownership token", "Ownership");
     private static readonly DiagnosticDescriptor ContractMessage = Rule("SING3001", "Invalid SIP contract message", "SIP contract method '{0}' must declare a unique [Message(id)]", "IPC contracts");
+    private static readonly DiagnosticDescriptor UnsupportedContractType = Rule("SING3002", "Unsupported SIP contract payload", "Contract member '{0}' uses an unsupported or unbounded payload type", "IPC contracts");
     private static readonly DiagnosticDescriptor SelfMint = Rule("SING4001", "Capability minting is authority-only", "SIP/driver code cannot call capability authority method '{0}'", "Capabilities");
     private static readonly DiagnosticDescriptor NondeterministicArtifact = Rule("SING5001", "Nondeterministic input is forbidden", "API '{0}' is forbidden in deterministic Sing+ artifacts", "Deterministic manifests");
 
     public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics =>
-        [ManagedAllocation, CapturingClosure, DynamicCode, ForbiddenApi, Boxing, BorrowEscape, UseAfterMove, ContractMessage, SelfMint, NondeterministicArtifact];
+        [ManagedAllocation, CapturingClosure, DynamicCode, ForbiddenApi, Boxing, BorrowEscape, UseAfterMove, ContractMessage, UnsupportedContractType, SelfMint, NondeterministicArtifact];
 
     public override void Initialize(AnalysisContext context)
     {
@@ -31,6 +32,7 @@ public sealed class SingPlusAnalyzer : DiagnosticAnalyzer
         context.RegisterOperationAction(AnalyzeAllocation, OperationKind.ObjectCreation, OperationKind.AnonymousObjectCreation, OperationKind.ArrayCreation);
         context.RegisterOperationAction(AnalyzeConversion, OperationKind.Conversion);
         context.RegisterOperationAction(AnalyzeInvocation, OperationKind.Invocation);
+        context.RegisterOperationAction(AnalyzeProperty, OperationKind.PropertyReference);
         context.RegisterSyntaxNodeAction(AnalyzeLambda, SyntaxKind.SimpleLambdaExpression, SyntaxKind.ParenthesizedLambdaExpression, SyntaxKind.AnonymousMethodExpression);
         context.RegisterSyntaxNodeAction(AnalyzeDynamic, SyntaxKind.IdentifierName);
         context.RegisterSyntaxNodeAction(AnalyzeBorrowReturn, SyntaxKind.ReturnStatement);
@@ -64,8 +66,8 @@ public sealed class SingPlusAnalyzer : DiagnosticAnalyzer
 
     private static void AnalyzeLambda(SyntaxNodeAnalysisContext context)
     {
-        if (!IsKernelNoHeap(context.Options)) return;
-        var flow = context.SemanticModel.AnalyzeDataFlow(context.Node);
+        if (!IsKernelNoHeap(context.Options) || context.Node is not ExpressionSyntax expression) return;
+        var flow = context.SemanticModel.AnalyzeDataFlow(expression);
         if (flow.Succeeded && flow.CapturedInside.Length != 0) context.ReportDiagnostic(Diagnostic.Create(CapturingClosure, context.Node.GetLocation()));
     }
 
@@ -90,14 +92,23 @@ public sealed class SingPlusAnalyzer : DiagnosticAnalyzer
         if (IsNondeterministic(containingType, method.Name)) context.ReportDiagnostic(Diagnostic.Create(NondeterministicArtifact, invocation.Syntax.GetLocation(), api));
     }
 
+    private static void AnalyzeProperty(OperationAnalysisContext context)
+    {
+        var property = (IPropertyReferenceOperation)context.Operation;
+        var containingType = property.Property.ContainingType?.ToDisplayString() ?? string.Empty;
+        var name = property.Property.Name;
+        if ((containingType == "System.DateTime" && (name == "Now" || name == "UtcNow")) || (containingType == "System.Environment" && (name == "MachineName" || name == "CurrentDirectory")))
+            context.ReportDiagnostic(Diagnostic.Create(NondeterministicArtifact, property.Syntax.GetLocation(), containingType + "." + name));
+    }
+
     private static bool IsForbiddenKernelApi(string type, string ns, string method) => type == "System.Console" || type == "System.Environment" || type == "System.GC" || type == "System.Activator" || type == "System.Threading.ThreadPool" || type == "System.Threading.Tasks.Task" || type == "System.Diagnostics.Process" || (type == "System.Delegate" && method == "CreateDelegate") || ns.StartsWith("System.IO", StringComparison.Ordinal) || ns.StartsWith("System.Net", StringComparison.Ordinal) || ns.StartsWith("System.Reflection", StringComparison.Ordinal) || ns.StartsWith("System.Linq.Expressions", StringComparison.Ordinal);
 
-    private static bool IsNondeterministic(string type, string method) => (type == "System.Guid" && method == "NewGuid") || type == "System.Random" || (type == "System.DateTime" && (method == "get_Now" || method == "get_UtcNow")) || (type == "System.Environment" && (method == "get_MachineName" || method == "get_CurrentDirectory"));
+    private static bool IsNondeterministic(string type, string method) => (type == "System.Guid" && method == "NewGuid") || type == "System.Random";
 
     private static void AnalyzeBorrowReturn(SyntaxNodeAnalysisContext context)
     {
         var statement = (ReturnStatementSyntax)context.Node;
-        if (statement.Expression is null) return;
+        if (statement.Expression is not IdentifierNameSyntax) return;
         var type = context.SemanticModel.GetTypeInfo(statement.Expression, context.CancellationToken).Type;
         if (type?.Name == "BorrowedSpan") context.ReportDiagnostic(Diagnostic.Create(BorrowEscape, statement.GetLocation()));
     }
@@ -116,12 +127,29 @@ public sealed class SingPlusAnalyzer : DiagnosticAnalyzer
     {
         var type = (INamedTypeSymbol)context.Symbol;
         if (type.TypeKind != TypeKind.Interface || !type.GetAttributes().Any(static a => a.AttributeClass?.Name == "SipContractAttribute")) return;
+        if (type.Arity != 0) context.ReportDiagnostic(Diagnostic.Create(UnsupportedContractType, type.Locations.FirstOrDefault(), type.Name));
         var ids = new HashSet<int>();
         foreach (var method in type.GetMembers().OfType<IMethodSymbol>().Where(static m => m.MethodKind == MethodKind.Ordinary))
         {
             var message = method.GetAttributes().FirstOrDefault(static a => a.AttributeClass?.Name == "MessageAttribute");
             var valid = message is not null && message.ConstructorArguments.Length == 1 && message.ConstructorArguments[0].Value is int id && id > 0 && ids.Add(id);
             if (!valid) context.ReportDiagnostic(Diagnostic.Create(ContractMessage, method.Locations.FirstOrDefault(), method.Name));
+            if (!method.ReturnsVoid && !IsSupportedContractType(method.ReturnType)) context.ReportDiagnostic(Diagnostic.Create(UnsupportedContractType, method.Locations.FirstOrDefault(), method.Name));
+            foreach (var parameter in method.Parameters)
+            {
+                var consumes = parameter.GetAttributes().Any(static a => a.AttributeClass?.Name == "ConsumesAttribute");
+                var borrows = parameter.GetAttributes().Any(static a => a.AttributeClass?.Name == "BorrowsAttribute");
+                if (parameter.RefKind != RefKind.None || !IsSupportedContractType(parameter.Type) || (consumes && borrows))
+                    context.ReportDiagnostic(Diagnostic.Create(UnsupportedContractType, parameter.Locations.FirstOrDefault(), method.Name + "." + parameter.Name));
+            }
         }
+    }
+
+    private static bool IsSupportedContractType(ITypeSymbol type)
+    {
+        if (type.TypeKind == TypeKind.Enum) return true;
+        if (type.SpecialType is SpecialType.System_Boolean or SpecialType.System_Byte or SpecialType.System_SByte or SpecialType.System_Int16 or SpecialType.System_UInt16 or SpecialType.System_Int32 or SpecialType.System_UInt32 or SpecialType.System_Int64 or SpecialType.System_UInt64 or SpecialType.System_Char or SpecialType.System_Single or SpecialType.System_Double or SpecialType.System_Decimal) return true;
+        if (type is INamedTypeSymbol named && named.Name is "OwnedBuffer" or "OwnedRegion") return true;
+        return type.GetAttributes().Any(static a => a.AttributeClass?.Name == "BoundedPayloadAttribute");
     }
 }
