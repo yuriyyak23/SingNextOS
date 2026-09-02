@@ -14,7 +14,7 @@ public sealed class PlatformOwnedRegionMappingV2Tests
         var kernel = new RuntimeKernel(provider);
         var (_, owner) = TestFixtures.Create(kernel, 701, 710);
         var (_, other) = TestFixtures.Create(kernel, 702, 720);
-        var region = kernel.AllocateRegion(owner, 128).Value!;
+        var region = kernel.AllocateBuffer<byte>(owner, 128).Value!;
         var binding = kernel.BindPlatformDomain(owner).Value!;
         var capability = MintRegionCapability(kernel, owner, region.Handle,
             CapabilityRights.Map | CapabilityRights.Read);
@@ -47,7 +47,7 @@ public sealed class PlatformOwnedRegionMappingV2Tests
         var kernel = new RuntimeKernel(provider);
         var (_, owner) = TestFixtures.Create(kernel, 703, 730);
         var (_, target) = TestFixtures.Create(kernel, 704, 740);
-        var region = kernel.AllocateRegion(owner, 4096).Value!;
+        var region = kernel.AllocateBuffer<byte>(owner, 4096).Value!;
         var binding = kernel.BindPlatformDomain(owner).Value!;
         var capability = MintRegionCapability(kernel, owner, region.Handle,
             CapabilityRights.Map | CapabilityRights.Read | CapabilityRights.Write);
@@ -133,7 +133,7 @@ public sealed class PlatformOwnedRegionMappingV2Tests
         var kernel = new RuntimeKernel(provider);
         var (_, owner) = TestFixtures.Create(kernel, 707, 770);
         var (_, target) = TestFixtures.Create(kernel, 708, 780);
-        var region = kernel.AllocateRegion(owner, 512).Value!;
+        var region = kernel.AllocateBuffer<byte>(owner, 512).Value!;
         var binding = kernel.BindPlatformDomain(owner).Value!;
         var capability = MintRegionCapability(kernel, owner, region.Handle,
             CapabilityRights.Map | CapabilityRights.Read);
@@ -197,7 +197,7 @@ public sealed class PlatformOwnedRegionMappingV2Tests
         var provider = new ExactMappingProvider();
         var kernel = new RuntimeKernel(provider);
         var (_, owner) = TestFixtures.Create(kernel, processId, domainId);
-        var region = kernel.AllocateRegion(owner, 1024).Value!;
+        var region = kernel.AllocateBuffer<byte>(owner, 1024).Value!;
         var binding = kernel.BindPlatformDomain(owner).Value!;
         var capability = MintRegionCapability(kernel, owner, region.Handle,
             CapabilityRights.Map | CapabilityRights.Read);
