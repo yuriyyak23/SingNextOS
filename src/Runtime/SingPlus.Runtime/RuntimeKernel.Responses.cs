@@ -5,7 +5,7 @@ namespace SingPlus.Runtime;
 public sealed partial class RuntimeKernel
 {
     private ResponseRegistry? _responseRegistry;
-    private ResponseRegistry Responses => _responseRegistry ??= new ResponseRegistry(Regions);
+    private ResponseRegistry Responses => _responseRegistry ??= new ResponseRegistry(Regions, Channels);
 
     public KernelResult<ResponseEnvelope> PublishResponse(
         ProcessHandle responder,
@@ -66,5 +66,23 @@ public sealed partial class RuntimeKernel
             return KernelResult<ResponseEnvelope>.Fail(endpointValidation.Error, endpointValidation.Message!);
 
         return Responses.Receive(requester, endpoint);
+    }
+
+    public ValueTask<KernelResult<ResponseEnvelope>> WaitForResponseAsync(
+        ProcessHandle requester,
+        ChannelEndpointHandle endpoint,
+        ulong requestSequence)
+    {
+        var requesterProcess = Processes.Resolve(requester);
+        if (!requesterProcess.IsSuccess)
+            return ValueTask.FromResult(
+                KernelResult<ResponseEnvelope>.Fail(requesterProcess.Error, requesterProcess.Message!));
+
+        var endpointValidation = Channels.GetEndpoint(endpoint);
+        if (!endpointValidation.IsSuccess)
+            return ValueTask.FromResult(
+                KernelResult<ResponseEnvelope>.Fail(endpointValidation.Error, endpointValidation.Message!));
+
+        return Responses.WaitAsync(requester, endpoint, requestSequence);
     }
 }

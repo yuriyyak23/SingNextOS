@@ -147,6 +147,7 @@ public sealed partial class RuntimeKernel
 
     private void CleanupProcess(SingProcess process)
     {
+        Channels.CloseAllForProcess(new ProcessHandle(process.ProcessId, process.Generation));
         process.ClearCapabilities();
         var domainEnded = Domains.Remove(process);
         if (domainEnded)

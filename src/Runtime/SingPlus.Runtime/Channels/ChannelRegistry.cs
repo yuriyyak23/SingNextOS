@@ -32,6 +32,8 @@ public sealed class ChannelRegistry
         _regions = regions;
     }
 
+    internal event Action<ChannelId>? ChannelClosed;
+
     internal (ChannelEndpointHandle Left, ChannelEndpointHandle Right) Create(ProtocolDefinitionV1 protocol, SingProcess left, SingProcess right, int capacity)
     {
         if (capacity <= 0) throw new ArgumentOutOfRangeException(nameof(capacity));
@@ -136,13 +138,32 @@ public sealed class ChannelRegistry
         return KernelResult<ChannelEnvelope>.Ok(record.Queue.Dequeue());
     }
 
+    internal void CloseAllForProcess(ProcessHandle owner)
+    {
+        var closing = _channels.Values
+            .Where(record => !record.Closed && (record.LeftOwner == owner || record.RightOwner == owner))
+            .OrderBy(static record => record.Id.Value)
+            .ToArray();
+        CloseRecords(closing);
+    }
+
     internal void CloseAllForDomain(DomainId domainId)
     {
-        foreach (var record in _channels.Values.Where(r => !r.Closed && (r.LeftDomain == domainId || r.RightDomain == domainId)))
+        var closing = _channels.Values
+            .Where(record => !record.Closed && (record.LeftDomain == domainId || record.RightDomain == domainId))
+            .OrderBy(static record => record.Id.Value)
+            .ToArray();
+        CloseRecords(closing);
+    }
+
+    private void CloseRecords(IEnumerable<ChannelRecord> records)
+    {
+        foreach (var record in records)
         {
             record.Closed = true;
             record.Generation++;
             record.Queue.Clear();
+            ChannelClosed?.Invoke(record.Id);
         }
     }
 
