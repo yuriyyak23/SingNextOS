@@ -79,6 +79,8 @@ public sealed class ChannelRegistry
         if (!IsSupportedPayload(payload)) return KernelResult<ChannelEnvelope>.Fail(KernelError.UnsupportedPayload, "Payload must be primitive, enum, bounded payload, or declared owned region data.");
         var ownershipValidation = ValidateOwnershipPayload(message, payload);
         if (!ownershipValidation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(ownershipValidation.Error, ownershipValidation.Message!);
+        var boundedValidation = ValidateBoundedPayload(message, payload);
+        if (!boundedValidation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(boundedValidation.Error, boundedValidation.Message!);
 
         object? queuedPayload = payload;
         if (message.Borrows.Count != 0)
@@ -191,11 +193,36 @@ public sealed class ChannelRegistry
         return KernelResult.Ok();
     }
 
+    private static KernelResult ValidateBoundedPayload(ProtocolMessageDescriptorV1 message, object? payload)
+    {
+        var expected = message.BoundedPayload;
+        if (expected is null)
+        {
+            return payload is IBoundedPayload
+                ? KernelResult.Fail(KernelError.UnsupportedPayload, "Bounded payloads require an explicit contract declaration with type and MaxBytes.")
+                : KernelResult.Ok();
+        }
+
+        if (payload is not IBoundedPayload bounded)
+            return KernelResult.Fail(KernelError.UnsupportedPayload, "Message requires the declared bounded payload shape.");
+
+        var actualTypeName = payload.GetType().FullName ?? payload.GetType().Name;
+        if (!string.Equals(actualTypeName, expected.TypeName, StringComparison.Ordinal))
+            return KernelResult.Fail(KernelError.UnsupportedPayload, $"Expected bounded payload type {expected.TypeName}, got {actualTypeName}.");
+        if (bounded.PayloadSize < 0)
+            return KernelResult.Fail(KernelError.UnsupportedPayload, "Bounded payload size cannot be negative.");
+        if (bounded.MaxPayloadSize != expected.MaxBytes)
+            return KernelResult.Fail(KernelError.UnsupportedPayload, $"Bounded payload self-reported limit {bounded.MaxPayloadSize} does not match contract MaxBytes {expected.MaxBytes}.");
+        if (bounded.PayloadSize > expected.MaxBytes)
+            return KernelResult.Fail(KernelError.UnsupportedPayload, $"Bounded payload size {bounded.PayloadSize} exceeds contract MaxBytes {expected.MaxBytes}.");
+        return KernelResult.Ok();
+    }
+
     private static bool IsSupportedPayload(object? payload)
     {
         if (payload is null) return true;
         if (payload is ITransferableOwnedPayload) return true;
-        if (payload is IBoundedPayload bounded) return bounded.PayloadSize >= 0 && bounded.PayloadSize <= bounded.MaxPayloadSize;
+        if (payload is IBoundedPayload) return true;
         return payload is byte or sbyte or short or ushort or int or uint or long or ulong or float or double or bool or char or decimal or Enum;
     }
 }
