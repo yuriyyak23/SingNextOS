@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <SingPlusProfile>User</SingPlusProfile>
+    <SingPlusMemoryProfile>ManagedGc</SingPlusMemoryProfile>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../SingPlus.Kernel/SingPlus.Kernel.csproj" />
+  </ItemGroup>
+</Project>

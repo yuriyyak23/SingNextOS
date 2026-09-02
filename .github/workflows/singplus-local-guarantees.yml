@@ -1,0 +1,56 @@
+name: Sing+ local guarantees
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  local-guarantees:
+    name: SingNextOS local guarantees
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout SingNextOS
+        uses: actions/checkout@v4
+
+      - name: Setup .NET from global.json
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Restore
+        run: dotnet restore SingNextOS.slnx
+
+      - name: Build
+        run: dotnet build SingNextOS.slnx --configuration Release --no-restore
+
+      - name: Unit tests
+        run: dotnet test tests/SingPlus.Tests/SingPlus.Tests.csproj --configuration Release --no-build
+
+      - name: Analyzer tests
+        run: dotnet test tests/SingPlus.Tests/SingPlus.Tests.csproj --configuration Release --no-build --filter "Category=Analyzers"
+
+      - name: Generator tests
+        run: dotnet test tests/SingPlus.Tests/SingPlus.Tests.csproj --configuration Release --no-build --filter "Category=Generators"
+
+      - name: Negative compilation tests
+        run: dotnet test tests/SingPlus.Tests/SingPlus.Tests.csproj --configuration Release --no-build --filter "Category=NegativeCompilation"
+
+      - name: Admission verifier tests
+        run: dotnet test tests/SingPlus.Tests/SingPlus.Tests.csproj --configuration Release --no-build --filter "Category=Admission"
+
+      - name: Determinism tests
+        run: dotnet test tests/SingPlus.Tests/SingPlus.Tests.csproj --configuration Release --no-build --filter "Category=Determinism"
+
+      - name: Property tests
+        run: dotnet test tests/SingPlus.Tests/SingPlus.Tests.csproj --configuration Release --no-build --filter "Category=Property"
+
+# HybridCPU source repositories are intentionally not checked out or built here.
+# A future black-box integration job may consume a prebuilt external toolchain,
+# but it is not part of the SingNextOS local-guarantees gate.

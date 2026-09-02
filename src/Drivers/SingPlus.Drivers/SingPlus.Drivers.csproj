@@ -1,14 +1,12 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
-
-  <ItemGroup>
-    <ProjectReference Include="..\..\..\contracts\SingPlus.Contracts\SingPlus.Contracts.csproj" />
-    <ProjectReference Include="..\..\Sip\SingPlus.Sip\SingPlus.Sip.csproj" />
-  </ItemGroup>
-
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <SingPlusProfile>Driver</SingPlusProfile>
+    <SingPlusMemoryProfile>SipRegion</SingPlusMemoryProfile>
   </PropertyGroup>
-
+  <ItemGroup>
+    <ProjectReference Include="../../../contracts/SingPlus.Contracts/SingPlus.Contracts.csproj" />
+  </ItemGroup>
 </Project>

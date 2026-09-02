@@ -15,6 +15,9 @@
   <Folder Name="/src/Kernel/">
     <Project Path="src/Kernel/SingPlus.Kernel/SingPlus.Kernel.csproj" />
   </Folder>
+  <Folder Name="/src/Kernel/Hal/">
+    <Project Path="src/Kernel/Hal/SingPlus.Kernel.Hal.Host/SingPlus.Kernel.Hal.Host.csproj" />
+  </Folder>
   <Folder Name="/src/Kernel/Boot/">
     <Project Path="src/Kernel/Boot/SingPlus.Boot/SingPlus.Boot.csproj" />
   </Folder>
@@ -23,6 +26,9 @@
   </Folder>
   <Folder Name="/src/Sip/">
     <Project Path="src/Sip/SingPlus.Sip/SingPlus.Sip.csproj" />
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/SingPlus.Admission/SingPlus.Admission.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/SingPlus.Tests/SingPlus.Tests.csproj" />
