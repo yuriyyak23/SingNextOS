@@ -5,6 +5,7 @@
     <Nullable>enable</Nullable>
     <SingPlusProfile>Kernel</SingPlusProfile>
     <SingPlusMemoryProfile>KernelNoHeap</SingPlusMemoryProfile>
+    <SingPlusAdmissionRoot>SingPlus.Kernel.KernelEntryPoint::Run</SingPlusAdmissionRoot>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../../contracts/SingPlus.Contracts/SingPlus.Contracts.csproj" />
