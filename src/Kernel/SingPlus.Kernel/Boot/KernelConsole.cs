@@ -1,3 +1,5 @@
+using SingPlus.Kernel.Hal;
+
 namespace SingPlus.Kernel;
 
 public static class KernelConsole

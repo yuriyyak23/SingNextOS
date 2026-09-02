@@ -1,4 +1,4 @@
-namespace SingPlus.Kernel;
+namespace SingPlus.Kernel.Hal;
 
 public interface IKernelConsole
 {
