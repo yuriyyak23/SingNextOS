@@ -5,6 +5,7 @@ namespace SingPlus.Sip;
 internal interface ITransferableOwnedPayload
 {
     RegionHandle Handle { get; }
+    OwnershipPayloadKind PayloadKind { get; }
     bool IsValidForRuntime { get; }
     object TransferForRuntime(RegionHandle newHandle);
     object CreateBorrowLeaseForRuntime(BorrowLeaseHandle handle, BorrowLeaseLifetime lifetime);
@@ -98,6 +99,7 @@ public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanag
         return _storage.Data.AsSpan();
     }
 
+    OwnershipPayloadKind ITransferableOwnedPayload.PayloadKind => OwnershipPayloadKind.OwnedBuffer;
     bool ITransferableOwnedPayload.IsValidForRuntime => IsValid;
 
     object ITransferableOwnedPayload.TransferForRuntime(RegionHandle newHandle)

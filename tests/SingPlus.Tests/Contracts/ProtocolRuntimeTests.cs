@@ -70,6 +70,86 @@ public sealed class ProtocolRuntimeTests
     }
 
     [Fact]
+    public void DescriptorRejectsMalformedOwnershipCardinality()
+    {
+        Assert.Throws<ArgumentException>(() => new ProtocolMessageDescriptorV1(
+            10,
+            "TooMany",
+            consumes: new[] { "first", "second" },
+            ownershipPayloadKind: OwnershipPayloadKind.OwnedBuffer));
+
+        Assert.Throws<ArgumentException>(() => new ProtocolMessageDescriptorV1(
+            11,
+            "Both",
+            consumes: new[] { "data" },
+            borrows: new[] { "data" },
+            ownershipPayloadKind: OwnershipPayloadKind.OwnedBuffer));
+
+        Assert.Throws<ArgumentException>(() => new ProtocolMessageDescriptorV1(
+            12,
+            "MissingKind",
+            consumes: new[] { "data" }));
+
+        Assert.Throws<ArgumentException>(() => new ProtocolMessageDescriptorV1(
+            13,
+            "SpuriousKind",
+            ownershipPayloadKind: OwnershipPayloadKind.OwnedRegion));
+    }
+
+    [Fact]
+    public void DescriptorRejectsMalformedReturnedOwnershipShape()
+    {
+        Assert.Throws<ArgumentException>(() => new ProtocolMessageDescriptorV1(
+            20,
+            "MissingReturnKind",
+            returnsOwnership: true));
+
+        Assert.Throws<ArgumentException>(() => new ProtocolMessageDescriptorV1(
+            21,
+            "SpuriousReturnKind",
+            returnOwnershipPayloadKind: OwnershipPayloadKind.OwnedBuffer));
+    }
+
+    [Fact]
+    public void UndeclaredOwnedPayloadIsRejectedWithoutProtocolMutation()
+    {
+        var (kernel, left, right, endpoints) = CreateChannel(capacity: 4);
+        Activate(kernel, left, right, endpoints);
+        var buffer = kernel.AllocateBuffer<byte>(left, 1).Value!;
+        var before = kernel.Channels.GetEndpoint(endpoints.Left).Value!;
+
+        var send = kernel.Send(left, right, endpoints.Left, 3, buffer);
+
+        Assert.False(send.IsSuccess);
+        Assert.Equal(KernelError.UnsupportedPayload, send.Error);
+        Assert.True(buffer.IsValid);
+        var after = kernel.Channels.GetEndpoint(endpoints.Left).Value!;
+        Assert.Equal(before.ProtocolState, after.ProtocolState);
+        Assert.Equal(before.Sequence, after.Sequence);
+    }
+
+    [Fact]
+    public void DeclaredOwnershipPayloadKindMismatchIsRejectedWithoutMutation()
+    {
+        var (kernel, left, right, endpoints) = CreateChannel(capacity: 4);
+        Activate(kernel, left, right, endpoints);
+        var capability = kernel.MintCapability(new DomainId(10), left, ResourceKind.Device, "console0", CapabilityRights.Write);
+        Assert.True(capability.IsSuccess, capability.Message);
+        var region = kernel.AllocateRegion(left, 123).Value!;
+        var before = kernel.Channels.GetEndpoint(endpoints.Left).Value!;
+
+        var send = kernel.Send(left, right, endpoints.Left, 2, region, new[] { capability.Value!.CapabilityId });
+
+        Assert.False(send.IsSuccess);
+        Assert.Equal(KernelError.UnsupportedPayload, send.Error);
+        Assert.True(region.IsValid);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
+        var after = kernel.Channels.GetEndpoint(endpoints.Left).Value!;
+        Assert.Equal(before.ProtocolState, after.ProtocolState);
+        Assert.Equal(before.Sequence, after.Sequence);
+    }
+
+    [Fact]
     public void ConsumingMessageTransfersOwnershipToPeer()
     {
         var (kernel, left, right, endpoints) = CreateChannel(capacity: 4);
@@ -301,9 +381,14 @@ public sealed class ProtocolRuntimeTests
                 2,
                 "Write",
                 new[] { new CapabilityRequirementV1(ResourceKind.Device, "console0", CapabilityRights.Write) },
-                consumes: new[] { "data" }),
+                consumes: new[] { "data" },
+                ownershipPayloadKind: OwnershipPayloadKind.OwnedBuffer),
             new ProtocolMessageDescriptorV1(3, "Finish"),
-            new ProtocolMessageDescriptorV1(4, "Peek", borrows: new[] { "data" })
+            new ProtocolMessageDescriptorV1(
+                4,
+                "Peek",
+                borrows: new[] { "data" },
+                ownershipPayloadKind: OwnershipPayloadKind.OwnedBuffer)
         },
         new[]
         {

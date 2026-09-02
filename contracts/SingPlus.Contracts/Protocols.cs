@@ -2,6 +2,13 @@ namespace SingPlus.Contracts;
 
 public sealed record ProtocolTransitionV1(uint MessageId, string FromState, string ToState);
 
+public enum OwnershipPayloadKind
+{
+    None = 0,
+    OwnedBuffer = 1,
+    OwnedRegion = 2
+}
+
 public sealed class ProtocolMessageDescriptorV1
 {
     private readonly CapabilityRequirementV1[] _requiredCapabilities;
@@ -14,16 +21,32 @@ public sealed class ProtocolMessageDescriptorV1
         IEnumerable<CapabilityRequirementV1>? requiredCapabilities = null,
         IEnumerable<string>? consumes = null,
         IEnumerable<string>? borrows = null,
-        bool returnsOwnership = false)
+        bool returnsOwnership = false,
+        OwnershipPayloadKind ownershipPayloadKind = OwnershipPayloadKind.None,
+        OwnershipPayloadKind returnOwnershipPayloadKind = OwnershipPayloadKind.None)
     {
         if (messageId == 0) throw new ArgumentOutOfRangeException(nameof(messageId));
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Message name is required.", nameof(name));
         MessageId = messageId;
         Name = name;
         _requiredCapabilities = (requiredCapabilities ?? []).OrderBy(static x => x.ResourceKind).ThenBy(static x => x.ResourceId, StringComparer.Ordinal).ThenBy(static x => (int)x.Rights).ToArray();
-        _consumes = (consumes ?? []).OrderBy(static x => x, StringComparer.Ordinal).ToArray();
-        _borrows = (borrows ?? []).OrderBy(static x => x, StringComparer.Ordinal).ToArray();
+        _consumes = NormalizeOwnershipNames(consumes, nameof(consumes));
+        _borrows = NormalizeOwnershipNames(borrows, nameof(borrows));
+
+        if (_consumes.Length > 1 || _borrows.Length > 1)
+            throw new ArgumentException("The current channel transport supports at most one ownership-bearing payload per message.");
+        if (_consumes.Length != 0 && _borrows.Length != 0)
+            throw new ArgumentException("A single ownership-bearing payload cannot be both consumed and borrowed.");
+
+        var hasOwnershipInput = _consumes.Length + _borrows.Length == 1;
+        if (hasOwnershipInput != (ownershipPayloadKind != OwnershipPayloadKind.None))
+            throw new ArgumentException("Ownership payload metadata must declare exactly one concrete payload kind when Consumes or Borrows is present.", nameof(ownershipPayloadKind));
+        if (returnsOwnership != (returnOwnershipPayloadKind != OwnershipPayloadKind.None))
+            throw new ArgumentException("ReturnsOwnership metadata must declare a concrete returned ownership payload kind.", nameof(returnOwnershipPayloadKind));
+
         ReturnsOwnership = returnsOwnership;
+        OwnershipPayloadKind = ownershipPayloadKind;
+        ReturnOwnershipPayloadKind = returnOwnershipPayloadKind;
     }
 
     public uint MessageId { get; }
@@ -32,6 +55,16 @@ public sealed class ProtocolMessageDescriptorV1
     public IReadOnlyList<string> Consumes => _consumes;
     public IReadOnlyList<string> Borrows => _borrows;
     public bool ReturnsOwnership { get; }
+    public OwnershipPayloadKind OwnershipPayloadKind { get; }
+    public OwnershipPayloadKind ReturnOwnershipPayloadKind { get; }
+
+    private static string[] NormalizeOwnershipNames(IEnumerable<string>? names, string parameterName)
+    {
+        var normalized = (names ?? []).OrderBy(static x => x, StringComparer.Ordinal).ToArray();
+        if (normalized.Any(string.IsNullOrWhiteSpace)) throw new ArgumentException("Ownership parameter names cannot be empty.", parameterName);
+        if (normalized.Length != normalized.Distinct(StringComparer.Ordinal).Count()) throw new ArgumentException("Duplicate ownership parameter name.", parameterName);
+        return normalized;
+    }
 }
 
 public sealed class ProtocolDefinitionV1

@@ -11,6 +11,38 @@ namespace SingPlus.Generators;
 [Generator]
 public sealed class SingPlusGenerator : IIncrementalGenerator
 {
+    private static readonly DiagnosticDescriptor OwnershipTypeDiagnostic = new(
+        "SINGGEN001",
+        "Invalid ownership payload type",
+        "{0}",
+        "SingPlus.Contracts",
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    private static readonly DiagnosticDescriptor OwnershipAnnotationDiagnostic = new(
+        "SINGGEN002",
+        "Ownership annotation is required",
+        "{0}",
+        "SingPlus.Contracts",
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    private static readonly DiagnosticDescriptor OwnershipCardinalityDiagnostic = new(
+        "SINGGEN003",
+        "Unsupported ownership payload cardinality",
+        "{0}",
+        "SingPlus.Contracts",
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    private static readonly DiagnosticDescriptor ReturnsOwnershipDiagnostic = new(
+        "SINGGEN004",
+        "Invalid returned ownership shape",
+        "{0}",
+        "SingPlus.Contracts",
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
         var contracts = context.SyntaxProvider.ForAttributeWithMetadataName(
@@ -29,6 +61,7 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
 
     private static void EmitContract(SourceProductionContext output, INamedTypeSymbol contract)
     {
+        if (!ValidateOwnershipContract(output, contract)) return;
         var model = ContractModel.Create(contract);
         var hint = Sanitize(contract.ToDisplayString()) + ".";
         output.AddSource(hint + "Protocol.g.cs", SourceText.From(GenerateProtocol(model), Encoding.UTF8));
@@ -36,6 +69,92 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
         output.AddSource(hint + "Manifest.g.cs", SourceText.From(GenerateManifest(model), Encoding.UTF8));
         output.AddSource(hint + "Capabilities.g.cs", SourceText.From(GenerateCapabilities(model), Encoding.UTF8));
     }
+
+    private static bool ValidateOwnershipContract(SourceProductionContext output, INamedTypeSymbol contract)
+    {
+        var valid = true;
+        foreach (var method in contract.GetMembers().OfType<IMethodSymbol>().Where(static m => m.MethodKind == MethodKind.Ordinary))
+        {
+            var ownershipParameterCount = 0;
+            foreach (var parameter in method.Parameters)
+            {
+                var consumes = HasAttribute(parameter, "ConsumesAttribute");
+                var borrows = HasAttribute(parameter, "BorrowsAttribute");
+                var kind = OwnershipKind(parameter.Type, unwrapAsync: false);
+
+                if (consumes || borrows)
+                {
+                    ownershipParameterCount++;
+                    if (consumes && borrows)
+                    {
+                        Report(output, OwnershipCardinalityDiagnostic, parameter, $"Parameter '{parameter.Name}' cannot be both Consumes and Borrows.");
+                        valid = false;
+                    }
+                    if (kind == 0)
+                    {
+                        Report(output, OwnershipTypeDiagnostic, parameter, $"Ownership annotation on '{parameter.Name}' requires OwnedBuffer<T> or OwnedRegion<T>.");
+                        valid = false;
+                    }
+                    if (parameter.RefKind != RefKind.None)
+                    {
+                        Report(output, OwnershipTypeDiagnostic, parameter, $"Ownership parameter '{parameter.Name}' cannot use ref, in, or out passing.");
+                        valid = false;
+                    }
+                }
+                else if (kind != 0)
+                {
+                    Report(output, OwnershipAnnotationDiagnostic, parameter, $"Ownership parameter '{parameter.Name}' must declare exactly one of Consumes or Borrows.");
+                    valid = false;
+                }
+            }
+
+            if (ownershipParameterCount > 1)
+            {
+                Report(output, OwnershipCardinalityDiagnostic, method, $"Message '{method.Name}' has {ownershipParameterCount} ownership-bearing parameters, but the current channel transport supports exactly one payload slot.");
+                valid = false;
+            }
+
+            var returnsOwnership = HasAttribute(method, "ReturnsOwnershipAttribute");
+            var returnKind = OwnershipKind(method.ReturnType, unwrapAsync: true);
+            if (returnsOwnership && returnKind == 0)
+            {
+                Report(output, ReturnsOwnershipDiagnostic, method, $"Message '{method.Name}' declares ReturnsOwnership but does not return OwnedBuffer<T>/OwnedRegion<T> or Task/ValueTask wrapping one.");
+                valid = false;
+            }
+            else if (!returnsOwnership && returnKind != 0)
+            {
+                Report(output, ReturnsOwnershipDiagnostic, method, $"Message '{method.Name}' returns an ownership-bearing payload and must declare ReturnsOwnership.");
+                valid = false;
+            }
+        }
+        return valid;
+    }
+
+    private static void Report(SourceProductionContext output, DiagnosticDescriptor descriptor, ISymbol symbol, string message)
+    {
+        output.ReportDiagnostic(Diagnostic.Create(descriptor, symbol.Locations.FirstOrDefault(), message));
+    }
+
+    private static bool HasAttribute(ISymbol symbol, string attributeName) =>
+        symbol.GetAttributes().Any(a => a.AttributeClass?.Name == attributeName);
+
+    private static int OwnershipKind(ITypeSymbol type, bool unwrapAsync)
+    {
+        if (unwrapAsync && type is INamedTypeSymbol asyncType && asyncType.TypeArguments.Length == 1 &&
+            asyncType.ContainingNamespace.ToDisplayString() == "System.Threading.Tasks" &&
+            (asyncType.Name == "Task" || asyncType.Name == "ValueTask"))
+        {
+            type = asyncType.TypeArguments[0];
+        }
+
+        if (type is not INamedTypeSymbol named || named.TypeArguments.Length != 1 || named.ContainingNamespace.ToDisplayString() != "SingPlus.Sip") return 0;
+        if (named.Name == "OwnedBuffer") return 1;
+        if (named.Name == "OwnedRegion") return 2;
+        return 0;
+    }
+
+    private static void AppendOwnershipKind(StringBuilder builder, int kind) =>
+        builder.Append("(global::SingPlus.Contracts.OwnershipPayloadKind)").Append(kind.ToString(CultureInfo.InvariantCulture));
 
     private static string GenerateProtocol(ContractModel model)
     {
@@ -60,7 +179,11 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
             b.Append("new global::SingPlus.Contracts.CapabilityRequirementV1[] { ").Append(string.Join(", ", message.Capabilities.Select(CapabilityExpression))).Append(" }, ");
             b.Append("new string[] { ").Append(string.Join(", ", message.Consumes.Select(Literal))).Append(" }, ");
             b.Append("new string[] { ").Append(string.Join(", ", message.Borrows.Select(Literal))).Append(" }, ");
-            b.Append(message.ReturnsOwnership ? "true" : "false").AppendLine("),");
+            b.Append(message.ReturnsOwnership ? "true" : "false").Append(", ");
+            AppendOwnershipKind(b, message.OwnershipPayloadKind);
+            b.Append(", ");
+            AppendOwnershipKind(b, message.ReturnOwnershipPayloadKind);
+            b.AppendLine("),");
         }
         b.AppendLine("        },");
         b.AppendLine("        new global::SingPlus.Contracts.ProtocolTransitionV1[]");
@@ -121,7 +244,7 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
         {
             var canonical = string.Join(";", message.Capabilities.Select(static c => c.Kind + ":" + c.ResourceId + ":" + c.Rights));
             b.Append("    public const string ").Append(message.Name).Append(" = ").Append(Literal(canonical)).AppendLine(";");
-            b.Append("    public const string ").Append(message.Name).Append("_Ownership = ").Append(Literal("Consumes=" + string.Join(",", message.Consumes) + ";Borrows=" + string.Join(",", message.Borrows) + ";Returns=" + (message.ReturnsOwnership ? "1" : "0"))).AppendLine(";");
+            b.Append("    public const string ").Append(message.Name).Append("_Ownership = ").Append(Literal("Consumes=" + string.Join(",", message.Consumes) + ";Borrows=" + string.Join(",", message.Borrows) + ";InputKind=" + message.OwnershipPayloadKind.ToString(CultureInfo.InvariantCulture) + ";Returns=" + (message.ReturnsOwnership ? "1" : "0") + ";ReturnKind=" + message.ReturnOwnershipPayloadKind.ToString(CultureInfo.InvariantCulture))).AppendLine(";");
         }
         b.AppendLine("}");
         return b.ToString();
@@ -184,7 +307,7 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
             {
                 lines.Add("message=" + m.Id.ToString(CultureInfo.InvariantCulture) + "|" + m.Name + "|" + m.ReturnType + "|" + string.Join(",", m.Parameters.Select(static p => p.Type + " " + p.Name)));
                 lines.Add("cap=" + m.Id.ToString(CultureInfo.InvariantCulture) + "|" + string.Join(";", m.Capabilities.Select(static c => c.Kind + ":" + c.ResourceId + ":" + c.Rights)));
-                lines.Add("ownership=" + m.Id.ToString(CultureInfo.InvariantCulture) + "|" + string.Join(",", m.Consumes) + "|" + string.Join(",", m.Borrows) + "|" + (m.ReturnsOwnership ? "1" : "0"));
+                lines.Add("ownership=" + m.Id.ToString(CultureInfo.InvariantCulture) + "|" + string.Join(",", m.Consumes) + "|" + string.Join(",", m.Borrows) + "|" + m.OwnershipPayloadKind.ToString(CultureInfo.InvariantCulture) + "|" + (m.ReturnsOwnership ? "1" : "0") + "|" + m.ReturnOwnershipPayloadKind.ToString(CultureInfo.InvariantCulture));
             }
             lines.AddRange(transitions.Select(static t => "transition=" + t.MessageId.ToString(CultureInfo.InvariantCulture) + "|" + t.From + "|" + t.To));
             return string.Join("\n", lines);
@@ -201,6 +324,8 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
         public IReadOnlyList<string> Consumes { get; private set; } = Array.Empty<string>();
         public IReadOnlyList<string> Borrows { get; private set; } = Array.Empty<string>();
         public bool ReturnsOwnership { get; private set; }
+        public int OwnershipPayloadKind { get; private set; }
+        public int ReturnOwnershipPayloadKind { get; private set; }
         public IReadOnlyList<TransitionModel> Transitions { get; private set; } = Array.Empty<TransitionModel>();
 
         public static MessageModel Create(IMethodSymbol method, string initial)
@@ -216,6 +341,7 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
             var parameters = method.Parameters.Select(static p => new ParameterModel { Name = p.Name, Type = p.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat) }).ToArray();
             var consumes = method.Parameters.Where(static p => p.GetAttributes().Any(static a => a.AttributeClass?.Name == "ConsumesAttribute")).Select(static p => p.Name).OrderBy(static p => p, StringComparer.Ordinal).ToArray();
             var borrows = method.Parameters.Where(static p => p.GetAttributes().Any(static a => a.AttributeClass?.Name == "BorrowsAttribute")).Select(static p => p.Name).OrderBy(static p => p, StringComparer.Ordinal).ToArray();
+            var ownershipParameter = method.Parameters.FirstOrDefault(static p => p.GetAttributes().Any(static a => a.AttributeClass?.Name is "ConsumesAttribute" or "BorrowsAttribute"));
             var transitionAttributes = method.GetAttributes().Where(static a => a.AttributeClass?.Name == "TransitionAttribute").ToArray();
             var transitions = transitionAttributes.Length == 0 ? new[] { new TransitionModel { MessageId = id, From = initial, To = initial } } : transitionAttributes.Select(a => new TransitionModel { MessageId = id, From = (string?)a.ConstructorArguments[0].Value ?? initial, To = (string?)a.ConstructorArguments[1].Value ?? initial }).ToArray();
             return new MessageModel
@@ -228,6 +354,8 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
                 Consumes = consumes,
                 Borrows = borrows,
                 ReturnsOwnership = method.GetAttributes().Any(static a => a.AttributeClass?.Name == "ReturnsOwnershipAttribute"),
+                OwnershipPayloadKind = ownershipParameter is null ? 0 : OwnershipKind(ownershipParameter.Type, unwrapAsync: false),
+                ReturnOwnershipPayloadKind = OwnershipKind(method.ReturnType, unwrapAsync: true),
                 Transitions = transitions
             };
         }
