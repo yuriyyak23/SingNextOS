@@ -53,8 +53,7 @@ public sealed class PlatformExecutionLifecycleTests
         var provider = new LifecycleProvider(LifecycleBehavior.Success);
         var kernel = new RuntimeKernel(provider);
         var (process, handle) = CreateAdmittedProcess(kernel, 803, 903, 1);
-        var binding = kernel.BindPlatformDomain(handle);
-        Assert.True(binding.IsSuccess, binding.Message);
+        Assert.True(kernel.BindPlatformDomain(handle).IsSuccess);
         Assert.True(kernel.StartProcess(handle).IsSuccess);
         Assert.Equal(ProcessState.Running, process.State);
 
@@ -65,11 +64,12 @@ public sealed class PlatformExecutionLifecycleTests
         Assert.Equal(KernelError.PlatformBindingRevoked, park.Error);
         Assert.Equal(ProcessState.Running, process.State);
 
-        var validation = kernel.PlatformAuthority.ValidateDomain(
-            binding.Value!,
-            binding.Value!.Subject);
-        Assert.False(validation.IsSuccess);
-        Assert.Equal(KernelError.PlatformBindingRevoked, validation.Error);
+        var transitionsAfterRevocation = provider.Transitions.ToArray();
+        var secondPark = kernel.ParkProcess(handle);
+        Assert.False(secondPark.IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingRevoked, secondPark.Error);
+        Assert.Equal(ProcessState.Running, process.State);
+        Assert.Equal(transitionsAfterRevocation, provider.Transitions);
     }
 
     [Fact]
