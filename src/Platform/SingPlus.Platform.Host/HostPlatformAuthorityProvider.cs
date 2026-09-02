@@ -5,7 +5,8 @@ namespace SingPlus.Platform.Host;
 public sealed class HostPlatformAuthorityProvider :
     IPlatformAuthorityProvider,
     IPlatformFeatureProvider,
-    IPlatformCompletionProvider
+    IPlatformCompletionProvider,
+    IPlatformMemoryVisibilityProvider
 {
     private sealed class DomainRecord(PlatformProviderDomainLease lease)
     {
@@ -55,10 +56,15 @@ public sealed class HostPlatformAuthorityProvider :
         _regionRevocationFailure = regionRevocationFailure;
         Descriptor = new PlatformProviderDescriptor(new PlatformProviderId("host-test"), 2, features);
 
-        var legacyFeatures = PlatformFeatureManifest.FromLegacy(features).Features;
+        var featureDescriptors = PlatformFeatureManifest.FromLegacy(features).Features.ToList();
+        featureDescriptors.Add(new PlatformFeatureDescriptor(
+            PlatformFeatureFamily.ExplicitMemoryVisibility,
+            1,
+            PlatformFeatureAvailability.ModelOnly));
+
         _featureManifest = additionalFeatures is null
-            ? new PlatformFeatureManifest(legacyFeatures)
-            : new PlatformFeatureManifest(legacyFeatures.Concat(additionalFeatures));
+            ? new PlatformFeatureManifest(featureDescriptors)
+            : new PlatformFeatureManifest(featureDescriptors.Concat(additionalFeatures));
     }
 
     public PlatformProviderDescriptor Descriptor { get; }
@@ -70,6 +76,41 @@ public sealed class HostPlatformAuthorityProvider :
     public PlatformRegionRevocationPolicy? LastRegionRevocationPolicy { get; private set; }
 
     public PlatformFeatureManifest QueryFeatures() => _featureManifest;
+
+    public PlatformAuthorityResult<PlatformMemoryVisibilityResult> EnsureMemoryVisibility(
+        PlatformMemoryVisibilityRequest request)
+    {
+        var requestValidation = PlatformMemoryVisibilityContract.ValidateRequest(request);
+        if (!requestValidation.IsSuccess)
+        {
+            return PlatformAuthorityResult<PlatformMemoryVisibilityResult>.Fail(
+                requestValidation.Status,
+                requestValidation.Message!);
+        }
+
+        var operationValidation = ValidateOperation(request.Operation);
+        if (!operationValidation.IsSuccess)
+        {
+            return PlatformAuthorityResult<PlatformMemoryVisibilityResult>.Fail(
+                operationValidation.Status,
+                operationValidation.Message!);
+        }
+
+        var operationState = _operations[request.Operation.OperationId].State;
+        if (PlatformCompletionContract.IsTerminal(operationState))
+        {
+            return PlatformAuthorityResult<PlatformMemoryVisibilityResult>.Fail(
+                PlatformAuthorityStatus.Denied,
+                "Terminal platform operations cannot produce new memory-visibility evidence.");
+        }
+
+        var outcome = ModelMemoryVisibility(request.Consumer, request.Requirement);
+        return PlatformAuthorityResult<PlatformMemoryVisibilityResult>.Ok(
+            new PlatformMemoryVisibilityResult(
+                request.Consumer,
+                request.Requirement,
+                outcome));
+    }
 
     public PlatformAuthorityResult<PlatformOperationIdentity> StageOperation(
         PlatformProviderDomainLease domainLease)
@@ -395,6 +436,23 @@ public sealed class HostPlatformAuthorityProvider :
                     PlatformCompletionState.Closed or
                     PlatformCompletionState.Faulted,
             _ => false
+        };
+
+    private static PlatformMemoryVisibilityOutcome ModelMemoryVisibility(
+        PlatformMemoryConsumerClass consumer,
+        PlatformMemoryVisibilityRequirement requirement) =>
+        (consumer, requirement) switch
+        {
+            (PlatformMemoryConsumerClass.CpuExecution,
+                PlatformMemoryVisibilityRequirement.CoherentAccess) =>
+                PlatformMemoryVisibilityOutcome.Coherent,
+            (PlatformMemoryConsumerClass.ExternalExecutionDomain,
+                PlatformMemoryVisibilityRequirement.PublicationFence) =>
+                PlatformMemoryVisibilityOutcome.PublicationFenceSatisfied,
+            (PlatformMemoryConsumerClass.IoDevice,
+                PlatformMemoryVisibilityRequirement.CacheMaintenance) =>
+                PlatformMemoryVisibilityOutcome.CacheMaintenanceSatisfied,
+            _ => PlatformMemoryVisibilityOutcome.Unsupported
         };
 
     private bool Supports(PlatformAuthorityFeatures feature) =>
