@@ -37,6 +37,26 @@ public sealed class AnalyzerTests
         Assert.DoesNotContain(diagnostics, d => d.Id.StartsWith("SING1", StringComparison.Ordinal));
     }
 
+    [Fact]
+    [Trait("Category", "Ownership")]
+    [Trait("Category", "NegativeCompilation")]
+    public async Task BorrowEscapeIsRejected()
+    {
+        const string source = "ref struct BorrowedSpan<T> { } class C { BorrowedSpan<int> Escape(BorrowedSpan<int> borrowed) { return borrowed; } }";
+        var diagnostics = await Analyze(source, "Sip", "SipRegion");
+        Assert.Contains(diagnostics, d => d.Id == "SING2001");
+    }
+
+    [Fact]
+    [Trait("Category", "Ownership")]
+    [Trait("Category", "NegativeCompilation")]
+    public async Task UseAfterMoveIsRejected()
+    {
+        const string source = "class OwnedBuffer<T> { public OwnedBuffer<T> Move() => this; public int Length => 0; } class C { int M(OwnedBuffer<int> buffer) { _ = buffer.Move(); return buffer.Length; } }";
+        var diagnostics = await Analyze(source, "Sip", "SipRegion");
+        Assert.Contains(diagnostics, d => d.Id == "SING2002");
+    }
+
     private static async Task<ImmutableArray<Diagnostic>> Analyze(string source, string profile, string memoryProfile)
     {
         var tree = CSharpSyntaxTree.ParseText(source, new CSharpParseOptions(LanguageVersion.CSharp13));
