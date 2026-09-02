@@ -162,6 +162,20 @@ public sealed class RegionAuthority
         record.Payload = payload;
     }
 
+    internal IReadOnlyList<RegionHandle> ReturnAllLoansForBorrower(RegionOwner borrower)
+    {
+        var returned = new List<RegionHandle>();
+        foreach (var record in _regions.Values.Where(r => r.State == RegionState.Loaned && r.Borrower == borrower))
+        {
+            returned.Add(new RegionHandle(record.Id, record.Generation));
+            record.BorrowLifetime?.InvalidateForRuntime();
+            record.BorrowLifetime = null;
+            record.Borrower = null;
+            record.State = RegionState.Owned;
+        }
+        return returned.OrderBy(static h => h.RegionId.Value).ToArray();
+    }
+
     internal IReadOnlyList<RegionHandle> ReturnAllLoansForBorrowerDomain(DomainId borrowerDomainId)
     {
         var returned = new List<RegionHandle>();
@@ -174,6 +188,35 @@ public sealed class RegionAuthority
             record.State = RegionState.Owned;
         }
         return returned.OrderBy(static h => h.RegionId.Value).ToArray();
+    }
+
+    internal KernelResult<IReadOnlyList<RegionHandle>> ReclaimAllForOwner(RegionOwner owner)
+    {
+        var candidates = _regions.Values
+            .Where(r => r.Owner == owner && r.State is RegionState.Owned or RegionState.Loaned)
+            .OrderBy(static r => r.Id.Value)
+            .ToArray();
+
+        if (candidates.Any(static r => r.PlatformMappingReserved))
+        {
+            return KernelResult<IReadOnlyList<RegionHandle>>.Fail(
+                KernelError.PlatformBindingActive,
+                "Platform-mapped regions must reach verified closure before process reclaim.");
+        }
+
+        var reclaimed = new List<RegionHandle>(candidates.Length);
+        foreach (var record in candidates)
+        {
+            reclaimed.Add(new RegionHandle(record.Id, record.Generation));
+            record.BorrowLifetime?.InvalidateForRuntime();
+            record.BorrowLifetime = null;
+            record.Payload?.InvalidateForRuntime();
+            record.Payload = null;
+            record.Borrower = null;
+            record.State = RegionState.Released;
+        }
+
+        return KernelResult<IReadOnlyList<RegionHandle>>.Ok(reclaimed);
     }
 
     internal IReadOnlyList<RegionHandle> ReclaimAllForDomain(DomainId domainId)

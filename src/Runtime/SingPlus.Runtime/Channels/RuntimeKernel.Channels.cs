@@ -29,9 +29,17 @@ public sealed partial class RuntimeKernel
         var leftProcess = Processes.Resolve(left);
         if (!leftProcess.IsSuccess)
             return KernelResult<(ChannelEndpointHandle, ChannelEndpointHandle)>.Fail(leftProcess.Error, leftProcess.Message!);
+        var leftEffect = EnsureProcessAcceptsNewEffects(leftProcess.Value!);
+        if (!leftEffect.IsSuccess)
+            return KernelResult<(ChannelEndpointHandle, ChannelEndpointHandle)>.Fail(leftEffect.Error, leftEffect.Message!);
+
         var rightProcess = Processes.Resolve(right);
         if (!rightProcess.IsSuccess)
             return KernelResult<(ChannelEndpointHandle, ChannelEndpointHandle)>.Fail(rightProcess.Error, rightProcess.Message!);
+        var rightEffect = EnsureProcessAcceptsNewEffects(rightProcess.Value!);
+        if (!rightEffect.IsSuccess)
+            return KernelResult<(ChannelEndpointHandle, ChannelEndpointHandle)>.Fail(rightEffect.Error, rightEffect.Message!);
+
         if (leftProcess.Value!.Channels.Count >= leftProcess.Value.Manifest.ResourceLimits.MaxChannels ||
             rightProcess.Value!.Channels.Count >= rightProcess.Value.Manifest.ResourceLimits.MaxChannels)
         {

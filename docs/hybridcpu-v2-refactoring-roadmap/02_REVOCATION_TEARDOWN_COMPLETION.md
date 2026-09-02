@@ -2,9 +2,16 @@
 
 ## Status
 
-**In progress.** The first Phase-2 vertical slice makes owned-region mapping revocation completion-backed and separates local authorization death from external closure. Process exit/fault orchestration, SIP waiter ordering and multi-resource teardown remain future Phase-2 iterations.
+**Complete for the currently implemented authority classes.**
 
-## Current state
+Phase 2 now has two composed vertical slices:
+
+1. completion-backed owned-region mapping revocation;
+2. process exit/fault orchestration that closes local channels and authority first, drains all process-owned platform mappings, closes the platform domain binding, and only then performs local region/domain reclaim and publishes `Exited` / `Faulted`.
+
+This phase does **not** claim DMA, accelerator, VM, display or real HybridCPU teardown. Those authority classes do not exist yet in the current runtime and must reuse this lifecycle unchanged when their later roadmap phases add them.
+
+## Completed foundation from Phase 1
 
 Phase 1 established the prerequisites this phase consumes:
 
@@ -13,13 +20,9 @@ Phase 1 established the prerequisites this phase consumes:
 - completion states and identity-validated receipts;
 - explicit memory-visibility vocabulary.
 
-The existing region authority already pins an owned region while a platform mapping reservation exists. Before this slice, however, `RuntimeKernel.RevokePlatformRegionMapping()` and capability-revocation cascade treated a successful synchronous `IPlatformAuthorityProvider.RevokeRegionMapping()` return as enough to release that reservation.
+## Completed slice 1 — completion-backed region mapping revocation
 
-That was safe for the host model only because the provider completed synchronously; it was not a reusable rule for a real asynchronous device/runtime backend.
-
-## Completed slice — completion-backed region mapping revocation
-
-The bridge now tracks two independent dimensions for every platform region mapping:
+The bridge tracks two independent dimensions for every platform region mapping:
 
 ```text
 LocalAuthorizationRevoked = false | true
@@ -50,161 +53,191 @@ PlatformClosure == Closed
 
 ### Narrow provider revocation contract
 
-A new optional `IPlatformRegionRevocationProvider` extends completion observation with one mapping-specific begin operation:
+`IPlatformRegionRevocationProvider` exposes one mapping-specific begin operation:
 
 ```text
 BeginRegionMappingRevocation(mapping lease, policy)
   -> PlatformRegionRevocationTicket
 ```
 
-The ticket binds:
-
-- provider mapping ID;
-- provider mapping generation;
-- opaque `PlatformOperationIdentity`.
-
-The bridge validates that the ticket refers to the exact provider mapping/domain generation it asked to close. A provider that only implements the legacy synchronous `RevokeRegionMapping()` can still close its own state, but SingNextOS does **not** release the local region reservation without a completion-backed `Closed` receipt. That legacy path therefore remains pinned/fail-closed.
-
-### Non-blocking begin / observe lifecycle
-
-`RuntimeKernel.RevokePlatformRegionMapping()` now begins closure and observes once. A host provider may return `Closed` immediately; a real provider may remain `Draining`. No unbounded wait is hidden inside the call.
-
-`RuntimeKernel.ObservePlatformRegionMappingRevocation()` performs later completion observation.
-
-For capability revocation, local capability authority is revoked first as before. `PlatformAuthorityBridge.BeginCapabilityRevocation()` then marks every affected mapping `LocalAuthorizationRevoked = true` before platform closure begins. The cascade attempts to begin closure for every affected mapping even if one remains pending or faults.
+The ticket binds provider mapping ID/generation to an opaque `PlatformOperationIdentity`. The bridge validates the exact mapping/domain generations before accepting the ticket. A legacy provider that only returns synchronous revoke success remains non-reclaimable because it cannot provide a completion-backed `Closed` receipt.
 
 ### Reclaim gate
 
-A region reservation is released only after all of the following succeed in order:
+A region reservation is released only after all of the following succeed:
 
-1. the bridge has the exact local `PlatformRegionMapping` identity;
-2. the mapping-specific provider ticket matched the exact provider mapping/generation;
-3. `ObserveCompletion()` returned a receipt for the exact opaque operation/domain generation;
-4. that receipt state is exactly `Closed`;
-5. the local platform binding is still the exact expected binding/generation/subject;
-6. `RegionAuthority.Validate()` still sees the exact region generation and owner;
-7. `RegionAuthority.ReleasePlatformMappingReservation()` succeeds;
-8. the bridge records `LocalReservationReleased = true`.
+1. exact local `PlatformRegionMapping` identity;
+2. exact provider mapping/generation in the revocation ticket;
+3. exact opaque operation/domain generation in the completion receipt;
+4. receipt state exactly `Closed`;
+5. exact local platform binding generation and subject;
+6. exact region generation and owner;
+7. local reservation release;
+8. bridge acknowledgement of `LocalReservationReleased`.
 
-If the final bridge acknowledgement unexpectedly fails after local release, the kernel attempts to re-reserve the region so the failure remains fail-closed.
+`Completed`, `Cancelled`, `Faulted`, stale/wrong-domain/malformed receipts and legacy synchronous success are never reclaim proof.
 
-`Completed`, `Cancelled`, `Faulted`, stale receipts, wrong-domain receipts, malformed receipts and legacy synchronous success are never reclaim proof.
+## Completed slice 2 — process exit / fault completion orchestration
 
-### Host model
+`RuntimeKernel.TerminateProcess()` and `RuntimeKernel.FaultProcess()` no longer require callers to pre-revoke platform authority. They now begin the same explicit non-blocking teardown lifecycle.
 
-The host provider implements `IPlatformRegionRevocationProvider`.
-
-Default host behavior completes the revocation operation immediately so existing synchronous tests/behavior stay compatible, but it still goes through ticket + completion receipt validation.
-
-`deferRegionRevocationCompletion` is a host fault-injection/model knob for tests. It leaves the provider operation in `Draining` until `CompleteRegionMappingRevocation(...)` is invoked, allowing the bridge to prove that local authorization can be dead while the region remains pinned.
-
-## Target state machine
-
-Use one invariant across capabilities, mappings, future DMA grants, compute submissions and VM bindings:
+The observable process-level semantic phases are:
 
 ```text
-Active local authority
-  -> LocallyRevoked / Exiting
-       (no new effects)
-  -> PlatformDraining
-       (old external effects may still exist)
-  -> PlatformClosed
-       (completion receipt proves closure)
-  -> LocalReclaimAllowed
+ProcessState.Exiting
+  + ProcessTeardownPhase.LocalExitStarted
+      -> ProcessTeardownPhase.PlatformDraining
+      -> ProcessTeardownPhase.PlatformClosed
+      -> ProcessState.Exited | ProcessState.Faulted
 ```
 
-Never interpret `LocallyRevoked` as proof that a device/IOMMU/accelerator can no longer touch memory.
-
-## Remaining Phase-2 tasks
-
-### 1. Generalize authorization-vs-closure outcome to process teardown
-
-The mapping lifecycle now makes the distinction explicit. Process termination/fault still needs an aggregate internal outcome across all resource classes so callers cannot confuse local authorization death with external closure.
-
-### 2. Add domain teardown orchestration
-
-Replace the current all-or-nothing caller choreography with an explicit internal lifecycle:
+Provider/closure failure instead produces:
 
 ```text
-BeginProcessExit
-  -> close process channels / cancel pending SIP waits
-  -> revoke local capabilities for new effects
-  -> begin closing mappings/DMA/compute/device/child-domain authority
-  -> wait/observe platform completions
-  -> close platform domain lease
-  -> reclaim regions/domain state
-  -> publish Exited/Faulted
+ProcessState.Exiting
+  + ProcessTeardownPhase.PlatformFaulted
+  + LocalReclaimCompleted = false
 ```
 
-Do not hide unbounded hardware drain inside a synchronous syscall. Preserve the Track A guarantee that pending SIP response waiters are deterministically cancelled when channels close.
+A provider fault therefore does **not** publish a fully exited/faulted process and does not release pinned regions.
 
-### 3. Define aggregate fault containment
+`ProcessTeardownSnapshot` contains only local semantic evidence:
 
-For provider `Faulted` during revoke:
+- exact `ProcessHandle` generation;
+- requested local terminal state (`Exited` or `Faulted`);
+- teardown phase;
+- whether exact process channels were closed;
+- whether local authorization was revoked;
+- count of platform mappings still pending;
+- whether the platform domain binding is closed;
+- whether local reclaim completed;
+- a semantic `KernelError` blocking reason when fault-contained.
 
-- local authorization remains dead;
-- affected resource remains pinned/reserved;
-- process/domain cannot be reported fully exited/reclaimable;
-- diagnostics identify semantic local mapping/operation state without exposing provider authority;
-- a future platform-reset path, if one exists, must supply closure proof before reclaim.
+It contains no provider lease/operation IDs and is not a capability.
 
-### 4. Reuse composed generations for future resource classes
+### Required ordering
 
-Validation for platform-visible effects must continue comparing the relevant independent epochs rather than flattening them into one counter:
+The begin path is intentionally ordered:
+
+```text
+1. mark process Exiting
+2. close exact process-owned channels
+   -> ResponseRegistry cancels pending waiters
+   -> previously committed responses remain committed
+3. mark/revoke process-held local capability authority
+4. begin/observe all tracked process platform-mapping closures
+5. require every mapping to pass its existing exact Closed receipt + local-generation reclaim gate
+6. revoke the process platform-domain binding
+7. return loans borrowed by the exact process generation
+8. reclaim regions owned by the exact process generation
+9. remove the process from domain membership
+10. only for the final domain member, perform residual domain-wide capability/loan/region/channel cleanup
+11. publish Exited or Faulted and retire the exact process generation
+```
+
+No unbounded provider drain is hidden inside a syscall. A synchronous host backend can complete the whole sequence in the initial call. A deferred backend leaves the process live in `Exiting`; `ObserveProcessTeardown()` advances it later.
+
+### No-new-effects gate
+
+Once a process enters `Exiting`, it cannot mint/delegate new capabilities, allocate/transfer/release regions, create new channels, bind a new platform domain, or create new platform mappings. Existing channels were already closed before platform drain began, so send/receive/response operations fail through stale endpoint generations.
+
+Authority-reducing and observation paths needed by teardown remain available internally.
+
+### Process-generation-specific cleanup
+
+Local cleanup no longer relies only on domain-wide reclaim. `RegionAuthority` can now:
+
+- return loans borrowed by one exact `RegionOwner` (`DomainId + process generation`);
+- reclaim regions owned by one exact `RegionOwner`;
+- refuse that reclaim if any owned region is still platform-reserved.
+
+This lets one process leave a multi-process domain without destroying sibling process regions, capabilities or channels. Domain-wide cleanup is deferred until the final member exits.
+
+## Fault containment
+
+For a provider closure fault or another hard external-closure error:
+
+- process state remains `Exiting`;
+- exact process channels are already closed;
+- process-held local capability authority is already dead;
+- affected regions remain pinned/reserved;
+- `LocalReclaimCompleted` remains false;
+- `QueryProcessTeardown()` exposes a semantic fault-contained snapshot;
+- no rollback restores local authority;
+- a future platform-reset contract would still need stronger closure proof before reclaim.
+
+## Composed generations
+
+The completed Phase-2 paths compare independent epochs rather than inventing one global generation:
 
 ```text
 process generation
 capability revocation state
-region generation
+region generation / RegionOwner process generation
 local platform binding generation
-provider lease generation / future HybridCPU domain epoch
+local platform mapping generation
+provider mapping/domain lease generation
 operation generation
 ```
 
-The mapping slice now composes local mapping, binding, region, provider mapping/domain and operation generations at the reclaim boundary.
-
-## Code touched by the first Phase-2 slice
-
-- new `src/Platform/SingPlus.Platform.Abstractions/PlatformRegionRevocationContracts.cs`;
-- `src/Platform/SingPlus.Platform.Host/HostPlatformAuthorityProvider.cs`;
-- `src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.cs`;
-- `src/Runtime/SingPlus.Runtime/Platform/RuntimeKernel.Platform.cs`;
-- new `tests/SingPlus.Tests/Platform/PlatformRevocationLifecycleTests.cs`.
-
-No HybridCPU-v2, DMA, scheduler, IRQ or SIP protocol surface is changed by this slice.
+Any mismatch at the relevant boundary invalidates the operation or reclaim attempt.
 
 ## Tests
 
-First-slice coverage includes:
+Phase-2 coverage now proves:
 
-- capability revoke kills local authority immediately while deferred platform closure stays `Draining` and the region remains pinned;
+- capability revoke kills local authority immediately while deferred mapping closure stays `Draining` and the region remains pinned;
 - valid `Closed` receipt allows release only after exact local binding/region revalidation;
-- draining re-entry does not start a second provider revocation operation;
-- stale completion cannot release the reservation;
-- wrong-domain completion cannot release the reservation;
-- malformed completion faults closure and remains non-reclaimable;
-- stale local mapping/binding/region identity cannot finalize reclaim;
+- stale/wrong-domain/malformed completion cannot release a reservation;
+- `Faulted` completion remains observable and non-reclaimable;
 - duplicate valid `Closed` observation is idempotent;
-- legacy synchronous revoke without a completion receipt cannot authorize local reclaim;
-- existing immediate host revocation behavior remains compatible.
-
-Still required in later Phase-2 slices:
-
-- termination cancels SIP waiters before waiting for platform drain;
-- termination cannot reach `Exited` while any provider authority is merely `Draining`;
-- committed SIP response stays committed even if later platform teardown fails;
-- domain with multiple processes tears down only process-owned channels/resources until the final domain member exits;
-- aggregate multiple-resource fault containment.
+- legacy synchronous revoke without a receipt cannot authorize reclaim;
+- process termination closes/cancels pending SIP response waiters before deferred platform drain completes;
+- a process remains `Exiting`, not `Exited` / `Faulted`, while any mapping is still draining;
+- `FaultProcess` publishes terminal `Faulted` only after verified platform closure and local cleanup;
+- a response committed before teardown remains published even when later platform closure faults;
+- after `Exiting`, authority-producing region/capability/channel/platform APIs fail closed;
+- one process exiting a shared domain reclaims only its exact process-generation resources while sibling process authority remains live;
+- final-domain-member cleanup remains domain-wide only after membership reaches zero.
 
 ## Acceptance criteria
 
-Phase 2 is **not complete yet**. The owned-region mapping/capability-revocation path now makes reclaim mechanically impossible before verified external closure. Phase 2 remains open until process exit/fault uses the same explicit lifecycle and ordering across all currently implemented resource classes.
+Phase 2 is complete for current code when:
+
+- local revocation / `Exiting` immediately prevents all new process authority uses;
+- external platform closure is represented independently as `Draining`, `Closed` or fault-contained;
+- local region reclaim is mechanically impossible before exact verified `Closed` evidence;
+- process terminal state is mechanically impossible before all current platform mappings close, the platform domain binding closes, and local cleanup succeeds;
+- SIP waiter cancellation precedes platform drain waiting/observation;
+- committed responses are not rolled back by later teardown failure;
+- multi-process domains do not suffer premature domain-wide cleanup.
+
+The implementation now satisfies these criteria for the platform domain + owned-region mapping authority classes that currently exist.
+
+## Reuse requirement for later phases
+
+Later DMA, accelerator, virtualization and display work must plug into this same lifecycle:
+
+```text
+local authority dead / process Exiting
+  -> external authority Draining
+  -> exact completion receipt Closed
+  -> exact local generation revalidation
+  -> local reclaim
+```
+
+They must not create parallel timeout-based or synchronous-success reclaim rules.
 
 ## Do not do
 
-- do not restore a revoked local capability because external revoke failed;
-- do not free/reuse memory after a timeout unless the platform contract proves reset/revocation;
+- do not restore revoked local authority because external revoke failed;
+- do not free/reuse memory after a timeout unless a platform contract proves reset/revocation;
 - do not model provider completion as a normal SIP response capability;
 - do not assume synchronous device shutdown;
-- do not treat legacy synchronous provider success as a substitute for a valid `Closed` receipt on the new reclaim path;
-- no HybridCPU binding or DMA in this Phase-2 slice.
+- do not treat legacy synchronous provider success as `Closed` evidence;
+- do not flatten process/capability/region/binding/provider/operation generations into one epoch;
+- no HybridCPU binding or DMA in Phase 2.
+
+## Next roadmap phase
+
+Proceed to **Phase 3 — real neutral HybridCPU domain binding**. The Phase-2 teardown lifecycle is now the required security boundary that any real backend must plug into rather than bypass.
