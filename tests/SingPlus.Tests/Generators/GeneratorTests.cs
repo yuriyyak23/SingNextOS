@@ -16,6 +16,8 @@ using SingPlus.Sip;
 using SingPlus.Sip.Sdk;
 namespace GeneratedTest;
 
+public enum ConsoleMode : byte { Normal = 0, Diagnostic = 1 }
+
 [BoundedPayload(64)]
 public readonly struct ConsolePacket : IBoundedPayload
 {
@@ -34,13 +36,22 @@ public interface IConsoleService
 
     [Message(3), Transition("Ready", "Ready")]
     void Configure(ConsolePacket packet);
+
+    [Message(4), Transition("Ready", "Ready")]
+    void SetLevel(int level);
+
+    [Message(5), Transition("Ready", "Ready")]
+    void SetMode(ConsoleMode mode);
+
+    [Message(6), Transition("Ready", "Ready")]
+    void Ping();
 }
 """;
 
     [Fact]
     [Trait("Category", "Generators")]
     [Trait("Category", "Determinism")]
-    public void GeneratorProducesFourDeterministicArtifactsWithPayloadShapes()
+    public void GeneratorProducesFourDeterministicArtifactsWithCompleteRequestShapes()
     {
         var first = RunValid(ContractSource);
         var second = RunValid(ContractSource);
@@ -50,11 +61,15 @@ public interface IConsoleService
         Assert.Contains(first.Keys, x => x.EndsWith(".Dispatcher.g.cs", StringComparison.Ordinal));
         Assert.Contains(first.Keys, x => x.EndsWith(".Manifest.g.cs", StringComparison.Ordinal));
         Assert.Contains(first.Keys, x => x.EndsWith(".Capabilities.g.cs", StringComparison.Ordinal));
-        Assert.Contains(first.Values, text => text.Contains("OwnershipPayloadKind)1", StringComparison.Ordinal));
+        Assert.Contains(first.Values, text => text.Contains("RequestPayloadKind)4", StringComparison.Ordinal));
         Assert.Contains(first.Values, text => text.Contains("ReturnKind=2", StringComparison.Ordinal));
-        Assert.Contains(first.Values, text => text.Contains("BoundedPayloadDescriptorV1(\"packet\", \"GeneratedTest.ConsolePacket\", 64)", StringComparison.Ordinal));
-        Assert.Contains(first.Values, text => text.Contains("Parameter=packet;Type=GeneratedTest.ConsolePacket;MaxBytes=64", StringComparison.Ordinal));
-        Assert.Contains(first.Values, text => text.Contains("bounded=3|packet|GeneratedTest.ConsolePacket|64", StringComparison.Ordinal));
+        Assert.Contains(first.Values, text => text.Contains("RequestPayloadKind)3", StringComparison.Ordinal) && text.Contains("GeneratedTest.ConsolePacket", StringComparison.Ordinal));
+        Assert.Contains(first.Values, text => text.Contains("Kind=1;Parameter=level;Type=System.Int32", StringComparison.Ordinal));
+        Assert.Contains(first.Values, text => text.Contains("Kind=2;Parameter=mode;Type=GeneratedTest.ConsoleMode", StringComparison.Ordinal));
+        Assert.Contains(first.Values, text => text.Contains("Kind=0;Parameter=;Type=", StringComparison.Ordinal));
+        Assert.Contains(first.Values, text => text.Contains("request=3|3|packet|GeneratedTest.ConsolePacket|64|0", StringComparison.Ordinal));
+        Assert.Contains(first.Values, text => text.Contains("request=4|1|level|System.Int32|0|0", StringComparison.Ordinal));
+        Assert.Contains(first.Values, text => text.Contains("request=5|2|mode|GeneratedTest.ConsoleMode|0|0", StringComparison.Ordinal));
         Assert.Contains(first.Values, text => text.Contains("ContractDigest", StringComparison.Ordinal));
     }
 
@@ -187,6 +202,32 @@ public interface IBadContract
         var diagnostics = RunDiagnostics(source);
 
         Assert.Contains(diagnostics, diagnostic => diagnostic.Id == "SINGGEN006" && diagnostic.Severity == DiagnosticSeverity.Error);
+        Assert.Contains(diagnostics, diagnostic => diagnostic.Id == "SINGGEN007" && diagnostic.Severity == DiagnosticSeverity.Error);
+    }
+
+    [Theory]
+    [InlineData("void Bad(int first, int second);", "SINGGEN007")]
+    [InlineData("void Bad([Consumes] OwnedBuffer<byte> data, int flags);", "SINGGEN007")]
+    [InlineData("void Bad(string text);", "SINGGEN008")]
+    [InlineData("void Bad(ref int value);", "SINGGEN008")]
+    [Trait("Category", "Generators")]
+    public void UnsupportedRequestShapeFailsClosed(string methodDeclaration, string expectedDiagnostic)
+    {
+        var source = $$"""
+using SingPlus.Sip;
+using SingPlus.Sip.Sdk;
+namespace GeneratedTest;
+[SipContract]
+public interface IBadContract
+{
+    [Message(1)]
+    {{methodDeclaration}}
+}
+""";
+
+        var diagnostics = RunDiagnostics(source);
+
+        Assert.Contains(diagnostics, diagnostic => diagnostic.Id == expectedDiagnostic && diagnostic.Severity == DiagnosticSeverity.Error);
     }
 
     private static Dictionary<string, string> RunValid(string source)
