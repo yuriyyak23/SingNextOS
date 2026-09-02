@@ -76,13 +76,15 @@ public sealed class ChannelRegistry
         if (!record.Protocol.TryTransition(record.State, messageId, out var transition)) return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidProtocolTransition, $"Message {messageId} is illegal in state '{record.State}'.");
         var capabilityValidation = ValidateCapabilities(sender, message, capabilityIds);
         if (!capabilityValidation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(capabilityValidation.Error, capabilityValidation.Message!);
-        if (!IsSupportedPayload(payload)) return KernelResult<ChannelEnvelope>.Fail(KernelError.UnsupportedPayload, "Payload must be primitive, enum, bounded payload, or owned region data.");
-        if (message.Borrows.Count != 0 && message.Consumes.Count != 0) return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidMessage, "A single payload cannot be both borrowed and consumed.");
+        if (!IsSupportedPayload(payload)) return KernelResult<ChannelEnvelope>.Fail(KernelError.UnsupportedPayload, "Payload must be primitive, enum, bounded payload, or declared owned region data.");
+        var ownershipValidation = ValidateOwnershipPayload(message, payload);
+        if (!ownershipValidation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(ownershipValidation.Error, ownershipValidation.Message!);
 
         object? queuedPayload = payload;
         if (message.Borrows.Count != 0)
         {
-            if (payload is not ITransferableOwnedPayload borrowed || !borrowed.IsValidForRuntime) return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidRegionState, "Borrowing messages require a valid owned payload.");
+            var borrowed = (ITransferableOwnedPayload)payload!;
+            if (!borrowed.IsValidForRuntime) return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidRegionState, "Borrowing messages require a valid owned payload.");
             var owner = new RegionOwner(sender.DomainId, sender.Generation);
             var borrower = new RegionOwner(receiver.DomainId, receiver.Generation);
             var borrowValidation = _regions.Validate(borrowed.Handle, owner);
@@ -103,7 +105,8 @@ public sealed class ChannelRegistry
 
         if (message.Consumes.Count != 0)
         {
-            if (payload is not ITransferableOwnedPayload owned || !owned.IsValidForRuntime) return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidRegionState, "Consuming messages require a valid owned payload.");
+            var owned = (ITransferableOwnedPayload)payload!;
+            if (!owned.IsValidForRuntime) return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidRegionState, "Consuming messages require a valid owned payload.");
             var oldHandle = owned.Handle;
             var owner = new RegionOwner(sender.DomainId, sender.Generation);
             var regionValidation = _regions.Validate(oldHandle, owner);
@@ -168,6 +171,23 @@ public sealed class ChannelRegistry
             }
             if (!found) return KernelResult.Fail(KernelError.MissingCapability, $"Message requires {requirement.ResourceKind}:{requirement.ResourceId} ({requirement.Rights}).");
         }
+        return KernelResult.Ok();
+    }
+
+    private static KernelResult ValidateOwnershipPayload(ProtocolMessageDescriptorV1 message, object? payload)
+    {
+        var declaresOwnership = message.Consumes.Count + message.Borrows.Count == 1;
+        if (!declaresOwnership)
+        {
+            return payload is ITransferableOwnedPayload
+                ? KernelResult.Fail(KernelError.UnsupportedPayload, "Owned payloads require an explicit Consumes or Borrows contract declaration.")
+                : KernelResult.Ok();
+        }
+
+        if (payload is not ITransferableOwnedPayload owned)
+            return KernelResult.Fail(KernelError.UnsupportedPayload, "Ownership-bearing messages require the declared owned payload shape.");
+        if (owned.PayloadKind != message.OwnershipPayloadKind)
+            return KernelResult.Fail(KernelError.UnsupportedPayload, $"Expected ownership payload kind {message.OwnershipPayloadKind}, got {owned.PayloadKind}.");
         return KernelResult.Ok();
     }
 
