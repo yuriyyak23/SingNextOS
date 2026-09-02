@@ -6,7 +6,8 @@ public sealed class HostPlatformAuthorityProvider :
     IPlatformAuthorityProvider,
     IPlatformFeatureProvider,
     IPlatformCompletionProvider,
-    IPlatformMemoryVisibilityProvider
+    IPlatformMemoryVisibilityProvider,
+    IPlatformRegionRevocationProvider
 {
     private sealed class DomainRecord(PlatformProviderDomainLease lease)
     {
@@ -18,6 +19,7 @@ public sealed class HostPlatformAuthorityProvider :
     {
         public PlatformProviderRegionMappingLease Lease { get; } = lease;
         public bool Revoked { get; set; }
+        public PlatformOperationIdentity? RevocationOperation { get; set; }
     }
 
     private sealed class OperationRecord(PlatformOperationIdentity operation)
@@ -38,6 +40,7 @@ public sealed class HostPlatformAuthorityProvider :
     private readonly Dictionary<PlatformDomainIdentity, PlatformProviderDomainLeaseId> _activeSubjects = [];
     private readonly Dictionary<PlatformRegionIdentity, PlatformProviderRegionMappingId> _activeRegions = [];
     private readonly PlatformAuthorityStatus? _regionRevocationFailure;
+    private readonly bool _deferRegionRevocationCompletion;
     private readonly PlatformFeatureManifest _featureManifest;
     private ulong _nextDomainId = 1;
     private ulong _nextMappingId = 1;
@@ -48,12 +51,14 @@ public sealed class HostPlatformAuthorityProvider :
             PlatformAuthorityFeatures.NeutralDomainBinding |
             PlatformAuthorityFeatures.DirectOwnedRegionMapping,
         PlatformAuthorityStatus? regionRevocationFailure = null,
-        IEnumerable<PlatformFeatureDescriptor>? additionalFeatures = null)
+        IEnumerable<PlatformFeatureDescriptor>? additionalFeatures = null,
+        bool deferRegionRevocationCompletion = false)
     {
         if (regionRevocationFailure == PlatformAuthorityStatus.Success)
             throw new ArgumentOutOfRangeException(nameof(regionRevocationFailure));
 
         _regionRevocationFailure = regionRevocationFailure;
+        _deferRegionRevocationCompletion = deferRegionRevocationCompletion;
         Descriptor = new PlatformProviderDescriptor(new PlatformProviderId("host-test"), 2, features);
 
         var featureDescriptors = PlatformFeatureManifest.FromLegacy(features).Features.ToList();
@@ -74,6 +79,7 @@ public sealed class HostPlatformAuthorityProvider :
     public int MapOwnedRegionCallCount { get; private set; }
     public int RevokeRegionMappingCallCount { get; private set; }
     public PlatformRegionRevocationPolicy? LastRegionRevocationPolicy { get; private set; }
+    public PlatformOperationIdentity? LastRegionRevocationOperation { get; private set; }
 
     public PlatformFeatureManifest QueryFeatures() => _featureManifest;
 
@@ -296,6 +302,119 @@ public sealed class HostPlatformAuthorityProvider :
         return PlatformAuthorityResult<PlatformProviderRegionMappingLease>.Ok(lease);
     }
 
+    public PlatformAuthorityResult<PlatformRegionRevocationTicket> BeginRegionMappingRevocation(
+        PlatformProviderRegionMappingLease mapping,
+        PlatformRegionRevocationPolicy policy)
+    {
+        RevokeRegionMappingCallCount++;
+        LastRegionRevocationPolicy = policy;
+
+        var validation = ValidateRegionMappingForRevocation(mapping, policy);
+        if (!validation.IsSuccess)
+            return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Fail(
+                validation.Status,
+                validation.Message!);
+
+        var record = _mappings[mapping.MappingId];
+        if (record.RevocationOperation is { } existingOperation)
+        {
+            return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Ok(
+                new PlatformRegionRevocationTicket(
+                    mapping.MappingId,
+                    mapping.Generation,
+                    existingOperation));
+        }
+
+        if (_regionRevocationFailure is { } failure)
+        {
+            return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Fail(
+                failure,
+                "The host provider was configured to fail region drain/revocation.");
+        }
+
+        var staged = StageOperation(mapping.DomainLease);
+        if (!staged.IsSuccess)
+        {
+            return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Fail(
+                staged.Status,
+                staged.Message!);
+        }
+
+        var operation = staged.Value!;
+        var pending = AdvanceOperation(operation, PlatformCompletionState.Pending);
+        if (!pending.IsSuccess)
+        {
+            return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Fail(
+                pending.Status,
+                pending.Message!);
+        }
+
+        var draining = AdvanceOperation(operation, PlatformCompletionState.Draining);
+        if (!draining.IsSuccess)
+        {
+            return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Fail(
+                draining.Status,
+                draining.Message!);
+        }
+
+        record.RevocationOperation = operation;
+        LastRegionRevocationOperation = operation;
+
+        if (!_deferRegionRevocationCompletion)
+        {
+            var closed = CompleteRegionMappingRevocation(operation);
+            if (!closed.IsSuccess)
+            {
+                return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Fail(
+                    closed.Status,
+                    closed.Message!);
+            }
+        }
+
+        return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Ok(
+            new PlatformRegionRevocationTicket(
+                mapping.MappingId,
+                mapping.Generation,
+                operation));
+    }
+
+    public PlatformAuthorityResult<PlatformCompletionReceipt> CompleteRegionMappingRevocation(
+        PlatformOperationIdentity operation)
+    {
+        var operationValidation = ValidateOperation(operation);
+        if (!operationValidation.IsSuccess)
+        {
+            return PlatformAuthorityResult<PlatformCompletionReceipt>.Fail(
+                operationValidation.Status,
+                operationValidation.Message!);
+        }
+
+        MappingRecord? mappingRecord = null;
+        foreach (var candidate in _mappings.Values)
+        {
+            if (candidate.RevocationOperation is { } candidateOperation &&
+                candidateOperation == operation)
+            {
+                mappingRecord = candidate;
+                break;
+            }
+        }
+
+        if (mappingRecord is null)
+        {
+            return PlatformAuthorityResult<PlatformCompletionReceipt>.Fail(
+                PlatformAuthorityStatus.Denied,
+                "The platform operation is not a region-mapping revocation operation.");
+        }
+
+        if (mappingRecord.Revoked)
+            return ObserveCompletion(operation);
+
+        mappingRecord.Revoked = true;
+        _activeRegions.Remove(mappingRecord.Lease.Region);
+        return AdvanceOperation(operation, PlatformCompletionState.Closed);
+    }
+
     public PlatformAuthorityResult RevokeRegionMapping(
         PlatformProviderRegionMappingLease mapping,
         PlatformRegionRevocationPolicy policy)
@@ -303,6 +422,24 @@ public sealed class HostPlatformAuthorityProvider :
         RevokeRegionMappingCallCount++;
         LastRegionRevocationPolicy = policy;
 
+        var validation = ValidateRegionMappingForRevocation(mapping, policy);
+        if (!validation.IsSuccess) return validation;
+
+        if (_regionRevocationFailure is { } failure)
+            return PlatformAuthorityResult.Fail(
+                failure,
+                "The host provider was configured to fail region drain/revocation.");
+
+        var record = _mappings[mapping.MappingId];
+        record.Revoked = true;
+        _activeRegions.Remove(record.Lease.Region);
+        return PlatformAuthorityResult.Ok();
+    }
+
+    private PlatformAuthorityResult ValidateRegionMappingForRevocation(
+        PlatformProviderRegionMappingLease mapping,
+        PlatformRegionRevocationPolicy policy)
+    {
         if (policy != PlatformRegionRevocationPolicy.DrainBeforeRevoke)
             return PlatformAuthorityResult.Fail(
                 PlatformAuthorityStatus.Unsupported,
@@ -328,13 +465,6 @@ public sealed class HostPlatformAuthorityProvider :
                 PlatformAuthorityStatus.Revoked,
                 "The platform mapping has already been revoked.");
 
-        if (_regionRevocationFailure is { } failure)
-            return PlatformAuthorityResult.Fail(
-                failure,
-                "The host provider was configured to fail region drain/revocation.");
-
-        record.Revoked = true;
-        _activeRegions.Remove(record.Lease.Region);
         return PlatformAuthorityResult.Ok();
     }
 

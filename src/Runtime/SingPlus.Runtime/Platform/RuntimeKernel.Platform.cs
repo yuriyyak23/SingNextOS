@@ -119,35 +119,122 @@ public sealed partial class RuntimeKernel
         var resolved = Processes.Resolve(owner);
         if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
 
-        var process = resolved.Value!;
-        var identity = new PlatformDomainIdentity(process.DomainId, owner.Generation);
-        var revoke = PlatformAuthority.RevokeRegionMapping(
+        var identity = new PlatformDomainIdentity(
+            resolved.Value!.DomainId,
+            owner.Generation);
+        var lifecycle = PlatformAuthority.BeginRegionMappingRevocation(
             mapping,
             identity,
             PlatformRegionRevocationPolicy.DrainBeforeRevoke);
-        if (!revoke.IsSuccess) return revoke;
+        if (!lifecycle.IsSuccess)
+            return KernelResult.Fail(lifecycle.Error, lifecycle.Message!);
 
-        return Regions.ReleasePlatformMappingReservation(
-            mapping.Region,
-            new RegionOwner(process.DomainId, owner.Generation));
+        return FinalizePlatformRegionMappingClosure(mapping, identity, lifecycle.Value!);
+    }
+
+    public KernelResult ObservePlatformRegionMappingRevocation(
+        ProcessHandle owner,
+        PlatformRegionMapping mapping)
+    {
+        var resolved = Processes.Resolve(owner);
+        if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+
+        var identity = new PlatformDomainIdentity(
+            resolved.Value!.DomainId,
+            owner.Generation);
+        var lifecycle = PlatformAuthority.ObserveRegionMappingRevocation(mapping, identity);
+        if (!lifecycle.IsSuccess)
+            return KernelResult.Fail(lifecycle.Error, lifecycle.Message!);
+
+        return FinalizePlatformRegionMappingClosure(mapping, identity, lifecycle.Value!);
+    }
+
+    public KernelResult<PlatformRegionMappingLifecycle> QueryPlatformRegionMappingLifecycle(
+        ProcessHandle owner,
+        PlatformRegionMapping mapping)
+    {
+        var resolved = Processes.Resolve(owner);
+        if (!resolved.IsSuccess)
+            return KernelResult<PlatformRegionMappingLifecycle>.Fail(
+                resolved.Error,
+                resolved.Message!);
+
+        var identity = new PlatformDomainIdentity(
+            resolved.Value!.DomainId,
+            owner.Generation);
+        return PlatformAuthority.QueryRegionMappingLifecycle(mapping, identity);
     }
 
     internal KernelResult CascadePlatformCapabilityRevocation(CapabilityId capabilityId)
     {
         var mappings = PlatformAuthority.BeginCapabilityRevocation(capabilityId);
+        KernelResult? firstFailure = null;
+
         foreach (var mapping in mappings)
         {
             var subject = mapping.DomainBinding.Subject;
-            var revoke = PlatformAuthority.RevokeRegionMapping(
+            var lifecycle = PlatformAuthority.BeginRegionMappingRevocation(
                 mapping,
                 subject,
                 PlatformRegionRevocationPolicy.DrainBeforeRevoke);
-            if (!revoke.IsSuccess) return revoke;
 
-            var release = Regions.ReleasePlatformMappingReservation(
-                mapping.Region,
-                new RegionOwner(subject.DomainId, subject.ProcessGeneration));
-            if (!release.IsSuccess) return release;
+            if (!lifecycle.IsSuccess)
+            {
+                firstFailure ??= KernelResult.Fail(lifecycle.Error, lifecycle.Message!);
+                continue;
+            }
+
+            var finalize = FinalizePlatformRegionMappingClosure(
+                mapping,
+                subject,
+                lifecycle.Value!);
+            if (!finalize.IsSuccess)
+                firstFailure ??= finalize;
+        }
+
+        return firstFailure ?? KernelResult.Ok();
+    }
+
+    private KernelResult FinalizePlatformRegionMappingClosure(
+        PlatformRegionMapping mapping,
+        PlatformDomainIdentity identity,
+        PlatformRegionMappingLifecycle lifecycle)
+    {
+        if (lifecycle.PlatformClosure == PlatformExternalClosureState.Faulted)
+        {
+            return KernelResult.Fail(
+                KernelError.PlatformFaulted,
+                "The platform region mapping closure faulted; local reclaim remains forbidden.");
+        }
+
+        if (lifecycle.PlatformClosure != PlatformExternalClosureState.Closed)
+        {
+            return KernelResult.Fail(
+                KernelError.PlatformBindingDraining,
+                "The platform region mapping is still draining; local reclaim remains forbidden.");
+        }
+
+        if (lifecycle.LocalReservationReleased)
+            return KernelResult.Ok();
+
+        var bindingValidation = PlatformAuthority.ValidateDomain(
+            mapping.DomainBinding,
+            identity);
+        if (!bindingValidation.IsSuccess) return bindingValidation;
+
+        var owner = new RegionOwner(identity.DomainId, identity.ProcessGeneration);
+        var regionValidation = Regions.Validate(mapping.Region, owner);
+        if (!regionValidation.IsSuccess)
+            return KernelResult.Fail(regionValidation.Error, regionValidation.Message!);
+
+        var release = Regions.ReleasePlatformMappingReservation(mapping.Region, owner);
+        if (!release.IsSuccess) return release;
+
+        var markReleased = PlatformAuthority.MarkRegionReservationReleased(mapping, identity);
+        if (!markReleased.IsSuccess)
+        {
+            _ = Regions.ReservePlatformMapping(mapping.Region, owner);
+            return markReleased;
         }
 
         return KernelResult.Ok();
