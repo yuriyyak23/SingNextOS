@@ -11,17 +11,16 @@ public sealed class BoundedPayloadRuntimeTests
     [Fact]
     public void DescriptorRejectsMalformedBoundedPayloadMetadata()
     {
-        Assert.Throws<ArgumentException>(() => new BoundedPayloadDescriptorV1("", typeof(Packet).FullName!, 64));
-        Assert.Throws<ArgumentException>(() => new BoundedPayloadDescriptorV1("packet", "", 64));
-        Assert.Throws<ArgumentOutOfRangeException>(() => new BoundedPayloadDescriptorV1("packet", typeof(Packet).FullName!, 0));
+        Assert.Throws<ArgumentException>(() => new RequestPayloadDescriptorV1(RequestPayloadKind.Bounded, "", typeof(Packet).FullName!, 64));
+        Assert.Throws<ArgumentException>(() => new RequestPayloadDescriptorV1(RequestPayloadKind.Bounded, "packet", "", 64));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new RequestPayloadDescriptorV1(RequestPayloadKind.Bounded, "packet", typeof(Packet).FullName!, 0));
 
-        var bounded = new BoundedPayloadDescriptorV1("packet", typeof(Packet).FullName!, 64);
+        var bounded = new RequestPayloadDescriptorV1(RequestPayloadKind.Bounded, "packet", typeof(Packet).FullName!, 64);
         Assert.Throws<ArgumentException>(() => new ProtocolMessageDescriptorV1(
             10,
             "Ambiguous",
             consumes: new[] { "data" },
-            ownershipPayloadKind: OwnershipPayloadKind.OwnedBuffer,
-            boundedPayload: bounded));
+            requestPayload: bounded));
     }
 
     [Fact]
@@ -132,7 +131,7 @@ public sealed class BoundedPayloadRuntimeTests
                 new ProtocolMessageDescriptorV1(
                     1,
                     "Packet",
-                    boundedPayload: new BoundedPayloadDescriptorV1("packet", typeof(Packet).FullName!, 64)),
+                    requestPayload: new RequestPayloadDescriptorV1(RequestPayloadKind.Bounded, "packet", typeof(Packet).FullName!, 64)),
                 new ProtocolMessageDescriptorV1(2, "Plain")
             },
             transitions: new[]
