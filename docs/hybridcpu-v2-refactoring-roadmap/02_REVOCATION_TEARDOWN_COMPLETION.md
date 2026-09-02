@@ -7,7 +7,7 @@
 Phase 2 now has two composed vertical slices:
 
 1. completion-backed owned-region mapping revocation;
-2. process exit/fault orchestration that closes local channels and authority first, drains all process-owned platform mappings, closes the platform domain binding, and only then performs local region/domain reclaim and publishes `Exited` / `Faulted`.
+2. process exit/fault orchestration that closes local channels and process-held authority first, drains all process-owned platform mappings, closes the platform domain binding, and only then completes process retirement. Domain-scoped region/loan reclaim remains deferred until the final domain member exits.
 
 This phase does **not** claim DMA, accelerator, VM, display or real HybridCPU teardown. Those authority classes do not exist yet in the current runtime and must reuse this lifecycle unchanged when their later roadmap phases add them.
 
@@ -107,10 +107,10 @@ A provider fault therefore does **not** publish a fully exited/faulted process a
 - requested local terminal state (`Exited` or `Faulted`);
 - teardown phase;
 - whether exact process channels were closed;
-- whether local authorization was revoked;
+- whether process-held local authorization was revoked;
 - count of platform mappings still pending;
-- whether the platform domain binding is closed;
-- whether local reclaim completed;
+- whether the process platform-domain binding is closed;
+- whether process-local retirement cleanup completed (`LocalReclaimCompleted`); for a shared domain this does **not** mean domain-scoped region records have been freed;
 - a semantic `KernelError` blocking reason when fault-contained.
 
 It contains no provider lease/operation IDs and is not a capability.
@@ -128,11 +128,14 @@ The begin path is intentionally ordered:
 4. begin/observe all tracked process platform-mapping closures
 5. require every mapping to pass its existing exact Closed receipt + local-generation reclaim gate
 6. revoke the process platform-domain binding
-7. return loans borrowed by the exact process generation
-8. reclaim regions owned by the exact process generation
-9. remove the process from domain membership
-10. only for the final domain member, perform residual domain-wide capability/loan/region/channel cleanup
-11. publish Exited or Faulted and retire the exact process generation
+7. remove the process from domain membership
+8. if and only if this was the final domain member:
+   -> revoke residual domain capabilities
+   -> return domain borrower loans
+   -> reclaim domain regions
+   -> close residual domain channels
+9. clear the exiting process's local runtime references
+10. publish Exited or Faulted and retire the exact process generation
 ```
 
 No unbounded provider drain is hidden inside a syscall. A synchronous host backend can complete the whole sequence in the initial call. A deferred backend leaves the process live in `Exiting`; `ObserveProcessTeardown()` advances it later.
@@ -143,15 +146,21 @@ Once a process enters `Exiting`, it cannot mint/delegate new capabilities, alloc
 
 Authority-reducing and observation paths needed by teardown remain available internally.
 
-### Process-generation-specific cleanup
+### Shared-domain lifetime semantics
 
-Local cleanup no longer relies only on domain-wide reclaim. `RegionAuthority` can now:
+The existing ownership model intentionally keeps domain-scoped regions and borrower-domain loans alive while another process still keeps the domain active. This iteration preserves that rule rather than inventing a second process-local region lifetime.
 
-- return loans borrowed by one exact `RegionOwner` (`DomainId + process generation`);
-- reclaim regions owned by one exact `RegionOwner`;
-- refuse that reclaim if any owned region is still platform-reserved.
+Therefore a non-final process exit performs process-specific teardown only where the authority is already process-specific:
 
-This lets one process leave a multi-process domain without destroying sibling process regions, capabilities or channels. Domain-wide cleanup is deferred until the final member exits.
+- exact process channels are closed;
+- process-held capability IDs are revoked/cleared;
+- exact tracked platform mappings are drained and closed;
+- the exact process platform binding is closed;
+- process-local runtime references are cleared and the process generation is retired.
+
+Owned region and borrower-loan records remain under the existing domain lifetime until the final member exits. When final-domain cleanup eventually reclaims them, every earlier platform mapping reservation for those regions has already been forced through the same verified-`Closed` gate during the owning process's exit.
+
+This preserves the existing `SharedDomainIsReclaimedOnlyAfterLastProcessTerminates` and `SharedBorrowerDomainReturnsLoansOnlyAfterLastProcessTerminates` guarantees while adding the external-closure ordering required by Phase 2.
 
 ## Fault containment
 
@@ -192,13 +201,14 @@ Phase-2 coverage now proves:
 - `Faulted` completion remains observable and non-reclaimable;
 - duplicate valid `Closed` observation is idempotent;
 - legacy synchronous revoke without a receipt cannot authorize reclaim;
-- process termination closes/cancels pending SIP response waiters before deferred platform drain completes;
-- a process remains `Exiting`, not `Exited` / `Faulted`, while any mapping is still draining;
-- `FaultProcess` publishes terminal `Faulted` only after verified platform closure and local cleanup;
+- process termination closes/cancels pending SIP response waiters and the cancellation is observed before deferred platform drain is completed;
+- a process remains `Exiting`, not `Exited` / terminal `Faulted`, while any mapping is still draining;
+- `FaultProcess` publishes terminal `Faulted` only after verified platform closure and cleanup;
 - a response committed before teardown remains published even when later platform closure faults;
 - after `Exiting`, authority-producing region/capability/channel/platform APIs fail closed;
-- one process exiting a shared domain reclaims only its exact process-generation resources while sibling process authority remains live;
-- final-domain-member cleanup remains domain-wide only after membership reaches zero.
+- one process exiting a shared domain closes only its exact process channel authority while sibling capability/channel authority remains live;
+- shared-domain regions remain owned and borrower-domain loans remain loaned until the final member exits;
+- final-domain-member cleanup reclaims those domain-scoped resources only after all process platform mappings have already reached verified closure.
 
 ## Acceptance criteria
 
@@ -206,11 +216,12 @@ Phase 2 is complete for current code when:
 
 - local revocation / `Exiting` immediately prevents all new process authority uses;
 - external platform closure is represented independently as `Draining`, `Closed` or fault-contained;
-- local region reclaim is mechanically impossible before exact verified `Closed` evidence;
-- process terminal state is mechanically impossible before all current platform mappings close, the platform domain binding closes, and local cleanup succeeds;
-- SIP waiter cancellation precedes platform drain waiting/observation;
+- a platform mapping reservation is mechanically impossible to release before exact verified `Closed` evidence;
+- process terminal state is mechanically impossible before all current process mappings close and the process platform-domain binding closes;
+- any domain/region reclaim that actually runs occurs only after the relevant mapping reservations were safely closed;
+- SIP waiter cancellation precedes platform drain completion/observation;
 - committed responses are not rolled back by later teardown failure;
-- multi-process domains do not suffer premature domain-wide cleanup.
+- multi-process domains preserve their existing region/loan lifetime until the final member and do not suffer premature domain-wide cleanup.
 
 The implementation now satisfies these criteria for the platform domain + owned-region mapping authority classes that currently exist.
 
@@ -223,7 +234,7 @@ local authority dead / process Exiting
   -> external authority Draining
   -> exact completion receipt Closed
   -> exact local generation revalidation
-  -> local reclaim
+  -> local/domain reclaim when its existing lifetime permits
 ```
 
 They must not create parallel timeout-based or synchronous-success reclaim rules.
@@ -236,6 +247,7 @@ They must not create parallel timeout-based or synchronous-success reclaim rules
 - do not assume synchronous device shutdown;
 - do not treat legacy synchronous provider success as `Closed` evidence;
 - do not flatten process/capability/region/binding/provider/operation generations into one epoch;
+- do not silently change shared-domain region/loan lifetime while adding platform teardown;
 - no HybridCPU binding or DMA in Phase 2.
 
 ## Next roadmap phase
