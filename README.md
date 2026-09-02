@@ -1,0 +1,1 @@
+SingNextOS is a capability-native domain host OS for HybridCPU-v2 ISE model: firmware-like trusted authority below services and VMs, with virtualization treated as one neutral domain service rather than the kernel’s defining abstraction.
