@@ -2,11 +2,11 @@
 
 ## Status
 
-**Highest-priority SingNextOS refactoring.** This phase can be implemented with the host provider first and does not require a working HybridCPU backend.
+**In progress.** Typed/versioned semantic feature discovery is the first completed Phase-1 slice. Completion receipts, memory-visibility vocabulary and the broader semantic provider-family split remain future Phase-1 iterations. No working HybridCPU backend is required for the current host-backed work.
 
 ## Current state
 
-`src/Platform/SingPlus.Platform.Abstractions/PlatformAuthorityContracts.cs` currently exposes a deliberately narrow v1:
+The legacy v1 authority operations remain deliberately narrow:
 
 ```text
 Features:
@@ -24,24 +24,21 @@ Operations:
 
 The audit conclusion is to **extend this seam**, not replace it with a universal HAL.
 
-## Target contract shape
+### Completed slice — typed/versioned semantic discovery
 
-### 1. Replace boolean-ish feature discovery with typed, versioned discovery
+The host provider now implements optional `IPlatformFeatureProvider` discovery through an immutable `PlatformFeatureManifest`.
 
-Keep current v1 bits for compatibility if useful, but add a vNext query such as:
+Feature records carry only:
 
 ```text
-PlatformFeatureManifest QueryFeatures()
+semantic family
+contract version
+availability/evidence class
 ```
 
-A feature record should identify:
+Current semantic families are named independently of HybridCPU implementation details, including `NeutralDomains`, `OwnedRegionMapping`, `IoDomainBinding`, `DmaMapping`, `ExplicitMemoryVisibility`, compute families, virtualization/nested domains, evidence, secure domains and surface presentation.
 
-- semantic feature family;
-- contract version;
-- availability class;
-- optional profile metadata that is safe to expose to the kernel.
-
-Suggested availability classes:
+Availability classes are:
 
 ```text
 Unavailable
@@ -52,9 +49,34 @@ Executable
 ProductionSecure
 ```
 
-Do not assume these form a simple numeric privilege ladder for every feature. They describe evidence level/readiness, not grants to a caller.
+These classes are **not a numeric privilege ladder**. A discovery request for one availability class requires that exact evidence class; for example, `ProjectionOnly` does not satisfy `Executable`, and `ModelOnly` does not satisfy `ProductionSecure`.
 
-Feature families should remain semantic, for example:
+The current host-backed v1 domain/mapping operations are reported as `RuntimeAdmission` contract version 1. This means the configured provider can admit the semantic operation in the current runtime; it is not a claim of real HybridCPU hardware execution or production security.
+
+Providers that still implement only v1 `PlatformAuthorityFeatures` receive a compatibility projection into the semantic manifest. This preserves existing providers while allowing new providers to implement `IPlatformFeatureProvider` independently of the operational authority interface.
+
+`RuntimeKernel.QueryPlatformFeatures()` exposes only this semantic manifest. It exposes no provider lease IDs, capabilities, physical addresses, VMX/VMCS state, lanes or opcodes. Discovery is evidence only: current capability/ownership validation still runs before any provider authority call.
+
+## Target contract shape
+
+### 1. Replace boolean-ish feature discovery with typed, versioned discovery
+
+**First slice implemented.** Keep current v1 bits for compatibility, while typed discovery is available as:
+
+```text
+IPlatformFeatureProvider.QueryFeatures()
+RuntimeKernel.QueryPlatformFeatures()
+```
+
+A feature record identifies:
+
+- semantic feature family;
+- contract version;
+- availability class.
+
+Optional profile metadata remains intentionally deferred until a concrete safe use case requires it.
+
+Feature families remain semantic, for example:
 
 ```text
 NeutralDomains
@@ -72,9 +94,11 @@ SecureDomains
 SurfacePresentation
 ```
 
+Discovery must never be treated as per-request authority.
+
 ### 2. Introduce a common opaque operation/completion model
 
-Add bridge-private identities and a neutral completion receipt usable by mapping, DMA, compute and virtualization:
+**Not implemented in this slice.** Add bridge-private identities and a neutral completion receipt usable by mapping, DMA, compute and virtualization:
 
 ```text
 PlatformOperationId
@@ -105,10 +129,9 @@ It must not expose HybridCPU internal descriptor pointers, lane IDs, IOMMU table
 
 ### 3. Split optional provider capabilities by semantic family
 
-Avoid growing one giant `IPlatformAuthorityProvider` method list. Prefer a root provider plus optional interfaces, for example:
+**Started only for discovery.** `IPlatformFeatureProvider` is now optional and separate from the legacy authority interface. Do not grow one giant `IPlatformAuthorityProvider` method list. Add further semantic families only when a concrete cross-repository operation requires them, for example:
 
 ```text
-IPlatformFeatureProvider
 IPlatformDomainProvider
 IPlatformMemoryProvider
 IPlatformIoProvider
@@ -118,13 +141,13 @@ IPlatformEvidenceProvider
 IPlatformSecureComputeProvider
 ```
 
-The root provider owns identity/version and exposes supported extension interfaces. The bridge remains the only component that stores their opaque leases.
+The bridge remains the only component that stores opaque leases.
 
 This split is **not** a universal HAL: every interface exists only when a concrete cross-repository use case requires it.
 
 ### 4. Make memory visibility explicit in contract vocabulary
 
-Add semantic input/output types instead of a global `FlushCaches` operation:
+**Not implemented in this slice.** Add semantic input/output types instead of a global `FlushCaches` operation:
 
 ```text
 PlatformMemoryConsumerClass
@@ -153,33 +176,38 @@ BorrowLeaseId                  != accelerator/device token
 provider completion receipt    != process-visible capability
 ```
 
-A provider result may prove external state, but only Sing kernel policy can mint/delegate a local capability.
+A provider feature manifest proves only provider-declared semantic availability. Only Sing kernel policy can mint/delegate a local capability or authorize a concrete effect.
 
-## Likely SingNextOS code touched
+## Code touched by the first slice
 
-- `src/Platform/SingPlus.Platform.Abstractions/PlatformAuthorityContracts.cs`;
-- new small files under `src/Platform/SingPlus.Platform.Abstractions/` for feature/completion/memory-visibility types;
+- new `src/Platform/SingPlus.Platform.Abstractions/PlatformFeatureContracts.cs`;
 - `src/Platform/SingPlus.Platform.Host/HostPlatformAuthorityProvider.cs`;
 - `src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.cs`;
-- `tests/SingPlus.Tests/Platform/PlatformAuthorityBridgeTests.cs` and new vNext contract tests.
-
-Keep public contracts small enough that host tests can exhaustively fault-inject every state.
+- `src/Runtime/SingPlus.Runtime/Platform/RuntimeKernel.Platform.cs`;
+- new `tests/SingPlus.Tests/Platform/PlatformFeatureDiscoveryTests.cs`.
 
 ## Tests
 
-At minimum:
+First-slice coverage includes:
 
-- unsupported feature is distinguishable from denied;
-- `ProjectionOnly` virtualization cannot be used as `Executable`;
-- `ModelOnly` SecureCompute cannot satisfy a production-secure request;
+- host provider exposes typed/versioned semantic features;
+- an absent feature is `Unavailable`, distinct from an authority operation returning `Denied`;
+- `ProjectionOnly` virtualization cannot satisfy an `Executable` query;
+- `ModelOnly` SecureDomains cannot satisfy `ProductionSecure`;
+- malformed zero-version, explicit-Unavailable and duplicate-family manifests fail closed;
+- legacy v1 providers receive semantic discovery without invoking authority operations;
+- feature presence never bypasses local capability validation;
+- a kernel with no provider reports semantic features unavailable.
+
+Later Phase-1 tests still required with completion work:
+
 - provider lease IDs never escape bridge-visible snapshots;
 - malformed completion identity is rejected and provider state is closed/cancelled;
-- completion for stale generation cannot authorize local commit;
-- feature presence never bypasses local capability validation.
+- completion for stale generation cannot authorize local commit.
 
 ## Acceptance criteria
 
-Phase 1 is done when the host provider can model all lifecycle/completion states needed by later phases, while current v1 domain/mapping behavior remains compatible and no raw HybridCPU type appears in SingNextOS public/SIP/kernel contracts.
+Phase 1 is **not yet complete**. The typed/versioned discovery requirement is satisfied for host-backed/legacy-compatible providers, but Phase 1 remains open until the host provider can model the lifecycle/completion states needed by later phases and memory visibility is explicit, while current v1 domain/mapping behavior remains compatible and no raw HybridCPU type appears in SingNextOS public/SIP/kernel contracts.
 
 ## Do not do
 
@@ -188,4 +216,4 @@ Phase 1 is done when the host provider can model all lifecycle/completion states
 - no VMCS fields;
 - no physical addresses;
 - no guarantee of global coherence;
-- no feature bit that is treated as per-request authority.
+- no feature discovery result that is treated as per-request authority.

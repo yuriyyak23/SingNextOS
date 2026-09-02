@@ -2,7 +2,7 @@ using SingPlus.Platform;
 
 namespace SingPlus.Platform.Host;
 
-public sealed class HostPlatformAuthorityProvider : IPlatformAuthorityProvider
+public sealed class HostPlatformAuthorityProvider : IPlatformAuthorityProvider, IPlatformFeatureProvider
 {
     private sealed class DomainRecord(PlatformProviderDomainLease lease)
     {
@@ -21,6 +21,7 @@ public sealed class HostPlatformAuthorityProvider : IPlatformAuthorityProvider
     private readonly Dictionary<PlatformDomainIdentity, PlatformProviderDomainLeaseId> _activeSubjects = [];
     private readonly Dictionary<PlatformRegionIdentity, PlatformProviderRegionMappingId> _activeRegions = [];
     private readonly PlatformAuthorityStatus? _regionRevocationFailure;
+    private readonly PlatformFeatureManifest _featureManifest;
     private ulong _nextDomainId = 1;
     private ulong _nextMappingId = 1;
 
@@ -28,13 +29,19 @@ public sealed class HostPlatformAuthorityProvider : IPlatformAuthorityProvider
         PlatformAuthorityFeatures features =
             PlatformAuthorityFeatures.NeutralDomainBinding |
             PlatformAuthorityFeatures.DirectOwnedRegionMapping,
-        PlatformAuthorityStatus? regionRevocationFailure = null)
+        PlatformAuthorityStatus? regionRevocationFailure = null,
+        IEnumerable<PlatformFeatureDescriptor>? additionalFeatures = null)
     {
         if (regionRevocationFailure == PlatformAuthorityStatus.Success)
             throw new ArgumentOutOfRangeException(nameof(regionRevocationFailure));
 
         _regionRevocationFailure = regionRevocationFailure;
         Descriptor = new PlatformProviderDescriptor(new PlatformProviderId("host-test"), 2, features);
+
+        var legacyFeatures = PlatformFeatureManifest.FromLegacy(features).Features;
+        _featureManifest = additionalFeatures is null
+            ? new PlatformFeatureManifest(legacyFeatures)
+            : new PlatformFeatureManifest(legacyFeatures.Concat(additionalFeatures));
     }
 
     public PlatformProviderDescriptor Descriptor { get; }
@@ -44,6 +51,8 @@ public sealed class HostPlatformAuthorityProvider : IPlatformAuthorityProvider
     public int MapOwnedRegionCallCount { get; private set; }
     public int RevokeRegionMappingCallCount { get; private set; }
     public PlatformRegionRevocationPolicy? LastRegionRevocationPolicy { get; private set; }
+
+    public PlatformFeatureManifest QueryFeatures() => _featureManifest;
 
     public PlatformAuthorityResult<PlatformProviderDomainLease> BindDomain(PlatformDomainIdentity subject)
     {
