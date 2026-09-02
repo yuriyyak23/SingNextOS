@@ -1,3 +1,5 @@
+using System;
+using System.Collections.Generic;
 using System.Collections.Immutable;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -61,7 +63,8 @@ public sealed class SingPlusAnalyzer : DiagnosticAnalyzer
     {
         if (!IsKernelNoHeap(context.Options)) return;
         var conversion = (IConversionOperation)context.Operation;
-        if (conversion.Conversion.IsBoxing) context.ReportDiagnostic(Diagnostic.Create(Boxing, conversion.Syntax.GetLocation(), conversion.Type?.ToDisplayString() ?? "object"));
+        if (conversion.Operand.Type?.IsValueType == true && conversion.Type?.IsValueType == false)
+            context.ReportDiagnostic(Diagnostic.Create(Boxing, conversion.Syntax.GetLocation(), conversion.Type?.ToDisplayString() ?? "object"));
     }
 
     private static void AnalyzeLambda(SyntaxNodeAnalysisContext context)

@@ -96,7 +96,7 @@ public static class AdmissionVerifier
         var rootHandle = rootModel.FindMethod(root) ?? throw new InvalidOperationException($"Admission root '{root}' was not found.");
         var queue = new Queue<MethodLocation>();
         var visited = new HashSet<MethodLocation>();
-        queue.Enqueue(new MethodLocation(rootModel.Name, rootHandle.Value));
+        queue.Enqueue(new MethodLocation(rootModel.Name, rootHandle));
 
         while (queue.Count != 0)
         {

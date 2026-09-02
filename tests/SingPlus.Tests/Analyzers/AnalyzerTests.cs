@@ -73,7 +73,7 @@ public sealed class AnalyzerTests
 
     internal static MetadataReference[] PlatformReferences() => ((string?)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES") ?? throw new InvalidOperationException("TPA unavailable"))
         .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
-        .Select(MetadataReference.CreateFromFile)
+        .Select(static path => MetadataReference.CreateFromFile(path))
         .ToArray();
 
     private sealed class TestAnalyzerConfigOptionsProvider(IReadOnlyDictionary<string, string> values) : AnalyzerConfigOptionsProvider

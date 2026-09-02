@@ -1,0 +1,36 @@
+<Solution>
+  <Folder Name="/Amissions/" Id="07c2787e-eac7-c090-1ba3-a61ec2a24d84">
+    <Project Path="tools/SingPlus.Admission/SingPlus.Admission.csproj" />
+  </Folder>
+  <Folder Name="/contracts/">
+    <Project Path="contracts/SingPlus.Contracts/SingPlus.Contracts.csproj" />
+  </Folder>
+  <Folder Name="/sdk/">
+    <Project Path="sdk/SingPlus.Analyzers/SingPlus.Analyzers.csproj" />
+    <Project Path="sdk/SingPlus.Generators/SingPlus.Generators.csproj" />
+    <Project Path="sdk/SingPlus.Kernel.Sdk/SingPlus.Kernel.Sdk.csproj" />
+    <Project Path="sdk/SingPlus.Sip.Sdk/SingPlus.Sip.Sdk.csproj" />
+  </Folder>
+  <Folder Name="/src/" />
+  <Folder Name="/src/Drivers/">
+    <Project Path="src/Drivers/SingPlus.Drivers/SingPlus.Drivers.csproj" />
+  </Folder>
+  <Folder Name="/src/Kernel/">
+    <Project Path="src/Kernel/SingPlus.Kernel/SingPlus.Kernel.csproj" />
+  </Folder>
+  <Folder Name="/src/Kernel/Boot/">
+    <Project Path="src/Kernel/Boot/SingPlus.Boot/SingPlus.Boot.csproj" />
+  </Folder>
+  <Folder Name="/src/Kernel/Hal.Host/" Id="9f89a4ac-d3ea-0297-734d-b818aef93f72">
+    <Project Path="src/Kernel/Hal/SingPlus.Kernel.Hal.Host/SingPlus.Kernel.Hal.Host.csproj" />
+  </Folder>
+  <Folder Name="/src/Runtime/">
+    <Project Path="src/Runtime/SingPlus.Runtime/SingPlus.Runtime.csproj" />
+  </Folder>
+  <Folder Name="/src/Sip/">
+    <Project Path="src/Sip/SingPlus.Sip/SingPlus.Sip.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/SingPlus.Tests/SingPlus.Tests.csproj" />
+  </Folder>
+</Solution>
