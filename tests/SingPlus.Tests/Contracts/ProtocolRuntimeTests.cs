@@ -73,8 +73,7 @@ public sealed class ProtocolRuntimeTests
     public void ConsumingMessageTransfersOwnershipToPeer()
     {
         var (kernel, left, right, endpoints) = CreateChannel(capacity: 4);
-        Assert.True(kernel.Send(left, right, endpoints.Left, 1).IsSuccess);
-        Assert.True(kernel.Receive(right, endpoints.Right).IsSuccess);
+        Activate(kernel, left, right, endpoints);
         var capability = kernel.MintCapability(new DomainId(10), left, ResourceKind.Device, "console0", CapabilityRights.Write);
         Assert.True(capability.IsSuccess, capability.Message);
         var buffer = kernel.AllocateBuffer<byte>(left, 4).Value!;
@@ -91,6 +90,145 @@ public sealed class ProtocolRuntimeTests
         Assert.Equal(oldHandle.RegionId, transferred.Handle.RegionId);
         Assert.Equal(oldHandle.Generation.Value + 1, transferred.Handle.Generation.Value);
         Assert.True(kernel.Receive(right, endpoints.Right).IsSuccess);
+    }
+
+    [Fact]
+    public void BorrowingMessageDeliversReadOnlyLeaseAndReturnRevokesAccess()
+    {
+        var (kernel, left, right, endpoints) = CreateChannel(capacity: 4);
+        Activate(kernel, left, right, endpoints);
+        var buffer = kernel.AllocateBuffer<byte>(left, 4).Value!;
+        buffer.Span[0] = 42;
+
+        var send = kernel.Send(left, right, endpoints.Left, 4, buffer);
+        var receive = kernel.Receive(right, endpoints.Right);
+
+        Assert.True(send.IsSuccess, send.Message);
+        Assert.True(receive.IsSuccess, receive.Message);
+        Assert.True(buffer.IsValid);
+        Assert.Equal(RegionState.Loaned, Assert.Single(kernel.Regions.Snapshot()).State);
+        Assert.Throws<InvalidOperationException>(() => buffer.Span[0] = 7);
+
+        var lease = Assert.IsType<BorrowLease<byte>>(receive.Value!.Payload);
+        Assert.True(lease.IsValid);
+        Assert.Equal(4, lease.Length);
+        Assert.Equal((byte)42, lease.Span[0]);
+        Assert.Equal(buffer.Handle, lease.Handle.Region);
+
+        var returned = kernel.ReturnBorrow(right, lease.Handle);
+
+        Assert.True(returned.IsSuccess, returned.Message);
+        Assert.False(lease.IsValid);
+        Assert.Throws<InvalidOperationException>(() => _ = lease.Length);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
+        buffer.Span[0] = 43;
+        Assert.Equal((byte)43, buffer.Span[0]);
+    }
+
+    [Fact]
+    public void OwnerRevokeInvalidatesChannelBorrowLeaseAndRejectsLateReturn()
+    {
+        var (kernel, left, right, endpoints) = CreateChannel(capacity: 4);
+        Activate(kernel, left, right, endpoints);
+        var buffer = kernel.AllocateBuffer<int>(left, 2).Value!;
+        buffer.Span[0] = 11;
+        Assert.True(kernel.Send(left, right, endpoints.Left, 4, buffer).IsSuccess);
+        var receive = kernel.Receive(right, endpoints.Right);
+        Assert.True(receive.IsSuccess, receive.Message);
+        var lease = Assert.IsType<BorrowLease<int>>(receive.Value!.Payload);
+
+        var revoked = kernel.RevokeBorrow(left, lease.Handle);
+        var lateReturn = kernel.ReturnBorrow(right, lease.Handle);
+
+        Assert.True(revoked.IsSuccess, revoked.Message);
+        Assert.False(lease.IsValid);
+        Assert.Throws<InvalidOperationException>(() => _ = lease.Span[0]);
+        Assert.False(lateReturn.IsSuccess);
+        Assert.Equal(KernelError.InvalidRegionState, lateReturn.Error);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
+        Assert.Equal(11, buffer.Span[0]);
+    }
+
+    [Fact]
+    public void ReborrowIncrementsLeaseGenerationAndRejectsStaleToken()
+    {
+        var (kernel, left, right, endpoints) = CreateChannel(capacity: 6);
+        Activate(kernel, left, right, endpoints);
+        var buffer = kernel.AllocateBuffer<byte>(left, 1).Value!;
+        buffer.Span[0] = 9;
+
+        Assert.True(kernel.Send(left, right, endpoints.Left, 4, buffer).IsSuccess);
+        var first = Assert.IsType<BorrowLease<byte>>(kernel.Receive(right, endpoints.Right).Value!.Payload);
+        Assert.True(kernel.ReturnBorrow(right, first.Handle).IsSuccess);
+
+        Assert.True(kernel.Send(left, right, endpoints.Left, 4, buffer).IsSuccess);
+        var second = Assert.IsType<BorrowLease<byte>>(kernel.Receive(right, endpoints.Right).Value!.Payload);
+
+        Assert.Equal(first.Handle.Region, second.Handle.Region);
+        Assert.Equal(first.Handle.Generation.Value + 1, second.Handle.Generation.Value);
+        var staleReturn = kernel.ReturnBorrow(right, first.Handle);
+        Assert.False(staleReturn.IsSuccess);
+        Assert.Equal(KernelError.StaleGeneration, staleReturn.Error);
+        Assert.False(first.IsValid);
+        Assert.True(second.IsValid);
+        Assert.Equal((byte)9, second.Span[0]);
+        Assert.True(kernel.RevokeBorrow(left, second.Handle).IsSuccess);
+    }
+
+    [Fact]
+    public void BorrowerTerminationInvalidatesChannelLeaseAndRestoresOwnerAccess()
+    {
+        var (kernel, left, right, endpoints) = CreateChannel(capacity: 4);
+        Activate(kernel, left, right, endpoints);
+        var buffer = kernel.AllocateBuffer<int>(left, 1).Value!;
+        buffer.Span[0] = 55;
+        Assert.True(kernel.Send(left, right, endpoints.Left, 4, buffer).IsSuccess);
+        var lease = Assert.IsType<BorrowLease<int>>(kernel.Receive(right, endpoints.Right).Value!.Payload);
+
+        var terminated = kernel.TerminateProcess(right);
+
+        Assert.True(terminated.IsSuccess, terminated.Message);
+        Assert.False(lease.IsValid);
+        Assert.Throws<InvalidOperationException>(() => _ = lease.Length);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
+        Assert.Equal(55, buffer.Span[0]);
+    }
+
+    [Fact]
+    public void OwnerTerminationInvalidatesChannelLeaseAndBackingStorage()
+    {
+        var (kernel, left, right, endpoints) = CreateChannel(capacity: 4);
+        Activate(kernel, left, right, endpoints);
+        var buffer = kernel.AllocateBuffer<int>(left, 1).Value!;
+        buffer.Span[0] = 77;
+        Assert.True(kernel.Send(left, right, endpoints.Left, 4, buffer).IsSuccess);
+        var lease = Assert.IsType<BorrowLease<int>>(kernel.Receive(right, endpoints.Right).Value!.Payload);
+
+        var terminated = kernel.TerminateProcess(left);
+
+        Assert.True(terminated.IsSuccess, terminated.Message);
+        Assert.False(lease.IsValid);
+        Assert.False(buffer.IsValid);
+        Assert.Throws<InvalidOperationException>(() => _ = lease.Length);
+        Assert.Throws<InvalidOperationException>(() => _ = buffer.Length);
+        Assert.Equal(RegionState.Released, Assert.Single(kernel.Regions.Snapshot()).State);
+    }
+
+    [Fact]
+    public void BorrowLeaseCannotBeRedelegatedAsChannelPayload()
+    {
+        var (kernel, left, right, endpoints) = CreateChannel(capacity: 4);
+        Activate(kernel, left, right, endpoints);
+        var buffer = kernel.AllocateBuffer<byte>(left, 1).Value!;
+        Assert.True(kernel.Send(left, right, endpoints.Left, 4, buffer).IsSuccess);
+        var lease = Assert.IsType<BorrowLease<byte>>(kernel.Receive(right, endpoints.Right).Value!.Payload);
+
+        var redelegate = kernel.Send(right, left, endpoints.Right, 4, lease);
+
+        Assert.False(redelegate.IsSuccess);
+        Assert.Equal(KernelError.UnsupportedPayload, redelegate.Error);
+        Assert.True(lease.IsValid);
+        Assert.True(kernel.ReturnBorrow(right, lease.Handle).IsSuccess);
     }
 
     [Fact]
@@ -133,6 +271,14 @@ public sealed class ProtocolRuntimeTests
         Assert.Equal(KernelError.WrongEndpointOwner, result.Error);
     }
 
+    private static void Activate(RuntimeKernel kernel, ProcessHandle left, ProcessHandle right, (ChannelEndpointHandle Left, ChannelEndpointHandle Right) endpoints)
+    {
+        var start = kernel.Send(left, right, endpoints.Left, 1);
+        Assert.True(start.IsSuccess, start.Message);
+        var receive = kernel.Receive(right, endpoints.Right);
+        Assert.True(receive.IsSuccess, receive.Message);
+    }
+
     private static (RuntimeKernel Kernel, ProcessHandle Left, ProcessHandle Right, (ChannelEndpointHandle Left, ChannelEndpointHandle Right) Endpoints) CreateChannel(int capacity)
     {
         var kernel = new RuntimeKernel();
@@ -156,12 +302,14 @@ public sealed class ProtocolRuntimeTests
                 "Write",
                 new[] { new CapabilityRequirementV1(ResourceKind.Device, "console0", CapabilityRights.Write) },
                 consumes: new[] { "data" }),
-            new ProtocolMessageDescriptorV1(3, "Finish")
+            new ProtocolMessageDescriptorV1(3, "Finish"),
+            new ProtocolMessageDescriptorV1(4, "Peek", borrows: new[] { "data" })
         },
         new[]
         {
             new ProtocolTransitionV1(1, "Idle", "Active"),
             new ProtocolTransitionV1(2, "Active", "Active"),
-            new ProtocolTransitionV1(3, "Active", "Done")
+            new ProtocolTransitionV1(3, "Active", "Done"),
+            new ProtocolTransitionV1(4, "Active", "Active")
         });
 }
