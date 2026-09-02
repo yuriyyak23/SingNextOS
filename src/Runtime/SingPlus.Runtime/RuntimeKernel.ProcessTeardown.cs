@@ -355,14 +355,7 @@ public sealed partial class RuntimeKernel
     private KernelResult FinalizeProcessCleanup(SingProcess process)
     {
         var handle = new ProcessHandle(process.ProcessId, process.Generation);
-        var owner = new RegionOwner(process.DomainId, process.Generation);
-
         Channels.CloseAllForProcess(handle);
-        Regions.ReturnAllLoansForBorrower(owner);
-
-        var processReclaim = Regions.ReclaimAllForOwner(owner);
-        if (!processReclaim.IsSuccess)
-            return KernelResult.Fail(processReclaim.Error, processReclaim.Message!);
 
         var domainEnded = Domains.Remove(process);
         if (domainEnded)
