@@ -2,7 +2,7 @@ using YAKSys_Hybrid_CPU.Core;
 
 namespace SingPlus.Platform.HybridCpu;
 
-public sealed class HybridCpuPlatformAuthorityProvider :
+public sealed partial class HybridCpuPlatformAuthorityProvider :
     IPlatformAuthorityProvider,
     IPlatformFeatureProvider,
     IPlatformDomainExecutionProvider
@@ -33,14 +33,23 @@ public sealed class HybridCpuPlatformAuthorityProvider :
         _runtime = runtime;
         Descriptor = new PlatformProviderDescriptor(
             new PlatformProviderId("hybridcpu-neutral"),
-            3,
-            PlatformAuthorityFeatures.NeutralDomainBinding);
+            4,
+            PlatformAuthorityFeatures.NeutralDomainBinding |
+            PlatformAuthorityFeatures.DirectOwnedRegionMapping);
         _featureManifest = new PlatformFeatureManifest(
             new[]
             {
                 new PlatformFeatureDescriptor(
                     PlatformFeatureFamily.NeutralDomains,
                     1,
+                    PlatformFeatureAvailability.Executable),
+                new PlatformFeatureDescriptor(
+                    PlatformFeatureFamily.OwnedRegionMapping,
+                    PlatformOwnedRegionMappingContract.ContractVersion,
+                    PlatformFeatureAvailability.Executable),
+                new PlatformFeatureDescriptor(
+                    PlatformFeatureFamily.ExplicitMemoryVisibility,
+                    PlatformRegionVisibilityContract.ContractVersion,
                     PlatformFeatureAvailability.Executable),
             });
     }
@@ -143,6 +152,13 @@ public sealed class HybridCpuPlatformAuthorityProvider :
         var validation = ValidateDomain(lease);
         if (!validation.IsSuccess) return validation;
 
+        if (HasActiveProviderMappings(lease))
+        {
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.Denied,
+                "HybridCPU owned-region mappings must close before the provider domain lease.");
+        }
+
         var record = _domains[lease.LeaseId];
         var external = _runtime.Close(record.HybridCpuLease);
         switch (external.Decision)
@@ -173,17 +189,31 @@ public sealed class HybridCpuPlatformAuthorityProvider :
     public PlatformAuthorityResult<PlatformProviderRegionMappingLease> MapOwnedRegion(
         PlatformProviderDomainLease domainLease,
         PlatformRegionIdentity region,
-        PlatformMemoryAccess access) =>
-        PlatformAuthorityResult<PlatformProviderRegionMappingLease>.Fail(
-            PlatformAuthorityStatus.Unsupported,
-            "HybridCPU owned-region mapping is intentionally outside the Phase-3 neutral-domain slice.");
+        PlatformMemoryAccess access)
+    {
+        var mapped = MapOwnedRegionSlice(
+            domainLease,
+            new PlatformRegionSlice(region, 0, region.ByteLength, access));
+        return mapped.IsSuccess
+            ? PlatformAuthorityResult<PlatformProviderRegionMappingLease>.Ok(mapped.Value!.Lease)
+            : PlatformAuthorityResult<PlatformProviderRegionMappingLease>.Fail(
+                mapped.Status,
+                mapped.Message ?? "HybridCPU whole-region compatibility mapping failed.");
+    }
 
     public PlatformAuthorityResult RevokeRegionMapping(
         PlatformProviderRegionMappingLease mapping,
-        PlatformRegionRevocationPolicy policy) =>
-        PlatformAuthorityResult.Fail(
-            PlatformAuthorityStatus.Unsupported,
-            "HybridCPU owned-region mapping is intentionally outside the Phase-3 neutral-domain slice.");
+        PlatformRegionRevocationPolicy policy)
+    {
+        if (!Enum.IsDefined(policy) || policy != PlatformRegionRevocationPolicy.DrainBeforeRevoke)
+        {
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.Unsupported,
+                "Only drain-before-revoke is supported for HybridCPU region mappings.");
+        }
+
+        return CloseProviderRegionMapping(mapping);
+    }
 
     private PlatformAuthorityResult ValidateDomain(PlatformProviderDomainLease lease)
     {

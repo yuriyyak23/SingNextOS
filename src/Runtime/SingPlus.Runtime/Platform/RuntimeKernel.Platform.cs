@@ -127,6 +127,161 @@ public sealed partial class RuntimeKernel
         return mapping;
     }
 
+    public KernelResult<PlatformOwnedRegionSliceMapping> MapPlatformOwnedRegionSlice(
+        ProcessHandle owner,
+        PlatformDomainBinding binding,
+        CapabilityId capabilityId,
+        RegionHandle region,
+        long offset,
+        long length,
+        PlatformMemoryAccess access)
+    {
+        if (!IsValidPlatformAccess(access))
+        {
+            return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(
+                KernelError.PlatformDenied,
+                "Platform memory access must be Read, Write, or Read|Write.");
+        }
+
+        var resolved = Processes.Resolve(owner);
+        if (!resolved.IsSuccess)
+        {
+            return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(
+                resolved.Error,
+                resolved.Message!);
+        }
+
+        var process = resolved.Value!;
+        var effect = EnsureProcessAcceptsNewEffects(process);
+        if (!effect.IsSuccess)
+        {
+            return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(
+                effect.Error,
+                effect.Message!);
+        }
+
+        var identity = new PlatformDomainIdentity(process.DomainId, owner.Generation);
+        var bindingValidation = PlatformAuthority.ValidateDomain(binding, identity);
+        if (!bindingValidation.IsSuccess)
+        {
+            return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(
+                bindingValidation.Error,
+                bindingValidation.Message!);
+        }
+
+        var requiredRights = CapabilityRights.Map;
+        if ((access & PlatformMemoryAccess.Read) != 0) requiredRights |= CapabilityRights.Read;
+        if ((access & PlatformMemoryAccess.Write) != 0) requiredRights |= CapabilityRights.Write;
+
+        var capability = CapabilityAuthority.Validate(
+            capabilityId,
+            process.DomainId,
+            owner.Generation,
+            requiredRights);
+        if (!capability.IsSuccess)
+        {
+            return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(
+                capability.Error,
+                capability.Message!);
+        }
+
+        var capabilityDescriptor = capability.Value!;
+        if (capabilityDescriptor.ResourceKind != ResourceKind.MemoryRegion ||
+            !string.Equals(
+                capabilityDescriptor.ResourceId,
+                CapabilityResourceIds.MemoryRegion(region.RegionId),
+                StringComparison.Ordinal))
+        {
+            return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(
+                KernelError.WrongCapabilityResource,
+                "The local capability does not authorize this memory region.");
+        }
+
+        var ownerIdentity = new RegionOwner(process.DomainId, owner.Generation);
+        var regionValidation = Regions.Validate(region, ownerIdentity);
+        if (!regionValidation.IsSuccess)
+        {
+            return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(
+                regionValidation.Error,
+                regionValidation.Message!);
+        }
+
+        var platformRegion = new PlatformRegionIdentity(
+            regionValidation.Value!.Handle,
+            regionValidation.Value.Owner,
+            regionValidation.Value.ByteLength);
+        var slice = new PlatformRegionSlice(
+            platformRegion,
+            offset,
+            length,
+            access);
+        var sliceValidation = PlatformOwnedRegionMappingContract.ValidateSlice(slice);
+        if (!sliceValidation.IsSuccess)
+        {
+            return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(
+                KernelError.PlatformDenied,
+                sliceValidation.Message ?? "The requested region slice is invalid.");
+        }
+
+        var reservation = Regions.ReservePlatformMapping(region, ownerIdentity);
+        if (!reservation.IsSuccess)
+        {
+            return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(
+                reservation.Error,
+                reservation.Message!);
+        }
+
+        var mapping = PlatformAuthority.MapOwnedRegionSlice(
+            binding,
+            identity,
+            capabilityId,
+            slice);
+        if (!mapping.IsSuccess)
+        {
+            _ = Regions.ReleasePlatformMappingReservation(region, ownerIdentity);
+            return mapping;
+        }
+
+        TrackPlatformMapping(owner, mapping.Value!.Mapping);
+        return mapping;
+    }
+
+    public KernelResult<PlatformRegionVisibilityEvidence> PreparePlatformRegionMappingForConsumer(
+        ProcessHandle owner,
+        PlatformOwnedRegionSliceMapping mapping,
+        PlatformMemoryConsumerClass consumer,
+        PlatformMemoryVisibilityRequirement requirement)
+    {
+        var resolved = Processes.Resolve(owner);
+        if (!resolved.IsSuccess)
+        {
+            return KernelResult<PlatformRegionVisibilityEvidence>.Fail(
+                resolved.Error,
+                resolved.Message!);
+        }
+
+        var process = resolved.Value!;
+        var effect = EnsureProcessAcceptsNewEffects(process);
+        if (!effect.IsSuccess)
+        {
+            return KernelResult<PlatformRegionVisibilityEvidence>.Fail(
+                effect.Error,
+                effect.Message!);
+        }
+
+        var identity = new PlatformDomainIdentity(process.DomainId, owner.Generation);
+        return PlatformAuthority.PrepareRegionMappingForConsumer(
+            mapping,
+            identity,
+            consumer,
+            requirement);
+    }
+
+    public KernelResult RevokePlatformRegionMapping(
+        ProcessHandle owner,
+        PlatformOwnedRegionSliceMapping mapping) =>
+        RevokePlatformRegionMapping(owner, mapping.Mapping);
+
     public KernelResult RevokePlatformRegionMapping(
         ProcessHandle owner,
         PlatformRegionMapping mapping)
@@ -232,6 +387,7 @@ public sealed partial class RuntimeKernel
         if (lifecycle.LocalReservationReleased)
         {
             UntrackPlatformMapping(mapping);
+            PlatformAuthority.ForgetExactMappingMetadata(mapping);
             return KernelResult.Ok();
         }
 
@@ -256,6 +412,7 @@ public sealed partial class RuntimeKernel
         }
 
         UntrackPlatformMapping(mapping);
+        PlatformAuthority.ForgetExactMappingMetadata(mapping);
         return KernelResult.Ok();
     }
 

@@ -38,7 +38,7 @@ public readonly record struct PlatformRegionMappingLifecycle(
         PlatformClosure == PlatformExternalClosureState.Closed && LocalReservationReleased;
 }
 
-public sealed class PlatformAuthorityBridge
+public sealed partial class PlatformAuthorityBridge
 {
     private sealed class DomainRecord(
         PlatformDomainBinding binding,
