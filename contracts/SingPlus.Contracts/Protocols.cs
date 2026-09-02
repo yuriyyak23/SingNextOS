@@ -9,6 +9,23 @@ public enum OwnershipPayloadKind
     OwnedRegion = 2
 }
 
+public sealed class BoundedPayloadDescriptorV1
+{
+    public BoundedPayloadDescriptorV1(string parameterName, string typeName, int maxBytes)
+    {
+        if (string.IsNullOrWhiteSpace(parameterName)) throw new ArgumentException("Bounded payload parameter name is required.", nameof(parameterName));
+        if (string.IsNullOrWhiteSpace(typeName)) throw new ArgumentException("Bounded payload type name is required.", nameof(typeName));
+        if (maxBytes <= 0) throw new ArgumentOutOfRangeException(nameof(maxBytes), "Bounded payload limit must be positive.");
+        ParameterName = parameterName;
+        TypeName = typeName;
+        MaxBytes = maxBytes;
+    }
+
+    public string ParameterName { get; }
+    public string TypeName { get; }
+    public int MaxBytes { get; }
+}
+
 public sealed class ProtocolMessageDescriptorV1
 {
     private readonly CapabilityRequirementV1[] _requiredCapabilities;
@@ -23,7 +40,8 @@ public sealed class ProtocolMessageDescriptorV1
         IEnumerable<string>? borrows = null,
         bool returnsOwnership = false,
         OwnershipPayloadKind ownershipPayloadKind = OwnershipPayloadKind.None,
-        OwnershipPayloadKind returnOwnershipPayloadKind = OwnershipPayloadKind.None)
+        OwnershipPayloadKind returnOwnershipPayloadKind = OwnershipPayloadKind.None,
+        BoundedPayloadDescriptorV1? boundedPayload = null)
     {
         if (messageId == 0) throw new ArgumentOutOfRangeException(nameof(messageId));
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Message name is required.", nameof(name));
@@ -43,10 +61,13 @@ public sealed class ProtocolMessageDescriptorV1
             throw new ArgumentException("Ownership payload metadata must declare exactly one concrete payload kind when Consumes or Borrows is present.", nameof(ownershipPayloadKind));
         if (returnsOwnership != (returnOwnershipPayloadKind != OwnershipPayloadKind.None))
             throw new ArgumentException("ReturnsOwnership metadata must declare a concrete returned ownership payload kind.", nameof(returnOwnershipPayloadKind));
+        if (hasOwnershipInput && boundedPayload is not null)
+            throw new ArgumentException("The current channel transport has one payload slot and cannot combine ownership and bounded value payload metadata.", nameof(boundedPayload));
 
         ReturnsOwnership = returnsOwnership;
         OwnershipPayloadKind = ownershipPayloadKind;
         ReturnOwnershipPayloadKind = returnOwnershipPayloadKind;
+        BoundedPayload = boundedPayload;
     }
 
     public uint MessageId { get; }
@@ -57,6 +78,7 @@ public sealed class ProtocolMessageDescriptorV1
     public bool ReturnsOwnership { get; }
     public OwnershipPayloadKind OwnershipPayloadKind { get; }
     public OwnershipPayloadKind ReturnOwnershipPayloadKind { get; }
+    public BoundedPayloadDescriptorV1? BoundedPayload { get; }
 
     private static string[] NormalizeOwnershipNames(IEnumerable<string>? names, string parameterName)
     {
