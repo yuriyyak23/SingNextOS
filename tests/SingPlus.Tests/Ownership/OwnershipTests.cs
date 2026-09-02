@@ -97,7 +97,14 @@ public sealed class OwnershipTests
 
         _ = buffer.Move();
 
-        Assert.Throws<InvalidOperationException>(() => _ = borrowed.Length);
+        try
+        {
+            _ = borrowed.Length;
+            Assert.Fail("BorrowedSpan remained usable after its owner was moved.");
+        }
+        catch (InvalidOperationException)
+        {
+        }
     }
 
     [Fact]
