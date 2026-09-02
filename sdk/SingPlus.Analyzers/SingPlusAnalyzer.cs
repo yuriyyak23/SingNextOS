@@ -16,12 +16,13 @@ public sealed class SingPlusAnalyzer : DiagnosticAnalyzer
     private static readonly DiagnosticDescriptor ForbiddenApi = Rule("SING1004", "Runtime/host API is forbidden", "API '{0}' is forbidden under KernelNoHeap", "Profile/NoHeap");
     private static readonly DiagnosticDescriptor Boxing = Rule("SING1005", "Boxing is forbidden", "Boxing conversion to '{0}' is forbidden under KernelNoHeap", "Profile/NoHeap");
     private static readonly DiagnosticDescriptor BorrowEscape = Rule("SING2001", "Borrow may escape its owner", "BorrowedSpan values must not be returned from a method", "Ownership");
+    private static readonly DiagnosticDescriptor UseAfterMove = Rule("SING2002", "Ownership token used after move", "'{0}' is referenced after Move() consumed its ownership token", "Ownership");
     private static readonly DiagnosticDescriptor ContractMessage = Rule("SING3001", "Invalid SIP contract message", "SIP contract method '{0}' must declare a unique [Message(id)]", "IPC contracts");
     private static readonly DiagnosticDescriptor SelfMint = Rule("SING4001", "Capability minting is authority-only", "SIP/driver code cannot call capability authority method '{0}'", "Capabilities");
     private static readonly DiagnosticDescriptor NondeterministicArtifact = Rule("SING5001", "Nondeterministic input is forbidden", "API '{0}' is forbidden in deterministic Sing+ artifacts", "Deterministic manifests");
 
     public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics =>
-        [ManagedAllocation, CapturingClosure, DynamicCode, ForbiddenApi, Boxing, BorrowEscape, ContractMessage, SelfMint, NondeterministicArtifact];
+        [ManagedAllocation, CapturingClosure, DynamicCode, ForbiddenApi, Boxing, BorrowEscape, UseAfterMove, ContractMessage, SelfMint, NondeterministicArtifact];
 
     public override void Initialize(AnalysisContext context)
     {
@@ -33,15 +34,13 @@ public sealed class SingPlusAnalyzer : DiagnosticAnalyzer
         context.RegisterSyntaxNodeAction(AnalyzeLambda, SyntaxKind.SimpleLambdaExpression, SyntaxKind.ParenthesizedLambdaExpression, SyntaxKind.AnonymousMethodExpression);
         context.RegisterSyntaxNodeAction(AnalyzeDynamic, SyntaxKind.IdentifierName);
         context.RegisterSyntaxNodeAction(AnalyzeBorrowReturn, SyntaxKind.ReturnStatement);
+        context.RegisterSyntaxNodeAction(AnalyzeMoveUse, SyntaxKind.InvocationExpression);
         context.RegisterSymbolAction(AnalyzeContract, SymbolKind.NamedType);
     }
 
-    private static DiagnosticDescriptor Rule(string id, string title, string message, string category) =>
-        new(id, title, message, category, DiagnosticSeverity.Error, isEnabledByDefault: true);
+    private static DiagnosticDescriptor Rule(string id, string title, string message, string category) => new(id, title, message, category, DiagnosticSeverity.Error, isEnabledByDefault: true);
 
-    private static bool IsKernelNoHeap(AnalyzerOptions options) =>
-        options.AnalyzerConfigOptionsProvider.GlobalOptions.TryGetValue("build_property.SingPlusMemoryProfile", out var value) &&
-        string.Equals(value, "KernelNoHeap", StringComparison.Ordinal);
+    private static bool IsKernelNoHeap(AnalyzerOptions options) => options.AnalyzerConfigOptionsProvider.GlobalOptions.TryGetValue("build_property.SingPlusMemoryProfile", out var value) && string.Equals(value, "KernelNoHeap", StringComparison.Ordinal);
 
     private static string Profile(AnalyzerOptions options)
     {
@@ -60,24 +59,21 @@ public sealed class SingPlusAnalyzer : DiagnosticAnalyzer
     {
         if (!IsKernelNoHeap(context.Options)) return;
         var conversion = (IConversionOperation)context.Operation;
-        if (conversion.Conversion.IsBoxing)
-            context.ReportDiagnostic(Diagnostic.Create(Boxing, conversion.Syntax.GetLocation(), conversion.Type?.ToDisplayString() ?? "object"));
+        if (conversion.Conversion.IsBoxing) context.ReportDiagnostic(Diagnostic.Create(Boxing, conversion.Syntax.GetLocation(), conversion.Type?.ToDisplayString() ?? "object"));
     }
 
     private static void AnalyzeLambda(SyntaxNodeAnalysisContext context)
     {
         if (!IsKernelNoHeap(context.Options)) return;
         var flow = context.SemanticModel.AnalyzeDataFlow(context.Node);
-        if (flow.Succeeded && flow.CapturedInside.Length != 0)
-            context.ReportDiagnostic(Diagnostic.Create(CapturingClosure, context.Node.GetLocation()));
+        if (flow.Succeeded && flow.CapturedInside.Length != 0) context.ReportDiagnostic(Diagnostic.Create(CapturingClosure, context.Node.GetLocation()));
     }
 
     private static void AnalyzeDynamic(SyntaxNodeAnalysisContext context)
     {
         if (!IsKernelNoHeap(context.Options)) return;
         var identifier = (IdentifierNameSyntax)context.Node;
-        if (identifier.Identifier.ValueText != "dynamic") return;
-        if (context.SemanticModel.GetTypeInfo(identifier, context.CancellationToken).Type?.TypeKind == TypeKind.Dynamic)
+        if (identifier.Identifier.ValueText == "dynamic" && context.SemanticModel.GetTypeInfo(identifier, context.CancellationToken).Type?.TypeKind == TypeKind.Dynamic)
             context.ReportDiagnostic(Diagnostic.Create(DynamicCode, identifier.GetLocation()));
     }
 
@@ -88,29 +84,15 @@ public sealed class SingPlusAnalyzer : DiagnosticAnalyzer
         var containingType = method.ContainingType?.ToDisplayString() ?? string.Empty;
         var containingNamespace = method.ContainingNamespace?.ToDisplayString() ?? string.Empty;
         var api = containingType + "." + method.Name;
-
-        if (IsKernelNoHeap(context.Options) && IsForbiddenKernelApi(containingType, containingNamespace, method.Name))
-            context.ReportDiagnostic(Diagnostic.Create(ForbiddenApi, invocation.Syntax.GetLocation(), api));
-
+        if (IsKernelNoHeap(context.Options) && IsForbiddenKernelApi(containingType, containingNamespace, method.Name)) context.ReportDiagnostic(Diagnostic.Create(ForbiddenApi, invocation.Syntax.GetLocation(), api));
         var profile = Profile(context.Options);
-        if ((profile == "Sip" || profile == "Driver") && containingType.EndsWith("CapabilityAuthority", StringComparison.Ordinal) && (method.Name == "Mint" || method.Name == "Delegate"))
-            context.ReportDiagnostic(Diagnostic.Create(SelfMint, invocation.Syntax.GetLocation(), method.Name));
-
-        if (IsNondeterministic(containingType, method.Name))
-            context.ReportDiagnostic(Diagnostic.Create(NondeterministicArtifact, invocation.Syntax.GetLocation(), api));
+        if ((profile == "Sip" || profile == "Driver") && containingType.EndsWith("CapabilityAuthority", StringComparison.Ordinal) && (method.Name == "Mint" || method.Name == "Delegate")) context.ReportDiagnostic(Diagnostic.Create(SelfMint, invocation.Syntax.GetLocation(), method.Name));
+        if (IsNondeterministic(containingType, method.Name)) context.ReportDiagnostic(Diagnostic.Create(NondeterministicArtifact, invocation.Syntax.GetLocation(), api));
     }
 
-    private static bool IsForbiddenKernelApi(string type, string ns, string method) =>
-        type == "System.Console" || type == "System.Environment" || type == "System.GC" || type == "System.Activator" ||
-        type == "System.Threading.ThreadPool" || type == "System.Threading.Tasks.Task" || type == "System.Diagnostics.Process" ||
-        (type == "System.Delegate" && method == "CreateDelegate") || ns.StartsWith("System.IO", StringComparison.Ordinal) ||
-        ns.StartsWith("System.Net", StringComparison.Ordinal) || ns.StartsWith("System.Reflection", StringComparison.Ordinal) ||
-        ns.StartsWith("System.Reflection.Emit", StringComparison.Ordinal) || ns.StartsWith("System.Linq.Expressions", StringComparison.Ordinal);
+    private static bool IsForbiddenKernelApi(string type, string ns, string method) => type == "System.Console" || type == "System.Environment" || type == "System.GC" || type == "System.Activator" || type == "System.Threading.ThreadPool" || type == "System.Threading.Tasks.Task" || type == "System.Diagnostics.Process" || (type == "System.Delegate" && method == "CreateDelegate") || ns.StartsWith("System.IO", StringComparison.Ordinal) || ns.StartsWith("System.Net", StringComparison.Ordinal) || ns.StartsWith("System.Reflection", StringComparison.Ordinal) || ns.StartsWith("System.Linq.Expressions", StringComparison.Ordinal);
 
-    private static bool IsNondeterministic(string type, string method) =>
-        (type == "System.Guid" && method == "NewGuid") || (type == "System.Random") ||
-        (type == "System.DateTime" && (method == "get_Now" || method == "get_UtcNow")) ||
-        (type == "System.Environment" && (method == "get_MachineName" || method == "get_CurrentDirectory"));
+    private static bool IsNondeterministic(string type, string method) => (type == "System.Guid" && method == "NewGuid") || type == "System.Random" || (type == "System.DateTime" && (method == "get_Now" || method == "get_UtcNow")) || (type == "System.Environment" && (method == "get_MachineName" || method == "get_CurrentDirectory"));
 
     private static void AnalyzeBorrowReturn(SyntaxNodeAnalysisContext context)
     {
@@ -118,6 +100,16 @@ public sealed class SingPlusAnalyzer : DiagnosticAnalyzer
         if (statement.Expression is null) return;
         var type = context.SemanticModel.GetTypeInfo(statement.Expression, context.CancellationToken).Type;
         if (type?.Name == "BorrowedSpan") context.ReportDiagnostic(Diagnostic.Create(BorrowEscape, statement.GetLocation()));
+    }
+
+    private static void AnalyzeMoveUse(SyntaxNodeAnalysisContext context)
+    {
+        var invocation = (InvocationExpressionSyntax)context.Node;
+        if (invocation.Expression is not MemberAccessExpressionSyntax { Name.Identifier.ValueText: "Move", Expression: IdentifierNameSyntax receiver }) return;
+        var block = invocation.FirstAncestorOrSelf<BlockSyntax>();
+        if (block is null) return;
+        var laterUse = block.DescendantNodes().OfType<IdentifierNameSyntax>().FirstOrDefault(i => i.SpanStart > invocation.Span.End && i.Identifier.ValueText == receiver.Identifier.ValueText);
+        if (laterUse is not null) context.ReportDiagnostic(Diagnostic.Create(UseAfterMove, laterUse.GetLocation(), receiver.Identifier.ValueText));
     }
 
     private static void AnalyzeContract(SymbolAnalysisContext context)

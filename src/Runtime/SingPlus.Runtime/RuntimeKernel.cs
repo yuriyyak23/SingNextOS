@@ -10,11 +10,13 @@ public sealed partial class RuntimeKernel
         Processes = new ProcessRegistry();
         Domains = new DomainRegistry();
         CapabilityAuthority = new CapabilityAuthority();
+        Regions = new RegionAuthority();
     }
 
     public ProcessRegistry Processes { get; }
     public DomainRegistry Domains { get; }
     public CapabilityAuthority CapabilityAuthority { get; }
+    public RegionAuthority Regions { get; }
 
     public KernelResult<SingProcess> CreateProcess(SingProcessManifestV1 manifest)
     {
@@ -84,12 +86,7 @@ public sealed partial class RuntimeKernel
         return KernelResult.Ok();
     }
 
-    public KernelResult<CapabilityDescriptorV1> MintCapability(
-        DomainId issuerDomain,
-        ProcessHandle subject,
-        ResourceKind resourceKind,
-        string resourceId,
-        CapabilityRights rights)
+    public KernelResult<CapabilityDescriptorV1> MintCapability(DomainId issuerDomain, ProcessHandle subject, ResourceKind resourceKind, string resourceId, CapabilityRights rights)
     {
         var resolved = Processes.Resolve(subject);
         if (!resolved.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(resolved.Error, resolved.Message!);
@@ -99,11 +96,7 @@ public sealed partial class RuntimeKernel
         return KernelResult<CapabilityDescriptorV1>.Ok(descriptor);
     }
 
-    public KernelResult<CapabilityDescriptorV1> DelegateCapability(
-        ProcessHandle delegator,
-        ProcessHandle target,
-        CapabilityId sourceCapability,
-        CapabilityRights rights)
+    public KernelResult<CapabilityDescriptorV1> DelegateCapability(ProcessHandle delegator, ProcessHandle target, CapabilityId sourceCapability, CapabilityRights rights)
     {
         var sourceProcess = Processes.Resolve(delegator);
         if (!sourceProcess.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(sourceProcess.Error, sourceProcess.Message!);
@@ -124,10 +117,7 @@ public sealed partial class RuntimeKernel
     public KernelResult RevokeCapability(CapabilityId capabilityId)
     {
         var result = CapabilityAuthority.Revoke(capabilityId);
-        if (result.IsSuccess)
-        {
-            foreach (var process in Processes.Snapshot()) process.RemoveCapability(capabilityId);
-        }
+        if (result.IsSuccess) foreach (var process in Processes.Snapshot()) process.RemoveCapability(capabilityId);
         return result;
     }
 
@@ -145,10 +135,13 @@ public sealed partial class RuntimeKernel
     {
         process.ClearCapabilities();
         var domainEnded = Domains.Remove(process);
-        if (domainEnded) CapabilityAuthority.RevokeAllForDomain(process.DomainId);
+        if (domainEnded)
+        {
+            CapabilityAuthority.RevokeAllForDomain(process.DomainId);
+            Regions.ReclaimAllForDomain(process.DomainId);
+        }
         process.ClearRuntimeResources();
     }
 
-    private static KernelResult InvalidTransition(ProcessState actual, ProcessState requested) =>
-        KernelResult.Fail(KernelError.InvalidTransition, $"Cannot transition from {actual} to {requested}.");
+    private static KernelResult InvalidTransition(ProcessState actual, ProcessState requested) => KernelResult.Fail(KernelError.InvalidTransition, $"Cannot transition from {actual} to {requested}.");
 }
