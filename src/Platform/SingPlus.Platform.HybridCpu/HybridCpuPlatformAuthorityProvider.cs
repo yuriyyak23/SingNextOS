@@ -4,7 +4,8 @@ namespace SingPlus.Platform.HybridCpu;
 
 public sealed class HybridCpuPlatformAuthorityProvider :
     IPlatformAuthorityProvider,
-    IPlatformFeatureProvider
+    IPlatformFeatureProvider,
+    IPlatformDomainExecutionProvider
 {
     private sealed class DomainRecord(
         PlatformProviderDomainLease lease,
@@ -40,7 +41,7 @@ public sealed class HybridCpuPlatformAuthorityProvider :
                 new PlatformFeatureDescriptor(
                     PlatformFeatureFamily.NeutralDomains,
                     1,
-                    PlatformFeatureAvailability.RuntimeAdmission),
+                    PlatformFeatureAvailability.Executable),
             });
     }
 
@@ -76,6 +77,65 @@ public sealed class HybridCpuPlatformAuthorityProvider :
         _domains.Add(lease.LeaseId, new DomainRecord(lease, external.Lease));
         _activeSubjects.Add(subject, lease.LeaseId);
         return PlatformAuthorityResult<PlatformProviderDomainLease>.Ok(lease);
+    }
+
+    public PlatformAuthorityResult<PlatformDomainExecutionTransitionResult> TransitionDomainExecution(
+        PlatformProviderDomainLease domainLease,
+        PlatformDomainExecutionTransition transition)
+    {
+        var validation = ValidateDomain(domainLease);
+        if (!validation.IsSuccess)
+        {
+            return PlatformAuthorityResult<PlatformDomainExecutionTransitionResult>.Fail(
+                validation.Status,
+                validation.Message ?? "The provider domain lease is not live.");
+        }
+
+        var transitionValidation = PlatformDomainExecutionContract.ValidateTransition(transition);
+        if (!transitionValidation.IsSuccess)
+        {
+            return PlatformAuthorityResult<PlatformDomainExecutionTransitionResult>.Fail(
+                transitionValidation.Status,
+                transitionValidation.Message ?? "The platform execution transition is invalid.");
+        }
+
+        var record = _domains[domainLease.LeaseId];
+        var neutralTransition = ToNeutralTransition(transition);
+        var external = _runtime.TransitionExecution(record.HybridCpuLease, neutralTransition);
+        if (!external.IsTransitioned)
+        {
+            if (external.Decision == NeutralExecutionTransitionDecision.Revoked)
+                MarkRevoked(record);
+
+            var status = external.Decision switch
+            {
+                NeutralExecutionTransitionDecision.InvalidTransition => PlatformAuthorityStatus.Denied,
+                NeutralExecutionTransitionDecision.Revoked => PlatformAuthorityStatus.Revoked,
+                NeutralExecutionTransitionDecision.Stale => PlatformAuthorityStatus.Faulted,
+                NeutralExecutionTransitionDecision.NotFound => PlatformAuthorityStatus.Faulted,
+                NeutralExecutionTransitionDecision.Faulted => PlatformAuthorityStatus.Faulted,
+                _ => PlatformAuthorityStatus.Faulted,
+            };
+
+            return PlatformAuthorityResult<PlatformDomainExecutionTransitionResult>.Fail(
+                status,
+                external.Reason);
+        }
+
+        if (external.Lease != record.HybridCpuLease ||
+            external.Transition != neutralTransition ||
+            external.State != ToNeutralState(PlatformDomainExecutionContract.ExpectedState(transition)))
+        {
+            return PlatformAuthorityResult<PlatformDomainExecutionTransitionResult>.Fail(
+                PlatformAuthorityStatus.Faulted,
+                "HybridCPU returned execution evidence that does not match the provider-owned transition.");
+        }
+
+        return PlatformAuthorityResult<PlatformDomainExecutionTransitionResult>.Ok(
+            new PlatformDomainExecutionTransitionResult(
+                record.Lease,
+                transition,
+                FromNeutralState(external.State)));
     }
 
     public PlatformAuthorityResult RevokeDomain(PlatformProviderDomainLease lease)
@@ -178,6 +238,34 @@ public sealed class HybridCpuPlatformAuthorityProvider :
         record.Revoked = true;
         _activeSubjects.Remove(record.Lease.Subject);
     }
+
+    private static NeutralExecutionTransition ToNeutralTransition(
+        PlatformDomainExecutionTransition transition) =>
+        transition switch
+        {
+            PlatformDomainExecutionTransition.Start => NeutralExecutionTransition.Start,
+            PlatformDomainExecutionTransition.Park => NeutralExecutionTransition.Park,
+            PlatformDomainExecutionTransition.Resume => NeutralExecutionTransition.Resume,
+            _ => throw new ArgumentOutOfRangeException(nameof(transition)),
+        };
+
+    private static NeutralExecutionState ToNeutralState(PlatformDomainExecutionState state) =>
+        state switch
+        {
+            PlatformDomainExecutionState.Ready => NeutralExecutionState.Ready,
+            PlatformDomainExecutionState.Running => NeutralExecutionState.Running,
+            PlatformDomainExecutionState.Parked => NeutralExecutionState.Parked,
+            _ => throw new ArgumentOutOfRangeException(nameof(state)),
+        };
+
+    private static PlatformDomainExecutionState FromNeutralState(NeutralExecutionState state) =>
+        state switch
+        {
+            NeutralExecutionState.Ready => PlatformDomainExecutionState.Ready,
+            NeutralExecutionState.Running => PlatformDomainExecutionState.Running,
+            NeutralExecutionState.Parked => PlatformDomainExecutionState.Parked,
+            _ => throw new ArgumentOutOfRangeException(nameof(state)),
+        };
 
     private static ulong NextNonZero(ref ulong next)
     {

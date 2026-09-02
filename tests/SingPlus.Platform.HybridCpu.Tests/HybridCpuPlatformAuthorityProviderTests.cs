@@ -7,7 +7,7 @@ namespace SingPlus.Platform.HybridCpu.Tests;
 public sealed class HybridCpuPlatformAuthorityProviderTests
 {
     [Fact]
-    public void ProviderBindsAndRevokesRealNeutralRuntimeLease()
+    public void ProviderBindsTransitionsAndRevokesRealNeutralRuntimeLease()
     {
         var runtime = new NeutralDomainRuntimeFacade();
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
@@ -23,6 +23,25 @@ public sealed class HybridCpuPlatformAuthorityProviderTests
         Assert.NotEqual(typeof(PlatformProviderDomainLeaseId), typeof(NeutralDomainBindingHandle));
         Assert.NotEqual(typeof(PlatformProviderLeaseGeneration), typeof(NeutralDomainBindingEpoch));
 
+        var start = provider.TransitionDomainExecution(
+            bind.Value,
+            PlatformDomainExecutionTransition.Start);
+        Assert.True(start.IsSuccess, start.Message);
+        Assert.Equal(bind.Value, start.Value!.DomainLease);
+        Assert.Equal(PlatformDomainExecutionState.Running, start.Value.State);
+
+        var park = provider.TransitionDomainExecution(
+            bind.Value,
+            PlatformDomainExecutionTransition.Park);
+        Assert.True(park.IsSuccess, park.Message);
+        Assert.Equal(PlatformDomainExecutionState.Parked, park.Value!.State);
+
+        var resume = provider.TransitionDomainExecution(
+            bind.Value,
+            PlatformDomainExecutionTransition.Resume);
+        Assert.True(resume.IsSuccess, resume.Message);
+        Assert.Equal(PlatformDomainExecutionState.Running, resume.Value!.State);
+
         var revoke = provider.RevokeDomain(bind.Value);
 
         Assert.True(revoke.IsSuccess, revoke.Message);
@@ -30,7 +49,29 @@ public sealed class HybridCpuPlatformAuthorityProviderTests
     }
 
     [Fact]
-    public void StaleOrWrongSubjectProviderLeaseIsRejectedBeforeExternalClosure()
+    public void InvalidRealHybridCpuExecutionOrderIsDeniedWithoutProviderLeaseLoss()
+    {
+        var runtime = new NeutralDomainRuntimeFacade();
+        var provider = new HybridCpuPlatformAuthorityProvider(runtime);
+        var binding = provider.BindDomain(
+            new PlatformDomainIdentity(new DomainId(11), 1)).Value!;
+
+        var park = provider.TransitionDomainExecution(
+            binding,
+            PlatformDomainExecutionTransition.Park);
+
+        Assert.Equal(PlatformAuthorityStatus.Denied, park.Status);
+        Assert.Equal(1, runtime.ActiveBindingCount);
+
+        var start = provider.TransitionDomainExecution(
+            binding,
+            PlatformDomainExecutionTransition.Start);
+        Assert.True(start.IsSuccess, start.Message);
+        Assert.Equal(PlatformDomainExecutionState.Running, start.Value!.State);
+    }
+
+    [Fact]
+    public void StaleOrWrongSubjectProviderLeaseIsRejectedBeforeExternalTransitionOrClosure()
     {
         var runtime = new NeutralDomainRuntimeFacade();
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
@@ -46,15 +87,41 @@ public sealed class HybridCpuPlatformAuthorityProviderTests
             Subject = new PlatformDomainIdentity(new DomainId(21), 3),
         };
 
-        var staleResult = provider.RevokeDomain(stale);
-        var wrongSubjectResult = provider.RevokeDomain(wrongSubject);
+        var staleTransition = provider.TransitionDomainExecution(
+            stale,
+            PlatformDomainExecutionTransition.Start);
+        var wrongTransition = provider.TransitionDomainExecution(
+            wrongSubject,
+            PlatformDomainExecutionTransition.Start);
+        var staleRevoke = provider.RevokeDomain(stale);
+        var wrongRevoke = provider.RevokeDomain(wrongSubject);
 
-        Assert.Equal(PlatformAuthorityStatus.Stale, staleResult.Status);
-        Assert.Equal(PlatformAuthorityStatus.WrongDomain, wrongSubjectResult.Status);
+        Assert.Equal(PlatformAuthorityStatus.Stale, staleTransition.Status);
+        Assert.Equal(PlatformAuthorityStatus.WrongDomain, wrongTransition.Status);
+        Assert.Equal(PlatformAuthorityStatus.Stale, staleRevoke.Status);
+        Assert.Equal(PlatformAuthorityStatus.WrongDomain, wrongRevoke.Status);
         Assert.Equal(1, runtime.ActiveBindingCount);
 
         Assert.True(provider.RevokeDomain(binding).IsSuccess);
         Assert.Equal(0, runtime.ActiveBindingCount);
+    }
+
+    [Fact]
+    public void RuntimeKernelPublishesRunningAndParkedOnlyAfterRealHybridCpuTransitions()
+    {
+        var runtime = new NeutralDomainRuntimeFacade();
+        var kernel = new RuntimeKernel(new HybridCpuPlatformAuthorityProvider(runtime));
+        var (process, handle) = CreateProcess(kernel, 30, 300, 1);
+        Assert.True(kernel.AdmitProcess(handle).IsSuccess);
+        Assert.True(kernel.BindPlatformDomain(handle).IsSuccess);
+
+        Assert.True(kernel.StartProcess(handle).IsSuccess);
+        Assert.Equal(ProcessState.Running, process.State);
+        Assert.True(kernel.ParkProcess(handle).IsSuccess);
+        Assert.Equal(ProcessState.Parked, process.State);
+        Assert.True(kernel.ResumeProcess(handle).IsSuccess);
+        Assert.Equal(ProcessState.Running, process.State);
+        Assert.Equal(1, runtime.ActiveBindingCount);
     }
 
     [Fact]
@@ -76,29 +143,35 @@ public sealed class HybridCpuPlatformAuthorityProviderTests
     }
 
     [Fact]
-    public void WrongProcessGenerationIsRejectedBeforeHybridCpuAdmission()
+    public void WrongProcessGenerationIsRejectedBeforeHybridCpuAdmissionOrTransition()
     {
         var runtime = new NeutralDomainRuntimeFacade();
         var kernel = new RuntimeKernel(new HybridCpuPlatformAuthorityProvider(runtime));
-        var (_, handle) = CreateProcess(kernel, 32, 320, 4);
+        var (process, handle) = CreateProcess(kernel, 32, 320, 4);
+        Assert.True(kernel.AdmitProcess(handle).IsSuccess);
+        Assert.True(kernel.BindPlatformDomain(handle).IsSuccess);
         var stale = handle with { Generation = handle.Generation + 1 };
 
-        var bind = kernel.BindPlatformDomain(stale);
+        var start = kernel.StartProcess(stale);
 
-        Assert.False(bind.IsSuccess);
-        Assert.Equal(KernelError.StaleHandle, bind.Error);
-        Assert.Equal(0, runtime.ActiveBindingCount);
+        Assert.False(start.IsSuccess);
+        Assert.Equal(KernelError.StaleHandle, start.Error);
+        Assert.Equal(ProcessState.Admitted, process.State);
+        Assert.Equal(1, runtime.ActiveBindingCount);
     }
 
     [Fact]
-    public void PhaseTwoProcessTeardownClosesHybridCpuDomainBeforePublishingExit()
+    public void PhaseTwoProcessTeardownClosesRunningHybridCpuDomainBeforePublishingExit()
     {
         var runtime = new NeutralDomainRuntimeFacade();
         var kernel = new RuntimeKernel(new HybridCpuPlatformAuthorityProvider(runtime));
         var (process, handle) = CreateProcess(kernel, 33, 330, 1);
 
+        Assert.True(kernel.AdmitProcess(handle).IsSuccess);
         var binding = kernel.BindPlatformDomain(handle);
         Assert.True(binding.IsSuccess, binding.Message);
+        Assert.True(kernel.StartProcess(handle).IsSuccess);
+        Assert.Equal(ProcessState.Running, process.State);
         Assert.Equal(1, runtime.ActiveBindingCount);
 
         var terminate = kernel.TerminateProcess(handle);
@@ -110,13 +183,13 @@ public sealed class HybridCpuPlatformAuthorityProviderTests
     }
 
     [Fact]
-    public void ProviderAdvertisesOnlyNeutralRuntimeAdmissionInThisSlice()
+    public void ProviderAdvertisesNeutralDomainsAsExecutableWithoutMappingClaims()
     {
         var provider = new HybridCpuPlatformAuthorityProvider(new NeutralDomainRuntimeFacade());
         var features = provider.QueryFeatures();
 
         Assert.Equal(
-            PlatformFeatureAvailability.RuntimeAdmission,
+            PlatformFeatureAvailability.Executable,
             features.Resolve(PlatformFeatureFamily.NeutralDomains).Availability);
         Assert.Equal(
             PlatformFeatureAvailability.Unavailable,

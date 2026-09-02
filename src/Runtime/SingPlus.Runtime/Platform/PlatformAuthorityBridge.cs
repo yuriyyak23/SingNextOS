@@ -193,6 +193,51 @@ public sealed class PlatformAuthorityBridge
         return KernelResult.Ok();
     }
 
+    internal KernelResult TransitionDomainExecution(
+        PlatformDomainBinding binding,
+        PlatformDomainIdentity expectedSubject,
+        PlatformDomainExecutionTransition transition)
+    {
+        var bindingValidation = ValidateDomain(binding, expectedSubject);
+        if (!bindingValidation.IsSuccess) return bindingValidation;
+
+        var transitionValidation = PlatformDomainExecutionContract.ValidateTransition(transition);
+        if (!transitionValidation.IsSuccess)
+            return FromProviderFailure(transitionValidation.Status, transitionValidation.Message);
+
+        if (_provider is not IPlatformDomainExecutionProvider executionProvider)
+        {
+            return KernelResult.Fail(
+                KernelError.PlatformUnsupported,
+                "The bound platform provider does not expose neutral execution lifecycle transitions.");
+        }
+
+        var record = _domains[binding.BindingId];
+        var providerResult = executionProvider.TransitionDomainExecution(
+            record.ProviderLease,
+            transition);
+        if (!providerResult.IsSuccess)
+        {
+            if (providerResult.Status is PlatformAuthorityStatus.Revoked or PlatformAuthorityStatus.Stale)
+                MarkDomainRevoked(record);
+
+            return FromProviderFailure(providerResult.Status, providerResult.Message);
+        }
+
+        var resultValidation = PlatformDomainExecutionContract.ValidateResult(
+            record.ProviderLease,
+            transition,
+            providerResult.Value!);
+        if (!resultValidation.IsSuccess)
+        {
+            return KernelResult.Fail(
+                KernelError.PlatformFaulted,
+                resultValidation.Message ?? "The platform provider returned malformed execution transition evidence.");
+        }
+
+        return KernelResult.Ok();
+    }
+
     internal KernelResult<PlatformRegionMapping> MapOwnedRegion(
         PlatformDomainBinding binding,
         PlatformDomainIdentity expectedSubject,

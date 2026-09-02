@@ -61,11 +61,11 @@ jobs:
         with:
           path: SingNextOS
 
-      - name: Checkout pinned HybridCPU neutral-domain facade
+      - name: Checkout pinned HybridCPU neutral execution lifecycle
         uses: actions/checkout@v4
         with:
           repository: yuriyyak23/HybridCPU-v2
-          ref: e09147e5c2e9f5d463884d3f46cb45bd9ceeda6b
+          ref: 3ea2303e1a5fe423e76ef3c2f3c399001ca08288
           path: HybridCPU-v2
 
       - name: Setup .NET from SingNextOS global.json
@@ -89,4 +89,4 @@ jobs:
         run: dotnet test HybridCPU-v2/HybridCPU_NeutralRuntime.Tests/HybridCPU_NeutralRuntime.Tests.csproj --configuration Release
 
 # The normal local-guarantees job remains independent of HybridCPU source.
-# Phase-3 cross-repository binding is verified only by the pinned narrow integration job above.
+# Phase-3 cross-repository execution lifecycle is verified only by the pinned narrow integration job above.

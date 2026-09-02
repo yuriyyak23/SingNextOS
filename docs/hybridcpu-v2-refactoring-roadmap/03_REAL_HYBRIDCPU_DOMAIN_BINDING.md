@@ -2,18 +2,38 @@
 
 ## Status
 
-**In progress.** The first cross-repository slice now materializes and closes a real HybridCPU-owned neutral runtime domain through a privileged SingNextOS provider. Execution lifecycle transitions (`StartProcess` / `ParkProcess` / `ResumeProcess`) remain a later Phase-3 slice, so the feature is still classified as `RuntimeAdmission`, not `Executable`.
+**Implementation complete; merge acceptance requires the pinned cross-repository CI gate.**
 
-The external neutral export is supplied by HybridCPU-v2 PR #5 (`Runtime: export neutral domain binding facade`) and is pinned by the SingNextOS integration gate to exact HybridCPU commit `e09147e5c2e9f5d463884d3f46cb45bd9ceeda6b`.
+Phase 3 now has both required halves:
+
+1. real neutral HybridCPU bind/revoke, merged into SingNextOS by PR #23;
+2. real neutral `Start / Park / Resume` execution lifecycle, implemented by this iteration.
+
+The external dependency chain is intentionally split because HybridCPU-v2 PR #5 is still open:
+
+```text
+HybridCPU-v2 PR #5
+  neutral bind / close owner
+  head e09147e5c2e9f5d463884d3f46cb45bd9ceeda6b
+
+    -> stacked HybridCPU-v2 PR #6
+       neutral Start / Park / Resume owner
+       head 3ea2303e1a5fe423e76ef3c2f3c399001ca08288
+
+         -> SingNextOS Phase-3 lifecycle PR
+            exact pinned cross-repository integration
+```
+
+No new lifecycle scope was folded into PR #5. PR #6 is a one-commit, two-file delta on top of the already-reviewed neutral runtime export.
 
 ## Goal
 
-Materialize a live SingNextOS security principal into neutral HybridCPU execution, memory and I/O runtime ownership without importing VMX/VMCS or HybridCPU internal implementation types into SingNextOS core authority surfaces.
+Materialize a live SingNextOS security principal into neutral HybridCPU runtime ownership and ensure that local execution state is never published stronger than the exact external state proved by the bound provider.
 
-Current relation:
+Current identity and authority relation:
 
 ```text
-Sing PlatformDomainIdentity(DomainId, ProcessGeneration)
+Sing DomainId + process generation
   -> local PlatformDomainBindingId / generation
   -> privileged HybridCpuPlatformAuthorityProvider
   -> provider PlatformProviderDomainLeaseId / generation
@@ -21,27 +41,20 @@ Sing PlatformDomainIdentity(DomainId, ProcessGeneration)
   -> private HybridCPU neutral runtime context
        -> private DomainTag / AddressSpaceTag
        -> neutral execution + memory + I/O owners
+       -> semantic execution state Ready / Running / Parked
 ```
 
 Every arrow is a validated bridge relation, not numeric identity reuse.
 
-The local Sing identity remains authoritative for OS policy. HybridCPU owns the external neutral runtime lease and close state. Neither side treats evidence from the other as a capability.
+The local Sing identity remains authoritative for OS policy. HybridCPU owns the external neutral runtime lease and execution state. Neither side treats evidence from the other as a capability.
 
-## Completed slice — real neutral bind / revoke
+## Completed slice A — real neutral bind / revoke
 
-### 1. Why a new narrow HybridCPU export was required
+SingNextOS PR #23 added a privileged `SingPlus.Platform.HybridCpu` provider backed by the narrow `HybridCPU_NeutralRuntime` export from HybridCPU-v2 PR #5.
 
-Inspection of HybridCPU-v2 master at `38bf0614d8a58e2543b4a956ccc23bb22e1a8170` found public neutral domain descriptors/admission concepts such as `DomainRuntimeContext`, execution/memory/I/O domain descriptors and their validators. However, there was no public provider-facing owner that creates a live neutral lease and later closes that exact lease.
-
-Constructing those descriptors directly inside SingNextOS would therefore have duplicated HybridCPU admission shape without creating external HybridCPU-owned lifetime authority.
-
-The first integration attempt also proved an important repository boundary: the current monolithic `HybridCPU_ISE.csproj` has an unrelated pre-existing SecureCompute source-baseline break (missing debug-policy source types expected by its own tests). Phase 3 does not repair or take ownership of that unrelated graph.
-
-HybridCPU-v2 PR #5 therefore exports a dedicated narrow assembly:
+The bind/revoke relation is:
 
 ```text
-HybridCPU_NeutralRuntime
-
 NeutralDomainRuntimeFacade.Bind(OrdinaryService)
   -> NeutralDomainBindingLease(handle, epoch)
 
@@ -49,11 +62,11 @@ NeutralDomainRuntimeFacade.Close(exact lease)
   -> Closed | NotFound | Stale | Revoked | Faulted
 ```
 
-The neutral assembly is self-contained. It owns a private neutral context consisting of execution, memory and I/O owner state and private runtime tags. It does not reference SecureCompute, VMX, DMA, scheduler or the broken monolithic project graph.
+The provider issues a fresh independent `PlatformProviderDomainLeaseId` only after external materialization succeeds and stores the HybridCPU lease only in its private ledger.
 
-### 2. Ordinary-service authority profile
+### Ordinary-service authority profile
 
-The first real profile deliberately proves only external neutral domain presence/lifetime. It materializes private execution + memory + I/O owner state while denying later-phase authority:
+The neutral runtime profile deliberately grants none of the later-phase authority:
 
 ```text
 DMA authority                 = false
@@ -64,39 +77,169 @@ materialized VM guest state   = false
 typed HybridCPU capability    = none
 ```
 
-The public facade surface exposes only the semantic profile, opaque binding handle/epoch and typed bind/close outcomes. Private `DomainTag` / `AddressSpaceTag` values and owner state never cross the facade boundary.
+Private `DomainTag` / `AddressSpaceTag` values and owner state never cross the HybridCPU facade boundary.
 
-This slice therefore does **not** pre-authorize Phase 4 region mapping, Phase 5 DMA, Phase 8 virtualization or VMX compatibility work.
+## Completed slice B — real neutral execution lifecycle
 
-### 3. Privileged SingNextOS provider assembly
+### 1. HybridCPU semantic transition owner
 
-`SingPlus.Platform.HybridCpu` is a separate privileged integration assembly. It references only `HybridCPU_NeutralRuntime`; `SingPlus.Platform.Abstractions` and `SingPlus.Runtime` do not reference any HybridCPU assembly.
+HybridCPU-v2 PR #6 adds one synchronous provider-facing operation to the existing narrow neutral owner:
 
-`HybridCpuPlatformAuthorityProvider` implements only the existing provider contract:
+```text
+NeutralDomainRuntimeFacade.TransitionExecution(exact lease, transition)
+```
+
+Semantic state machine:
+
+```text
+Ready   -- Start  --> Running
+Running -- Park   --> Parked
+Parked  -- Resume --> Running
+```
+
+Public types are limited to:
+
+```text
+NeutralExecutionTransition = Start | Park | Resume
+NeutralExecutionState      = Ready | Running | Parked
+```
+
+The transition result echoes:
+
+- the exact opaque HybridCPU lease;
+- the requested semantic transition;
+- the resulting semantic state.
+
+No scheduler placement, lane ID, SMT identity, bundle/slot state, ISA opcode, VMCS field or completion token is exposed.
+
+### 2. Why this lifecycle is synchronous
+
+No new `PlatformOperationId` or completion state machine is invented for these transitions.
+
+The neutral facade owns the lease and execution state and performs each current transition atomically in the narrow runtime owner. It can therefore return definitive synchronous success/failure truthfully.
+
+If a future external implementation makes these transitions asynchronous, it must reuse the existing Platform Contract vNext operation/completion model rather than introducing a second completion authority.
+
+### 3. HybridCPU fail-closed transition semantics
+
+The neutral owner rejects without state mutation:
+
+- stale lease epoch -> `Stale`;
+- unknown/unmaterialized lease -> `NotFound`;
+- already-closed lease -> `Revoked`;
+- invalid state/transition pair -> `InvalidTransition`;
+- undefined transition enum -> `Faulted`.
+
+Close remains valid from a live `Ready`, `Running`, or `Parked` binding and still requires the exact lease/epoch.
+
+### 4. Sing platform execution contract
+
+`SingPlus.Platform.Abstractions` adds a semantic optional provider interface:
+
+```text
+IPlatformDomainExecutionProvider
+  TransitionDomainExecution(
+    exact PlatformProviderDomainLease,
+    Start | Park | Resume)
+```
+
+The result contains only:
+
+```text
+exact provider domain lease
+requested semantic transition
+semantic resulting state
+```
+
+`PlatformDomainExecutionContract.ValidateResult(...)` requires:
+
+- exact provider lease ID;
+- exact provider lease generation;
+- exact local subject;
+- exact requested transition;
+- exact expected resulting state.
+
+A provider that returns `Success` with mismatched identity/transition/state produces `PlatformFaulted`; malformed evidence never becomes local execution authority.
+
+### 5. HybridCpuPlatformAuthorityProvider bridge
+
+`HybridCpuPlatformAuthorityProvider` now implements:
 
 ```text
 IPlatformAuthorityProvider
 IPlatformFeatureProvider
+IPlatformDomainExecutionProvider
 ```
 
-Its descriptor advertises only:
+The provider validates the exact Sing provider lease before touching HybridCPU, translates only semantic transitions, calls the exact privately-held HybridCPU lease, and validates the returned external lease/transition/state before returning Sing platform evidence.
+
+External failures map conservatively:
+
+- invalid external transition -> `Denied`;
+- external `Revoked` -> provider lease becomes revoked;
+- external `Stale` or `NotFound` for the provider-owned private lease -> `Faulted`;
+- external `Faulted` -> `Faulted`.
+
+### 6. Local RuntimeKernel publication ordering
+
+For a process without a tracked platform binding, the existing local-only lifecycle remains unchanged.
+
+For a process with a tracked platform binding, `RuntimeKernel` now requires this order:
 
 ```text
-NeutralDomainBinding
+StartProcess
+  Resolve exact ProcessHandle generation
+  require local Admitted
+  validate exact PlatformDomainBinding
+  provider Start succeeds with exact evidence
+  -> publish local Runnable
+  -> publish local Running
+
+ParkProcess
+  Resolve exact ProcessHandle generation
+  require local Running
+  validate exact PlatformDomainBinding
+  provider Park succeeds with exact evidence
+  -> publish local Parked
+
+ResumeProcess
+  Resolve exact ProcessHandle generation
+  require local Parked
+  validate exact PlatformDomainBinding
+  provider Resume succeeds with exact evidence
+  -> publish local Running
 ```
 
-and its semantic feature manifest reports:
+If the bound provider does not implement `IPlatformDomainExecutionProvider`, the transition fails with `PlatformUnsupported`. There is no silent fallback to local-only publication for an externally bound process.
+
+Provider denial/revocation/fault or malformed success evidence leaves the current local process state unchanged.
+
+## Feature classification
+
+The real HybridCPU provider now reports:
 
 ```text
-NeutralDomains v1 = RuntimeAdmission
+NeutralDomains v1 = Executable
 OwnedRegionMapping = Unavailable
 ```
 
-`MapOwnedRegion` / `RevokeRegionMapping` explicitly return `Unsupported` in this provider slice.
+`Executable` here means only that the neutral domain bind + start/park/resume + close lifecycle is wired and verified through the pinned provider integration.
 
-### 4. Strict identity separation
+It does **not** claim:
 
-No ID space is reused:
+- region mapping;
+- coherent/non-coherent memory access;
+- DMA;
+- device execution;
+- scheduler placement/quality;
+- VM/nested-domain execution;
+- production secure execution.
+
+The host/model provider retains its own existing availability classification; feature availability remains provider-specific and exact, not ordinal.
+
+## Identity separation
+
+No identity space is reused:
 
 ```text
 DomainId
@@ -110,124 +253,112 @@ process generation
   != NeutralDomainBindingEpoch
 ```
 
-HybridCPU `DomainTag` and `AddressSpaceTag` are allocated inside the neutral facade and never reach the Sing provider contract at all.
+HybridCPU `DomainTag` and `AddressSpaceTag` remain private to `HybridCPU_NeutralRuntime`.
 
-`BindDomain()` passes only semantic `OrdinaryService` to HybridCPU. It does not pass `DomainId.Value`, process generation, `CapabilityId` or any local resource identifier as a HybridCPU tag/handle.
+`Start / Park / Resume` requests never carry local `CapabilityId`, physical addresses, mapping IDs, lane IDs, opcodes or HybridCPU tags.
 
-After successful external materialization, the provider allocates a fresh independent `PlatformProviderDomainLeaseId` and stores the HybridCPU lease only in its private provider ledger.
+## Phase-2 teardown composition remains authoritative
 
-### 5. Fail-closed revoke mapping
+No second teardown state machine was added.
 
-The provider validates exact provider lease ID, provider generation and Sing subject before external close.
-
-External close outcomes map conservatively:
-
-- exact `Closed` -> provider success;
-- external `Revoked` for the exact privately-held lease -> provider success/idempotent closure;
-- external `Stale` -> `Faulted`, because current closure is not proven;
-- external `NotFound` -> `Faulted`, because disappearance is not closure proof;
-- external `Faulted` -> `Faulted`.
-
-A forged/stale/wrong-subject provider lease is rejected before the HybridCPU facade is called.
-
-### 6. Phase-2 teardown reuse
-
-No new process-teardown state machine was added.
-
-The completed Phase-2 lifecycle already performs:
+A bound process still tears down through the completed Phase-2 ordering:
 
 ```text
 ProcessState.Exiting
   -> local channels/authority closed
-  -> platform mappings closed (none for this provider slice)
+  -> platform mappings closed (none for this provider phase)
   -> PlatformAuthorityBridge.RevokeDomain(exact binding)
   -> provider RevokeDomain(exact provider lease)
-  -> HybridCPU facade Close(exact private lease)
+  -> HybridCPU Close(exact private lease)
   -> local process/domain cleanup
   -> Exited | Faulted
 ```
 
-An ordinary process bound through `HybridCpuPlatformAuthorityProvider` therefore cannot publish `Exited` until the HybridCPU neutral domain close succeeds. A provider fault remains fail-closed through existing Phase-2 containment semantics.
+The same exact close path works when the external neutral execution state is `Running` or `Parked`.
+
+## Tests
+
+### HybridCPU neutral-runtime tests
+
+- exact `Ready -> Running -> Parked -> Running` lifecycle;
+- invalid transition ordering does not mutate state;
+- stale epoch cannot transition live authority;
+- closed binding cannot transition;
+- undefined transition fails `Faulted` without mutation;
+- exact close/revoked behavior remains intact;
+- public facade signatures contain no domain-tag/address-space/capability/VMX/DMA/IOMMU/lane/opcode/bundle/slot/SMT authority terms.
+
+### Sing platform contract / bridge tests
+
+- bound process publishes `Running/Parked` only after provider success;
+- denied Start leaves local process `Admitted`;
+- provider revocation during Park leaves local process `Running` and revokes the bridge binding;
+- malformed provider success is `PlatformFaulted` and leaves local state unchanged;
+- bound provider without execution interface cannot fall back to local-only state;
+- stale process generation is rejected before provider transition;
+- execution result validation rejects stale generation, wrong subject, wrong transition and wrong resulting state.
+
+### Real HybridCPU provider integration tests
+
+- provider bind + Start + Park + Resume + revoke against exact `HybridCPU_NeutralRuntime`;
+- invalid real HybridCPU transition order maps to provider denial without losing the lease;
+- stale/wrong-subject provider leases are rejected before external transition/close;
+- RuntimeKernel publishes real `Running/Parked/Running` only after the external transitions succeed;
+- Phase-2 teardown closes a real currently-Running HybridCPU binding before local `Exited` publication;
+- feature discovery reports `NeutralDomains = Executable` and `OwnedRegionMapping = Unavailable`;
+- core platform/runtime assemblies still do not reference `HybridCPU_NeutralRuntime`.
 
 ## Cross-repository verification
 
-The normal `Sing+ local guarantees` job remains independent of HybridCPU source.
+The normal `SingNextOS local guarantees` job remains independent of HybridCPU source.
 
-A separate `HybridCPU neutral domain integration` job:
-
-1. checks out SingNextOS;
-2. checks out exact HybridCPU neutral-runtime commit `e09147e5c2e9f5d463884d3f46cb45bd9ceeda6b` as a sibling repository;
-3. builds the isolated `SingPlus.Platform.HybridCpu` provider and its tests against `HybridCPU_NeutralRuntime`;
-4. runs Sing provider/runtime integration tests;
-5. runs focused `HybridCPU_NeutralRuntime.Tests`.
-
-The gate intentionally does not build unrelated `HybridCPU_ISE` / SecureCompute code. That keeps this iteration responsible only for the neutral provider contract it actually consumes while making the exact cross-repository dependency reproducible.
-
-## Tests in this slice
-
-HybridCPU neutral-runtime coverage:
-
-- ordinary-service bind materializes private execution/memory/I/O owners;
-- private domain/address-space tags are non-zero and independent from public lease handle/epoch values;
-- the profile does not gain DMA/IOMMU/second-stage/VM/compatibility authority;
-- stale epoch cannot close live authority;
-- exact close revokes the binding;
-- duplicate close reports `Revoked`;
-- unsupported profile does not materialize authority;
-- public facade signatures contain no domain tag/address-space/capability/VMX/DMA/IOMMU/lane/opcode authority terms.
-
-Sing provider coverage:
-
-- real facade bind creates one live HybridCPU binding and exact revoke closes it;
-- provider lease identity/generation types remain distinct from HybridCPU handle/epoch types;
-- stale provider generation is rejected before external close;
-- wrong Sing subject is rejected before external close;
-- duplicate active Sing subject cannot materialize a second HybridCPU binding;
-- stale `ProcessHandle` generation is rejected by Sing before HybridCPU admission;
-- Phase-2 `TerminateProcess` closes the HybridCPU lease before publishing `Exited`;
-- feature discovery advertises only neutral runtime admission;
-- core platform/runtime assemblies do not reference `HybridCPU_NeutralRuntime`; only the privileged provider assembly does.
-
-## Remaining Phase-3 work
-
-### 1. Real execution lifecycle transitions
-
-`StartProcess`, `ParkProcess` and `ResumeProcess` still only publish local execution state. The next slice must consume a narrow neutral HybridCPU transition owner and preserve this ordering:
+The separate `HybridCPU neutral domain integration` job pins exact HybridCPU transition head:
 
 ```text
-local state/generation validation
-  -> exact platform-domain binding validation
-  -> provider transition begin/observe
-  -> exact completion proof if asynchronous
-  -> local Running/Parked publication
+3ea2303e1a5fe423e76ef3c2f3c399001ca08288
 ```
 
-If external transition fails or remains pending, Sing must not publish a stronger local state.
+It must:
 
-### 2. Keep lifecycle authority semantic
-
-Any required HybridCPU export must remain neutral and provider-facing. Do not expose lane IDs, bundle slots, VMCS fields, SMT topology or raw execution opcodes through Sing contracts.
-
-### 3. Completion integration only when required
-
-If a neutral HybridCPU transition is asynchronous, reuse `PlatformOperationId` / completion receipts rather than inventing a second completion model. Synchronous transition success may remain synchronous only when the external owner can prove it truthfully.
+1. checkout SingNextOS;
+2. checkout the exact stacked HybridCPU transition commit;
+3. restore/build the isolated provider integration graph;
+4. run Sing real-provider integration tests;
+5. run `HybridCPU_NeutralRuntime.Tests`.
 
 ## Acceptance criteria
 
-Phase 3 is **not complete yet**.
+Phase 3 is complete at implementation level when the same bound process can:
 
-The bind/revoke half is complete when the cross-repository integration gate is green: a Sing process can acquire a live HybridCPU-owned neutral domain lease, retain strict identity separation, and have Phase-2 teardown close that lease before local exit.
+```text
+bind exact neutral external lease
+ -> Start externally, then publish local Running
+ -> Park externally, then publish local Parked
+ -> Resume externally, then publish local Running
+ -> teardown through exact external Close
+ -> publish local Exited only after closure
+```
 
-Full Phase 3 completes only when the same bound process can also transition through real neutral start/park/resume lifecycle state with local publication gated by external success/completion, then tear down with stale-handle rejection.
+with stale/revoked/denied/malformed paths failing closed and all external identities remaining bridge-private.
+
+Merge acceptance additionally requires the full Sing regression gate and pinned cross-repository integration gate to be green on the final PR head.
+
+## Next phase
+
+After Phase 3 lands, the first actually incomplete roadmap phase is:
+
+**Phase 4 — exact non-coherent-safe owned-region mapping.**
+
+That phase must start from exact range/access/coherence/visibility semantics. It must not infer DMA, IOMMU, cache behavior or physical zero-copy from the existence of the neutral execution lifecycle.
 
 ## Do not do
 
 - no `DomainId.Value == HybridCPU DomainTag/handle` shortcut;
 - no provider lease ID == HybridCPU lease handle shortcut;
 - no VMCS-backed process model;
-- no lane placement API;
-- no scheduler rewrite in the bind/revoke slice;
-- no region mapping or DMA in this slice;
+- no lane/SMT placement API;
+- no raw scheduler/ISA opcode lifecycle API;
+- no region mapping in Phase 3;
+- no DMA in Phase 3;
 - no repair of unrelated SecureCompute baseline as part of Phase 3;
-- no claim that `RuntimeAdmission` means external execution is already wired;
-- no claim that every Sing service is a nested VM.
+- no claim that `Executable` implies mapping/DMA/virtualization/production-secure support.

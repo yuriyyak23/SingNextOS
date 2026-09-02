@@ -58,13 +58,31 @@ public sealed partial class RuntimeKernel
         if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
         var process = resolved.Value!;
         if (process.State != ProcessState.Admitted) return InvalidTransition(process.State, ProcessState.Runnable);
+
+        var platform = TransitionPlatformExecutionIfBound(
+            handle,
+            process,
+            PlatformDomainExecutionTransition.Start);
+        if (!platform.IsSuccess) return platform;
+
         process.SetState(ProcessState.Runnable);
         process.SetState(ProcessState.Running);
         return KernelResult.Ok();
     }
 
-    public KernelResult ParkProcess(ProcessHandle handle) => Transition(handle, ProcessState.Running, ProcessState.Parked);
-    public KernelResult ResumeProcess(ProcessHandle handle) => Transition(handle, ProcessState.Parked, ProcessState.Running);
+    public KernelResult ParkProcess(ProcessHandle handle) =>
+        TransitionProcessExecution(
+            handle,
+            ProcessState.Running,
+            ProcessState.Parked,
+            PlatformDomainExecutionTransition.Park);
+
+    public KernelResult ResumeProcess(ProcessHandle handle) =>
+        TransitionProcessExecution(
+            handle,
+            ProcessState.Parked,
+            ProcessState.Running,
+            PlatformDomainExecutionTransition.Resume);
 
     public KernelResult TerminateProcess(ProcessHandle handle) =>
         BeginOrAdvanceProcessTeardown(handle, ProcessState.Exited);
@@ -120,14 +138,37 @@ public sealed partial class RuntimeKernel
         return cascade.IsSuccess ? result : cascade;
     }
 
-    private KernelResult Transition(ProcessHandle handle, ProcessState from, ProcessState to)
+    private KernelResult TransitionProcessExecution(
+        ProcessHandle handle,
+        ProcessState from,
+        ProcessState to,
+        PlatformDomainExecutionTransition platformTransition)
     {
         var resolved = Processes.Resolve(handle);
         if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
         var process = resolved.Value!;
         if (process.State != from) return InvalidTransition(process.State, to);
+
+        var platform = TransitionPlatformExecutionIfBound(
+            handle,
+            process,
+            platformTransition);
+        if (!platform.IsSuccess) return platform;
+
         process.SetState(to);
         return KernelResult.Ok();
+    }
+
+    private KernelResult TransitionPlatformExecutionIfBound(
+        ProcessHandle handle,
+        SingProcess process,
+        PlatformDomainExecutionTransition transition)
+    {
+        if (!_processPlatformBindings.TryGetValue(handle, out var binding))
+            return KernelResult.Ok();
+
+        var identity = new PlatformDomainIdentity(process.DomainId, process.Generation);
+        return PlatformAuthority.TransitionDomainExecution(binding, identity, transition);
     }
 
     private static KernelResult EnsureProcessAcceptsNewEffects(SingProcess process)
