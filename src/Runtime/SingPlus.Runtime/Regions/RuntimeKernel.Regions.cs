@@ -97,4 +97,18 @@ public sealed partial class RuntimeKernel
         resolved.Value.RemoveRegion(handle);
         return KernelResult.Ok();
     }
+
+    public KernelResult ReturnBorrow(ProcessHandle borrower, BorrowLeaseHandle lease)
+    {
+        var resolved = Processes.Resolve(borrower);
+        if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+        return Regions.ReturnLoan(lease, new RegionOwner(resolved.Value!.DomainId, borrower.Generation));
+    }
+
+    public KernelResult RevokeBorrow(ProcessHandle owner, BorrowLeaseHandle lease)
+    {
+        var resolved = Processes.Resolve(owner);
+        if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+        return Regions.RevokeLoan(lease, new RegionOwner(resolved.Value!.DomainId, owner.Generation));
+    }
 }
