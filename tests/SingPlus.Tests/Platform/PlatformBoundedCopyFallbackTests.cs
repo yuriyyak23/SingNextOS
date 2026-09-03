@@ -31,7 +31,7 @@ public sealed class PlatformBoundedCopyFallbackTests
     [Fact]
     public void CopyFallbackRequiresExplicitTargetMappingRequest()
     {
-        var scenario = CreateScenario(bufferLength: 64, rejectTargetMapping: false);
+        var scenario = CreateScenario(bufferLength: 128, rejectTargetMapping: false);
 
         var result = scenario.Kernel.MovePlatformOwnedBuffer(
             scenario.Source,
