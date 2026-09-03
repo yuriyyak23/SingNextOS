@@ -61,11 +61,11 @@ jobs:
         with:
           path: SingNextOS
 
-      - name: Checkout pinned HybridCPU exact owned-region mapping
+      - name: Checkout pinned HybridCPU exact mapping acquire runtime
         uses: actions/checkout@v4
         with:
           repository: yuriyyak23/HybridCPU-v2
-          ref: 79131c89d686a03636f17cd27fdecf818b12c8c0
+          ref: 4dce496d072b56efae61dfa9d99058eaa782fea3
           path: HybridCPU-v2
 
       - name: Setup .NET from SingNextOS global.json
@@ -89,4 +89,4 @@ jobs:
         run: dotnet test HybridCPU-v2/HybridCPU_NeutralRuntime.Tests/HybridCPU_NeutralRuntime.Tests.csproj --configuration Release
 
 # The normal local-guarantees job remains independent of HybridCPU source.
-# Phase-4 exact mapping is verified only by the pinned narrow integration job above.
+# Phase-4 two-domain MOVE/acquire is verified only by the pinned narrow integration job above.

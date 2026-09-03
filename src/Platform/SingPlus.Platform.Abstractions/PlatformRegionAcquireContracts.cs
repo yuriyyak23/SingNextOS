@@ -1,29 +1,41 @@
 namespace SingPlus.Platform;
 
-public readonly record struct PlatformRegionVisibilityRequest(
+public enum PlatformMemoryAcquireRequirement
+{
+    AcquisitionFence = 0,
+}
+
+public enum PlatformMemoryAcquireOutcome
+{
+    AcquisitionFenceSatisfied = 0,
+    Unsupported,
+}
+
+public readonly record struct PlatformRegionAcquireRequest(
     PlatformProviderRegionMappingLease Mapping,
     PlatformRegionSlice Slice,
-    PlatformMemoryConsumerClass Consumer,
-    PlatformMemoryVisibilityRequirement Requirement);
+    PlatformMemoryConsumerClass Producer,
+    PlatformMemoryAcquireRequirement Requirement);
 
-public readonly record struct PlatformRegionVisibilityResult(
+public readonly record struct PlatformRegionAcquireResult(
     PlatformProviderRegionMappingId MappingId,
     PlatformProviderLeaseGeneration MappingGeneration,
     PlatformRegionSlice Slice,
-    PlatformMemoryConsumerClass Consumer,
-    PlatformMemoryVisibilityRequirement Requirement,
-    PlatformMemoryVisibilityOutcome Outcome)
+    PlatformMemoryConsumerClass Producer,
+    PlatformMemoryAcquireRequirement Requirement,
+    PlatformMemoryAcquireOutcome Outcome)
 {
     public bool IsSatisfied =>
-        PlatformMemoryVisibilityContract.IsSatisfied(Requirement, Outcome);
+        Requirement == PlatformMemoryAcquireRequirement.AcquisitionFence &&
+        Outcome == PlatformMemoryAcquireOutcome.AcquisitionFenceSatisfied;
 }
 
-public static class PlatformRegionVisibilityContract
+public static class PlatformRegionAcquireContract
 {
     public const uint ContractVersion = 3;
 
     public static PlatformAuthorityResult ValidateRequest(
-        PlatformRegionVisibilityRequest request)
+        PlatformRegionAcquireRequest request)
     {
         var sliceValidation = PlatformOwnedRegionMappingContract.ValidateSlice(request.Slice);
         if (!sliceValidation.IsSuccess) return sliceValidation;
@@ -33,7 +45,7 @@ public static class PlatformRegionVisibilityContract
         {
             return PlatformAuthorityResult.Fail(
                 PlatformAuthorityStatus.Faulted,
-                "Region-visibility requests require a materialized provider mapping identity.");
+                "Region-acquire requests require a materialized provider mapping identity.");
         }
 
         if (request.Mapping.Region != request.Slice.Region ||
@@ -41,29 +53,29 @@ public static class PlatformRegionVisibilityContract
         {
             return PlatformAuthorityResult.Fail(
                 PlatformAuthorityStatus.Faulted,
-                "Region-visibility requests must bind the exact provider mapping to the exact region slice.");
+                "Region-acquire requests must bind the exact provider mapping to the exact region slice.");
         }
 
-        if (!Enum.IsDefined(request.Consumer))
+        if (!Enum.IsDefined(request.Producer))
         {
             return PlatformAuthorityResult.Fail(
                 PlatformAuthorityStatus.Faulted,
-                "The memory consumer class is undefined.");
+                "The memory producer class is undefined.");
         }
 
         if (!Enum.IsDefined(request.Requirement))
         {
             return PlatformAuthorityResult.Fail(
                 PlatformAuthorityStatus.Faulted,
-                "The memory-visibility requirement is undefined.");
+                "The memory-acquire requirement is undefined.");
         }
 
         return PlatformAuthorityResult.Ok();
     }
 
     public static PlatformAuthorityResult ValidateResult(
-        PlatformRegionVisibilityRequest request,
-        PlatformRegionVisibilityResult result)
+        PlatformRegionAcquireRequest request,
+        PlatformRegionAcquireResult result)
     {
         var requestValidation = ValidateRequest(request);
         if (!requestValidation.IsSuccess) return requestValidation;
@@ -72,38 +84,38 @@ public static class PlatformRegionVisibilityContract
         {
             return PlatformAuthorityResult.Fail(
                 PlatformAuthorityStatus.Denied,
-                "Region-visibility evidence belongs to a different provider mapping.");
+                "Region-acquire evidence belongs to a different provider mapping.");
         }
 
         if (result.MappingGeneration != request.Mapping.Generation)
         {
             return PlatformAuthorityResult.Fail(
                 PlatformAuthorityStatus.Stale,
-                "Region-visibility evidence uses a stale provider mapping generation.");
+                "Region-acquire evidence uses a stale provider mapping generation.");
         }
 
         if (result.Slice != request.Slice ||
-            result.Consumer != request.Consumer ||
+            result.Producer != request.Producer ||
             result.Requirement != request.Requirement)
         {
             return PlatformAuthorityResult.Fail(
                 PlatformAuthorityStatus.Faulted,
-                "Region-visibility evidence does not match the exact request.");
+                "Region-acquire evidence does not match the exact request.");
         }
 
         if (!Enum.IsDefined(result.Outcome))
         {
             return PlatformAuthorityResult.Fail(
                 PlatformAuthorityStatus.Faulted,
-                "Region-visibility evidence contains an undefined outcome.");
+                "Region-acquire evidence contains an undefined outcome.");
         }
 
         return PlatformAuthorityResult.Ok();
     }
 }
 
-public interface IPlatformRegionVisibilityProvider
+public interface IPlatformRegionAcquireProvider
 {
-    PlatformAuthorityResult<PlatformRegionVisibilityResult> PrepareRegionMappingForConsumer(
-        PlatformRegionVisibilityRequest request);
+    PlatformAuthorityResult<PlatformRegionAcquireResult> AcquireRegionMappingFromConsumer(
+        PlatformRegionAcquireRequest request);
 }
