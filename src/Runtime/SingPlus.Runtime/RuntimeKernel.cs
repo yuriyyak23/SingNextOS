@@ -134,8 +134,10 @@ public sealed partial class RuntimeKernel
         foreach (var process in Processes.Snapshot())
             process.RemoveCapability(capabilityId);
 
-        var cascade = CascadePlatformCapabilityRevocation(capabilityId);
-        return cascade.IsSuccess ? result : cascade;
+        var deviceCascade = CascadePlatformDeviceCapabilityRevocation(capabilityId);
+        var mappingCascade = CascadePlatformCapabilityRevocation(capabilityId);
+        if (!deviceCascade.IsSuccess) return deviceCascade;
+        return mappingCascade.IsSuccess ? result : mappingCascade;
     }
 
     private KernelResult TransitionProcessExecution(
