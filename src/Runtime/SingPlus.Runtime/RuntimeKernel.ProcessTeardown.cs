@@ -232,7 +232,19 @@ public sealed partial class RuntimeKernel
 
         var deviceProgress = AdvancePlatformDeviceLeasesForProcess(process, record.Handle);
         if (!deviceProgress.IsSuccess)
+        {
+            if (deviceProgress.Error == KernelError.PlatformBindingDraining)
+            {
+                // A submitted DMA operation is an expected external lifetime, not a fault.
+                // Do not advance mapping/domain closure until a later completion slice can
+                // prove the exact operation drained and release its grant pin.
+                record.Phase = ProcessTeardownPhase.PlatformDraining;
+                record.BlockingError = null;
+                return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
+            }
+
             firstBlockingError ??= deviceProgress.Error;
+        }
 
         var borrowGrantProgress = AdvancePlatformBorrowReadGrantsForProcess(record.Handle);
         if (!borrowGrantProgress.IsSuccess)
