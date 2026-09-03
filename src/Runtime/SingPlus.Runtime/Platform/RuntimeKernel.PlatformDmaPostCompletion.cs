@@ -1,4 +1,5 @@
 using SingPlus.Contracts;
+using SingPlus.Platform;
 
 namespace SingPlus.Runtime;
 
