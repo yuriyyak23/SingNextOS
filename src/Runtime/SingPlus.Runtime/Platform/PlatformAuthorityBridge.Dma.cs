@@ -138,6 +138,20 @@ public sealed partial class PlatformAuthorityBridge
         var validation = ValidateDmaGrantIdentity(grant, expectedSubject);
         if (!validation.IsSuccess) return validation;
 
+        if (HasFaultPinnedDmaSubmission(grant.GrantId))
+        {
+            return KernelResult.Fail(
+                KernelError.PlatformFaulted,
+                "The DMA grant cannot close because submission state is fault-pinned and an external effect may still exist.");
+        }
+
+        if (HasActiveDmaSubmission(grant.GrantId))
+        {
+            return KernelResult.Fail(
+                KernelError.PlatformBindingDraining,
+                "The DMA grant cannot close while its submitted operation is pending exact completion.");
+        }
+
         var record = _dmaGrants[grant.GrantId];
         if (record.PlatformClosed)
         {
