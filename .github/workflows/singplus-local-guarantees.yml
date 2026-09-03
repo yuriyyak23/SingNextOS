@@ -61,11 +61,11 @@ jobs:
         with:
           path: SingNextOS
 
-      - name: Checkout pinned HybridCPU neutral IRQ event runtime
+      - name: Checkout pinned HybridCPU neutral DMA grant runtime
         uses: actions/checkout@v4
         with:
           repository: yuriyyak23/HybridCPU-v2
-          ref: cb42afbee49bb632467d9f3c13dc7eb9f96524eb
+          ref: 4feb0d9cd96e9ba9fb4b83103001ae0c5cfa603c
           path: HybridCPU-v2
 
       - name: Setup .NET from SingNextOS global.json
@@ -89,4 +89,4 @@ jobs:
         run: dotnet test HybridCPU-v2/HybridCPU_NeutralRuntime.Tests/HybridCPU_NeutralRuntime.Tests.csproj --configuration Release
 
 # The normal local-guarantees job remains independent of HybridCPU source.
-# Phase-5 IRQ/event authority is verified only by the pinned narrow integration job above.
+# Phase-5 DMA grant admission is verified only by the pinned narrow integration job above.
