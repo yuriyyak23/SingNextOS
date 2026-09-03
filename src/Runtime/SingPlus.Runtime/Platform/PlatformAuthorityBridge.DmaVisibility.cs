@@ -45,6 +45,7 @@ public sealed partial class PlatformAuthorityBridge
         public PlatformDmaVisibilityCycle LocalCycle { get; set; } = localCycle;
         public PlatformProviderDmaVisibilityCycle ProviderCycle { get; set; } = providerCycle;
         public bool Acquired { get; set; }
+        public bool Consumed { get; set; }
     }
 
     private readonly Dictionary<PlatformDmaGrantId, DmaVisibilityState> _dmaVisibilityStates = [];
@@ -73,7 +74,7 @@ public sealed partial class PlatformAuthorityBridge
         {
             return KernelResult<PlatformDmaPrepareEvidence>.Fail(
                 KernelError.PlatformBindingDraining,
-                "DMA visibility cannot be re-prepared while the exact submitted operation is pending completion.");
+                "DMA visibility cannot be re-prepared while the exact submitted operation is still in its post-submit lifecycle.");
         }
 
         if (!_featureManifest.Supports(
@@ -157,7 +158,7 @@ public sealed partial class PlatformAuthorityBridge
         {
             return KernelResult<PlatformDmaAcquireEvidence>.Fail(
                 KernelError.PlatformBindingDraining,
-                "CPU acquire is forbidden until completion is proven for the exact submitted operation.");
+                "The legacy acquire path cannot consume a submitted cycle; exact post-completion visibility must finish first.");
         }
 
         if (!_dmaVisibilityStates.TryGetValue(grant.GrantId, out var state) ||
@@ -166,6 +167,13 @@ public sealed partial class PlatformAuthorityBridge
             return KernelResult<PlatformDmaAcquireEvidence>.Fail(
                 KernelError.PlatformDenied,
                 "The exact DMA grant has no prepared visibility cycle to acquire.");
+        }
+
+        if (state.Consumed)
+        {
+            return KernelResult<PlatformDmaAcquireEvidence>.Fail(
+                KernelError.PlatformDenied,
+                "The current DMA visibility cycle has already been consumed and cannot satisfy another phase.");
         }
 
         if (state.Acquired)
@@ -204,6 +212,7 @@ public sealed partial class PlatformAuthorityBridge
         }
 
         state.Acquired = true;
+        state.Consumed = true;
         return KernelResult<PlatformDmaAcquireEvidence>.Ok(
             new PlatformDmaAcquireEvidence(
                 grant.GrantId,
@@ -222,7 +231,8 @@ public sealed partial class PlatformAuthorityBridge
         !HasActiveDmaSubmission(grant.GrantId) &&
         _dmaVisibilityStates.TryGetValue(grant.GrantId, out var state) &&
         state.LocalCycle.Value != 0 &&
-        !state.Acquired;
+        !state.Acquired &&
+        !state.Consumed;
 
     private ulong NextLocalDmaVisibilityCycle()
     {

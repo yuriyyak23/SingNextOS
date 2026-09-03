@@ -2,7 +2,7 @@
 
 ## Status
 
-**In progress — seven vertical slices implemented.**
+**Complete — eight vertical slices implemented.**
 
 Implemented slices:
 
@@ -12,11 +12,12 @@ Implemented slices:
 4. exact admission-only DMA grant authority composed from a live device lease plus an exact mapped owned-region slice, bounded relative range, and direction;
 5. exact grant-scoped non-coherent DMA visibility cycles with release/publication prepare evidence and direction-aware post-write CPU acquire evidence;
 6. bounded DMA submit admission tied to the exact current prepared-and-unacquired visibility cycle, with a separate Sing-local pending operation identity and fail-closed teardown pinning;
-7. exact one-shot DMA completion proof tied to the exact pending local/provider operation, exact grant generation, and exact prepared visibility cycle, with stale/forged/replayed/wrong-generation/wrong-cycle evidence rejected fail closed.
+7. exact one-shot DMA completion proof tied to the exact pending local/provider operation, exact grant generation, and exact prepared visibility cycle, with stale/forged/replayed/wrong-generation/wrong-cycle evidence rejected fail closed;
+8. direction-aware post-completion visibility plus controlled DMA/mapping/device/domain release through verified mapping closure to `RegionAuthority` CPU transfer/reclaim.
 
-Slice 7 closes exact DMA **completion proof** without performing post-completion CPU acquire/maintenance or releasing DMA/mapping/device authority. Post-completion acquire for device-written memory, drain/revoke ordering after acquire, and final CPU reuse/reclaim remain Phase-5 work. The phase acceptance boundary is therefore **not** complete.
+Slice 8 closes the Phase-5 correctness acceptance boundary. A faithful SingNextOS provider path now proves the full bounded non-coherent DMA ordering from exact owned memory through prepare, submit, completion, required post-write acquire, explicit lower-authority closure, and CPU reuse/reclaim, including denial/stale/revoke/completion-fault handling.
 
-The real cross-repository integration gate remains pinned read-only to HybridCPU neutral DMA-visibility commit `4960e7be34f485cf3c8261801daecdefe6172701`, based on HybridCPU `master` `1c0adf62fb01bc0963caa2dacc5f0933a8bce8cc`. HybridCPU remains v2 / visibility-only; Slices 6 and 7 use faithful SingNextOS provider models for bounded submit and completion proof and do not modify external repositories.
+The real cross-repository integration gate remains pinned read-only to HybridCPU neutral DMA-visibility commit `4960e7be34f485cf3c8261801daecdefe6172701`, based on HybridCPU `master` `1c0adf62fb01bc0963caa2dacc5f0933a8bce8cc`. HybridCPU remains v2 / visibility-only. Slices 6–8 use faithful SingNextOS provider models for submit, completion and lifecycle acceptance and do not modify external repositories. Phase-5 completion therefore does **not** claim real HybridCPU executable DMA enablement.
 
 ## Goal
 
@@ -617,9 +618,115 @@ Slice-7 tests prove:
 - public completion evidence contains no provider/neutral token, raw address, IOMMU/PTE, descriptor/queue, interrupt-controller, VM/lane/opcode identity;
 - unchanged pinned HybridCPU visibility integration remains green.
 
-## DMA — remaining Phase-5 work
+## Slice 8 — post-completion visibility and controlled release to CPU reclaim
 
-Slices 4–7 now establish exact DMA authority, explicit non-coherent publication, bounded submit acceptance, and exact completion proof. The remaining state machine is:
+Slice 8 closes the remaining post-submit lifecycle without introducing coherent-DMA assumptions or evidence-as-authority shortcuts.
+
+### Direction-aware post-completion visibility
+
+The exact completed operation must advance through its exact consumed prepared cycle:
+
+```text
+exact tracked PlatformDmaSubmission
++ exact satisfied PlatformDmaCompletionEvidence
++ completion-proven bridge state
++ exact consumed PlatformDmaVisibilityCycle
+-> DeviceReadsMemory:
+     post-completion visibility = NotRequired
+-> DeviceWritesMemory | Bidirectional:
+     exact provider acquire for the stored provider cycle
+     -> AcquisitionFenceSatisfied
+-> PlatformDmaPostCompletionVisibilityEvidence
+```
+
+For device-read-only DMA, the device cannot have modified memory, so no CPU acquire is issued. For write-capable DMA, a **fresh acquire after exact completion** is mandatory. An acquire performed before submit belongs to a consumed earlier cycle and cannot satisfy the post-completion requirement.
+
+Successful submit permanently marks its exact prepared cycle consumed. Removing the submitted-operation pin after completion therefore cannot make that old cycle eligible for replay submission.
+
+### Evidence is not release authority
+
+`PlatformDmaPostCompletionVisibilityEvidence` contains only local operation/grant/cycle identities, direction, and semantic visibility requirement/outcome. It carries no provider token, raw address, IOMMU/PTE, descriptor/queue, interrupt-controller, VM/lane/opcode or backend execution identity.
+
+Completion and post-completion visibility evidence do **not** themselves release memory ownership. They only permit the existing explicit authority closure sequence to continue.
+
+### Controlled release ordering
+
+The completed operation remains a lower-authority pin until required post-completion visibility succeeds. The release path is:
+
+```text
+exact completion proven
+-> required post-completion visibility satisfied
+-> submitted-operation lifetime retired
+-> exact DMA grant revoke
+-> completion-backed exact region-mapping revoke reaches Closed
+-> local platform-mapping reservation released
+-> device/domain closure as applicable
+-> RegionAuthority transfer/reclaim allowed
+```
+
+The provider mapping close remains completion-backed. A legacy synchronous provider revoke is not sufficient to release `PlatformMappingReserved`; verified `Closed` evidence is required before local reservation release.
+
+`RegionAuthority` remains the only component that changes CPU ownership/generation or final process reclaim state.
+
+### Revocation and process teardown
+
+Local capability revoke continues to stop new effects immediately. Exact completion observation and post-completion visibility remain available for the already-authorized operation after local revoke or while the process is `Exiting` so that external authority can drain safely.
+
+Process teardown remains `PlatformDraining` before exact completion/post-visibility. Once those phases complete, existing teardown ordering closes DMA grants, devices and completion-backed mappings, closes the domain, releases the mapping reservation, and only then calls local region reclaim. Any DMA completion or post-completion visibility fault leaves teardown `PlatformFaulted` and lower authority pinned.
+
+### Fail-closed validation
+
+Slice 8 rejects or pins:
+
+- fabricated completion evidence presented before bridge completion is proven;
+- stale local operation generation;
+- stale local grant generation;
+- wrong local prepared visibility cycle;
+- replayed consumed prepared cycles;
+- pre-submit acquire used as a substitute for post-completion acquire;
+- malformed provider post-completion acquire grant/cycle/direction evidence;
+- provider stale/revoked/wrong-domain/faulted acquire lifetime;
+- mapping reclaim before completion-backed mapping closure reaches `Closed`.
+
+### Feature discovery after Slice 8
+
+The faithful SingNextOS lifecycle model advertises:
+
+```text
+PlatformFeatureFamily.DmaMapping
+  -> PlatformDmaLifecycleContract v5 / RuntimeAdmission
+```
+
+The real pinned HybridCPU provider remains:
+
+```text
+PlatformFeatureFamily.DmaMapping
+  -> DMA grant + visibility v2 / RuntimeAdmission
+```
+
+Phase-5 correctness acceptance is therefore satisfied by the faithful v5 model while real HybridCPU executable-DMA enablement remains separate future provider/backend work.
+
+### Slice-8 focused and acceptance tests
+
+Slice-8 tests prove:
+
+- device-write DMA cannot revoke its grant after completion until fresh post-completion acquire succeeds;
+- device-read-only DMA performs no acquire but still consumes the submitted cycle before release;
+- stale operation/grant generation and wrong-cycle completion evidence fail before provider acquire;
+- fabricated completion evidence cannot advance post-completion visibility before exact bridge completion;
+- pre-submit acquire cannot satisfy a later submitted cycle's post-completion acquire;
+- malformed provider acquire evidence fault-pins DMA grant, mapping/device closure and CPU transfer;
+- local capability revoke blocks new effects while exact completion/post-visibility drain remains possible;
+- completion-backed mapping closure is required before `RegionAuthority` releases the platform mapping reservation;
+- explicit successful ordering reaches DMA grant closure, mapping/device/domain closure and CPU `TransferRegion` with a fresh region generation;
+- process termination remains draining until completion/post-visibility, then reaches platform closure and local region `Released` reclaim;
+- completion-provider fault injection leaves the process `PlatformFaulted`, lower provider authority unclosed and the region still `Owned`;
+- public lifecycle evidence contains no provider/neutral or hardware/backend identity;
+- unchanged pinned HybridCPU v2 visibility integration remains green.
+
+## DMA — Phase-5 acceptance result
+
+The bounded DMA state machine is now proven end to end by a faithful provider model:
 
 ```text
 CPU-Owned exact region/mapping
@@ -628,24 +735,17 @@ CPU-Owned exact region/mapping
 -> Submit bounded transfer using that exact prepared cycle
 -> exact completion proven for that exact operation/cycle
 -> Acquire / maintenance when device may have written memory
--> revoke DMA grant
--> revoke region mapping / device as applicable
--> CPU ownership / reclaim allowed
+-> revoke exact DMA grant
+-> verified completion-backed region-mapping closure
+-> device/domain closure as applicable
+-> CPU ownership transfer / process reclaim allowed by RegionAuthority
 ```
 
-No coherent-DMA premise is allowed. Grant existence, prepare evidence, submit acceptance, or completion proof alone must never authorize CPU reuse.
-
-Required remaining negative/acceptance tests include:
-
-- submission evidence cannot itself satisfy completion or post-completion acquire;
-- pre-submit acquire cannot satisfy the required post-completion acquire;
-- device-written memory cannot return to CPU use before exact completion plus required post-write acquire/maintenance;
-- process termination remains pinned until required acquire/maintenance and grant/mapping/device closure after completion;
-- one faithful bounded DMA path reaches post-write acquire when required, DMA/mapping/device closure, and CPU reuse/reclaim after exact completion.
+No coherent-DMA premise is used. Grant existence, prepare evidence, submit acceptance or completion proof alone never authorizes CPU reuse.
 
 ## Acceptance criteria
 
-Phase 5 is complete only when one real or faithful provider path performs a bounded DMA transfer over an owned region and proves the full ordering:
+Phase 5 required one real or faithful provider path to perform a bounded DMA lifecycle over an owned region and prove:
 
 ```text
 owned exact region
@@ -658,13 +758,13 @@ owned exact region
 -> CPU reuse/reclaim
 ```
 
-**That acceptance criterion is not yet met. Phase 5 remains In progress.**
+**This acceptance criterion is met by the faithful SingNextOS v5 provider path. Phase 5 is Complete.**
+
+Real HybridCPU executable-DMA implementation is intentionally not implied by this status and remains future provider/backend integration work.
 
 ## Remaining Phase-5 work
 
-- direction-aware post-completion acquire/maintenance tied to the exact completion-proven operation/cycle;
-- drain/revoke continuation through DMA grant, mapping, device and process teardown after required acquire;
-- one faithful end-to-end bounded DMA acceptance path with denial/stale/revoke/completion-fault injection through CPU reuse/reclaim.
+None for the Phase-5 correctness acceptance boundary.
 
 ## Do not do
 
