@@ -33,7 +33,7 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
         _runtime = runtime;
         Descriptor = new PlatformProviderDescriptor(
             new PlatformProviderId("hybridcpu-neutral"),
-            4,
+            5,
             PlatformAuthorityFeatures.NeutralDomainBinding |
             PlatformAuthorityFeatures.DirectOwnedRegionMapping);
         _featureManifest = new PlatformFeatureManifest(
@@ -49,7 +49,7 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                     PlatformFeatureAvailability.Executable),
                 new PlatformFeatureDescriptor(
                     PlatformFeatureFamily.ExplicitMemoryVisibility,
-                    PlatformRegionVisibilityContract.ContractVersion,
+                    PlatformRegionAcquireContract.ContractVersion,
                     PlatformFeatureAvailability.Executable),
             });
     }
