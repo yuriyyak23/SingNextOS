@@ -321,7 +321,12 @@ public sealed partial class RuntimeKernel
             targetProcess.DomainId,
             target.Generation,
             requiredRights);
-        if (!capability.IsSuccess) return capability;
+        if (!capability.IsSuccess)
+        {
+            return KernelResult.Fail(
+                capability.Error,
+                capability.Message ?? "The target mapping capability is invalid.");
+        }
 
         var descriptor = capability.Value!;
         if (descriptor.ResourceKind != ResourceKind.MemoryRegion ||
