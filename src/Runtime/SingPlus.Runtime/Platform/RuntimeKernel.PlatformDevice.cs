@@ -99,6 +99,9 @@ public sealed partial class RuntimeKernel
         if (!resolved.IsSuccess)
             return KernelResult.Fail(resolved.Error, resolved.Message!);
 
+        var mmio = AdvancePlatformMmioLeasesForDevice(lease);
+        if (!mmio.IsSuccess) return mmio;
+
         var identity = new PlatformDomainIdentity(
             resolved.Value!.DomainId,
             subject.Generation);
@@ -113,6 +116,13 @@ public sealed partial class RuntimeKernel
         KernelResult? firstFailure = null;
         foreach (var lease in PlatformAuthority.BeginDeviceCapabilityRevocation(capabilityId))
         {
+            var mmio = AdvancePlatformMmioLeasesForDevice(lease);
+            if (!mmio.IsSuccess)
+            {
+                firstFailure ??= mmio;
+                continue;
+            }
+
             var revoke = PlatformAuthority.RevokeDevice(
                 lease,
                 lease.DomainBinding.Subject);
@@ -132,6 +142,9 @@ public sealed partial class RuntimeKernel
         SingProcess process,
         ProcessHandle handle)
     {
+        var mmio = AdvancePlatformMmioLeasesForProcess(process, handle);
+        if (!mmio.IsSuccess) return mmio;
+
         if (!_processPlatformDeviceLeases.TryGetValue(handle, out var leases) || leases.Count == 0)
             return KernelResult.Ok();
 
