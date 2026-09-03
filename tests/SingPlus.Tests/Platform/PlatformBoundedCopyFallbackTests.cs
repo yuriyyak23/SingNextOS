@@ -76,10 +76,10 @@ public sealed class PlatformBoundedCopyFallbackTests
         Assert.Equal(KernelError.PlatformUnsupported, result.Value.TargetExposureError);
 
         var copy = Assert.NotNull(result.Value.BoundedCopy);
-        Assert.True(copy.Value.IsExactAndBounded);
-        Assert.Equal(result.Value.Buffer.Handle, copy.Value.Region);
-        Assert.Equal(256, copy.Value.ByteLength);
-        Assert.Equal(256, copy.Value.MaxBytes);
+        Assert.True(copy.IsExactAndBounded);
+        Assert.Equal(result.Value.Buffer.Handle, copy.Region);
+        Assert.Equal(256, copy.ByteLength);
+        Assert.Equal(256, copy.MaxBytes);
         Assert.Equal(expected, result.Value.Buffer.Span.ToArray());
         Assert.NotSame(sourceStorage, StorageIdentity(result.Value.Buffer));
 
