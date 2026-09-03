@@ -2,23 +2,24 @@
 
 ## Status
 
-**In progress — three real vertical slices implemented.**
+**Complete — four vertical slices implemented.**
 
-The phase now has:
+Phase 4 now has:
 
 1. exact non-coherent owned-region mapping, publication evidence and completion-backed revoke;
 2. a two-domain `OwnedBuffer<T>` MOVE handoff with post-close acquire for writable external mappings;
-3. a CPU `BorrowLease<T>` -> bounded external shared-read grant lifecycle with verified closure before borrow completion or process reclaim.
+3. a CPU `BorrowLease<T>` -> bounded external shared-read grant lifecycle with verified closure before borrow completion or process reclaim;
+4. an explicit true bounded-copy fallback when a requested target exact mapping cannot be materialized.
 
-The cross-repository integration gate remains pinned to HybridCPU neutral acquire commit `4dce496d072b56efae61dfa9d99058eaa782fea3`, stacked on the exact mapping owner from PR #7. The borrow/shared-read slice needs no new HybridCPU export: it reuses the existing exact read-only mapping, `PublicationFence`, revoke and completion primitives through the current Sing provider.
+The cross-repository integration gate remains pinned to HybridCPU neutral acquire commit `4dce496d072b56efae61dfa9d99058eaa782fea3`. The final bounded-copy slice requires no HybridCPU-v2 export or source change: it is a Sing runtime fallback after the external direct-mapping attempt fails.
 
-Phase 4 is **not** complete. A true bounded-copy fallback remains separate work. DMA/IOMMU remain out of scope.
+DMA/IOMMU remain outside Phase 4 and outside this iteration.
 
 ## Goal
 
 Preserve SingNextOS ownership semantics while making owned memory safely visible across HybridCPU execution domains without assuming universal coherence or physical zero-copy.
 
-The semantic contract remains:
+The semantic contract is:
 
 ```text
 small values          -> copy
@@ -26,13 +27,14 @@ large mutable payload -> MOVE exclusive authority
 temporary access      -> revocable borrow/shared grant
 external access       -> exact bounded mapping/grant
 completion            -> close/acquire/return authority
+direct-map failure    -> explicit bounded-copy fallback or local-only fallback
 ```
 
 `MOVE` is an authority transfer. It does **not** promise atomic page-table remap, same physical backing, or physical zero-copy.
 
 ## Slice 1 — exact non-coherent mapping
 
-Implemented before the later handoff slices:
+Implemented guarantees:
 
 - exact `PlatformRegionSlice` with region generation, owner, byte length, offset, length and access;
 - local capability/owner/generation/bounds checks before provider admission;
@@ -44,8 +46,6 @@ Implemented before the later handoff slices:
 The whole Sing region remains conservatively reserved while one ordinary exact external slice mapping exists, so MOVE, borrow and release are blocked until closure.
 
 ## Slice 2 — two-domain MOVE handoff
-
-### Handoff order
 
 `RuntimeKernel.MovePlatformOwnedBuffer<T>(...)` composes existing primitives rather than creating a second ownership state machine:
 
@@ -70,42 +70,13 @@ validate source + target process generations
 
 No local owner/generation mutation occurs while the source mapping is `Active`, `Draining`, `Faulted`, missing publication proof, or missing required acquire proof.
 
-### Publication and acquire are different evidence classes
+Writable external mappings require mapping-bound post-close acquire evidence. Read-only source mappings have no external writer and therefore need exact `Closed` plus source publication but no acquire fence. Evidence remains evidence; `RegionAuthority` remains ownership authority.
 
-Producer publication remains the existing mapping visibility surface. Writable external mappings additionally require a separate mapping-bound post-close acquire contract:
-
-```text
-PlatformMemoryAcquireRequirement.AcquisitionFence
-PlatformMemoryAcquireOutcome.AcquisitionFenceSatisfied
-PlatformRegionAcquireRequest / Result
-IPlatformRegionAcquireProvider
-```
-
-Acquire evidence is valid only for the exact provider mapping ID/generation, exact Sing region slice and exact producer class. It is evidence, not authority.
-
-The narrow `HybridCPU_NeutralRuntime` dependency provides the matching post-close acquire operation. Acquire before close is rejected; stale mapping epochs and revoked domains cannot manufacture acquire evidence. Duplicate acquire is idempotent evidence and does not create ownership authority.
-
-Read-only source mappings have no external writer and therefore need exact `Closed` plus source publication but no acquire fence. Writable mappings fail closed if acquire is unsupported, stale, wrong-domain, malformed or faulted.
-
-### Optional target exposure and fallback
-
-A MOVE may optionally request an exact target mapping for the **new** region generation. Target binding/capability rights are checked before source drain begins; materialization occurs only after `RegionAuthority.Transfer()` commits the new owner/generation.
-
-If target mapping/publication cannot be materialized after the local transfer, the result is:
-
-```text
-PlatformMoveTargetExposureState.LocalOwnershipFallback
-```
-
-This means the target owns the region locally. It is not a claim that the bytes were copied and not a physical zero-copy guarantee. A true bounded-copy fallback remains separate work.
+A target mapping request is prevalidated before source drain, but actual materialization occurs only after `RegionAuthority.Transfer()` commits the new owner and generation.
 
 ## Slice 3 — CPU borrow + external shared-read grant
 
-### 1. Separate lifetime and identity spaces
-
-`BorrowLease<T>` remains the CPU-local read-only lifetime object. It is never passed to the provider and never becomes a provider mapping token.
-
-The bridge derives a separate grant identity:
+`BorrowLease<T>` remains the CPU-local read-only lifetime object and never becomes a provider token. The bridge derives a separate grant identity:
 
 ```text
 BorrowLeaseHandle / BorrowLeaseGeneration
@@ -115,150 +86,113 @@ BorrowLeaseHandle / BorrowLeaseGeneration
   != NeutralOwnedRegionMappingHandle / epoch
 ```
 
-The grant surface carries only Sing/bridge-local identities, the exact platform domain binding, the CPU borrow identity and exact byte range. Provider mapping leases, provider operations and HybridCPU mapping handles remain bridge/provider-private evidence.
-
-### 2. Owner-bound external execution domain
-
-The real HybridCPU provider already enforces an important neutral invariant:
+The real HybridCPU provider requires:
 
 ```text
 PlatformRegionSlice.Region.Owner
   == PlatformProviderDomainLease.Subject
 ```
 
-Therefore the minimal reusable shared-read slice binds the external execution domain to the **exact Sing region owner**, not to the CPU borrower. No cross-owner provider grant/export is introduced.
+Therefore the external shared-read grant is bound to the exact owner platform domain while the CPU borrower remains a separate local read-only lifetime.
 
-This yields three deliberately distinct roles:
+Grant admission requires exact owner/borrower process generations, exact borrow and region generations, the exact live `BorrowLeaseLifetime`, exact owner-bound platform binding generation, exact bounded range and `Read` only access.
 
-```text
-Sing owner
-  -> remains RegionAuthority owner, but mutable CPU access is suppressed by BorrowLease lifetime
-CPU borrower
-  -> local read-only BorrowLease<T>
-owner-bound external execution domain
-  -> separate exact bounded read-only grant
-```
-
-The CPU borrower and external reader may coexist only as readers. The platform binding is revalidated against the exact owner `DomainId + process generation` and binding generation.
-
-### 3. Admission contract
-
-A grant can be created only from an exact live CPU borrow:
+Completion remains:
 
 ```text
-exact owner process generation
-  + exact borrower process generation
-  + exact BorrowLeaseHandle / BorrowLeaseGeneration
-  + exact RegionHandle / RegionGeneration
-  + exact RegionOwner
-  + exact live BorrowLeaseLifetime object
-  + exact owner-bound PlatformDomainBinding / generation
-  + exact bounded byte range
-  -> hidden provider mapping with Read access only
-  -> separate PlatformBorrowReadGrant identity
+external read grant Active
+  -> request completion
+  -> Draining / no new external effects
+  -> exact Closed completion
+  -> exact local borrow + region + owner + binding + hidden mapping revalidation
+  -> reclaim bridge-private grant metadata
+  -> only then ReturnLoan / RevokeLoan
 ```
 
-Local stale/wrong-owner/wrong-domain/range failures happen before provider admission. Provider denied/revoked/faulted/malformed mapping results fail closed and roll back the local grant reservation.
+`Faulted` is not closure. Existing process teardown closes/drains these grants before borrower loan return or owner region reclaim.
 
-The provider mapping is always `PlatformMemoryAccess.Read`. There is no grant API accepting `Write`; the grant carries no MOVE/release authority. A normal owned-region writable mapping cannot be admitted while the region is in `Loaned` state.
+## Slice 4 — true bounded-copy MOVE fallback
 
-### 4. Publication before external use
+### 1. Explicit opt-in and exact bound
 
-External reader admission requires mapping-bound visibility evidence:
+The fallback is requested with a separate policy:
 
 ```text
-PlatformMemoryConsumerClass.ExternalExecutionDomain
-  + PlatformMemoryVisibilityRequirement.PublicationFence
-  -> PublicationFenceSatisfied
+PlatformBoundedCopyFallbackPolicy(MaxBytes)
 ```
 
-`PlatformBorrowReadGrantEvidence` exposes the local grant plus semantic visibility outcome only. It contains no provider mapping ID, provider operation ID, HybridCPU token or hardware-shaped authority identity.
+It is legal only together with an explicit target mapping request. The full authoritative moved region byte length, not merely the requested target slice length, must fit inside `MaxBytes`.
 
-Denied, revoked, faulted or malformed publication evidence fails closed. Once revoke begins, the hidden mapping is `Draining`; existing mapping validation rejects new visibility/effects before another provider call.
+The bound is validated before source publication/revoke begins. A too-small or malformed bound therefore cannot consume source authority or start external drain.
 
-### 5. Completion / revoke ordering
+### 2. Trigger boundary
 
-Normal borrow completion is explicit and fail-closed:
+The true copy path is used only when the post-transfer **target exact mapping cannot be materialized**.
+
+It is not used when a target mapping was successfully created and later publication fails. Once a target mapping identity exists, its own revoke/closure lifecycle must remain authoritative; bounded copy must never rematerialize backing underneath a live or potentially live external mapping.
+
+Without an explicit copy policy, the existing result remains:
 
 ```text
-local owner + CPU BorrowLease live
-  -> external read grant Active
-  -> RequestPlatformBorrowCompletion
-  -> hidden exact mapping Draining
-  -> no new external effects
-  -> exact completion observation
-  -> Closed required
-  -> exact local revalidation
-       BorrowLease identity + generation + exact lifetime object
-       RegionHandle + RegionGeneration
-       owner DomainId + owner process generation
-       borrower DomainId + borrower process generation
-       external grant id + generation + exact range
-       owner-bound platform binding id + generation + subject
-       hidden mapping id + generation + exact read-only slice
-  -> release external-borrow reservation
-  -> reclaim bridge-private exact mapping/grant metadata
-  -> only now RegionAuthority.ReturnLoan()
-       invalidate BorrowLeaseLifetime
-       region Loaned -> Owned
+PlatformMoveTargetExposureState.LocalOwnershipFallback
 ```
 
-A non-terminal completion leaves the grant `Draining` and the CPU borrow live. Stale/wrong-domain/wrong-operation/malformed closure evidence cannot release the reservation. `Faulted` is never closure and never permits borrow completion or grant reclaim.
-
-### 6. RegionAuthority interlock
-
-`RegionAuthority` remains the sole Sing ownership authority and owns the local interlock for this relationship. While the external read grant is active or draining:
-
-- `ReturnLoan` is blocked;
-- owner `RevokeLoan` is blocked;
-- ownership transfer/release cannot become legal through early borrow completion;
-- a second grant cannot reuse the same borrow lifetime;
-- normal platform mapping reservation cannot reuse the borrowed region;
-- aggregate domain loan/region reclaim refuses to bypass the grant.
-
-The bridge can release the reservation only after verified `Closed` plus exact local borrow/region/owner/binding/mapping revalidation. Completion and visibility evidence never become ownership authority.
-
-### 7. Existing process teardown owns closure too
-
-The grant is registered with the existing process teardown orchestrator so a new authority class cannot bypass Phase-2 closure rules.
-
-For borrower exit:
+With a valid policy and a failed target mapping admission/materialization, the result is:
 
 ```text
-Exiting
-  -> close/drain external read grant using owner-bound platform identity
-  -> Closed + exact revalidation
-  -> reclaim grant metadata
-  -> ReturnLoan
-  -> borrower local reclaim
+PlatformMoveTargetExposureState.BoundedCopyFallback
 ```
 
-For owner exit:
+The original target mapping error is retained as `TargetExposureError`; no target external mapping or publication evidence is claimed.
+
+### 3. Ordering and authority
+
+The bounded-copy path runs only after the normal source handoff has completed:
 
 ```text
-Exiting
-  -> close/drain external read grant
-  -> Closed + exact revalidation
-  -> reclaim grant metadata
-  -> RevokeLoan
-  -> revoke owner platform domain
-  -> owner region reclaim
+source PublicationFence
+  -> source drain / Closed
+  -> source AcquisitionFence when writable
+  -> release source mapping reservation
+  -> RegionAuthority.Transfer()
+       owner := target
+       region generation++ exactly once
+  -> target exact mapping attempt
+  -> mapping unavailable
+  -> exact target RegionAuthority owner/generation revalidation
+  -> prove no target platform mapping is active
+  -> kernel-private exact-size staging region
+       target backing -> staging
+       staging -> fresh target backing
+  -> RegionAuthority payload replacement for the same target RegionHandle
+  -> invalidate old moved backing
+  -> clear/reclaim staging region
+  -> return only the fresh target-owned buffer
 ```
 
-If closure is still non-terminal, process teardown remains `PlatformDraining`. If grant closure faults, process teardown becomes fault-contained and local reclaim remains forbidden.
+The copy is therefore a physical/backing rematerialization **after** authority already belongs exclusively to the target. It never creates a second Sing owner and never rolls ownership back to the source.
 
-### 8. No new HybridCPU capability required
+The staging region is kernel-private data storage only. It has no `RegionHandle`, provider lease, HybridCPU token or independent Sing authority. This is deliberate: `RegionAuthority` remains the only source of Sing ownership authority for the transferred region.
 
-The existing neutral runtime already has the minimal primitives needed for this read-only slice:
+### 4. Whole-buffer copy, not mapped-slice copy
 
-- exact bounded read mapping;
-- explicit non-coherent `PublicationFence`;
-- exact mapping close;
-- completion-backed `Closed` evidence through the Sing provider bridge.
+MOVE transfers the whole `OwnedBuffer<T>` authority. Therefore bounded-copy rematerialization copies the full authoritative region byte length even if the failed target mapping request covered only one exact slice.
 
-Because the external grant is read-only, there is no external producer and no post-close `AcquisitionFence` requirement for this lifecycle. The existing acquire primitive remains required for writable MOVE, not for shared-read grant closure.
+`PlatformBoundedCopyEvidence` records only:
 
-No HybridCPU-v2 source change is required. The existing pinned cross-repository workflow adds a real provider/runtime integration test for the new borrow/read-grant path.
+```text
+RegionHandle
+ByteLength
+MaxBytes
+```
+
+It is evidence that an exact bounded copy occurred; it is not ownership or mapping authority.
+
+### 5. No new HybridCPU capability
+
+No new HybridCPU-v2 primitive is required. The fallback specifically covers the case where direct target mapping is unavailable and performs the rematerialization entirely inside Sing after the existing source mapping lifecycle has been safely closed.
+
+The existing pinned HybridCPU gate remains unchanged and continues to prove the direct mapping/publication/revoke/acquire paths used before fallback selection.
 
 ## Identity and authority invariants
 
@@ -279,76 +213,51 @@ NeutralDomainBindingHandle / epoch
 NeutralOwnedRegionMappingHandle / epoch
 ```
 
-None are interchangeable.
+`PlatformBoundedCopyFallbackPolicy` and `PlatformBoundedCopyEvidence` introduce no new authority identity namespace.
 
-`PlatformRegionVisibilityEvidence`, `PlatformRegionAcquireEvidence`, `PlatformBorrowReadGrantEvidence`, completion receipts and feature discovery are evidence only. `RegionAuthority` remains the sole Sing ownership authority.
+None of the authority identities above are interchangeable. Visibility/acquire/copy evidence, completion receipts and feature discovery remain evidence only. `RegionAuthority` remains the sole Sing ownership authority.
 
 Compatibility projections remain downstream. No provider/HybridCPU mapping ID or hardware-shaped identity is introduced into the SIP/kernel ownership authority ABI.
 
 ## Negative guarantees
 
-### MOVE slice
+Tests across the four slices prove:
 
-Tests continue to prove:
-
-- target capability/binding denial happens before source revoke;
-- source publication failure happens before source revoke;
+- source publication failure happens before revoke or ownership mutation;
 - `Draining` keeps owner/generation/reservation unchanged;
-- stale acquire evidence cannot release reservation;
-- unsupported acquire on writable mapping cannot MOVE;
-- read-only external mapping does not require acquire;
-- successful writable path orders publication -> close -> `Closed` -> acquire -> generation-changing transfer;
-- old source `RegionHandle` is stale after MOVE;
-- target mapping is bound to the new region generation;
-- unsupported target mapping yields local-ownership fallback without rollback or zero-copy claim;
-- real neutral HybridCPU acquire requires exact close and rejects stale generations.
+- stale/faulted acquire or completion evidence cannot transfer/reclaim authority;
+- `Faulted` never counts as closure;
+- successful writable MOVE orders publication -> close -> acquire -> generation-changing transfer;
+- target capability/binding failure is rejected before source drain;
+- unsupported target direct mapping without copy policy remains local-only fallback and makes no zero-copy claim;
+- bounded-copy limits are checked before source drain;
+- bounded-copy policy cannot exist without an explicit target mapping request;
+- bounded-copy fallback changes backing identity while preserving all bytes in the whole owned buffer;
+- bounded-copy fallback changes `RegionGeneration` only through the single MOVE transfer;
+- source and intermediate moved backing are invalid after successful rematerialization;
+- target mapping publication failure does not masquerade as bounded-copy fallback;
+- bounded-copy public evidence contains no provider/HybridCPU or hardware authority identity;
+- external shared-read grants remain exactly read-only and cannot outlive verified closure;
+- process teardown cannot bypass active/draining external grant authority.
 
-### Borrow/shared-read slice
+## Phase-4 acceptance boundary
 
-Focused tests prove:
+Phase 4 is complete when normal Sing guarantees plus the unchanged pinned HybridCPU gate prove all of:
 
-- external grant cannot be created without a live exact CPU borrow;
-- stale region, borrow, owner/borrower process or platform-binding generation fails before provider admission;
-- wrong owner-bound platform domain fails before provider admission;
-- grant identity is separate from borrow, region, bridge mapping and provider mapping identity spaces;
-- grant access is always exactly `Read` and the range is exact/bounded;
-- denied/revoked/faulted/malformed mapping or publication evidence fails closed;
-- MOVE/release/borrow return/owner revoke cannot bypass an active or draining grant;
-- completion request starts drain without completing the CPU borrow;
-- new external visibility/effects are rejected after drain starts;
-- every non-terminal completion remains insufficient;
-- stale/wrong-domain/wrong-operation/malformed closure evidence fails closed;
-- `Faulted` remains non-reclaimable;
-- only valid `Closed` plus exact local revalidation allows grant metadata reclaim and CPU borrow completion;
-- reclaimed grants cannot create later evidence/effects;
-- borrower and owner process teardown both close the grant before local borrow/region reclaim, including a draining retry case;
-- the pinned real HybridCPU provider/runtime completes an actual CPU borrow + exact read grant + publication + close + return path;
-- public grant surfaces expose no provider/HybridCPU mapping ID or hardware-shaped authority identity.
+```text
+exact non-coherent mapping + publication + verified revoke
+writable MOVE: publication -> Closed -> acquire -> RegionAuthority.Transfer generation++
+read-only CPU borrow + external grant -> drain -> Closed -> exact revalidation -> borrow completion
+failed target direct mapping + explicit bound -> whole-buffer bounded copy into fresh target backing
+```
+
+The bounded-copy fallback is an optimization/safety fallback, not a promise of universal copy, universal direct mapping or physical zero-copy.
 
 ## Remaining Phase-4 work
 
-### True bounded-copy fallback
+None. Phase 4 acceptance requirements are closed by the four slices above.
 
-When direct target mapping cannot be materialized, a future fallback may copy through a kernel/service-owned bounded region. That path must preserve the same high-level MOVE exclusivity and never allow both old and new owners to remain live.
-
-This fallback is intentionally **not** implemented by the borrow/shared-read PR.
-
-## Acceptance boundary
-
-The borrow/shared-read iteration is complete when normal Sing guarantees plus the existing pinned HybridCPU gate prove:
-
-```text
-live CPU borrow
-  -> exact owner-bound read-only external grant
-  -> PublicationFence evidence
-  -> drain / no new effects
-  -> exact Closed completion
-  -> exact local borrow + region + owner + binding revalidation
-  -> bridge-private grant metadata reclaimed
-  -> CPU borrow returned/revoked before local reclaim
-```
-
-Full Phase 4 remains **In progress** until the true bounded-copy fallback is implemented or explicitly dispositioned by the roadmap.
+Further device/MMIO/IRQ/DMA work belongs to later roadmap phases. DMA/IOMMU were not introduced by this phase.
 
 ## Do not do
 
@@ -358,4 +267,4 @@ Full Phase 4 remains **In progress** until the true bounded-copy fallback is imp
 - no raw physical/PTE/page-table/IOMMU identifiers in SIP/kernel authority ABI;
 - no mutable shared region without explicit single-writer/visibility protocol;
 - no unconditional physical zero-copy guarantee;
-- no DMA/IOMMU work in this iteration.
+- no DMA/IOMMU work in Phase 4.
