@@ -30,7 +30,9 @@ public sealed class HybridCpuDeviceLeaseTests
             features.Resolve(PlatformFeatureFamily.IoDomainBinding).ContractVersion);
         Assert.Equal(PlatformFeatureAvailability.Executable,
             features.Resolve(PlatformFeatureFamily.IoDomainBinding).Availability);
-        Assert.Equal(PlatformFeatureAvailability.Unavailable,
+        Assert.Equal(PlatformFeatureAvailability.RuntimeAdmission,
+            features.Resolve(PlatformFeatureFamily.DmaMapping).Availability);
+        Assert.NotEqual(PlatformFeatureAvailability.Executable,
             features.Resolve(PlatformFeatureFamily.DmaMapping).Availability);
 
         var lease = kernel.BindPlatformDevice(
