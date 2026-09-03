@@ -99,6 +99,13 @@ public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformDevice
                 "The provider device lease has already been revoked.");
         }
 
+        if (HasActiveProviderMmioLeases(record.Lease))
+        {
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.Denied,
+                "HybridCPU MMIO leases must close before the provider device lease.");
+        }
+
         var external = _runtime.CloseDevice(record.HybridCpuLease);
         switch (external.Decision)
         {
@@ -110,6 +117,11 @@ public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformDevice
                 record.Revoked = true;
                 return PlatformAuthorityResult.Fail(
                     PlatformAuthorityStatus.Revoked,
+                    external.Reason);
+
+            case NeutralDeviceCloseDecision.ActiveDependents:
+                return PlatformAuthorityResult.Fail(
+                    PlatformAuthorityStatus.Denied,
                     external.Reason);
 
             case NeutralDeviceCloseDecision.Stale:
