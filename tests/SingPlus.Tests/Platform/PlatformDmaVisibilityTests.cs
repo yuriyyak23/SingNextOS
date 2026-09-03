@@ -414,6 +414,14 @@ public sealed class PlatformDmaVisibilityTests
             return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Ok(mapped);
         }
 
+        public PlatformAuthorityResult RevokeRegionMapping(
+            PlatformProviderRegionMappingLease mapping,
+            PlatformRegionRevocationPolicy policy)
+        {
+            _mappings.Remove(mapping.MappingId);
+            return PlatformAuthorityResult.Ok();
+        }
+
         public PlatformAuthorityResult<PlatformProviderDmaGrant> BindDmaGrant(
             PlatformDmaGrantRequest request)
         {
