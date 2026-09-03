@@ -18,7 +18,7 @@ public readonly record struct PlatformDmaPostCompletionVisibilityEvidence(
         GrantId.Value != 0 &&
         GrantGeneration.Value != 0 &&
         PreparedCycle.Value != 0 &&
-        Direction switch
+        (Direction switch
         {
             PlatformDmaDirection.DeviceReadsMemory =>
                 Requirement == PlatformDmaPostCompletionVisibilityRequirement.None &&
@@ -27,7 +27,7 @@ public readonly record struct PlatformDmaPostCompletionVisibilityEvidence(
                 Requirement == PlatformDmaPostCompletionVisibilityRequirement.AcquisitionFence &&
                 Outcome == PlatformDmaPostCompletionVisibilityOutcome.AcquisitionFenceSatisfied,
             _ => false,
-        };
+        });
 }
 
 public sealed partial class PlatformAuthorityBridge
