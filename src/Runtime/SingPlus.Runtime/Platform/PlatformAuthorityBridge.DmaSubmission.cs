@@ -22,6 +22,7 @@ public sealed partial class PlatformAuthorityBridge
     {
         public PlatformDmaSubmission Submission { get; } = submission;
         public PlatformProviderDmaSubmission ProviderSubmission { get; } = providerSubmission;
+        public bool CompletionProven { get; set; }
     }
 
     private readonly Dictionary<PlatformDmaGrantId, DmaSubmissionRecord> _activeDmaSubmissions = [];
@@ -52,7 +53,7 @@ public sealed partial class PlatformAuthorityBridge
         {
             return KernelResult<PlatformDmaSubmission>.Fail(
                 KernelError.PlatformBindingActive,
-                "The exact DMA grant already has a submitted operation pending completion.");
+                "The exact DMA grant already has a submitted operation whose post-submit lifecycle is not closed.");
         }
 
         if (!_featureManifest.Supports(
@@ -152,8 +153,6 @@ public sealed partial class PlatformAuthorityBridge
             providerSubmission);
         if (!providerValidation.IsSuccess)
         {
-            // A provider that reported success may already have accepted the external effect.
-            // Pin all lower authority until a later completion/drain slice can resolve it.
             _dmaSubmissionFaultPins.Add(grant.GrantId);
             return KernelResult<PlatformDmaSubmission>.Fail(
                 KernelError.PlatformFaulted,
@@ -176,6 +175,14 @@ public sealed partial class PlatformAuthorityBridge
 
     internal bool HasActiveDmaSubmission(PlatformDmaGrantId grantId) =>
         _activeDmaSubmissions.ContainsKey(grantId);
+
+    internal bool HasPendingDmaSubmission(PlatformDmaGrantId grantId) =>
+        _activeDmaSubmissions.TryGetValue(grantId, out var record) &&
+        !record.CompletionProven;
+
+    internal bool HasCompletedDmaSubmission(PlatformDmaGrantId grantId) =>
+        _activeDmaSubmissions.TryGetValue(grantId, out var record) &&
+        record.CompletionProven;
 
     internal bool HasFaultPinnedDmaSubmission(PlatformDmaGrantId grantId) =>
         _dmaSubmissionFaultPins.Contains(grantId);
