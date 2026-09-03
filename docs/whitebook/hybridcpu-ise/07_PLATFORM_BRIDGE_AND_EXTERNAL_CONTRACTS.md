@@ -3,10 +3,13 @@
 > Status note: this chapter's “current” inventory is the historical
 > `af791aba...` Phase-1 snapshot named below. The implementation-ordered roadmap
 > is authoritative for later delivery status. Phase 3 added the real neutral
-> HybridCPU provider, Phases 4–5 added bounded memory/I/O lifecycles, and the
-> first Phase-6 slice versions the SingPlus `NeutralDomains` contract at v2 with
-> an exact `(DomainId, ProcessHandle)` subject. These updates do not upgrade any
-> hardware, DMA, scheduling, boot or security claim beyond its tested evidence.
+> HybridCPU provider, Phases 4–5 added bounded memory/I/O lifecycles, and Phase 6
+> versions the SingPlus `NeutralDomains` contract at v2 with an exact
+> `(DomainId, ProcessHandle)` subject. The current scheduler slice adds
+> `ExecutionPolicy` v1 as a binding-scoped host `ModelOnly` contract while the
+> HybridCPU provider reports that family unavailable. This proves no HybridCPU
+> placement, budget enforcement, scheduler quality, hard real-time, boot or
+> security property beyond its tested evidence.
 
 ## Current status at SingNextOS `af791aba...`
 
