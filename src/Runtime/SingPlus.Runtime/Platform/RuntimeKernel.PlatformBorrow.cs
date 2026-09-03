@@ -119,6 +119,7 @@ public sealed partial class RuntimeKernel
             return grant;
         }
 
+        TrackPlatformBorrowReadGrant(owner, borrower, grant.Value!);
         return grant;
     }
 
@@ -284,8 +285,11 @@ public sealed partial class RuntimeKernel
             return reclaimGrant;
         }
 
-        return Regions.ReturnLoan(
+        var returned = Regions.ReturnLoan(
             borrowLease,
             borrowerIdentity);
+        if (returned.IsSuccess)
+            UntrackPlatformBorrowReadGrant(grant);
+        return returned;
     }
 }
