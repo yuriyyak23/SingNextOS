@@ -53,13 +53,13 @@ public sealed class PlatformBorrowReadGrantTests
         Assert.Equal(0, provider.MapCalls);
 
         var staleOwner = owner with { Generation = owner.Generation + 1 };
-        Assert.Equal(KernelError.StaleGeneration,
+        Assert.Equal(KernelError.StaleHandle,
             kernel.CreatePlatformBorrowReadGrant(
                 staleOwner, borrower, ownerBinding, lease.Handle, 0, 64).Error);
         Assert.Equal(0, provider.MapCalls);
 
         var staleBorrower = borrower with { Generation = borrower.Generation + 1 };
-        Assert.Equal(KernelError.StaleGeneration,
+        Assert.Equal(KernelError.StaleHandle,
             kernel.CreatePlatformBorrowReadGrant(
                 owner, staleBorrower, ownerBinding, lease.Handle, 0, 64).Error);
         Assert.Equal(0, provider.MapCalls);
@@ -342,9 +342,9 @@ public sealed class PlatformBorrowReadGrantTests
     [InlineData(ReceiptFaultMode.StaleGeneration, KernelError.StaleGeneration)]
     [InlineData(ReceiptFaultMode.WrongDomain, KernelError.WrongPlatformDomain)]
     [InlineData(ReceiptFaultMode.WrongOperation, KernelError.PlatformDenied)]
-    [InlineData(ReceiptFaultMode.StaleMappingTicket, KernelError.StaleGeneration)]
-    [InlineData(ReceiptFaultMode.WrongMappingTicket, KernelError.PlatformDenied)]
-    [InlineData(ReceiptFaultMode.WrongTicketDomain, KernelError.WrongPlatformDomain)]
+    [InlineData(ReceiptFaultMode.StaleMappingTicket, KernelError.PlatformFaulted)]
+    [InlineData(ReceiptFaultMode.WrongMappingTicket, KernelError.PlatformFaulted)]
+    [InlineData(ReceiptFaultMode.WrongTicketDomain, KernelError.PlatformFaulted)]
     [InlineData(ReceiptFaultMode.MalformedTicket, KernelError.PlatformFaulted)]
     public void StaleWrongDomainWrongOperationAndMalformedClosureEvidenceFailClosed(
         ReceiptFaultMode mode,
@@ -414,7 +414,7 @@ public sealed class PlatformBorrowReadGrantTests
         scenario.Provider.CompletionState = PlatformCompletionState.Closed;
 
         var staleOwner = scenario.Owner with { Generation = scenario.Owner.Generation + 1 };
-        Assert.Equal(KernelError.StaleGeneration,
+        Assert.Equal(KernelError.StaleHandle,
             scenario.Kernel.RequestPlatformBorrowCompletion(
                 staleOwner,
                 scenario.Borrower,
@@ -426,7 +426,7 @@ public sealed class PlatformBorrowReadGrantTests
         {
             Generation = scenario.Borrower.Generation + 1,
         };
-        Assert.Equal(KernelError.StaleGeneration,
+        Assert.Equal(KernelError.StaleHandle,
             scenario.Kernel.RequestPlatformBorrowCompletion(
                 scenario.Owner,
                 staleBorrower,
