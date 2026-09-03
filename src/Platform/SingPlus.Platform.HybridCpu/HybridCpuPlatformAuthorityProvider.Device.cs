@@ -99,6 +99,13 @@ public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformDevice
                 "The provider device lease has already been revoked.");
         }
 
+        if (HasActiveProviderDmaGrants(record.Lease))
+        {
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.Denied,
+                "HybridCPU DMA grants must close before the provider device lease.");
+        }
+
         if (HasActiveProviderInterruptBindings(record.Lease))
         {
             return PlatformAuthorityResult.Fail(
