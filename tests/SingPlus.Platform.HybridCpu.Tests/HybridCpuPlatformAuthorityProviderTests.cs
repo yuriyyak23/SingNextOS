@@ -223,7 +223,7 @@ public sealed class HybridCpuPlatformAuthorityProviderTests
     }
 
     [Fact]
-    public void ProviderAdvertisesExactMappingVisibilityAndDmaAdmissionWithoutExecutionClaim()
+    public void ProviderAdvertisesExactImplementedFeaturesWithoutSchedulerPolicyClaim()
     {
         var provider = new HybridCpuPlatformAuthorityProvider(new NeutralDomainRuntimeFacade());
         var features = provider.QueryFeatures();
@@ -246,10 +246,49 @@ public sealed class HybridCpuPlatformAuthorityProviderTests
             features.Resolve(PlatformFeatureFamily.DmaMapping).Availability);
         Assert.NotEqual(PlatformFeatureAvailability.Executable,
             features.Resolve(PlatformFeatureFamily.DmaMapping).Availability);
+        Assert.Equal(0u,
+            features.Resolve(PlatformFeatureFamily.ExecutionPolicy).ContractVersion);
+        Assert.Equal(PlatformFeatureAvailability.Unavailable,
+            features.Resolve(PlatformFeatureFamily.ExecutionPolicy).Availability);
+        Assert.DoesNotContain(
+            typeof(IPlatformExecutionPolicyProvider),
+            provider.GetType().GetInterfaces());
         Assert.Equal(
             PlatformAuthorityFeatures.NeutralDomainBinding |
             PlatformAuthorityFeatures.DirectOwnedRegionMapping,
             provider.Descriptor.Features);
+    }
+
+    [Fact]
+    public void UnsupportedSchedulerPolicyDoesNotPoisonRealNeutralExecutionBinding()
+    {
+        var runtime = new NeutralDomainRuntimeFacade();
+        var kernel = new RuntimeKernel(new HybridCpuPlatformAuthorityProvider(runtime));
+        var (process, handle) = CreateProcess(kernel, 36, 360, 1);
+        Assert.True(kernel.AdmitProcess(handle).IsSuccess);
+        var binding = kernel.BindPlatformDomain(handle).Value!;
+        var policy = new PlatformExecutionPolicy(
+            new ExecutionBudget(
+                TimeSpan.FromMilliseconds(4),
+                TimeSpan.FromMilliseconds(20)),
+            PriorityClass.Interactive,
+            LatencyHint.PreferLowLatency,
+            ThroughputHint.Balanced);
+
+        var configuration = kernel.ConfigurePlatformExecutionPolicy(
+            handle,
+            binding,
+            policy);
+
+        Assert.False(configuration.IsSuccess);
+        Assert.Equal(KernelError.PlatformUnsupported, configuration.Error);
+        Assert.Equal(default(PlatformExecutionPolicyRegistration), configuration.Value);
+        Assert.Equal(ProcessState.Admitted, process.State);
+        Assert.Equal(1, runtime.ActiveBindingCount);
+
+        Assert.True(kernel.StartProcess(handle).IsSuccess);
+        Assert.Equal(ProcessState.Running, process.State);
+        Assert.Equal(1, runtime.ActiveBindingCount);
     }
 
     [Fact]

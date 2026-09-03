@@ -2,16 +2,18 @@ using SingPlus.Platform;
 
 namespace SingPlus.Platform.Host;
 
-public sealed class HostPlatformAuthorityProvider :
+public sealed partial class HostPlatformAuthorityProvider :
     IPlatformAuthorityProvider,
     IPlatformFeatureProvider,
     IPlatformCompletionProvider,
     IPlatformMemoryVisibilityProvider,
-    IPlatformRegionRevocationProvider
+    IPlatformRegionRevocationProvider,
+    IPlatformExecutionPolicyProvider
 {
     private sealed class DomainRecord(PlatformProviderDomainLease lease)
     {
         public PlatformProviderDomainLease Lease { get; } = lease;
+        public PlatformExecutionPolicy? ExecutionPolicy { get; set; }
         public bool Revoked { get; set; }
     }
 
@@ -70,6 +72,10 @@ public sealed class HostPlatformAuthorityProvider :
                 PlatformFeatureFamily.NeutralDomains,
                 PlatformDomainContract.ContractVersion,
                 PlatformFeatureAvailability.RuntimeAdmission));
+            featureDescriptors.Add(new PlatformFeatureDescriptor(
+                PlatformFeatureFamily.ExecutionPolicy,
+                PlatformExecutionPolicyContract.ContractVersion,
+                PlatformFeatureAvailability.ModelOnly));
         }
 
         featureDescriptors.Add(new PlatformFeatureDescriptor(

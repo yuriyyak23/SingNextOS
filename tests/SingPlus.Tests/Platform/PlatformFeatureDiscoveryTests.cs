@@ -25,6 +25,14 @@ public sealed class PlatformFeatureDiscoveryTests
             PlatformFeatureFamily.OwnedRegionMapping,
             1,
             PlatformFeatureAvailability.RuntimeAdmission));
+        Assert.True(manifest.Supports(
+            PlatformFeatureFamily.ExecutionPolicy,
+            PlatformExecutionPolicyContract.ContractVersion,
+            PlatformFeatureAvailability.ModelOnly));
+        Assert.False(manifest.Supports(
+            PlatformFeatureFamily.ExecutionPolicy,
+            PlatformExecutionPolicyContract.ContractVersion,
+            PlatformFeatureAvailability.Executable));
 
         var unsupported = manifest.Resolve(PlatformFeatureFamily.VirtualizationDomains);
         Assert.Equal(0u, unsupported.ContractVersion);
@@ -144,6 +152,9 @@ public sealed class PlatformFeatureDiscoveryTests
         Assert.Equal(
             PlatformFeatureAvailability.Unavailable,
             manifest.Resolve(PlatformFeatureFamily.OwnedRegionMapping).Availability);
+        Assert.Equal(
+            PlatformFeatureAvailability.Unavailable,
+            manifest.Resolve(PlatformFeatureFamily.ExecutionPolicy).Availability);
         Assert.False(bind.IsSuccess);
         Assert.Equal(KernelError.PlatformUnsupported, bind.Error);
     }

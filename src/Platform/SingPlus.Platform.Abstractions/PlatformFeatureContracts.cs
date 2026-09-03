@@ -19,6 +19,7 @@ public enum PlatformFeatureFamily
     SurfacePresentation,
     MmioMapping,
     IrqBinding,
+    ExecutionPolicy,
 }
 
 public enum PlatformFeatureAvailability
