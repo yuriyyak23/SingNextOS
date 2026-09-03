@@ -195,6 +195,7 @@ public sealed partial class RuntimeKernel
             foreach (var mapping in PlatformAuthority.BeginCapabilityRevocation(capabilityId))
                 mappings[mapping.MappingId] = mapping;
 
+            _ = PlatformAuthority.BeginDeviceCapabilityRevocation(capabilityId);
             _ = CapabilityAuthority.Revoke(capabilityId);
         }
         process.ClearCapabilities();
@@ -226,6 +227,10 @@ public sealed partial class RuntimeKernel
         var identity = new PlatformDomainIdentity(process.DomainId, process.Generation);
         KernelError? firstBlockingError = null;
         var pendingMappings = 0;
+
+        var deviceProgress = AdvancePlatformDeviceLeasesForProcess(process, record.Handle);
+        if (!deviceProgress.IsSuccess)
+            firstBlockingError ??= deviceProgress.Error;
 
         var borrowGrantProgress = AdvancePlatformBorrowReadGrantsForProcess(record.Handle);
         if (!borrowGrantProgress.IsSuccess)
@@ -359,6 +364,7 @@ public sealed partial class RuntimeKernel
         _processTeardowns.Remove(record.Handle);
         _processPlatformBindings.Remove(record.Handle);
         _processPlatformMappings.Remove(record.Handle);
+        _processPlatformDeviceLeases.Remove(record.Handle);
         return KernelResult<ProcessTeardownSnapshot>.Ok(completed);
     }
 
