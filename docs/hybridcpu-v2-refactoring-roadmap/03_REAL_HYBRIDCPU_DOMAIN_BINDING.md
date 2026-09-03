@@ -4,6 +4,13 @@
 
 **Implementation complete; merge acceptance requires the pinned cross-repository CI gate.**
 
+> Historical phase-closure record: PR state, dependency heads, feature versions
+> and availability below describe Phase 3 at acceptance. Later phases have
+> advanced the provider and CI pin. Phase 6 upgrades the Sing platform subject
+> from `DomainId + process generation` to exact `DomainId + ProcessHandle` and
+> upgrades `NeutralDomains` to v2. The current roadmap README, Phase-6 file and
+> workflow are authoritative for present state.
+
 Phase 3 now has both required halves:
 
 1. real neutral HybridCPU bind/revoke, merged into SingNextOS by PR #23;
@@ -30,7 +37,7 @@ No new lifecycle scope was folded into PR #5. PR #6 is a one-commit, two-file de
 
 Materialize a live SingNextOS security principal into neutral HybridCPU runtime ownership and ensure that local execution state is never published stronger than the exact external state proved by the bound provider.
 
-Current identity and authority relation:
+Phase-3 closure identity and authority relation:
 
 ```text
 Sing DomainId + process generation
@@ -216,7 +223,7 @@ Provider denial/revocation/fault or malformed success evidence leaves the curren
 
 ## Feature classification
 
-The real HybridCPU provider now reports:
+At Phase-3 closure, the real HybridCPU provider reported:
 
 ```text
 NeutralDomains v1 = Executable
@@ -292,7 +299,8 @@ The same exact close path works when the external neutral execution state is `Ru
 
 - bound process publishes `Running/Parked` only after provider success;
 - denied Start leaves local process `Admitted`;
-- provider revocation during Park leaves local process `Running` and revokes the bridge binding;
+- provider revocation during Park leaves local process `Running`; Phase 6 later
+  refines the bridge outcome to quarantine until exact provider close succeeds;
 - malformed provider success is `PlatformFaulted` and leaves local state unchanged;
 - bound provider without execution interface cannot fall back to local-only state;
 - stale process generation is rejected before provider transition;
@@ -312,7 +320,8 @@ The same exact close path works when the external neutral execution state is `Ru
 
 The normal `SingNextOS local guarantees` job remains independent of HybridCPU source.
 
-The separate `HybridCPU neutral domain integration` job pins exact HybridCPU transition head:
+At Phase-3 closure, the separate `HybridCPU neutral domain integration` job
+pinned the exact HybridCPU transition head:
 
 ```text
 3ea2303e1a5fe423e76ef3c2f3c399001ca08288

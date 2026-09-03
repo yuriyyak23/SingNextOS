@@ -4,6 +4,12 @@
 
 **Complete at the host-backed contract level.** Typed/versioned feature discovery, the minimal operation/completion model, and explicit semantic memory-visibility vocabulary are implemented. The phase does **not** claim real HybridCPU execution, DMA, cache-topology integration, or Phase-2 reclaim orchestration.
 
+> Historical phase-closure note: availability/version statements in this file
+> describe the Phase-1 acceptance point. Later phases advance individual
+> contracts; in particular, Phase 6 makes `NeutralDomains` v2 process-exact.
+> The roadmap README and the corresponding later phase are authoritative for
+> the current feature matrix.
+
 The next roadmap phase is Phase 2: explicit local-revoked / platform-draining / platform-closed lifecycle and reclaim proof.
 
 ## Current state
@@ -47,7 +53,11 @@ ProductionSecure
 
 For example, `ProjectionOnly` cannot satisfy `Executable`, and `ModelOnly` cannot satisfy `ProductionSecure`.
 
-The host-backed legacy domain/mapping features remain `RuntimeAdmission` contract version 1. `ExplicitMemoryVisibility` is now advertised by the host provider as contract version 1 `ModelOnly`: the host model can exercise the semantic contract, but this is not a claim of executable HybridCPU cache/fence behavior.
+At Phase-1 closure, the host-backed legacy domain/mapping features were
+`RuntimeAdmission` contract version 1. `ExplicitMemoryVisibility` was advertised
+by the host provider as contract version 1 `ModelOnly`: the host model could
+exercise the semantic contract, but this was not a claim of executable HybridCPU
+cache/fence behavior.
 
 `RuntimeKernel.QueryPlatformFeatures()` remains discovery/evidence only. Feature presence never bypasses Sing capability/ownership validation.
 
