@@ -11,7 +11,7 @@ Implemented slices:
 
 IRQ routing and DMA grant/submit/completion remain separate later slices. The Phase-5 acceptance boundary is therefore **not** complete.
 
-The cross-repository integration gate for Slice 2 is pinned to HybridCPU neutral MMIO commit `60c565843ea355c3d3e93608ec61263651fe2e01`, based on the merged device-lease stack head `be88202bfac9e372d2de2acf92fe3d783c3094cf`.
+The cross-repository integration gate for Slice 2 is pinned to HybridCPU neutral MMIO commit `eeda80b92e8f6733d950f43f65a50e55bde608df`, based on the merged device-lease stack head `be88202bfac9e372d2de2acf92fe3d783c3094cf`.
 
 ## Goal
 
@@ -162,7 +162,8 @@ Rules enforced by the slice:
 - process teardown marks MMIO authorization revoked and closes MMIO before device/domain closure;
 - MMIO provider-close failure pins teardown in `PlatformFaulted` and prevents device/domain close;
 - the HybridCPU provider independently refuses device close while a provider MMIO lease remains live;
-- the neutral runtime independently reports active MMIO dependents instead of silently closing the device underneath them.
+- the neutral runtime independently reports active MMIO dependents instead of silently closing the device underneath them;
+- exact MMIO closure remains structurally valid after local device authorization is revoked, while any operation that would consume MMIO authority still requires live authorization.
 
 ### Feature discovery
 
@@ -230,6 +231,7 @@ Slice-2 focused tests additionally prove:
 - process teardown closes MMIO before device and platform domain;
 - MMIO close fault pins teardown before device/domain closure;
 - real pinned HybridCPU runtime materializes and closes the exact neutral MMIO lease;
+- the prior device-surface negative test now permits this implemented MMIO facade while continuing to reject DMA/IRQ and hardware-shaped authority terms;
 - public Sing and neutral MMIO surfaces contain no provider/hardware-shaped authority identities.
 
 Later required negative tests remain:
