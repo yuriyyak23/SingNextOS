@@ -227,6 +227,16 @@ public sealed partial class RuntimeKernel
         KernelError? firstBlockingError = null;
         var pendingMappings = 0;
 
+        var borrowGrantProgress = AdvancePlatformBorrowReadGrantsForProcess(record.Handle);
+        if (!borrowGrantProgress.IsSuccess)
+        {
+            firstBlockingError ??= borrowGrantProgress.Error;
+        }
+        else
+        {
+            pendingMappings += borrowGrantProgress.Value;
+        }
+
         foreach (var mapping in record.Mappings)
         {
             var queried = PlatformAuthority.QueryRegionMappingLifecycle(mapping, identity);
