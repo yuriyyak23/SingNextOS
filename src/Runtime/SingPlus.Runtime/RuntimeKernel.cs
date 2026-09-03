@@ -173,9 +173,14 @@ public sealed partial class RuntimeKernel
         if (!_processPlatformBindings.TryGetValue(handle, out var binding))
             return KernelResult.Ok();
 
-        var identity = new PlatformDomainIdentity(process.DomainId, process.Generation);
+        var identity = PlatformIdentity(process);
         return PlatformAuthority.TransitionDomainExecution(binding, identity, transition);
     }
+
+    private static PlatformDomainIdentity PlatformIdentity(SingProcess process) =>
+        new(
+            process.DomainId,
+            new ProcessHandle(process.ProcessId, process.Generation));
 
     private static KernelResult EnsureProcessAcceptsNewEffects(SingProcess process)
     {

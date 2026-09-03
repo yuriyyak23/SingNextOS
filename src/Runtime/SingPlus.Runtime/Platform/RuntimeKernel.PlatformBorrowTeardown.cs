@@ -76,9 +76,7 @@ public sealed partial class RuntimeKernel
         if (!currentBorrow.IsSuccess)
             return KernelResult.Fail(currentBorrow.Error, currentBorrow.Message!);
 
-        var platformSubject = new PlatformDomainIdentity(
-            ownerProcess.Value.DomainId,
-            tracked.Owner.Generation);
+        var platformSubject = PlatformIdentity(ownerProcess.Value);
         var lifecycle = PlatformAuthority.QueryBorrowReadGrantLifecycle(
             tracked.Grant,
             platformSubject);

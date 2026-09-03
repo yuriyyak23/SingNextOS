@@ -27,7 +27,7 @@ public sealed partial class RuntimeKernel
                 effect.Message!);
         }
 
-        var identity = new PlatformDomainIdentity(process.DomainId, subject.Generation);
+        var identity = PlatformIdentity(process);
         return PlatformAuthority.PrepareDmaGrantVisibility(grant, identity);
     }
 
@@ -44,7 +44,7 @@ public sealed partial class RuntimeKernel
         }
 
         var process = resolved.Value!;
-        var identity = new PlatformDomainIdentity(process.DomainId, subject.Generation);
+        var identity = PlatformIdentity(process);
         return PlatformAuthority.AcquireDmaGrantVisibility(grant, identity);
     }
 }

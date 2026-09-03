@@ -72,7 +72,9 @@ public sealed class HybridCpuOwnedRegionMappingTests
     {
         var runtime = new NeutralDomainRuntimeFacade();
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
-        var subject = new PlatformDomainIdentity(new DomainId(430), 3);
+        var subject = new PlatformDomainIdentity(
+            new DomainId(430),
+            new ProcessHandle(new ProcessId(431), 3));
         var domain = provider.BindDomain(subject).Value!;
         var region = new PlatformRegionIdentity(
             new RegionHandle(new RegionId(9), new RegionGeneration(4)),

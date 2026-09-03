@@ -61,7 +61,17 @@ public sealed class HostPlatformAuthorityProvider :
         _deferRegionRevocationCompletion = deferRegionRevocationCompletion;
         Descriptor = new PlatformProviderDescriptor(new PlatformProviderId("host-test"), 2, features);
 
-        var featureDescriptors = PlatformFeatureManifest.FromLegacy(features).Features.ToList();
+        var featureDescriptors = PlatformFeatureManifest.FromLegacy(features).Features
+            .Where(static feature => feature.Family != PlatformFeatureFamily.NeutralDomains)
+            .ToList();
+        if ((features & PlatformAuthorityFeatures.NeutralDomainBinding) != 0)
+        {
+            featureDescriptors.Add(new PlatformFeatureDescriptor(
+                PlatformFeatureFamily.NeutralDomains,
+                PlatformDomainContract.ContractVersion,
+                PlatformFeatureAvailability.RuntimeAdmission));
+        }
+
         featureDescriptors.Add(new PlatformFeatureDescriptor(
             PlatformFeatureFamily.ExplicitMemoryVisibility,
             1,
@@ -210,10 +220,11 @@ public sealed class HostPlatformAuthorityProvider :
                 PlatformAuthorityStatus.Unsupported,
                 "Neutral domain binding is not supported by this provider.");
 
-        if (subject.ProcessGeneration == 0)
+        var subjectValidation = PlatformDomainContract.ValidateSubject(subject);
+        if (!subjectValidation.IsSuccess)
             return PlatformAuthorityResult<PlatformProviderDomainLease>.Fail(
-                PlatformAuthorityStatus.Denied,
-                "Process generation zero is not a valid platform subject.");
+                subjectValidation.Status,
+                subjectValidation.Message!);
 
         if (_activeSubjects.ContainsKey(subject))
             return PlatformAuthorityResult<PlatformProviderDomainLease>.Fail(

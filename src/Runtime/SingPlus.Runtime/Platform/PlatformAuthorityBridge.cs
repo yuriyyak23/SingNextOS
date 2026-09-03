@@ -40,13 +40,20 @@ public readonly record struct PlatformRegionMappingLifecycle(
 
 public sealed partial class PlatformAuthorityBridge
 {
+    private enum DomainAuthorityState
+    {
+        Active = 0,
+        Quarantined,
+        Closed,
+    }
+
     private sealed class DomainRecord(
         PlatformDomainBinding binding,
         PlatformProviderDomainLease providerLease)
     {
         public PlatformDomainBinding Binding { get; } = binding;
         public PlatformProviderDomainLease ProviderLease { get; } = providerLease;
-        public bool Revoked { get; set; }
+        public DomainAuthorityState AuthorityState { get; set; }
     }
 
     private sealed class MappingRecord(
@@ -103,10 +110,24 @@ public sealed partial class PlatformAuthorityBridge
                 KernelError.PlatformUnavailable,
                 "No platform authority provider is configured.");
 
-        if (!Supports(PlatformAuthorityFeatures.NeutralDomainBinding))
+        var subjectValidation = PlatformDomainContract.ValidateSubject(subject);
+        if (!subjectValidation.IsSuccess)
+            return FromProviderFailure<PlatformDomainBinding>(
+                subjectValidation.Status,
+                subjectValidation.Message);
+
+        var neutralDomainFeature = _featureManifest.Resolve(
+            PlatformFeatureFamily.NeutralDomains);
+        if (!Supports(PlatformAuthorityFeatures.NeutralDomainBinding) ||
+            neutralDomainFeature.ContractVersion < PlatformDomainContract.ContractVersion ||
+            neutralDomainFeature.Availability is not
+                (PlatformFeatureAvailability.RuntimeAdmission or
+                 PlatformFeatureAvailability.Executable))
+        {
             return KernelResult<PlatformDomainBinding>.Fail(
                 KernelError.PlatformUnsupported,
-                "The platform provider does not support neutral domain binding.");
+                $"The platform provider does not admit neutral domain contract v{PlatformDomainContract.ContractVersion} authority.");
+        }
 
         if (_activeSubjects.ContainsKey(subject))
             return KernelResult<PlatformDomainBinding>.Fail(
@@ -118,29 +139,55 @@ public sealed partial class PlatformAuthorityBridge
             return FromProviderFailure<PlatformDomainBinding>(providerResult.Status, providerResult.Message);
 
         var providerLease = providerResult.Value!;
-        if (providerLease.Subject != subject)
+        var leaseValidation = PlatformDomainContract.ValidateLease(subject, providerLease);
+        if (!leaseValidation.IsSuccess)
         {
-            _ = _provider.RevokeDomain(providerLease);
+            var leaseMessage = leaseValidation.Message ??
+                "The platform provider returned malformed domain authority.";
+            var cleanup = _provider.RevokeDomain(providerLease);
+            if (!cleanup.IsSuccess)
+            {
+                _ = AddDomainRecord(
+                    subject,
+                    providerLease,
+                    DomainAuthorityState.Quarantined);
+            }
+
             return KernelResult<PlatformDomainBinding>.Fail(
                 KernelError.PlatformFaulted,
-                "The platform provider returned a domain binding for a different subject.");
+                cleanup.IsSuccess
+                    ? leaseMessage
+                    : $"{leaseMessage} Cleanup returned {cleanup.Status}; the provider lease remains quarantined for teardown.");
         }
 
-        var binding = new PlatformDomainBinding(
-            new PlatformDomainBindingId(_nextDomainBindingId++),
-            new PlatformDomainBindingGeneration(1),
-            subject);
-
-        _domains.Add(binding.BindingId, new DomainRecord(binding, providerLease));
-        _activeSubjects.Add(subject, binding.BindingId);
+        var binding = AddDomainRecord(
+            subject,
+            providerLease,
+            DomainAuthorityState.Active);
         return KernelResult<PlatformDomainBinding>.Ok(binding);
+    }
+
+    internal bool TryGetQuarantinedDomainBinding(
+        PlatformDomainIdentity subject,
+        out PlatformDomainBinding binding)
+    {
+        if (_activeSubjects.TryGetValue(subject, out var bindingId) &&
+            _domains.TryGetValue(bindingId, out var record) &&
+            record.AuthorityState == DomainAuthorityState.Quarantined)
+        {
+            binding = record.Binding;
+            return true;
+        }
+
+        binding = default;
+        return false;
     }
 
     internal KernelResult RevokeDomain(
         PlatformDomainBinding binding,
         PlatformDomainIdentity expectedSubject)
     {
-        var validation = ValidateDomain(binding, expectedSubject);
+        var validation = ValidateDomainIdentity(binding, expectedSubject);
         if (!validation.IsSuccess) return validation;
 
         if (_mappings.Values.Any(m =>
@@ -153,20 +200,48 @@ public sealed partial class PlatformAuthorityBridge
         }
 
         var record = _domains[binding.BindingId];
+        if (record.AuthorityState == DomainAuthorityState.Closed)
+        {
+            ReleaseActiveSubject(record);
+            return KernelResult.Ok();
+        }
+
         var providerResult = _provider!.RevokeDomain(record.ProviderLease);
         if (!providerResult.IsSuccess)
         {
-            if (providerResult.Status is PlatformAuthorityStatus.Revoked or PlatformAuthorityStatus.Stale)
-                MarkDomainRevoked(record);
+            if (RequiresDomainQuarantine(providerResult.Status))
+                QuarantineDomain(record);
 
             return FromProviderFailure(providerResult.Status, providerResult.Message);
         }
 
-        MarkDomainRevoked(record);
+        CloseDomain(record);
         return KernelResult.Ok();
     }
 
     internal KernelResult ValidateDomain(
+        PlatformDomainBinding binding,
+        PlatformDomainIdentity expectedSubject)
+    {
+        var identityValidation = ValidateDomainIdentity(binding, expectedSubject);
+        if (!identityValidation.IsSuccess) return identityValidation;
+
+        var record = _domains[binding.BindingId];
+        if (record.AuthorityState != DomainAuthorityState.Active)
+        {
+            return record.AuthorityState == DomainAuthorityState.Closed
+                ? KernelResult.Fail(
+                    KernelError.PlatformBindingRevoked,
+                    "The platform domain binding has reached externally confirmed closure.")
+                : KernelResult.Fail(
+                    KernelError.PlatformFaulted,
+                    "The platform domain binding is quarantined without external closure proof.");
+        }
+
+        return KernelResult.Ok();
+    }
+
+    private KernelResult ValidateDomainIdentity(
         PlatformDomainBinding binding,
         PlatformDomainIdentity expectedSubject)
     {
@@ -185,11 +260,6 @@ public sealed partial class PlatformAuthorityBridge
                 KernelError.WrongPlatformDomain,
                 "The platform domain binding does not belong to the expected local subject.");
 
-        if (record.Revoked)
-            return KernelResult.Fail(
-                KernelError.PlatformBindingRevoked,
-                "The platform domain binding has been revoked.");
-
         return KernelResult.Ok();
     }
 
@@ -205,6 +275,16 @@ public sealed partial class PlatformAuthorityBridge
         if (!transitionValidation.IsSuccess)
             return FromProviderFailure(transitionValidation.Status, transitionValidation.Message);
 
+        if (!_featureManifest.Supports(
+                PlatformFeatureFamily.NeutralDomains,
+                PlatformDomainContract.ContractVersion,
+                PlatformFeatureAvailability.Executable))
+        {
+            return KernelResult.Fail(
+                KernelError.PlatformUnsupported,
+                "The bound platform provider does not classify neutral execution transitions as executable.");
+        }
+
         if (_provider is not IPlatformDomainExecutionProvider executionProvider)
         {
             return KernelResult.Fail(
@@ -218,8 +298,8 @@ public sealed partial class PlatformAuthorityBridge
             transition);
         if (!providerResult.IsSuccess)
         {
-            if (providerResult.Status is PlatformAuthorityStatus.Revoked or PlatformAuthorityStatus.Stale)
-                MarkDomainRevoked(record);
+            if (RequiresDomainQuarantine(providerResult.Status))
+                QuarantineDomain(record);
 
             return FromProviderFailure(providerResult.Status, providerResult.Message);
         }
@@ -230,6 +310,7 @@ public sealed partial class PlatformAuthorityBridge
             providerResult.Value!);
         if (!resultValidation.IsSuccess)
         {
+            QuarantineDomain(record);
             return KernelResult.Fail(
                 KernelError.PlatformFaulted,
                 resultValidation.Message ?? "The platform provider returned malformed execution transition evidence.");
@@ -271,7 +352,7 @@ public sealed partial class PlatformAuthorityBridge
         if (!providerResult.IsSuccess)
         {
             if (providerResult.Status is PlatformAuthorityStatus.Revoked or PlatformAuthorityStatus.Stale)
-                MarkDomainRevoked(domainRecord);
+                QuarantineDomain(domainRecord);
 
             return FromProviderFailure<PlatformRegionMapping>(providerResult.Status, providerResult.Message);
         }
@@ -568,7 +649,7 @@ public sealed partial class PlatformAuthorityBridge
     internal bool HasActiveAuthority(PlatformDomainIdentity subject) =>
         (_activeSubjects.TryGetValue(subject, out var id) &&
          _domains.TryGetValue(id, out var domain) &&
-         !domain.Revoked) ||
+         domain.AuthorityState != DomainAuthorityState.Closed) ||
         _mappings.Values.Any(
             m =>
                 !m.LocalReservationReleased &&
@@ -625,10 +706,49 @@ public sealed partial class PlatformAuthorityBridge
         return ValidateDomain(record.Mapping.DomainBinding, expectedSubject);
     }
 
-    private void MarkDomainRevoked(DomainRecord record)
+    private PlatformDomainBinding AddDomainRecord(
+        PlatformDomainIdentity subject,
+        PlatformProviderDomainLease providerLease,
+        DomainAuthorityState authorityState)
     {
-        record.Revoked = true;
-        _activeSubjects.Remove(record.Binding.Subject);
+        var binding = new PlatformDomainBinding(
+            new PlatformDomainBindingId(_nextDomainBindingId++),
+            new PlatformDomainBindingGeneration(1),
+            subject);
+        var record = new DomainRecord(binding, providerLease)
+        {
+            AuthorityState = authorityState,
+        };
+        _domains.Add(binding.BindingId, record);
+        _activeSubjects.Add(subject, binding.BindingId);
+        return binding;
+    }
+
+    private static void QuarantineDomain(DomainRecord record)
+    {
+        if (record.AuthorityState != DomainAuthorityState.Closed)
+            record.AuthorityState = DomainAuthorityState.Quarantined;
+    }
+
+    private static bool RequiresDomainQuarantine(PlatformAuthorityStatus status) =>
+        status is PlatformAuthorityStatus.Stale or
+            PlatformAuthorityStatus.Revoked or
+            PlatformAuthorityStatus.WrongDomain or
+            PlatformAuthorityStatus.Faulted;
+
+    private void CloseDomain(DomainRecord record)
+    {
+        record.AuthorityState = DomainAuthorityState.Closed;
+        ReleaseActiveSubject(record);
+    }
+
+    private void ReleaseActiveSubject(DomainRecord record)
+    {
+        if (_activeSubjects.TryGetValue(record.Binding.Subject, out var activeId) &&
+            activeId == record.Binding.BindingId)
+        {
+            _activeSubjects.Remove(record.Binding.Subject);
+        }
     }
 
     private bool Supports(PlatformAuthorityFeatures feature) =>

@@ -26,7 +26,9 @@ public sealed class PlatformAuthorityBridgeTests
     {
         var left = new HostPlatformAuthorityProvider();
         var right = new HostPlatformAuthorityProvider();
-        var subject = new PlatformDomainIdentity(new DomainId(10), 1);
+        var subject = new PlatformDomainIdentity(
+            new DomainId(10),
+            new ProcessHandle(new ProcessId(11), 1));
 
         var leftLease = left.BindDomain(subject);
         var rightLease = right.BindDomain(subject);

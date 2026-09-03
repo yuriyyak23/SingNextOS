@@ -19,9 +19,7 @@ public sealed partial class RuntimeKernel
 
         // Completion observation drains an already-authorized external effect. It must remain
         // available after local capability revocation and while the process is Exiting.
-        var identity = new PlatformDomainIdentity(
-            resolved.Value!.DomainId,
-            subject.Generation);
+        var identity = PlatformIdentity(resolved.Value!);
         return PlatformAuthority.ObserveDmaCompletion(submission, identity);
     }
 }

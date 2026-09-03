@@ -13,6 +13,7 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
     {
         public PlatformProviderDomainLease Lease { get; } = lease;
         public NeutralDomainBindingLease HybridCpuLease { get; } = hybridCpuLease;
+        public bool ExternalRevocationObserved { get; set; }
         public bool Revoked { get; set; }
     }
 
@@ -41,7 +42,7 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
             {
                 new PlatformFeatureDescriptor(
                     PlatformFeatureFamily.NeutralDomains,
-                    1,
+                    PlatformDomainContract.ContractVersion,
                     PlatformFeatureAvailability.Executable),
                 new PlatformFeatureDescriptor(
                     PlatformFeatureFamily.OwnedRegionMapping,
@@ -77,12 +78,11 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
     public PlatformAuthorityResult<PlatformProviderDomainLease> BindDomain(
         PlatformDomainIdentity subject)
     {
-        if (subject.ProcessGeneration == 0)
-        {
+        var subjectValidation = PlatformDomainContract.ValidateSubject(subject);
+        if (!subjectValidation.IsSuccess)
             return PlatformAuthorityResult<PlatformProviderDomainLease>.Fail(
-                PlatformAuthorityStatus.Denied,
-                "Process generation zero is not a valid platform subject.");
-        }
+                subjectValidation.Status,
+                subjectValidation.Message!);
 
         if (_activeSubjects.ContainsKey(subject))
         {
@@ -130,7 +130,7 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
         if (!external.IsTransitioned)
         {
             if (external.Decision == NeutralExecutionTransitionDecision.Revoked)
-                MarkRevoked(record);
+                record.ExternalRevocationObserved = true;
 
             var status = external.Decision switch
             {
@@ -165,8 +165,16 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
 
     public PlatformAuthorityResult RevokeDomain(PlatformProviderDomainLease lease)
     {
-        var validation = ValidateDomain(lease);
+        var validation = ValidateDomainIdentity(lease);
         if (!validation.IsSuccess) return validation;
+
+        var record = _domains[lease.LeaseId];
+        if (record.Revoked)
+        {
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.Revoked,
+                "The provider domain lease has already been revoked.");
+        }
 
         if (HasActiveProviderDeviceLeases(lease))
         {
@@ -182,7 +190,9 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                 "HybridCPU owned-region mappings must close before the provider domain lease.");
         }
 
-        var record = _domains[lease.LeaseId];
+        // A transition-time Revoked observation never substitutes for this exact
+        // close call. The neutral runtime must still confirm Closed or that this
+        // exact lease was already Revoked before provider closure is published.
         var external = _runtime.Close(record.HybridCpuLease);
         switch (external.Decision)
         {
@@ -240,6 +250,22 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
 
     private PlatformAuthorityResult ValidateDomain(PlatformProviderDomainLease lease)
     {
+        var identityValidation = ValidateDomainIdentity(lease);
+        if (!identityValidation.IsSuccess) return identityValidation;
+
+        var record = _domains[lease.LeaseId];
+        if (record.Revoked || record.ExternalRevocationObserved)
+        {
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.Revoked,
+                "The provider domain lease has already been revoked.");
+        }
+
+        return PlatformAuthorityResult.Ok();
+    }
+
+    private PlatformAuthorityResult ValidateDomainIdentity(PlatformProviderDomainLease lease)
+    {
         if (!_domains.TryGetValue(lease.LeaseId, out var record))
         {
             return PlatformAuthorityResult.Fail(
@@ -259,13 +285,6 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
             return PlatformAuthorityResult.Fail(
                 PlatformAuthorityStatus.WrongDomain,
                 "The provider domain lease belongs to a different Sing platform subject.");
-        }
-
-        if (record.Revoked)
-        {
-            return PlatformAuthorityResult.Fail(
-                PlatformAuthorityStatus.Revoked,
-                "The provider domain lease has already been revoked.");
         }
 
         return PlatformAuthorityResult.Ok();

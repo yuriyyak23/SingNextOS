@@ -20,9 +20,7 @@ public sealed partial class RuntimeKernel
 
         // This advances an already-authorized external lifetime. It must remain callable
         // after local capability revocation and while the process is Exiting.
-        var identity = new PlatformDomainIdentity(
-            resolved.Value!.DomainId,
-            subject.Generation);
+        var identity = PlatformIdentity(resolved.Value!);
         return PlatformAuthority.FinalizeDmaPostCompletionVisibility(
             submission,
             completionEvidence,

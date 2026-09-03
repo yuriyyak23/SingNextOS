@@ -248,7 +248,9 @@ public sealed class PlatformOwnedRegionMappingV2Tests
 
         public PlatformFeatureManifest QueryFeatures() => new(new[]
         {
-            new PlatformFeatureDescriptor(PlatformFeatureFamily.NeutralDomains, 1,
+            new PlatformFeatureDescriptor(
+                PlatformFeatureFamily.NeutralDomains,
+                PlatformDomainContract.ContractVersion,
                 PlatformFeatureAvailability.Executable),
             new PlatformFeatureDescriptor(PlatformFeatureFamily.OwnedRegionMapping,
                 PlatformOwnedRegionMappingContract.ContractVersion,

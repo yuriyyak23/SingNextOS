@@ -35,7 +35,13 @@ public enum PlatformRegionRevocationPolicy
     DrainBeforeRevoke = 0
 }
 
-public readonly record struct PlatformDomainIdentity(DomainId DomainId, ulong ProcessGeneration);
+public readonly record struct PlatformDomainIdentity(
+    DomainId DomainId,
+    ProcessHandle Process)
+{
+    public ProcessId ProcessId => Process.ProcessId;
+    public ulong ProcessGeneration => Process.Generation;
+}
 
 public readonly record struct PlatformRegionIdentity(
     RegionHandle Handle,
@@ -51,6 +57,49 @@ public readonly record struct PlatformProviderDomainLease(
     PlatformProviderDomainLeaseId LeaseId,
     PlatformProviderLeaseGeneration Generation,
     PlatformDomainIdentity Subject);
+
+public static class PlatformDomainContract
+{
+    public const uint ContractVersion = 2;
+
+    public static PlatformAuthorityResult ValidateSubject(PlatformDomainIdentity subject)
+    {
+        if (subject.DomainId.Value == 0 ||
+            subject.ProcessId.Value == 0 ||
+            subject.ProcessGeneration == 0)
+        {
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.Denied,
+                "Platform domain subjects require materialized domain and process identities with a non-zero process generation.");
+        }
+
+        return PlatformAuthorityResult.Ok();
+    }
+
+    public static PlatformAuthorityResult ValidateLease(
+        PlatformDomainIdentity expectedSubject,
+        PlatformProviderDomainLease lease)
+    {
+        var subjectValidation = ValidateSubject(expectedSubject);
+        if (!subjectValidation.IsSuccess) return subjectValidation;
+
+        if (lease.LeaseId.Value == 0 || lease.Generation.Value == 0)
+        {
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.Faulted,
+                "Provider domain leases require non-zero lease IDs and generations.");
+        }
+
+        if (lease.Subject != expectedSubject)
+        {
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.WrongDomain,
+                "The provider domain lease belongs to a different local process subject.");
+        }
+
+        return PlatformAuthorityResult.Ok();
+    }
+}
 
 public readonly record struct PlatformProviderRegionMappingLease(
     PlatformProviderRegionMappingId MappingId,

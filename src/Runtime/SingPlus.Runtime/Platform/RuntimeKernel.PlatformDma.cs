@@ -33,7 +33,7 @@ public sealed partial class RuntimeKernel
                 effect.Message!);
         }
 
-        var identity = new PlatformDomainIdentity(process.DomainId, subject.Generation);
+        var identity = PlatformIdentity(process);
         var device = PlatformAuthority.ValidateDeviceLease(deviceLease, identity);
         if (!device.IsSuccess)
         {
@@ -69,9 +69,7 @@ public sealed partial class RuntimeKernel
         if (!resolved.IsSuccess)
             return KernelResult.Fail(resolved.Error, resolved.Message!);
 
-        var identity = new PlatformDomainIdentity(
-            resolved.Value!.DomainId,
-            subject.Generation);
+        var identity = PlatformIdentity(resolved.Value!);
         var revoke = PlatformAuthority.RevokeDmaGrant(grant, identity);
         if (revoke.IsSuccess)
             UntrackPlatformDmaGrant(grant);
@@ -125,7 +123,7 @@ public sealed partial class RuntimeKernel
         if (!_processPlatformDmaGrants.TryGetValue(handle, out var grants) || grants.Count == 0)
             return KernelResult.Ok();
 
-        var identity = new PlatformDomainIdentity(process.DomainId, process.Generation);
+        var identity = PlatformIdentity(process);
         KernelResult? firstFailure = null;
         foreach (var grant in grants.ToArray())
         {

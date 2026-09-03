@@ -22,6 +22,19 @@ public sealed class PlatformAuthorityBoundaryTests
 
     [Fact]
     [Trait("Category", "Runtime")]
+    public void PlatformSubjectUsesExactLocalProcessHandleWithoutCollapsingProviderIdentity()
+    {
+        var processProperty = typeof(PlatformDomainIdentity)
+            .GetProperty(nameof(PlatformDomainIdentity.Process));
+
+        Assert.NotNull(processProperty);
+        Assert.Equal(typeof(ProcessHandle), processProperty.PropertyType);
+        Assert.NotEqual(typeof(ProcessHandle), typeof(PlatformProviderDomainLeaseId));
+        Assert.NotEqual(typeof(ProcessHandle), typeof(CapabilityId));
+    }
+
+    [Fact]
+    [Trait("Category", "Runtime")]
     public void SipContractsDoNotReferencePlatformProviderTypes()
     {
         var references = typeof(CapabilityId).Assembly.GetReferencedAssemblies();

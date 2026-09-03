@@ -80,7 +80,7 @@ public sealed partial class PlatformAuthorityBridge
         if (!providerResult.IsSuccess)
         {
             if (providerResult.Status is PlatformAuthorityStatus.Revoked or PlatformAuthorityStatus.Stale)
-                MarkDomainRevoked(domainRecord);
+                QuarantineDomain(domainRecord);
 
             return FromProviderFailure<PlatformOwnedRegionSliceMapping>(
                 providerResult.Status,
