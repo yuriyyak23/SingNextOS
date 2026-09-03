@@ -52,7 +52,7 @@ public sealed class HybridCpuIrqBindingTests
     }
 
     [Fact]
-    public void HybridCpuProviderAdvertisesIrqBindingWithoutDmaClaim()
+    public void HybridCpuProviderAdvertisesIrqBindingWithDmaAdmissionOnly()
     {
         var provider = new HybridCpuPlatformAuthorityProvider(new NeutralDomainRuntimeFacade());
         var features = provider.QueryFeatures();
@@ -64,7 +64,10 @@ public sealed class HybridCpuIrqBindingTests
             PlatformFeatureAvailability.Executable,
             features.Resolve(PlatformFeatureFamily.IrqBinding).Availability);
         Assert.Equal(
-            PlatformFeatureAvailability.Unavailable,
+            PlatformFeatureAvailability.RuntimeAdmission,
+            features.Resolve(PlatformFeatureFamily.DmaMapping).Availability);
+        Assert.NotEqual(
+            PlatformFeatureAvailability.Executable,
             features.Resolve(PlatformFeatureFamily.DmaMapping).Availability);
     }
 
