@@ -116,11 +116,11 @@ public sealed partial class PlatformAuthorityBridge
                 "DMA prepare evidence does not match the current exact visibility cycle.");
         }
 
-        if (visibilityState.Acquired)
+        if (visibilityState.Acquired || visibilityState.Consumed)
         {
             return KernelResult<PlatformDmaSubmission>.Fail(
                 KernelError.PlatformDenied,
-                "The current DMA visibility cycle was already acquired and cannot be submitted.");
+                "The current DMA visibility cycle was already consumed and cannot be submitted.");
         }
 
         var providerGrant = _dmaGrants[grant.GrantId].ProviderGrant;
@@ -167,6 +167,7 @@ public sealed partial class PlatformAuthorityBridge
             visibilityState.LocalCycle,
             grant.Range,
             grant.Direction);
+        visibilityState.Consumed = true;
         _activeDmaSubmissions.Add(
             grant.GrantId,
             new DmaSubmissionRecord(submission, providerSubmission));
