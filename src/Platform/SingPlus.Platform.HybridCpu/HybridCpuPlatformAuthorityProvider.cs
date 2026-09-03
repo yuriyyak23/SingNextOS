@@ -48,6 +48,10 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                     PlatformOwnedRegionMappingContract.ContractVersion,
                     PlatformFeatureAvailability.Executable),
                 new PlatformFeatureDescriptor(
+                    PlatformFeatureFamily.IoDomainBinding,
+                    PlatformDeviceLeaseContract.ContractVersion,
+                    PlatformFeatureAvailability.Executable),
+                new PlatformFeatureDescriptor(
                     PlatformFeatureFamily.ExplicitMemoryVisibility,
                     PlatformRegionAcquireContract.ContractVersion,
                     PlatformFeatureAvailability.Executable),
@@ -151,6 +155,13 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
     {
         var validation = ValidateDomain(lease);
         if (!validation.IsSuccess) return validation;
+
+        if (HasActiveProviderDeviceLeases(lease))
+        {
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.Denied,
+                "HybridCPU device leases must close before the provider domain lease.");
+        }
 
         if (HasActiveProviderMappings(lease))
         {
