@@ -22,9 +22,7 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
         Assert.Equal(KernelError.PlatformBindingActive, blockedTransfer.Error);
 
         scenario.Provider.CompletionState = PlatformProviderDmaCompletionState.Completed;
-        var completion = scenario.Kernel.ObservePlatformDmaCompletion(
-            scenario.Subject,
-            submission);
+        var completion = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submission);
         Assert.True(completion.IsSuccess, completion.Message);
 
         var earlyRevoke = scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant);
@@ -51,10 +49,10 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
         Assert.Equal(submission.PreparedCycle, visibility.Value.PreparedCycle);
         Assert.Equal(1, scenario.Provider.AcquireCalls);
 
-        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
-        Assert.True(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
-        Assert.True(scenario.Kernel.RevokePlatformDevice(scenario.Subject, scenario.Device).IsSuccess);
-        Assert.True(scenario.Kernel.RevokePlatformDomain(scenario.Subject, scenario.Binding).IsSuccess);
+        AssertSuccess(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant));
+        AssertSuccess(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping));
+        AssertSuccess(scenario.Kernel.RevokePlatformDevice(scenario.Subject, scenario.Device));
+        AssertSuccess(scenario.Kernel.RevokePlatformDomain(scenario.Subject, scenario.Binding));
         Assert.Equal(1, scenario.Provider.DmaRevokeCalls);
         Assert.Equal(1, scenario.Provider.MappingRevokeCalls);
         Assert.Equal(1, scenario.Provider.DeviceRevokeCalls);
@@ -73,21 +71,9 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
 
         var forbidden = new[]
         {
-            "PlatformProvider",
-            "Neutral",
-            "Physical",
-            "BusAddress",
-            "Iommu",
-            "PageTable",
-            "Pte",
-            "Descriptor",
-            "Queue",
-            "Vector",
-            "Controller",
-            "Vmcs",
-            "Vmx",
-            "Lane",
-            "Opcode",
+            "PlatformProvider", "Neutral", "Physical", "BusAddress", "Iommu",
+            "PageTable", "Pte", "Descriptor", "Queue", "Vector", "Controller",
+            "Vmcs", "Vmx", "Lane", "Opcode",
         };
         foreach (var member in typeof(PlatformDmaPostCompletionVisibilityEvidence).GetMembers(
                      BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static))
@@ -130,9 +116,9 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
         Assert.False(replaySubmit.IsSuccess);
         Assert.Equal(KernelError.PlatformDenied, replaySubmit.Error);
 
-        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
-        Assert.True(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
-        Assert.True(scenario.Kernel.RevokePlatformDevice(scenario.Subject, scenario.Device).IsSuccess);
+        AssertSuccess(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant));
+        AssertSuccess(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping));
+        AssertSuccess(scenario.Kernel.RevokePlatformDevice(scenario.Subject, scenario.Device));
     }
 
     [Fact]
@@ -217,20 +203,14 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
     public void PreSubmitAcquireCannotSatisfyFreshPostCompletionAcquire()
     {
         var scenario = CreateScenario(1804, 1840, PlatformDmaDirection.Bidirectional);
-        var firstPrepare = scenario.Kernel.PreparePlatformDmaForDevice(
-            scenario.Subject,
-            scenario.Grant);
+        var firstPrepare = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant);
         Assert.True(firstPrepare.IsSuccess, firstPrepare.Message);
-        var preSubmitAcquire = scenario.Kernel.AcquirePlatformDmaForCpu(
-            scenario.Subject,
-            scenario.Grant);
+        var preSubmitAcquire = scenario.Kernel.AcquirePlatformDmaForCpu(scenario.Subject, scenario.Grant);
         Assert.True(preSubmitAcquire.IsSuccess, preSubmitAcquire.Message);
         Assert.Equal(firstPrepare.Value!.Cycle, preSubmitAcquire.Value!.Cycle);
         Assert.Equal(1, scenario.Provider.AcquireCalls);
 
-        var secondPrepare = scenario.Kernel.PreparePlatformDmaForDevice(
-            scenario.Subject,
-            scenario.Grant);
+        var secondPrepare = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant);
         Assert.True(secondPrepare.IsSuccess, secondPrepare.Message);
         Assert.NotEqual(firstPrepare.Value.Cycle, secondPrepare.Value!.Cycle);
         var submit = scenario.Kernel.SubmitPlatformDma(
@@ -240,9 +220,7 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
         Assert.True(submit.IsSuccess, submit.Message);
 
         scenario.Provider.CompletionState = PlatformProviderDmaCompletionState.Completed;
-        var completion = scenario.Kernel.ObservePlatformDmaCompletion(
-            scenario.Subject,
-            submit.Value!);
+        var completion = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submit.Value!);
         Assert.True(completion.IsSuccess, completion.Message);
 
         var post = scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(
@@ -292,9 +270,41 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
     }
 
     [Fact]
-    public void ProcessExitReclaimsOnlyAfterCompletionPostVisibilityAndAuthorityClosure()
+    public void CapabilityRevokeStopsNewEffectsButCompletionDrainCanStillReachReclaim()
     {
         var scenario = CreateScenario(1806, 1860, PlatformDmaDirection.DeviceWritesMemory);
+        var submission = PrepareAndSubmit(scenario);
+
+        var revoke = scenario.Kernel.RevokeCapability(scenario.DeviceCapability);
+        Assert.False(revoke.IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingDraining, revoke.Error);
+
+        var newPrepare = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant);
+        Assert.False(newPrepare.IsSuccess);
+
+        scenario.Provider.CompletionState = PlatformProviderDmaCompletionState.Completed;
+        var completion = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submission);
+        Assert.True(completion.IsSuccess, completion.Message);
+        var visibility = scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(
+            scenario.Subject,
+            submission,
+            completion.Value!);
+        Assert.True(visibility.IsSuccess, visibility.Message);
+
+        AssertSuccess(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant));
+        AssertSuccess(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping));
+
+        var moved = scenario.Kernel.TransferRegion(
+            scenario.Subject,
+            scenario.Target,
+            scenario.Buffer);
+        Assert.True(moved.IsSuccess, moved.Message);
+    }
+
+    [Fact]
+    public void ProcessExitReclaimsOnlyAfterCompletionPostVisibilityAndAuthorityClosure()
+    {
+        var scenario = CreateScenario(1807, 1870, PlatformDmaDirection.DeviceWritesMemory);
         var submission = PrepareAndSubmit(scenario);
 
         var terminate = scenario.Kernel.TerminateProcess(scenario.Subject);
@@ -306,9 +316,7 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
         Assert.False(before.Value.LocalReclaimCompleted);
 
         scenario.Provider.CompletionState = PlatformProviderDmaCompletionState.Completed;
-        var completion = scenario.Kernel.ObservePlatformDmaCompletion(
-            scenario.Subject,
-            submission);
+        var completion = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submission);
         Assert.True(completion.IsSuccess, completion.Message);
         var visibility = scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(
             scenario.Subject,
@@ -334,13 +342,11 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
     [Fact]
     public void CompletionFaultInjectionKeepsEndToEndReclaimPinned()
     {
-        var scenario = CreateScenario(1807, 1870, PlatformDmaDirection.DeviceWritesMemory);
+        var scenario = CreateScenario(1808, 1880, PlatformDmaDirection.DeviceWritesMemory);
         var submission = PrepareAndSubmit(scenario);
         scenario.Provider.CompletionFailure = PlatformAuthorityStatus.Faulted;
 
-        var completion = scenario.Kernel.ObservePlatformDmaCompletion(
-            scenario.Subject,
-            submission);
+        var completion = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submission);
         Assert.False(completion.IsSuccess);
         Assert.Equal(KernelError.PlatformFaulted, completion.Error);
 
@@ -361,11 +367,12 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
         Assert.Equal(0, scenario.Provider.DeviceRevokeCalls);
     }
 
+    private static void AssertSuccess(KernelResult result) =>
+        Assert.True(result.IsSuccess, $"{result.Error}: {result.Message}");
+
     private static PlatformDmaSubmission PrepareAndSubmit(Scenario scenario)
     {
-        var prepare = scenario.Kernel.PreparePlatformDmaForDevice(
-            scenario.Subject,
-            scenario.Grant);
+        var prepare = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant);
         Assert.True(prepare.IsSuccess, prepare.Message);
         var submit = scenario.Kernel.SubmitPlatformDma(
             scenario.Subject,
@@ -509,6 +516,7 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
         IPlatformFeatureProvider,
         IPlatformDeviceLeaseProvider,
         IPlatformOwnedRegionMappingProvider,
+        IPlatformRegionRevocationProvider,
         IPlatformDmaGrantProvider,
         IPlatformDmaVisibilityProvider,
         IPlatformDmaSubmissionProvider,
@@ -521,12 +529,14 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
         private readonly HashSet<PlatformProviderDmaGrantId> _acquired = [];
         private readonly Dictionary<PlatformProviderDmaGrantId, PlatformProviderDmaSubmission> _submissions = [];
         private readonly HashSet<PlatformProviderDmaGrantId> _completed = [];
+        private readonly Dictionary<PlatformOperationId, PlatformProviderRegionMappingLease> _mappingClosures = [];
         private PlatformProviderDomainLease? _domain;
         private ulong _nextDevice = 1;
         private ulong _nextMapping = 1;
         private ulong _nextGrant = 1;
         private ulong _nextCycle = 1;
         private ulong _nextSubmission = 1;
+        private ulong _nextOperation = 1;
 
         public int AcquireCalls { get; private set; }
         public int DmaRevokeCalls { get; private set; }
@@ -657,7 +667,6 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
             PlatformProviderRegionMappingLease mapping,
             PlatformRegionRevocationPolicy policy)
         {
-            MappingRevokeCalls++;
             if (_grants.Values.Any(grant => grant.MappingLease == mapping))
             {
                 return PlatformAuthorityResult.Fail(
@@ -667,6 +676,64 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
 
             _mappings.Remove(mapping.MappingId);
             return PlatformAuthorityResult.Ok();
+        }
+
+        public PlatformAuthorityResult<PlatformRegionRevocationTicket> BeginRegionMappingRevocation(
+            PlatformProviderRegionMappingLease mapping,
+            PlatformRegionRevocationPolicy policy)
+        {
+            MappingRevokeCalls++;
+            if (!_mappings.TryGetValue(mapping.MappingId, out var exact) || exact.Lease != mapping)
+            {
+                return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Fail(
+                    PlatformAuthorityStatus.Stale,
+                    "Unknown exact provider mapping.");
+            }
+
+            if (_grants.Values.Any(grant => grant.MappingLease == mapping))
+            {
+                return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Fail(
+                    PlatformAuthorityStatus.Denied,
+                    "DMA grant remains live.");
+            }
+
+            var operation = new PlatformOperationIdentity(
+                new PlatformOperationId(_nextOperation++),
+                new PlatformOperationGeneration(1),
+                mapping.DomainLease);
+            _mappingClosures.Add(operation.OperationId, mapping);
+            return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Ok(
+                new PlatformRegionRevocationTicket(
+                    mapping.MappingId,
+                    mapping.Generation,
+                    operation));
+        }
+
+        public PlatformAuthorityResult<PlatformCompletionReceipt> ObserveCompletion(
+            PlatformOperationIdentity operation)
+        {
+            if (!_mappingClosures.TryGetValue(operation.OperationId, out var mapping))
+            {
+                return PlatformAuthorityResult<PlatformCompletionReceipt>.Fail(
+                    PlatformAuthorityStatus.Stale,
+                    "Unknown provider mapping closure operation.");
+            }
+
+            if (operation.Generation.Value != 1 || operation.DomainLease != mapping.DomainLease)
+            {
+                return PlatformAuthorityResult<PlatformCompletionReceipt>.Fail(
+                    PlatformAuthorityStatus.Stale,
+                    "Stale provider mapping closure identity.");
+            }
+
+            _mappingClosures.Remove(operation.OperationId);
+            _mappings.Remove(mapping.MappingId);
+            return PlatformAuthorityResult<PlatformCompletionReceipt>.Ok(
+                new PlatformCompletionReceipt(
+                    operation.OperationId,
+                    operation.Generation,
+                    operation.DomainLease,
+                    PlatformCompletionState.Closed));
         }
 
         public PlatformAuthorityResult<PlatformProviderDmaGrant> BindDmaGrant(
@@ -701,7 +768,7 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
                     "Unknown DMA grant.");
             }
 
-            if (_submissions.TryGetValue(grant.GrantId, out _))
+            if (_submissions.ContainsKey(grant.GrantId))
             {
                 if (!_completed.Contains(grant.GrantId))
                 {
@@ -710,7 +777,7 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
                         "DMA completion is not proven.");
                 }
 
-                if (grant.Direction is PlatformDmaDirection.DeviceWritesMemory or PlatformDmaDirection.Bidirectional &&
+                if ((grant.Direction is PlatformDmaDirection.DeviceWritesMemory or PlatformDmaDirection.Bidirectional) &&
                     !_acquired.Contains(grant.GrantId))
                 {
                     return PlatformAuthorityResult.Fail(
