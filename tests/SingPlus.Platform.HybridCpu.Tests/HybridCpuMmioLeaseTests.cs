@@ -51,7 +51,7 @@ public sealed class HybridCpuMmioLeaseTests
     }
 
     [Fact]
-    public void HybridCpuProviderAdvertisesMmioWithoutDmaClaim()
+    public void HybridCpuProviderAdvertisesMmioWithDmaAdmissionOnly()
     {
         var provider = new HybridCpuPlatformAuthorityProvider(new NeutralDomainRuntimeFacade());
         var features = provider.QueryFeatures();
@@ -63,7 +63,10 @@ public sealed class HybridCpuMmioLeaseTests
             PlatformFeatureAvailability.Executable,
             features.Resolve(PlatformFeatureFamily.MmioMapping).Availability);
         Assert.Equal(
-            PlatformFeatureAvailability.Unavailable,
+            PlatformFeatureAvailability.RuntimeAdmission,
+            features.Resolve(PlatformFeatureFamily.DmaMapping).Availability);
+        Assert.NotEqual(
+            PlatformFeatureAvailability.Executable,
             features.Resolve(PlatformFeatureFamily.DmaMapping).Availability);
     }
 
