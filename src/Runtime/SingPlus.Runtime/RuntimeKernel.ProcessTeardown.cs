@@ -243,7 +243,11 @@ public sealed partial class RuntimeKernel
                 return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
             }
 
-            firstBlockingError ??= deviceProgress.Error;
+            // A device/DMA fault may mean an external effect still exists. Fail closed before
+            // touching any lower mapping/domain authority or local reclaim path.
+            record.Phase = ProcessTeardownPhase.PlatformFaulted;
+            record.BlockingError = deviceProgress.Error;
+            return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
         }
 
         var borrowGrantProgress = AdvancePlatformBorrowReadGrantsForProcess(record.Handle);
