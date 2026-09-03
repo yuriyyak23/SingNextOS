@@ -159,7 +159,7 @@ public sealed class HybridCpuPlatformAuthorityProviderTests
     }
 
     [Fact]
-    public void ProviderAdvertisesExactMappingAndVisibilityWithoutDmaClaims()
+    public void ProviderAdvertisesExactMappingVisibilityAndDmaAdmissionWithoutExecutionClaim()
     {
         var provider = new HybridCpuPlatformAuthorityProvider(new NeutralDomainRuntimeFacade());
         var features = provider.QueryFeatures();
@@ -174,7 +174,11 @@ public sealed class HybridCpuPlatformAuthorityProviderTests
             features.Resolve(PlatformFeatureFamily.ExplicitMemoryVisibility).ContractVersion);
         Assert.Equal(PlatformFeatureAvailability.Executable,
             features.Resolve(PlatformFeatureFamily.ExplicitMemoryVisibility).Availability);
-        Assert.Equal(PlatformFeatureAvailability.Unavailable,
+        Assert.Equal(PlatformDmaGrantContract.ContractVersion,
+            features.Resolve(PlatformFeatureFamily.DmaMapping).ContractVersion);
+        Assert.Equal(PlatformFeatureAvailability.RuntimeAdmission,
+            features.Resolve(PlatformFeatureFamily.DmaMapping).Availability);
+        Assert.NotEqual(PlatformFeatureAvailability.Executable,
             features.Resolve(PlatformFeatureFamily.DmaMapping).Availability);
         Assert.Equal(
             PlatformAuthorityFeatures.NeutralDomainBinding |

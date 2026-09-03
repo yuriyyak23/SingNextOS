@@ -296,6 +296,9 @@ public sealed partial class RuntimeKernel
         var resolved = Processes.Resolve(owner);
         if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
 
+        var dma = AdvancePlatformDmaGrantsForMapping(mapping);
+        if (!dma.IsSuccess) return dma;
+
         var identity = new PlatformDomainIdentity(
             resolved.Value!.DomainId,
             owner.Generation);
@@ -350,6 +353,13 @@ public sealed partial class RuntimeKernel
         foreach (var mapping in mappings)
         {
             var subject = mapping.DomainBinding.Subject;
+            var dma = AdvancePlatformDmaGrantsForMapping(mapping);
+            if (!dma.IsSuccess)
+            {
+                firstFailure ??= dma;
+                continue;
+            }
+
             var lifecycle = PlatformAuthority.BeginRegionMappingRevocation(
                 mapping,
                 subject,

@@ -268,6 +268,13 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
         var validation = ValidateProviderMapping(mapping, expectedSlice: null);
         if (!validation.IsSuccess) return validation;
 
+        if (HasActiveProviderDmaGrants(mapping))
+        {
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.Denied,
+                "HybridCPU DMA grants must close before the provider region mapping.");
+        }
+
         var record = _providerMappings[mapping.MappingId];
         var external = _runtime.CloseOwnedRegionMapping(record.HybridCpuLease);
         switch (external.Decision)
@@ -276,6 +283,10 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
             case NeutralOwnedRegionCloseDecision.Revoked:
                 record.Revoked = true;
                 return PlatformAuthorityResult.Ok();
+            case NeutralOwnedRegionCloseDecision.ActiveDependents:
+                return PlatformAuthorityResult.Fail(
+                    PlatformAuthorityStatus.Denied,
+                    external.Reason);
             case NeutralOwnedRegionCloseDecision.Stale:
                 return PlatformAuthorityResult.Fail(
                     PlatformAuthorityStatus.Faulted,
