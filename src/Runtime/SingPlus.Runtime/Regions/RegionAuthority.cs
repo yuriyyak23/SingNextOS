@@ -5,6 +5,13 @@ namespace SingPlus.Runtime;
 
 internal readonly record struct BorrowLeaseGrant(BorrowLeaseHandle Handle, BorrowLeaseLifetime Lifetime);
 
+internal readonly record struct BorrowLeaseAuthoritySnapshot(
+    BorrowLeaseHandle Handle,
+    RegionOwner Owner,
+    RegionOwner Borrower,
+    long ByteLength,
+    BorrowLeaseLifetime Lifetime);
+
 public sealed class RegionAuthority
 {
     private sealed class RegionRecord
@@ -20,6 +27,7 @@ public sealed class RegionAuthority
         public BorrowLeaseLifetime? BorrowLifetime { get; set; }
         public ITransferableOwnedPayload? Payload { get; set; }
         public bool PlatformMappingReserved { get; set; }
+        public bool ExternalBorrowReadGrantReserved { get; set; }
     }
 
     private readonly Dictionary<RegionId, RegionRecord> _regions = [];
@@ -68,6 +76,7 @@ public sealed class RegionAuthority
         if (!validation.IsSuccess) return KernelResult<BorrowLeaseGrant>.Fail(validation.Error, validation.Message!);
         var record = _regions[handle.RegionId];
         if (record.PlatformMappingReserved) return KernelResult<BorrowLeaseGrant>.Fail(KernelError.PlatformBindingActive, "An owned region with an active platform mapping cannot be loaned.");
+        if (record.ExternalBorrowReadGrantReserved) return KernelResult<BorrowLeaseGrant>.Fail(KernelError.PlatformBindingActive, "An owned region with an active external borrow read grant cannot be loaned.");
         if (record.BorrowGeneration.Value == ulong.MaxValue) return KernelResult<BorrowLeaseGrant>.Fail(KernelError.CapacityExhausted, "Borrow lease generation is exhausted.");
 
         var generation = new BorrowLeaseGeneration(record.BorrowGeneration.Value + 1);
@@ -80,12 +89,71 @@ public sealed class RegionAuthority
         return KernelResult<BorrowLeaseGrant>.Ok(new BorrowLeaseGrant(lease, lifetime));
     }
 
+    internal KernelResult<BorrowLeaseAuthoritySnapshot> ValidateBorrowLease(
+        BorrowLeaseHandle lease,
+        RegionOwner owner,
+        RegionOwner borrower)
+    {
+        if (!_regions.TryGetValue(lease.Region.RegionId, out var record))
+            return KernelResult<BorrowLeaseAuthoritySnapshot>.Fail(KernelError.RegionNotFound, "Region was not found.");
+        if (record.Generation != lease.Region.Generation)
+            return KernelResult<BorrowLeaseAuthoritySnapshot>.Fail(KernelError.StaleGeneration, "Region generation is stale.");
+        if (record.BorrowGeneration != lease.Generation)
+            return KernelResult<BorrowLeaseAuthoritySnapshot>.Fail(KernelError.StaleGeneration, "Borrow lease generation is stale.");
+        if (record.Owner != owner)
+            return KernelResult<BorrowLeaseAuthoritySnapshot>.Fail(KernelError.WrongRegionOwner, "Region owner does not match the borrow lease.");
+        if (record.State != RegionState.Loaned || record.Borrower != borrower || record.BorrowLifetime is null || !record.BorrowLifetime.IsActive)
+            return KernelResult<BorrowLeaseAuthoritySnapshot>.Fail(KernelError.InvalidRegionState, "Borrow lease is not active for the specified borrower.");
+
+        return KernelResult<BorrowLeaseAuthoritySnapshot>.Ok(
+            new BorrowLeaseAuthoritySnapshot(
+                lease,
+                record.Owner,
+                borrower,
+                record.ByteLength,
+                record.BorrowLifetime));
+    }
+
+    internal KernelResult ReserveExternalBorrowReadGrant(
+        BorrowLeaseHandle lease,
+        RegionOwner owner,
+        RegionOwner borrower)
+    {
+        var validation = ValidateBorrowLease(lease, owner, borrower);
+        if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
+        var record = _regions[lease.Region.RegionId];
+        if (record.PlatformMappingReserved)
+            return KernelResult.Fail(KernelError.PlatformBindingActive, "The borrowed region already has an owned-region platform mapping reservation.");
+        if (record.ExternalBorrowReadGrantReserved)
+            return KernelResult.Fail(KernelError.PlatformBindingActive, "The borrow lease already has an active external read grant.");
+        record.ExternalBorrowReadGrantReserved = true;
+        return KernelResult.Ok();
+    }
+
+    internal KernelResult ReleaseExternalBorrowReadGrantReservation(
+        BorrowLeaseHandle lease,
+        RegionOwner owner,
+        RegionOwner borrower,
+        BorrowLeaseLifetime expectedLifetime)
+    {
+        var validation = ValidateBorrowLease(lease, owner, borrower);
+        if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
+        var record = _regions[lease.Region.RegionId];
+        if (!ReferenceEquals(record.BorrowLifetime, expectedLifetime))
+            return KernelResult.Fail(KernelError.StaleGeneration, "Borrow lease lifetime is stale.");
+        if (!record.ExternalBorrowReadGrantReserved)
+            return KernelResult.Fail(KernelError.PlatformBindingNotFound, "The borrow lease does not have an active external read grant reservation.");
+        record.ExternalBorrowReadGrantReserved = false;
+        return KernelResult.Ok();
+    }
+
     public KernelResult ReturnLoan(BorrowLeaseHandle lease, RegionOwner borrower)
     {
         if (!_regions.TryGetValue(lease.Region.RegionId, out var record)) return KernelResult.Fail(KernelError.RegionNotFound, "Region was not found.");
         if (record.Generation != lease.Region.Generation) return KernelResult.Fail(KernelError.StaleGeneration, "Region generation is stale.");
         if (record.BorrowGeneration != lease.Generation) return KernelResult.Fail(KernelError.StaleGeneration, "Borrow lease generation is stale.");
         if (record.State != RegionState.Loaned || record.Borrower != borrower || record.BorrowLifetime is null) return KernelResult.Fail(KernelError.InvalidRegionState, "Borrow lease is not active for the specified borrower.");
+        if (record.ExternalBorrowReadGrantReserved) return KernelResult.Fail(KernelError.PlatformBindingActive, "The CPU borrow cannot complete while its external read grant is active or draining.");
         record.BorrowLifetime.InvalidateForRuntime();
         record.BorrowLifetime = null;
         record.Borrower = null;
@@ -100,6 +168,7 @@ public sealed class RegionAuthority
         if (record.BorrowGeneration != lease.Generation) return KernelResult.Fail(KernelError.StaleGeneration, "Borrow lease generation is stale.");
         if (record.Owner != owner) return KernelResult.Fail(KernelError.WrongRegionOwner, "Region owner does not match.");
         if (record.State != RegionState.Loaned || record.Borrower is null || record.BorrowLifetime is null) return KernelResult.Fail(KernelError.InvalidRegionState, "Region does not have an active borrow lease.");
+        if (record.ExternalBorrowReadGrantReserved) return KernelResult.Fail(KernelError.PlatformBindingActive, "The CPU borrow cannot be revoked while its external read grant is active or draining.");
         record.BorrowLifetime.InvalidateForRuntime();
         record.BorrowLifetime = null;
         record.Borrower = null;
@@ -113,6 +182,7 @@ public sealed class RegionAuthority
         if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
         var record = _regions[handle.RegionId];
         if (record.PlatformMappingReserved) return KernelResult.Fail(KernelError.PlatformBindingActive, "The owned region already has an active platform mapping.");
+        if (record.ExternalBorrowReadGrantReserved) return KernelResult.Fail(KernelError.PlatformBindingActive, "The region has an active external borrow read grant.");
         record.PlatformMappingReserved = true;
         return KernelResult.Ok();
     }
@@ -133,6 +203,7 @@ public sealed class RegionAuthority
         if (!validation.IsSuccess) return KernelResult<RegionHandle>.Fail(validation.Error, validation.Message!);
         var record = _regions[handle.RegionId];
         if (record.PlatformMappingReserved) return KernelResult<RegionHandle>.Fail(KernelError.PlatformBindingActive, "An owned region with an active platform mapping cannot be transferred.");
+        if (record.ExternalBorrowReadGrantReserved) return KernelResult<RegionHandle>.Fail(KernelError.PlatformBindingActive, "A region with an active external borrow read grant cannot be transferred.");
         record.State = RegionState.Transferred;
         record.Owner = target;
         record.Generation = new RegionGeneration(record.Generation.Value + 1);
@@ -146,6 +217,7 @@ public sealed class RegionAuthority
         if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
         var record = _regions[handle.RegionId];
         if (record.PlatformMappingReserved) return KernelResult.Fail(KernelError.PlatformBindingActive, "An owned region with an active platform mapping cannot be released.");
+        if (record.ExternalBorrowReadGrantReserved) return KernelResult.Fail(KernelError.PlatformBindingActive, "A region with an active external borrow read grant cannot be released.");
         record.State = RegionState.Released;
         record.Payload = null;
         return KernelResult.Ok();
@@ -164,8 +236,14 @@ public sealed class RegionAuthority
 
     internal IReadOnlyList<RegionHandle> ReturnAllLoansForBorrowerDomain(DomainId borrowerDomainId)
     {
+        var candidates = _regions.Values
+            .Where(r => r.State == RegionState.Loaned && r.Borrower?.DomainId == borrowerDomainId)
+            .ToArray();
+        if (candidates.Any(static r => r.ExternalBorrowReadGrantReserved))
+            throw new InvalidOperationException("External borrow read grants must reach verified closure before borrower-domain loan reclaim.");
+
         var returned = new List<RegionHandle>();
-        foreach (var record in _regions.Values.Where(r => r.State == RegionState.Loaned && r.Borrower?.DomainId == borrowerDomainId))
+        foreach (var record in candidates)
         {
             returned.Add(new RegionHandle(record.Id, record.Generation));
             record.BorrowLifetime?.InvalidateForRuntime();
@@ -182,6 +260,7 @@ public sealed class RegionAuthority
         foreach (var record in _regions.Values.Where(r => r.Owner.DomainId == domainId && r.State is RegionState.Owned or RegionState.Loaned))
         {
             if (record.PlatformMappingReserved) throw new InvalidOperationException("Platform-mapped regions must be revoked before domain reclaim.");
+            if (record.ExternalBorrowReadGrantReserved) throw new InvalidOperationException("External borrow read grants must be revoked before domain reclaim.");
             reclaimed.Add(new RegionHandle(record.Id, record.Generation));
             record.BorrowLifetime?.InvalidateForRuntime();
             record.BorrowLifetime = null;
