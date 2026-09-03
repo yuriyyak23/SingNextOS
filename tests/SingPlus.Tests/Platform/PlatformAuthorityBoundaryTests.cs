@@ -1,6 +1,7 @@
 using System.Reflection;
 using SingPlus.Contracts;
 using SingPlus.Platform;
+using SingPlus.Runtime;
 
 namespace SingPlus.Tests.Platform;
 
@@ -56,7 +57,11 @@ public sealed class PlatformAuthorityBoundaryTests
             "VMX",
             "PhysicalAddress",
             "Opcode",
-            "LaneId"
+            "Lane",
+            "Slot",
+            "Smt",
+            "VirtualThreadId",
+            "FunctionalUnit"
         };
 
         var surface = typeof(IPlatformAuthorityProvider).Assembly
@@ -70,6 +75,29 @@ public sealed class PlatformAuthorityBoundaryTests
                 surface,
                 entry => entry.Contains(forbidden, StringComparison.OrdinalIgnoreCase));
         }
+    }
+
+    [Fact]
+    [Trait("Category", "Runtime")]
+    public void ExecutionPolicyBoundaryKeepsProviderIdentityBridgePrivate()
+    {
+        var providerParameterTypes = typeof(IPlatformExecutionPolicyProvider)
+            .GetMethods()
+            .SelectMany(static method => method.GetParameters())
+            .Select(static parameter => parameter.ParameterType)
+            .ToArray();
+
+        Assert.DoesNotContain(typeof(CapabilityId), providerParameterTypes);
+        Assert.DoesNotContain(typeof(PlatformDomainBinding), providerParameterTypes);
+
+        var registrationPropertyTypes = typeof(PlatformExecutionPolicyRegistration)
+            .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+            .Select(static property => property.PropertyType)
+            .ToArray();
+
+        Assert.DoesNotContain(typeof(PlatformProviderDomainLease), registrationPropertyTypes);
+        Assert.DoesNotContain(typeof(PlatformProviderDomainLeaseId), registrationPropertyTypes);
+        Assert.DoesNotContain(typeof(PlatformProviderLeaseGeneration), registrationPropertyTypes);
     }
 
     private static IEnumerable<string> DescribePublicSurface(Type type)

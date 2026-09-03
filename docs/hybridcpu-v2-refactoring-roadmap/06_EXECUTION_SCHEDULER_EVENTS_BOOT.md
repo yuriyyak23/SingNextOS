@@ -10,10 +10,20 @@ generation-bound `KernelEventEndpoint` use through IRQ delivery.
 The first Phase 6 slice closes the remaining execution-attachment and causal
 identity gaps: an external domain may be attached or explicitly detached only
 while the process is `Created` or `Admitted`, and the v2 platform subject contains
-the exact `DomainId + ProcessHandle`. Scheduler-policy admission, reuse of the
-event primitive by another asynchronous subsystem, and AOT/image/ISE
-qualification remain open. External qualification can proceed independently and
-corresponds to `EXT-HCPU-001`.
+the exact `DomainId + ProcessHandle`.
+
+The second slice adds the local `ExecutionPolicy` v1 contract. It carries only a
+semantic `ExecutionBudget`, `PriorityClass`, `LatencyHint` and `ThroughputHint`,
+is configured against the exact live v2 local platform-domain binding, and
+returns a local `PlatformExecutionPolicyRegistration` only after provider
+success. The host provider advertises this feature only as `ModelOnly`.
+`HybridCpuPlatformAuthorityProvider` reports it unavailable because the current
+neutral runtime has no stable scheduler-policy interface; real admission and
+enforcement therefore remain `ExternalBlocked` under `EXT-HCPU-003`.
+
+Reuse of the event primitive by another asynchronous subsystem and
+AOT/image/ISE qualification remain open. External qualification can proceed
+independently and corresponds to `EXT-HCPU-001`.
 
 ## Goal
 
@@ -106,22 +116,52 @@ provider makes it asynchronous, it must compose with the existing
 `PlatformOperationIdentity` / completion contract and reject stale completion
 generations; parsing or receipt possession alone must not publish process state.
 
-## Scheduling contract
+## Completed slice B — minimal scheduler-policy contract
 
-Expose intent, not implementation topology.
-
-Good inputs:
+`ExecutionPolicy` v1 exposes intent, not implementation topology:
 
 ```text
-ExecutionBudget
+ExecutionBudget(
+  TimeSpan MaximumExecutionTime,
+  TimeSpan ReplenishmentPeriod)
 PriorityClass
 LatencyHint
 ThroughputHint
-DeadlineProfile (future/optional)
-AffinityClass (only if semantically justified)
 ```
 
-Bad inputs:
+`MaximumExecutionTime` is aggregate provider-accounted execution time within a
+positive `ReplenishmentPeriod`; it is not a wall-clock deadline or a single-lane
+utilization fraction. It may therefore exceed the replenishment period when a
+provider accounts parallel execution contexts. Both durations must be positive,
+but their ratio establishes no placement, concurrency or real-time guarantee.
+Latency and throughput are independent hints; their combination remains subject
+to provider admission rather than becoming a topology assumption in the ABI.
+
+`RuntimeKernel.ConfigurePlatformExecutionPolicy(...)` validates the exact live
+process generation and the caller-supplied local `PlatformDomainBinding` before
+the privileged bridge resolves its private provider lease. A successful result
+returns:
+
+```text
+PlatformExecutionPolicyRegistration(
+  exact local PlatformDomainBinding,
+  exact requested policy,
+  exact feature descriptor)
+```
+
+The registration is a record of accepted SingNextOS policy intent. It is not a
+capability, provider grant, completion receipt, scheduler-quality result or
+evidence that budget enforcement occurred. Provider lease identity remains
+bridge-private, and no registration is published when local validation, feature
+discovery, the provider call or provider-result validation fails.
+
+Policy is immutable for the lifetime of one binding and must be configured
+before execution starts. Repeating the exact accepted request is idempotent and
+does not call the provider again; attempting to replace it, or configuring it
+after the process becomes `Running`, `Parked` or `Exiting`, fails before another
+provider policy call.
+
+The contract intentionally has no fields for:
 
 ```text
 lane 0..7 placement
@@ -130,7 +170,11 @@ SMT virtual-thread ID
 exact physical functional unit selection
 ```
 
-HybridCPU runtime remains authoritative for legality, lane materialization and scheduling-budget enforcement.
+The deterministic host provider exercises the contract and its negative
+boundaries as `ExecutionPolicy` v1 / `ModelOnly`. The HybridCPU provider does not
+fabricate an implementation from lane, slot, SMT or opcode internals and reports
+the family unavailable. HybridCPU remains authoritative for legality, physical
+placement and any future scheduling-budget enforcement.
 
 ## Event/wait primitive
 
@@ -217,29 +261,49 @@ Until then expose only supported budget/priority semantics.
   before publishing local exit/reclaim;
 - post-start provider-close failure pins teardown in `Exiting` and forbids local reclaim.
 
+## Completed slice-B tests
+
+- a valid budget/priority/latency/throughput request against the exact live v2
+  binding returns the exact local `PlatformExecutionPolicyRegistration` only
+  after host provider success;
+- invalid policy values, a stale process generation, and a stale or forged local
+  binding are rejected before the provider policy call;
+- provider denial, stale/revoked/wrong-domain/faulted failure and malformed
+  success do not publish a local registration; ambiguous outcomes quarantine
+  the binding until its exact domain close;
+- registration identity is tied to the exact process-scoped binding; a
+  same-domain sibling cannot configure through it, and a closed old binding
+  cannot be reused after a fresh binding is created;
+- the first exact policy is immutable, an exact repeat is idempotent, and
+  `Running`, `Parked` or `Exiting` processes cannot configure policy;
+- exact domain-close failure after policy quarantine pins the process in
+  `Exiting` without publishing local reclaim;
+- feature contract/version/availability checks fail closed, the host advertises
+  only `ModelOnly`, and the HybridCPU provider reports policy unavailable;
+- public scheduler-policy contracts contain no lane, slot, SMT, physical-unit,
+  raw opcode, VMCS or provider-token authority.
+
 ## Remaining Phase-6 tests
 
 - stale lifecycle completion cannot transition a recycled process;
 - park waits for platform completion when required;
-- scheduler request contains no lane IDs/raw opcodes;
 - event routed after process generation change is rejected;
 - cancellation of a platform operation cannot return an owned buffer before Phase 2/4 closure;
 - external toolchain qualification records versioned evidence without changing native API semantics.
 
 ## Next implementation pool and external boundaries
 
-The next pool is the first minimal scheduler-policy slice: semantic execution
-budget, priority and latency/throughput intent tied to the exact local v2
-platform-domain binding; the provider lease remains bridge-private. No lane,
-slot, SMT or raw opcode becomes ABI. The host path may be classified only as
-`ModelOnly`. The current HybridCPU neutral runtime exports synchronous lifecycle
-transitions but no stable scheduler-policy API, so real enforcement remains
-`ExternalBlocked` under the remaining part of `EXT-HCPU-003`.
+The next pool should reuse the existing policy-neutral event/completion primitive
+for one additional asynchronous subsystem. It must bind delivery to the exact
+process generation, reject stale delivery, and define cancellation/drain/reclaim
+ordering without creating a second publication authority. A host/model path may
+prove local semantics, but it cannot be reported as hardware event delivery.
 
-Real timer binding remains `ExternalBlocked` under `EXT-HCPU-002`. Reproducible
-AOT/image/ISE qualification remains `ExternalBlocked` under `EXT-HCPU-001`.
-Neither boundary is replaced with a locally fabricated success path in this
-slice.
+Real timer binding remains `ExternalBlocked` under `EXT-HCPU-002`. Real
+HybridCPU scheduler-policy admission remains `ExternalBlocked` under
+`EXT-HCPU-003`. Reproducible AOT/image/ISE qualification remains
+`ExternalBlocked` under `EXT-HCPU-001`. None of those boundaries is replaced
+with a locally fabricated success path.
 
 ## Acceptance criteria
 

@@ -54,6 +54,7 @@ public sealed partial class PlatformAuthorityBridge
         public PlatformDomainBinding Binding { get; } = binding;
         public PlatformProviderDomainLease ProviderLease { get; } = providerLease;
         public DomainAuthorityState AuthorityState { get; set; }
+        public PlatformExecutionPolicyRegistration? ExecutionPolicy { get; set; }
     }
 
     private sealed class MappingRecord(

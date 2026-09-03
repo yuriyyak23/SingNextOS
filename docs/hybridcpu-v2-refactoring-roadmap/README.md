@@ -78,7 +78,7 @@ The main missing element is not a new ISA or a new OS object model. It is a prod
 
 | Area | Current SingNextOS | Current HybridCPU-v2 | Planned closure |
 |---|---|---|---|
-| execution domains | process-exact v2 platform binding with synchronous typed Start/Park/Resume; no scheduler-policy contract | neutral execution-domain descriptors/admission | Phases 1, 3, 6 |
+| execution domains | process-exact v2 platform binding with synchronous typed Start/Park/Resume plus binding-scoped `ExecutionPolicy` v1 on the host model | neutral execution lifecycle; no stable scheduler-policy API | Phases 1, 3, 6 |
 | memory domains | strong region ownership/generation; minimal platform mapping | bounded memory/address-space domain model | Phases 1, 3, 4 |
 | mapping/remap | host-backed exact owned-region mapping abstraction | translation/invalidation mechanisms; no generic atomic ownership remap proof | Phase 4 |
 | ownership | `OwnedRegion`/`OwnedBuffer`, MOVE, generation | domain/mapping authority, not a duplicate OS ownership object | Preserve Sing ownership; adapt in Phase 4 |
@@ -93,7 +93,7 @@ The main missing element is not a new ISA or a new OS object model. It is a prod
 | evidence | no provider API | evidence/visibility concepts exist; hardware-rooted attestation not proven | Phase 9 |
 | GPU/display | no materialized service/provider | generic DMA/accelerator primitives, no proven display path | Phase 11 |
 | boot/AOT | native entry/build/admission only | external toolchain/ISE is required | Phase 6 |
-| scheduler interaction | bound Running/Parked publication follows confirmed neutral transitions; no budget/priority/latency contract | scheduling budget and lane legality owned by HybridCPU runtime | Phase 6 |
+| scheduler interaction | typed budget/priority/latency/throughput intent produces an exact local registration only after host `ModelOnly` acceptance; no HybridCPU enforcement claim | scheduling budget and lane legality remain HybridCPU-owned; external policy admission is unavailable | Phase 6 |
 | feature discovery | versioned semantic manifest plus legacy flags; `NeutralDomains` is v2 | richer hardware/runtime/domain states exist internally | Phase 1 foundation; version bumps remain phase-local |
 
 ## Minimal high-value implementation slice
