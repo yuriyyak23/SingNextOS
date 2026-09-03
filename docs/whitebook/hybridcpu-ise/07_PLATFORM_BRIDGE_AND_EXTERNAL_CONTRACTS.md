@@ -7,9 +7,14 @@
 > versions the SingPlus `NeutralDomains` contract at v2 with an exact
 > `(DomainId, ProcessHandle)` subject. The current scheduler slice adds
 > `ExecutionPolicy` v1 as a binding-scoped host `ModelOnly` contract while the
-> HybridCPU provider reports that family unavailable. This proves no HybridCPU
-> placement, budget enforcement, scheduler quality, hard real-time, boot or
-> security property beyond its tested evidence.
+> HybridCPU provider reports that family unavailable. The DMA-event Phase-6 slice
+> reuses the generation-bound `KernelEventEndpoint` for a second producer: an
+> exact local/model DMA-completion notification is committed only after the
+> existing provider completion evidence validates. That event is not completion
+> authority, CPU-visibility evidence or reclaim proof, and HybridCPU exposes no
+> neutral DMA submit/completion/cancel API behind it. These slices prove no
+> HybridCPU placement, budget enforcement, executable DMA, scheduler quality,
+> hard real-time, boot or security property beyond their tested evidence.
 
 ## Current status at SingNextOS `af791aba...`
 

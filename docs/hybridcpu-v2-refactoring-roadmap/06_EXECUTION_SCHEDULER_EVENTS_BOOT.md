@@ -21,9 +21,16 @@ success. The host provider advertises this feature only as `ModelOnly`.
 neutral runtime has no stable scheduler-policy interface; real admission and
 enforcement therefore remain `ExternalBlocked` under `EXT-HCPU-003`.
 
-Reuse of the event primitive by another asynchronous subsystem and
-AOT/image/ISE qualification remain open. External qualification can proceed
-independently and corresponds to `EXT-HCPU-001`.
+The third slice applies the same process-generation-bound `KernelEventEndpoint`
+mailbox to exact DMA completion observation. The new overload reserves an
+invisible endpoint slot before provider observation and commits one local
+`Completion` event only after exact v4 `Completed` evidence validates. Pending,
+denied, faulted, malformed or stale outcomes publish nothing. The event remains
+a wakeup, not completion authority, CPU-visibility evidence or reclaim proof.
+
+A cancellable asynchronous waiter over the endpoint and AOT/image/ISE
+qualification remain open. External qualification can proceed independently and
+corresponds to `EXT-HCPU-001`.
 
 ## Goal
 
@@ -176,14 +183,56 @@ fabricate an implementation from lane, slot, SMT or opcode internals and reports
 the family unavailable. HybridCPU remains authoritative for legality, physical
 placement and any future scheduling-budget enforcement.
 
-## Event/wait primitive
+## Completed slice C — second asynchronous event source
 
-Introduce or standardize one minimal kernel/runtime event/completion abstraction suitable for:
+The minimal kernel/runtime event abstraction is now used by two distinct
+platform producers:
+
+| Producer | Delivery gate | Classification |
+|---|---|---|
+| IRQ | exact provider delivery observation plus exact provider sequence completion | HybridCPU neutral binding where advertised |
+| DMA completion | exact v4 provider `Completed` observation for the tracked submission | local/model projection only; no executable HybridCPU DMA claim |
+
+`KernelEventRegistry` separates an invisible staged reservation from committed
+consumer-visible delivery. An endpoint still admits only one staged or committed
+event. A source reserves that slot, completes its source-specific validation and
+then either commits the exact event or rolls the reservation back. This prevents
+an occupied endpoint from consuming a one-shot DMA completion observation and
+prevents IRQ/DMA failure paths from exposing a placeholder event.
+
+The bridge also admits only one in-flight provider completion observation for
+one exact DMA submission. A concurrent observer through another endpoint is
+rejected as draining before a second provider call; after the first result is
+settled, normal pending retry or completed replay rules apply.
+
+The public DMA shape is only an overload of the existing completion observation:
+
+```text
+ObservePlatformDmaCompletion(
+  exact ProcessHandle,
+  exact PlatformDmaSubmission,
+  exact KernelEventEndpoint)
+    -> exact PlatformDmaCompletionEvidence
+       + one committed KernelEventClass.Completion notification
+```
+
+The endpoint belongs to the exact `ProcessHandle` generation. The event source
+uses only the local operation ID/generation; provider submission/grant tokens do
+not enter the event. A stale/recycled process, stale/closed/foreign endpoint, or
+forged operation/grant/cycle identity is rejected before provider observation.
+At most one event is committed for one exact completion proof.
+
+The event means only "exact DMA completion was observed." It does not mean that
+device-written bytes are CPU-visible. `PlatformDmaCompletionEvidence` remains the
+typed input to the existing direction-aware post-completion step; write-capable
+DMA still requires a fresh acquire before the submission pin is released. Event
+consumption is neither required for nor sufficient to close a grant, mapping,
+device or domain, and it cannot authorize region transfer or reclaim.
+
+The same minimal abstraction remains suitable for later:
 
 - process park/wakeup;
 - timer completion;
-- IRQ delivery;
-- DMA completion;
 - accelerator completion;
 - virtualization traps/events;
 - platform domain transition completion.
@@ -192,12 +241,27 @@ High-level source APIs remain `Task`/`ValueTask`, cancellation and typed SIP eve
 
 ## Cancellation
 
-Compose with Track A rather than replacing it:
+Endpoint cancellation and external-operation cancellation remain separate.
+Closing a `KernelEventEndpoint` cancels unread/future local notification only;
+it does not cancel, complete or close a DMA submission. If the endpoint is full
+or closed, provider completion observation is not started through the event
+overload. A close that races an already staged provider observation returns
+`PlatformBindingDraining`; it can be retried after that exact publication either
+commits or rolls back. If the process is already `Exiting`, the event overload is
+rejected and the existing endpoint-free completion/post-visibility calls remain
+available solely to drain the already-authorized operation.
+
+This composes with Track A rather than replacing it:
 
 - SIP call cancellation closes/cancels protocol work at the service/runtime boundary;
 - platform operation cancellation requests external closure;
 - caller-visible cancellation is published only with a well-defined ownership state;
 - cancelled platform work must still drain/revoke mappings before buffer reuse.
+
+No neutral HybridCPU DMA cancellation/closure receipt exists today, so this
+slice does not fabricate `CancelDma` success. Completion, required visibility,
+DMA-grant close, mapping/device/domain close and only then local reclaim remain
+mandatory after notification cancellation.
 
 ## Boot/AOT/ISE qualification
 
@@ -283,31 +347,67 @@ Until then expose only supported budget/priority semantics.
 - public scheduler-policy contracts contain no lane, slot, SMT, physical-unit,
   raw opcode, VMCS or provider-token authority.
 
+## Completed slice-C tests
+
+- `Pending` DMA completion and ordinary provider denial roll back an invisible
+  reservation and leave the endpoint empty; a later exact `Completed` retry
+  commits one generation-bound event;
+- provider fault, stale/revoked/wrong-domain completion lifetime and malformed
+  success publish no event and retain the existing fault pin;
+- stale process generation, stale/closed/foreign endpoint, and forged operation,
+  grant generation or visibility cycle fail before provider observation;
+- a full endpoint backpressures a second DMA completion before provider
+  observation, then delivers it exactly once after the first event is consumed;
+- an in-flight reservation rejects concurrent observers of one exact submission
+  before a second provider call, publishes at most once, and keeps a racing
+  endpoint close draining until the staged publication resolves;
+- the IRQ source now also commits only after exact provider delivery completion,
+  and failed completion exposes no event before a safe retry;
+- consuming the DMA notification does not permit grant closure, region transfer
+  or CPU access before exact post-completion visibility;
+- closing the endpoint cancels notification only; process teardown remains
+  `PlatformDraining`, the endpoint-bearing overload is rejected in `Exiting`,
+  and the endpoint-free completion/visibility path drains all external authority
+  before region reclaim;
+- an old endpoint cannot deliver into a recycled process generation, and events
+  expose neither provider tokens nor raw hardware/topology identity.
+
 ## Remaining Phase-6 tests
 
 - stale lifecycle completion cannot transition a recycled process;
 - park waits for platform completion when required;
-- event routed after process generation change is rejected;
 - cancellation of a platform operation cannot return an owned buffer before Phase 2/4 closure;
+- cancellable asynchronous endpoint waiting composes with process/channel teardown
+  without turning a wait cancellation into platform-operation completion;
 - external toolchain qualification records versioned evidence without changing native API semantics.
 
 ## Next implementation pool and external boundaries
 
-The next pool should reuse the existing policy-neutral event/completion primitive
-for one additional asynchronous subsystem. It must bind delivery to the exact
-process generation, reject stale delivery, and define cancellation/drain/reclaim
-ordering without creating a second publication authority. A host/model path may
-prove local semantics, but it cannot be reported as hardware event delivery.
+The next pool should add one exact cancellable asynchronous wait over
+`KernelEventEndpoint`, following Track-A waiter teardown rules: endpoint/process
+close cancels only an uncommitted wait, while an already committed event remains
+the source result until consumed or the endpoint itself is explicitly closed.
+Wait cancellation must not become DMA/platform cancellation or ownership-return
+proof. This remains a local runtime contract, not evidence of HybridCPU WFE/SEV,
+timer or executable DMA delivery.
 
 Real timer binding remains `ExternalBlocked` under `EXT-HCPU-002`. Real
 HybridCPU scheduler-policy admission remains `ExternalBlocked` under
-`EXT-HCPU-003`. Reproducible AOT/image/ISE qualification remains
+`EXT-HCPU-003`. HybridCPU `master` has no neutral DMA submit/completion/cancel
+surface; the separately pinned visibility head likewise does not provide one.
+Executable DMA therefore remains `ExternalBlocked` under `EXT-HCPU-004`.
+Reproducible AOT/image/ISE qualification remains
 `ExternalBlocked` under `EXT-HCPU-001`. None of those boundaries is replaced
 with a locally fabricated success path.
 
 ## Acceptance criteria
 
-Phase 6 is complete when process lifecycle state is causally tied to neutral HybridCPU execution lifecycle, one reusable event/completion primitive handles asynchronous platform effects, and the AOT/image/ISE path is either reproducibly qualified or explicitly remains `ExternalBlocked` with no fabricated fallback claim.
+Phase 6 is complete when process lifecycle state is causally tied to neutral
+HybridCPU execution lifecycle, one reusable event/completion primitive handles
+typed asynchronous platform sources and provides cancellable asynchronous
+consumption with exact endpoint/process teardown semantics, and the AOT/image/ISE
+path is either reproducibly qualified or explicitly remains `ExternalBlocked`
+with no fabricated fallback claim.
 
 ## Do not do
 
