@@ -152,6 +152,23 @@ internal sealed class KernelEventRegistry
         }
     }
 
+    public KernelResult DiscardExact(KernelEvent @event)
+    {
+        var validation = Validate(@event.Endpoint.Owner, @event.Endpoint);
+        if (!validation.IsSuccess) return validation;
+
+        var record = _endpoints[@event.Endpoint.EndpointId];
+        if (record.Pending is not { } pending || pending != @event)
+        {
+            return KernelResult.Fail(
+                KernelError.PlatformFaulted,
+                "The exact kernel event selected for rollback is no longer pending.");
+        }
+
+        record.Pending = null;
+        return KernelResult.Ok();
+    }
+
     public KernelResult<KernelEvent> Consume(
         ProcessHandle owner,
         KernelEventEndpoint endpoint)
