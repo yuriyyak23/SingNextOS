@@ -2,18 +2,19 @@
 
 ## Status
 
-**In progress — four vertical slices implemented.**
+**In progress — five vertical slices implemented.**
 
 Implemented slices:
 
 1. exact capability-backed semantic device lease authority;
 2. exact capability-backed bounded MMIO lease/range authority;
 3. exact capability-backed stale-generation-safe IRQ/event binding;
-4. exact admission-only DMA grant authority composed from a live device lease plus an exact mapped owned-region slice, bounded relative range, and direction.
+4. exact admission-only DMA grant authority composed from a live device lease plus an exact mapped owned-region slice, bounded relative range, and direction;
+5. exact grant-scoped non-coherent DMA visibility cycles with release/publication prepare evidence and direction-aware post-write CPU acquire evidence.
 
-Slice 4 closes the first DMA-authority admission step, including exact identity composition and dependent-lifetime ordering. It deliberately does **not** claim executable DMA: non-coherent prepare/acquire, submit, completion/drain, and a real or faithful bounded transfer acceptance path remain Phase-5 work. The phase acceptance boundary is therefore **not** complete.
+Slice 5 closes the explicit non-coherent visibility-ordering step without claiming executable DMA. DMA submit, completion/drain/revoke ordering around an in-flight transfer, and a real or faithful bounded transfer acceptance path remain Phase-5 work. The phase acceptance boundary is therefore **not** complete.
 
-The Slice-4 cross-repository integration gate is pinned to HybridCPU neutral DMA-grant commit `ccb1dc3d9b35beedfe4286e010c51451e8a46f78`, based on HybridCPU `master` `67d1e6f528de2f181c4b5c68df4e95ef7e2bd0aa` after the IRQ/event slice.
+The Slice-5 cross-repository integration gate is pinned to HybridCPU neutral DMA-visibility commit `4960e7be34f485cf3c8261801daecdefe6172701`, based on HybridCPU `master` `1c0adf62fb01bc0963caa2dacc5f0933a8bce8cc` after the admission-only DMA-grant slice.
 
 ## Goal
 
@@ -263,14 +264,14 @@ A successful `PlatformDmaGrant` proves only that the exact device and exact boun
 - device-to-CPU acquisition/maintenance;
 - coherent DMA.
 
-Accordingly, the real HybridCPU provider advertises:
+At the Slice-4 boundary the real HybridCPU provider advertised:
 
 ```text
 PlatformFeatureFamily.DmaMapping
   -> PlatformDmaGrantContract v1 / RuntimeAdmission
 ```
 
-It is explicitly **not** `Executable`.
+It was explicitly **not** `Executable`.
 
 ### Lifetime and teardown ordering
 
@@ -308,7 +309,96 @@ The public DMA admission surfaces expose no:
 
 There is no `SubmitDma`, DMA completion, or transfer queue API in Slice 4.
 
-## Feature discovery after Slice 4
+## Slice 5 — exact grant-scoped non-coherent DMA visibility
+
+Slice 5 adds explicit memory-visibility ordering to the exact DMA grant while deliberately keeping DMA execution out of scope.
+
+### Visibility cycle identity
+
+Prepare materializes a fresh visibility cycle rooted in the exact live grant:
+
+```text
+exact live PlatformDmaGrant
+-> PreparePlatformDmaForDevice
+-> fresh PlatformDmaVisibilityCycle
+-> hidden PlatformProviderDmaVisibilityCycle
+-> hidden NeutralDmaVisibilityCycle
+-> release/publication evidence
+```
+
+The three cycle identity spaces are separate. Provider and HybridCPU cycle tokens remain bridge-private and never become local authority.
+
+The Sing-visible prepare evidence carries only:
+
+```text
+exact local DMA grant id / generation
++ exact local visibility cycle
++ exact DMA direction
++ PublicationFence requirement
++ PublicationFenceSatisfied outcome
+```
+
+The evidence is **not authority**, **not submission evidence**, and **not completion evidence**.
+
+### Non-coherent prepare semantics
+
+Every current neutral owned-region mapping remains explicitly `NonCoherent`. Prepare therefore requires an explicit publication/release boundary for the exact mapping behind the exact grant.
+
+The neutral implementation composes the grant with the already policy-neutral owned-region visibility primitive and requires:
+
+```text
+NeutralMemoryVisibilityRequirement.PublicationFence
+-> NeutralMemoryVisibilityOutcome.PublicationFenceSatisfied
+```
+
+A successful prepare starts a fresh cycle and leaves the grant, mapping, device and domain authority live. It proves only CPU-to-device visibility ordering for a possible future operation.
+
+### Direction-aware CPU acquire
+
+Post-write acquire is meaningful only when the device may have written memory:
+
+```text
+DeviceWritesMemory | Bidirectional
++ exact prepared visibility cycle
+-> AcquirePlatformDmaForCpu
+-> AcquisitionFenceSatisfied evidence
+```
+
+`DeviceReadsMemory` cannot modify memory and therefore has no post-write CPU acquire requirement; attempting the acquire path is denied as not required.
+
+For write-capable directions, acquire before prepare is denied. A second acquire for the same cycle is denied. A successful acquire consumes the current cycle for future-submit purposes while leaving the grant and mapping themselves live.
+
+### Future-submit-safe cycle consumption
+
+The cycle state deliberately distinguishes:
+
+```text
+prepared + not acquired
+prepared + acquired
+```
+
+A future executable-DMA submit slice can therefore require **prepared + not acquired**. This prevents a caller from acquiring before submission and then reusing that old acquire evidence as if it proved post-completion CPU visibility.
+
+Re-prepare after an acquire creates a fresh local/provider/neutral cycle. This is the bridge between the current visibility-only slice and a later submit/completion state machine without pretending that completion already exists.
+
+### Fail-closed evidence validation
+
+The slice validates evidence at every namespace boundary:
+
+- stale or forged local DMA grant fails before any provider visibility call;
+- provider prepare evidence must match exact provider grant id/generation, direction and a materialized provider cycle;
+- provider acquire evidence must match the exact stored provider cycle from prepare;
+- HybridCPU prepare/acquire evidence must match the exact neutral grant handle/epoch, direction and exact stored neutral cycle;
+- malformed provider evidence becomes `PlatformFaulted`;
+- revoked grant cannot create new visibility evidence.
+
+### No completion or ownership claim
+
+Acquire in Slice 5 is only a visibility fence operation for the exact cycle. Because no device operation can yet be submitted, it does **not** prove that a device transfer occurred or completed.
+
+`RegionAuthority` remains the sole ownership authority. The slice does not return a region to CPU ownership, does not alter region generation, and does not weaken the existing rule that lower device/mapping authority must close before reclaim where required.
+
+## Feature discovery after Slice 5
 
 The real HybridCPU provider advertises:
 
@@ -316,54 +406,57 @@ The real HybridCPU provider advertises:
 PlatformFeatureFamily.IoDomainBinding -> device lease v1 / Executable
 PlatformFeatureFamily.MmioMapping     -> MMIO lease v1 / Executable
 PlatformFeatureFamily.IrqBinding      -> IRQ binding v1 / Executable
-PlatformFeatureFamily.DmaMapping      -> DMA grant v1 / RuntimeAdmission
+PlatformFeatureFamily.DmaMapping      -> DMA grant + visibility v2 / RuntimeAdmission
 ```
 
-`RuntimeAdmission` is intentionally weaker than `Executable` and prevents discovery from overstating the implemented DMA behavior.
+`RuntimeAdmission` remains intentionally weaker than `Executable`. Contract v2 means exact DMA grant admission plus exact grant-scoped non-coherent prepare/acquire visibility cycles; it does not advertise transfer execution or completion.
 
 ## Tests
 
-Slice-1, Slice-2 and Slice-3 tests remain in place.
+Slice-1 through Slice-4 tests remain in place.
 
-Slice-4 focused tests prove:
+Slice-5 focused tests prove:
 
-- exact live device lease plus exact live mapped region slice materialize a separate bounded DMA grant;
-- device and mapping must belong to the same exact domain lifetime;
-- invalid range, undefined direction, insufficient device rights and insufficient mapped-memory access are rejected;
-- missing/forged local device or mapping authority fails before the provider DMA-grant call;
-- one live grant per exact mapping is enforced in this first slice;
-- stale or forged grant closure fails closed;
-- a live grant blocks both device and mapping closure at runtime, provider and neutral layers;
-- explicit revoke, capability cascade and process teardown drain DMA grants before lower device/mapping authority;
-- DMA-grant revoke failure prevents lower authority closure;
-- the real pinned HybridCPU provider materializes and closes the exact neutral DMA grant;
-- public Sing/provider/neutral DMA surfaces contain no raw address, IOMMU, page-table, descriptor/queue, VM, lane or opcode authority;
-- the facade contains no DMA submit/completion operation;
-- feature discovery reports DMA grant v1 as `RuntimeAdmission`, not `Executable`.
+- an exact live DMA grant can create a fresh local/provider/neutral visibility cycle only through explicit publication preparation;
+- prepare evidence is bound to the exact grant generation, direction and cycle;
+- write-capable DMA acquire is denied before prepare;
+- read-only device DMA does not require a post-write acquire;
+- acquire evidence must refer to the exact most-recent prepared cycle;
+- a cycle cannot be acquired twice;
+- re-prepare after acquire creates a fresh cycle, so pre-acquire cannot satisfy a future submit requirement;
+- stale or forged local DMA grants fail before provider visibility calls;
+- malformed provider prepare/acquire evidence fails closed as `PlatformFaulted`;
+- revoked neutral grants cannot produce visibility evidence;
+- prepare/acquire leave the exact grant and mapped-region authority live;
+- real pinned HybridCPU integration executes the full Sing -> provider -> neutral prepare/acquire path;
+- local/provider/neutral visibility-cycle identity types remain distinct;
+- public visibility evidence contains no provider/Hybrid token, raw address, IOMMU, page-table, descriptor/queue, interrupt-controller, VM, lane/opcode, submission or completion identity;
+- feature discovery reports DMA visibility v2 as `RuntimeAdmission`, not `Executable`.
 
 ## DMA — remaining Phase-5 work
 
-Slice 4 establishes admission only. Executable DMA must add explicit visibility and completion semantics on top of that exact grant:
+Slices 4 and 5 now establish exact DMA admission plus explicit non-coherent visibility ordering. Executable DMA must add bounded submission and completion semantics on top of a **prepared, not-yet-acquired** exact visibility cycle:
 
 ```text
 CPU-Owned exact region/mapping
 -> exact DMA grant admission
--> Prepare / Publish for device direction
--> Submit bounded transfer
+-> Prepare / Publish -> fresh cycle
+-> Submit bounded transfer using that exact prepared cycle
 -> completion pending
--> completion proven
+-> completion proven for that exact operation/cycle
 -> Acquire / maintenance when device may have written memory
 -> revoke DMA grant
 -> revoke region mapping
 -> CPU ownership / reclaim allowed
 ```
 
-No coherent-DMA premise is allowed. Grant existence alone must never authorize submission or CPU reuse.
+No coherent-DMA premise is allowed. Grant existence or visibility evidence alone must never authorize CPU reuse or claim device completion.
 
 Required remaining negative/acceptance tests include:
 
-- non-coherent device access without required prepare/publish is denied before submit;
-- device-written memory cannot return to CPU use before completion plus required acquire/maintenance;
+- submit without an exact prepared + unacquired visibility cycle is denied;
+- an acquired/pre-consumed visibility cycle cannot be submitted;
+- device-written memory cannot return to CPU use before exact completion plus required post-write acquire/maintenance;
 - local capability revoke stops new submissions immediately while an already-submitted DMA operation drains;
 - process termination cannot reclaim the buffer before DMA completion, required acquire/maintenance, and grant/mapping closure;
 - stale/faulted provider execution/completion evidence fails closed;
@@ -378,8 +471,7 @@ Phase 5 is complete only when one real or faithful provider path performs a boun
 
 ## Remaining Phase-5 work
 
-- explicit non-coherent DMA prepare/publish and post-write acquire/maintenance semantics;
-- bounded DMA submit plus completion/drain/revoke ordering and process-teardown integration;
+- bounded DMA submit plus exact completion/drain/revoke ordering and process-teardown integration;
 - one real or faithful bounded DMA acceptance path with denial/stale/revoke/completion fault injection.
 
 ## Do not do
