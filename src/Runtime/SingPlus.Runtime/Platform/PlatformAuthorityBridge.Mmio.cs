@@ -185,7 +185,7 @@ public sealed partial class PlatformAuthorityBridge
                 "The platform MMIO lease has been closed.");
         }
 
-        return KernelResult.Ok();
+        return ValidateDeviceLease(lease.DeviceLease, expectedSubject);
     }
 
     internal IReadOnlyList<PlatformMmioLease> BeginMmioCapabilityRevocation(
@@ -244,6 +244,9 @@ public sealed partial class PlatformAuthorityBridge
                 "The platform MMIO lease identity is malformed.");
         }
 
-        return ValidateDeviceLease(lease.DeviceLease, expectedSubject);
+        // Closure must remain possible after local device authorization is revoked.
+        // Use structural device/domain identity here; ValidateMmioLease above adds
+        // live-authorization checks for operations that would consume MMIO authority.
+        return ValidateDeviceLeaseIdentity(lease.DeviceLease, expectedSubject);
     }
 }
