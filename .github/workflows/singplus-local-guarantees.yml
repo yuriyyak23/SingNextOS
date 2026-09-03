@@ -61,11 +61,11 @@ jobs:
         with:
           path: SingNextOS
 
-      - name: Checkout pinned HybridCPU neutral device lease runtime
+      - name: Checkout pinned HybridCPU neutral MMIO lease runtime
         uses: actions/checkout@v4
         with:
           repository: yuriyyak23/HybridCPU-v2
-          ref: e1c0255f3b7da7fa69e3230783b95b4521cc664c
+          ref: eeda80b92e8f6733d950f43f65a50e55bde608df
           path: HybridCPU-v2
 
       - name: Setup .NET from SingNextOS global.json
@@ -89,4 +89,4 @@ jobs:
         run: dotnet test HybridCPU-v2/HybridCPU_NeutralRuntime.Tests/HybridCPU_NeutralRuntime.Tests.csproj --configuration Release
 
 # The normal local-guarantees job remains independent of HybridCPU source.
-# Phase-5 device-lease authority is verified only by the pinned narrow integration job above.
+# Phase-5 bounded MMIO authority is verified only by the pinned narrow integration job above.

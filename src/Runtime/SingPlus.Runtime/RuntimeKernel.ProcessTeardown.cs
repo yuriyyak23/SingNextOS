@@ -195,6 +195,7 @@ public sealed partial class RuntimeKernel
             foreach (var mapping in PlatformAuthority.BeginCapabilityRevocation(capabilityId))
                 mappings[mapping.MappingId] = mapping;
 
+            _ = PlatformAuthority.BeginMmioCapabilityRevocation(capabilityId);
             _ = PlatformAuthority.BeginDeviceCapabilityRevocation(capabilityId);
             _ = CapabilityAuthority.Revoke(capabilityId);
         }
@@ -364,6 +365,7 @@ public sealed partial class RuntimeKernel
         _processTeardowns.Remove(record.Handle);
         _processPlatformBindings.Remove(record.Handle);
         _processPlatformMappings.Remove(record.Handle);
+        _processPlatformMmioLeases.Remove(record.Handle);
         _processPlatformDeviceLeases.Remove(record.Handle);
         return KernelResult<ProcessTeardownSnapshot>.Ok(completed);
     }

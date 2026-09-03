@@ -2,17 +2,22 @@
 
 ## Status
 
-**In progress — first device-authority root slice implemented.**
+**In progress — two vertical slices implemented.**
 
-Phase 5 now has an exact capability-backed device lease lifecycle. MMIO mapping, IRQ routing and DMA grant/submit/completion remain separate later slices. The phase acceptance boundary is therefore **not** complete.
+Implemented slices:
 
-The cross-repository integration gate is pinned to HybridCPU neutral device-lease commit `e1c0255f3b7da7fa69e3230783b95b4521cc664c`, stacked on the Phase-4 neutral acquire owner `4dce496d072b56efae61dfa9d99058eaa782fea3`.
+1. exact capability-backed semantic device lease authority;
+2. exact capability-backed bounded MMIO lease/range authority.
+
+IRQ routing and DMA grant/submit/completion remain separate later slices. The Phase-5 acceptance boundary is therefore **not** complete.
+
+The cross-repository integration gate for Slice 2 is pinned to HybridCPU neutral MMIO commit `eeda80b92e8f6733d950f43f65a50e55bde608df`, based on the merged device-lease stack head `be88202bfac9e372d2de2acf92fe3d783c3094cf`.
 
 ## Goal
 
-Turn local `DmaCapability`, MMIO/IRQ capability types and owned regions into exact, revocable platform effects without giving drivers ambient authority.
+Turn local device/MMIO/IRQ/DMA capabilities and exact owned-region authority into bounded, revocable platform effects without giving drivers ambient authority.
 
-The central rule is:
+The central later-DMA rule remains:
 
 ```text
 client-derived exact region authority
@@ -26,11 +31,7 @@ A driver with device authority must never be able to DMA into an arbitrary calle
 
 ## Slice 1 — exact device lease authority root
 
-The first Phase-5 slice deliberately stops before MMIO, IRQ and DMA. It establishes the device-side authority root that those later effects must compose with.
-
-### Local admission
-
-A process can request a device lease only from an exact local device capability and exact live platform domain binding:
+A process can materialize a semantic device lifetime only from:
 
 ```text
 exact ProcessHandle generation
@@ -42,128 +43,153 @@ exact ProcessHandle generation
   -> separate PlatformDeviceLease identity
 ```
 
-Requested platform device rights are translated only to the corresponding local capability rights. A capability with insufficient rights, wrong resource kind, stale process generation or wrong platform-domain subject is rejected before provider device admission.
+The local capability is admission authority only. Provider and HybridCPU leases remain separate bridge-private identity spaces.
 
-`CapabilityId` is admission authority. It is not a provider lease and is never passed through as external device authority.
+Revocation ordering is:
 
-### Separate identity spaces
+```text
+revoke local authorization
+  -> close dependent external device authority
+  -> close platform domain
+  -> local reclaim
+```
 
-The following identities are deliberately distinct:
+Provider closure failure is fail-closed and pins teardown before domain closure/reclaim.
+
+## Slice 2 — exact bounded MMIO lease/range
+
+Slice 2 composes an exact live device lease with a separate local `ResourceKind.MmioRegion` capability. No raw physical address is accepted from the caller.
+
+### Canonical MMIO capability identity
+
+`CapabilityResourceIds.MmioRegion(...)` now encodes a canonical semantic authority tuple:
+
+```text
+semantic device resource id
++ semantic MMIO region resource id
++ authoritative semantic byte length
+```
+
+The runtime parses that tuple from the live local capability. The caller supplies only:
+
+```text
+offset
+length
+Read | Write
+```
+
+Therefore the caller cannot widen the authoritative region extent by passing a larger size parameter to `BindPlatformMmio`.
+
+Admission requires:
+
+```text
+exact live ProcessHandle
++ exact live PlatformDeviceLease
++ live ResourceKind.MmioRegion CapabilityId
++ capability device id == device lease device id
++ CapabilityRights.Map
++ capability Read/Write rights matching requested access
++ device Configure right
++ device Read/Write rights matching requested access
++ exact bounded offset/length inside capability byte extent
+```
+
+All admission failures occur before provider MMIO materialization.
+
+### Separate MMIO identity spaces
+
+The MMIO lifetime keeps these identities distinct:
 
 ```text
 CapabilityId
-PlatformDomainBindingId / generation
 PlatformDeviceLeaseId / generation
-PlatformProviderDomainLeaseId / generation
+PlatformMmioLeaseId / generation
 PlatformProviderDeviceLeaseId / generation
-NeutralDomainBindingHandle / epoch
+PlatformProviderMmioLeaseId / generation
 NeutralDeviceLeaseHandle / epoch
+NeutralMmioLeaseHandle / epoch
 ```
 
-Provider and HybridCPU identities remain bridge/provider-private. The Sing-visible `PlatformDeviceLease` carries only the local lease identity, local platform-domain binding, semantic device resource and semantic rights.
-
-### HybridCPU neutral device owner
-
-The narrow `HybridCPU_NeutralRuntime` owner now materializes:
+The Sing-visible MMIO lease contains only:
 
 ```text
-NeutralDeviceLease(
-    exact live NeutralDomainBindingLease,
-    semantic NeutralDeviceIdentity,
-    Read | Write | Configure)
+local MMIO lease identity
+device lease
+semantic region id + byte length
+exact relative offset/length
+semantic Read/Write access
 ```
 
-It rejects invalid identities/rights, stale or revoked domains, and duplicate binding of the same semantic device in the same live domain lifetime. Exact close requires the materialized lease handle/epoch/domain/device/rights identity.
+It exposes no provider token, physical address, BAR number, PTE/page-table identity, interrupt vector, DMA window, IOMMU token, VM state, lane or opcode.
 
-This export is intentionally only a semantic device lifetime. It exposes no MMIO register address, IRQ vector/controller route, DMA window, IOMMU binding/token, queue, lane, opcode, VM state or physical address.
+### HybridCPU neutral MMIO owner
 
-### Revocation and teardown ordering
-
-Device leases are synchronous lifetime authority in this slice; no asynchronous device work exists yet.
-
-Normal explicit closure is:
+The narrow `HybridCPU_NeutralRuntime` owner materializes:
 
 ```text
-live local capability + PlatformDeviceLease
-  -> RevokePlatformDevice
-  -> exact provider device lease close
-  -> exact HybridCPU neutral device lease close
-  -> local device lease closed
-  -> platform domain may close
-```
-
-Local capability revocation first marks the derived local lease unauthorized and closes the external device lease before returning success. An old lease cannot authorize later effects.
-
-Process teardown includes the new authority class before platform-domain closure:
-
-```text
-Exiting
-  -> close channels / revoke local capabilities
-  -> close tracked device leases
-  -> close borrow grants / region mappings
-  -> close platform domain
-  -> local process/domain/region reclaim
-```
-
-If provider device closure faults, teardown is fault-contained in `PlatformFaulted`; platform-domain close and local reclaim are forbidden.
-
-The HybridCPU provider also independently refuses domain closure while one of its provider device leases remains live.
-
-### Feature discovery
-
-The real HybridCPU provider advertises:
-
-```text
-PlatformFeatureFamily.IoDomainBinding
-PlatformDeviceLeaseContract.ContractVersion == 1
-PlatformFeatureAvailability.Executable
-```
-
-For this slice, `IoDomainBinding` means only that the semantic device authority root is executable. It does **not** imply that DMA mapping, MMIO mapping or IRQ delivery is implemented. `PlatformFeatureFamily.DmaMapping` remains unavailable.
-
-## Target provider contracts
-
-### Device lease
-
-The implemented bridge-private semantic lease is:
-
-```text
-DeviceLease BindDevice(
-    PlatformDomainLease domain,
-    LocalDeviceIdentity device,
-    RequestedDeviceRights rights)
-```
-
-The Sing-visible device capability remains a local resource capability. The provider lease is never returned to the SIP client.
-
-### MMIO
-
-A future privileged device service may request:
-
-```text
-MmioMappingLease MapMmio(
-    DeviceLease,
-    registerRange,
+NeutralMmioLease(
+    exact live NeutralDeviceLease,
+    semantic region identity + byte length,
+    exact relative range,
     Read | Write)
 ```
 
-The mapping must be bounded to the device resource/range. Ordinary apps must not get raw physical MMIO addresses.
+A mapping requires device `Configure` plus the matching Read/Write device rights. Invalid or overflowing ranges, invalid access, stale/forged device identities and duplicate live mapping of the same semantic MMIO region fail closed.
 
-### IRQ/event binding
+The first MMIO slice deliberately models exact authority/lifetime only. It does **not** export raw register addresses or implement a generic read/write syscall surface.
 
-A future slice should map a device interrupt source to a kernel-owned event route:
+### Revocation / teardown ordering
+
+An MMIO lease is synchronous authority in this slice; there is no asynchronous MMIO operation object.
+
+Normal ordering is:
+
+```text
+MMIO live
+  -> local MMIO authorization revoked
+  -> exact provider MMIO close
+  -> exact HybridCPU neutral MMIO close
+  -> device may close
+  -> platform domain may close
+  -> local reclaim
+```
+
+Rules enforced by the slice:
+
+- explicit device revoke drains all derived MMIO leases first;
+- revoking an MMIO capability closes only MMIO authority derived from that capability;
+- revoking the device capability drains dependent MMIO before device close;
+- process teardown marks MMIO authorization revoked and closes MMIO before device/domain closure;
+- MMIO provider-close failure pins teardown in `PlatformFaulted` and prevents device/domain close;
+- the HybridCPU provider independently refuses device close while a provider MMIO lease remains live;
+- the neutral runtime independently reports active MMIO dependents instead of silently closing the device underneath them;
+- exact MMIO closure remains structurally valid after local device authorization is revoked, while any operation that would consume MMIO authority still requires live authorization.
+
+### Feature discovery
+
+The HybridCPU provider now advertises:
+
+```text
+PlatformFeatureFamily.IoDomainBinding    -> device lease contract v1 / Executable
+PlatformFeatureFamily.MmioMapping        -> MMIO lease contract v1 / Executable
+PlatformFeatureFamily.DmaMapping         -> Unavailable
+```
+
+`MmioMapping` was appended as a distinct feature family so existing feature-family numeric identities are not renumbered.
+
+## IRQ/event binding — future slice
+
+A later slice should map a semantic device interrupt source to a kernel-owned event route:
 
 ```text
 IrqBindingLease BindInterrupt(DeviceLease, source, KernelEventEndpoint)
 ```
 
-The provider handles vector/controller details. SIP clients receive normalized event/channel notifications, not raw interrupt vectors.
+Provider vector/controller details must remain private. Delivery must be stale-generation-safe and teardown must prevent delivery into a recycled process generation.
 
-The contract must define enough semantics for edge/level acknowledgment and teardown so an IRQ cannot target a stale process generation.
+## DMA — future slices
 
-### DMA
-
-A later slice must use an exact grant derived from both device and region authority:
+DMA must compose exact device authority with exact caller-derived region authority:
 
 ```text
 DmaGrantLease BindDma(
@@ -173,95 +199,44 @@ DmaGrantLease BindDma(
     Direction)
 ```
 
-Then:
+Then the lifecycle remains:
 
 ```text
-PrepareForConsumer
-Submit
-Wait/Poll completion
-AcquireFromConsumer
-RevokeDma
-RevokeRegionMapping
-```
-
-`Direction` must distinguish at least device-read, device-write and bidirectional where supported.
-
-## Integration with HybridCPU-v2
-
-The audit found code-confirmed HybridCPU concepts for I/O domains, DMA windows, IOMMU bindings, permissions/ranges, domain epochs and explicit `NonCoherentFenceRequired` failure. These remain targets for later provider slices.
-
-The first slice does not import those internal objects. Instead, a narrow neutral facade now owns only the exact semantic device lease lifetime required by SingNextOS.
-
-SingNextOS should continue consuming stable exported semantic facades over hardware mechanisms. It should **not** import HybridCPU internal `IommuDomainBinding` or DMA authority objects into public/kernel contracts.
-
-## Confused-deputy prevention
-
-Bad shape:
-
-```text
-DriverService.MapForDma(address, length)
-```
-
-Required later shape:
-
-```text
-client supplies exact region capability/borrow
-service supplies device capability
-kernel validates both subjects/resources/generations
-bridge materializes exact provider grant
-```
-
-Slice 1 establishes the second input — exact device authority — without fabricating the still-missing region+device DMA composition.
-
-The service may choose protocol policy, but cannot widen the region or direction beyond caller-derived authority.
-
-## DMA ownership state machine
-
-Still future work. The target lifecycle remains:
-
-```text
-CPU-Owned
-  -> Prepare/Publish
-Mapped-For-Device
+Prepare/Publish
   -> exact DMA grant
-Device-Reading/Writing
+  -> Submit
   -> completion pending
-Completed
+  -> completion proven
   -> Acquire/maintenance
-Draining
-  -> revoke grant + IOTLB/mapping closure
-CPU-Owned / transferred owner
+  -> revoke DMA grant
+  -> revoke region mapping
+  -> CPU ownership/reclaim allowed
 ```
 
-For device-write buffers, CPU mutable access must remain unavailable until completion + acquire. For device-read buffers, app mutation must be prevented for the grant lifetime unless the protocol explicitly supports immutable snapshots.
-
-## Interrupt and completion delivery
-
-Still future work. Do not add device-specific kernel syscalls. Reuse a small policy-neutral kernel event/completion primitive that can also support:
-
-- timer wakeups;
-- scheduler/runtime completions;
-- accelerator completions;
-- VM trap/event delivery.
-
-Device service SIP translates those events into service-specific async APIs.
+No coherent-DMA assumption is permitted. Device-write and device-read ownership restrictions must be explicit.
 
 ## Tests
 
-Slice-1 focused tests prove:
+Slice-1 tests continue to prove exact device admission, separate identity, capability revocation, teardown ordering and real pinned HybridCPU device lifetime.
 
-- exact local `ResourceKind.Device` capability + live domain can bind a separate device lease;
-- insufficient rights, wrong capability resource, wrong domain or stale process fail before provider device admission;
-- malformed provider device/domain/rights/identity evidence fails closed and is best-effort revoked;
-- an active device lease blocks early platform-domain closure;
-- local capability revoke closes the derived external device authority;
-- process termination closes device authority before the platform domain and local reclaim;
-- provider closure fault pins process teardown and prevents domain close;
-- real pinned HybridCPU runtime materializes and closes the exact neutral device lifetime;
-- public Sing and neutral device surfaces expose no provider/hardware-shaped authority identities.
+Slice-2 focused tests additionally prove:
+
+- canonical MMIO capability identity round-trips device, region and authoritative extent;
+- exact MMIO capability + exact live device lease materialize a separate bounded MMIO lease;
+- wrong device resource, non-canonical MMIO capability, insufficient capability rights and out-of-range requests fail before provider mapping;
+- device rights must include `Configure` plus requested Read/Write access;
+- malformed provider MMIO identity/range fails closed and is best-effort revoked;
+- MMIO capability revoke closes only derived MMIO authority;
+- explicit device revoke closes MMIO before device;
+- process teardown closes MMIO before device and platform domain;
+- MMIO close fault pins teardown before device/domain closure;
+- real pinned HybridCPU runtime materializes and closes the exact neutral MMIO lease;
+- the prior device-surface negative test now permits this implemented MMIO facade while continuing to reject DMA/IRQ and hardware-shaped authority terms;
+- public Sing and neutral MMIO surfaces contain no provider/hardware-shaped authority identities.
 
 Later required negative tests remain:
 
+- stale IRQ binding cannot deliver to a recycled process generation;
 - device capability without region authority cannot create DMA grant;
 - region authority without device authority cannot create DMA grant;
 - wrong DMA range/direction denied before provider submit;
@@ -269,7 +244,6 @@ Later required negative tests remain:
 - non-coherent device access without required prepare/fence denied;
 - local capability revoke stops new submissions immediately while old DMA drains;
 - process termination cannot reclaim buffer before DMA completion/revoke;
-- stale IRQ binding cannot deliver to a recycled process generation;
 - provider token never appears in a SIP payload.
 
 ## Acceptance criteria
@@ -280,15 +254,15 @@ Phase 5 is done only when one real or faithful provider path can perform a bound
 
 ## Remaining Phase-5 work
 
-- exact bounded MMIO lease/range semantics, if a stable external provider surface is available;
 - IRQ/event binding with stale-generation-safe delivery and teardown;
-- exact DMA grant composed from this device lease plus exact region authority;
+- exact DMA grant composed from device lease plus exact region authority;
 - direction and non-coherent prepare/acquire semantics;
 - submit/completion/drain/revoke ordering and process-teardown integration;
 - real or faithful bounded DMA acceptance path and fault injection.
 
 ## Do not do
 
+- no raw physical MMIO address ABI;
 - no raw DMA pointer ABI;
 - no app-visible IOMMU IDs;
 - no ambient global device service authority over arbitrary memory;

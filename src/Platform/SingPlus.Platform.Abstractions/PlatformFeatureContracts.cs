@@ -16,7 +16,8 @@ public enum PlatformFeatureFamily
     NestedDomains,
     PlatformEvidence,
     SecureDomains,
-    SurfacePresentation
+    SurfacePresentation,
+    MmioMapping,
 }
 
 public enum PlatformFeatureAvailability
