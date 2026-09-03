@@ -62,6 +62,20 @@ public sealed partial class PlatformAuthorityBridge
                 validation.Message!);
         }
 
+        if (HasFaultPinnedDmaSubmission(grant.GrantId))
+        {
+            return KernelResult<PlatformDmaPrepareEvidence>.Fail(
+                KernelError.PlatformFaulted,
+                "DMA visibility cannot be re-prepared while submission state is fault-pinned.");
+        }
+
+        if (HasActiveDmaSubmission(grant.GrantId))
+        {
+            return KernelResult<PlatformDmaPrepareEvidence>.Fail(
+                KernelError.PlatformBindingDraining,
+                "DMA visibility cannot be re-prepared while the exact submitted operation is pending completion.");
+        }
+
         if (!_featureManifest.Supports(
                 PlatformFeatureFamily.DmaMapping,
                 PlatformDmaVisibilityContract.ContractVersion,
@@ -125,11 +139,25 @@ public sealed partial class PlatformAuthorityBridge
                 validation.Message!);
         }
 
+        if (HasFaultPinnedDmaSubmission(grant.GrantId))
+        {
+            return KernelResult<PlatformDmaAcquireEvidence>.Fail(
+                KernelError.PlatformFaulted,
+                "CPU acquire is forbidden while DMA submission state is fault-pinned.");
+        }
+
         if (grant.Direction == PlatformDmaDirection.DeviceReadsMemory)
         {
             return KernelResult<PlatformDmaAcquireEvidence>.Fail(
                 KernelError.PlatformDenied,
                 "Read-only device DMA cannot modify memory and does not require post-write CPU acquire evidence.");
+        }
+
+        if (HasActiveDmaSubmission(grant.GrantId))
+        {
+            return KernelResult<PlatformDmaAcquireEvidence>.Fail(
+                KernelError.PlatformBindingDraining,
+                "CPU acquire is forbidden until completion is proven for the exact submitted operation.");
         }
 
         if (!_dmaVisibilityStates.TryGetValue(grant.GrantId, out var state) ||
@@ -190,6 +218,8 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDmaGrant grant,
         PlatformDomainIdentity expectedSubject) =>
         ValidateDmaGrant(grant, expectedSubject).IsSuccess &&
+        !HasFaultPinnedDmaSubmission(grant.GrantId) &&
+        !HasActiveDmaSubmission(grant.GrantId) &&
         _dmaVisibilityStates.TryGetValue(grant.GrantId, out var state) &&
         state.LocalCycle.Value != 0 &&
         !state.Acquired;
