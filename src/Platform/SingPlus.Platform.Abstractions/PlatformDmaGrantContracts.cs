@@ -35,14 +35,14 @@ public readonly record struct PlatformProviderDmaGrant(
     PlatformDmaDirection Direction);
 
 /// <summary>
-/// Admission-only DMA authority contract. A successful grant proves that an exact
-/// device lease and exact mapped-region slice/range are composition-compatible.
-/// It does not submit a transfer and carries no bus address, IOMMU identity,
+/// DMA authority family contract. Version 1 established exact admission-only grants;
+/// version 2 adds grant-scoped non-coherent prepare/acquire visibility cycles. A grant
+/// still does not submit a transfer and carries no bus address, IOMMU identity,
 /// descriptor/queue identity, or completion authority.
 /// </summary>
 public static class PlatformDmaGrantContract
 {
-    public const uint ContractVersion = 1;
+    public const uint ContractVersion = 2;
 
     public static PlatformAuthorityResult ValidateRequest(PlatformDmaGrantRequest request)
     {
