@@ -63,8 +63,8 @@ public sealed partial class RuntimeKernel
         }
 
         var platformSubject = new PlatformDomainIdentity(
-            borrowerProcess.Value.DomainId,
-            borrower.Generation);
+            ownerProcess.Value.DomainId,
+            owner.Generation);
         var bindingValidation = PlatformAuthority.ValidateDomain(
             externalDomain,
             platformSubject);
@@ -123,18 +123,18 @@ public sealed partial class RuntimeKernel
     }
 
     public KernelResult<PlatformBorrowReadGrantEvidence> PreparePlatformBorrowReadGrantForExternalReader(
-        ProcessHandle borrower,
+        ProcessHandle owner,
         PlatformBorrowReadGrant grant)
     {
-        var borrowerProcess = Processes.Resolve(borrower);
-        if (!borrowerProcess.IsSuccess)
+        var ownerProcess = Processes.Resolve(owner);
+        if (!ownerProcess.IsSuccess)
         {
             return KernelResult<PlatformBorrowReadGrantEvidence>.Fail(
-                borrowerProcess.Error,
-                borrowerProcess.Message!);
+                ownerProcess.Error,
+                ownerProcess.Message!);
         }
 
-        var effect = EnsureProcessAcceptsNewEffects(borrowerProcess.Value!);
+        var effect = EnsureProcessAcceptsNewEffects(ownerProcess.Value!);
         if (!effect.IsSuccess)
         {
             return KernelResult<PlatformBorrowReadGrantEvidence>.Fail(
@@ -143,28 +143,28 @@ public sealed partial class RuntimeKernel
         }
 
         var subject = new PlatformDomainIdentity(
-            borrowerProcess.Value!.DomainId,
-            borrower.Generation);
+            ownerProcess.Value!.DomainId,
+            owner.Generation);
         return PlatformAuthority.PrepareBorrowReadGrantForExternalReader(
             grant,
             subject);
     }
 
     public KernelResult<PlatformBorrowReadGrantLifecycle> QueryPlatformBorrowReadGrantLifecycle(
-        ProcessHandle borrower,
+        ProcessHandle owner,
         PlatformBorrowReadGrant grant)
     {
-        var borrowerProcess = Processes.Resolve(borrower);
-        if (!borrowerProcess.IsSuccess)
+        var ownerProcess = Processes.Resolve(owner);
+        if (!ownerProcess.IsSuccess)
         {
             return KernelResult<PlatformBorrowReadGrantLifecycle>.Fail(
-                borrowerProcess.Error,
-                borrowerProcess.Message!);
+                ownerProcess.Error,
+                ownerProcess.Message!);
         }
 
         var subject = new PlatformDomainIdentity(
-            borrowerProcess.Value!.DomainId,
-            borrower.Generation);
+            ownerProcess.Value!.DomainId,
+            owner.Generation);
         return PlatformAuthority.QueryBorrowReadGrantLifecycle(
             grant,
             subject);
@@ -209,8 +209,8 @@ public sealed partial class RuntimeKernel
             return KernelResult.Fail(currentBorrow.Error, currentBorrow.Message!);
 
         var subject = new PlatformDomainIdentity(
-            borrowerProcess.Value.DomainId,
-            borrower.Generation);
+            ownerProcess.Value.DomainId,
+            owner.Generation);
         var lifecycle = PlatformAuthority.QueryBorrowReadGrantLifecycle(
             grant,
             subject);
