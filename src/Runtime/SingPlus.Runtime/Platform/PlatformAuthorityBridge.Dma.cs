@@ -149,7 +149,7 @@ public sealed partial class PlatformAuthorityBridge
         {
             return KernelResult.Fail(
                 KernelError.PlatformBindingDraining,
-                "The DMA grant cannot close while its submitted operation is pending exact completion.");
+                "The DMA grant cannot close until exact completion and required post-completion visibility have both finished.");
         }
 
         var record = _dmaGrants[grant.GrantId];
@@ -172,14 +172,14 @@ public sealed partial class PlatformAuthorityBridge
         {
             if (providerResult.Status == PlatformAuthorityStatus.Revoked)
             {
-                record.PlatformClosed = true;
+                MarkDmaGrantClosed(grant.GrantId, record);
                 return KernelResult.Ok();
             }
 
             return FromProviderFailure(providerResult.Status, providerResult.Message);
         }
 
-        record.PlatformClosed = true;
+        MarkDmaGrantClosed(grant.GrantId, record);
         return KernelResult.Ok();
     }
 
@@ -232,6 +232,14 @@ public sealed partial class PlatformAuthorityBridge
             .OrderBy(record => record.Grant.GrantId.Value)
             .Select(static record => record.Grant)
             .ToArray();
+
+    private void MarkDmaGrantClosed(PlatformDmaGrantId grantId, DmaGrantRecord record)
+    {
+        record.PlatformClosed = true;
+        _dmaVisibilityStates.Remove(grantId);
+        _activeDmaSubmissions.Remove(grantId);
+        _dmaSubmissionFaultPins.Remove(grantId);
+    }
 
     private KernelResult ValidateDmaGrantIdentity(
         PlatformDmaGrant grant,
