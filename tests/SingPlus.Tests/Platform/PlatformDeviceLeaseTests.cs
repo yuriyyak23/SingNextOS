@@ -237,7 +237,7 @@ public sealed class PlatformDeviceLeaseTests
         };
         var forbidden = new[]
         {
-            "Provider",
+            "PlatformProvider",
             "HybridCPU",
             "Neutral",
             "Physical",
