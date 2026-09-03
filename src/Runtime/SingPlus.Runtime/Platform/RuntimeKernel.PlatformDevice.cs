@@ -99,6 +99,9 @@ public sealed partial class RuntimeKernel
         if (!resolved.IsSuccess)
             return KernelResult.Fail(resolved.Error, resolved.Message!);
 
+        var irq = AdvancePlatformIrqBindingsForDevice(lease);
+        if (!irq.IsSuccess) return irq;
+
         var mmio = AdvancePlatformMmioLeasesForDevice(lease);
         if (!mmio.IsSuccess) return mmio;
 
@@ -116,6 +119,13 @@ public sealed partial class RuntimeKernel
         KernelResult? firstFailure = null;
         foreach (var lease in PlatformAuthority.BeginDeviceCapabilityRevocation(capabilityId))
         {
+            var irq = AdvancePlatformIrqBindingsForDevice(lease);
+            if (!irq.IsSuccess)
+            {
+                firstFailure ??= irq;
+                continue;
+            }
+
             var mmio = AdvancePlatformMmioLeasesForDevice(lease);
             if (!mmio.IsSuccess)
             {
@@ -142,6 +152,9 @@ public sealed partial class RuntimeKernel
         SingProcess process,
         ProcessHandle handle)
     {
+        var irq = AdvancePlatformIrqBindingsForProcess(process, handle);
+        if (!irq.IsSuccess) return irq;
+
         var mmio = AdvancePlatformMmioLeasesForProcess(process, handle);
         if (!mmio.IsSuccess) return mmio;
 
