@@ -31,6 +31,13 @@ public sealed partial class RuntimeKernel
         var resolved = Processes.Resolve(subject);
         if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
 
+        if (PlatformAuthority.HasActiveDeviceLeases(binding))
+        {
+            return KernelResult.Fail(
+                KernelError.PlatformBindingActive,
+                "Platform device leases must close before the platform domain binding.");
+        }
+
         var identity = new PlatformDomainIdentity(resolved.Value!.DomainId, subject.Generation);
         var revoke = PlatformAuthority.RevokeDomain(binding, identity);
         if (revoke.IsSuccess)
