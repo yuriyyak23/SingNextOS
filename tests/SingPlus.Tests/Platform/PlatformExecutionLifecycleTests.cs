@@ -727,7 +727,7 @@ public sealed class PlatformExecutionLifecycleTests
                 new PlatformProviderDomainLeaseId(
                     ReturnZeroLeaseId ? 0 : _nextLeaseId++),
                 new PlatformProviderLeaseGeneration(
-                    ReturnZeroLeaseGeneration ? 0 : 1),
+                    ReturnZeroLeaseGeneration ? 0UL : 1UL),
                 subject);
             _leases.Add(lease.LeaseId, lease);
             return PlatformAuthorityResult<PlatformProviderDomainLease>.Ok(lease);
