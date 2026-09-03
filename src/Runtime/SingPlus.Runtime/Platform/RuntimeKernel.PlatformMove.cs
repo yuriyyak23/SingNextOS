@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using SingPlus.Contracts;
 using SingPlus.Platform;
 using SingPlus.Sip;
@@ -9,11 +10,23 @@ public readonly record struct PlatformMoveTargetMappingRequest(
     CapabilityId CapabilityId,
     PlatformMemoryAccess Access);
 
+public readonly record struct PlatformBoundedCopyFallbackPolicy(long MaxBytes);
+
+public readonly record struct PlatformBoundedCopyEvidence(
+    RegionHandle Region,
+    long ByteLength,
+    long MaxBytes)
+{
+    public bool IsExactAndBounded =>
+        ByteLength > 0 && MaxBytes >= ByteLength;
+}
+
 public enum PlatformMoveTargetExposureState
 {
     NotRequested = 0,
     ExactMappedAndPublished,
     LocalOwnershipFallback,
+    BoundedCopyFallback,
 }
 
 public readonly record struct PlatformOwnedBufferMoveResult<T>(
@@ -22,10 +35,46 @@ public readonly record struct PlatformOwnedBufferMoveResult<T>(
     PlatformOwnedRegionSliceMapping? TargetMapping,
     PlatformRegionVisibilityEvidence? TargetPublication,
     KernelError TargetExposureError)
-    where T : unmanaged;
+    where T : unmanaged
+{
+    public PlatformBoundedCopyEvidence? BoundedCopy { get; init; }
+}
 
 public sealed partial class RuntimeKernel
 {
+    private sealed class BoundedCopyStagingRegion<T> : IDisposable
+        where T : unmanaged
+    {
+        private T[]? _data;
+
+        internal BoundedCopyStagingRegion(int elementCount, long byteLength, long maxBytes)
+        {
+            if (elementCount <= 0)
+                throw new ArgumentOutOfRangeException(nameof(elementCount));
+            if (byteLength <= 0 || maxBytes < byteLength)
+                throw new ArgumentOutOfRangeException(nameof(maxBytes));
+
+            _data = new T[elementCount];
+            ByteLength = byteLength;
+            MaxBytes = maxBytes;
+        }
+
+        internal long ByteLength { get; }
+        internal long MaxBytes { get; }
+
+        internal Span<T> Span =>
+            _data is { } data
+                ? data.AsSpan()
+                : throw new ObjectDisposedException(nameof(BoundedCopyStagingRegion<T>));
+
+        public void Dispose()
+        {
+            if (_data is not { } data) return;
+            Array.Clear(data);
+            _data = null;
+        }
+    }
+
     private readonly HashSet<PlatformRegionMappingId> _movePublishedMappings = [];
 
     public KernelResult<PlatformOwnedBufferMoveResult<T>> MovePlatformOwnedBuffer<T>(
@@ -33,7 +82,8 @@ public sealed partial class RuntimeKernel
         ProcessHandle target,
         OwnedBuffer<T> buffer,
         PlatformOwnedRegionSliceMapping sourceMapping,
-        PlatformMoveTargetMappingRequest? targetMapping = null)
+        PlatformMoveTargetMappingRequest? targetMapping = null,
+        PlatformBoundedCopyFallbackPolicy? copyFallback = null)
         where T : unmanaged
     {
         var sourceProcessResult = Processes.Resolve(source);
@@ -88,6 +138,46 @@ public sealed partial class RuntimeKernel
             return KernelResult<PlatformOwnedBufferMoveResult<T>>.Fail(
                 KernelError.StaleGeneration,
                 "The owned buffer generation does not match the exact source mapping.");
+        }
+
+        var sourceOwner = new RegionOwner(sourceProcess.DomainId, source.Generation);
+        var sourceRegion = Regions.Validate(buffer.Handle, sourceOwner);
+        if (!sourceRegion.IsSuccess)
+        {
+            return KernelResult<PlatformOwnedBufferMoveResult<T>>.Fail(
+                sourceRegion.Error,
+                sourceRegion.Message!);
+        }
+
+        var authoritativeByteLength = sourceRegion.Value!.ByteLength;
+        long bufferByteLength;
+        try
+        {
+            bufferByteLength = checked((long)buffer.Length * Unsafe.SizeOf<T>());
+        }
+        catch (OverflowException)
+        {
+            return KernelResult<PlatformOwnedBufferMoveResult<T>>.Fail(
+                KernelError.CapacityExhausted,
+                "The moved buffer byte length overflows the bounded-copy accounting range.");
+        }
+
+        if (bufferByteLength != authoritativeByteLength)
+        {
+            return KernelResult<PlatformOwnedBufferMoveResult<T>>.Fail(
+                KernelError.PlatformFaulted,
+                "The owned buffer storage length does not match RegionAuthority byte length.");
+        }
+
+        var copyPolicyValidation = ValidateBoundedCopyPolicy(
+            targetMapping,
+            copyFallback,
+            authoritativeByteLength);
+        if (!copyPolicyValidation.IsSuccess)
+        {
+            return KernelResult<PlatformOwnedBufferMoveResult<T>>.Fail(
+                copyPolicyValidation.Error,
+                copyPolicyValidation.Message!);
         }
 
         var mappingValidation = PlatformAuthority.ValidateExactMapping(
@@ -256,6 +346,38 @@ public sealed partial class RuntimeKernel
             targetRequest.Access);
         if (!mappedTarget.IsSuccess)
         {
+            if (copyFallback is { } fallbackPolicy)
+            {
+                var rematerialized = RematerializeMovedBufferThroughBoundedCopy(
+                    target,
+                    targetProcess,
+                    moved.Value,
+                    authoritativeByteLength,
+                    fallbackPolicy);
+                if (rematerialized.IsSuccess)
+                {
+                    var copy = rematerialized.Value!;
+                    return KernelResult<PlatformOwnedBufferMoveResult<T>>.Ok(
+                        new PlatformOwnedBufferMoveResult<T>(
+                            copy.Buffer,
+                            PlatformMoveTargetExposureState.BoundedCopyFallback,
+                            null,
+                            null,
+                            mappedTarget.Error)
+                        {
+                            BoundedCopy = copy.Evidence,
+                        });
+                }
+
+                return KernelResult<PlatformOwnedBufferMoveResult<T>>.Ok(
+                    new PlatformOwnedBufferMoveResult<T>(
+                        moved.Value,
+                        PlatformMoveTargetExposureState.LocalOwnershipFallback,
+                        null,
+                        null,
+                        rematerialized.Error));
+            }
+
             return KernelResult<PlatformOwnedBufferMoveResult<T>>.Ok(
                 new PlatformOwnedBufferMoveResult<T>(
                     moved.Value,
@@ -289,6 +411,109 @@ public sealed partial class RuntimeKernel
                 mappedTarget.Value,
                 targetPublication.Value,
                 KernelError.None));
+    }
+
+    private static KernelResult ValidateBoundedCopyPolicy(
+        PlatformMoveTargetMappingRequest? targetMapping,
+        PlatformBoundedCopyFallbackPolicy? policy,
+        long authoritativeByteLength)
+    {
+        if (policy is null) return KernelResult.Ok();
+
+        if (targetMapping is null)
+        {
+            return KernelResult.Fail(
+                KernelError.PlatformDenied,
+                "Bounded-copy fallback requires an explicit target mapping request.");
+        }
+
+        if (policy.Value.MaxBytes <= 0)
+        {
+            return KernelResult.Fail(
+                KernelError.PlatformDenied,
+                "Bounded-copy fallback requires a positive maximum byte bound.");
+        }
+
+        if (authoritativeByteLength > policy.Value.MaxBytes)
+        {
+            return KernelResult.Fail(
+                KernelError.CapacityExhausted,
+                "The authoritative moved region exceeds the bounded-copy fallback limit.");
+        }
+
+        return KernelResult.Ok();
+    }
+
+    private KernelResult<(OwnedBuffer<T> Buffer, PlatformBoundedCopyEvidence Evidence)>
+        RematerializeMovedBufferThroughBoundedCopy<T>(
+            ProcessHandle target,
+            SingProcess targetProcess,
+            OwnedBuffer<T> moved,
+            long authoritativeByteLength,
+            PlatformBoundedCopyFallbackPolicy policy)
+        where T : unmanaged
+    {
+        var targetOwner = new RegionOwner(targetProcess.DomainId, target.Generation);
+        var regionValidation = Regions.Validate(moved.Handle, targetOwner);
+        if (!regionValidation.IsSuccess)
+        {
+            return KernelResult<(OwnedBuffer<T>, PlatformBoundedCopyEvidence)>.Fail(
+                regionValidation.Error,
+                regionValidation.Message!);
+        }
+
+        if (regionValidation.Value!.ByteLength != authoritativeByteLength)
+        {
+            return KernelResult<(OwnedBuffer<T>, PlatformBoundedCopyEvidence)>.Fail(
+                KernelError.StaleGeneration,
+                "The target region byte length changed before bounded-copy rematerialization.");
+        }
+
+        if (PlatformAuthority.HasActiveMapping(moved.Handle))
+        {
+            return KernelResult<(OwnedBuffer<T>, PlatformBoundedCopyEvidence)>.Fail(
+                KernelError.PlatformBindingActive,
+                "Bounded-copy rematerialization is forbidden while a target platform mapping remains active.");
+        }
+
+        if (authoritativeByteLength <= 0 || authoritativeByteLength > policy.MaxBytes)
+        {
+            return KernelResult<(OwnedBuffer<T>, PlatformBoundedCopyEvidence)>.Fail(
+                KernelError.CapacityExhausted,
+                "The target region no longer fits the prevalidated bounded-copy limit.");
+        }
+
+        try
+        {
+            using var staging = new BoundedCopyStagingRegion<T>(
+                moved.Length,
+                authoritativeByteLength,
+                policy.MaxBytes);
+            moved.Span.CopyTo(staging.Span);
+
+            var replacementData = new T[moved.Length];
+            staging.Span.CopyTo(replacementData);
+            var replacement = new OwnedBuffer<T>(moved.Handle, replacementData);
+
+            Regions.ReplacePayload(
+                moved.Handle,
+                moved.Handle,
+                (ITransferableOwnedPayload)replacement);
+            ((ITransferableOwnedPayload)moved).InvalidateForRuntime();
+
+            var evidence = new PlatformBoundedCopyEvidence(
+                replacement.Handle,
+                staging.ByteLength,
+                staging.MaxBytes);
+            return KernelResult<(OwnedBuffer<T>, PlatformBoundedCopyEvidence)>.Ok(
+                (replacement, evidence));
+        }
+        catch (OutOfMemoryException)
+        {
+            return KernelResult<(OwnedBuffer<T>, PlatformBoundedCopyEvidence)>.Fail(
+                KernelError.CapacityExhausted,
+                "The bounded-copy staging or replacement backing could not be allocated.");
+        }
     }
 
     private KernelResult ValidateMoveTargetMappingPrerequisites(
