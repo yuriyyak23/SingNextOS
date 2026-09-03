@@ -65,7 +65,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: yuriyyak23/HybridCPU-v2
-          ref: 21628636d22191db2ba1c91f515fb95189147040
+          ref: 4960e7be34f485cf3c8261801daecdefe6172701
           path: HybridCPU-v2
 
       - name: Setup .NET from SingNextOS global.json
