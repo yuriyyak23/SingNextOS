@@ -185,6 +185,40 @@ public sealed class PlatformIrqBindingTests
     }
 
     [Fact]
+    public void FailedInterruptCompletionRollsBackInvisibleReservationBeforeRetry()
+    {
+        var provider = new IrqProvider { CompletionStatus = PlatformAuthorityStatus.Faulted };
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1309, 1390);
+        var (device, irqCapability, endpoint) = CreateAuthorities(
+            kernel,
+            subject,
+            "device/retry0",
+            "notify",
+            IrqTriggerMode.Edge);
+        var route = kernel.BindPlatformInterrupt(
+            subject,
+            device,
+            irqCapability,
+            endpoint).Value!;
+
+        Assert.True(provider.Signal("notify"));
+        var failed = kernel.PollPlatformInterrupt(subject, route);
+        Assert.False(failed.IsSuccess);
+        Assert.Equal(KernelError.PlatformFaulted, failed.Error);
+        Assert.Equal(
+            KernelError.ResponseNotAvailable,
+            kernel.ConsumeKernelEvent(subject, endpoint).Error);
+        Assert.True(provider.IsPending("notify"));
+
+        provider.CompletionStatus = null;
+        var retry = kernel.PollPlatformInterrupt(subject, route);
+        Assert.True(retry.IsSuccess, retry.Message);
+        Assert.True(kernel.ConsumeKernelEvent(subject, endpoint).IsSuccess);
+        Assert.False(provider.IsPending("notify"));
+    }
+
+    [Fact]
     public void RecycledProcessGenerationCannotReceiveFromOldInterruptRoute()
     {
         var provider = new IrqProvider();
