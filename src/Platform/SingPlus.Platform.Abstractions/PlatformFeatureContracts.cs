@@ -18,6 +18,7 @@ public enum PlatformFeatureFamily
     SecureDomains,
     SurfacePresentation,
     MmioMapping,
+    IrqBinding,
 }
 
 public enum PlatformFeatureAvailability

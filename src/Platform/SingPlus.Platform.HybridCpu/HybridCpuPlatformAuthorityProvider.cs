@@ -56,6 +56,10 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                     PlatformMmioLeaseContract.ContractVersion,
                     PlatformFeatureAvailability.Executable),
                 new PlatformFeatureDescriptor(
+                    PlatformFeatureFamily.IrqBinding,
+                    PlatformIrqBindingContract.ContractVersion,
+                    PlatformFeatureAvailability.Executable),
+                new PlatformFeatureDescriptor(
                     PlatformFeatureFamily.ExplicitMemoryVisibility,
                     PlatformRegionAcquireContract.ContractVersion,
                     PlatformFeatureAvailability.Executable),

@@ -195,6 +195,7 @@ public sealed partial class RuntimeKernel
             foreach (var mapping in PlatformAuthority.BeginCapabilityRevocation(capabilityId))
                 mappings[mapping.MappingId] = mapping;
 
+            _ = PlatformAuthority.BeginIrqCapabilityRevocation(capabilityId);
             _ = PlatformAuthority.BeginMmioCapabilityRevocation(capabilityId);
             _ = PlatformAuthority.BeginDeviceCapabilityRevocation(capabilityId);
             _ = CapabilityAuthority.Revoke(capabilityId);
@@ -365,6 +366,7 @@ public sealed partial class RuntimeKernel
         _processTeardowns.Remove(record.Handle);
         _processPlatformBindings.Remove(record.Handle);
         _processPlatformMappings.Remove(record.Handle);
+        _processPlatformIrqBindings.Remove(record.Handle);
         _processPlatformMmioLeases.Remove(record.Handle);
         _processPlatformDeviceLeases.Remove(record.Handle);
         return KernelResult<ProcessTeardownSnapshot>.Ok(completed);
@@ -374,6 +376,7 @@ public sealed partial class RuntimeKernel
     {
         var handle = new ProcessHandle(process.ProcessId, process.Generation);
         Channels.CloseAllForProcess(handle);
+        _kernelEvents.CloseAllForProcess(handle);
 
         var domainEnded = Domains.Remove(process);
         if (domainEnded)

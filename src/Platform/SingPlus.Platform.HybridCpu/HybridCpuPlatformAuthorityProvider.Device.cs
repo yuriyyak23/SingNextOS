@@ -99,6 +99,13 @@ public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformDevice
                 "The provider device lease has already been revoked.");
         }
 
+        if (HasActiveProviderInterruptBindings(record.Lease))
+        {
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.Denied,
+                "HybridCPU interrupt bindings must close before the provider device lease.");
+        }
+
         if (HasActiveProviderMmioLeases(record.Lease))
         {
             return PlatformAuthorityResult.Fail(
