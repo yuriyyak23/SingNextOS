@@ -226,7 +226,7 @@ public sealed partial class RuntimeKernel
         if (record.Phase == ProcessTeardownPhase.PlatformFaulted)
             return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
 
-        var identity = new PlatformDomainIdentity(process.DomainId, process.Generation);
+        var identity = PlatformIdentity(process);
         KernelError? firstBlockingError = null;
         var pendingMappings = 0;
 

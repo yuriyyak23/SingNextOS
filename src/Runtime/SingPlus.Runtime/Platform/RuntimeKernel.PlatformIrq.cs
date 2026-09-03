@@ -43,7 +43,7 @@ public sealed partial class RuntimeKernel
                 endpointValidation.Message!);
         }
 
-        var identity = new PlatformDomainIdentity(process.DomainId, subject.Generation);
+        var identity = PlatformIdentity(process);
         var deviceValidation = PlatformAuthority.ValidateDeviceLease(deviceLease, identity);
         if (!deviceValidation.IsSuccess)
         {
@@ -138,7 +138,7 @@ public sealed partial class RuntimeKernel
                 endpointValidation.Message!);
         }
 
-        var identity = new PlatformDomainIdentity(process.DomainId, subject.Generation);
+        var identity = PlatformIdentity(process);
         var validation = PlatformAuthority.ValidateIrqBinding(binding, identity);
         if (!validation.IsSuccess)
         {
@@ -205,9 +205,7 @@ public sealed partial class RuntimeKernel
         if (!resolved.IsSuccess)
             return KernelResult.Fail(resolved.Error, resolved.Message!);
 
-        var identity = new PlatformDomainIdentity(
-            resolved.Value!.DomainId,
-            subject.Generation);
+        var identity = PlatformIdentity(resolved.Value!);
         var revoke = PlatformAuthority.RevokeIrq(binding, identity);
         if (revoke.IsSuccess)
             UntrackPlatformIrqBinding(binding);
@@ -281,7 +279,7 @@ public sealed partial class RuntimeKernel
         if (!_processPlatformIrqBindings.TryGetValue(handle, out var bindings) || bindings.Count == 0)
             return KernelResult.Ok();
 
-        var identity = new PlatformDomainIdentity(process.DomainId, process.Generation);
+        var identity = PlatformIdentity(process);
         KernelResult? firstFailure = null;
         foreach (var binding in bindings.ToArray())
         {

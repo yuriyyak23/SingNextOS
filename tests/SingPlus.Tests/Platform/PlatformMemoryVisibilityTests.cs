@@ -260,7 +260,9 @@ public sealed class PlatformMemoryVisibilityTests
         ulong processGeneration)
     {
         var result = provider.BindDomain(
-            new PlatformDomainIdentity(new DomainId(domainId), processGeneration));
+            new PlatformDomainIdentity(
+                new DomainId(domainId),
+                new ProcessHandle(new ProcessId(domainId), processGeneration)));
 
         Assert.True(result.IsSuccess, result.Message);
         return result.Value!;

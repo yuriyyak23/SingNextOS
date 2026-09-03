@@ -555,7 +555,7 @@ public sealed class PlatformBorrowReadGrantTests
         var buffer = kernel.AllocateBuffer<byte>(owner, 256).Value!;
         var lease = CreateCpuBorrow(kernel, owner, borrower, buffer);
         var binding = kernel.BindPlatformDomain(owner).Value!;
-        var ownerIdentity = new PlatformDomainIdentity(new DomainId(910), owner.Generation);
+        var ownerIdentity = new PlatformDomainIdentity(new DomainId(910), owner);
         return new BorrowScenario(
             kernel,
             provider,
@@ -703,7 +703,7 @@ public sealed class PlatformBorrowReadGrantTests
         {
             new PlatformFeatureDescriptor(
                 PlatformFeatureFamily.NeutralDomains,
-                1,
+                PlatformDomainContract.ContractVersion,
                 PlatformFeatureAvailability.Executable),
             new PlatformFeatureDescriptor(
                 PlatformFeatureFamily.OwnedRegionMapping,

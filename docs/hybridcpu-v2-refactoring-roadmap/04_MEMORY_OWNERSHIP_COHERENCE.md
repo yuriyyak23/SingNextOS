@@ -142,7 +142,7 @@ owner-bound external execution domain
   -> separate exact bounded read-only grant
 ```
 
-The CPU borrower and external reader may coexist only as readers. The platform binding is revalidated against the exact owner `DomainId + process generation` and binding generation.
+The CPU borrower and external reader may coexist only as readers. The platform binding is revalidated against the exact owner `DomainId + ProcessHandle` and binding generation.
 
 ### 3. Admission contract
 

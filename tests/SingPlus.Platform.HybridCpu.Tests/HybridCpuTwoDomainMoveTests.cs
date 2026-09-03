@@ -77,7 +77,9 @@ public sealed class HybridCpuTwoDomainMoveTests
     {
         var runtime = new NeutralDomainRuntimeFacade();
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
-        var subject = new PlatformDomainIdentity(new DomainId(530), 3);
+        var subject = new PlatformDomainIdentity(
+            new DomainId(530),
+            new ProcessHandle(new ProcessId(531), 3));
         var domain = provider.BindDomain(subject).Value!;
         var region = new PlatformRegionIdentity(
             new RegionHandle(new RegionId(77), new RegionGeneration(9)),

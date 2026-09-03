@@ -1,5 +1,13 @@
 # 07. Platform Bridge And External Contracts
 
+> Status note: this chapter's “current” inventory is the historical
+> `af791aba...` Phase-1 snapshot named below. The implementation-ordered roadmap
+> is authoritative for later delivery status. Phase 3 added the real neutral
+> HybridCPU provider, Phases 4–5 added bounded memory/I/O lifecycles, and the
+> first Phase-6 slice versions the SingPlus `NeutralDomains` contract at v2 with
+> an exact `(DomainId, ProcessHandle)` subject. These updates do not upgrade any
+> hardware, DMA, scheduling, boot or security claim beyond its tested evidence.
+
 ## Current status at SingNextOS `af791aba...`
 
 Platform Authority Bridge больше не является только proposed abstraction. В текущем SingNextOS реализован **local/host-backed v1 contour**:
@@ -93,9 +101,11 @@ live provider/platform grant
 
 Neither half substitutes for the other.
 
-## Current domain binding semantics
+## Phase-1 snapshot domain binding semantics
 
-`RuntimeKernel.BindPlatformDomain(ProcessHandle)` resolves the live process and binds the provider subject as:
+At the `af791aba...` snapshot,
+`RuntimeKernel.BindPlatformDomain(ProcessHandle)` resolved the live process and
+bound the provider subject as:
 
 ```text
 PlatformDomainIdentity(
@@ -103,11 +113,16 @@ PlatformDomainIdentity(
     ProcessGeneration)
 ```
 
-The bridge rejects duplicate active bindings, stale generations, wrong subjects and revoked bindings. Provider-returned subject identity is checked before the local binding is published.
+That historical bridge rejected duplicate active bindings, stale generations,
+wrong subjects and revoked bindings. Provider-returned subject identity was
+checked before the local binding was published. Current v2 instead carries the
+exact `ProcessHandle`, as stated in the status note above.
 
-Current v1 does **not** split execution/memory/I/O leases into three separately implemented local types. `NeutralDomainBinding` is a deliberately narrow generic local seam. The richer split documented elsewhere remains a target for the point where a real external API requires it.
+The v1 snapshot did **not** split execution/memory/I/O leases into three
+separately implemented local types. `NeutralDomainBinding` was a deliberately
+narrow generic local seam. Later delivery remains described by the roadmap.
 
-## Current direct owned-region mapping semantics
+## Phase-1 snapshot direct owned-region mapping semantics
 
 `RuntimeKernel.MapPlatformOwnedRegion` enforces the local side before calling the provider:
 
@@ -354,6 +369,11 @@ A real provider integration must preserve current negative properties and add ha
 
 ## Decision
 
-The current repository now proves the **local shape** of the Platform Authority Bridge: narrow semantic contracts, opaque provider leases, generation checks, local capability validation and owned-region mapping interlocks.
+At the Phase-1 snapshot, the repository proved the **local shape** of the
+Platform Authority Bridge: narrow semantic contracts, opaque provider leases,
+generation checks, local capability validation and owned-region mapping
+interlocks.
 
-The next claim boundary is external. Until a real HybridCPU-backed provider is present and tested, documentation must say **local/host-backed**, not “HybridCPU DMA/remap/coherent zero-copy implemented”.
+At that closure point, the next claim boundary was external. The later real
+provider still does not prove HybridCPU DMA/remap/coherent zero-copy; those
+claims require their own current code and tests.

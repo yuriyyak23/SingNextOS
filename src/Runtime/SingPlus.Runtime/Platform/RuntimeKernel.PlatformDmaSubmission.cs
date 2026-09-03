@@ -28,7 +28,7 @@ public sealed partial class RuntimeKernel
                 effect.Message!);
         }
 
-        var identity = new PlatformDomainIdentity(process.DomainId, subject.Generation);
+        var identity = PlatformIdentity(process);
         return PlatformAuthority.SubmitDmaGrant(
             grant,
             prepareEvidence,

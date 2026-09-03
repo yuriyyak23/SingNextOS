@@ -120,12 +120,8 @@ public sealed partial class RuntimeKernel
                 targetEffect.Message!);
         }
 
-        var sourceIdentity = new PlatformDomainIdentity(
-            sourceProcess.DomainId,
-            source.Generation);
-        var targetIdentity = new PlatformDomainIdentity(
-            targetProcess.DomainId,
-            target.Generation);
+        var sourceIdentity = PlatformIdentity(sourceProcess);
+        var targetIdentity = PlatformIdentity(targetProcess);
         if (sourceIdentity == targetIdentity)
         {
             return KernelResult<PlatformOwnedBufferMoveResult<T>>.Fail(
@@ -529,9 +525,7 @@ public sealed partial class RuntimeKernel
                 "Target platform memory access must be Read, Write, or Read|Write.");
         }
 
-        var identity = new PlatformDomainIdentity(
-            targetProcess.DomainId,
-            target.Generation);
+        var identity = PlatformIdentity(targetProcess);
         var binding = PlatformAuthority.ValidateDomain(request.Binding, identity);
         if (!binding.IsSuccess) return binding;
 

@@ -62,9 +62,7 @@ public sealed partial class RuntimeKernel
                 borrowValidation.Message!);
         }
 
-        var platformSubject = new PlatformDomainIdentity(
-            ownerProcess.Value.DomainId,
-            owner.Generation);
+        var platformSubject = PlatformIdentity(ownerProcess.Value);
         var bindingValidation = PlatformAuthority.ValidateDomain(
             externalDomain,
             platformSubject);
@@ -143,9 +141,7 @@ public sealed partial class RuntimeKernel
                 effect.Message!);
         }
 
-        var subject = new PlatformDomainIdentity(
-            ownerProcess.Value!.DomainId,
-            owner.Generation);
+        var subject = PlatformIdentity(ownerProcess.Value!);
         return PlatformAuthority.PrepareBorrowReadGrantForExternalReader(
             grant,
             subject);
@@ -163,9 +159,7 @@ public sealed partial class RuntimeKernel
                 ownerProcess.Message!);
         }
 
-        var subject = new PlatformDomainIdentity(
-            ownerProcess.Value!.DomainId,
-            owner.Generation);
+        var subject = PlatformIdentity(ownerProcess.Value!);
         return PlatformAuthority.QueryBorrowReadGrantLifecycle(
             grant,
             subject);
@@ -209,9 +203,7 @@ public sealed partial class RuntimeKernel
         if (!currentBorrow.IsSuccess)
             return KernelResult.Fail(currentBorrow.Error, currentBorrow.Message!);
 
-        var subject = new PlatformDomainIdentity(
-            ownerProcess.Value.DomainId,
-            owner.Generation);
+        var subject = PlatformIdentity(ownerProcess.Value);
         var lifecycle = PlatformAuthority.QueryBorrowReadGrantLifecycle(
             grant,
             subject);

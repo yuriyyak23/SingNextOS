@@ -41,7 +41,7 @@ public sealed partial class RuntimeKernel
                 effect.Message!);
         }
 
-        var identity = new PlatformDomainIdentity(process.DomainId, subject.Generation);
+        var identity = PlatformIdentity(process);
         var deviceValidation = PlatformAuthority.ValidateDeviceLease(deviceLease, identity);
         if (!deviceValidation.IsSuccess)
         {
@@ -119,9 +119,7 @@ public sealed partial class RuntimeKernel
         if (!resolved.IsSuccess)
             return KernelResult.Fail(resolved.Error, resolved.Message!);
 
-        var identity = new PlatformDomainIdentity(
-            resolved.Value!.DomainId,
-            subject.Generation);
+        var identity = PlatformIdentity(resolved.Value!);
         var revoke = PlatformAuthority.RevokeMmio(lease, identity);
         if (revoke.IsSuccess)
             UntrackPlatformMmioLease(lease);
@@ -175,7 +173,7 @@ public sealed partial class RuntimeKernel
         if (!_processPlatformMmioLeases.TryGetValue(handle, out var leases) || leases.Count == 0)
             return KernelResult.Ok();
 
-        var identity = new PlatformDomainIdentity(process.DomainId, process.Generation);
+        var identity = PlatformIdentity(process);
         KernelResult? firstFailure = null;
         foreach (var lease in leases.ToArray())
         {

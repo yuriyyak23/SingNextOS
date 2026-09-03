@@ -16,8 +16,11 @@ public sealed class PlatformFeatureDiscoveryTests
 
         Assert.True(manifest.Supports(
             PlatformFeatureFamily.NeutralDomains,
-            1,
+            PlatformDomainContract.ContractVersion,
             PlatformFeatureAvailability.RuntimeAdmission));
+        Assert.Equal(
+            PlatformDomainContract.ContractVersion,
+            manifest.Resolve(PlatformFeatureFamily.NeutralDomains).ContractVersion);
         Assert.True(manifest.Supports(
             PlatformFeatureFamily.OwnedRegionMapping,
             1,
@@ -75,7 +78,9 @@ public sealed class PlatformFeatureDiscoveryTests
         var unsupported = provider.QueryFeatures().Resolve(
             PlatformFeatureFamily.OwnedRegionMapping);
         var denied = provider.BindDomain(
-            new PlatformDomainIdentity(new DomainId(7), 0));
+            new PlatformDomainIdentity(
+                new DomainId(7),
+                new ProcessHandle(new ProcessId(8), 0)));
 
         Assert.Equal(PlatformFeatureAvailability.Unavailable, unsupported.Availability);
         Assert.Equal(0u, unsupported.ContractVersion);
@@ -121,19 +126,45 @@ public sealed class PlatformFeatureDiscoveryTests
 
     [Fact]
     [Trait("Category", "Runtime")]
-    public void LegacyV1ProviderGetsSemanticDiscoveryWithoutNewAuthorityCalls()
+    public void BareLegacyFeatureBitsRemainV1AndAreRejectedBeforeAuthorityCall()
     {
         var kernel = new RuntimeKernel(new LegacyV1Provider());
+        var (_, owner) = TestFixtures.Create(kernel, 8, 80);
 
         var manifest = kernel.QueryPlatformFeatures();
+        var bind = kernel.BindPlatformDomain(owner);
 
         Assert.True(manifest.Supports(
             PlatformFeatureFamily.NeutralDomains,
             1,
             PlatformFeatureAvailability.RuntimeAdmission));
         Assert.Equal(
+            1u,
+            manifest.Resolve(PlatformFeatureFamily.NeutralDomains).ContractVersion);
+        Assert.Equal(
             PlatformFeatureAvailability.Unavailable,
             manifest.Resolve(PlatformFeatureFamily.OwnedRegionMapping).Availability);
+        Assert.False(bind.IsSuccess);
+        Assert.Equal(KernelError.PlatformUnsupported, bind.Error);
+    }
+
+    [Theory]
+    [Trait("Category", "Runtime")]
+    [InlineData(PlatformFeatureAvailability.ModelOnly)]
+    [InlineData(PlatformFeatureAvailability.ProjectionOnly)]
+    [InlineData(PlatformFeatureAvailability.ProductionSecure)]
+    public void NonAdmissionAvailabilityCannotMaterializeDomainAuthority(
+        PlatformFeatureAvailability availability)
+    {
+        var provider = new NonAdmissionDomainProvider(availability);
+        var kernel = new RuntimeKernel(provider);
+        var (_, owner) = TestFixtures.Create(kernel, 9, 90);
+
+        var bind = kernel.BindPlatformDomain(owner);
+
+        Assert.False(bind.IsSuccess);
+        Assert.Equal(KernelError.PlatformUnsupported, bind.Error);
+        Assert.Equal(0, provider.BindCalls);
     }
 
     [Fact]
@@ -201,5 +232,53 @@ public sealed class PlatformFeatureDiscoveryTests
             PlatformProviderRegionMappingLease mapping,
             PlatformRegionRevocationPolicy policy) =>
             throw new InvalidOperationException("Feature discovery must not invoke authority operations.");
+    }
+
+    private sealed class NonAdmissionDomainProvider :
+        IPlatformAuthorityProvider,
+        IPlatformFeatureProvider
+    {
+        private readonly PlatformFeatureManifest _manifest;
+
+        public NonAdmissionDomainProvider(PlatformFeatureAvailability availability)
+        {
+            _manifest = new PlatformFeatureManifest(new[]
+            {
+                new PlatformFeatureDescriptor(
+                    PlatformFeatureFamily.NeutralDomains,
+                    PlatformDomainContract.ContractVersion,
+                    availability),
+            });
+        }
+
+        public int BindCalls { get; private set; }
+
+        public PlatformProviderDescriptor Descriptor { get; } = new(
+            new PlatformProviderId("non-admission-domain"),
+            PlatformDomainContract.ContractVersion,
+            PlatformAuthorityFeatures.NeutralDomainBinding);
+
+        public PlatformFeatureManifest QueryFeatures() => _manifest;
+
+        public PlatformAuthorityResult<PlatformProviderDomainLease> BindDomain(
+            PlatformDomainIdentity subject)
+        {
+            BindCalls++;
+            throw new InvalidOperationException("Non-admission evidence must not invoke authority operations.");
+        }
+
+        public PlatformAuthorityResult RevokeDomain(PlatformProviderDomainLease lease) =>
+            throw new InvalidOperationException("Non-admission evidence must not invoke authority operations.");
+
+        public PlatformAuthorityResult<PlatformProviderRegionMappingLease> MapOwnedRegion(
+            PlatformProviderDomainLease domainLease,
+            PlatformRegionIdentity region,
+            PlatformMemoryAccess access) =>
+            throw new InvalidOperationException("Non-admission evidence must not invoke authority operations.");
+
+        public PlatformAuthorityResult RevokeRegionMapping(
+            PlatformProviderRegionMappingLease mapping,
+            PlatformRegionRevocationPolicy policy) =>
+            throw new InvalidOperationException("Non-admission evidence must not invoke authority operations.");
     }
 }

@@ -13,14 +13,26 @@ public sealed partial class RuntimeKernel
         if (!resolved.IsSuccess)
             return KernelResult<PlatformDomainBinding>.Fail(resolved.Error, resolved.Message!);
 
-        var effect = EnsureProcessAcceptsNewEffects(resolved.Value!);
+        var process = resolved.Value!;
+        var effect = EnsureProcessAcceptsNewEffects(process);
         if (!effect.IsSuccess)
             return KernelResult<PlatformDomainBinding>.Fail(effect.Error, effect.Message!);
 
-        var identity = new PlatformDomainIdentity(resolved.Value!.DomainId, subject.Generation);
+        if (!CanChangePlatformExecutionAttachment(process.State))
+        {
+            return KernelResult<PlatformDomainBinding>.Fail(
+                KernelError.InvalidTransition,
+                $"A platform execution domain cannot be attached while the process is {process.State}; bind before execution starts.");
+        }
+
+        var identity = PlatformIdentity(process);
         var binding = PlatformAuthority.BindDomain(identity);
         if (binding.IsSuccess)
             TrackPlatformBinding(subject, binding.Value!);
+        else if (PlatformAuthority.TryGetQuarantinedDomainBinding(
+                     identity,
+                     out var quarantinedBinding))
+            TrackPlatformBinding(subject, quarantinedBinding);
         return binding;
     }
 
@@ -31,6 +43,14 @@ public sealed partial class RuntimeKernel
         var resolved = Processes.Resolve(subject);
         if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
 
+        var process = resolved.Value!;
+        if (!CanChangePlatformExecutionAttachment(process.State))
+        {
+            return KernelResult.Fail(
+                KernelError.InvalidTransition,
+                $"A platform execution domain cannot be detached while the process is {process.State}; post-start closure must use process teardown.");
+        }
+
         if (PlatformAuthority.HasActiveDeviceLeases(binding))
         {
             return KernelResult.Fail(
@@ -38,12 +58,15 @@ public sealed partial class RuntimeKernel
                 "Platform device leases must close before the platform domain binding.");
         }
 
-        var identity = new PlatformDomainIdentity(resolved.Value!.DomainId, subject.Generation);
+        var identity = PlatformIdentity(process);
         var revoke = PlatformAuthority.RevokeDomain(binding, identity);
         if (revoke.IsSuccess)
             UntrackPlatformBinding(subject, binding);
         return revoke;
     }
+
+    private static bool CanChangePlatformExecutionAttachment(ProcessState state) =>
+        state is ProcessState.Created or ProcessState.Admitted;
 
     public KernelResult<PlatformRegionMapping> MapPlatformOwnedRegion(
         ProcessHandle owner,
@@ -66,7 +89,7 @@ public sealed partial class RuntimeKernel
         if (!effect.IsSuccess)
             return KernelResult<PlatformRegionMapping>.Fail(effect.Error, effect.Message!);
 
-        var identity = new PlatformDomainIdentity(process.DomainId, owner.Generation);
+        var identity = PlatformIdentity(process);
 
         var bindingValidation = PlatformAuthority.ValidateDomain(binding, identity);
         if (!bindingValidation.IsSuccess)
@@ -167,7 +190,7 @@ public sealed partial class RuntimeKernel
                 effect.Message!);
         }
 
-        var identity = new PlatformDomainIdentity(process.DomainId, owner.Generation);
+        var identity = PlatformIdentity(process);
         var bindingValidation = PlatformAuthority.ValidateDomain(binding, identity);
         if (!bindingValidation.IsSuccess)
         {
@@ -276,7 +299,7 @@ public sealed partial class RuntimeKernel
                 effect.Message!);
         }
 
-        var identity = new PlatformDomainIdentity(process.DomainId, owner.Generation);
+        var identity = PlatformIdentity(process);
         return PlatformAuthority.PrepareRegionMappingForConsumer(
             mapping,
             identity,
@@ -299,9 +322,7 @@ public sealed partial class RuntimeKernel
         var dma = AdvancePlatformDmaGrantsForMapping(mapping);
         if (!dma.IsSuccess) return dma;
 
-        var identity = new PlatformDomainIdentity(
-            resolved.Value!.DomainId,
-            owner.Generation);
+        var identity = PlatformIdentity(resolved.Value!);
         var lifecycle = PlatformAuthority.BeginRegionMappingRevocation(
             mapping,
             identity,
@@ -319,9 +340,7 @@ public sealed partial class RuntimeKernel
         var resolved = Processes.Resolve(owner);
         if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
 
-        var identity = new PlatformDomainIdentity(
-            resolved.Value!.DomainId,
-            owner.Generation);
+        var identity = PlatformIdentity(resolved.Value!);
         var lifecycle = PlatformAuthority.ObserveRegionMappingRevocation(mapping, identity);
         if (!lifecycle.IsSuccess)
             return KernelResult.Fail(lifecycle.Error, lifecycle.Message!);
@@ -339,9 +358,7 @@ public sealed partial class RuntimeKernel
                 resolved.Error,
                 resolved.Message!);
 
-        var identity = new PlatformDomainIdentity(
-            resolved.Value!.DomainId,
-            owner.Generation);
+        var identity = PlatformIdentity(resolved.Value!);
         return PlatformAuthority.QueryRegionMappingLifecycle(mapping, identity);
     }
 

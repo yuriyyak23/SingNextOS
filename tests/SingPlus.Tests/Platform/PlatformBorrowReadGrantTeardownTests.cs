@@ -190,7 +190,7 @@ public sealed class PlatformBorrowReadGrantTeardownTests
         {
             new PlatformFeatureDescriptor(
                 PlatformFeatureFamily.NeutralDomains,
-                1,
+                PlatformDomainContract.ContractVersion,
                 PlatformFeatureAvailability.Executable),
             new PlatformFeatureDescriptor(
                 PlatformFeatureFamily.OwnedRegionMapping,

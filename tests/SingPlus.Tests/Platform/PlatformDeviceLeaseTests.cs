@@ -321,7 +321,7 @@ public sealed class PlatformDeviceLeaseTests
         {
             new PlatformFeatureDescriptor(
                 PlatformFeatureFamily.NeutralDomains,
-                1,
+                PlatformDomainContract.ContractVersion,
                 PlatformFeatureAvailability.Executable),
             new PlatformFeatureDescriptor(
                 PlatformFeatureFamily.IoDomainBinding,
