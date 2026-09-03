@@ -70,14 +70,14 @@ public sealed partial class PlatformAuthorityBridge
         long offset,
         long length)
     {
-        var expectedBorrower = new RegionOwner(
+        var expectedOwner = new RegionOwner(
             expectedSubject.DomainId,
             expectedSubject.ProcessGeneration);
-        if (borrow.Borrower != expectedBorrower)
+        if (borrow.Owner != expectedOwner)
         {
             return KernelResult<PlatformBorrowReadGrant>.Fail(
                 KernelError.WrongPlatformDomain,
-                "The platform domain is not bound to the active CPU borrower.");
+                "The external platform domain is not bound to the exact Sing region owner.");
         }
 
         if (!borrow.Lifetime.IsActive)
@@ -87,12 +87,11 @@ public sealed partial class PlatformAuthorityBridge
                 "The CPU borrow lifetime is no longer active.");
         }
 
-        var platformRegion = new PlatformRegionIdentity(
-            borrow.Handle.Region,
-            borrow.Owner,
-            borrow.ByteLength);
         var slice = new PlatformRegionSlice(
-            platformRegion,
+            new PlatformRegionIdentity(
+                borrow.Handle.Region,
+                borrow.Owner,
+                borrow.ByteLength),
             offset,
             length,
             PlatformMemoryAccess.Read);
@@ -171,11 +170,12 @@ public sealed partial class PlatformAuthorityBridge
                 validation.Message!);
         }
 
-        var lifecycle = BeginRegionMappingRevocation(
-            validation.Value!.Mapping.Mapping,
-            expectedSubject,
-            PlatformRegionRevocationPolicy.DrainBeforeRevoke);
-        return ProjectBorrowReadGrantLifecycle(grant, lifecycle);
+        return ProjectBorrowReadGrantLifecycle(
+            grant,
+            BeginRegionMappingRevocation(
+                validation.Value!.Mapping.Mapping,
+                expectedSubject,
+                PlatformRegionRevocationPolicy.DrainBeforeRevoke));
     }
 
     internal KernelResult<PlatformBorrowReadGrantLifecycle> ObserveBorrowReadGrantRevocation(
@@ -190,10 +190,11 @@ public sealed partial class PlatformAuthorityBridge
                 validation.Message!);
         }
 
-        var lifecycle = ObserveRegionMappingRevocation(
-            validation.Value!.Mapping.Mapping,
-            expectedSubject);
-        return ProjectBorrowReadGrantLifecycle(grant, lifecycle);
+        return ProjectBorrowReadGrantLifecycle(
+            grant,
+            ObserveRegionMappingRevocation(
+                validation.Value!.Mapping.Mapping,
+                expectedSubject));
     }
 
     internal KernelResult<PlatformBorrowReadGrantLifecycle> QueryBorrowReadGrantLifecycle(
@@ -208,10 +209,11 @@ public sealed partial class PlatformAuthorityBridge
                 validation.Message!);
         }
 
-        var lifecycle = QueryRegionMappingLifecycle(
-            validation.Value!.Mapping.Mapping,
-            expectedSubject);
-        return ProjectBorrowReadGrantLifecycle(grant, lifecycle);
+        return ProjectBorrowReadGrantLifecycle(
+            grant,
+            QueryRegionMappingLifecycle(
+                validation.Value!.Mapping.Mapping,
+                expectedSubject));
     }
 
     internal KernelResult ValidateBorrowReadGrantLocalAuthority(
@@ -224,6 +226,16 @@ public sealed partial class PlatformAuthorityBridge
             return KernelResult.Fail(validation.Error, validation.Message!);
 
         var record = validation.Value!;
+        var expectedOwner = new RegionOwner(
+            expectedSubject.DomainId,
+            expectedSubject.ProcessGeneration);
+        if (currentBorrow.Owner != expectedOwner || record.Owner != expectedOwner)
+        {
+            return KernelResult.Fail(
+                KernelError.WrongRegionOwner,
+                "The exact Sing owner no longer matches the external platform domain.");
+        }
+
         if (record.Grant.BorrowLease != currentBorrow.Handle)
         {
             return KernelResult.Fail(
@@ -231,12 +243,11 @@ public sealed partial class PlatformAuthorityBridge
                 "The CPU borrow identity no longer matches the external read grant.");
         }
 
-        if (record.Owner != currentBorrow.Owner ||
-            record.Borrower != currentBorrow.Borrower)
+        if (record.Borrower != currentBorrow.Borrower)
         {
             return KernelResult.Fail(
                 KernelError.WrongRegionOwner,
-                "The CPU borrow owner or borrower no longer matches the external read grant.");
+                "The CPU borrower no longer matches the external read grant.");
         }
 
         if (!ReferenceEquals(record.BorrowLifetime, currentBorrow.Lifetime) ||
@@ -275,7 +286,8 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDomainIdentity expectedSubject)
     {
         var validation = ValidateBorrowReadGrantIdentity(grant, expectedSubject);
-        if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
+        if (!validation.IsSuccess)
+            return KernelResult.Fail(validation.Error, validation.Message!);
 
         var record = validation.Value!;
         var lifecycle = QueryRegionMappingLifecycle(
@@ -332,6 +344,16 @@ public sealed partial class PlatformAuthorityBridge
             return KernelResult<BorrowReadGrantRecord>.Fail(
                 KernelError.StaleGeneration,
                 "The external CPU-borrow platform-binding generation is stale.");
+        }
+
+        var expectedOwner = new RegionOwner(
+            expectedSubject.DomainId,
+            expectedSubject.ProcessGeneration);
+        if (record.Owner != expectedOwner)
+        {
+            return KernelResult<BorrowReadGrantRecord>.Fail(
+                KernelError.WrongPlatformDomain,
+                "The external platform domain no longer matches the exact Sing owner.");
         }
 
         if (record.Grant.BorrowLease.Region.RegionId != grant.BorrowLease.Region.RegionId)
