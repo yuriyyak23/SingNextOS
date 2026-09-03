@@ -2,29 +2,31 @@
 
 ## Status
 
-**In progress — three vertical slices implemented.**
+**In progress — four vertical slices implemented.**
 
 Implemented slices:
 
 1. exact capability-backed semantic device lease authority;
 2. exact capability-backed bounded MMIO lease/range authority;
-3. exact capability-backed stale-generation-safe IRQ/event binding.
+3. exact capability-backed stale-generation-safe IRQ/event binding;
+4. exact admission-only DMA grant authority composed from a live device lease plus an exact mapped owned-region slice, bounded relative range, and direction.
 
-The remaining Phase-5 acceptance work is DMA authority, visibility/ownership ordering, completion/drain/revoke, and a bounded DMA acceptance path. The phase acceptance boundary is therefore **not** complete.
+Slice 4 closes the first DMA-authority admission step, including exact identity composition and dependent-lifetime ordering. It deliberately does **not** claim executable DMA: non-coherent prepare/acquire, submit, completion/drain, and a real or faithful bounded transfer acceptance path remain Phase-5 work. The phase acceptance boundary is therefore **not** complete.
 
-The Slice-3 cross-repository integration gate is pinned to HybridCPU neutral IRQ/event commit `cb42afbee49bb632467d9f3c13dc7eb9f96524eb`, based on normalized HybridCPU `master` `53e51234e9428115a9af505549f939d0d4eb4e4b`.
+The Slice-4 cross-repository integration gate is pinned to HybridCPU neutral DMA-grant commit `ccb1dc3d9b35beedfe4286e010c51451e8a46f78`, based on HybridCPU `master` `67d1e6f528de2f181c4b5c68df4e95ef7e2bd0aa` after the IRQ/event slice.
 
 ## Goal
 
 Turn local device/MMIO/IRQ/DMA capabilities and exact owned-region authority into bounded, revocable platform effects without giving drivers ambient authority.
 
-The central later-DMA rule remains:
+The central executable-DMA rule remains:
 
 ```text
 client-derived exact region authority
 AND device-service authority
 AND live platform domain/mapping
-AND HybridCPU I/O-domain/IOMMU admission
+AND explicit device-memory visibility ordering
+AND provider DMA admission/execution
   -> bounded device effect
 ```
 
@@ -73,7 +75,7 @@ NeutralMmioLeaseHandle / epoch
 
 MMIO closes before device/domain authority. Exact closure remains structurally possible after local authorization is revoked, while consuming MMIO authority still requires live authorization.
 
-The real HybridCPU provider advertises MMIO contract v1 as `Executable`. `DmaMapping` remains unavailable.
+The real HybridCPU provider advertises MMIO contract v1 as `Executable`.
 
 ## Slice 3 — exact stale-safe IRQ/event binding
 
@@ -206,79 +208,167 @@ It provides explicit semantic signal/poll/complete/close behavior with one exact
 
 This surface exports no vector/controller/APIC/GIC/MSI/GSI, DMA, IOMMU, physical-address, VM, queue, lane or opcode authority.
 
-### Feature discovery
+## Slice 4 — exact admission-only DMA grant authority
 
-The real HybridCPU provider now advertises:
+Slice 4 introduces a bounded, revocable DMA **admission** authority without introducing a transfer-execution surface.
+
+### Authority composition
+
+A Sing-local grant is materialized only from already-proven exact authorities:
+
+```text
+exact live ProcessHandle generation
++ exact live PlatformDeviceLease
++ exact live PlatformOwnedRegionSliceMapping
++ exact bounded range relative to that mapped slice
++ DeviceReadsMemory | DeviceWritesMemory | Bidirectional
+-> separate PlatformDmaGrant identity
+```
+
+There is no new DMA capability namespace. Device capability authority is already committed into the exact `PlatformDeviceLease`; memory capability and `RegionAuthority` ownership are already committed into the exact mapping. `RegionAuthority` remains the sole ownership authority.
+
+The DMA identity spaces remain separate:
+
+```text
+PlatformDmaGrantId / generation
+PlatformProviderDmaGrantId / generation
+NeutralDmaGrantHandle / epoch
+```
+
+Provider and HybridCPU identities stay bridge-private and never become SIP/local memory authority.
+
+### Admission rules
+
+Admission requires:
+
+- exact live device and mapping identities;
+- device and mapping belonging to the exact same platform-domain lifetime;
+- a positive non-overflowing range wholly contained in the exact mapped slice;
+- device `Configure` plus direction-specific `Read`/`Write` rights;
+- mapped-memory access matching the direction;
+- one live grant per exact mapping in this first admission-only slice.
+
+`DeviceReadsMemory` requires readable device/mapping authority; `DeviceWritesMemory` requires writable device/mapping authority; `Bidirectional` requires both.
+
+Missing/forged/stale local authority and invalid range/direction/access fail before the provider DMA-grant call.
+
+### Admission is not execution
+
+A successful `PlatformDmaGrant` proves only that the exact device and exact bounded mapped range are composition-compatible for DMA authority. It does **not** prove:
+
+- CPU-to-device publication or cache maintenance;
+- transfer submission;
+- hardware/device execution;
+- completion;
+- device-to-CPU acquisition/maintenance;
+- coherent DMA.
+
+Accordingly, the real HybridCPU provider advertises:
+
+```text
+PlatformFeatureFamily.DmaMapping
+  -> PlatformDmaGrantContract v1 / RuntimeAdmission
+```
+
+It is explicitly **not** `Executable`.
+
+### Lifetime and teardown ordering
+
+A live grant pins both lower authorities:
+
+```text
+live DMA grant
+  -> device close denied
+  -> mapped-region close denied
+```
+
+Runtime teardown closes dependent DMA grants before lower authority:
+
+```text
+DMA grant close
+-> IRQ/MMIO/device closure as applicable
+-> region-mapping closure
+-> domain/process reclaim
+```
+
+The slice enforces this ordering for explicit device revoke, explicit region-mapping revoke, device-capability cascade, memory-capability cascade, and process teardown. If DMA-grant revoke faults, lower device/mapping authority remains pinned and reclaim is forbidden.
+
+Provider and neutral layers independently enforce the same dependent-lifetime rule rather than trusting only the Sing runtime ordering.
+
+### Hardware-boundary exclusions
+
+The public DMA admission surfaces expose no:
+
+- raw/physical/bus address;
+- IOMMU identifier or control handle;
+- page-table/PTE identity;
+- descriptor, scatter/gather, ring or queue identity;
+- interrupt vector/controller identity;
+- VM state, lane or opcode identity.
+
+There is no `SubmitDma`, DMA completion, or transfer queue API in Slice 4.
+
+## Feature discovery after Slice 4
+
+The real HybridCPU provider advertises:
 
 ```text
 PlatformFeatureFamily.IoDomainBinding -> device lease v1 / Executable
 PlatformFeatureFamily.MmioMapping     -> MMIO lease v1 / Executable
 PlatformFeatureFamily.IrqBinding      -> IRQ binding v1 / Executable
-PlatformFeatureFamily.DmaMapping      -> Unavailable
+PlatformFeatureFamily.DmaMapping      -> DMA grant v1 / RuntimeAdmission
 ```
 
-`IrqBinding` is appended after the existing feature families so existing numeric identities are not renumbered.
+`RuntimeAdmission` is intentionally weaker than `Executable` and prevents discovery from overstating the implemented DMA behavior.
 
 ## Tests
 
-Slice-1 and Slice-2 tests remain in place.
+Slice-1, Slice-2 and Slice-3 tests remain in place.
 
-Slice-3 focused tests prove:
+Slice-4 focused tests prove:
 
-- canonical IRQ capability identity round-trips semantic device/source/trigger;
-- exact IRQ capability + exact live device lease + exact local event endpoint materialize a separate route;
-- wrong device resource, missing `Signal`, non-canonical IRQ identity and wrong endpoint owner fail before provider binding;
-- device `Configure` authority is required;
-- provider delivery becomes a local `KernelEvent` and exact provider completion occurs only after local publication;
-- a full local endpoint leaves external delivery pending and unacknowledged until publication can succeed;
-- stale old process handles and recycled process generations cannot receive from an old route;
-- IRQ capability revoke closes derived route without closing unrelated device authority;
-- device revoke and process teardown close IRQ route before device/domain authority;
-- IRQ close fault pins teardown before device/domain close and event reclaim;
-- real pinned HybridCPU provider materializes and closes the exact neutral interrupt route;
-- neutral signal/poll/complete tests reject stale/forged route and wrong delivery sequence;
-- public Sing and neutral IRQ/event surfaces contain no provider or raw hardware-routing authority identities.
+- exact live device lease plus exact live mapped region slice materialize a separate bounded DMA grant;
+- device and mapping must belong to the same exact domain lifetime;
+- invalid range, undefined direction, insufficient device rights and insufficient mapped-memory access are rejected;
+- missing/forged local device or mapping authority fails before the provider DMA-grant call;
+- one live grant per exact mapping is enforced in this first slice;
+- stale or forged grant closure fails closed;
+- a live grant blocks both device and mapping closure at runtime, provider and neutral layers;
+- explicit revoke, capability cascade and process teardown drain DMA grants before lower device/mapping authority;
+- DMA-grant revoke failure prevents lower authority closure;
+- the real pinned HybridCPU provider materializes and closes the exact neutral DMA grant;
+- public Sing/provider/neutral DMA surfaces contain no raw address, IOMMU, page-table, descriptor/queue, VM, lane or opcode authority;
+- the facade contains no DMA submit/completion operation;
+- feature discovery reports DMA grant v1 as `RuntimeAdmission`, not `Executable`.
 
 ## DMA — remaining Phase-5 work
 
-DMA must compose exact device authority with exact caller-derived region authority:
+Slice 4 establishes admission only. Executable DMA must add explicit visibility and completion semantics on top of that exact grant:
 
 ```text
-DmaGrantLease BindDma(
-    DeviceLease,
-    PlatformRegionMappingLease,
-    ExactRange,
-    Direction)
-```
-
-The required lifecycle remains:
-
-```text
-CPU-Owned
--> Prepare / Publish
--> exact DMA grant
--> Submit
+CPU-Owned exact region/mapping
+-> exact DMA grant admission
+-> Prepare / Publish for device direction
+-> Submit bounded transfer
 -> completion pending
 -> completion proven
--> Acquire / maintenance
+-> Acquire / maintenance when device may have written memory
 -> revoke DMA grant
 -> revoke region mapping
 -> CPU ownership / reclaim allowed
 ```
 
-`Direction` must distinguish device-read, device-write and bidirectional where supported. No coherent-DMA premise is allowed.
+No coherent-DMA premise is allowed. Grant existence alone must never authorize submission or CPU reuse.
 
 Required remaining negative/acceptance tests include:
 
-- device capability without region authority cannot create a DMA grant;
-- region authority without device authority cannot create a DMA grant;
-- wrong DMA range/direction is denied before provider submit;
-- stale domain/IOMMU/provider epoch invalidates the DMA grant;
-- non-coherent device access without required prepare/acquire is denied;
-- local capability revoke stops new submissions immediately while old DMA drains;
-- process termination cannot reclaim the buffer before DMA completion/revoke;
-- provider token never appears in a SIP payload;
-- one real or faithful bounded DMA path survives denial/stale/revoke fault injection.
+- non-coherent device access without required prepare/publish is denied before submit;
+- device-written memory cannot return to CPU use before completion plus required acquire/maintenance;
+- local capability revoke stops new submissions immediately while an already-submitted DMA operation drains;
+- process termination cannot reclaim the buffer before DMA completion, required acquire/maintenance, and grant/mapping closure;
+- stale/faulted provider execution/completion evidence fails closed;
+- provider execution tokens never appear in SIP payloads;
+- one real or faithful bounded DMA path survives denial/stale/revoke/completion fault injection.
 
 ## Acceptance criteria
 
@@ -288,10 +378,9 @@ Phase 5 is complete only when one real or faithful provider path performs a boun
 
 ## Remaining Phase-5 work
 
-- exact DMA grant composed from device lease plus exact region authority;
-- direction and non-coherent prepare/acquire semantics;
-- submit/completion/drain/revoke ordering and process-teardown integration;
-- real or faithful bounded DMA acceptance path and fault injection.
+- explicit non-coherent DMA prepare/publish and post-write acquire/maintenance semantics;
+- bounded DMA submit plus completion/drain/revoke ordering and process-teardown integration;
+- one real or faithful bounded DMA acceptance path with denial/stale/revoke/completion fault injection.
 
 ## Do not do
 
