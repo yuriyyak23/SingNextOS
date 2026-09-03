@@ -99,6 +99,9 @@ public sealed partial class RuntimeKernel
         if (!resolved.IsSuccess)
             return KernelResult.Fail(resolved.Error, resolved.Message!);
 
+        var dma = AdvancePlatformDmaGrantsForDevice(lease);
+        if (!dma.IsSuccess) return dma;
+
         var irq = AdvancePlatformIrqBindingsForDevice(lease);
         if (!irq.IsSuccess) return irq;
 
@@ -119,6 +122,13 @@ public sealed partial class RuntimeKernel
         KernelResult? firstFailure = null;
         foreach (var lease in PlatformAuthority.BeginDeviceCapabilityRevocation(capabilityId))
         {
+            var dma = AdvancePlatformDmaGrantsForDevice(lease);
+            if (!dma.IsSuccess)
+            {
+                firstFailure ??= dma;
+                continue;
+            }
+
             var irq = AdvancePlatformIrqBindingsForDevice(lease);
             if (!irq.IsSuccess)
             {
@@ -152,6 +162,9 @@ public sealed partial class RuntimeKernel
         SingProcess process,
         ProcessHandle handle)
     {
+        var dma = AdvancePlatformDmaGrantsForProcess(process, handle);
+        if (!dma.IsSuccess) return dma;
+
         var irq = AdvancePlatformIrqBindingsForProcess(process, handle);
         if (!irq.IsSuccess) return irq;
 
