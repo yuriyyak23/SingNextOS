@@ -8,9 +8,21 @@ public readonly record struct MmioRegionResourceId(
     string RegionResourceId,
     long ByteLength);
 
+public enum IrqTriggerMode : byte
+{
+    Edge = 0,
+    Level = 1,
+}
+
+public readonly record struct IrqResourceId(
+    string DeviceResourceId,
+    string SourceResourceId,
+    IrqTriggerMode Trigger);
+
 public static class CapabilityResourceIds
 {
     private const string MmioPrefix = "mmio-region:v1:";
+    private const string IrqPrefix = "irq:v1:";
 
     public static string MemoryRegion(RegionId regionId) =>
         $"memory-region:{regionId.Value.ToString(CultureInfo.InvariantCulture)}";
@@ -20,8 +32,8 @@ public static class CapabilityResourceIds
         string regionResourceId,
         long byteLength)
     {
-        ValidateMmioPart(deviceResourceId, nameof(deviceResourceId));
-        ValidateMmioPart(regionResourceId, nameof(regionResourceId));
+        ValidateSemanticPart(deviceResourceId, nameof(deviceResourceId), "MMIO");
+        ValidateSemanticPart(regionResourceId, nameof(regionResourceId), "MMIO");
         if (byteLength <= 0)
             throw new ArgumentOutOfRangeException(nameof(byteLength));
 
@@ -50,8 +62,8 @@ public static class CapabilityResourceIds
             return false;
         }
 
-        if (!IsValidMmioPart(deviceResourceId) ||
-            !IsValidMmioPart(regionResourceId) ||
+        if (!IsValidSemanticPart(deviceResourceId) ||
+            !IsValidSemanticPart(regionResourceId) ||
             !string.Equals(parts[0], Encode(deviceResourceId), StringComparison.Ordinal) ||
             !string.Equals(parts[1], Encode(regionResourceId), StringComparison.Ordinal))
         {
@@ -65,15 +77,67 @@ public static class CapabilityResourceIds
         return true;
     }
 
-    private static void ValidateMmioPart(string value, string parameterName)
+    public static string Irq(
+        string deviceResourceId,
+        string sourceResourceId,
+        IrqTriggerMode trigger)
     {
-        if (!IsValidMmioPart(value))
+        ValidateSemanticPart(deviceResourceId, nameof(deviceResourceId), "IRQ");
+        ValidateSemanticPart(sourceResourceId, nameof(sourceResourceId), "IRQ");
+        if (!Enum.IsDefined(trigger))
+            throw new ArgumentOutOfRangeException(nameof(trigger));
+
+        return $"{IrqPrefix}{Encode(deviceResourceId)}:{Encode(sourceResourceId)}:{((byte)trigger).ToString(CultureInfo.InvariantCulture)}";
+    }
+
+    public static bool TryParseIrq(
+        string? resourceId,
+        out IrqResourceId parsed)
+    {
+        parsed = default;
+        if (string.IsNullOrWhiteSpace(resourceId) ||
+            !resourceId.StartsWith(IrqPrefix, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var payload = resourceId[IrqPrefix.Length..];
+        var parts = payload.Split(':');
+        if (parts.Length != 3 ||
+            !TryDecode(parts[0], out var deviceResourceId) ||
+            !TryDecode(parts[1], out var sourceResourceId) ||
+            !byte.TryParse(parts[2], NumberStyles.None, CultureInfo.InvariantCulture, out var triggerValue))
+        {
+            return false;
+        }
+
+        var trigger = (IrqTriggerMode)triggerValue;
+        if (!Enum.IsDefined(trigger) ||
+            !IsValidSemanticPart(deviceResourceId) ||
+            !IsValidSemanticPart(sourceResourceId) ||
+            !string.Equals(parts[0], Encode(deviceResourceId), StringComparison.Ordinal) ||
+            !string.Equals(parts[1], Encode(sourceResourceId), StringComparison.Ordinal) ||
+            !string.Equals(parts[2], triggerValue.ToString(CultureInfo.InvariantCulture), StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        parsed = new IrqResourceId(deviceResourceId, sourceResourceId, trigger);
+        return true;
+    }
+
+    private static void ValidateSemanticPart(
+        string value,
+        string parameterName,
+        string authorityName)
+    {
+        if (!IsValidSemanticPart(value))
             throw new ArgumentException(
-                "MMIO semantic resource identities must be non-empty and at most 128 characters.",
+                $"{authorityName} semantic resource identities must be non-empty and at most 128 characters.",
                 parameterName);
     }
 
-    private static bool IsValidMmioPart(string? value) =>
+    private static bool IsValidSemanticPart(string? value) =>
         !string.IsNullOrWhiteSpace(value) && value.Length <= 128;
 
     private static string Encode(string value) =>
