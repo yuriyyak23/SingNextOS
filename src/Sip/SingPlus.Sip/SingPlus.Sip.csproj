@@ -9,5 +9,6 @@
   <ItemGroup>
     <ProjectReference Include="../../../contracts/SingPlus.Contracts/SingPlus.Contracts.csproj" />
     <ProjectReference Include="../../../sdk/SingPlus.Sip.Sdk/SingPlus.Sip.Sdk.csproj" />
+    <ProjectReference Include="../../../sdk/SingPlus.Generators/SingPlus.Generators.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" PrivateAssets="all" />
   </ItemGroup>
 </Project>
