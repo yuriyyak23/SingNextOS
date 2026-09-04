@@ -24,6 +24,8 @@ public static class CapabilityResourceIds
     private const string MmioPrefix = "mmio-region:v1:";
     private const string IrqPrefix = "irq:v1:";
 
+    public const string Dsc1Copy = "compute:dsc1-copy:v1";
+
     public static string MemoryRegion(RegionId regionId) =>
         $"memory-region:{regionId.Value.ToString(CultureInfo.InvariantCulture)}";
 

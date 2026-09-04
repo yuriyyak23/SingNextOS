@@ -58,7 +58,8 @@ public enum CapabilityRights
     Signal = 1 << 3,
     Configure = 1 << 4,
     Transfer = 1 << 5,
-    Delegate = 1 << 6
+    Delegate = 1 << 6,
+    Execute = 1 << 7
 }
 
 public enum ResourceKind
@@ -69,7 +70,8 @@ public enum ResourceKind
     Device = 3,
     MmioRegion = 4,
     Irq = 5,
-    Dma = 6
+    Dma = 6,
+    Compute = 7
 }
 
 public readonly record struct CapabilityRequirementV1(ResourceKind ResourceKind, string ResourceId, CapabilityRights Rights);

@@ -13,3 +13,4 @@ public sealed record CapabilityDescriptorV1(
 public readonly record struct MmioRegionCapability(CapabilityId CapabilityId);
 public readonly record struct IrqCapability(CapabilityId CapabilityId);
 public readonly record struct DmaCapability(CapabilityId CapabilityId);
+public readonly record struct Dsc1ComputeCapability(CapabilityId CapabilityId);

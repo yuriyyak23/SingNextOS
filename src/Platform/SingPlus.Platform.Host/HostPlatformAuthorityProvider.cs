@@ -8,7 +8,8 @@ public sealed partial class HostPlatformAuthorityProvider :
     IPlatformCompletionProvider,
     IPlatformMemoryVisibilityProvider,
     IPlatformRegionRevocationProvider,
-    IPlatformExecutionPolicyProvider
+    IPlatformExecutionPolicyProvider,
+    IPlatformDsc1ComputeProvider
 {
     private sealed class DomainRecord(PlatformProviderDomainLease lease)
     {
@@ -54,13 +55,15 @@ public sealed partial class HostPlatformAuthorityProvider :
             PlatformAuthorityFeatures.DirectOwnedRegionMapping,
         PlatformAuthorityStatus? regionRevocationFailure = null,
         IEnumerable<PlatformFeatureDescriptor>? additionalFeatures = null,
-        bool deferRegionRevocationCompletion = false)
+        bool deferRegionRevocationCompletion = false,
+        bool deferDsc1Completion = false)
     {
         if (regionRevocationFailure == PlatformAuthorityStatus.Success)
             throw new ArgumentOutOfRangeException(nameof(regionRevocationFailure));
 
         _regionRevocationFailure = regionRevocationFailure;
         _deferRegionRevocationCompletion = deferRegionRevocationCompletion;
+        _deferDsc1Completion = deferDsc1Completion;
         Descriptor = new PlatformProviderDescriptor(new PlatformProviderId("host-test"), 2, features);
 
         var featureDescriptors = PlatformFeatureManifest.FromLegacy(features).Features
@@ -82,6 +85,17 @@ public sealed partial class HostPlatformAuthorityProvider :
             PlatformFeatureFamily.ExplicitMemoryVisibility,
             1,
             PlatformFeatureAvailability.ModelOnly));
+
+        if ((features & (PlatformAuthorityFeatures.NeutralDomainBinding |
+                         PlatformAuthorityFeatures.DirectOwnedRegionMapping)) ==
+            (PlatformAuthorityFeatures.NeutralDomainBinding |
+             PlatformAuthorityFeatures.DirectOwnedRegionMapping))
+        {
+            featureDescriptors.Add(new PlatformFeatureDescriptor(
+                PlatformFeatureFamily.Dsc1BulkCompute,
+                PlatformDsc1ComputeContract.ContractVersion,
+                PlatformFeatureAvailability.ModelOnly));
+        }
 
         _featureManifest = additionalFeatures is null
             ? new PlatformFeatureManifest(featureDescriptors)
@@ -259,6 +273,11 @@ public sealed partial class HostPlatformAuthorityProvider :
                 PlatformAuthorityStatus.Denied,
                 "Active region mappings must be revoked before the domain binding.");
 
+        if (HasActiveDsc1SubmissionForDomain(lease))
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.Denied,
+                "Active DSC1 model submissions must close before the domain binding.");
+
         var record = _domains[lease.LeaseId];
         record.Revoked = true;
         _activeSubjects.Remove(record.Lease.Subject);
@@ -331,6 +350,13 @@ public sealed partial class HostPlatformAuthorityProvider :
             return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Fail(
                 validation.Status,
                 validation.Message!);
+
+        if (HasActiveDsc1SubmissionForMapping(mapping))
+        {
+            return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Fail(
+                PlatformAuthorityStatus.Denied,
+                "Active DSC1 model submissions must close before their owned-region mappings.");
+        }
 
         var record = _mappings[mapping.MappingId];
         if (record.RevocationOperation is { } existingOperation)
@@ -441,6 +467,11 @@ public sealed partial class HostPlatformAuthorityProvider :
 
         var validation = ValidateRegionMappingForRevocation(mapping, policy);
         if (!validation.IsSuccess) return validation;
+
+        if (HasActiveDsc1SubmissionForMapping(mapping))
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.Denied,
+                "Active DSC1 model submissions must close before their owned-region mappings.");
 
         if (_regionRevocationFailure is { } failure)
             return PlatformAuthorityResult.Fail(

@@ -128,16 +128,24 @@ public sealed partial class RuntimeKernel
 
     public KernelResult RevokeCapability(CapabilityId capabilityId)
     {
+        lock (_dsc1PayloadGate)
+            return RevokeCapabilityLocked(capabilityId);
+    }
+
+    private KernelResult RevokeCapabilityLocked(CapabilityId capabilityId)
+    {
         var result = CapabilityAuthority.Revoke(capabilityId);
         if (!result.IsSuccess) return result;
 
         foreach (var process in Processes.Snapshot())
             process.RemoveCapability(capabilityId);
 
+        var computeCascade = CascadePlatformDsc1CapabilityRevocation(capabilityId);
         var irqCascade = CascadePlatformIrqCapabilityRevocation(capabilityId);
         var mmioCascade = CascadePlatformMmioCapabilityRevocation(capabilityId);
         var deviceCascade = CascadePlatformDeviceCapabilityRevocation(capabilityId);
         var mappingCascade = CascadePlatformCapabilityRevocation(capabilityId);
+        if (!computeCascade.IsSuccess) return computeCascade;
         if (!irqCascade.IsSuccess) return irqCascade;
         if (!mmioCascade.IsSuccess) return mmioCascade;
         if (!deviceCascade.IsSuccess) return deviceCascade;
