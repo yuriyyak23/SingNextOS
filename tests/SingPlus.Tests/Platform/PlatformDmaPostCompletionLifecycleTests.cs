@@ -632,6 +632,9 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
         using var release = new ManualResetEventSlim();
         scenario.Provider.CompletionEntered = entered;
         scenario.Provider.CompletionRelease = release;
+        var firstWait = scenario.Kernel.WaitForKernelEventAsync(
+            scenario.Subject,
+            firstEndpoint).AsTask();
 
         var firstTask = Task.Run(() => scenario.Kernel.ObservePlatformDmaCompletion(
             scenario.Subject,
@@ -658,6 +661,7 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
                 scenario.Kernel.CloseKernelEventEndpoint(
                     scenario.Subject,
                     firstEndpoint).Error);
+            Assert.False(firstWait.IsCompleted);
         }
         finally
         {
@@ -667,7 +671,12 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
         var first = await firstTask;
         Assert.True(first.IsSuccess, first.Message);
         Assert.Equal(1, scenario.Provider.CompletionCalls);
-        Assert.True(scenario.Kernel.ConsumeKernelEvent(scenario.Subject, firstEndpoint).IsSuccess);
+        var firstEvent = await firstWait;
+        Assert.True(firstEvent.IsSuccess, firstEvent.Message);
+        Assert.Equal(KernelEventClass.Completion, firstEvent.Value!.EventClass);
+        Assert.Equal(
+            KernelError.ResponseNotAvailable,
+            scenario.Kernel.ConsumeKernelEvent(scenario.Subject, firstEndpoint).Error);
         AssertSuccess(scenario.Kernel.CloseKernelEventEndpoint(
             scenario.Subject,
             firstEndpoint));
@@ -682,6 +691,61 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
         Assert.False(replay.IsSuccess);
         Assert.Equal(KernelError.PlatformDenied, replay.Error);
         Assert.Equal(1, scenario.Provider.CompletionCalls);
+    }
+
+    [Fact]
+    public async Task WaitCancellationLeavesDmaAndEndpointAuthorityIntact()
+    {
+        var scenario = CreateScenario(1817, 1980, PlatformDmaDirection.DeviceWritesMemory);
+        var endpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        var submission = PrepareAndSubmit(scenario);
+        using var cancellation = new CancellationTokenSource();
+        var wait = scenario.Kernel.WaitForKernelEventAsync(
+            scenario.Subject,
+            endpoint,
+            cancellation.Token).AsTask();
+
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => wait);
+        Assert.Equal(0, scenario.Provider.CompletionCalls);
+        Assert.Equal(0, scenario.Provider.DmaRevokeCalls);
+        Assert.Equal(
+            KernelError.PlatformBindingDraining,
+            scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).Error);
+        Assert.Equal(
+            KernelError.PlatformBindingActive,
+            scenario.Kernel.TransferRegion(
+                scenario.Subject,
+                scenario.Target,
+                scenario.Buffer).Error);
+
+        scenario.Provider.CompletionState = PlatformProviderDmaCompletionState.Completed;
+        var completion = scenario.Kernel.ObservePlatformDmaCompletion(
+            scenario.Subject,
+            submission,
+            endpoint);
+        Assert.True(completion.IsSuccess, completion.Message);
+        Assert.Equal(1, scenario.Provider.CompletionCalls);
+
+        var delivered = await scenario.Kernel.WaitForKernelEventAsync(
+            scenario.Subject,
+            endpoint);
+        Assert.True(delivered.IsSuccess, delivered.Message);
+        Assert.Equal(KernelEventClass.Completion, delivered.Value!.EventClass);
+        Assert.Equal(endpoint, delivered.Value.Endpoint);
+
+        // Notification delivery still cannot release a write-capable DMA grant
+        // or return the buffer before exact post-completion visibility.
+        Assert.Equal(
+            KernelError.PlatformBindingDraining,
+            scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).Error);
+        Assert.Equal(
+            KernelError.PlatformBindingActive,
+            scenario.Kernel.TransferRegion(
+                scenario.Subject,
+                scenario.Target,
+                scenario.Buffer).Error);
     }
 
     [Fact]
