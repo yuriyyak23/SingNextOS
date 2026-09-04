@@ -22,7 +22,7 @@ Each requirement uses this format:
 | [`EXT-HCPU-002`](EXT-HCPU-002.md) | platform console/timer/MMIO/IRQ/DMA HAL bindings |
 | [`EXT-HCPU-003`](EXT-HCPU-003.md) | neutral execution/memory/I/O domain binding |
 | [`EXT-HCPU-004`](EXT-HCPU-004.md) | owned-region mapping, revocation and DMA/direct-access binding |
-| [`EXT-HCPU-005`](EXT-HCPU-005.md) | local DSC1 Copy Host model delivered; executable HybridCPU MatrixTile/DSC1/L7 bindings remain blocked |
+| [`EXT-HCPU-005`](EXT-HCPU-005.md) | local DSC1 Copy Host model and generation-bound observation wakeup delivered; executable HybridCPU MatrixTile/DSC1/L7 bindings remain blocked |
 | [`EXT-HCPU-006`](EXT-HCPU-006.md) | virtualization/nested/evidence/SecureCompute feature discovery |
 
 The architecture rationale for `EXT-HCPU-003` through `EXT-HCPU-006` is documented in `docs/whitebook/hybridcpu-ise/`.

@@ -2,7 +2,7 @@
 
 ## Status
 
-**In progress — local Slice 1 complete; HybridCPU executable path remains
+**In progress — local Slices 1–2 complete; HybridCPU executable path remains
 `ExternalBlocked`.** Depends on Phases 1–6 and corresponds to `EXT-HCPU-005`.
 
 ## Delivered Slice 1 — bounded DSC1 Copy host model
@@ -75,6 +75,71 @@ malformed submit/completion/cancellation fault pinning, cancellation drain
 retry, concurrent single-winner finalization, submit/revoke serialization,
 the pre-acquired managed-alias limitation, capability-revoke/teardown ordering,
 forbidden topology vocabulary and HybridCPU fail-closed conformance.
+
+## Delivered Slice 2 — generation-bound DSC1 observation wakeup
+
+DSC1 now reuses the same `KernelEventEndpoint` already used for IRQ and model
+DMA completion. No accelerator-specific event object, queue or provider token
+was added. The only new public shape is an overload of the existing terminal
+observation:
+
+```text
+ObservePlatformDsc1Copy(
+  exact ProcessHandle,
+  exact PlatformDsc1CopySubmission,
+  exact KernelEventEndpoint)
+    -> exact PlatformDsc1CopyReceipt
+       + one committed KernelEventClass.Completion notification
+```
+
+The runtime validates the exact live process generation, endpoint owner and
+generation, and complete local submission before provider observation. It then
+reserves the endpoint's single slot invisibly, observes and validates the typed
+provider terminal outcome, settles the local payload, and only then commits the
+event. `Completed` publishes the staged output and releases both buffer
+reservations before a waiter can wake. An observed `Cancelled` outcome leaves
+output unchanged, releases the same reservations, and may publish the same
+observation wakeup. The event source contains only local submission ID and
+generation.
+
+`Pending`, provider denial, malformed/faulted evidence and all stale or forged
+inputs publish no event. Every failure before terminal settlement rolls back
+the exact invisible reservation. A full endpoint backpressures before the
+provider call, so a terminal provider observation is not consumed when local
+notification cannot be retained. Replay cannot invoke the provider or publish
+a second event. The exact staged pin and the DSC1 gate make a post-settlement
+`CommitExact` failure an internal invariant loss; that path faults without
+claiming delivery and retains fail-closed endpoint state rather than reclaiming
+through an unaccounted publication.
+
+The event is an optional, observation-driven wakeup, not an autonomous provider
+push, compute capability, completion receipt, provider closure proof,
+memory-visibility result or reclaim authority. Cancelling a
+`WaitForKernelEventAsync` waiter or closing its endpoint does not cancel DSC1 or
+return the buffers. Direct `CancelPlatformDsc1Copy` remains endpoint-free and
+does not promise an event. During process exit the event-bearing overload is
+rejected, while existing endpoint-free observation/cancellation continues the
+exact provider drain. Provider closure and local payload release still precede
+mapping/domain closure and region reclaim.
+
+`KernelEvent` intentionally does not encode `Completed` versus `Cancelled`.
+The caller that performs observation must propagate the returned typed
+`PlatformDsc1CopyReceipt` to any consumer that needs the authoritative outcome;
+the event alone only says that this exact local observation committed.
+
+The Host `ModelOnly` implementation retains the existing coarse DSC1 payload
+serialization while it calls the provider. A stalled provider observation can
+therefore delay the start of another DSC1 operation or process teardown. This
+is fail-closed for publication and reclaim, but is not a prompt-revocation or
+non-blocking-provider guarantee; a future executable provider needs a bounded
+per-operation in-flight protocol rather than relying on this model lock.
+
+Tests cover pending rollback and retry, successful output-before-wakeup,
+observed cancellation, occupied endpoint backpressure, exact at-most-once
+delivery, stale/closed/foreign endpoint and stale/forged submission rejection,
+provider denial and malformed completion, waiter cancellation, endpoint-close
+races, process-exit drain, recycled process generations and absence of early
+reclaim.
 
 ## Goal
 
@@ -186,20 +251,17 @@ Do **not** add new opcodes, DSC2, universal accelerator protocol, global coheren
 
 Phase 7 is complete when one real HybridCPU compute operation can consume/produce Sing-owned regions with explicit memory visibility and trustworthy completion while keeping the source API semantic and platform-neutral.
 
-Slice 1 does not satisfy that full-phase criterion. The missing stable neutral
+Slices 1–2 do not satisfy that full-phase criterion. The missing stable neutral
 HybridCPU submission/completion/cancel facade and executable output-visibility/
 custody proof remain isolated in `EXT-HCPU-005`.
 
-The next local pool should project the same terminal DSC1 observation onto the
-existing generation-bound `KernelEventEndpoint` without changing provider
-authority or adding a second event abstraction. Slice 1 intentionally exposes
-only typed poll/cancel; accelerator event delivery is not claimed here.
-
 Before any provider can expose executable DMA and DSC1 over the same mapping,
-a later local authority-composition pool must also define their cross-mechanism
-conflict/interlock rules. The current Host provider has no executable DMA and
-the current HybridCPU provider has no DSC1 surface, so this slice neither
-implements nor claims that combination.
+the next local authority-composition pool should define their cross-mechanism
+mapping-use conflict/interlock rules. It must reject conflicting active use,
+permit independently authorized disjoint mappings, and release or retain each
+pin only after exact completion/cancel/fault disposition. The current Host
+provider has no executable DMA and the current HybridCPU provider has no DSC1
+surface, so Slices 1–2 neither implement nor claim a combined hardware path.
 
 ## Do not do
 

@@ -34,7 +34,12 @@
 > staging CPU reference copy while the Host provider models lifecycle and
 > advertises `ModelOnly`; the HybridCPU provider reports
 > DSC1 unavailable because no neutral semantic executable facade exists. This
-> adds no ISE/compiler dependency or hardware/coherence claim.
+> adds no ISE/compiler dependency or hardware/coherence claim. Phase-7 Slice 2
+> now makes exact DSC1 observation the third producer of the same generation-bound
+> `KernelEventEndpoint`: the event is staged before terminal observation and
+> committed only after completed output or cancelled custody is locally settled.
+> Pending/error paths publish nothing, and notification cancellation never
+> substitutes for DSC1 cancellation, provider drain or reclaim authority.
 
 ## Current status at SingNextOS `af791aba...`
 
@@ -234,6 +239,18 @@ provider only models lifecycle; `RuntimeKernel` uses private staging for the
 local CPU reference copy and publishes output only after verified provider
 closure. Its feature class is strictly `ModelOnly`, and a pre-acquired managed
 `Span<T>` remains outside the revocable-reservation guarantee.
+
+An overload of `ObservePlatformDsc1Copy` may additionally project an exactly
+observed `Completed` or `Cancelled` terminal result onto the existing
+process-generation-bound `KernelEventEndpoint`. Endpoint capacity is reserved
+before provider observation; output/reservation settlement precedes event
+commit. A stale/closed/foreign endpoint, stale/forged submission, pending result
+or provider failure cannot publish an event. The event carries only a local
+submission identity and remains a notification rather than completion,
+visibility or reclaim evidence. Direct cancellation and process-exit drain do
+not depend on an endpoint. This is an observation-driven wakeup, not an
+autonomous provider push; the event does not encode the terminal disposition,
+which remains in the typed receipt returned to the observer.
 
 The HybridCPU provider intentionally does not implement this interface and
 reports `Dsc1BulkCompute` unavailable. MatrixTile, arithmetic/reduction DSC1,

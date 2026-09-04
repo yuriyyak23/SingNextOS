@@ -13,6 +13,9 @@ SingNextOS now has a narrow DSC1 Copy v1 authority/lifecycle contract:
 - bridge-private provider operation identity and public local continuation;
 - exact typed completion/cancellation disposition composed with the generic
   `PlatformCompletionReceipt` closure proof;
+- optional observation-driven, generation-bound terminal wakeup through the
+  existing `KernelEventEndpoint`, committed only after local
+  output/reservations settle;
 - private bounded staging and runtime reservations that block subsequent
   `OwnedBuffer` API access, so model output is not published before verified
   `Closed + Completed`;
@@ -24,6 +27,25 @@ SingNextOS now has a narrow DSC1 Copy v1 authority/lifecycle contract:
 
 This local reference operation is neither ISE execution nor evidence that a
 HybridCPU accelerator consumed or produced the mapped regions.
+
+The event-bearing observation is also local-only and is not an autonomous
+provider-pushed completion. It validates the exact process, endpoint and
+submission generations before provider observation,
+reserves endpoint capacity invisibly, and commits a `Completion` notification
+only after a verified terminal result has settled local output and custody.
+Pending/error paths roll that reservation back. Waiter or endpoint cancellation
+does not cancel DSC1, and process teardown continues through the endpoint-free
+provider drain before mapping/domain/local reclaim. The notification is not a
+provider receipt, compute authority, output-visibility proof or hardware event.
+It does not encode `Completed` versus `Cancelled`; the observer must propagate
+the returned typed receipt wherever that authoritative outcome is required.
+
+The Host `ModelOnly` path also keeps provider observation under the existing
+coarse DSC1 payload lock. A stalled model provider can delay the start of local
+teardown, although no output, event or region reclaim can cross that blocked
+observation. This is not a prompt-revocation guarantee. A future executable
+binding must supply a bounded per-operation in-flight/drain protocol rather
+than depend on this Host serialization.
 
 The Host provider models only submit/completion/cancel lifecycle and has no
 region-content effect; `RuntimeKernel` performs the local CPU-staged reference
