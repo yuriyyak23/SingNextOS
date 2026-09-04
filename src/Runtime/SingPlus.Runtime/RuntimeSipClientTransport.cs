@@ -36,6 +36,40 @@ public sealed class RuntimeSipClientTransport : ISipClientRuntimeTransport
             messageId,
             requestPayload,
             _capabilities);
+        return await WaitForResponseAsync(send).ConfigureAwait(false);
+    }
+
+    public ResponseEnvelope InvokeOwnershipPair(
+        uint messageId,
+        object firstOwnershipPayload,
+        object secondOwnershipPayload) =>
+        InvokeOwnershipPairAsync(messageId, firstOwnershipPayload, secondOwnershipPayload)
+            .AsTask()
+            .GetAwaiter()
+            .GetResult();
+
+    public async ValueTask<ResponseEnvelope> InvokeOwnershipPairAsync(
+        uint messageId,
+        object firstOwnershipPayload,
+        object secondOwnershipPayload)
+    {
+        ArgumentNullException.ThrowIfNull(firstOwnershipPayload);
+        ArgumentNullException.ThrowIfNull(secondOwnershipPayload);
+
+        var send = _kernel.SendOwnershipPair(
+            _requester,
+            _responder,
+            _requesterEndpoint,
+            messageId,
+            firstOwnershipPayload,
+            secondOwnershipPayload,
+            _capabilities);
+        return await WaitForResponseAsync(send).ConfigureAwait(false);
+    }
+
+    private async ValueTask<ResponseEnvelope> WaitForResponseAsync(
+        KernelResult<ChannelEnvelope> send)
+    {
         if (!send.IsSuccess)
             throw Failure("send", send.Error, send.Message);
 
