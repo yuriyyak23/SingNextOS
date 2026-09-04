@@ -10,6 +10,14 @@ public sealed partial class RuntimeKernel
         ProcessHandle subject,
         PlatformDmaGrant grant)
     {
+        lock (_platformMemoryUseGate)
+            return PreparePlatformDmaForDeviceLocked(subject, grant);
+    }
+
+    private KernelResult<PlatformDmaPrepareEvidence> PreparePlatformDmaForDeviceLocked(
+        ProcessHandle subject,
+        PlatformDmaGrant grant)
+    {
         var resolved = Processes.Resolve(subject);
         if (!resolved.IsSuccess)
         {
@@ -32,6 +40,14 @@ public sealed partial class RuntimeKernel
     }
 
     public KernelResult<PlatformDmaAcquireEvidence> AcquirePlatformDmaForCpu(
+        ProcessHandle subject,
+        PlatformDmaGrant grant)
+    {
+        lock (_platformMemoryUseGate)
+            return AcquirePlatformDmaForCpuLocked(subject, grant);
+    }
+
+    private KernelResult<PlatformDmaAcquireEvidence> AcquirePlatformDmaForCpuLocked(
         ProcessHandle subject,
         PlatformDmaGrant grant)
     {

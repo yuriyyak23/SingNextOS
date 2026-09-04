@@ -64,7 +64,7 @@ public sealed partial class RuntimeKernel
 
     public KernelResult<ProcessTeardownSnapshot> ObserveProcessTeardown(ProcessHandle handle)
     {
-        lock (_dsc1PayloadGate)
+        lock (_platformMemoryUseGate)
             return ObserveProcessTeardownLocked(handle);
     }
 
@@ -119,7 +119,7 @@ public sealed partial class RuntimeKernel
         ProcessHandle handle,
         ProcessState targetTerminalState)
     {
-        lock (_dsc1PayloadGate)
+        lock (_platformMemoryUseGate)
             return BeginOrAdvanceProcessTeardownLocked(handle, targetTerminalState);
     }
 

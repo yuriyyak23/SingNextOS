@@ -128,7 +128,7 @@ public sealed partial class RuntimeKernel
 
     public KernelResult RevokeCapability(CapabilityId capabilityId)
     {
-        lock (_dsc1PayloadGate)
+        lock (_platformMemoryUseGate)
             return RevokeCapabilityLocked(capabilityId);
     }
 

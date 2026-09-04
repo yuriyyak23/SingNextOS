@@ -95,6 +95,14 @@ public sealed partial class RuntimeKernel
         ProcessHandle subject,
         PlatformDeviceLease lease)
     {
+        lock (_platformMemoryUseGate)
+            return RevokePlatformDeviceLocked(subject, lease);
+    }
+
+    private KernelResult RevokePlatformDeviceLocked(
+        ProcessHandle subject,
+        PlatformDeviceLease lease)
+    {
         var resolved = Processes.Resolve(subject);
         if (!resolved.IsSuccess)
             return KernelResult.Fail(resolved.Error, resolved.Message!);

@@ -34,6 +34,24 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDmaRange range,
         PlatformDmaDirection direction)
     {
+        lock (_dmaCompletionGate)
+        {
+            return BindDmaGrantLocked(
+                deviceLease,
+                mapping,
+                expectedSubject,
+                range,
+                direction);
+        }
+    }
+
+    private KernelResult<PlatformDmaGrant> BindDmaGrantLocked(
+        PlatformDeviceLease deviceLease,
+        PlatformOwnedRegionSliceMapping mapping,
+        PlatformDomainIdentity expectedSubject,
+        PlatformDmaRange range,
+        PlatformDmaDirection direction)
+    {
         var deviceValidation = ValidateDeviceLease(deviceLease, expectedSubject);
         if (!deviceValidation.IsSuccess)
         {
@@ -135,6 +153,14 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDmaGrant grant,
         PlatformDomainIdentity expectedSubject)
     {
+        lock (_dmaCompletionGate)
+            return RevokeDmaGrantLocked(grant, expectedSubject);
+    }
+
+    private KernelResult RevokeDmaGrantLocked(
+        PlatformDmaGrant grant,
+        PlatformDomainIdentity expectedSubject)
+    {
         var validation = ValidateDmaGrantIdentity(grant, expectedSubject);
         if (!validation.IsSuccess) return validation;
 
@@ -187,6 +213,14 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDmaGrant grant,
         PlatformDomainIdentity expectedSubject)
     {
+        lock (_dmaCompletionGate)
+            return ValidateDmaGrantLocked(grant, expectedSubject);
+    }
+
+    private KernelResult ValidateDmaGrantLocked(
+        PlatformDmaGrant grant,
+        PlatformDomainIdentity expectedSubject)
+    {
         var validation = ValidateDmaGrantIdentity(grant, expectedSubject);
         if (!validation.IsSuccess) return validation;
 
@@ -203,35 +237,55 @@ public sealed partial class PlatformAuthorityBridge
         return ValidateExactMapping(grant.Mapping, expectedSubject);
     }
 
-    internal bool HasActiveDmaGrants(PlatformDeviceLease deviceLease) =>
-        _dmaGrants.Values.Any(record =>
-            !record.PlatformClosed &&
-            record.Grant.DeviceLease.LeaseId == deviceLease.LeaseId);
+    internal bool HasActiveDmaGrants(PlatformDeviceLease deviceLease)
+    {
+        lock (_dmaCompletionGate)
+        {
+            return _dmaGrants.Values.Any(record =>
+                !record.PlatformClosed &&
+                record.Grant.DeviceLease.LeaseId == deviceLease.LeaseId);
+        }
+    }
 
-    internal bool HasActiveDmaGrants(PlatformRegionMapping mapping) =>
-        _dmaGrants.Values.Any(record =>
-            !record.PlatformClosed &&
-            record.Grant.Mapping.Mapping.MappingId == mapping.MappingId);
+    internal bool HasActiveDmaGrants(PlatformRegionMapping mapping)
+    {
+        lock (_dmaCompletionGate)
+        {
+            return _dmaGrants.Values.Any(record =>
+                !record.PlatformClosed &&
+                record.Grant.Mapping.Mapping.MappingId == mapping.MappingId);
+        }
+    }
 
     internal IReadOnlyList<PlatformDmaGrant> ActiveDmaGrantsForDevice(
-        PlatformDeviceLease deviceLease) =>
-        _dmaGrants.Values
-            .Where(record =>
-                !record.PlatformClosed &&
-                record.Grant.DeviceLease.LeaseId == deviceLease.LeaseId)
-            .OrderBy(record => record.Grant.GrantId.Value)
-            .Select(static record => record.Grant)
-            .ToArray();
+        PlatformDeviceLease deviceLease)
+    {
+        lock (_dmaCompletionGate)
+        {
+            return _dmaGrants.Values
+                .Where(record =>
+                    !record.PlatformClosed &&
+                    record.Grant.DeviceLease.LeaseId == deviceLease.LeaseId)
+                .OrderBy(record => record.Grant.GrantId.Value)
+                .Select(static record => record.Grant)
+                .ToArray();
+        }
+    }
 
     internal IReadOnlyList<PlatformDmaGrant> ActiveDmaGrantsForMapping(
-        PlatformRegionMapping mapping) =>
-        _dmaGrants.Values
-            .Where(record =>
-                !record.PlatformClosed &&
-                record.Grant.Mapping.Mapping.MappingId == mapping.MappingId)
-            .OrderBy(record => record.Grant.GrantId.Value)
-            .Select(static record => record.Grant)
-            .ToArray();
+        PlatformRegionMapping mapping)
+    {
+        lock (_dmaCompletionGate)
+        {
+            return _dmaGrants.Values
+                .Where(record =>
+                    !record.PlatformClosed &&
+                    record.Grant.Mapping.Mapping.MappingId == mapping.MappingId)
+                .OrderBy(record => record.Grant.GrantId.Value)
+                .Select(static record => record.Grant)
+                .ToArray();
+        }
+    }
 
     private void MarkDmaGrantClosed(PlatformDmaGrantId grantId, DmaGrantRecord record)
     {

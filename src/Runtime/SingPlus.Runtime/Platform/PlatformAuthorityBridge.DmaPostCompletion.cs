@@ -37,6 +37,20 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDmaCompletionEvidence completionEvidence,
         PlatformDomainIdentity expectedSubject)
     {
+        lock (_dmaCompletionGate)
+        {
+            return FinalizeDmaPostCompletionVisibilityLocked(
+                submission,
+                completionEvidence,
+                expectedSubject);
+        }
+    }
+
+    private KernelResult<PlatformDmaPostCompletionVisibilityEvidence> FinalizeDmaPostCompletionVisibilityLocked(
+        PlatformDmaSubmission submission,
+        PlatformDmaCompletionEvidence completionEvidence,
+        PlatformDomainIdentity expectedSubject)
+    {
         var submissionValidation = ValidateDmaSubmissionIdentity(submission, expectedSubject);
         if (!submissionValidation.IsSuccess)
         {
@@ -127,7 +141,19 @@ public sealed partial class PlatformAuthorityBridge
         }
 
         var providerGrant = _dmaGrants[submission.GrantId].ProviderGrant;
-        var providerResult = visibilityProvider.AcquireDmaGrantVisibility(providerGrant);
+        PlatformAuthorityResult<PlatformProviderDmaAcquireEvidence> providerResult;
+        try
+        {
+            providerResult = visibilityProvider.AcquireDmaGrantVisibility(providerGrant);
+        }
+        catch (Exception exception)
+        {
+            _dmaSubmissionFaultPins.Add(submission.GrantId);
+            return KernelResult<PlatformDmaPostCompletionVisibilityEvidence>.Fail(
+                KernelError.PlatformFaulted,
+                $"The DMA provider threw during post-completion acquire; the exact mapping remains pinned: {exception.Message}");
+        }
+
         if (!providerResult.IsSuccess)
         {
             if (providerResult.Status is PlatformAuthorityStatus.Faulted or

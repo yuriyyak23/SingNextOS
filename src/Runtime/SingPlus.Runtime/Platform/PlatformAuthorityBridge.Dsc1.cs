@@ -86,52 +86,19 @@ public sealed partial class PlatformAuthorityBridge
     {
         lock (_dsc1Gate)
         {
-            var bindingValidation = ValidateDomain(binding, expectedSubject);
-            if (!bindingValidation.IsSuccess)
-            {
-                return KernelResult<PlatformDsc1CopySubmission>.Fail(
-                    bindingValidation.Error,
-                    bindingValidation.Message!);
-            }
-
-            var sourceValidation = ValidateDsc1LocalRange(
+            // Repeat exact mapping-use admission at the bridge boundary. The
+            // RuntimeKernel outer gate makes this check and operation-record
+            // publication one atomic local policy transition.
+            var mappingUse = ValidateDsc1MappingUseAdmissionLocked(
                 binding,
                 expectedSubject,
                 source,
-                PlatformMemoryAccess.Read,
-                "source");
-            if (!sourceValidation.IsSuccess)
+                destination);
+            if (!mappingUse.IsSuccess)
             {
                 return KernelResult<PlatformDsc1CopySubmission>.Fail(
-                    sourceValidation.Error,
-                    sourceValidation.Message!);
-            }
-
-            var destinationValidation = ValidateDsc1LocalRange(
-                binding,
-                expectedSubject,
-                destination,
-                PlatformMemoryAccess.Write,
-                "destination");
-            if (!destinationValidation.IsSuccess)
-            {
-                return KernelResult<PlatformDsc1CopySubmission>.Fail(
-                    destinationValidation.Error,
-                    destinationValidation.Message!);
-            }
-
-            if (source.Length != destination.Length)
-            {
-                return KernelResult<PlatformDsc1CopySubmission>.Fail(
-                    KernelError.PlatformDenied,
-                    "DSC1 Copy source and destination ranges must have equal byte lengths.");
-            }
-
-            if (source.Mapping.Region.RegionId == destination.Mapping.Region.RegionId)
-            {
-                return KernelResult<PlatformDsc1CopySubmission>.Fail(
-                    KernelError.PlatformDenied,
-                    "DSC1 Copy v1 requires disjoint source and destination owned regions.");
+                    mappingUse.Error,
+                    mappingUse.Message!);
             }
 
             var feature = _featureManifest.Resolve(

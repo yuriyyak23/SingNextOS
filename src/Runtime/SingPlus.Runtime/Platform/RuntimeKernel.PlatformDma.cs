@@ -16,6 +16,26 @@ public sealed partial class RuntimeKernel
         long length,
         PlatformDmaDirection direction)
     {
+        lock (_platformMemoryUseGate)
+        {
+            return BindPlatformDmaLocked(
+                subject,
+                deviceLease,
+                mapping,
+                offset,
+                length,
+                direction);
+        }
+    }
+
+    private KernelResult<PlatformDmaGrant> BindPlatformDmaLocked(
+        ProcessHandle subject,
+        PlatformDeviceLease deviceLease,
+        PlatformOwnedRegionSliceMapping mapping,
+        long offset,
+        long length,
+        PlatformDmaDirection direction)
+    {
         var resolved = Processes.Resolve(subject);
         if (!resolved.IsSuccess)
         {
@@ -62,6 +82,14 @@ public sealed partial class RuntimeKernel
     }
 
     public KernelResult RevokePlatformDma(
+        ProcessHandle subject,
+        PlatformDmaGrant grant)
+    {
+        lock (_platformMemoryUseGate)
+            return RevokePlatformDmaLocked(subject, grant);
+    }
+
+    private KernelResult RevokePlatformDmaLocked(
         ProcessHandle subject,
         PlatformDmaGrant grant)
     {
