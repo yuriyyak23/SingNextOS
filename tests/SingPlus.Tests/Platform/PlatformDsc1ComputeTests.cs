@@ -618,6 +618,648 @@ public sealed class PlatformDsc1ComputeTests
     }
 
     [Fact]
+    public async Task PendingObservationRollsBackThenTerminalCompletionPublishesOneEvent()
+    {
+        var provider = new HostPlatformAuthorityProvider(deferDsc1Completion: true);
+        var scenario = CreateScenario(provider, 2120, 2300, 32);
+        scenario.Source.Span.Fill(0x6A);
+        scenario.Destination.Span.Fill(0x19);
+        var destinationAlias = scenario.Destination.Span;
+        var endpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        var submitted = SubmitWhole(scenario).Value!;
+        var wait = scenario.Kernel.WaitForKernelEventAsync(
+            scenario.Subject,
+            endpoint).AsTask();
+
+        var pending = scenario.Kernel.ObservePlatformDsc1Copy(
+            scenario.Subject,
+            submitted,
+            endpoint);
+
+        Assert.False(pending.IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingDraining, pending.Error);
+        Assert.False(wait.IsCompleted);
+        Assert.Equal(
+            KernelError.ResponseNotAvailable,
+            scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint).Error);
+        Assert.All(destinationAlias.ToArray(), value => Assert.Equal((byte)0x19, value));
+        Assert.Throws<InvalidOperationException>(() =>
+        {
+            _ = scenario.Destination.Span[0];
+        });
+
+        Assert.True(provider.LastDsc1Submission.HasValue);
+        var providerCompletion = provider.CompleteDsc1Copy(
+            provider.LastDsc1Submission.Value);
+        Assert.True(providerCompletion.IsSuccess, providerCompletion.Message);
+
+        var completed = scenario.Kernel.ObservePlatformDsc1Copy(
+            scenario.Subject,
+            submitted,
+            endpoint);
+        var delivered = await wait;
+
+        Assert.True(completed.IsSuccess, completed.Message);
+        Assert.Equal(PlatformDsc1CopyOutcome.Completed, completed.Value!.Outcome);
+        Assert.True(completed.Value.OutputPublished);
+        Assert.True(delivered.IsSuccess, delivered.Message);
+        Assert.Equal(endpoint, delivered.Value!.Endpoint);
+        Assert.Equal(KernelEventClass.Completion, delivered.Value.EventClass);
+        Assert.Equal(
+            FormattableString.Invariant(
+                $"platform/dsc1-terminal-observed/v1/{submitted.SubmissionId.Value}/{submitted.Generation.Value}"),
+            delivered.Value.SourceResourceId);
+        Assert.All(scenario.Destination.Span.ToArray(), value => Assert.Equal((byte)0x6A, value));
+        Assert.Equal(2, provider.ObserveDsc1CompletionCallCount);
+        Assert.Equal(
+            KernelError.ResponseNotAvailable,
+            scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint).Error);
+
+        var replay = scenario.Kernel.ObservePlatformDsc1Copy(
+            scenario.Subject,
+            submitted,
+            endpoint);
+        Assert.False(replay.IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingNotFound, replay.Error);
+        Assert.Equal(2, provider.ObserveDsc1CompletionCallCount);
+    }
+
+    [Fact]
+    public void StaleForgedForeignAndClosedEventInputsFailBeforeProviderObservation()
+    {
+        var provider = new HostPlatformAuthorityProvider(deferDsc1Completion: true);
+        var scenario = CreateScenario(provider, 2121, 2310, 32);
+        var (_, sibling) = TestFixtures.Create(scenario.Kernel, 2122, 2320);
+        var endpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        var siblingEndpoint = scenario.Kernel.CreateKernelEventEndpoint(sibling).Value!;
+        var closedEndpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        Assert.True(scenario.Kernel.CloseKernelEventEndpoint(
+            scenario.Subject,
+            closedEndpoint).IsSuccess);
+        var submitted = SubmitWhole(scenario).Value!;
+
+        Assert.Equal(
+            KernelError.StaleHandle,
+            scenario.Kernel.ObservePlatformDsc1Copy(
+                scenario.Subject with { Generation = scenario.Subject.Generation + 1 },
+                submitted,
+                endpoint).Error);
+        Assert.Equal(
+            KernelError.WrongEndpointOwner,
+            scenario.Kernel.ObservePlatformDsc1Copy(
+                scenario.Subject,
+                submitted,
+                siblingEndpoint).Error);
+        Assert.Equal(
+            KernelError.StaleGeneration,
+            scenario.Kernel.ObservePlatformDsc1Copy(
+                scenario.Subject,
+                submitted,
+                endpoint with
+                {
+                    Generation = new KernelEventEndpointGeneration(
+                        endpoint.Generation.Value + 1),
+                }).Error);
+        Assert.Equal(
+            KernelError.EndpointNotFound,
+            scenario.Kernel.ObservePlatformDsc1Copy(
+                scenario.Subject,
+                submitted,
+                closedEndpoint).Error);
+        Assert.Equal(
+            KernelError.StaleGeneration,
+            scenario.Kernel.ObservePlatformDsc1Copy(
+                scenario.Subject,
+                submitted with
+                {
+                    Generation = new PlatformDsc1SubmissionGeneration(
+                        submitted.Generation.Value + 1),
+                },
+                endpoint).Error);
+        Assert.Equal(
+            KernelError.PlatformDenied,
+            scenario.Kernel.ObservePlatformDsc1Copy(
+                scenario.Subject,
+                submitted with
+                {
+                    Destination = submitted.Destination with
+                    {
+                        Length = submitted.Destination.Length - 1,
+                    },
+                },
+                endpoint).Error);
+        Assert.Equal(
+            KernelError.WrongPlatformDomain,
+            scenario.Kernel.ObservePlatformDsc1Copy(
+                sibling,
+                submitted,
+                siblingEndpoint).Error);
+
+        Assert.Equal(0, provider.ObserveDsc1CompletionCallCount);
+        Assert.Equal(
+            KernelError.ResponseNotAvailable,
+            scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint).Error);
+        Assert.Equal(
+            KernelError.ResponseNotAvailable,
+            scenario.Kernel.ConsumeKernelEvent(sibling, siblingEndpoint).Error);
+        Assert.True(scenario.Kernel.CancelPlatformDsc1Copy(
+            scenario.Subject,
+            submitted).IsSuccess);
+    }
+
+    [Fact]
+    public void BusyEndpointBackpressuresBeforeObservationAndRetryDeliversOnce()
+    {
+        var provider = new HostPlatformAuthorityProvider();
+        var scenario = CreateScenario(provider, 2123, 2330, 32);
+        var endpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        scenario.Source.Span.Fill(0x27);
+        scenario.Destination.Span.Fill(0x11);
+
+        var firstSubmission = SubmitWhole(scenario).Value!;
+        var firstCompletion = scenario.Kernel.ObservePlatformDsc1Copy(
+            scenario.Subject,
+            firstSubmission,
+            endpoint);
+        Assert.True(firstCompletion.IsSuccess, firstCompletion.Message);
+        Assert.Equal(1, provider.ObserveDsc1CompletionCallCount);
+
+        scenario.Source.Span.Fill(0x82);
+        scenario.Destination.Span.Fill(0x33);
+        var secondOutputAlias = scenario.Destination.Span;
+        var secondSubmission = SubmitWhole(scenario).Value!;
+
+        var blocked = scenario.Kernel.ObservePlatformDsc1Copy(
+            scenario.Subject,
+            secondSubmission,
+            endpoint);
+
+        Assert.False(blocked.IsSuccess);
+        Assert.Equal(KernelError.CapacityExhausted, blocked.Error);
+        Assert.Equal(1, provider.ObserveDsc1CompletionCallCount);
+        Assert.All(secondOutputAlias.ToArray(), value => Assert.Equal((byte)0x33, value));
+        Assert.Throws<InvalidOperationException>(() =>
+        {
+            _ = scenario.Destination.Span[0];
+        });
+
+        var firstEvent = scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint);
+        Assert.True(firstEvent.IsSuccess, firstEvent.Message);
+        var retried = scenario.Kernel.ObservePlatformDsc1Copy(
+            scenario.Subject,
+            secondSubmission,
+            endpoint);
+        Assert.True(retried.IsSuccess, retried.Message);
+        Assert.Equal(2, provider.ObserveDsc1CompletionCallCount);
+        Assert.All(scenario.Destination.Span.ToArray(), value => Assert.Equal((byte)0x82, value));
+
+        var secondEvent = scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint);
+        Assert.True(secondEvent.IsSuccess, secondEvent.Message);
+        Assert.NotEqual(firstEvent.Value!.Sequence, secondEvent.Value!.Sequence);
+        Assert.NotEqual(firstEvent.Value.SourceResourceId, secondEvent.Value.SourceResourceId);
+
+        var replay = scenario.Kernel.ObservePlatformDsc1Copy(
+            scenario.Subject,
+            secondSubmission,
+            endpoint);
+        Assert.False(replay.IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingNotFound, replay.Error);
+        Assert.Equal(2, provider.ObserveDsc1CompletionCallCount);
+    }
+
+    [Fact]
+    public async Task DeniedObservationRollsBackReservationAndPreservesWaiterForRetry()
+    {
+        var provider = new FaultInjectingDsc1Provider
+        {
+            DenyFirstObservation = true,
+        };
+        var scenario = CreateScenario(provider, 2124, 2340, 32);
+        scenario.Source.Span.Fill(0x44);
+        scenario.Destination.Span.Fill(0x95);
+        var endpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        var submitted = SubmitWhole(scenario).Value!;
+        var wait = scenario.Kernel.WaitForKernelEventAsync(
+            scenario.Subject,
+            endpoint).AsTask();
+
+        var denied = scenario.Kernel.ObservePlatformDsc1Copy(
+            scenario.Subject,
+            submitted,
+            endpoint);
+
+        Assert.False(denied.IsSuccess);
+        Assert.Equal(KernelError.PlatformDenied, denied.Error);
+        Assert.Equal(1, provider.ObserveCalls);
+        Assert.False(wait.IsCompleted);
+        Assert.Equal(
+            KernelError.ResponseNotAvailable,
+            scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint).Error);
+        Assert.Throws<InvalidOperationException>(() =>
+        {
+            _ = scenario.Destination.Span[0];
+        });
+
+        var providerCompletion = provider.CompleteAcceptedDsc1();
+        Assert.True(providerCompletion.IsSuccess, providerCompletion.Message);
+        var retry = scenario.Kernel.ObservePlatformDsc1Copy(
+            scenario.Subject,
+            submitted,
+            endpoint);
+        var delivered = await wait;
+
+        Assert.True(retry.IsSuccess, retry.Message);
+        Assert.True(delivered.IsSuccess, delivered.Message);
+        Assert.Equal(endpoint, delivered.Value!.Endpoint);
+        Assert.Equal(2, provider.ObserveCalls);
+        Assert.All(scenario.Destination.Span.ToArray(), value => Assert.Equal((byte)0x44, value));
+    }
+
+    [Fact]
+    public void MalformedTerminalObservationPublishesNoEventAndPinsReclaim()
+    {
+        var provider = new FaultInjectingDsc1Provider
+        {
+            ForgeCompletionGeneration = true,
+        };
+        var scenario = CreateScenario(provider, 2125, 2350, 32);
+        scenario.Source.Span.Fill(0x61);
+        scenario.Destination.Span.Fill(0xA7);
+        var destinationAlias = scenario.Destination.Span;
+        var endpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        var submitted = SubmitWhole(scenario).Value!;
+        var providerCompletion = provider.CompleteAcceptedDsc1();
+        Assert.True(providerCompletion.IsSuccess, providerCompletion.Message);
+
+        var malformed = scenario.Kernel.ObservePlatformDsc1Copy(
+            scenario.Subject,
+            submitted,
+            endpoint);
+
+        Assert.False(malformed.IsSuccess);
+        Assert.Equal(KernelError.PlatformFaulted, malformed.Error);
+        Assert.Equal(1, provider.ObserveCalls);
+        Assert.Equal(
+            KernelError.ResponseNotAvailable,
+            scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint).Error);
+        Assert.All(destinationAlias.ToArray(), value => Assert.Equal((byte)0xA7, value));
+        Assert.Throws<InvalidOperationException>(() =>
+        {
+            _ = scenario.Destination.Span[0];
+        });
+        Assert.Equal(
+            KernelError.PlatformFaulted,
+            scenario.Kernel.TerminateProcess(scenario.Subject).Error);
+        Assert.Contains(
+            scenario.Kernel.Regions.Snapshot(),
+            region => region.Handle.RegionId == scenario.Destination.Handle.RegionId &&
+                      region.State == RegionState.Owned);
+    }
+
+    [Fact]
+    public async Task WaitCancellationLeavesDsc1AndEndpointAuthorityIntact()
+    {
+        var provider = new HostPlatformAuthorityProvider(deferDsc1Completion: true);
+        var scenario = CreateScenario(provider, 2126, 2360, 32);
+        scenario.Source.Span.Fill(0x38);
+        scenario.Destination.Span.Fill(0xC4);
+        var endpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        var submitted = SubmitWhole(scenario).Value!;
+        using var cancellation = new CancellationTokenSource();
+        var wait = scenario.Kernel.WaitForKernelEventAsync(
+            scenario.Subject,
+            endpoint,
+            cancellation.Token).AsTask();
+
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => wait);
+        Assert.Equal(0, provider.ObserveDsc1CompletionCallCount);
+        Assert.Equal(0, provider.CancelDsc1CallCount);
+        Assert.Throws<InvalidOperationException>(() =>
+        {
+            _ = scenario.Destination.Span[0];
+        });
+
+        Assert.True(provider.LastDsc1Submission.HasValue);
+        var providerCompletion = provider.CompleteDsc1Copy(
+            provider.LastDsc1Submission.Value);
+        Assert.True(providerCompletion.IsSuccess, providerCompletion.Message);
+        var observed = scenario.Kernel.ObservePlatformDsc1Copy(
+            scenario.Subject,
+            submitted,
+            endpoint);
+        Assert.True(observed.IsSuccess, observed.Message);
+
+        var delivered = await scenario.Kernel.WaitForKernelEventAsync(
+            scenario.Subject,
+            endpoint);
+        Assert.True(delivered.IsSuccess, delivered.Message);
+        Assert.Equal(KernelEventClass.Completion, delivered.Value!.EventClass);
+        Assert.All(scenario.Destination.Span.ToArray(), value => Assert.Equal((byte)0x38, value));
+    }
+
+    [Fact]
+    public void PendingCancellationCanPublishExactCancelledTerminalNotification()
+    {
+        var provider = new FaultInjectingDsc1Provider
+        {
+            ReturnPendingForFirstCancellation = true,
+        };
+        var scenario = CreateScenario(provider, 2129, 2390, 32);
+        scenario.Source.Span.Fill(0x56);
+        scenario.Destination.Span.Fill(0xB3);
+        var destinationAlias = scenario.Destination.Span;
+        var endpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        var submitted = SubmitWhole(scenario).Value!;
+
+        var draining = scenario.Kernel.CancelPlatformDsc1Copy(
+            scenario.Subject,
+            submitted);
+        Assert.False(draining.IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingDraining, draining.Error);
+        Assert.Equal(1, provider.CancelCalls);
+        Assert.Equal(0, provider.ObserveCalls);
+        Assert.Equal(
+            KernelError.ResponseNotAvailable,
+            scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint).Error);
+
+        var cancelled = scenario.Kernel.ObservePlatformDsc1Copy(
+            scenario.Subject,
+            submitted,
+            endpoint);
+
+        Assert.True(cancelled.IsSuccess, cancelled.Message);
+        Assert.Equal(PlatformDsc1CopyOutcome.Cancelled, cancelled.Value!.Outcome);
+        Assert.False(cancelled.Value.OutputPublished);
+        Assert.Equal(1, provider.CancelCalls);
+        Assert.Equal(1, provider.ObserveCalls);
+        Assert.All(destinationAlias.ToArray(), value => Assert.Equal((byte)0xB3, value));
+        Assert.All(scenario.Destination.Span.ToArray(), value => Assert.Equal((byte)0xB3, value));
+        var delivered = scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint);
+        Assert.True(delivered.IsSuccess, delivered.Message);
+        Assert.Equal(KernelEventClass.Completion, delivered.Value!.EventClass);
+        Assert.Equal(
+            FormattableString.Invariant(
+                $"platform/dsc1-terminal-observed/v1/{submitted.SubmissionId.Value}/{submitted.Generation.Value}"),
+            delivered.Value.SourceResourceId);
+    }
+
+    [Fact]
+    public void DirectTerminalCancellationRemainsEndpointFreeAndPublishesNoEvent()
+    {
+        var provider = new HostPlatformAuthorityProvider(deferDsc1Completion: true);
+        var scenario = CreateScenario(provider, 2132, 2420, 32);
+        scenario.Destination.Span.Fill(0x6D);
+        var endpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        var submitted = SubmitWhole(scenario).Value!;
+
+        var cancelled = scenario.Kernel.CancelPlatformDsc1Copy(
+            scenario.Subject,
+            submitted);
+
+        Assert.True(cancelled.IsSuccess, cancelled.Message);
+        Assert.Equal(PlatformDsc1CopyOutcome.Cancelled, cancelled.Value!.Outcome);
+        Assert.False(cancelled.Value.OutputPublished);
+        Assert.Equal(1, provider.CancelDsc1CallCount);
+        Assert.Equal(0, provider.ObserveDsc1CompletionCallCount);
+        Assert.All(scenario.Destination.Span.ToArray(), value => Assert.Equal((byte)0x6D, value));
+        Assert.Equal(
+            KernelError.ResponseNotAvailable,
+            scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint).Error);
+    }
+
+    [Fact]
+    public void UnreadTerminalNotificationDoesNotBecomeReclaimAuthority()
+    {
+        var provider = new HostPlatformAuthorityProvider();
+        var scenario = CreateScenario(provider, 2130, 2400, 32);
+        scenario.Source.Span.Fill(0x9C);
+        scenario.Destination.Span.Fill(0x12);
+        var endpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        var submitted = SubmitWhole(scenario).Value!;
+
+        var completed = scenario.Kernel.ObservePlatformDsc1Copy(
+            scenario.Subject,
+            submitted,
+            endpoint);
+        Assert.True(completed.IsSuccess, completed.Message);
+        Assert.True(completed.Value!.OutputPublished);
+
+        var terminated = scenario.Kernel.TerminateProcess(scenario.Subject);
+
+        Assert.True(terminated.IsSuccess, terminated.Message);
+        Assert.Equal(0, provider.CancelDsc1CallCount);
+        Assert.False(scenario.Source.IsValid);
+        Assert.False(scenario.Destination.IsValid);
+        Assert.DoesNotContain(
+            scenario.Kernel.Regions.Snapshot(),
+            region => region.Owner.DomainId == new DomainId(2400) &&
+                      region.State != RegionState.Released);
+    }
+
+    [Fact]
+    public void EndpointCloseAndProcessExitDoNotBypassCancellationDrainBeforeReclaim()
+    {
+        var provider = new FaultInjectingDsc1Provider
+        {
+            ReturnPendingForFirstCancellation = true,
+        };
+        var scenario = CreateScenario(provider, 2127, 2370, 32);
+        scenario.Destination.Span.Fill(0xD2);
+        var destinationAlias = scenario.Destination.Span;
+        var closedEndpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        var exitEndpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        Assert.True(scenario.Kernel.CloseKernelEventEndpoint(
+            scenario.Subject,
+            closedEndpoint).IsSuccess);
+        var submitted = SubmitWhole(scenario).Value!;
+
+        var closedDelivery = scenario.Kernel.ObservePlatformDsc1Copy(
+            scenario.Subject,
+            submitted,
+            closedEndpoint);
+        Assert.False(closedDelivery.IsSuccess);
+        Assert.Equal(KernelError.EndpointNotFound, closedDelivery.Error);
+        Assert.Equal(0, provider.ObserveCalls);
+        Assert.Equal(0, provider.CancelCalls);
+        Assert.Throws<InvalidOperationException>(() =>
+        {
+            _ = scenario.Destination.Span[0];
+        });
+
+        var wait = scenario.Kernel.WaitForKernelEventAsync(
+            scenario.Subject,
+            exitEndpoint).AsTask();
+        var terminate = scenario.Kernel.TerminateProcess(scenario.Subject);
+
+        Assert.False(terminate.IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingDraining, terminate.Error);
+        Assert.True(wait.IsCanceled);
+        Assert.Equal(1, provider.CancelCalls);
+        Assert.Equal(0, provider.ObserveCalls);
+
+        var exitingDelivery = scenario.Kernel.ObservePlatformDsc1Copy(
+            scenario.Subject,
+            submitted,
+            exitEndpoint);
+        Assert.False(exitingDelivery.IsSuccess);
+        Assert.Equal(KernelError.InvalidTransition, exitingDelivery.Error);
+        Assert.Equal(0, provider.ObserveCalls);
+
+        var teardown = scenario.Kernel.ObserveProcessTeardown(scenario.Subject);
+        Assert.True(teardown.IsSuccess, teardown.Message);
+        Assert.True(teardown.Value!.LocalReclaimCompleted);
+        Assert.True(teardown.Value.PlatformDomainClosed);
+        Assert.Equal(1, provider.CancelCalls);
+        Assert.Equal(1, provider.ObserveCalls);
+        Assert.All(destinationAlias.ToArray(), value => Assert.Equal((byte)0xD2, value));
+        Assert.False(scenario.Source.IsValid);
+        Assert.False(scenario.Destination.IsValid);
+        Assert.DoesNotContain(
+            scenario.Kernel.Regions.Snapshot(),
+            region => region.Owner.DomainId == new DomainId(2370) &&
+                      region.State != RegionState.Released);
+
+        var (_, recycled) = TestFixtures.Create(
+            scenario.Kernel,
+            scenario.Subject.ProcessId.Value,
+            12_370,
+            generation: 2);
+        Assert.Equal(
+            KernelError.StaleHandle,
+            scenario.Kernel.ObservePlatformDsc1Copy(
+                scenario.Subject,
+                submitted,
+                exitEndpoint).Error);
+        Assert.Equal(
+            KernelError.WrongEndpointOwner,
+            scenario.Kernel.ObservePlatformDsc1Copy(
+                recycled,
+                submitted,
+                exitEndpoint).Error);
+        Assert.Equal(1, provider.ObserveCalls);
+    }
+
+    [Fact]
+    public async Task InFlightObservationKeepsEndpointCloseDrainingUntilExactCommit()
+    {
+        var provider = new FaultInjectingDsc1Provider(deferDsc1Completion: false);
+        var scenario = CreateScenario(provider, 2128, 2380, 32);
+        scenario.Source.Span.Fill(0x7B);
+        scenario.Destination.Span.Fill(0x24);
+        var destinationAlias = scenario.Destination.Span;
+        var endpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        var submitted = SubmitWhole(scenario).Value!;
+        using var observeEntered = new ManualResetEventSlim();
+        using var observeRelease = new ManualResetEventSlim();
+        provider.ObserveEntered = observeEntered;
+        provider.ObserveRelease = observeRelease;
+
+        var observeTask = Task.Run(() => scenario.Kernel.ObservePlatformDsc1Copy(
+            scenario.Subject,
+            submitted,
+            endpoint));
+        try
+        {
+            Assert.True(observeEntered.Wait(TimeSpan.FromSeconds(5)));
+            var close = scenario.Kernel.CloseKernelEventEndpoint(
+                scenario.Subject,
+                endpoint);
+            Assert.False(close.IsSuccess);
+            Assert.Equal(KernelError.PlatformBindingDraining, close.Error);
+            Assert.Equal(
+                KernelError.ResponseNotAvailable,
+                scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint).Error);
+            Assert.All(destinationAlias.ToArray(), value => Assert.Equal((byte)0x24, value));
+        }
+        finally
+        {
+            observeRelease.Set();
+        }
+
+        var observed = await observeTask;
+        Assert.True(observed.IsSuccess, observed.Message);
+        Assert.All(scenario.Destination.Span.ToArray(), value => Assert.Equal((byte)0x7B, value));
+        Assert.True(scenario.Kernel.ConsumeKernelEvent(
+            scenario.Subject,
+            endpoint).IsSuccess);
+        Assert.True(scenario.Kernel.CloseKernelEventEndpoint(
+            scenario.Subject,
+            endpoint).IsSuccess);
+    }
+
+    [Fact]
+    public async Task ConcurrentEventObserversCallProviderAndPublishOnlyOnce()
+    {
+        var provider = new FaultInjectingDsc1Provider(deferDsc1Completion: false);
+        var scenario = CreateScenario(provider, 2131, 2410, 32);
+        scenario.Source.Span.Fill(0x4E);
+        scenario.Destination.Span.Fill(0x16);
+        var firstEndpoint = scenario.Kernel.CreateKernelEventEndpoint(
+            scenario.Subject).Value!;
+        var secondEndpoint = scenario.Kernel.CreateKernelEventEndpoint(
+            scenario.Subject).Value!;
+        var submitted = SubmitWhole(scenario).Value!;
+        using var observeEntered = new ManualResetEventSlim();
+        using var observeRelease = new ManualResetEventSlim();
+        using var secondStarted = new ManualResetEventSlim();
+        provider.ObserveEntered = observeEntered;
+        provider.ObserveRelease = observeRelease;
+
+        var firstTask = Task.Run(() => scenario.Kernel.ObservePlatformDsc1Copy(
+            scenario.Subject,
+            submitted,
+            firstEndpoint));
+        Task<KernelResult<PlatformDsc1CopyReceipt>>? secondTask = null;
+        try
+        {
+            Assert.True(observeEntered.Wait(TimeSpan.FromSeconds(5)));
+            secondTask = Task.Run(() =>
+            {
+                secondStarted.Set();
+                return scenario.Kernel.ObservePlatformDsc1Copy(
+                    scenario.Subject,
+                    submitted,
+                    secondEndpoint);
+            });
+            Assert.True(secondStarted.Wait(TimeSpan.FromSeconds(5)));
+            Assert.False(secondTask.IsCompleted);
+            Assert.Equal(1, provider.ObserveCalls);
+            Assert.Equal(
+                KernelError.ResponseNotAvailable,
+                scenario.Kernel.ConsumeKernelEvent(
+                    scenario.Subject,
+                    firstEndpoint).Error);
+            Assert.Equal(
+                KernelError.ResponseNotAvailable,
+                scenario.Kernel.ConsumeKernelEvent(
+                    scenario.Subject,
+                    secondEndpoint).Error);
+        }
+        finally
+        {
+            observeRelease.Set();
+        }
+
+        var first = await firstTask;
+        var second = await secondTask!;
+
+        Assert.True(first.IsSuccess, first.Message);
+        Assert.False(second.IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingNotFound, second.Error);
+        Assert.Equal(1, provider.ObserveCalls);
+        Assert.True(scenario.Kernel.ConsumeKernelEvent(
+            scenario.Subject,
+            firstEndpoint).IsSuccess);
+        Assert.Equal(
+            KernelError.ResponseNotAvailable,
+            scenario.Kernel.ConsumeKernelEvent(
+                scenario.Subject,
+                secondEndpoint).Error);
+    }
+
+    [Fact]
     public void ContractValidatesExactLeaseAccessBoundsAndDisjointRegions()
     {
         var lease = ProviderDomain(31, 7, 301, 41, 5);
@@ -767,6 +1409,23 @@ public sealed class PlatformDsc1ComputeTests
             PlatformFeatureFamily.Dsc1BulkCompute);
         Assert.Equal(PlatformDsc1ComputeContract.ContractVersion, feature.ContractVersion);
         Assert.Equal(PlatformFeatureAvailability.ModelOnly, feature.Availability);
+
+        var eventOverload = typeof(RuntimeKernel)
+            .GetMethods(BindingFlags.Public | BindingFlags.Instance)
+            .Single(method =>
+                method.Name == nameof(RuntimeKernel.ObservePlatformDsc1Copy) &&
+                method.GetParameters().Length == 3);
+        Assert.Equal(
+            typeof(KernelEventEndpoint),
+            eventOverload.GetParameters()[2].ParameterType);
+        var eventSignature = eventOverload.ToString() ?? eventOverload.Name;
+        foreach (var term in forbidden)
+            Assert.DoesNotContain(term, eventSignature, StringComparison.OrdinalIgnoreCase);
+
+        Assert.DoesNotContain(
+            typeof(RuntimeKernel).GetMethods(BindingFlags.Public | BindingFlags.Instance),
+            method => method.Name == nameof(RuntimeKernel.CancelPlatformDsc1Copy) &&
+                      method.GetParameters().Length == 3);
     }
 
     private static KernelResult<PlatformDsc1CopySubmission> SubmitWhole(Scenario scenario) =>
@@ -895,12 +1554,19 @@ public sealed class PlatformDsc1ComputeTests
         IPlatformRegionRevocationProvider,
         IPlatformDsc1ComputeProvider
     {
-        private readonly HostPlatformAuthorityProvider _inner = new(
-            deferDsc1Completion: true);
+        private readonly HostPlatformAuthorityProvider _inner;
         private bool _cancellationAcknowledged;
         private bool _cancellationDenied;
+        private bool _observationDenied;
+
+        public FaultInjectingDsc1Provider(bool deferDsc1Completion = true)
+        {
+            _inner = new HostPlatformAuthorityProvider(
+                deferDsc1Completion: deferDsc1Completion);
+        }
 
         public bool DenySubmit { get; init; }
+        public bool DenyFirstObservation { get; init; }
         public bool ForgeSubmissionRequest { get; init; }
         public bool ForgeCompletionGeneration { get; init; }
         public bool ForgeCancellationGeneration { get; init; }
@@ -911,6 +1577,8 @@ public sealed class PlatformDsc1ComputeTests
         public int CancelCalls { get; private set; }
         public ManualResetEventSlim? SubmitEntered { get; set; }
         public ManualResetEventSlim? SubmitRelease { get; set; }
+        public ManualResetEventSlim? ObserveEntered { get; set; }
+        public ManualResetEventSlim? ObserveRelease { get; set; }
         public ManualResetEventSlim? MappingRevokeEntered { get; set; }
 
         public PlatformProviderDescriptor Descriptor => _inner.Descriptor;
@@ -995,6 +1663,21 @@ public sealed class PlatformDsc1ComputeTests
             ObserveDsc1Completion(PlatformProviderDsc1Submission submission)
         {
             ObserveCalls++;
+            ObserveEntered?.Set();
+            if (ObserveRelease is { } observeRelease &&
+                !observeRelease.Wait(TimeSpan.FromSeconds(5)))
+            {
+                throw new TimeoutException("Timed out waiting to release the injected DSC1 observation.");
+            }
+
+            if (DenyFirstObservation && !_observationDenied)
+            {
+                _observationDenied = true;
+                return PlatformAuthorityResult<PlatformProviderDsc1Completion>.Fail(
+                    PlatformAuthorityStatus.Denied,
+                    "Injected DSC1 observation denial.");
+            }
+
             var observed = _cancellationAcknowledged
                 ? _inner.CancelDsc1(submission)
                 : _inner.ObserveDsc1Completion(submission);
@@ -1011,6 +1694,19 @@ public sealed class PlatformDsc1ComputeTests
                             completion.Receipt.Generation.Value + 1),
                     },
                 });
+        }
+
+        public PlatformAuthorityResult<PlatformProviderDsc1Completion>
+            CompleteAcceptedDsc1()
+        {
+            if (_inner.LastDsc1Submission is not { } submission)
+            {
+                return PlatformAuthorityResult<PlatformProviderDsc1Completion>.Fail(
+                    PlatformAuthorityStatus.Denied,
+                    "No DSC1 submission has been accepted by the wrapped Host provider.");
+            }
+
+            return _inner.CompleteDsc1Copy(submission);
         }
 
         public PlatformAuthorityResult<PlatformProviderDsc1Completion> CancelDsc1(
