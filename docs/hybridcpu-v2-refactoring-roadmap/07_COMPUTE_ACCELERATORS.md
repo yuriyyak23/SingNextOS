@@ -2,17 +2,17 @@
 
 ## Status
 
-**In progress — local Slices 1–3 complete; HybridCPU executable path remains
+**In progress — local Slices 1–4 complete; HybridCPU executable path remains
 `ExternalBlocked`.** Depends on Phases 1–6 and corresponds to `EXT-HCPU-005`.
 
-## Delivered Slice 1 — bounded DSC1 Copy host model
+The local Phase-7 contour remains deliberately narrow: contiguous
+`UInt8` / `AllOrNone` DSC1 `Copy` only, bounded to 1 MiB. `Add`, `Mul`, `Fma`,
+`Reduce`, DSC2, queues, scatter/gather, overlapping copies and coherent async
+execution are not part of the delivered contract.
 
-The first local vertical slice deliberately implements only contiguous
-`UInt8`, `AllOrNone` `Copy`, with a 1 MiB maximum operation size and disjoint
-source/destination owned regions. `Add`, `Mul`, `Fma`, `Reduce`, DSC2, queues,
-scatter/gather and overlapping copies are not part of contract v1.
+## Delivered Slice 1 — bounded DSC1 Copy Host model
 
-The implemented authority intersection is:
+Slice 1 introduced the local/provider lifecycle for one bounded Copy operation:
 
 ```text
 exact live Dsc1ComputeCapability(Execute, compute:dsc1-copy:v1)
@@ -25,342 +25,250 @@ exact live Dsc1ComputeCapability(Execute, compute:dsc1-copy:v1)
 + exact provider submission and Closed terminal receipt
 ```
 
-`CapabilityId`, local DSC1 submission ID/generation, provider operation
-ID/generation, domain lease and mapping leases remain separate types. The
-capability never enters the provider request, and the local continuation never
-contains the provider operation identity.
+`CapabilityId`, local submission identity, provider operation identity, domain
+lease and mapping identities remain separate. Provider tokens never become SIP
+capabilities or public ownership handles.
 
-The default Host provider advertises this contour only as `ModelOnly`. The
-`RuntimeKernel` snapshots the exact source range into private bounded staging,
-holds internal reservations that reject subsequent owner access through the
-two `OwnedBuffer<byte>` APIs, and publishes the staged bytes to the destination
-only after an exact
-`Closed + Completed` provider receipt. `Closed + Cancelled` releases the
-reservations without modifying output. Pending, denied, stale, malformed or
-faulted completion cannot publish output; malformed/faulted completion pins
-the mappings and domain against unsafe reclaim.
+The Host provider advertises `Dsc1BulkCompute` only as `ModelOnly` and models
+submit/completion/cancel lifecycle. `RuntimeKernel` performs a private staged CPU
+reference copy and publishes output only after verified `Closed + Completed`.
+`Closed + Cancelled` releases custody without publishing output. Pending,
+denied, stale, malformed, faulted or ambiguous states cannot publish output and
+retain or quarantine authority when closure is not proved.
 
-The Host provider admits and closes lifecycle state only and never reads or
-writes region contents; the CPU reference copy belongs to `RuntimeKernel`.
-`ModelOnly` is therefore defined to have no external memory effect. A provider
-denial or malformed accepted identity may release these local buffer
-reservations, but its domain/mappings remain quarantined because exact external
-authority closure was not proved. This is not accelerator execution, zero-copy,
-a coherence claim or ISE evidence. Whole-region host mappings remain the
-existing local/runtime-admission model; bounded DSC1 ranges add no claim that
-the Host implements executable exact-slice mapping or accelerator cache
-maintenance.
-
-The reservation is not a revocable managed-memory capability: a raw `Span<T>`
-obtained before submission remains a usable alias. The model guarantees only
-that new access through `OwnedBuffer<T>` is rejected and that the submitted
-source bytes come from the private pre-submit snapshot. Executable custody must
-use a stronger external contract and remains blocked.
-
-Compute-capability revocation, explicit mapping closure and process teardown
-cancel/drain the exact operation before mapping/domain closure and local region
-reclaim. Observation and cancellation remain available for already-authorized
-work after local capability revocation or while process teardown is draining.
-
-The SingNextOS HybridCPU provider does not advertise `Dsc1BulkCompute` and does
-not implement `IPlatformDsc1ComputeProvider`. Submission therefore fails with
-`PlatformUnsupported` before any compute-provider call or host fallback. The
-live neutral domain and mappings are not poisoned by this ordinary unsupported
-result.
-
-Tests cover successful bounded publication, pending isolation, cancellation,
-capability/resource/right rejection before provider invocation, owner/range/
-access/generation failures, forged local continuations, provider denial,
-malformed submit/completion/cancellation fault pinning, cancellation drain
-retry, concurrent single-winner finalization, submit/revoke serialization,
-the pre-acquired managed-alias limitation, capability-revoke/teardown ordering,
-forbidden topology vocabulary and HybridCPU fail-closed conformance.
+This is not accelerator execution, zero-copy, coherent memory or ISE evidence.
+A managed `Span<T>` acquired before runtime reservation remains outside the
+revocable-custody guarantee.
 
 ## Delivered Slice 2 — generation-bound DSC1 observation wakeup
 
-DSC1 now reuses the same `KernelEventEndpoint` already used for IRQ and model
-DMA completion. No accelerator-specific event object, queue or provider token
-was added. The only new public shape is an overload of the existing terminal
-observation:
+Slice 2 reuses the existing generation-bound `KernelEventEndpoint` for an
+optional observation-driven completion notification. Endpoint capacity is
+reserved before provider observation, terminal provider evidence is validated,
+output/custody settles, and only then can the event commit.
 
-```text
-ObservePlatformDsc1Copy(
-  exact ProcessHandle,
-  exact PlatformDsc1CopySubmission,
-  exact KernelEventEndpoint)
-    -> exact PlatformDsc1CopyReceipt
-       + one committed KernelEventClass.Completion notification
-```
-
-The runtime validates the exact live process generation, endpoint owner and
-generation, and complete local submission before provider observation. It then
-reserves the endpoint's single slot invisibly, observes and validates the typed
-provider terminal outcome, settles the local payload, and only then commits the
-event. `Completed` publishes the staged output and releases both buffer
-reservations before a waiter can wake. An observed `Cancelled` outcome leaves
-output unchanged, releases the same reservations, and may publish the same
-observation wakeup. The event source contains only local submission ID and
-generation.
-
-`Pending`, provider denial, malformed/faulted evidence and all stale or forged
-inputs publish no event. Every failure before terminal settlement rolls back
-the exact invisible reservation. A full endpoint backpressures before the
-provider call, so a terminal provider observation is not consumed when local
-notification cannot be retained. Replay cannot invoke the provider or publish
-a second event. The exact staged pin and the DSC1 gate make a post-settlement
-`CommitExact` failure an internal invariant loss; that path faults without
-claiming delivery and retains fail-closed endpoint state rather than reclaiming
-through an unaccounted publication.
-
-The event is an optional, observation-driven wakeup, not an autonomous provider
-push, compute capability, completion receipt, provider closure proof,
-memory-visibility result or reclaim authority. Cancelling a
-`WaitForKernelEventAsync` waiter or closing its endpoint does not cancel DSC1 or
-return the buffers. Direct `CancelPlatformDsc1Copy` remains endpoint-free and
-does not promise an event. During process exit the event-bearing overload is
-rejected, while existing endpoint-free observation/cancellation continues the
-exact provider drain. Provider closure and local payload release still precede
-mapping/domain closure and region reclaim.
-
-`KernelEvent` intentionally does not encode `Completed` versus `Cancelled`.
-The caller that performs observation must propagate the returned typed
-`PlatformDsc1CopyReceipt` to any consumer that needs the authoritative outcome;
-the event alone only says that this exact local observation committed.
-
-The Host `ModelOnly` implementation retains the existing coarse DSC1 payload
-serialization while it calls the provider. A stalled provider observation can
-therefore delay the start of another DSC1 operation or process teardown. This
-is fail-closed for publication and reclaim, but is not a prompt-revocation or
-non-blocking-provider guarantee; a future executable provider needs a bounded
-per-operation in-flight protocol rather than relying on this model lock.
-
-Tests cover pending rollback and retry, successful output-before-wakeup,
-observed cancellation, occupied endpoint backpressure, exact at-most-once
-delivery, stale/closed/foreign endpoint and stale/forged submission rejection,
-provider denial and malformed completion, waiter cancellation, endpoint-close
-races, process-exit drain, recycled process generations and absence of early
-reclaim.
+The event is notification only. It is not compute authority, completion
+receipt, provider closure, output-visibility evidence or reclaim authority.
+Pending/error paths publish nothing, replay cannot publish a second event, and
+waiter/endpoint cancellation does not substitute for DSC1 cancellation or
+provider drain.
 
 ## Delivered Slice 3 — conservative DMA↔DSC1 mapping-use interlock
 
-`RuntimeKernel` now serializes local DMA/DSC1 admission and release through its
-private platform-memory-use gate. The bridge independently derives conflict
-state from the existing DMA and DSC1 lifecycle ledgers under their private
-gates; it creates no parallel authority or reservation registry. This two-layer
-interlock introduces no public contract, provider method, capability, platform
-grant or event type. A use is keyed by the complete local
-`PlatformRegionMapping` identity, including its generation. Normal accepted DMA
-uses are owned by an exact local operation record; ambiguous or invariant-fault
-submit paths retain a grant-scoped fault pin that resolves the same exact
-mapping. DSC1 uses are owned by the exact local submission record.
-
-The first rule is deliberately conservative:
+Slice 3 adds a bridge-private whole-mapping interlock without a new public
+contract or parallel authority ledger:
 
 ```text
-active or fail-closed DMA submit-path use of mapping M
+active or ambiguously accepted DMA use of mapping M
   conflicts with
-active or fail-closed DSC1 source or destination use of mapping M
+active or ambiguously accepted DSC1 source/destination use of mapping M
 ```
 
-This is whole-mapping exclusivity across the two mechanisms. It applies even
-when both sides would read, and even when their requested byte subranges do not
-overlap. The local bridge does not claim cache-line conflict analysis,
-range-granular engine compatibility or cross-engine coherence. Independently
-authorized distinct mappings may have overlapping accepted lifetimes in the
-same platform domain binding. Their submission admission still passes through
-the coarse local gate. Because current `RegionAuthority` permits only one live
-platform mapping per owned region, that disjoint case also denotes distinct
-owned regions rather than two aliases of one region.
+The rule is intentionally conservative. Same-mapping read/read and disjoint
+byte ranges still conflict. Distinct independently authorized mappings may have
+overlapping accepted lifetimes, although local admission is coarse-serialized.
 
-Admission validates the complete local authority first. The coarse admission
-gate and bridge ledger locks remain held across the provider submit and exact
-local record publication, so the other mechanism cannot enter that mapping in
-the provisional window. An ordinary provider denial returns without publishing
-an active lifecycle record. A successful acceptance retains the use through
-that record. If malformed success, provider fault or a throw leaves acceptance
-ambiguous, the exact use remains pinned through a trustworthy operation record
-or exact grant-scoped fault pin, or the containing platform domain is
-quarantined when exact operation identity cannot be retained. Forged/stale
-mapping, grant, submission or process identities cannot release another
-operation's use.
+DMA retains its mapping use through exact post-completion visibility. DSC1
+retains both uses through exact terminal closure, local output publication or
+discard, buffer-reservation release and exact local release commit. Ordinary
+pre-accept denial rolls back. Malformed, faulted, thrown or ambiguous external
+state retains the exact use where identifiable or quarantines the containing
+platform domain.
 
-DMA grant creation and visibility preparation alone are not active mapping
-uses. A DMA use starts when submission is accepted; ambiguous provider
-acceptance or a fail-closed submit-path invariant fault instead creates the
-exact grant-scoped fault pin. Exact completion proof alone does not release an
-accepted use: `DeviceReadsMemory` must traverse the exact post-completion
-no-acquire finalization, while write-capable directions must also finish the
-required direction-aware CPU acquire. Only the successful post-completion
-visibility transition releases the exact DMA use. Pending, malformed or faulted
-completion/visibility state retains it.
+This is local admission policy only. It proves no provider-side conflict model,
+IOMMU behavior, range/cache-line compatibility, CPU-alias mutation epoch or
+cross-engine coherence.
 
-DSC1 holds both source and destination uses until exact `Completed` or
-`Cancelled` provider closure is validated, completed output is published or
-teardown output is discarded, both local buffer leases are released, and the
-bridge commits the exact local-reservation release. Pending observation,
-ordinary observation/cancellation denial, malformed terminal state, provider
-fault or throw retains both mapping uses and therefore blocks conflicting DMA
-and unsafe mapping/domain reclaim.
+## Delivered Slice 4 — generated typed ComputeService ownership ingress
 
-This interlock proves only local cross-mechanism admission and exact pin
-lifetime. A prepared-but-unsubmitted DMA cycle is intentionally not a mapping
-use, and current `OwnedBuffer`/pre-acquired managed aliases carry no mutation
-epoch that invalidates old prepare evidence after an intervening CPU or DSC1
-write. Executable reuse therefore still needs an external visibility/custody
-contract that binds preparation to the current mutation epoch or requires a
-fresh prepare. Slice 3 is not that contract and makes no hardware-DMA,
-accelerator, IOMMU or coherence claim.
+Slice 4 adds the product-level semantic SIP ingress for the same bounded Copy
+authority without composing it with the platform DSC1 lifecycle yet:
 
-The current local model/test contour assumes provider calls made inside these
-coarse private gates are bounded and do not wait on a cross-thread callback
-that re-enters the same authority path. DSC1 lifecycle is exercised by the Host
-`ModelOnly` provider; the combined DMA↔DSC1 cases use a faithful test provider,
-not a Host executable-DMA path. A stalled or re-entrant provider can delay even
-disjoint admission. Before any executable provider is classified as supported,
-it needs a bounded provisional per-operation reservation and reconciliation
-protocol that does not depend on holding this coarse gate across an unbounded
-external call.
+```csharp
+[SipContract]
+public interface IComputeService
+{
+    [RequiresCapability(
+        ResourceKind.Compute,
+        CapabilityResourceIds.Dsc1Copy,
+        CapabilityRights.Execute)]
+    [ReturnsOwnership]
+    ValueTask<OwnedBuffer<byte>> CopyAsync(
+        [Borrows] OwnedBuffer<byte> source,
+        [Consumes] OwnedBuffer<byte> destination);
+}
+```
 
-Tests cover DMA-first and DSC1-first conflicts before the second provider call,
-read/read and non-overlapping-subrange rejection on the same mapping, permitted
-overlap of accepted uses on distinct mappings, rollback after ordinary submit
-denial,
-retention through pending and completion-before-visibility, exact release after
-DMA post-completion visibility and DSC1 completed/cancelled settlement, exact
-fault pinning or containing-domain quarantine, stale/forged identity rejection
-and mapping-close/ownership-transfer rejection while authority remains pinned.
+The public contract exposes no platform mapping identity, provider lease,
+HybridCPU token, lane, slot, opcode, descriptor, queue identity, physical
+address or range implementation detail. `ValueTask` is logical SIP scheduling;
+it does not claim asynchronous DSC1 hardware overlap.
+
+### Exact request transport
+
+The generated protocol now has one deliberately narrow two-slot ownership
+shape, `OwnershipPair`. It is valid only when a message has exactly two
+ownership-bearing parameters with exactly one `Borrow` and one `Consume`.
+Ordinary zero/one-payload contracts remain unchanged. Two consumes, two borrows,
+a bounded/primitive payload mixed with the pair, more than two parameters or an
+ownership parameter without its lifecycle annotation fail generation or runtime
+validation. This is not a variadic payload ABI or a generic tuple transport.
+
+The generated runtime client routes the pair through the dedicated
+`InvokeOwnershipPairAsync` transport. `SingPlus.Sip` explicitly wires the
+source generators as an analyzer for the production contract so protocol,
+response and runtime-client artifacts are built from the product interface,
+not duplicated by hand.
+
+### Authority and rollback order
+
+For a valid request the local ordering is:
+
+```text
+validate response/capacity/protocol state
+-> validate exact Compute/Execute capability
+-> validate both ownership payload kinds
+-> validate both current RegionAuthority owner/generation/state identities
+-> reject source == destination region
+-> preflight destination runtime transfer accessibility
+-> acquire exact source BorrowLease for responder
+-> transfer destination through RegionAuthority to responder
+   and advance destination generation
+-> enqueue exact correlated request
+```
+
+`RegionAuthority` remains the only ownership source of truth. No SIP transport
+ledger can mint ownership by itself.
+
+If destination transfer fails after source loan acquisition, the exact source
+loan is revoked before the send returns failure. Capability, malformed shape,
+stale generation, wrong owner, same-region alias and destination-reservation
+failures happen before the corresponding visible ownership publication.
+
+The source owner keeps ownership while its active borrow blocks new mutable
+owner access through the current managed ownership API. Returning the borrow
+invalidates its lifetime; replay fails. Destination MOVE invalidates the
+requester's old token and advances the authoritative generation. Destination
+ownership returns only through the existing typed response ownership transfer,
+which advances authority again rather than treating the response payload as
+mere evidence.
+
+Responder teardown closes the channel/pending response, returns borrower-domain
+loans before domain reclaim, and reclaims the service-owned destination rather
+than making the requester's consumed token valid again. This proves absence of
+premature local reclaim for this SIP transport contour.
+
+Tests cover deterministic generation, invalid two-slot shapes, missing/forged/
+wrong-right/wrong-resource compute capability, forged/stale region generation,
+wrong owner, same-region source/destination, replay, destination runtime
+reservation preflight, exact borrow return/replay, correlated destination
+ownership return and responder teardown cleanup.
+
+### Slice-4 non-claim
+
+Slice 4 stops at typed SIP ingress. It does **not** call
+`SubmitPlatformDsc1Copy`, create platform mappings, observe/cancel a DSC1
+submission or claim that the Host/HybridCPU provider executed the request. The
+existing Slice-1–3 platform/model contour remains separate until the next
+vertical slice composes these already-proven boundaries.
+
+HybridCPU-v2 therefore remains unchanged. The missing neutral executable DSC1
+facade and executable custody/visibility proof remain `ExternalBlocked` under
+`EXT-HCPU-005`.
 
 ## Goal
 
-Expose one **narrow, code-confirmed HybridCPU compute contour** through semantic Sing capabilities, owned regions and completion without leaking lanes/opcodes/runtime internals.
+Expose one narrow, code-confirmed HybridCPU compute contour through semantic
+Sing capabilities, owned regions and trustworthy completion without leaking
+lanes/opcodes/runtime internals.
 
-## Recommended first contour
+## Authority composition target
 
-Prefer **DSC1 bulk compute** for the first integration because it exercises the same authority boundaries as DMA while remaining semantically small:
-
-```text
-Copy
-Add
-Mul
-Fma
-Reduce
-```
-
-MatrixTile v1 is a valid alternative when numeric/layout contracts are more important. Scoped L7-SDC is a later useful device-style contour.
-
-Do not start by designing a universal GPU/accelerator API.
-
-## Provider shape
-
-A compute provider should expose semantic profiles and operations:
-
-```text
-QueryComputeProfiles()
-
-ComputeSubmission SubmitDsc1(
-    DomainLease,
-    ComputeCapabilityContext,
-    input region slices,
-    output region slices,
-    operation,
-    numeric/layout profile)
-
-Wait/Poll/Cancel
-CompletionReceipt
-```
-
-For MatrixTile, use typed shape/layout/numeric descriptors. For L7-SDC, use command families rather than raw lane-7 opcodes.
-
-## Authority composition
-
-A submission proceeds only when all are live:
+A future executable submission may proceed only when all authority layers are
+live:
 
 ```text
 caller/service compute capability
-owned/borrowed exact input/output authority
-platform domain lease
-provider compute feature at Executable level
-provider memory grants/visibility requirements
-operation-specific HybridCPU runtime admission
+AND current source borrow + destination exclusive ownership
+AND exact local process/resource generation
+AND live opaque platform domain/mapping authority
+AND provider compute feature at Executable level
+AND provider custody/visibility requirements
+AND HybridCPU runtime admission
+-> external effect may proceed
 ```
 
-Provider tokens/handles are evidence/continuation keys, not Sing capabilities.
+Intent, authority, evidence and published state remain distinct.
 
 ## Memory rules
 
-- immutable/read inputs may use bounded read grants;
-- mutable outputs should use exclusive ownership or a single-writer grant;
-- CPU cannot observe output until completion + acquire;
-- failed/cancelled operations must define whether output is unchanged, undefined-but-owned, or partially written;
-- choose an all-or-none semantic where the HybridCPU contour actually guarantees it; do not strengthen weaker backend semantics.
+- immutable/read inputs use bounded read authority;
+- mutable output remains single-writer/exclusive;
+- CPU-visible output cannot publish before trustworthy terminal closure and
+  required acquire/visibility semantics;
+- failed/cancelled operations must settle custody before ownership return;
+- no global coherence premise;
+- ownership transfer does not promise zero-copy.
 
 ## Feature truthfulness
 
-The provider must distinguish:
-
-- DSC1 supported;
-- DSC2/queue/async overlap unsupported if not active;
-- MatrixTile profile supported/unsupported;
-- L7 command family supported/unsupported;
-- coherent async memory not available unless explicitly proven.
-
-A host fallback can implement the same semantic interface, but provider identity/evidence must make clear that the operation was host-executed.
-
-## SingNextOS API layering
-
-Possible source-familiar API:
-
-```text
-System.Compute-like library
-  -> generated typed ComputeService SIP
-  -> ComputeCapability + OwnedRegion/OwnedBuffer
-  -> privileged platform compute bridge
-```
-
-The kernel ABI sees only region/grant/submission/completion primitives. It does not contain matrix algorithms or accelerator command vocabularies.
+The provider must distinguish `ModelOnly`, `Executable`, unavailable and denied
+states. A Host model may implement lifecycle semantics, but it must never be
+reported as HybridCPU hardware execution. DSC2/queues/coherent overlap remain
+unsupported until independently proven.
 
 ## HybridCPU-v2 changes expected
 
-Only a stable exported semantic facade if current internal runtime paths are not safe/stable for external integration. Reuse existing code-confirmed MatrixTile/DSC1/L7 authority and completion mechanisms.
+Only a stable exported semantic facade if an existing neutral interface does
+not already provide the exact required submit/completion/cancel/custody and
+visibility semantics. Internal ISE descriptors, lanes/opcodes or compiler types
+are not an acceptable OS contract.
 
-Do **not** add new opcodes, DSC2, universal accelerator protocol, global coherence or compiler lowering solely for this phase.
-
-## Tests
-
-- missing local compute capability prevents provider call;
-- wrong region owner/generation/range denied;
-- unsupported profile reports unsupported, not host fallback masquerading as hardware;
-- stale provider token cannot query/cancel a newer submission;
-- cancellation triggers drain/revoke before output ownership returns;
-- provider malformed completion cannot publish SIP success;
-- no generated SIP manifest contains physical lane IDs/opcodes;
-- host and HybridCPU providers pass the same authority-negative conformance suite.
+Do not add new opcodes, DSC2, a universal accelerator protocol, global
+coherence or compiler lowering solely for this phase.
 
 ## Acceptance criteria
 
-Phase 7 is complete when one real HybridCPU compute operation can consume/produce Sing-owned regions with explicit memory visibility and trustworthy completion while keeping the source API semantic and platform-neutral.
+Phase 7 is complete only when one real HybridCPU compute operation consumes and
+produces Sing-owned regions with exact authority, memory visibility,
+trustworthy completion and teardown/revocation proof through a stable neutral
+external facade.
 
-Slices 1–3 do not satisfy that full-phase criterion. The missing stable neutral
-HybridCPU submission/completion/cancel facade and executable output-visibility/
-custody proof remain isolated in `EXT-HCPU-005`.
+Slices 1–4 do **not** satisfy that full-phase criterion. Slice 4 proves only the
+semantic SIP authority ingress; Slices 1–3 prove the separate local/Host model
+platform lifecycle. The stable neutral executable HybridCPU
+submission/completion/cancel facade and executable output custody/visibility
+remain isolated in `EXT-HCPU-005`.
 
-Before any provider can expose executable DMA and DSC1, it must independently
-enforce or compose equivalent mapping-use, visibility and drain rules. The
-current Host provider has no executable DMA and the current HybridCPU provider
-has no DSC1 surface, so Slices 1–3 neither implement nor claim a combined
-hardware path.
+## Next sequential slice — not started
 
-The next local Phase-7 pool should carry the same bounded Copy authority through
-a generated typed `ComputeService` SIP ingress. It should support exactly the
-source-read and destination-exclusive authorities needed by this contour, with
-atomic validation/rollback and ownership return, rather than widening the
-operation set or adding a generic accelerator protocol. This is a SingNextOS
-contract task and does not remove the executable external blocker.
+After the Slice-4 PR is merged, the next local Phase-7 slice should compose the
+existing generated `ComputeService` ingress with the already implemented
+bounded DSC1 Copy lifecycle, without broadening the operation set:
+
+```text
+typed source Borrow + destination MOVE request
+-> service-side exact local authority
+-> required platform domain/mapping authority
+-> existing SubmitPlatformDsc1Copy / Observe / Cancel lifecycle
+-> terminal settlement + output publication/discard
+-> close platform uses before lower-resource reclaim
+-> return source borrow
+-> publish destination ownership response
+```
+
+The composition must fail closed on stale/forged/replayed ownership,
+wrong owner/domain/range/generation, unsupported provider feature, malformed or
+ambiguous provider success, terminal fault and teardown. Neither source borrow
+nor destination ownership may be returned while an accepted/ambiguous external
+use can still exist. Executable HybridCPU remains `ExternalBlocked` unless a
+real neutral facade independently satisfies that boundary.
 
 ## Do not do
 
 - no raw lane 6/lane 7 API;
 - no raw MicroOp/opcode construction in SIPs;
-- no universal GPU API;
+- no universal GPU/accelerator ABI;
 - no implicit coherent shared buffers;
-- no “accelerator token == capability” shortcut.
+- no provider/HybridCPU token as capability;
+- no operation-set expansion before the bounded Copy composition is closed.
