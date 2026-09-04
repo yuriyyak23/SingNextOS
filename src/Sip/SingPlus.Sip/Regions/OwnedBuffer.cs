@@ -7,6 +7,7 @@ internal interface ITransferableOwnedPayload
     RegionHandle Handle { get; }
     OwnershipPayloadKind PayloadKind { get; }
     bool IsValidForRuntime { get; }
+    void ValidateTransferForRuntime();
     object TransferForRuntime(RegionHandle newHandle);
     object CreateBorrowLeaseForRuntime(BorrowLeaseHandle handle, BorrowLeaseLifetime lifetime);
     void InvalidateForRuntime();
@@ -183,6 +184,7 @@ public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanag
 
     OwnershipPayloadKind ITransferableOwnedPayload.PayloadKind => OwnershipPayloadKind.OwnedBuffer;
     bool ITransferableOwnedPayload.IsValidForRuntime => IsValid;
+    void ITransferableOwnedPayload.ValidateTransferForRuntime() => EnsureOwnerAccess();
 
     object ITransferableOwnedPayload.TransferForRuntime(RegionHandle newHandle)
     {
