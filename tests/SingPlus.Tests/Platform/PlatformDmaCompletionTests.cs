@@ -169,15 +169,20 @@ public sealed class PlatformDmaCompletionTests
             1710 + (ulong)mutation,
             PlatformDmaDirection.DeviceWritesMemory);
         var submission = PrepareAndSubmit(scenario);
+        var endpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
         scenario.Provider.CompletionState = PlatformProviderDmaCompletionState.Completed;
         scenario.Provider.CompletionMutation = mutation;
 
         var completion = scenario.Kernel.ObservePlatformDmaCompletion(
             scenario.Subject,
-            submission);
+            submission,
+            endpoint);
         Assert.False(completion.IsSuccess);
         Assert.Equal(KernelError.PlatformFaulted, completion.Error);
         Assert.Equal(1, scenario.Provider.CompletionCalls);
+        Assert.Equal(
+            KernelError.ResponseNotAvailable,
+            scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint).Error);
 
         Assert.Equal(
             KernelError.PlatformFaulted,
@@ -203,13 +208,18 @@ public sealed class PlatformDmaCompletionTests
             1730 + (ulong)status,
             PlatformDmaDirection.DeviceReadsMemory);
         var submission = PrepareAndSubmit(scenario);
+        var endpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
         scenario.Provider.CompletionFailure = status;
 
         var completion = scenario.Kernel.ObservePlatformDmaCompletion(
             scenario.Subject,
-            submission);
+            submission,
+            endpoint);
         Assert.False(completion.IsSuccess);
         Assert.Equal(KernelError.PlatformFaulted, completion.Error);
+        Assert.Equal(
+            KernelError.ResponseNotAvailable,
+            scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint).Error);
         Assert.Equal(
             KernelError.PlatformFaulted,
             scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).Error);

@@ -9,6 +9,7 @@ public readonly record struct KernelEventSequence(ulong Value);
 public enum KernelEventClass
 {
     ExternalSignal = 0,
+    Completion = 1,
 }
 
 public readonly record struct KernelEventEndpoint(
@@ -25,17 +26,22 @@ public readonly record struct KernelEvent(
 /// <summary>
 /// Small policy-neutral process-bound event mailbox. The registry owns only local
 /// event delivery lifetime; platform/provider identities never enter an endpoint or event.
-/// Each endpoint intentionally admits at most one pending event in this first slice.
+/// Each endpoint intentionally admits at most one staged or committed event. Staged
+/// reservations are invisible to consumers until the exact source path commits them.
 /// </summary>
 internal sealed class KernelEventRegistry
 {
+    private const int MaximumSourceResourceIdLength = 128;
+
     private sealed class EndpointRecord(KernelEventEndpoint endpoint)
     {
         public KernelEventEndpoint Endpoint { get; } = endpoint;
+        public KernelEvent? Staged { get; set; }
         public KernelEvent? Pending { get; set; }
         public bool Closed { get; set; }
     }
 
+    private readonly object _gate = new();
     private readonly Dictionary<KernelEventEndpointId, EndpointRecord> _endpoints = [];
     private ulong _nextEndpointId = 1;
     private ulong _nextEventSequence = 1;
@@ -49,24 +55,140 @@ internal sealed class KernelEventRegistry
                 "Kernel event endpoints require an exact materialized process generation.");
         }
 
-        try
+        lock (_gate)
         {
-            var endpoint = new KernelEventEndpoint(
-                new KernelEventEndpointId(NextNonZero(ref _nextEndpointId)),
-                new KernelEventEndpointGeneration(1),
-                owner);
-            _endpoints.Add(endpoint.EndpointId, new EndpointRecord(endpoint));
-            return KernelResult<KernelEventEndpoint>.Ok(endpoint);
-        }
-        catch (Exception)
-        {
-            return KernelResult<KernelEventEndpoint>.Fail(
-                KernelError.CapacityExhausted,
-                "Kernel event endpoint identity allocation failed.");
+            try
+            {
+                var endpoint = new KernelEventEndpoint(
+                    new KernelEventEndpointId(NextNonZero(ref _nextEndpointId)),
+                    new KernelEventEndpointGeneration(1),
+                    owner);
+                _endpoints.Add(endpoint.EndpointId, new EndpointRecord(endpoint));
+                return KernelResult<KernelEventEndpoint>.Ok(endpoint);
+            }
+            catch (Exception)
+            {
+                return KernelResult<KernelEventEndpoint>.Fail(
+                    KernelError.CapacityExhausted,
+                    "Kernel event endpoint identity allocation failed.");
+            }
         }
     }
 
     public KernelResult Validate(ProcessHandle owner, KernelEventEndpoint endpoint)
+    {
+        lock (_gate)
+            return ValidateLocked(owner, endpoint);
+    }
+
+    /// <summary>
+    /// Reserves the endpoint's single mailbox slot without making an event visible
+    /// to the owner. A source must commit this exact staged event only after its
+    /// own completion/publication condition succeeds, or roll it back on failure.
+    /// </summary>
+    public KernelResult<KernelEvent> Stage(
+        ProcessHandle owner,
+        KernelEventEndpoint endpoint,
+        KernelEventClass eventClass,
+        string sourceResourceId)
+    {
+        lock (_gate)
+        {
+            var validation = ValidateLocked(owner, endpoint);
+            if (!validation.IsSuccess)
+            {
+                return KernelResult<KernelEvent>.Fail(
+                    validation.Error,
+                    validation.Message!);
+            }
+
+            if (!Enum.IsDefined(eventClass) ||
+                string.IsNullOrWhiteSpace(sourceResourceId) ||
+                sourceResourceId.Length > MaximumSourceResourceIdLength)
+            {
+                return KernelResult<KernelEvent>.Fail(
+                    KernelError.InvalidMessage,
+                    "Kernel events require a defined class and bounded semantic source identity.");
+            }
+
+            var record = _endpoints[endpoint.EndpointId];
+            if (record.Staged is not null || record.Pending is not null)
+            {
+                return KernelResult<KernelEvent>.Fail(
+                    KernelError.CapacityExhausted,
+                    "The kernel event endpoint already has a reserved or pending event.");
+            }
+
+            try
+            {
+                var @event = new KernelEvent(
+                    endpoint,
+                    new KernelEventSequence(NextNonZero(ref _nextEventSequence)),
+                    eventClass,
+                    sourceResourceId);
+                record.Staged = @event;
+                return KernelResult<KernelEvent>.Ok(@event);
+            }
+            catch (Exception)
+            {
+                return KernelResult<KernelEvent>.Fail(
+                    KernelError.CapacityExhausted,
+                    "Kernel event sequence allocation failed.");
+            }
+        }
+    }
+
+    public KernelResult<KernelEvent> CommitExact(
+        ProcessHandle owner,
+        KernelEvent staged)
+    {
+        lock (_gate)
+        {
+            var validation = ValidateLocked(owner, staged.Endpoint);
+            if (!validation.IsSuccess)
+            {
+                return KernelResult<KernelEvent>.Fail(
+                    validation.Error,
+                    validation.Message!);
+            }
+
+            var record = _endpoints[staged.Endpoint.EndpointId];
+            if (record.Staged is not { } exact || exact != staged || record.Pending is not null)
+            {
+                return KernelResult<KernelEvent>.Fail(
+                    KernelError.PlatformFaulted,
+                    "The exact staged kernel event is no longer the endpoint's publication reservation.");
+            }
+
+            record.Staged = null;
+            record.Pending = staged;
+            return KernelResult<KernelEvent>.Ok(staged);
+        }
+    }
+
+    public KernelResult RollbackExact(
+        ProcessHandle owner,
+        KernelEvent staged)
+    {
+        lock (_gate)
+        {
+            var validation = ValidateLocked(owner, staged.Endpoint);
+            if (!validation.IsSuccess) return validation;
+
+            var record = _endpoints[staged.Endpoint.EndpointId];
+            if (record.Staged is not { } exact || exact != staged)
+            {
+                return KernelResult.Fail(
+                    KernelError.PlatformFaulted,
+                    "The exact staged kernel event selected for rollback is no longer reserved.");
+            }
+
+            record.Staged = null;
+            return KernelResult.Ok();
+        }
+    }
+
+    private KernelResult ValidateLocked(ProcessHandle owner, KernelEventEndpoint endpoint)
     {
         if (!_endpoints.TryGetValue(endpoint.EndpointId, out var record))
         {
@@ -106,114 +228,68 @@ internal sealed class KernelEventRegistry
         return KernelResult.Ok();
     }
 
-    public KernelResult<KernelEvent> Publish(
-        KernelEventEndpoint endpoint,
-        KernelEventClass eventClass,
-        string sourceResourceId)
-    {
-        var validation = Validate(endpoint.Owner, endpoint);
-        if (!validation.IsSuccess)
-        {
-            return KernelResult<KernelEvent>.Fail(
-                validation.Error,
-                validation.Message!);
-        }
-
-        if (!Enum.IsDefined(eventClass) || string.IsNullOrWhiteSpace(sourceResourceId))
-        {
-            return KernelResult<KernelEvent>.Fail(
-                KernelError.InvalidMessage,
-                "Kernel events require a defined class and semantic source identity.");
-        }
-
-        var record = _endpoints[endpoint.EndpointId];
-        if (record.Pending is not null)
-        {
-            return KernelResult<KernelEvent>.Fail(
-                KernelError.CapacityExhausted,
-                "The kernel event endpoint already has a pending event.");
-        }
-
-        try
-        {
-            var @event = new KernelEvent(
-                endpoint,
-                new KernelEventSequence(NextNonZero(ref _nextEventSequence)),
-                eventClass,
-                sourceResourceId);
-            record.Pending = @event;
-            return KernelResult<KernelEvent>.Ok(@event);
-        }
-        catch (Exception)
-        {
-            return KernelResult<KernelEvent>.Fail(
-                KernelError.CapacityExhausted,
-                "Kernel event sequence allocation failed.");
-        }
-    }
-
-    public KernelResult DiscardExact(KernelEvent @event)
-    {
-        var validation = Validate(@event.Endpoint.Owner, @event.Endpoint);
-        if (!validation.IsSuccess) return validation;
-
-        var record = _endpoints[@event.Endpoint.EndpointId];
-        if (record.Pending is not { } pending || pending != @event)
-        {
-            return KernelResult.Fail(
-                KernelError.PlatformFaulted,
-                "The exact kernel event selected for rollback is no longer pending.");
-        }
-
-        record.Pending = null;
-        return KernelResult.Ok();
-    }
-
     public KernelResult<KernelEvent> Consume(
         ProcessHandle owner,
         KernelEventEndpoint endpoint)
     {
-        var validation = Validate(owner, endpoint);
-        if (!validation.IsSuccess)
+        lock (_gate)
         {
-            return KernelResult<KernelEvent>.Fail(
-                validation.Error,
-                validation.Message!);
-        }
+            var validation = ValidateLocked(owner, endpoint);
+            if (!validation.IsSuccess)
+            {
+                return KernelResult<KernelEvent>.Fail(
+                    validation.Error,
+                    validation.Message!);
+            }
 
-        var record = _endpoints[endpoint.EndpointId];
-        if (record.Pending is not { } pending)
-        {
-            return KernelResult<KernelEvent>.Fail(
-                KernelError.ResponseNotAvailable,
-                "No kernel event is pending on the exact endpoint.");
-        }
+            var record = _endpoints[endpoint.EndpointId];
+            if (record.Pending is not { } pending)
+            {
+                return KernelResult<KernelEvent>.Fail(
+                    KernelError.ResponseNotAvailable,
+                    "No committed kernel event is pending on the exact endpoint.");
+            }
 
-        record.Pending = null;
-        return KernelResult<KernelEvent>.Ok(pending);
+            record.Pending = null;
+            return KernelResult<KernelEvent>.Ok(pending);
+        }
     }
 
     public KernelResult Close(
         ProcessHandle owner,
         KernelEventEndpoint endpoint)
     {
-        var validation = Validate(owner, endpoint);
-        if (!validation.IsSuccess) return validation;
+        lock (_gate)
+        {
+            var validation = ValidateLocked(owner, endpoint);
+            if (!validation.IsSuccess) return validation;
 
-        var record = _endpoints[endpoint.EndpointId];
-        record.Pending = null;
-        record.Closed = true;
-        return KernelResult.Ok();
+            var record = _endpoints[endpoint.EndpointId];
+            if (record.Staged is not null)
+            {
+                return KernelResult.Fail(
+                    KernelError.PlatformBindingDraining,
+                    "The kernel event endpoint has an in-flight publication reservation.");
+            }
+
+            record.Pending = null;
+            record.Closed = true;
+            return KernelResult.Ok();
+        }
     }
 
     public void CloseAllForProcess(ProcessHandle owner)
     {
-        foreach (var record in _endpoints.Values)
+        lock (_gate)
         {
-            if (!record.Closed && record.Endpoint.Owner == owner)
+            foreach (var record in _endpoints.Values)
             {
-                record.Pending = null;
-                record.Closed = true;
+                if (!record.Closed && record.Endpoint.Owner == owner)
+                {
+                    record.Staged = null;
+                    record.Pending = null;
+                    record.Closed = true;
+                }
             }
         }
     }

@@ -22,9 +22,11 @@ public sealed partial class PlatformAuthorityBridge
     {
         public PlatformDmaSubmission Submission { get; } = submission;
         public PlatformProviderDmaSubmission ProviderSubmission { get; } = providerSubmission;
+        public bool CompletionObservationInFlight { get; set; }
         public bool CompletionProven { get; set; }
     }
 
+    private readonly object _dmaCompletionGate = new();
     private readonly Dictionary<PlatformDmaGrantId, DmaSubmissionRecord> _activeDmaSubmissions = [];
     private readonly HashSet<PlatformDmaGrantId> _dmaSubmissionFaultPins = [];
     private ulong _nextDmaOperationId = 1;

@@ -25,111 +25,134 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDmaSubmission submission,
         PlatformDomainIdentity expectedSubject)
     {
-        var validation = ValidateDmaSubmissionIdentity(submission, expectedSubject);
-        if (!validation.IsSuccess)
+        DmaSubmissionRecord record;
+        IPlatformDmaCompletionProvider completionProvider;
+        lock (_dmaCompletionGate)
         {
-            return KernelResult<PlatformDmaCompletionEvidence>.Fail(
-                validation.Error,
-                validation.Message!);
+            var validation = ValidateDmaSubmissionIdentity(submission, expectedSubject);
+            if (!validation.IsSuccess)
+            {
+                return KernelResult<PlatformDmaCompletionEvidence>.Fail(
+                    validation.Error,
+                    validation.Message!);
+            }
+
+            record = _activeDmaSubmissions[submission.GrantId];
+            if (record.CompletionProven)
+            {
+                return KernelResult<PlatformDmaCompletionEvidence>.Fail(
+                    KernelError.PlatformDenied,
+                    "Completion for this exact DMA operation has already been proven and cannot be replayed.");
+            }
+
+            if (HasFaultPinnedDmaSubmission(submission.GrantId))
+            {
+                return KernelResult<PlatformDmaCompletionEvidence>.Fail(
+                    KernelError.PlatformFaulted,
+                    "DMA completion state is fault-pinned and cannot produce reusable completion evidence.");
+            }
+
+            if (record.CompletionObservationInFlight)
+            {
+                return KernelResult<PlatformDmaCompletionEvidence>.Fail(
+                    KernelError.PlatformBindingDraining,
+                    "Completion observation for this exact DMA operation is already in flight.");
+            }
+
+            if (!_featureManifest.Supports(
+                    PlatformFeatureFamily.DmaMapping,
+                    PlatformDmaCompletionContract.ContractVersion,
+                    PlatformFeatureAvailability.RuntimeAdmission))
+            {
+                return KernelResult<PlatformDmaCompletionEvidence>.Fail(
+                    KernelError.PlatformUnsupported,
+                    "The platform provider does not advertise exact DMA completion contract v4.");
+            }
+
+            if (_provider is not IPlatformDmaCompletionProvider exactCompletionProvider)
+            {
+                return KernelResult<PlatformDmaCompletionEvidence>.Fail(
+                    KernelError.PlatformUnsupported,
+                    "The platform provider does not expose exact DMA completion observation.");
+            }
+
+            record.CompletionObservationInFlight = true;
+            completionProvider = exactCompletionProvider;
         }
 
-        var record = _activeDmaSubmissions[submission.GrantId];
-        if (record.CompletionProven)
+        try
         {
-            return KernelResult<PlatformDmaCompletionEvidence>.Fail(
-                KernelError.PlatformDenied,
-                "Completion for this exact DMA operation has already been proven and cannot be replayed.");
-        }
+            var providerResult = completionProvider.ObserveDmaCompletion(record.ProviderSubmission);
+            if (!providerResult.IsSuccess)
+            {
+                if (providerResult.Status is PlatformAuthorityStatus.Faulted or
+                    PlatformAuthorityStatus.Stale or
+                    PlatformAuthorityStatus.Revoked or
+                    PlatformAuthorityStatus.WrongDomain)
+                {
+                    _dmaSubmissionFaultPins.Add(submission.GrantId);
+                    return KernelResult<PlatformDmaCompletionEvidence>.Fail(
+                        KernelError.PlatformFaulted,
+                        providerResult.Message ?? "Provider DMA completion state became invalid while the operation remained locally pending.");
+                }
 
-        if (HasFaultPinnedDmaSubmission(submission.GrantId))
-        {
-            return KernelResult<PlatformDmaCompletionEvidence>.Fail(
-                KernelError.PlatformFaulted,
-                "DMA completion state is fault-pinned and cannot produce reusable completion evidence.");
-        }
+                return FromProviderFailure<PlatformDmaCompletionEvidence>(
+                    providerResult.Status,
+                    providerResult.Message);
+            }
 
-        if (!_featureManifest.Supports(
-                PlatformFeatureFamily.DmaMapping,
-                PlatformDmaCompletionContract.ContractVersion,
-                PlatformFeatureAvailability.RuntimeAdmission))
-        {
-            return KernelResult<PlatformDmaCompletionEvidence>.Fail(
-                KernelError.PlatformUnsupported,
-                "The platform provider does not advertise exact DMA completion contract v4.");
-        }
-
-        if (_provider is not IPlatformDmaCompletionProvider completionProvider)
-        {
-            return KernelResult<PlatformDmaCompletionEvidence>.Fail(
-                KernelError.PlatformUnsupported,
-                "The platform provider does not expose exact DMA completion observation.");
-        }
-
-        var providerResult = completionProvider.ObserveDmaCompletion(record.ProviderSubmission);
-        if (!providerResult.IsSuccess)
-        {
-            if (providerResult.Status is PlatformAuthorityStatus.Faulted or
-                PlatformAuthorityStatus.Stale or
-                PlatformAuthorityStatus.Revoked or
-                PlatformAuthorityStatus.WrongDomain)
+            var providerEvidence = providerResult.Value!;
+            var providerValidation = PlatformDmaCompletionContract.ValidateEvidence(
+                record.ProviderSubmission,
+                providerEvidence);
+            if (!providerValidation.IsSuccess)
             {
                 _dmaSubmissionFaultPins.Add(submission.GrantId);
                 return KernelResult<PlatformDmaCompletionEvidence>.Fail(
                     KernelError.PlatformFaulted,
-                    providerResult.Message ?? "Provider DMA completion state became invalid while the operation remained locally pending.");
+                    providerValidation.Message ?? "The provider returned malformed DMA completion evidence.");
             }
 
-            return FromProviderFailure<PlatformDmaCompletionEvidence>(
-                providerResult.Status,
-                providerResult.Message);
+            switch (providerEvidence.State)
+            {
+                case PlatformProviderDmaCompletionState.Pending:
+                    return KernelResult<PlatformDmaCompletionEvidence>.Fail(
+                        KernelError.PlatformBindingDraining,
+                        "The exact DMA operation remains pending; completion has not been proven.");
+
+                case PlatformProviderDmaCompletionState.Faulted:
+                    _dmaSubmissionFaultPins.Add(submission.GrantId);
+                    return KernelResult<PlatformDmaCompletionEvidence>.Fail(
+                        KernelError.PlatformFaulted,
+                        "The provider reported the exact DMA operation faulted; lower authority remains pinned.");
+
+                case PlatformProviderDmaCompletionState.Completed:
+                    record.CompletionProven = true;
+                    return KernelResult<PlatformDmaCompletionEvidence>.Ok(
+                        new PlatformDmaCompletionEvidence(
+                            submission.OperationId,
+                            submission.Generation,
+                            submission.GrantId,
+                            submission.GrantGeneration,
+                            submission.PreparedCycle,
+                            submission.Range,
+                            submission.Direction));
+
+                default:
+                    _dmaSubmissionFaultPins.Add(submission.GrantId);
+                    return KernelResult<PlatformDmaCompletionEvidence>.Fail(
+                        KernelError.PlatformFaulted,
+                        "The provider returned an undefined DMA completion state.");
+            }
         }
-
-        var providerEvidence = providerResult.Value!;
-        var providerValidation = PlatformDmaCompletionContract.ValidateEvidence(
-            record.ProviderSubmission,
-            providerEvidence);
-        if (!providerValidation.IsSuccess)
+        finally
         {
-            _dmaSubmissionFaultPins.Add(submission.GrantId);
-            return KernelResult<PlatformDmaCompletionEvidence>.Fail(
-                KernelError.PlatformFaulted,
-                providerValidation.Message ?? "The provider returned malformed DMA completion evidence.");
-        }
-
-        switch (providerEvidence.State)
-        {
-            case PlatformProviderDmaCompletionState.Pending:
-                return KernelResult<PlatformDmaCompletionEvidence>.Fail(
-                    KernelError.PlatformBindingDraining,
-                    "The exact DMA operation remains pending; completion has not been proven.");
-
-            case PlatformProviderDmaCompletionState.Faulted:
-                _dmaSubmissionFaultPins.Add(submission.GrantId);
-                return KernelResult<PlatformDmaCompletionEvidence>.Fail(
-                    KernelError.PlatformFaulted,
-                    "The provider reported the exact DMA operation faulted; lower authority remains pinned.");
-
-            case PlatformProviderDmaCompletionState.Completed:
-                record.CompletionProven = true;
-                return KernelResult<PlatformDmaCompletionEvidence>.Ok(
-                    new PlatformDmaCompletionEvidence(
-                        submission.OperationId,
-                        submission.Generation,
-                        submission.GrantId,
-                        submission.GrantGeneration,
-                        submission.PreparedCycle,
-                        submission.Range,
-                        submission.Direction));
-
-            default:
-                _dmaSubmissionFaultPins.Add(submission.GrantId);
-                return KernelResult<PlatformDmaCompletionEvidence>.Fail(
-                    KernelError.PlatformFaulted,
-                    "The provider returned an undefined DMA completion state.");
+            lock (_dmaCompletionGate)
+                record.CompletionObservationInFlight = false;
         }
     }
 
-    private KernelResult ValidateDmaSubmissionIdentity(
+    internal KernelResult ValidateDmaSubmissionIdentity(
         PlatformDmaSubmission submission,
         PlatformDomainIdentity expectedSubject)
     {

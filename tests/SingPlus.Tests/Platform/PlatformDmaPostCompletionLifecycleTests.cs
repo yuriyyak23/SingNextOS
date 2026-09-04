@@ -367,19 +367,490 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
         Assert.Equal(0, scenario.Provider.DeviceRevokeCalls);
     }
 
+    [Fact]
+    public void ExactDmaCompletionPublishesOneGenerationBoundNotificationWithoutReclaim()
+    {
+        var scenario = CreateScenario(1810, 1910, PlatformDmaDirection.DeviceWritesMemory);
+        var endpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        var submission = PrepareAndSubmit(scenario);
+
+        var pending = scenario.Kernel.ObservePlatformDmaCompletion(
+            scenario.Subject,
+            submission,
+            endpoint);
+        Assert.False(pending.IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingDraining, pending.Error);
+        Assert.Equal(1, scenario.Provider.CompletionCalls);
+        Assert.Equal(
+            KernelError.ResponseNotAvailable,
+            scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint).Error);
+
+        scenario.Provider.CompletionState = PlatformProviderDmaCompletionState.Completed;
+        var completed = scenario.Kernel.ObservePlatformDmaCompletion(
+            scenario.Subject,
+            submission,
+            endpoint);
+        Assert.True(completed.IsSuccess, completed.Message);
+        Assert.True(completed.Value!.IsSatisfied);
+        Assert.Equal(2, scenario.Provider.CompletionCalls);
+
+        var delivered = scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint);
+        Assert.True(delivered.IsSuccess, delivered.Message);
+        Assert.Equal(endpoint, delivered.Value!.Endpoint);
+        Assert.Equal(KernelEventClass.Completion, delivered.Value.EventClass);
+        Assert.Equal(
+            FormattableString.Invariant(
+                $"platform/dma-completion-observed/v1/{submission.OperationId.Value}/{submission.Generation.Value}"),
+            delivered.Value.SourceResourceId);
+        var eventOverload = typeof(RuntimeKernel).GetMethods(BindingFlags.Public | BindingFlags.Instance)
+            .Single(method =>
+                method.Name == nameof(RuntimeKernel.ObservePlatformDmaCompletion) &&
+                method.GetParameters().Length == 3);
+        var eventSignature = eventOverload.ToString() ?? eventOverload.Name;
+        foreach (var forbidden in new[]
+                 {
+                     "PlatformProvider", "Neutral", "Physical", "BusAddress", "Iommu",
+                     "PageTable", "Pte", "Descriptor", "Queue", "Vector", "Controller",
+                     "Vmcs", "Vmx", "Lane", "Opcode",
+                 })
+        {
+            Assert.DoesNotContain(forbidden, eventSignature, StringComparison.OrdinalIgnoreCase);
+        }
+
+        var earlyRevoke = scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant);
+        Assert.False(earlyRevoke.IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingDraining, earlyRevoke.Error);
+        var earlyTransfer = scenario.Kernel.TransferRegion(
+            scenario.Subject,
+            scenario.Target,
+            scenario.Buffer);
+        Assert.False(earlyTransfer.IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingActive, earlyTransfer.Error);
+
+        var replay = scenario.Kernel.ObservePlatformDmaCompletion(
+            scenario.Subject,
+            submission,
+            endpoint);
+        Assert.False(replay.IsSuccess);
+        Assert.Equal(KernelError.PlatformDenied, replay.Error);
+        Assert.Equal(2, scenario.Provider.CompletionCalls);
+        Assert.Equal(
+            KernelError.ResponseNotAvailable,
+            scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint).Error);
+
+        var visibility = scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(
+            scenario.Subject,
+            submission,
+            completed.Value);
+        Assert.True(visibility.IsSuccess, visibility.Message);
+        Assert.Equal(1, scenario.Provider.AcquireCalls);
+
+        AssertSuccess(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant));
+        AssertSuccess(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping));
+        AssertSuccess(scenario.Kernel.RevokePlatformDevice(scenario.Subject, scenario.Device));
+        AssertSuccess(scenario.Kernel.RevokePlatformDomain(scenario.Subject, scenario.Binding));
+
+        var moved = scenario.Kernel.TransferRegion(
+            scenario.Subject,
+            scenario.Target,
+            scenario.Buffer);
+        Assert.True(moved.IsSuccess, moved.Message);
+    }
+
+    [Fact]
+    public void StaleForgedAndForeignEventDeliveryInputsFailBeforeProviderObservation()
+    {
+        var scenario = CreateScenario(1811, 1920, PlatformDmaDirection.DeviceReadsMemory);
+        var endpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        var foreignEndpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Target).Value!;
+        var closedEndpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        AssertSuccess(scenario.Kernel.CloseKernelEventEndpoint(scenario.Subject, closedEndpoint));
+        var submission = PrepareAndSubmit(scenario);
+
+        var staleSubject = scenario.Subject with { Generation = scenario.Subject.Generation + 1 };
+        Assert.Equal(
+            KernelError.StaleHandle,
+            scenario.Kernel.ObservePlatformDmaCompletion(
+                staleSubject,
+                submission,
+                endpoint).Error);
+        Assert.Equal(
+            KernelError.WrongEndpointOwner,
+            scenario.Kernel.ObservePlatformDmaCompletion(
+                scenario.Subject,
+                submission,
+                foreignEndpoint).Error);
+        Assert.Equal(
+            KernelError.StaleGeneration,
+            scenario.Kernel.ObservePlatformDmaCompletion(
+                scenario.Subject,
+                submission,
+                endpoint with
+                {
+                    Generation = new KernelEventEndpointGeneration(endpoint.Generation.Value + 1),
+                }).Error);
+        Assert.Equal(
+            KernelError.EndpointNotFound,
+            scenario.Kernel.ObservePlatformDmaCompletion(
+                scenario.Subject,
+                submission,
+                closedEndpoint).Error);
+
+        Assert.Equal(
+            KernelError.StaleGeneration,
+            scenario.Kernel.ObservePlatformDmaCompletion(
+                scenario.Subject,
+                submission with
+                {
+                    Generation = new PlatformDmaOperationGeneration(submission.Generation.Value + 1),
+                },
+                endpoint).Error);
+        Assert.Equal(
+            KernelError.PlatformDenied,
+            scenario.Kernel.ObservePlatformDmaCompletion(
+                scenario.Subject,
+                submission with
+                {
+                    OperationId = new PlatformDmaOperationId(submission.OperationId.Value + 1),
+                },
+                endpoint).Error);
+        Assert.Equal(
+            KernelError.StaleGeneration,
+            scenario.Kernel.ObservePlatformDmaCompletion(
+                scenario.Subject,
+                submission with
+                {
+                    GrantGeneration = new PlatformDmaGrantGeneration(
+                        submission.GrantGeneration.Value + 1),
+                },
+                endpoint).Error);
+        Assert.Equal(
+            KernelError.PlatformDenied,
+            scenario.Kernel.ObservePlatformDmaCompletion(
+                scenario.Subject,
+                submission with
+                {
+                    PreparedCycle = new PlatformDmaVisibilityCycle(submission.PreparedCycle.Value + 1),
+                },
+                endpoint).Error);
+        Assert.Equal(0, scenario.Provider.CompletionCalls);
+        Assert.Equal(
+            KernelError.ResponseNotAvailable,
+            scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint).Error);
+    }
+
+    [Fact]
+    public void BusyEndpointBackpressuresBeforeCompletionObservationAndRetryDeliversOnce()
+    {
+        var scenario = CreateScenario(1812, 1930, PlatformDmaDirection.DeviceReadsMemory);
+        var second = CreateAdditionalDmaGrant(scenario);
+        var endpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        var firstSubmission = PrepareAndSubmit(scenario);
+        var secondSubmission = PrepareAndSubmit(scenario, second.Grant);
+        scenario.Provider.CompletionState = PlatformProviderDmaCompletionState.Completed;
+
+        var first = scenario.Kernel.ObservePlatformDmaCompletion(
+            scenario.Subject,
+            firstSubmission,
+            endpoint);
+        Assert.True(first.IsSuccess, first.Message);
+        Assert.Equal(1, scenario.Provider.CompletionCalls);
+
+        var blocked = scenario.Kernel.ObservePlatformDmaCompletion(
+            scenario.Subject,
+            secondSubmission,
+            endpoint);
+        Assert.False(blocked.IsSuccess);
+        Assert.Equal(KernelError.CapacityExhausted, blocked.Error);
+        Assert.Equal(1, scenario.Provider.CompletionCalls);
+
+        var firstEvent = scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint);
+        Assert.True(firstEvent.IsSuccess, firstEvent.Message);
+        var retried = scenario.Kernel.ObservePlatformDmaCompletion(
+            scenario.Subject,
+            secondSubmission,
+            endpoint);
+        Assert.True(retried.IsSuccess, retried.Message);
+        Assert.Equal(2, scenario.Provider.CompletionCalls);
+
+        var secondEvent = scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint);
+        Assert.True(secondEvent.IsSuccess, secondEvent.Message);
+        Assert.NotEqual(firstEvent.Value!.Sequence, secondEvent.Value!.Sequence);
+        Assert.NotEqual(firstEvent.Value.SourceResourceId, secondEvent.Value.SourceResourceId);
+
+        var replay = scenario.Kernel.ObservePlatformDmaCompletion(
+            scenario.Subject,
+            secondSubmission,
+            endpoint);
+        Assert.False(replay.IsSuccess);
+        Assert.Equal(KernelError.PlatformDenied, replay.Error);
+        Assert.Equal(2, scenario.Provider.CompletionCalls);
+        Assert.Equal(
+            KernelError.ResponseNotAvailable,
+            scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint).Error);
+    }
+
+    [Fact]
+    public void ProviderFailureRollsBackReservationWithoutPrematureEventPublication()
+    {
+        var scenario = CreateScenario(1813, 1940, PlatformDmaDirection.DeviceReadsMemory);
+        var endpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        var submission = PrepareAndSubmit(scenario);
+        scenario.Provider.CompletionFailure = PlatformAuthorityStatus.Denied;
+
+        var denied = scenario.Kernel.ObservePlatformDmaCompletion(
+            scenario.Subject,
+            submission,
+            endpoint);
+        Assert.False(denied.IsSuccess);
+        Assert.Equal(KernelError.PlatformDenied, denied.Error);
+        Assert.Equal(1, scenario.Provider.CompletionCalls);
+        Assert.Equal(
+            KernelError.ResponseNotAvailable,
+            scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint).Error);
+
+        scenario.Provider.CompletionFailure = null;
+        scenario.Provider.CompletionState = PlatformProviderDmaCompletionState.Completed;
+        var retry = scenario.Kernel.ObservePlatformDmaCompletion(
+            scenario.Subject,
+            submission,
+            endpoint);
+        Assert.True(retry.IsSuccess, retry.Message);
+        Assert.Equal(2, scenario.Provider.CompletionCalls);
+        Assert.True(scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint).IsSuccess);
+    }
+
+    [Fact]
+    public async Task ConcurrentCompletionObserversCallProviderAndPublishOnlyOnce()
+    {
+        var scenario = CreateScenario(1816, 1970, PlatformDmaDirection.DeviceReadsMemory);
+        var firstEndpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        var secondEndpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        var submission = PrepareAndSubmit(scenario);
+        scenario.Provider.CompletionState = PlatformProviderDmaCompletionState.Completed;
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        scenario.Provider.CompletionEntered = entered;
+        scenario.Provider.CompletionRelease = release;
+
+        var firstTask = Task.Run(() => scenario.Kernel.ObservePlatformDmaCompletion(
+            scenario.Subject,
+            submission,
+            firstEndpoint));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+            var concurrent = scenario.Kernel.ObservePlatformDmaCompletion(
+                scenario.Subject,
+                submission,
+                secondEndpoint);
+            Assert.False(concurrent.IsSuccess);
+            Assert.Equal(KernelError.PlatformBindingDraining, concurrent.Error);
+            Assert.Equal(1, scenario.Provider.CompletionCalls);
+            Assert.Equal(
+                KernelError.ResponseNotAvailable,
+                scenario.Kernel.ConsumeKernelEvent(scenario.Subject, firstEndpoint).Error);
+            Assert.Equal(
+                KernelError.ResponseNotAvailable,
+                scenario.Kernel.ConsumeKernelEvent(scenario.Subject, secondEndpoint).Error);
+            Assert.Equal(
+                KernelError.PlatformBindingDraining,
+                scenario.Kernel.CloseKernelEventEndpoint(
+                    scenario.Subject,
+                    firstEndpoint).Error);
+        }
+        finally
+        {
+            release.Set();
+        }
+
+        var first = await firstTask;
+        Assert.True(first.IsSuccess, first.Message);
+        Assert.Equal(1, scenario.Provider.CompletionCalls);
+        Assert.True(scenario.Kernel.ConsumeKernelEvent(scenario.Subject, firstEndpoint).IsSuccess);
+        AssertSuccess(scenario.Kernel.CloseKernelEventEndpoint(
+            scenario.Subject,
+            firstEndpoint));
+        Assert.Equal(
+            KernelError.ResponseNotAvailable,
+            scenario.Kernel.ConsumeKernelEvent(scenario.Subject, secondEndpoint).Error);
+
+        var replay = scenario.Kernel.ObservePlatformDmaCompletion(
+            scenario.Subject,
+            submission,
+            secondEndpoint);
+        Assert.False(replay.IsSuccess);
+        Assert.Equal(KernelError.PlatformDenied, replay.Error);
+        Assert.Equal(1, scenario.Provider.CompletionCalls);
+    }
+
+    [Fact]
+    public void EndpointCancellationDoesNotCancelDmaDrainOrPermitEarlyReclaim()
+    {
+        var scenario = CreateScenario(1814, 1950, PlatformDmaDirection.DeviceWritesMemory);
+        var cancelledEndpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        var exitEndpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        var submission = PrepareAndSubmit(scenario);
+
+        AssertSuccess(scenario.Kernel.CloseKernelEventEndpoint(
+            scenario.Subject,
+            cancelledEndpoint));
+        Assert.Equal(
+            KernelError.EndpointNotFound,
+            scenario.Kernel.ObservePlatformDmaCompletion(
+                scenario.Subject,
+                submission,
+                cancelledEndpoint).Error);
+        Assert.Equal(0, scenario.Provider.CompletionCalls);
+        Assert.Equal(
+            KernelError.PlatformBindingDraining,
+            scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).Error);
+        Assert.Equal(
+            KernelError.PlatformBindingActive,
+            scenario.Kernel.TransferRegion(
+                scenario.Subject,
+                scenario.Target,
+                scenario.Buffer).Error);
+
+        var terminate = scenario.Kernel.TerminateProcess(scenario.Subject);
+        Assert.False(terminate.IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingDraining, terminate.Error);
+        Assert.Equal(
+            KernelError.InvalidTransition,
+            scenario.Kernel.ObservePlatformDmaCompletion(
+                scenario.Subject,
+                submission,
+                exitEndpoint).Error);
+        Assert.Equal(0, scenario.Provider.CompletionCalls);
+        Assert.Equal(0, scenario.Provider.DmaRevokeCalls);
+        Assert.Equal(0, scenario.Provider.MappingRevokeCalls);
+        Assert.Equal(0, scenario.Provider.DeviceRevokeCalls);
+
+        scenario.Provider.CompletionState = PlatformProviderDmaCompletionState.Completed;
+        var completion = scenario.Kernel.ObservePlatformDmaCompletion(
+            scenario.Subject,
+            submission);
+        Assert.True(completion.IsSuccess, completion.Message);
+        var visibility = scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(
+            scenario.Subject,
+            submission,
+            completion.Value!);
+        Assert.True(visibility.IsSuccess, visibility.Message);
+
+        var progress = scenario.Kernel.ObserveProcessTeardown(scenario.Subject);
+        Assert.True(progress.IsSuccess, progress.Message);
+        Assert.True(progress.Value!.LocalReclaimCompleted);
+        Assert.True(progress.Value.PlatformDomainClosed);
+        var reclaimed = scenario.Kernel.Regions.Snapshot()
+            .Single(region => region.Handle.RegionId == scenario.Buffer.Handle.RegionId);
+        Assert.Equal(RegionState.Released, reclaimed.State);
+
+        var (_, recycled) = TestFixtures.Create(
+            scenario.Kernel,
+            scenario.Subject.ProcessId.Value,
+            scenario.Binding.Subject.DomainId.Value + 10_000,
+            generation: 2);
+        var callsBeforeStaleDelivery = scenario.Provider.CompletionCalls;
+        Assert.Equal(
+            KernelError.StaleHandle,
+            scenario.Kernel.ObservePlatformDmaCompletion(
+                scenario.Subject,
+                submission,
+                cancelledEndpoint).Error);
+        Assert.Equal(
+            KernelError.WrongEndpointOwner,
+            scenario.Kernel.ObservePlatformDmaCompletion(
+                recycled,
+                submission,
+                cancelledEndpoint).Error);
+        Assert.Equal(callsBeforeStaleDelivery, scenario.Provider.CompletionCalls);
+    }
+
+    [Fact]
+    public void FaultedProviderCompletionStatePublishesNoEventAndPinsReclaim()
+    {
+        var scenario = CreateScenario(1815, 1960, PlatformDmaDirection.DeviceWritesMemory);
+        var endpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        var submission = PrepareAndSubmit(scenario);
+        scenario.Provider.CompletionState = PlatformProviderDmaCompletionState.Faulted;
+
+        var completion = scenario.Kernel.ObservePlatformDmaCompletion(
+            scenario.Subject,
+            submission,
+            endpoint);
+        Assert.False(completion.IsSuccess);
+        Assert.Equal(KernelError.PlatformFaulted, completion.Error);
+        Assert.Equal(1, scenario.Provider.CompletionCalls);
+        Assert.Equal(
+            KernelError.ResponseNotAvailable,
+            scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint).Error);
+        Assert.Equal(
+            KernelError.PlatformFaulted,
+            scenario.Kernel.TerminateProcess(scenario.Subject).Error);
+        var region = scenario.Kernel.Regions.Snapshot()
+            .Single(item => item.Handle.RegionId == scenario.Buffer.Handle.RegionId);
+        Assert.Equal(RegionState.Owned, region.State);
+    }
+
     private static void AssertSuccess(KernelResult result) =>
         Assert.True(result.IsSuccess, $"{result.Error}: {result.Message}");
 
     private static PlatformDmaSubmission PrepareAndSubmit(Scenario scenario)
+        => PrepareAndSubmit(scenario, scenario.Grant);
+
+    private static PlatformDmaSubmission PrepareAndSubmit(
+        Scenario scenario,
+        PlatformDmaGrant grant)
     {
-        var prepare = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant);
+        var prepare = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, grant);
         Assert.True(prepare.IsSuccess, prepare.Message);
         var submit = scenario.Kernel.SubmitPlatformDma(
             scenario.Subject,
-            scenario.Grant,
+            grant,
             prepare.Value!);
         Assert.True(submit.IsSuccess, submit.Message);
         return submit.Value!;
+    }
+
+    private static (
+        OwnedBuffer<byte> Buffer,
+        PlatformOwnedRegionSliceMapping Mapping,
+        PlatformDmaGrant Grant) CreateAdditionalDmaGrant(Scenario scenario)
+    {
+        var access = scenario.Grant.Direction switch
+        {
+            PlatformDmaDirection.DeviceReadsMemory => PlatformMemoryAccess.Read,
+            PlatformDmaDirection.DeviceWritesMemory => PlatformMemoryAccess.Write,
+            PlatformDmaDirection.Bidirectional => PlatformMemoryAccess.Read | PlatformMemoryAccess.Write,
+            _ => throw new ArgumentOutOfRangeException(nameof(scenario)),
+        };
+        var rights = CapabilityRights.Map;
+        if ((access & PlatformMemoryAccess.Read) != 0) rights |= CapabilityRights.Read;
+        if ((access & PlatformMemoryAccess.Write) != 0) rights |= CapabilityRights.Write;
+
+        var buffer = scenario.Kernel.AllocateBuffer<byte>(scenario.Subject, 512).Value!;
+        var capability = Mint(
+            scenario.Kernel,
+            scenario.Subject,
+            ResourceKind.MemoryRegion,
+            CapabilityResourceIds.MemoryRegion(buffer.Handle.RegionId),
+            rights);
+        var mapping = scenario.Kernel.MapPlatformOwnedRegionSlice(
+            scenario.Subject,
+            scenario.Binding,
+            capability,
+            buffer.Handle,
+            96,
+            192,
+            access).Value!;
+        var grant = scenario.Kernel.BindPlatformDma(
+            scenario.Subject,
+            scenario.Device,
+            mapping,
+            24,
+            64,
+            scenario.Grant.Direction).Value!;
+        return (buffer, mapping, grant);
     }
 
     private static Scenario CreateScenario(
@@ -538,6 +1009,7 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
         private ulong _nextSubmission = 1;
         private ulong _nextOperation = 1;
 
+        public int CompletionCalls { get; private set; }
         public int AcquireCalls { get; private set; }
         public int DmaRevokeCalls { get; private set; }
         public int MappingRevokeCalls { get; private set; }
@@ -545,6 +1017,8 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
         public PlatformProviderDmaCompletionState CompletionState { get; set; } =
             PlatformProviderDmaCompletionState.Pending;
         public PlatformAuthorityStatus? CompletionFailure { get; set; }
+        public ManualResetEventSlim? CompletionEntered { get; set; }
+        public ManualResetEventSlim? CompletionRelease { get; set; }
         public AcquireMutation AcquireMutation { get; set; }
 
         public PlatformProviderDescriptor Descriptor { get; } = new(
@@ -902,6 +1376,9 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
         public PlatformAuthorityResult<PlatformProviderDmaCompletionEvidence> ObserveDmaCompletion(
             PlatformProviderDmaSubmission submission)
         {
+            CompletionCalls++;
+            CompletionEntered?.Set();
+            CompletionRelease?.Wait(TimeSpan.FromSeconds(10));
             if (!_submissions.TryGetValue(submission.GrantId, out var exact) || exact != submission)
             {
                 return PlatformAuthorityResult<PlatformProviderDmaCompletionEvidence>.Fail(

@@ -162,16 +162,17 @@ public sealed partial class RuntimeKernel
                 new PlatformInterruptPollResult(false, null));
         }
 
-        var published = _kernelEvents.Publish(
+        var staged = _kernelEvents.Stage(
+            subject,
             binding.EventEndpoint,
             KernelEventClass.ExternalSignal,
             binding.Source.ResourceId);
-        if (!published.IsSuccess)
+        if (!staged.IsSuccess)
         {
             // No provider completion occurs: the exact external delivery remains pending.
             return KernelResult<PlatformInterruptPollResult>.Fail(
-                published.Error,
-                published.Message!);
+                staged.Error,
+                staged.Message!);
         }
 
         var completed = PlatformAuthority.CompleteIrqDelivery(
@@ -180,12 +181,12 @@ public sealed partial class RuntimeKernel
             delivery.ProviderSequence);
         if (!completed.IsSuccess)
         {
-            var rollback = _kernelEvents.DiscardExact(published.Value!);
+            var rollback = _kernelEvents.RollbackExact(subject, staged.Value!);
             if (!rollback.IsSuccess)
             {
                 return KernelResult<PlatformInterruptPollResult>.Fail(
                     KernelError.PlatformFaulted,
-                    "Interrupt completion failed and the exact local event could not be rolled back.");
+                    "Interrupt completion failed and the exact staged local event could not be rolled back.");
             }
 
             return KernelResult<PlatformInterruptPollResult>.Fail(
@@ -193,8 +194,16 @@ public sealed partial class RuntimeKernel
                 completed.Message!);
         }
 
+        var committed = _kernelEvents.CommitExact(subject, staged.Value!);
+        if (!committed.IsSuccess)
+        {
+            return KernelResult<PlatformInterruptPollResult>.Fail(
+                KernelError.PlatformFaulted,
+                "Interrupt delivery completed but the exact staged local event could not be committed.");
+        }
+
         return KernelResult<PlatformInterruptPollResult>.Ok(
-            new PlatformInterruptPollResult(true, published.Value!));
+            new PlatformInterruptPollResult(true, committed.Value!));
     }
 
     public KernelResult RevokePlatformInterrupt(

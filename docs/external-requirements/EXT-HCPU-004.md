@@ -51,4 +51,10 @@ If the external platform cannot provide direct mapping for a case, SingNextOS ma
 
 ## Fallback/mock used
 
-Current `RegionAuthority`, `OwnedRegion<T>`, `OwnedBuffer<T>` and `BorrowLease<T>` semantics remain authoritative for local ownership. Hardware-visible mapping stays unavailable until this requirement is satisfied.
+Current `RegionAuthority`, `OwnedRegion<T>`, `OwnedBuffer<T>` and
+`BorrowLease<T>` semantics remain authoritative for local ownership. SingNextOS
+has bounded host/model DMA lifecycle tests and separately pinned grant-scoped
+HybridCPU visibility integration, but the neutral runtime still has no executable
+submit/completion/cancel surface. The Phase-6 completion event is therefore a
+local notification over validated model evidence; it does not satisfy this
+external DMA requirement.
