@@ -70,7 +70,7 @@ The main missing element is not a new ISA or a new OS object model. It is a prod
 | 4 | [`04_MEMORY_OWNERSHIP_COHERENCE.md`](04_MEMORY_OWNERSHIP_COHERENCE.md) | Exact region slices, non-coherent-safe handoff, revoke/rebind and zero-copy-as-optimization semantics. |
 | 5 | [`05_DEVICE_DMA_IRQ_IO.md`](05_DEVICE_DMA_IRQ_IO.md) | Device/MMIO/IRQ/DMA authority as bounded grants, never ambient device access. |
 | 6 | [`06_EXECUTION_SCHEDULER_EVENTS_BOOT.md`](06_EXECUTION_SCHEDULER_EVENTS_BOOT.md) | **Complete locally:** domain lifecycle, model policy and reusable exact event/wait integration; reproducible AOT/ISE attempt stops honestly at `EXT-HCPU-001`. |
-| 7 | [`07_COMPUTE_ACCELERATORS.md`](07_COMPUTE_ACCELERATORS.md) | **In progress:** bounded DSC1 Copy v1 Host model over owned regions and exact completion; executable HybridCPU remains blocked. |
+| 7 | [`07_COMPUTE_ACCELERATORS.md`](07_COMPUTE_ACCELERATORS.md) | **In progress:** bounded DSC1 Copy v1 Host model over owned regions, exact completion and generation-bound observation wakeup; executable HybridCPU remains blocked. |
 | 8 | [`08_VIRTUALIZATION_NESTED_DOMAINS.md`](08_VIRTUALIZATION_NESTED_DOMAINS.md) | Neutral `VirtualizationService` over child domains; VMX remains a compatibility projection. |
 | 9 | [`09_EVIDENCE_SECURECOMPUTE.md`](09_EVIDENCE_SECURECOMPUTE.md) | Classified evidence and fail-closed SecureCompute feature gating. |
 | 10 | [`10_NATIVE_API_SYSTEM_SERVICES.md`](10_NATIVE_API_SYSTEM_SERVICES.md) | Filesystem/network/process/device/virt APIs as source-familiar libraries over typed SIP. |
@@ -87,8 +87,8 @@ The main missing element is not a new ISA or a new OS object model. It is a prod
 | ownership | `OwnedRegion`/`OwnedBuffer`, MOVE, generation | domain/mapping authority, not a duplicate OS ownership object | Preserve Sing ownership; adapt in Phase 4 |
 | borrow/shared grants | local revocable borrow | bounded platform permissions, no generic Sing borrow object needed | Phase 4 |
 | DMA | bounded local v5 submit/completion/visibility/closure model plus generation-bound completion notification; no executable HybridCPU DMA | neutral admission-only grant plus grant-scoped prepare/acquire visibility evidence merged on master; no neutral submit/completion/cancel API | Phases 5, 6 |
-| interrupts/events | exact HybridCPU IRQ binding and model DMA completion feed one `KernelEventEndpoint`; exact cancellable async consumption stops before process drain and preserves staged publication | neutral IRQ binding exists; no generic timer/event, wait, or DMA-completion surface | Phases 5, 6 |
-| accelerators | bounded DSC1 Copy v1 capability/provider lifecycle with private staging and Host `ModelOnly`; HybridCPU provider fails closed | MatrixTile, DSC1 and scoped L7 paths are code-confirmed internally, but no stable neutral compute facade is supplied | Phase 7 in progress; `EXT-HCPU-005` |
+| interrupts/events | exact HybridCPU IRQ binding plus model DMA and model DSC1 terminal completion feed one generation-bound `KernelEventEndpoint`; exact cancellable async consumption stops before process drain and preserves staged publication | neutral IRQ binding exists; no generic timer/event, wait, DMA-completion or compute-completion surface | Phases 5–7 |
+| accelerators | bounded DSC1 Copy v1 capability/provider lifecycle with private staging, exact observation-driven terminal wakeup and Host `ModelOnly`; HybridCPU provider fails closed | MatrixTile, DSC1 and scoped L7 paths are code-confirmed internally, but no stable neutral compute facade is supplied | Phase 7 in progress; `EXT-HCPU-005` |
 | coherence/fences | no global-coherence assumption | explicit non-coherent fence requirements exist; universal coherence not proven | Phases 1, 4, 5 |
 | virtualization | local target only | neutral domain substrate + VMX projection; backend incomplete | Phase 8 |
 | nested domains | no provider | neutral nested-domain composition exists | Phase 8 |

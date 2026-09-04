@@ -17,10 +17,14 @@ boundaries.
 > kernel build and admission artifacts, but the external path stops at
 > `ManagedAssemblyToHybridCpuAot`. `EXT-HCPU-001` remains `ExternalBlocked`; the
 > image stage is `NotProduced` and ISE execution is `NotAttempted`. Phase-7
-> Slice 1 now provides bounded DSC1 `UInt8` Copy as a Host `ModelOnly`
+> Slices 1–2 now provide bounded DSC1 `UInt8` Copy as a Host `ModelOnly`
 > reference lifecycle over separate compute capability, owned regions and
-> exact completion/cancellation closure. HybridCPU executable compute remains
-> unavailable under `EXT-HCPU-005`; no ISE/compiler code is consumed or changed.
+> exact completion/cancellation closure, plus an observation-driven wakeup
+> through the existing generation-bound `KernelEventEndpoint`. Output/custody
+> settles before event commit, and notification cancellation never replaces
+> provider drain.
+> HybridCPU executable compute remains unavailable under `EXT-HCPU-005`; no
+> ISE/compiler code is consumed or changed.
 
 ## Historical baseline delta
 
@@ -170,11 +174,12 @@ Tracked by `EXT-HCPU-004`.
 
 ## Track E — first narrow ISE compute provider
 
-**In progress locally; ExternalBlocked for ISE execution.** Phase-7 Slice 1
+**In progress locally; ExternalBlocked for ISE execution.** Phase-7 Slices 1–2
 implements the bounded DSC1 Copy contract, a `RuntimeKernel` CPU-staged
 reference copy admitted by a Host `ModelOnly` lifecycle provider, and
-fail-closed feature selection. A real provider still depends on an actual
-stable neutral external interface, not internal ISE breadth.
+generation-bound observation wakeup through the existing event endpoint,
+alongside fail-closed feature selection. A real provider still depends on an
+actual stable neutral external interface, not internal ISE breadth.
 
 Candidates remain:
 
@@ -191,7 +196,9 @@ Do not claim DSC2 queues or coherent async overlap.
 Current local v1 supports only `UInt8/AllOrNone Copy`, disjoint owned regions
 and at most 1 MiB. It does not yet expose Add/Mul/Fma/Reduce. Provider denial,
 stale/forged identity, malformed completion and cancellation cannot publish
-output; operation closure precedes mapping/domain/local reclaim.
+output. Exact terminal observation may publish one local `Completion` wakeup
+only after output/reservation settlement; operation closure still precedes
+mapping/domain/local reclaim.
 
 ### MatrixTile v1
 
@@ -208,11 +215,12 @@ Tracked by `EXT-HCPU-005`.
 **Current for the locally owned Phase-6 contour; partially HybridCPU-bound.**
 Exact process-scoped execution lifecycle, binding-scoped semantic
 budget/priority/latency/throughput intent, IRQ and model DMA-completion delivery
-through one generation-bound endpoint, and cancellable `ValueTask` consumption
-are implemented. The scheduler policy is host `ModelOnly`; the HybridCPU
-provider correctly reports that family unavailable. HybridCPU supplies the
-exact neutral IRQ binding, but no generic timer/event wait or DMA-completion
-surface.
+plus model DSC1 terminal delivery through one generation-bound endpoint, and
+cancellable `ValueTask` consumption are implemented. The scheduler policy and
+DSC1 lifecycle are host `ModelOnly`; the HybridCPU provider correctly reports
+those unavailable where no neutral interface exists. HybridCPU supplies the
+exact neutral IRQ binding, but no generic timer/event wait, DMA-completion or
+compute-completion surface.
 
 Public API remains `Task`/`ValueTask`/cancellation/event/channel-oriented and
 does not expose `WFE`, `SEV`, VT IDs or lane placement as native ABI. Real timer

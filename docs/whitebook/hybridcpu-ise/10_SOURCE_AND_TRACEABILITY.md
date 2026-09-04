@@ -159,8 +159,9 @@ Repository search at this baseline does not find current `IWindowService`, `ICom
 
 The referenced HybridCPU ISE/compiler material is architecture and audit
 background only. It is not accepted as current executable integration evidence,
-and Phase-7 Slice 1 neither consumes nor changes `HybridCPU_Compiler_v2` or ISE
-implementation types.
+and Phase-7 Slices 1–2 neither consume nor change `HybridCPU_Compiler_v2` or ISE
+implementation types. Slice 2 only projects exact local DSC1 terminal settlement
+onto the existing generation-bound kernel event primitive.
 
 ## External requirement traceability
 
@@ -170,7 +171,7 @@ implementation types.
 | `EXT-HCPU-002` | real console/timer/MMIO/IRQ/DMA platform binding still required |
 | `EXT-HCPU-003` | local neutral binding abstraction now exists, but real HybridCPU provider is still external-blocked |
 | `EXT-HCPU-004` | local exact owned-region mapping abstraction/interlock now exists, but real mapping/revocation/DMA semantics are external-blocked |
-| `EXT-HCPU-005` | local bounded DSC1 Copy v1 + Host `ModelOnly` lifecycle exists; neutral executable HybridCPU compute/visibility binding remains external-blocked |
+| `EXT-HCPU-005` | local bounded DSC1 Copy v1 + Host `ModelOnly` lifecycle and exact observation wakeup exist; neutral executable HybridCPU compute/visibility binding remains external-blocked |
 | `EXT-HCPU-006` | virtualization/nested/evidence/SecureCompute provider discovery remains external-blocked |
 
 ## Key decision-to-source map
