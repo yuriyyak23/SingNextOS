@@ -67,13 +67,9 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
         var valid = true;
         foreach (var method in contract.GetMembers().OfType<IMethodSymbol>().Where(static m => m.MethodKind == MethodKind.Ordinary))
         {
-            if (method.Parameters.Length > 1)
-            {
-                Report(output, RequestPayloadCardinalityDiagnostic, method, $"Message '{method.Name}' has {method.Parameters.Length} request parameters, but the current channel transport supports zero or one payload slot.");
-                valid = false;
-            }
-
             var ownershipParameterCount = 0;
+            var borrowParameterCount = 0;
+            var consumeParameterCount = 0;
             var boundedParameterCount = 0;
             foreach (var parameter in method.Parameters)
             {
@@ -84,6 +80,8 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
                 if (consumes || borrows)
                 {
                     ownershipParameterCount++;
+                    if (consumes) consumeParameterCount++;
+                    if (borrows) borrowParameterCount++;
                     if (consumes && borrows)
                     {
                         Report(output, OwnershipCardinalityDiagnostic, parameter, $"Parameter '{parameter.Name}' cannot be both Consumes and Borrows.");
@@ -159,24 +157,32 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
                 }
             }
 
-            if (ownershipParameterCount > 1)
+            if (method.Parameters.Length > 2 ||
+                (method.Parameters.Length == 2 && ownershipParameterCount != 2))
             {
-                Report(output, OwnershipCardinalityDiagnostic, method, $"Message '{method.Name}' has {ownershipParameterCount} ownership-bearing parameters, but the current channel transport supports exactly one payload slot.");
+                Report(output, RequestPayloadCardinalityDiagnostic, method, $"Message '{method.Name}' may carry at most one ordinary request payload or exactly one two-slot ownership pair.");
+                valid = false;
+            }
+
+            if (ownershipParameterCount > 2 ||
+                (ownershipParameterCount == 2 && (method.Parameters.Length != 2 || borrowParameterCount != 1 || consumeParameterCount != 1)))
+            {
+                Report(output, OwnershipCardinalityDiagnostic, method, $"Message '{method.Name}' may carry one ownership payload or exactly one Borrow+Consume ownership pair.");
                 valid = false;
             }
             if (boundedParameterCount > 1)
             {
-                Report(output, BoundedPayloadCardinalityDiagnostic, method, $"Message '{method.Name}' has {boundedParameterCount} bounded payload parameters, but the current channel transport supports exactly one payload slot.");
+                Report(output, BoundedPayloadCardinalityDiagnostic, method, $"Message '{method.Name}' has {boundedParameterCount} bounded payload parameters, but the current channel transport supports exactly one bounded payload slot.");
                 valid = false;
             }
             if (boundedParameterCount == 1 && method.Parameters.Length != 1)
             {
-                Report(output, BoundedPayloadCardinalityDiagnostic, method, $"Bounded payload message '{method.Name}' must have exactly one parameter because the current channel transport has one payload slot.");
+                Report(output, BoundedPayloadCardinalityDiagnostic, method, $"Bounded payload message '{method.Name}' must have exactly one parameter because bounded payloads cannot share the ownership-pair transport.");
                 valid = false;
             }
             if (boundedParameterCount != 0 && ownershipParameterCount != 0)
             {
-                Report(output, BoundedPayloadCardinalityDiagnostic, method, $"Message '{method.Name}' cannot combine bounded and ownership-bearing payload parameters in one channel payload slot.");
+                Report(output, BoundedPayloadCardinalityDiagnostic, method, $"Message '{method.Name}' cannot combine bounded and ownership-bearing payload parameters.");
                 valid = false;
             }
 
@@ -264,6 +270,16 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
             return;
         }
 
+        if (request.Kind == 5)
+        {
+            builder.Append("new global::SingPlus.Contracts.RequestPayloadDescriptorV1(");
+            AppendOwnershipRequestSlot(builder, request.OwnershipPair[0]);
+            builder.Append(", ");
+            AppendOwnershipRequestSlot(builder, request.OwnershipPair[1]);
+            builder.Append(')');
+            return;
+        }
+
         builder.Append("new global::SingPlus.Contracts.RequestPayloadDescriptorV1((global::SingPlus.Contracts.RequestPayloadKind)")
             .Append(request.Kind.ToString(CultureInfo.InvariantCulture)).Append(", ")
             .Append(Literal(request.ParameterName)).Append(", ")
@@ -271,6 +287,15 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
             .Append(request.MaxBytes.ToString(CultureInfo.InvariantCulture)).Append(", ");
         AppendOwnershipKind(builder, request.OwnershipPayloadKind);
         builder.Append(')');
+    }
+
+    private static void AppendOwnershipRequestSlot(StringBuilder builder, OwnershipRequestSlotModel slot)
+    {
+        builder.Append("new global::SingPlus.Contracts.OwnershipRequestDescriptorV1(")
+            .Append(Literal(slot.ParameterName)).Append(", ");
+        AppendOwnershipKind(builder, slot.OwnershipPayloadKind);
+        builder.Append(", (global::SingPlus.Contracts.OwnershipRequestDisposition)")
+            .Append(slot.Disposition.ToString(CultureInfo.InvariantCulture)).Append(')');
     }
 
     private static string GenerateProtocol(ContractModel model)
@@ -363,7 +388,10 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
             b.Append("    public const string ").Append(message.Name).Append(" = ").Append(Literal(canonical)).AppendLine(";");
             b.Append("    public const string ").Append(message.Name).Append("_Ownership = ").Append(Literal("Consumes=" + string.Join(",", message.Consumes) + ";Borrows=" + string.Join(",", message.Borrows) + ";InputKind=" + message.RequestPayload.OwnershipPayloadKind.ToString(CultureInfo.InvariantCulture) + ";Returns=" + (message.ReturnsOwnership ? "1" : "0") + ";ReturnKind=" + message.ReturnOwnershipPayloadKind.ToString(CultureInfo.InvariantCulture))).AppendLine(";");
             var request = message.RequestPayload;
-            b.Append("    public const string ").Append(message.Name).Append("_RequestPayload = ").Append(Literal("Kind=" + request.Kind.ToString(CultureInfo.InvariantCulture) + ";Parameter=" + request.ParameterName + ";Type=" + request.TypeName + ";MaxBytes=" + request.MaxBytes.ToString(CultureInfo.InvariantCulture) + ";OwnershipKind=" + request.OwnershipPayloadKind.ToString(CultureInfo.InvariantCulture))).AppendLine(";");
+            var requestMetadata = request.Kind == 5
+                ? "Kind=5;OwnershipPair=" + string.Join(",", request.OwnershipPair.Select(static slot => slot.ParameterName + ":" + slot.OwnershipPayloadKind + ":" + slot.Disposition))
+                : "Kind=" + request.Kind.ToString(CultureInfo.InvariantCulture) + ";Parameter=" + request.ParameterName + ";Type=" + request.TypeName + ";MaxBytes=" + request.MaxBytes.ToString(CultureInfo.InvariantCulture) + ";OwnershipKind=" + request.OwnershipPayloadKind.ToString(CultureInfo.InvariantCulture);
+            b.Append("    public const string ").Append(message.Name).Append("_RequestPayload = ").Append(Literal(requestMetadata)).AppendLine(";");
         }
         b.AppendLine("}");
         return b.ToString();
@@ -428,7 +456,14 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
                 lines.Add("cap=" + m.Id.ToString(CultureInfo.InvariantCulture) + "|" + string.Join(";", m.Capabilities.Select(static c => c.Kind + ":" + c.ResourceId + ":" + c.Rights)));
                 lines.Add("ownership=" + m.Id.ToString(CultureInfo.InvariantCulture) + "|" + string.Join(",", m.Consumes) + "|" + string.Join(",", m.Borrows) + "|" + (m.ReturnsOwnership ? "1" : "0") + "|" + m.ReturnOwnershipPayloadKind.ToString(CultureInfo.InvariantCulture));
                 var request = m.RequestPayload;
-                lines.Add("request=" + m.Id.ToString(CultureInfo.InvariantCulture) + "|" + request.Kind.ToString(CultureInfo.InvariantCulture) + "|" + request.ParameterName + "|" + request.TypeName + "|" + request.MaxBytes.ToString(CultureInfo.InvariantCulture) + "|" + request.OwnershipPayloadKind.ToString(CultureInfo.InvariantCulture));
+                if (request.Kind == 5)
+                {
+                    lines.Add("request=" + m.Id.ToString(CultureInfo.InvariantCulture) + "|5|pair|" + string.Join(";", request.OwnershipPair.Select(static slot => slot.ParameterName + ":" + slot.OwnershipPayloadKind + ":" + slot.Disposition)));
+                }
+                else
+                {
+                    lines.Add("request=" + m.Id.ToString(CultureInfo.InvariantCulture) + "|" + request.Kind.ToString(CultureInfo.InvariantCulture) + "|" + request.ParameterName + "|" + request.TypeName + "|" + request.MaxBytes.ToString(CultureInfo.InvariantCulture) + "|" + request.OwnershipPayloadKind.ToString(CultureInfo.InvariantCulture));
+                }
             }
             lines.AddRange(transitions.Select(static t => "transition=" + t.MessageId.ToString(CultureInfo.InvariantCulture) + "|" + t.From + "|" + t.To));
             return string.Join("\n", lines);
@@ -483,6 +518,20 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
         private static RequestPayloadModel CreateRequestPayload(IMethodSymbol method)
         {
             if (method.Parameters.Length == 0) return new RequestPayloadModel();
+            if (method.Parameters.Length == 2)
+            {
+                return new RequestPayloadModel
+                {
+                    Kind = 5,
+                    OwnershipPair = method.Parameters.Select(parameter => new OwnershipRequestSlotModel
+                    {
+                        ParameterName = parameter.Name,
+                        OwnershipPayloadKind = OwnershipKind(parameter.Type, unwrapAsync: false),
+                        Disposition = HasAttribute(parameter, "BorrowsAttribute") ? 1 : 2
+                    }).ToArray()
+                };
+            }
+
             var parameter = method.Parameters[0];
             var ownershipKind = OwnershipKind(parameter.Type, unwrapAsync: false);
             if (ownershipKind != 0)
@@ -524,7 +573,8 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
 
     private sealed class ParameterModel { public string Name { get; set; } = string.Empty; public string Type { get; set; } = string.Empty; }
     private sealed class CapabilityModel { public int Kind { get; set; } public string ResourceId { get; set; } = string.Empty; public int Rights { get; set; } }
-    private sealed class RequestPayloadModel { public int Kind { get; set; } public string ParameterName { get; set; } = string.Empty; public string TypeName { get; set; } = string.Empty; public int MaxBytes { get; set; } public int OwnershipPayloadKind { get; set; } }
+    private sealed class OwnershipRequestSlotModel { public string ParameterName { get; set; } = string.Empty; public int OwnershipPayloadKind { get; set; } public int Disposition { get; set; } }
+    private sealed class RequestPayloadModel { public int Kind { get; set; } public string ParameterName { get; set; } = string.Empty; public string TypeName { get; set; } = string.Empty; public int MaxBytes { get; set; } public int OwnershipPayloadKind { get; set; } public IReadOnlyList<OwnershipRequestSlotModel> OwnershipPair { get; set; } = Array.Empty<OwnershipRequestSlotModel>(); }
     private sealed class TransitionModel { public uint MessageId { get; set; } public string From { get; set; } = string.Empty; public string To { get; set; } = string.Empty; }
 
     private static string? AttributeString(INamedTypeSymbol symbol, string attributeName)
