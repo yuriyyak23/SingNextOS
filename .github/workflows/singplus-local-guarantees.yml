@@ -88,5 +88,51 @@ jobs:
       - name: Run HybridCPU neutral facade tests
         run: dotnet test HybridCPU-v2/HybridCPU_NeutralRuntime.Tests/HybridCPU_NeutralRuntime.Tests.csproj --configuration Release
 
+  hybridcpu-aot-qualification:
+    name: HybridCPU AOT qualification evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout SingNextOS
+        uses: actions/checkout@v4
+        with:
+          path: SingNextOS
+
+      - name: Checkout pinned HybridCPU source
+        uses: actions/checkout@v4
+        with:
+          repository: yuriyyak23/HybridCPU-v2
+          ref: 9e001bf29df06ad3d4ff7337f81d4e5bc0a62fc9
+          path: HybridCPU-v2
+
+      - name: Setup exact SingNextOS .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: SingNextOS/global.json
+
+      - name: Record runner and SDK identity
+        working-directory: SingNextOS
+        run: |
+          printf 'ImageOS=%s\nImageVersion=%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+          dotnet --info
+
+      - name: Build twice and record fail-closed qualification
+        working-directory: SingNextOS
+        run: bash eng/qualify-hybridcpu-aot.sh ../HybridCPU-v2
+
+      - name: Upload qualification evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hybridcpu-aot-qualification-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            SingNextOS/artifacts/hybridcpu-aot-qualification/
+            SingNextOS/src/Kernel/SingPlus.Kernel/bin/Release/net10.0/SingPlus.Kernel.dll
+            SingNextOS/src/Kernel/Boot/SingPlus.Boot/bin/Release/net10.0/SingPlus.Boot.dll
+
 # The normal local-guarantees job remains independent of HybridCPU source.
 # Phase-5 grant-scoped DMA visibility is verified only by the pinned narrow integration job above.
+# The qualification job records a reproducible ExternalBlocked boundary. A green
+# result is evidence capture, not successful HybridCPU AOT, image loading or boot.
