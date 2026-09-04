@@ -157,6 +157,11 @@ Repository search at this baseline does not find current `IWindowService`, `ICom
 | L7 | `Documentation/Stream WhiteBook/ExternalAccelerators/01_L7_SDC_Executive_Summary.md` | scoped accelerator command/commit contour |
 | L7 conflicts | `Documentation/Stream WhiteBook/ExternalAccelerators/07_Memory_Conflict_Model.md` | model-local conflict handling is not universal CPU/device coherence |
 
+The referenced HybridCPU ISE/compiler material is architecture and audit
+background only. It is not accepted as current executable integration evidence,
+and Phase-7 Slice 1 neither consumes nor changes `HybridCPU_Compiler_v2` or ISE
+implementation types.
+
 ## External requirement traceability
 
 | Requirement | Current meaning |
@@ -165,7 +170,7 @@ Repository search at this baseline does not find current `IWindowService`, `ICom
 | `EXT-HCPU-002` | real console/timer/MMIO/IRQ/DMA platform binding still required |
 | `EXT-HCPU-003` | local neutral binding abstraction now exists, but real HybridCPU provider is still external-blocked |
 | `EXT-HCPU-004` | local exact owned-region mapping abstraction/interlock now exists, but real mapping/revocation/DMA semantics are external-blocked |
-| `EXT-HCPU-005` | compute provider bindings remain external-blocked |
+| `EXT-HCPU-005` | local bounded DSC1 Copy v1 + Host `ModelOnly` lifecycle exists; neutral executable HybridCPU compute/visibility binding remains external-blocked |
 | `EXT-HCPU-006` | virtualization/nested/evidence/SecureCompute provider discovery remains external-blocked |
 
 ## Key decision-to-source map
