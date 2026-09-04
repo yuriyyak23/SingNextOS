@@ -227,8 +227,8 @@ public sealed class PlatformDsc1ComputeTests
 
         var results = await Task.WhenAll(observeTask, cancelTask);
 
-        var winner = Assert.Single(results.Where(static result => result.IsSuccess));
-        var loser = Assert.Single(results.Where(static result => !result.IsSuccess));
+        var winner = Assert.Single(results, static result => result.IsSuccess);
+        var loser = Assert.Single(results, static result => !result.IsSuccess);
         Assert.Equal(PlatformDsc1CopyOutcome.Completed, winner.Value!.Outcome);
         Assert.True(winner.Value.OutputPublished);
         Assert.Equal(KernelError.PlatformBindingNotFound, loser.Error);
@@ -892,6 +892,7 @@ public sealed class PlatformDsc1ComputeTests
     private sealed class FaultInjectingDsc1Provider :
         IPlatformAuthorityProvider,
         IPlatformFeatureProvider,
+        IPlatformRegionRevocationProvider,
         IPlatformDsc1ComputeProvider
     {
         private readonly HostPlatformAuthorityProvider _inner = new(
@@ -932,6 +933,19 @@ public sealed class PlatformDsc1ComputeTests
             PlatformProviderRegionMappingLease mapping,
             PlatformRegionRevocationPolicy policy) =>
             RevokeRegionMappingCore(mapping, policy);
+
+        public PlatformAuthorityResult<PlatformRegionRevocationTicket>
+            BeginRegionMappingRevocation(
+                PlatformProviderRegionMappingLease mapping,
+                PlatformRegionRevocationPolicy policy)
+        {
+            MappingRevokeEntered?.Set();
+            return _inner.BeginRegionMappingRevocation(mapping, policy);
+        }
+
+        public PlatformAuthorityResult<PlatformCompletionReceipt> ObserveCompletion(
+            PlatformOperationIdentity operation) =>
+            _inner.ObserveCompletion(operation);
 
         private PlatformAuthorityResult RevokeRegionMappingCore(
             PlatformProviderRegionMappingLease mapping,
