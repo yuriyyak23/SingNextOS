@@ -38,8 +38,9 @@ public sealed class ClientRuntimeAdapterGenerator : IIncrementalGenerator
             .ToArray();
 
         if (methods.Any(static method =>
-                method.Parameters.Length > 1 ||
-                method.Parameters.Any(static parameter => parameter.RefKind != RefKind.None)))
+                method.Parameters.Length > 2 ||
+                method.Parameters.Any(static parameter => parameter.RefKind != RefKind.None) ||
+                (method.Parameters.Length == 2 && !IsOwnershipPair(method))))
         {
             return;
         }
@@ -49,6 +50,31 @@ public sealed class ClientRuntimeAdapterGenerator : IIncrementalGenerator
             Sanitize(contract.ToDisplayString()) + ".ClientRuntimeAdapter.g.cs",
             SourceText.From(source, Encoding.UTF8));
     }
+
+    private static bool IsOwnershipPair(IMethodSymbol method)
+    {
+        if (method.Parameters.Length != 2) return false;
+        var borrows = 0;
+        var consumes = 0;
+        foreach (var parameter in method.Parameters)
+        {
+            var isBorrow = HasAttribute(parameter, "BorrowsAttribute");
+            var isConsume = HasAttribute(parameter, "ConsumesAttribute");
+            if (isBorrow == isConsume || !IsOwnershipType(parameter.Type)) return false;
+            if (isBorrow) borrows++;
+            if (isConsume) consumes++;
+        }
+        return borrows == 1 && consumes == 1;
+    }
+
+    private static bool HasAttribute(ISymbol symbol, string attributeName) =>
+        symbol.GetAttributes().Any(attribute => attribute.AttributeClass?.Name == attributeName);
+
+    private static bool IsOwnershipType(ITypeSymbol type) =>
+        type is INamedTypeSymbol named &&
+        named.TypeArguments.Length == 1 &&
+        named.ContainingNamespace.ToDisplayString() == "SingPlus.Sip" &&
+        named.Name is "OwnedBuffer" or "OwnedRegion";
 
     private static string Generate(
         INamedTypeSymbol contract,
@@ -102,14 +128,15 @@ public sealed class ClientRuntimeAdapterGenerator : IIncrementalGenerator
         var returnType = method.ReturnType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
         builder.Append("    public ").Append(returnType).Append(" Send_").Append(method.Name)
             .Append("(uint messageId");
-        if (method.Parameters.Length != 0)
-            builder.Append(", ").Append(Parameter(method.Parameters[0]));
+        foreach (var parameter in method.Parameters)
+            builder.Append(", ").Append(Parameter(parameter));
         builder.Append(')');
 
-        var payload = method.Parameters.Length == 0 ? "null" : "@" + method.Parameters[0].Name;
+        var syncInvocation = RuntimeInvocation(method, async: false);
+        var asyncInvocation = RuntimeInvocation(method, async: true);
         if (method.ReturnsVoid)
         {
-            builder.Append(" => EnsureVoid(_runtime.Invoke(messageId, ").Append(payload).AppendLine("), messageId);");
+            builder.Append(" => EnsureVoid(").Append(syncInvocation).AppendLine(", messageId);");
             return;
         }
 
@@ -118,24 +145,37 @@ public sealed class ClientRuntimeAdapterGenerator : IIncrementalGenerator
             switch (asyncKind)
             {
                 case AsyncKind.Task:
-                    builder.Append(" => AwaitTask(_runtime.InvokeAsync(messageId, ").Append(payload).AppendLine("), messageId);");
+                    builder.Append(" => AwaitTask(").Append(asyncInvocation).AppendLine(", messageId);");
                     return;
                 case AsyncKind.TaskOfT:
-                    builder.Append(" => AwaitTask<").Append(Display(responseType!)).Append(">(_runtime.InvokeAsync(messageId, ")
-                        .Append(payload).AppendLine("), messageId);");
+                    builder.Append(" => AwaitTask<").Append(Display(responseType!)).Append(">(")
+                        .Append(asyncInvocation).AppendLine(", messageId);");
                     return;
                 case AsyncKind.ValueTask:
-                    builder.Append(" => AwaitValueTask(_runtime.InvokeAsync(messageId, ").Append(payload).AppendLine("), messageId);");
+                    builder.Append(" => AwaitValueTask(").Append(asyncInvocation).AppendLine(", messageId);");
                     return;
                 case AsyncKind.ValueTaskOfT:
-                    builder.Append(" => AwaitValueTask<").Append(Display(responseType!)).Append(">(_runtime.InvokeAsync(messageId, ")
-                        .Append(payload).AppendLine("), messageId);");
+                    builder.Append(" => AwaitValueTask<").Append(Display(responseType!)).Append(">(")
+                        .Append(asyncInvocation).AppendLine(", messageId);");
                     return;
             }
         }
 
-        builder.Append(" => Decode<").Append(returnType).Append(">(_runtime.Invoke(messageId, ")
-            .Append(payload).AppendLine("), messageId);");
+        builder.Append(" => Decode<").Append(returnType).Append(">(")
+            .Append(syncInvocation).AppendLine(", messageId);");
+    }
+
+    private static string RuntimeInvocation(IMethodSymbol method, bool async)
+    {
+        if (method.Parameters.Length == 2)
+        {
+            var operation = async ? "InvokeOwnershipPairAsync" : "InvokeOwnershipPair";
+            return "_runtime." + operation + "(messageId, @" + method.Parameters[0].Name + ", @" + method.Parameters[1].Name + ")";
+        }
+
+        var singleOperation = async ? "InvokeAsync" : "Invoke";
+        var payload = method.Parameters.Length == 0 ? "null" : "@" + method.Parameters[0].Name;
+        return "_runtime." + singleOperation + "(messageId, " + payload + ")";
     }
 
     private static void AppendHelpers(StringBuilder builder)
