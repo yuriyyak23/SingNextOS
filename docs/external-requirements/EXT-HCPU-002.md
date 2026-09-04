@@ -30,8 +30,10 @@ Only real HybridCPU-backed hardware driver execution. The local `IConsoleDriver`
 `HostKernelConsole` and host console/timer driver implementations inside
 SingNextOS, plus capability-aware runtime tests. The current HybridCPU adapter
 has a tested neutral semantic IRQ binding, but no generic timer binding. DMA is
-limited to bounded authority/visibility integration against the exact external
-revision pinned by CI; HybridCPU exposes no neutral submit/completion/cancel API.
+limited to bounded authority/visibility integration against merged HybridCPU
+`9e001bf...`, pinned by CI; HybridCPU exposes no neutral
+submit/completion/cancel API.
 The Phase-6 DMA-completion `KernelEventEndpoint` path is therefore a local/model
-notification over a test provider, not hardware delivery and not a fabricated
-HybridCPU ABI.
+notification over a test provider. Its cancellable asynchronous wait is likewise
+local runtime consumption, not a generic HybridCPU timer/event wait, hardware
+delivery or fabricated WFE/SEV ABI.

@@ -185,7 +185,7 @@ public sealed class PlatformIrqBindingTests
     }
 
     [Fact]
-    public void FailedInterruptCompletionRollsBackInvisibleReservationBeforeRetry()
+    public async Task FailedInterruptCompletionRollsBackInvisibleReservationBeforeRetry()
     {
         var provider = new IrqProvider { CompletionStatus = PlatformAuthorityStatus.Faulted };
         var kernel = new RuntimeKernel(provider);
@@ -201,6 +201,7 @@ public sealed class PlatformIrqBindingTests
             device,
             irqCapability,
             endpoint).Value!;
+        var wait = kernel.WaitForKernelEventAsync(subject, endpoint).AsTask();
 
         Assert.True(provider.Signal("notify"));
         var failed = kernel.PollPlatformInterrupt(subject, route);
@@ -209,13 +210,201 @@ public sealed class PlatformIrqBindingTests
         Assert.Equal(
             KernelError.ResponseNotAvailable,
             kernel.ConsumeKernelEvent(subject, endpoint).Error);
+        Assert.False(wait.IsCompleted);
         Assert.True(provider.IsPending("notify"));
 
         provider.CompletionStatus = null;
         var retry = kernel.PollPlatformInterrupt(subject, route);
         Assert.True(retry.IsSuccess, retry.Message);
-        Assert.True(kernel.ConsumeKernelEvent(subject, endpoint).IsSuccess);
+        var received = await wait;
+        Assert.True(received.IsSuccess, received.Message);
+        Assert.Equal(retry.Value!.Event, received.Value);
+        Assert.Equal(
+            KernelError.ResponseNotAvailable,
+            kernel.ConsumeKernelEvent(subject, endpoint).Error);
         Assert.False(provider.IsPending("notify"));
+    }
+
+    [Fact]
+    public async Task WaiterBeforeInterruptPublicationReceivesTheExactCommittedEventOnce()
+    {
+        var provider = new IrqProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1310, 1400);
+        var (device, irqCapability, endpoint) = CreateAuthorities(
+            kernel,
+            subject,
+            "device/wait0",
+            "ready",
+            IrqTriggerMode.Edge);
+        var route = kernel.BindPlatformInterrupt(
+            subject,
+            device,
+            irqCapability,
+            endpoint).Value!;
+        using var cancellation = new CancellationTokenSource();
+
+        var wait = kernel.WaitForKernelEventAsync(
+            subject,
+            endpoint,
+            cancellation.Token).AsTask();
+        Assert.False(wait.IsCompleted);
+
+        Assert.True(provider.Signal("ready"));
+        var delivery = kernel.PollPlatformInterrupt(subject, route);
+
+        Assert.True(delivery.IsSuccess, delivery.Message);
+        Assert.True(delivery.Value!.Event.HasValue);
+        cancellation.Cancel();
+        var received = await wait;
+        Assert.True(received.IsSuccess, received.Message);
+        Assert.Equal(delivery.Value.Event.Value, received.Value);
+        Assert.Equal(
+            KernelError.ResponseNotAvailable,
+            kernel.ConsumeKernelEvent(subject, endpoint).Error);
+    }
+
+    [Fact]
+    public async Task PrecommittedEventWinsOverAnAlreadyCancelledWaitToken()
+    {
+        var provider = new IrqProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1311, 1410);
+        var (device, irqCapability, endpoint) = CreateAuthorities(
+            kernel,
+            subject,
+            "device/wait1",
+            "complete",
+            IrqTriggerMode.Level);
+        var route = kernel.BindPlatformInterrupt(
+            subject,
+            device,
+            irqCapability,
+            endpoint).Value!;
+
+        Assert.True(provider.Signal("complete"));
+        var delivery = kernel.PollPlatformInterrupt(subject, route);
+        Assert.True(delivery.IsSuccess, delivery.Message);
+        Assert.True(delivery.Value!.Event.HasValue);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        var received = await kernel.WaitForKernelEventAsync(
+            subject,
+            endpoint,
+            cancellation.Token);
+
+        Assert.True(received.IsSuccess, received.Message);
+        Assert.Equal(delivery.Value.Event.Value, received.Value);
+        Assert.Equal(
+            KernelError.ResponseNotAvailable,
+            kernel.ConsumeKernelEvent(subject, endpoint).Error);
+    }
+
+    [Fact]
+    public async Task CallerCancellationRemovesOnlyTheWaiterAndLeavesEndpointReusable()
+    {
+        var provider = new IrqProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1312, 1420);
+        var (device, irqCapability, endpoint) = CreateAuthorities(
+            kernel,
+            subject,
+            "device/wait2",
+            "notify",
+            IrqTriggerMode.Edge);
+        var route = kernel.BindPlatformInterrupt(
+            subject,
+            device,
+            irqCapability,
+            endpoint).Value!;
+        using var cancellation = new CancellationTokenSource();
+        var cancelledWait = kernel.WaitForKernelEventAsync(
+            subject,
+            endpoint,
+            cancellation.Token).AsTask();
+
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => cancelledWait);
+        Assert.Equal(0, provider.CompleteCalls);
+        Assert.True(provider.Signal("notify"));
+        var delivery = kernel.PollPlatformInterrupt(subject, route);
+        Assert.True(delivery.IsSuccess, delivery.Message);
+        Assert.True(delivery.Value!.Event.HasValue);
+
+        var laterWait = await kernel.WaitForKernelEventAsync(subject, endpoint);
+        Assert.True(laterWait.IsSuccess, laterWait.Message);
+        Assert.Equal(delivery.Value.Event.Value, laterWait.Value);
+        Assert.Equal(1, provider.CompleteCalls);
+    }
+
+    [Fact]
+    public async Task EndpointAdmitsOneWaiterAndCloseCancelsOnlyThatUncommittedWait()
+    {
+        var provider = new IrqProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1313, 1430);
+        var endpoint = kernel.CreateKernelEventEndpoint(subject).Value!;
+        var first = kernel.WaitForKernelEventAsync(subject, endpoint).AsTask();
+
+        var second = await kernel.WaitForKernelEventAsync(subject, endpoint);
+
+        Assert.Equal(KernelError.CapacityExhausted, second.Error);
+        Assert.True(kernel.CloseKernelEventEndpoint(subject, endpoint).IsSuccess);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => first);
+        Assert.Equal(
+            KernelError.EndpointNotFound,
+            (await kernel.WaitForKernelEventAsync(subject, endpoint)).Error);
+
+        Assert.True(kernel.TerminateProcess(subject).IsSuccess);
+        var (_, recycled) = TestFixtures.Create(kernel, 1313, 1460, generation: 2);
+        Assert.Equal(
+            KernelError.StaleHandle,
+            (await kernel.WaitForKernelEventAsync(subject, endpoint)).Error);
+        Assert.Equal(
+            KernelError.WrongEndpointOwner,
+            (await kernel.WaitForKernelEventAsync(recycled, endpoint)).Error);
+    }
+
+    [Fact]
+    public async Task StaleForeignAndClosedEndpointWaitsFailBeforeWaiterRegistration()
+    {
+        var provider = new IrqProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1314, 1440);
+        var (_, other) = TestFixtures.Create(kernel, 1315, 1450);
+        var endpoint = kernel.CreateKernelEventEndpoint(subject).Value!;
+        var stale = endpoint with
+        {
+            Generation = new KernelEventEndpointGeneration(endpoint.Generation.Value + 1),
+        };
+        var forged = endpoint with { Owner = other };
+
+        Assert.Equal(
+            KernelError.StaleGeneration,
+            (await kernel.WaitForKernelEventAsync(subject, stale)).Error);
+        Assert.Equal(
+            KernelError.PlatformFaulted,
+            (await kernel.WaitForKernelEventAsync(subject, forged)).Error);
+        Assert.Equal(
+            KernelError.WrongEndpointOwner,
+            (await kernel.WaitForKernelEventAsync(other, endpoint)).Error);
+
+        using (var cancellation = new CancellationTokenSource())
+        {
+            var valid = kernel.WaitForKernelEventAsync(
+                subject,
+                endpoint,
+                cancellation.Token).AsTask();
+            cancellation.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => valid);
+        }
+
+        Assert.True(kernel.CloseKernelEventEndpoint(subject, endpoint).IsSuccess);
+        Assert.Equal(
+            KernelError.EndpointNotFound,
+            (await kernel.WaitForKernelEventAsync(subject, endpoint)).Error);
     }
 
     [Fact]
@@ -333,6 +522,64 @@ public sealed class PlatformIrqBindingTests
     }
 
     [Fact]
+    public async Task ProcessReclaimWaitsForStagedPublicationAfterPlatformClosure()
+    {
+        var provider = new IrqProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, subject) = TestFixtures.Create(kernel, 1316, 1460);
+        var (device, irqCapability, endpoint) = CreateAuthorities(
+            kernel,
+            subject,
+            "device/drain0",
+            "pending",
+            IrqTriggerMode.Edge);
+        var route = kernel.BindPlatformInterrupt(
+            subject,
+            device,
+            irqCapability,
+            endpoint).Value!;
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        provider.CompletionEntered = entered;
+        provider.CompletionRelease = release;
+        var wait = kernel.WaitForKernelEventAsync(subject, endpoint).AsTask();
+
+        Assert.True(provider.Signal("pending"));
+        var poll = Task.Run(() => kernel.PollPlatformInterrupt(subject, route));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+
+            var terminate = kernel.TerminateProcess(subject);
+
+            Assert.False(terminate.IsSuccess);
+            Assert.Equal(KernelError.PlatformBindingDraining, terminate.Error);
+            Assert.Equal(ProcessState.Exiting, process.State);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => wait);
+            var snapshot = kernel.QueryProcessTeardown(subject);
+            Assert.True(snapshot.IsSuccess, snapshot.Message);
+            Assert.Equal(ProcessTeardownPhase.PlatformClosed, snapshot.Value!.Phase);
+            Assert.True(snapshot.Value.PlatformDomainClosed);
+            Assert.False(snapshot.Value.LocalReclaimCompleted);
+            Assert.True(kernel.Processes.Resolve(subject).IsSuccess);
+        }
+        finally
+        {
+            release.Set();
+        }
+
+        var delivery = await poll;
+        Assert.True(delivery.IsSuccess, delivery.Message);
+        Assert.Equal(1, provider.CompleteCalls);
+
+        var observed = kernel.ObserveProcessTeardown(subject);
+        Assert.True(observed.IsSuccess, observed.Message);
+        Assert.True(observed.Value!.LocalReclaimCompleted);
+        Assert.Equal(ProcessState.Exited, process.State);
+        Assert.Equal(KernelError.StaleHandle, kernel.Processes.Resolve(subject).Error);
+    }
+
+    [Fact]
     public void PublicIrqAndKernelEventSurfacesCarryNoProviderOrRawHardwareIdentity()
     {
         var surface = new[]
@@ -382,6 +629,20 @@ public sealed class PlatformIrqBindingTests
             foreach (var term in forbidden)
                 Assert.DoesNotContain(term, signature, StringComparison.OrdinalIgnoreCase);
         }
+
+        var wait = typeof(RuntimeKernel).GetMethod(
+            nameof(RuntimeKernel.WaitForKernelEventAsync),
+            [typeof(ProcessHandle), typeof(KernelEventEndpoint), typeof(CancellationToken)]);
+        Assert.NotNull(wait);
+        Assert.Equal(
+            typeof(ValueTask<KernelResult<KernelEvent>>),
+            wait.ReturnType);
+        Assert.Equal(
+            new[] { typeof(ProcessHandle), typeof(KernelEventEndpoint), typeof(CancellationToken) },
+            wait.GetParameters().Select(static parameter => parameter.ParameterType));
+        var waitSignature = wait.ToString()!;
+        foreach (var term in forbidden)
+            Assert.DoesNotContain(term, waitSignature, StringComparison.OrdinalIgnoreCase);
     }
 
     private static (
@@ -458,6 +719,8 @@ public sealed class PlatformIrqBindingTests
         public bool ReturnWrongSource { get; set; }
         public PlatformAuthorityStatus? IrqRevokeStatus { get; set; }
         public PlatformAuthorityStatus? CompletionStatus { get; set; }
+        public ManualResetEventSlim? CompletionEntered { get; set; }
+        public ManualResetEventSlim? CompletionRelease { get; set; }
         public int BindCalls { get; private set; }
         public int PollCalls { get; private set; }
         public int CompleteCalls { get; private set; }
@@ -573,12 +836,19 @@ public sealed class PlatformIrqBindingTests
             PlatformProviderInterruptDeliverySequence sequence)
         {
             CompleteCalls++;
-            if (CompletionStatus is { } injected)
-                return PlatformAuthorityResult.Fail(injected, "Injected completion fault.");
             if (!_irqs.TryGetValue(binding.BindingId, out var record) || record.Binding != binding)
                 return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Unknown interrupt binding.");
             if (record.Pending.Value == 0 || record.Pending != sequence)
                 return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Stale, "Wrong delivery sequence.");
+            CompletionEntered?.Set();
+            if (CompletionRelease is { } release && !release.Wait(TimeSpan.FromSeconds(10)))
+            {
+                return PlatformAuthorityResult.Fail(
+                    PlatformAuthorityStatus.Faulted,
+                    "Timed out waiting for the test completion gate.");
+            }
+            if (CompletionStatus is { } injected)
+                return PlatformAuthorityResult.Fail(injected, "Injected completion fault.");
             record.Pending = default;
             return PlatformAuthorityResult.Ok();
         }

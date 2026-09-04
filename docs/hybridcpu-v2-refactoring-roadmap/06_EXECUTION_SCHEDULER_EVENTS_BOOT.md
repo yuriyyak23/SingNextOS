@@ -28,9 +28,14 @@ invisible endpoint slot before provider observation and commits one local
 denied, faulted, malformed or stale outcomes publish nothing. The event remains
 a wakeup, not completion authority, CPU-visibility evidence or reclaim proof.
 
-A cancellable asynchronous waiter over the endpoint and AOT/image/ISE
-qualification remain open. External qualification can proceed independently and
-corresponds to `EXT-HCPU-001`.
+The fourth slice adds one exact cancellable asynchronous wait over the same
+endpoint. Commit, caller cancellation, explicit close and process teardown are
+serialized against one waiter; teardown stops new waits before platform drain
+without discarding a staged producer reservation. This is local notification
+consumption, not platform-operation cancellation or HybridCPU event hardware.
+
+AOT/image/ISE qualification remains open. External qualification can proceed
+independently and corresponds to `EXT-HCPU-001`.
 
 ## Goal
 
@@ -239,6 +244,43 @@ The same minimal abstraction remains suitable for later:
 
 High-level source APIs remain `Task`/`ValueTask`, cancellation and typed SIP events. The event primitive is not a POSIX signal subsystem and does not expose hardware opcodes such as WFE/SEV.
 
+## Completed slice D — exact cancellable event wait
+
+The public wait surface adds no new authority or completion token:
+
+```text
+WaitForKernelEventAsync(
+  exact ProcessHandle,
+  exact KernelEventEndpoint,
+  CancellationToken)
+    -> ValueTask<KernelResult<KernelEvent>>
+```
+
+Owner and endpoint generation are validated before waiter registration. Each
+endpoint admits at most one asynchronous waiter, independently of its one event
+mailbox slot, so a producer can stage an event while its consumer is already
+waiting. A previously committed event is consumed immediately and exactly once,
+including when caller cancellation arrives later.
+
+The registry serializes all terminal races under one gate:
+
+- commit first transfers the exact event to the registered waiter; later caller
+  cancellation, endpoint close or process teardown cannot replace that result;
+- caller cancellation first removes only that exact waiter; a later commit is
+  retained as the endpoint's pending event for a subsequent wait or consume;
+- explicit endpoint close first cancels an uncommitted waiter and discards unread
+  notification state, but a staged producer keeps close in `PlatformBindingDraining`;
+- process teardown changes the endpoint from `Active` to `OwnerClosing`, cancels
+  current waiters and rejects new wait, consume and stage admission before any
+  external drain, while already staged work may still commit or roll back;
+- final endpoint reclaim is all-or-none for the process and remains draining
+  while any producer owns a staged publication reservation.
+
+Wait cancellation completes the `ValueTask` as cancelled rather than fabricating
+a successful event. Identity/admission failures remain typed `KernelResult`
+errors. No path converts cancellation into IRQ/DMA completion, visibility,
+grant closure, ownership transfer or permission to reclaim memory.
+
 ## Cancellation
 
 Endpoint cancellation and external-operation cancellation remain separate.
@@ -262,6 +304,13 @@ No neutral HybridCPU DMA cancellation/closure receipt exists today, so this
 slice does not fabricate `CancelDma` success. Completion, required visibility,
 DMA-grant close, mapping/device/domain close and only then local reclaim remain
 mandatory after notification cancellation.
+
+Cancelling only `WaitForKernelEventAsync` is narrower still: it neither closes
+the endpoint nor changes its producer or platform authority. Process teardown
+cancels registered event waiters alongside Track-A response waiters before
+external drain, but retains staged and committed local notification state until
+the final reclaim boundary. An exact event already committed to a waiter remains
+that waiter's result.
 
 ## Boot/AOT/ISE qualification
 
@@ -372,29 +421,54 @@ Until then expose only supported budget/priority semantics.
 - an old endpoint cannot deliver into a recycled process generation, and events
   expose neither provider tokens nor raw hardware/topology identity.
 
+## Completed slice-D tests
+
+- a waiter registered before IRQ or DMA publication receives the exact committed
+  event once, while synchronous consume cannot duplicate that delivery;
+- a provider completion failure rolls back only the staged reservation, publishes
+  nothing and leaves the waiter available for the later successful retry;
+- an event committed before token cancellation remains the waiter result, and an
+  already pending event wins over a pre-cancelled token;
+- caller cancellation first removes only the exact waiter; the endpoint remains
+  reusable and a later IRQ or DMA completion is retained and delivered;
+- one endpoint rejects a second waiter, and explicit endpoint close cancels the
+  uncommitted first waiter;
+- stale endpoint generation, foreign owner, closed endpoint, stale process handle
+  and a recycled `ProcessId` are rejected without replacing a valid waiter;
+- process teardown cancels both Track-A response and event waiters while an
+  intentionally deferred external mapping remains draining and unreclaimed;
+- teardown that has already closed its platform domain still pins process reclaim
+  while a racing IRQ producer owns a staged event, then completes only after the
+  exact publication commits;
+- wait cancellation does not call a DMA provider, close a grant or permit buffer
+  transfer before exact completion and post-completion visibility;
+- a staged DMA completion remains invisible to its waiter and keeps endpoint close
+  draining until the exact provider observation commits;
+- the public wait signature contains only local process/endpoint identity and
+  ordinary .NET cancellation, with no provider or hardware-topology token.
+
 ## Remaining Phase-6 tests
 
 - stale lifecycle completion cannot transition a recycled process;
 - park waits for platform completion when required;
 - cancellation of a platform operation cannot return an owned buffer before Phase 2/4 closure;
-- cancellable asynchronous endpoint waiting composes with process/channel teardown
-  without turning a wait cancellation into platform-operation completion;
 - external toolchain qualification records versioned evidence without changing native API semantics.
 
 ## Next implementation pool and external boundaries
 
-The next pool should add one exact cancellable asynchronous wait over
-`KernelEventEndpoint`, following Track-A waiter teardown rules: endpoint/process
-close cancels only an uncommitted wait, while an already committed event remains
-the source result until consumed or the endpoint itself is explicitly closed.
-Wait cancellation must not become DMA/platform cancellation or ownership-return
-proof. This remains a local runtime contract, not evidence of HybridCPU WFE/SEV,
-timer or executable DMA delivery.
+The next pool should perform a reproducible AOT/image/ISE qualification attempt:
+pin exact SingNextOS and HybridCPU/toolchain revisions, record the invoked build
+and image commands, hash any produced admission/image artifacts, and record ISE
+acceptance or the exact unavailable stage. If the merged external tree still
+lacks the required toolchain/loader path, update `EXT-HCPU-001` with that concrete
+reproduction and keep it honestly `ExternalBlocked`; do not add a local success
+substitute or toolchain-specific public API.
 
 Real timer binding remains `ExternalBlocked` under `EXT-HCPU-002`. Real
 HybridCPU scheduler-policy admission remains `ExternalBlocked` under
-`EXT-HCPU-003`. HybridCPU `master` has no neutral DMA submit/completion/cancel
-surface; the separately pinned visibility head likewise does not provide one.
+`EXT-HCPU-003`. Audited HybridCPU `master` `9e001bf...` includes merged,
+grant-scoped DMA prepare/acquire visibility evidence, but no neutral DMA
+submit/completion/cancel surface.
 Executable DMA therefore remains `ExternalBlocked` under `EXT-HCPU-004`.
 Reproducible AOT/image/ISE qualification remains
 `ExternalBlocked` under `EXT-HCPU-001`. None of those boundaries is replaced

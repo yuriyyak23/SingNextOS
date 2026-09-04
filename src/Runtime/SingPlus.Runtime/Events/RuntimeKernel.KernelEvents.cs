@@ -49,6 +49,34 @@ public sealed partial class RuntimeKernel
         return _kernelEvents.Consume(subject, endpoint);
     }
 
+    /// <summary>
+    /// Waits for one committed event on the exact process-generation-bound endpoint.
+    /// Cancelling the wait affects notification delivery only; it does not cancel or
+    /// complete the platform operation that may eventually produce an event.
+    /// </summary>
+    public ValueTask<KernelResult<KernelEvent>> WaitForKernelEventAsync(
+        ProcessHandle subject,
+        KernelEventEndpoint endpoint,
+        CancellationToken cancellationToken = default)
+    {
+        var resolved = Processes.Resolve(subject);
+        if (!resolved.IsSuccess)
+        {
+            return ValueTask.FromResult(KernelResult<KernelEvent>.Fail(
+                resolved.Error,
+                resolved.Message!));
+        }
+
+        if (resolved.Value!.State == ProcessState.Exiting)
+        {
+            return ValueTask.FromResult(KernelResult<KernelEvent>.Fail(
+                KernelError.InvalidTransition,
+                "An Exiting process cannot register a kernel event waiter."));
+        }
+
+        return _kernelEvents.WaitAsync(subject, endpoint, cancellationToken);
+    }
+
     public KernelResult CloseKernelEventEndpoint(
         ProcessHandle subject,
         KernelEventEndpoint endpoint)

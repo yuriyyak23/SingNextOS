@@ -129,7 +129,7 @@ public sealed partial class RuntimeKernel
 
         return KernelResult.Fail(
             KernelError.PlatformBindingDraining,
-            "Process is exiting while external platform authority is still draining.");
+            "Process teardown is still draining authority or staged publication before local reclaim.");
     }
 
     private KernelResult<ProcessTeardownSnapshot> BeginOrAdvanceProcessTeardownLifecycle(
@@ -180,8 +180,10 @@ public sealed partial class RuntimeKernel
 
         process.SetState(ProcessState.Exiting);
 
-        // Track A ordering guarantee: channel closure happens before platform drain begins.
+        // Track A ordering guarantee: channel and event-wait cancellation happens
+        // before platform drain begins, without closing event/source authority.
         Channels.CloseAllForProcess(handle);
+        _kernelEvents.BeginCloseForProcess(handle);
 
         var mappings = new Dictionary<PlatformRegionMappingId, PlatformRegionMapping>();
         if (_processPlatformMappings.TryGetValue(handle, out var trackedMappings))
@@ -367,6 +369,14 @@ public sealed partial class RuntimeKernel
         var cleanup = FinalizeProcessCleanup(process);
         if (!cleanup.IsSuccess)
         {
+            if (cleanup.Error == KernelError.PlatformBindingDraining)
+            {
+                // External domain authority is already closed. Keep that phase
+                // truthful while a staged local event publication delays reclaim.
+                record.BlockingError = null;
+                return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
+            }
+
             record.Phase = ProcessTeardownPhase.PlatformFaulted;
             record.BlockingError = cleanup.Error;
             return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
@@ -392,7 +402,8 @@ public sealed partial class RuntimeKernel
     {
         var handle = new ProcessHandle(process.ProcessId, process.Generation);
         Channels.CloseAllForProcess(handle);
-        _kernelEvents.CloseAllForProcess(handle);
+        var eventsClosed = _kernelEvents.CloseAllForProcess(handle);
+        if (!eventsClosed.IsSuccess) return eventsClosed;
 
         var domainEnded = Domains.Remove(process);
         if (domainEnded)

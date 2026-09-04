@@ -12,7 +12,13 @@
 > exact local/model DMA-completion notification is committed only after the
 > existing provider completion evidence validates. That event is not completion
 > authority, CPU-visibility evidence or reclaim proof, and HybridCPU exposes no
-> neutral DMA submit/completion/cancel API behind it. These slices prove no
+> neutral DMA submit/completion/cancel API behind it; merged HybridCPU
+> `9e001bf...` adds only exact grant-scoped prepare/acquire visibility. Exact
+> cancellable endpoint waiting now removes only the local waiter;
+> endpoint/process teardown cancels
+> uncommitted waits before external drain while staged source publication still
+> blocks final reclaim. Wait cancellation is not source/platform cancellation,
+> completion, ownership return or a WFE/SEV ABI. These slices prove no
 > HybridCPU placement, budget enforcement, executable DMA, scheduler quality,
 > hard real-time, boot or security property beyond their tested evidence.
 

@@ -33,12 +33,32 @@ internal sealed class KernelEventRegistry
 {
     private const int MaximumSourceResourceIdLength = 128;
 
+    private enum EndpointState
+    {
+        Active = 0,
+        OwnerClosing,
+        Closed,
+    }
+
+    private sealed class WaiterRecord
+    {
+        public TaskCompletionSource<KernelResult<KernelEvent>> Source { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    private sealed record WaiterCancellation(
+        KernelEventRegistry Registry,
+        KernelEventEndpoint Endpoint,
+        WaiterRecord Waiter,
+        CancellationToken CancellationToken);
+
     private sealed class EndpointRecord(KernelEventEndpoint endpoint)
     {
         public KernelEventEndpoint Endpoint { get; } = endpoint;
         public KernelEvent? Staged { get; set; }
         public KernelEvent? Pending { get; set; }
-        public bool Closed { get; set; }
+        public WaiterRecord? Waiter { get; set; }
+        public EndpointState State { get; set; }
     }
 
     private readonly object _gate = new();
@@ -112,6 +132,13 @@ internal sealed class KernelEventRegistry
             }
 
             var record = _endpoints[endpoint.EndpointId];
+            if (record.State != EndpointState.Active)
+            {
+                return KernelResult<KernelEvent>.Fail(
+                    KernelError.InvalidTransition,
+                    "A process that is closing cannot admit a new kernel event publication.");
+            }
+
             if (record.Staged is not null || record.Pending is not null)
             {
                 return KernelResult<KernelEvent>.Fail(
@@ -142,6 +169,8 @@ internal sealed class KernelEventRegistry
         ProcessHandle owner,
         KernelEvent staged)
     {
+        WaiterRecord? waiter;
+        KernelResult<KernelEvent> result;
         lock (_gate)
         {
             var validation = ValidateLocked(owner, staged.Endpoint);
@@ -161,9 +190,23 @@ internal sealed class KernelEventRegistry
             }
 
             record.Staged = null;
-            record.Pending = staged;
-            return KernelResult<KernelEvent>.Ok(staged);
+            waiter = record.Waiter;
+            if (waiter is null)
+            {
+                record.Pending = staged;
+            }
+            else
+            {
+                // The exact waiter owns this committed event at the commit
+                // linearization point. A later cancellation or close cannot steal it.
+                record.Waiter = null;
+            }
+
+            result = KernelResult<KernelEvent>.Ok(staged);
         }
+
+        _ = waiter?.Source.TrySetResult(result);
+        return result;
     }
 
     public KernelResult RollbackExact(
@@ -218,7 +261,7 @@ internal sealed class KernelEventRegistry
                 "The kernel event endpoint belongs to a different process generation.");
         }
 
-        if (record.Closed)
+        if (record.State == EndpointState.Closed)
         {
             return KernelResult.Fail(
                 KernelError.EndpointNotFound,
@@ -243,6 +286,13 @@ internal sealed class KernelEventRegistry
             }
 
             var record = _endpoints[endpoint.EndpointId];
+            if (record.State != EndpointState.Active)
+            {
+                return KernelResult<KernelEvent>.Fail(
+                    KernelError.InvalidTransition,
+                    "A process that is closing cannot consume kernel event delivery.");
+            }
+
             if (record.Pending is not { } pending)
             {
                 return KernelResult<KernelEvent>.Fail(
@@ -255,10 +305,100 @@ internal sealed class KernelEventRegistry
         }
     }
 
+    public ValueTask<KernelResult<KernelEvent>> WaitAsync(
+        ProcessHandle owner,
+        KernelEventEndpoint endpoint,
+        CancellationToken cancellationToken)
+    {
+        WaiterRecord waiter;
+        lock (_gate)
+        {
+            var validation = ValidateLocked(owner, endpoint);
+            if (!validation.IsSuccess)
+            {
+                return ValueTask.FromResult(KernelResult<KernelEvent>.Fail(
+                    validation.Error,
+                    validation.Message!));
+            }
+
+            var record = _endpoints[endpoint.EndpointId];
+            if (record.State != EndpointState.Active)
+            {
+                return ValueTask.FromResult(KernelResult<KernelEvent>.Fail(
+                    KernelError.InvalidTransition,
+                    "A process that is closing cannot register a kernel event waiter."));
+            }
+
+            if (record.Pending is { } pending)
+            {
+                // A commit that already won is observable even when the caller's
+                // token is concurrently cancelled.
+                record.Pending = null;
+                return ValueTask.FromResult(KernelResult<KernelEvent>.Ok(pending));
+            }
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return ValueTask.FromCanceled<KernelResult<KernelEvent>>(cancellationToken);
+            }
+
+            if (record.Waiter is not null)
+            {
+                return ValueTask.FromResult(KernelResult<KernelEvent>.Fail(
+                    KernelError.CapacityExhausted,
+                    "The kernel event endpoint already has an asynchronous waiter."));
+            }
+
+            waiter = new WaiterRecord();
+            record.Waiter = waiter;
+        }
+
+        return AwaitWaiterAsync(endpoint, waiter, cancellationToken);
+    }
+
+    private async ValueTask<KernelResult<KernelEvent>> AwaitWaiterAsync(
+        KernelEventEndpoint endpoint,
+        WaiterRecord waiter,
+        CancellationToken cancellationToken)
+    {
+        var state = new WaiterCancellation(
+            this,
+            endpoint,
+            waiter,
+            cancellationToken);
+        using var registration = cancellationToken.Register(
+            static value =>
+            {
+                var cancellation = (WaiterCancellation)value!;
+                cancellation.Registry.CancelExactWaiter(cancellation);
+            },
+            state);
+        return await waiter.Source.Task.ConfigureAwait(false);
+    }
+
+    private void CancelExactWaiter(WaiterCancellation cancellation)
+    {
+        var removed = false;
+        lock (_gate)
+        {
+            if (_endpoints.TryGetValue(cancellation.Endpoint.EndpointId, out var record) &&
+                record.Endpoint == cancellation.Endpoint &&
+                ReferenceEquals(record.Waiter, cancellation.Waiter))
+            {
+                record.Waiter = null;
+                removed = true;
+            }
+        }
+
+        if (removed)
+            _ = cancellation.Waiter.Source.TrySetCanceled(cancellation.CancellationToken);
+    }
+
     public KernelResult Close(
         ProcessHandle owner,
         KernelEventEndpoint endpoint)
     {
+        WaiterRecord? waiter;
         lock (_gate)
         {
             var validation = ValidateLocked(owner, endpoint);
@@ -273,25 +413,76 @@ internal sealed class KernelEventRegistry
             }
 
             record.Pending = null;
-            record.Closed = true;
-            return KernelResult.Ok();
+            waiter = record.Waiter;
+            record.Waiter = null;
+            record.State = EndpointState.Closed;
         }
+
+        _ = waiter?.Source.TrySetCanceled();
+        return KernelResult.Ok();
     }
 
-    public void CloseAllForProcess(ProcessHandle owner)
+    /// <summary>
+    /// Stops new waiter/publication admission and cancels only current waits.
+    /// Staged and committed events remain intact until final process reclaim.
+    /// </summary>
+    public void BeginCloseForProcess(ProcessHandle owner)
     {
+        List<WaiterRecord> waiters = [];
         lock (_gate)
         {
             foreach (var record in _endpoints.Values)
             {
-                if (!record.Closed && record.Endpoint.Owner == owner)
+                if (record.State != EndpointState.Closed && record.Endpoint.Owner == owner)
                 {
-                    record.Staged = null;
-                    record.Pending = null;
-                    record.Closed = true;
+                    record.State = EndpointState.OwnerClosing;
+                    if (record.Waiter is { } waiter)
+                    {
+                        record.Waiter = null;
+                        waiters.Add(waiter);
+                    }
                 }
             }
         }
+
+        foreach (var waiter in waiters)
+            _ = waiter.Source.TrySetCanceled();
+    }
+
+    /// <summary>
+    /// Reclaims all local event state only after no source still owns a staged
+    /// publication. The precheck makes the close all-or-none for one owner.
+    /// </summary>
+    public KernelResult CloseAllForProcess(ProcessHandle owner)
+    {
+        List<WaiterRecord> waiters = [];
+        lock (_gate)
+        {
+            var records = _endpoints.Values
+                .Where(record => record.State != EndpointState.Closed && record.Endpoint.Owner == owner)
+                .ToArray();
+            if (records.Any(static record => record.Staged is not null))
+            {
+                return KernelResult.Fail(
+                    KernelError.PlatformBindingDraining,
+                    "A kernel event source still owns a staged publication during process teardown.");
+            }
+
+            foreach (var record in records)
+            {
+                record.Pending = null;
+                if (record.Waiter is { } waiter)
+                {
+                    record.Waiter = null;
+                    waiters.Add(waiter);
+                }
+                record.State = EndpointState.Closed;
+            }
+        }
+
+        foreach (var waiter in waiters)
+            _ = waiter.Source.TrySetCanceled();
+        return KernelResult.Ok();
     }
 
     private static ulong NextNonZero(ref ulong next)

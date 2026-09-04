@@ -29,6 +29,8 @@ public sealed class ProcessTeardownLifecycleTests
             capability,
             region.Handle,
             PlatformMemoryAccess.Read).Value!;
+        var eventEndpoint = kernel.CreateKernelEventEndpoint(responder).Value!;
+        var eventWait = kernel.WaitForKernelEventAsync(responder, eventEndpoint).AsTask();
         var endpoints = CreateResponseChannel(kernel, requester, responder);
         var transport = new RuntimeSipClientTransport(kernel, requester, responder, endpoints.Left);
         var pending = transport.InvokeAsync(1).AsTask();
@@ -44,6 +46,9 @@ public sealed class ProcessTeardownLifecycleTests
         // proving channel/waiter cancellation precedes external closure.
         var cancelled = await pending;
         Assert.Equal(ResponsePublicationStatus.Cancelled, cancelled.Status);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => eventWait);
+        var lateEventWait = await kernel.WaitForKernelEventAsync(responder, eventEndpoint);
+        Assert.Equal(KernelError.InvalidTransition, lateEventWait.Error);
 
         var lifecycle = kernel.QueryProcessTeardown(responder);
         Assert.True(lifecycle.IsSuccess, lifecycle.Message);
