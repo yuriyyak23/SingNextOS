@@ -191,6 +191,13 @@ public sealed partial class PlatformAuthorityBridge
         var validation = ValidateDomainIdentity(binding, expectedSubject);
         if (!validation.IsSuccess) return validation;
 
+        if (HasActiveDsc1Operations(binding))
+        {
+            return KernelResult.Fail(
+                KernelError.PlatformBindingActive,
+                "DSC1 operations must close and release local reservations before the platform domain binding.");
+        }
+
         if (_mappings.Values.Any(m =>
                 !m.LocalReservationReleased &&
                 m.Mapping.DomainBinding.BindingId == binding.BindingId))
@@ -394,6 +401,13 @@ public sealed partial class PlatformAuthorityBridge
             return KernelResult<PlatformRegionMappingLifecycle>.Fail(
                 validation.Error,
                 validation.Message!);
+
+        if (Dsc1OperationsForMapping(mapping).Length != 0)
+        {
+            return KernelResult<PlatformRegionMappingLifecycle>.Fail(
+                KernelError.PlatformBindingActive,
+                "DSC1 operations must close and release local reservations before their owned-region mapping.");
+        }
 
         var record = _mappings[mapping.MappingId];
         if (record.LocalReservationReleased ||

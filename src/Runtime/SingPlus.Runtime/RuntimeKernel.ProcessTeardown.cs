@@ -64,6 +64,13 @@ public sealed partial class RuntimeKernel
 
     public KernelResult<ProcessTeardownSnapshot> ObserveProcessTeardown(ProcessHandle handle)
     {
+        lock (_dsc1PayloadGate)
+            return ObserveProcessTeardownLocked(handle);
+    }
+
+    private KernelResult<ProcessTeardownSnapshot> ObserveProcessTeardownLocked(
+        ProcessHandle handle)
+    {
         if (!_processTeardowns.TryGetValue(handle, out var record))
         {
             var resolved = Processes.Resolve(handle);
@@ -109,6 +116,14 @@ public sealed partial class RuntimeKernel
     }
 
     private KernelResult BeginOrAdvanceProcessTeardown(
+        ProcessHandle handle,
+        ProcessState targetTerminalState)
+    {
+        lock (_dsc1PayloadGate)
+            return BeginOrAdvanceProcessTeardownLocked(handle, targetTerminalState);
+    }
+
+    private KernelResult BeginOrAdvanceProcessTeardownLocked(
         ProcessHandle handle,
         ProcessState targetTerminalState)
     {
@@ -231,6 +246,21 @@ public sealed partial class RuntimeKernel
         var identity = PlatformIdentity(process);
         KernelError? firstBlockingError = null;
         var pendingMappings = 0;
+
+        var computeProgress = AdvancePlatformDsc1ForProcess(record.Handle);
+        if (!computeProgress.IsSuccess)
+        {
+            if (computeProgress.Error == KernelError.PlatformBindingDraining)
+            {
+                record.Phase = ProcessTeardownPhase.PlatformDraining;
+                record.BlockingError = null;
+                return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
+            }
+
+            record.Phase = ProcessTeardownPhase.PlatformFaulted;
+            record.BlockingError = computeProgress.Error;
+            return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
+        }
 
         var deviceProgress = AdvancePlatformDeviceLeasesForProcess(process, record.Handle);
         if (!deviceProgress.IsSuccess)

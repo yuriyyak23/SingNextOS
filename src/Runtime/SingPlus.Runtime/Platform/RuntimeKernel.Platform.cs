@@ -40,6 +40,14 @@ public sealed partial class RuntimeKernel
         ProcessHandle subject,
         PlatformDomainBinding binding)
     {
+        lock (_dsc1PayloadGate)
+            return RevokePlatformDomainLocked(subject, binding);
+    }
+
+    private KernelResult RevokePlatformDomainLocked(
+        ProcessHandle subject,
+        PlatformDomainBinding binding)
+    {
         var resolved = Processes.Resolve(subject);
         if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
 
@@ -56,6 +64,13 @@ public sealed partial class RuntimeKernel
             return KernelResult.Fail(
                 KernelError.PlatformBindingActive,
                 "Platform device leases must close before the platform domain binding.");
+        }
+
+        if (PlatformAuthority.HasActiveDsc1Operations(binding))
+        {
+            return KernelResult.Fail(
+                KernelError.PlatformBindingActive,
+                "DSC1 operations must reach provider closure and release their local buffer reservations before the platform domain binding.");
         }
 
         var identity = PlatformIdentity(process);
@@ -316,8 +331,19 @@ public sealed partial class RuntimeKernel
         ProcessHandle owner,
         PlatformRegionMapping mapping)
     {
+        lock (_dsc1PayloadGate)
+            return RevokePlatformRegionMappingLocked(owner, mapping);
+    }
+
+    private KernelResult RevokePlatformRegionMappingLocked(
+        ProcessHandle owner,
+        PlatformRegionMapping mapping)
+    {
         var resolved = Processes.Resolve(owner);
         if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+
+        var compute = AdvancePlatformDsc1ForMapping(mapping);
+        if (!compute.IsSuccess) return compute;
 
         var dma = AdvancePlatformDmaGrantsForMapping(mapping);
         if (!dma.IsSuccess) return dma;

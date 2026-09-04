@@ -21,27 +21,98 @@ internal sealed class BorrowLeaseLifetime
     internal void InvalidateForRuntime() => Interlocked.Exchange(ref _active, 0);
 }
 
+[Flags]
+internal enum RuntimeBufferAccess
+{
+    Read = 1 << 0,
+    Write = 1 << 1,
+}
+
+internal sealed class RuntimeBufferReservationLifetime
+{
+    private int _active = 1;
+
+    internal bool IsActive => Volatile.Read(ref _active) != 0;
+
+    internal void Invalidate() => Interlocked.Exchange(ref _active, 0);
+}
+
 public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanaged
 {
     internal sealed class Storage(T[] data)
     {
+        private readonly object _stateGate = new();
         private BorrowLeaseLifetime? _borrowLifetime;
+        private RuntimeBufferReservationLifetime? _runtimeReservation;
+        private bool _isAlive = true;
 
         public T[] Data { get; } = data;
-        public bool IsAlive { get; private set; } = true;
-        public bool IsBorrowed => _borrowLifetime?.IsActive == true;
+        public bool IsAlive
+        {
+            get
+            {
+                lock (_stateGate) return _isAlive;
+            }
+        }
+
+        public bool IsBorrowed
+        {
+            get
+            {
+                lock (_stateGate) return _borrowLifetime?.IsActive == true;
+            }
+        }
+
+        public bool IsRuntimeReserved
+        {
+            get
+            {
+                lock (_stateGate) return _runtimeReservation?.IsActive == true;
+            }
+        }
 
         internal void BeginBorrow(BorrowLeaseLifetime lifetime)
         {
-            if (!IsAlive) throw new InvalidOperationException("OwnedBuffer backing storage has been reclaimed.");
-            if (IsBorrowed) throw new InvalidOperationException("OwnedBuffer already has an active runtime borrow lease.");
-            _borrowLifetime = lifetime;
+            lock (_stateGate)
+            {
+                if (!_isAlive) throw new InvalidOperationException("OwnedBuffer backing storage has been reclaimed.");
+                if (_borrowLifetime?.IsActive == true) throw new InvalidOperationException("OwnedBuffer already has an active runtime borrow lease.");
+                if (_runtimeReservation?.IsActive == true) throw new InvalidOperationException("OwnedBuffer is reserved by an active runtime operation.");
+                _borrowLifetime = lifetime;
+            }
+        }
+
+        internal void BeginRuntimeReservation(RuntimeBufferReservationLifetime lifetime)
+        {
+            lock (_stateGate)
+            {
+                if (!_isAlive) throw new InvalidOperationException("OwnedBuffer backing storage has been reclaimed.");
+                if (_borrowLifetime?.IsActive == true) throw new InvalidOperationException("OwnedBuffer has an active runtime borrow lease.");
+                if (_runtimeReservation?.IsActive == true) throw new InvalidOperationException("OwnedBuffer is already reserved by a runtime operation.");
+                _runtimeReservation = lifetime;
+            }
+        }
+
+        internal void EndRuntimeReservation(RuntimeBufferReservationLifetime lifetime)
+        {
+            lock (_stateGate)
+            {
+                if (!ReferenceEquals(_runtimeReservation, lifetime) || !lifetime.IsActive)
+                    throw new InvalidOperationException("OwnedBuffer runtime reservation is stale or already released.");
+
+                lifetime.Invalidate();
+                _runtimeReservation = null;
+            }
         }
 
         internal void Invalidate()
         {
-            IsAlive = false;
-            _borrowLifetime?.InvalidateForRuntime();
+            lock (_stateGate)
+            {
+                _isAlive = false;
+                _borrowLifetime?.InvalidateForRuntime();
+                _runtimeReservation?.Invalidate();
+            }
         }
     }
 
@@ -99,6 +170,17 @@ public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanag
         return _storage.Data.AsSpan();
     }
 
+    internal RuntimeBufferLease<T> ReserveForRuntime(RuntimeBufferAccess access)
+    {
+        if (access is not RuntimeBufferAccess.Read and not RuntimeBufferAccess.Write)
+            throw new ArgumentOutOfRangeException(nameof(access));
+
+        EnsureOwnerAccess();
+        var lifetime = new RuntimeBufferReservationLifetime();
+        _storage.BeginRuntimeReservation(lifetime);
+        return new RuntimeBufferLease<T>(_storage, lifetime, access);
+    }
+
     OwnershipPayloadKind ITransferableOwnedPayload.PayloadKind => OwnershipPayloadKind.OwnedBuffer;
     bool ITransferableOwnedPayload.IsValidForRuntime => IsValid;
 
@@ -132,6 +214,60 @@ public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanag
     {
         EnsureValid();
         if (_storage.IsBorrowed) throw new InvalidOperationException("OwnedBuffer is temporarily inaccessible while a runtime borrow lease is active.");
+        if (_storage.IsRuntimeReserved) throw new InvalidOperationException("OwnedBuffer is temporarily inaccessible while a runtime operation owns its CPU-access reservation.");
+    }
+}
+
+internal sealed class RuntimeBufferLease<T> : IDisposable where T : unmanaged
+{
+    private readonly OwnedBuffer<T>.Storage _storage;
+    private readonly RuntimeBufferReservationLifetime _lifetime;
+    private readonly RuntimeBufferAccess _access;
+    private int _disposed;
+
+    internal RuntimeBufferLease(
+        OwnedBuffer<T>.Storage storage,
+        RuntimeBufferReservationLifetime lifetime,
+        RuntimeBufferAccess access)
+    {
+        _storage = storage;
+        _lifetime = lifetime;
+        _access = access;
+    }
+
+    internal bool IsActive => _lifetime.IsActive && _storage.IsAlive;
+
+    internal ReadOnlySpan<T> ReadOnlySpan
+    {
+        get
+        {
+            EnsureAccess(RuntimeBufferAccess.Read);
+            return _storage.Data.AsSpan();
+        }
+    }
+
+    internal Span<T> WritableSpan
+    {
+        get
+        {
+            EnsureAccess(RuntimeBufferAccess.Write);
+            return _storage.Data.AsSpan();
+        }
+    }
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        if (!IsActive) return;
+        _storage.EndRuntimeReservation(_lifetime);
+    }
+
+    private void EnsureAccess(RuntimeBufferAccess required)
+    {
+        if (!IsActive)
+            throw new InvalidOperationException("The runtime buffer reservation is no longer active.");
+        if ((_access & required) != required)
+            throw new InvalidOperationException("The runtime buffer reservation does not grant the requested access.");
     }
 }
 

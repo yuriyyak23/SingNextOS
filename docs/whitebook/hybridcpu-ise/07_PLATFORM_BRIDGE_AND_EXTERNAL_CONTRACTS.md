@@ -28,6 +28,13 @@
 > misreported as managed AOT or SingNextOS boot evidence. The report's
 > `ReproductionCommands` are a deterministic recipe; the workflow log is the
 > execution receipt, and neither JSON nor digest becomes platform authority.
+> Phase-7 Slice 1 now adds a separate `Dsc1ComputeCapability`, bounded
+> `UInt8/AllOrNone` Copy, local/provider operation-identity separation and exact
+> completion/cancellation closure. `RuntimeKernel` executes only a private-
+> staging CPU reference copy while the Host provider models lifecycle and
+> advertises `ModelOnly`; the HybridCPU provider reports
+> DSC1 unavailable because no neutral semantic executable facade exists. This
+> adds no ISE/compiler dependency or hardware/coherence claim.
 
 ## Current status at SingNextOS `af791aba...`
 
@@ -219,7 +226,19 @@ Device/Dma capability
 
 ### Compute
 
-MatrixTile, DSC1 and L7-SDC are integration candidates described in chapters 04–05 and `EXT-HCPU-005`. No current `IPlatformAuthorityProvider` method exposes them.
+`IPlatformDsc1ComputeProvider` now exposes only bounded, disjoint
+`UInt8/AllOrNone` Copy submission, exact typed completion observation and
+cancellation. Local compute authority, owned-region mapping authority, local
+submission identity and provider operation identity stay separate. The Host
+provider only models lifecycle; `RuntimeKernel` uses private staging for the
+local CPU reference copy and publishes output only after verified provider
+closure. Its feature class is strictly `ModelOnly`, and a pre-acquired managed
+`Span<T>` remains outside the revocable-reservation guarantee.
+
+The HybridCPU provider intentionally does not implement this interface and
+reports `Dsc1BulkCompute` unavailable. MatrixTile, arithmetic/reduction DSC1,
+DSC2 and L7-SDC remain future candidates described in chapters 04–05 and
+`EXT-HCPU-005`. Internal ISE types are not platform contracts.
 
 ### Virtualization, evidence and SecureCompute
 
@@ -331,12 +350,13 @@ This is **target semantics**, not current implementation. Until an external prov
 
 ## Feature discovery
 
-Current feature bits are intentionally small. Future discovery may add semantic features such as:
+Feature discovery remains semantic and phase-scoped. Current delivery now
+includes `Dsc1BulkCompute v1 / ModelOnly` only for the Host reference provider;
+future discovery may add other families such as:
 
 ```text
 IoDomainBinding
 DmaMapping
-BulkComputeDsc1
 MatrixTileV1
 AcceleratorCommandsV1
 VirtualizationDomains

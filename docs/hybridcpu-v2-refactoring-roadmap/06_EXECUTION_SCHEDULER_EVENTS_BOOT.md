@@ -541,11 +541,11 @@ external boot path has a reproducible, explicitly `ExternalBlocked`
 qualification record without a fabricated success substitute or a
 toolchain-specific public API.
 
-The next implementation pool starts Phase 7 with one narrow semantic DSC1 bulk
-compute feature/profile contract over existing owned-region and completion
-boundaries. Begin with a bounded operation rather than a universal accelerator
-API; keep the host path `ModelOnly` and the HybridCPU provider unavailable unless
-a stable neutral executable facade is actually present.
+The recommended next pool has now been delivered as Phase-7 Slice 1: bounded
+DSC1 `UInt8` Copy over owned-region and completion boundaries, with a Host
+`ModelOnly` reference path and a fail-closed unavailable HybridCPU feature.
+See `07_COMPUTE_ACCELERATORS.md` and `EXT-HCPU-005`; this historical Phase-6
+disposition does not claim the still-missing executable HybridCPU contour.
 
 Real timer binding remains `ExternalBlocked` under `EXT-HCPU-002`. Real
 HybridCPU scheduler-policy admission remains `ExternalBlocked` under

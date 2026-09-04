@@ -16,8 +16,11 @@ boundaries.
 > complete. This qualification changeset reproducibly digest-binds the managed
 > kernel build and admission artifacts, but the external path stops at
 > `ManagedAssemblyToHybridCpuAot`. `EXT-HCPU-001` remains `ExternalBlocked`; the
-> image stage is `NotProduced` and ISE execution is `NotAttempted`. Phase 7 is
-> next.
+> image stage is `NotProduced` and ISE execution is `NotAttempted`. Phase-7
+> Slice 1 now provides bounded DSC1 `UInt8` Copy as a Host `ModelOnly`
+> reference lifecycle over separate compute capability, owned regions and
+> exact completion/cancellation closure. HybridCPU executable compute remains
+> unavailable under `EXT-HCPU-005`; no ISE/compiler code is consumed or changed.
 
 ## Historical baseline delta
 
@@ -167,7 +170,11 @@ Tracked by `EXT-HCPU-004`.
 
 ## Track E — first narrow ISE compute provider
 
-**BridgeRequired after Phases 1–5.** Choose one provider based on an actual stable external interface, not breadth.
+**In progress locally; ExternalBlocked for ISE execution.** Phase-7 Slice 1
+implements the bounded DSC1 Copy contract, a `RuntimeKernel` CPU-staged
+reference copy admitted by a Host `ModelOnly` lifecycle provider, and
+fail-closed feature selection. A real provider still depends on an actual
+stable neutral external interface, not internal ISE breadth.
 
 Candidates remain:
 
@@ -180,6 +187,11 @@ Copy / Add / Mul / Fma / Reduce
 ```
 
 Do not claim DSC2 queues or coherent async overlap.
+
+Current local v1 supports only `UInt8/AllOrNone Copy`, disjoint owned regions
+and at most 1 MiB. It does not yet expose Add/Mul/Fma/Reduce. Provider denial,
+stale/forged identity, malformed completion and cancellation cannot publish
+output; operation closure precedes mapping/domain/local reclaim.
 
 ### MatrixTile v1
 
