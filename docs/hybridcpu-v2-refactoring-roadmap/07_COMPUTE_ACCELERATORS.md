@@ -2,7 +2,7 @@
 
 ## Status
 
-**In progress — local Slices 1–2 complete; HybridCPU executable path remains
+**In progress — local Slices 1–3 complete; HybridCPU executable path remains
 `ExternalBlocked`.** Depends on Phases 1–6 and corresponds to `EXT-HCPU-005`.
 
 ## Delivered Slice 1 — bounded DSC1 Copy host model
@@ -141,6 +141,95 @@ provider denial and malformed completion, waiter cancellation, endpoint-close
 races, process-exit drain, recycled process generations and absence of early
 reclaim.
 
+## Delivered Slice 3 — conservative DMA↔DSC1 mapping-use interlock
+
+`RuntimeKernel` now serializes local DMA/DSC1 admission and release through its
+private platform-memory-use gate. The bridge independently derives conflict
+state from the existing DMA and DSC1 lifecycle ledgers under their private
+gates; it creates no parallel authority or reservation registry. This two-layer
+interlock introduces no public contract, provider method, capability, platform
+grant or event type. A use is keyed by the complete local
+`PlatformRegionMapping` identity, including its generation. Normal accepted DMA
+uses are owned by an exact local operation record; ambiguous or invariant-fault
+submit paths retain a grant-scoped fault pin that resolves the same exact
+mapping. DSC1 uses are owned by the exact local submission record.
+
+The first rule is deliberately conservative:
+
+```text
+active or fail-closed DMA submit-path use of mapping M
+  conflicts with
+active or fail-closed DSC1 source or destination use of mapping M
+```
+
+This is whole-mapping exclusivity across the two mechanisms. It applies even
+when both sides would read, and even when their requested byte subranges do not
+overlap. The local bridge does not claim cache-line conflict analysis,
+range-granular engine compatibility or cross-engine coherence. Independently
+authorized distinct mappings may have overlapping accepted lifetimes in the
+same platform domain binding. Their submission admission still passes through
+the coarse local gate. Because current `RegionAuthority` permits only one live
+platform mapping per owned region, that disjoint case also denotes distinct
+owned regions rather than two aliases of one region.
+
+Admission validates the complete local authority first. The coarse admission
+gate and bridge ledger locks remain held across the provider submit and exact
+local record publication, so the other mechanism cannot enter that mapping in
+the provisional window. An ordinary provider denial returns without publishing
+an active lifecycle record. A successful acceptance retains the use through
+that record. If malformed success, provider fault or a throw leaves acceptance
+ambiguous, the exact use remains pinned through a trustworthy operation record
+or exact grant-scoped fault pin, or the containing platform domain is
+quarantined when exact operation identity cannot be retained. Forged/stale
+mapping, grant, submission or process identities cannot release another
+operation's use.
+
+DMA grant creation and visibility preparation alone are not active mapping
+uses. A DMA use starts when submission is accepted; ambiguous provider
+acceptance or a fail-closed submit-path invariant fault instead creates the
+exact grant-scoped fault pin. Exact completion proof alone does not release an
+accepted use: `DeviceReadsMemory` must traverse the exact post-completion
+no-acquire finalization, while write-capable directions must also finish the
+required direction-aware CPU acquire. Only the successful post-completion
+visibility transition releases the exact DMA use. Pending, malformed or faulted
+completion/visibility state retains it.
+
+DSC1 holds both source and destination uses until exact `Completed` or
+`Cancelled` provider closure is validated, completed output is published or
+teardown output is discarded, both local buffer leases are released, and the
+bridge commits the exact local-reservation release. Pending observation,
+ordinary observation/cancellation denial, malformed terminal state, provider
+fault or throw retains both mapping uses and therefore blocks conflicting DMA
+and unsafe mapping/domain reclaim.
+
+This interlock proves only local cross-mechanism admission and exact pin
+lifetime. A prepared-but-unsubmitted DMA cycle is intentionally not a mapping
+use, and current `OwnedBuffer`/pre-acquired managed aliases carry no mutation
+epoch that invalidates old prepare evidence after an intervening CPU or DSC1
+write. Executable reuse therefore still needs an external visibility/custody
+contract that binds preparation to the current mutation epoch or requires a
+fresh prepare. Slice 3 is not that contract and makes no hardware-DMA,
+accelerator, IOMMU or coherence claim.
+
+The current local model/test contour assumes provider calls made inside these
+coarse private gates are bounded and do not wait on a cross-thread callback
+that re-enters the same authority path. DSC1 lifecycle is exercised by the Host
+`ModelOnly` provider; the combined DMA↔DSC1 cases use a faithful test provider,
+not a Host executable-DMA path. A stalled or re-entrant provider can delay even
+disjoint admission. Before any executable provider is classified as supported,
+it needs a bounded provisional per-operation reservation and reconciliation
+protocol that does not depend on holding this coarse gate across an unbounded
+external call.
+
+Tests cover DMA-first and DSC1-first conflicts before the second provider call,
+read/read and non-overlapping-subrange rejection on the same mapping, permitted
+overlap of accepted uses on distinct mappings, rollback after ordinary submit
+denial,
+retention through pending and completion-before-visibility, exact release after
+DMA post-completion visibility and DSC1 completed/cancelled settlement, exact
+fault pinning or containing-domain quarantine, stale/forged identity rejection
+and mapping-close/ownership-transfer rejection while authority remains pinned.
+
 ## Goal
 
 Expose one **narrow, code-confirmed HybridCPU compute contour** through semantic Sing capabilities, owned regions and completion without leaking lanes/opcodes/runtime internals.
@@ -251,17 +340,22 @@ Do **not** add new opcodes, DSC2, universal accelerator protocol, global coheren
 
 Phase 7 is complete when one real HybridCPU compute operation can consume/produce Sing-owned regions with explicit memory visibility and trustworthy completion while keeping the source API semantic and platform-neutral.
 
-Slices 1–2 do not satisfy that full-phase criterion. The missing stable neutral
+Slices 1–3 do not satisfy that full-phase criterion. The missing stable neutral
 HybridCPU submission/completion/cancel facade and executable output-visibility/
 custody proof remain isolated in `EXT-HCPU-005`.
 
-Before any provider can expose executable DMA and DSC1 over the same mapping,
-the next local authority-composition pool should define their cross-mechanism
-mapping-use conflict/interlock rules. It must reject conflicting active use,
-permit independently authorized disjoint mappings, and release or retain each
-pin only after exact completion/cancel/fault disposition. The current Host
-provider has no executable DMA and the current HybridCPU provider has no DSC1
-surface, so Slices 1–2 neither implement nor claim a combined hardware path.
+Before any provider can expose executable DMA and DSC1, it must independently
+enforce or compose equivalent mapping-use, visibility and drain rules. The
+current Host provider has no executable DMA and the current HybridCPU provider
+has no DSC1 surface, so Slices 1–3 neither implement nor claim a combined
+hardware path.
+
+The next local Phase-7 pool should carry the same bounded Copy authority through
+a generated typed `ComputeService` SIP ingress. It should support exactly the
+source-read and destination-exclusive authorities needed by this contour, with
+atomic validation/rollback and ownership return, rather than widening the
+operation set or adding a generic accelerator protocol. This is a SingNextOS
+contract task and does not remove the executable external blocker.
 
 ## Do not do
 

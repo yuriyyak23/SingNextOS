@@ -1,7 +1,7 @@
 # EXT-HCPU-005
 
-**Status:** Local DSC1 v1 / Host `ModelOnly`; HybridCPU executable binding
-`ExternalBlocked`
+**Status:** Local DSC1 v1 + DMA mapping-use interlock / Host `ModelOnly`;
+HybridCPU executable binding `ExternalBlocked`
 
 ## Local boundary now implemented
 
@@ -21,6 +21,10 @@ SingNextOS now has a narrow DSC1 Copy v1 authority/lifecycle contract:
   `Closed + Completed`;
 - cancellation/capability revoke/process teardown closes the operation before
   mapping/domain/local reclaim;
+- private RuntimeKernel admission serialization plus bridge lifecycle-ledger
+  checks prevent accepted or ambiguously accepted DSC1 work from sharing either
+  exact mapping with active DMA, and prevent accepted/ambiguous DMA from
+  entering a mapping held by DSC1;
 - Host advertises `Dsc1BulkCompute` v1 only as `ModelOnly`;
 - the HybridCPU provider reports v0/`Unavailable` and performs no implicit Host
   fallback.
@@ -40,18 +44,38 @@ provider receipt, compute authority, output-visibility proof or hardware event.
 It does not encode `Completed` versus `Cancelled`; the observer must propagate
 the returned typed receipt wherever that authoritative outcome is required.
 
-The Host `ModelOnly` path also keeps provider observation under the existing
-coarse DSC1 payload lock. A stalled model provider can delay the start of local
-teardown, although no output, event or region reclaim can cross that blocked
-observation. This is not a prompt-revocation guarantee. A future executable
-binding must supply a bounded per-operation in-flight/drain protocol rather
-than depend on this Host serialization.
+The Host `ModelOnly` DSC1 path keeps provider observation inside the private
+RuntimeKernel platform-memory-use gate and bridge DSC1 ledger gate. A stalled
+model provider can delay the start of local teardown, although no output, event
+or region reclaim can cross that blocked observation. This is not a prompt-
+revocation guarantee. A future executable binding must supply a bounded per-
+operation in-flight/drain protocol rather than depend on this serialization.
 
 The Host provider models only submit/completion/cancel lifecycle and has no
 region-content effect; `RuntimeKernel` performs the local CPU-staged reference
 copy. A managed `Span<T>` acquired before reservation cannot be revoked, so
 this slice does not prove exclusive CPU custody. That limitation is explicit
 and covered by a boundary test rather than hidden behind a stronger claim.
+
+The cross-mechanism interlock uses the complete local mapping identity, not
+byte-range overlap. Same-mapping read/read and non-overlapping subranges are
+therefore rejected conservatively. Accepted lifetimes on distinct independently
+authorized mappings may overlap, although submission admission passes through
+the coarse local gate. DMA completion alone does not release a use: required
+post-completion visibility must finish. DSC1 releases only after terminal
+settlement, local publication/discard, both buffer-lease releases and the exact
+local release commit. Ordinary pre-accept denial rolls back; pending observation
+and any malformed, faulted, thrown or ambiguous external state retain the exact
+uses where they remain identifiable, or quarantine the containing platform
+domain when exact operation identity cannot be retained. This policy is local
+and is neither accelerator execution nor provider-side conflict enforcement.
+
+Provider submit calls in the local model/test contour also execute inside coarse
+private gates. Host supplies only the DSC1 `ModelOnly` half; combined DMA↔DSC1
+behavior uses a faithful test provider and is not Host DMA evidence. Calls are
+assumed bounded and must not wait on cross-thread re-entry. A future executable
+provider needs provisional per-operation reservation/reconciliation instead of
+treating this locking shape as a liveness guarantee.
 
 ## Exact external blocker
 
@@ -62,6 +86,16 @@ DSC1 descriptors, lane selection, provider tokens or compiler types are not an
 acceptable substitute. In addition, an executable asynchronous provider must
 prove output CPU-access custody and post-completion visibility for a reusable
 mapping; the Host-only staging rule does not prove that hardware boundary.
+The executable facade must also compose or enforce cross-engine mapping-use and
+drain policy rather than trusting only the local bridge.
+
+A prepared-but-unsubmitted DMA cycle is outside the new active-use interlock.
+Current owned buffers and pre-acquired managed aliases expose no mutation epoch
+that would make older prepare evidence stale after a later CPU or DSC1 write.
+Executable DMA/compute reuse of a mapping therefore additionally needs a
+mutation/visibility epoch or mandatory fresh prepare rule. This remains an
+external memory-visibility boundary shared with `EXT-HCPU-004`, not a capability
+that completion metadata can supply.
 
 Per project direction, this requirement records those gaps only. This
 iteration makes no change to HybridCPU ISE or `HybridCPU_Compiler_v2`.
@@ -118,6 +152,9 @@ An already existing or externally supplied platform interface that can expose a 
 4. Verify a missing local SingNextOS capability prevents the platform call.
 5. Verify an external denial or malformed result does not mutate local region ownership/protocol state.
 6. Verify unsupported/future-gated modes report unavailable rather than silently falling back to a different authority contour.
+7. Verify the external provider rejects or drains DMA and compute that target
+   the same mapping lifetime, and that terminal closure/visibility releases only
+   the exact operation's use.
 
 ## SingNextOS component blocked
 
@@ -126,6 +163,8 @@ output-visibility boundary only. The local capability/ownership model and Host
 reference provider are no longer blocked. A generated product ComputeService
 SIP remains a separate SingNextOS task because the current single ownership-
 payload request shape cannot yet carry both source and destination authority.
+That generated typed SIP ingress is the next local Phase-7 pool and does not
+depend on changing HybridCPU ISE or compiler code.
 
 ## Explicit non-request
 
