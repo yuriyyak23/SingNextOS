@@ -83,8 +83,8 @@ The main missing element is not a new ISA or a new OS object model. It is a prod
 | mapping/remap | host-backed exact owned-region mapping abstraction | translation/invalidation mechanisms; no generic atomic ownership remap proof | Phase 4 |
 | ownership | `OwnedRegion`/`OwnedBuffer`, MOVE, generation | domain/mapping authority, not a duplicate OS ownership object | Preserve Sing ownership; adapt in Phase 4 |
 | borrow/shared grants | local revocable borrow | bounded platform permissions, no generic Sing borrow object needed | Phase 4 |
-| DMA | bounded local v5 submit/completion/visibility/closure model plus generation-bound completion notification; no executable HybridCPU DMA | neutral admission-only grant and separately pinned visibility evidence; no neutral submit/completion/cancel API | Phases 5, 6 |
-| interrupts/events | exact HybridCPU IRQ binding feeds the local `KernelEventEndpoint`; model DMA completion is the second producer | neutral IRQ binding exists; no generic timer/event or DMA-completion surface | Phases 5, 6 |
+| DMA | bounded local v5 submit/completion/visibility/closure model plus generation-bound completion notification; no executable HybridCPU DMA | neutral admission-only grant plus grant-scoped prepare/acquire visibility evidence merged on master; no neutral submit/completion/cancel API | Phases 5, 6 |
+| interrupts/events | exact HybridCPU IRQ binding and model DMA completion feed one `KernelEventEndpoint`; exact cancellable async consumption stops before process drain and preserves staged publication | neutral IRQ binding exists; no generic timer/event, wait, or DMA-completion surface | Phases 5, 6 |
 | accelerators | external requirement only | MatrixTile, DSC1 and scoped L7 paths are code-confirmed | Phase 7 |
 | coherence/fences | no global-coherence assumption | explicit non-coherent fence requirements exist; universal coherence not proven | Phases 1, 4, 5 |
 | virtualization | local target only | neutral domain substrate + VMX projection; backend incomplete | Phase 8 |

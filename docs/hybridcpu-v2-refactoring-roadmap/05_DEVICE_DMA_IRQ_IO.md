@@ -17,7 +17,7 @@ Implemented slices:
 
 Slice 8 closes the Phase-5 correctness acceptance boundary. A faithful SingNextOS provider path now proves the full bounded non-coherent DMA ordering from exact owned memory through prepare, submit, completion, required post-write acquire, explicit lower-authority closure, and CPU reuse/reclaim, including denial/stale/revoke/completion-fault handling.
 
-The real cross-repository integration gate remains pinned read-only to HybridCPU neutral DMA-visibility commit `4960e7be34f485cf3c8261801daecdefe6172701`, based on HybridCPU `master` `1c0adf62fb01bc0963caa2dacc5f0933a8bce8cc`. HybridCPU remains v2 / visibility-only. Slices 6–8 use faithful SingNextOS provider models for submit, completion and lifecycle acceptance and do not modify external repositories. Phase-5 completion therefore does **not** claim real HybridCPU executable DMA enablement.
+The real cross-repository integration gate remains pinned read-only to merged HybridCPU neutral DMA-visibility commit `9e001bf29df06ad3d4ff7337f81d4e5bc0a62fc9` (tree-identical to the previously pinned PR head `4960e7be34f485cf3c8261801daecdefe6172701`). HybridCPU remains v2 / visibility-only. Slices 6–8 use faithful SingNextOS provider models for submit, completion and lifecycle acceptance and do not modify external repositories. Phase-5 completion therefore does **not** claim real HybridCPU executable DMA enablement.
 
 ## Goal
 
