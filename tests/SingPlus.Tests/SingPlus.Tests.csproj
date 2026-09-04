@@ -28,5 +28,6 @@
     <ProjectReference Include="../../src/Runtime/SingPlus.Runtime/SingPlus.Runtime.csproj" />
     <ProjectReference Include="../../src/Drivers/SingPlus.Drivers/SingPlus.Drivers.csproj" />
     <ProjectReference Include="../../tools/SingPlus.Admission/SingPlus.Admission.csproj" />
+    <ProjectReference Include="../../tools/SingPlus.HybridCpuQualification/SingPlus.HybridCpuQualification.csproj" />
   </ItemGroup>
 </Project>

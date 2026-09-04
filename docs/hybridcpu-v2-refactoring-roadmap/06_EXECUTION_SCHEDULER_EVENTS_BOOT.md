@@ -2,10 +2,11 @@
 
 ## Status
 
-**In progress after real domain binding.** Phase 3 already provides synchronous,
-definitive neutral `Start / Park / Resume` transitions and publishes local process
-state only after exact provider success. Phase 5 already provides the first
-generation-bound `KernelEventEndpoint` use through IRQ delivery.
+**Complete for the locally owned Phase-6 scope; external AOT/image/ISE remains
+`ExternalBlocked`.** Phase 3 already provides synchronous, definitive neutral
+`Start / Park / Resume` transitions and publishes local process state only after
+exact provider success. Phase 5 already provides the first generation-bound
+`KernelEventEndpoint` use through IRQ delivery.
 
 The first Phase 6 slice closes the remaining execution-attachment and causal
 identity gaps: an external domain may be attached or explicitly detached only
@@ -34,8 +35,12 @@ serialized against one waiter; teardown stops new waits before platform drain
 without discarding a staged producer reservation. This is local notification
 consumption, not platform-operation cancellation or HybridCPU event hardware.
 
-AOT/image/ISE qualification remains open. External qualification can proceed
-independently and corresponds to `EXT-HCPU-001`.
+The fifth slice runs the reproducible build/admission qualification lane and
+records why the external path stops at `ManagedAssemblyToHybridCpuAot`. The
+managed kernel assembly and admission proof receive per-run digests, while the
+missing external toolchain identity/command, HybridCPU image and ISE result stay
+explicitly absent. This is the accepted fail-closed Phase-6 outcome under
+`EXT-HCPU-001`, not a claim that external qualification succeeded.
 
 ## Goal
 
@@ -312,28 +317,59 @@ external drain, but retains staged and committed local notification state until
 the final reclaim boundary. An exact event already committed to a waiter remains
 that waiter's result.
 
-## Boot/AOT/ISE qualification
+## Completed slice E — reproducible boot/AOT/ISE qualification boundary
 
-Do not redesign SingNextOS around the external toolchain. Treat the toolchain as a black-box qualification lane:
+SingNextOS does not redesign itself around the external toolchain. The
+qualification treats that toolchain as a black-box lane:
 
 ```text
-build Sing kernel/boot assembly
+build the managed Sing kernel candidate
   -> local admission proof
   -> external HybridCPU AOT/image toolchain
   -> HybridCPU image
   -> ISE execution
 ```
 
-Record:
+The deterministic negative qualification lane records across its log and
+machine-readable report:
 
-- exact SingNextOS commit;
-- exact HybridCPU/toolchain version;
+- exact clean SingNextOS workflow commit;
+- exact HybridCPU source revision, SDK and compiler/runtime contract version;
+- resolved runner and .NET SDK identities;
+- deterministic `ReproductionCommands` recipe plus workflow-log execution receipt;
+- managed kernel assembly digest;
 - admission proof digest;
-- generated image digest;
-- ISE acceptance/result;
-- whether failure is local, toolchain, loader or runtime admission.
+- the first unavailable external stage and explicit `null` toolchain, image and
+  ISE fields.
 
-This should become a reproducible integration artifact when the external toolchain is available, but it must not block host-side architecture tests.
+This lane is deliberately scoped to the audited negative result. It neither
+accepts a caller-supplied positive toolchain result nor classifies later loader
+or runtime failures. A future positive qualification must extend or replace the
+lane only after the external interface required by `EXT-HCPU-001` is supplied.
+
+The qualification changes are based on SingNextOS `108195c...`; each run records
+its exact clean SingNextOS `HEAD`. For the audited `9e001bf...` HybridCPU-v2
+baseline, the local build and admission steps produce digest-bearing evidence.
+The HybridCPU compiler accepts already constructed `VLIW_Instruction` carriers,
+not a managed assembly, and no published prebuilt assembly-consuming toolchain is
+available. The report therefore records:
+
+```text
+ManagedAssemblyToHybridCpuAot = ExternalBlocked
+ToolchainIdentity/AotCommand  = null / null
+ImageGeneration/ImageDigest  = NotProduced / null
+IseLoaderAcceptance/IseResult = NotAttempted / null
+```
+
+`SingPlus.Kernel.dll`, rooted at
+`SingPlus.Kernel.KernelEntryPoint::Run`, is the admitted managed candidate.
+`SingPlus.Boot.dll` remains a `User` / `ManagedGc` host smoke harness that
+depends on `SingPlus.Kernel.Hal.Host`; it is not relabelled as a HybridCPU image.
+The exact stage evidence and reproduction commands are recorded in
+`EXT-HCPU-001` and in the per-run
+`artifacts/hybridcpu-aot-qualification/SingPlusHybridCpuQualificationV1.json` CI
+artifact. `SHA256SUMS` in the same directory binds the report and both copies of
+the compared artifacts. Host-side architecture tests remain independent.
 
 ## Real-time claims
 
@@ -447,22 +483,69 @@ Until then expose only supported budget/priority semantics.
 - the public wait signature contains only local process/endpoint identity and
   ordinary .NET cancellation, with no provider or hardware-topology token.
 
-## Remaining Phase-6 tests
+## Completed slice-E evidence
 
-- stale lifecycle completion cannot transition a recycled process;
-- park waits for platform completion when required;
-- cancellation of a platform operation cannot return an owned buffer before Phase 2/4 closure;
-- external toolchain qualification records versioned evidence without changing native API semantics.
+- the qualification branch starts at fresh-master SingNextOS `108195c...` and
+  records the exact clean per-run SingNextOS `HEAD`; it pins HybridCPU-v2
+  `9e001bf...`, SingNextOS SDK `10.0.204`, HybridCPU-v2 SDK `10.0.201` and
+  HybridCPU compiler/runtime contract version `6`;
+- two clean Release builds on pinned `ubuntu-24.04` must reproduce the kernel,
+  host-boot and admission-proof bytes; the actual CI log captures the resolved
+  runner identity and command execution, while the `ReproductionCommands`
+  recipe, checked-out commits, `ComparedArtifactSets = 2`,
+  `Comparison = ByteIdentical`, artifact SHA-256 values and embedded admission
+  digests are recorded in
+  `SingPlusHybridCpuQualificationV1`;
+- the recorder validates the exact `SingPlus.Kernel` and `SingPlus.Boot` managed
+  PE names, reruns the current `AdmissionVerifier`, requires the regenerated
+  canonical proof to equal the supplied proof, and records
+  `Stages[LocalArtifacts].Outcome = Validated`,
+  `Stages[LocalAdmissionProof].Outcome = Validated` and
+  `Stages[LocalArtifactComparison].Outcome = Validated` rather than claiming
+  that its JSON proves either build invocation ran;
+- the admitted candidate and root are `SingPlus.Kernel.dll` and
+  `SingPlus.Kernel.KernelEntryPoint::Run`; the host-HAL-dependent
+  `SingPlus.Boot.dll` is explicitly excluded from HybridCPU image claims;
+- the external source/release audit finds no supplied command that consumes the
+  managed assembly: the current HybridCPU compiler consumes VLIW carriers and
+  its `ProgramImage` is not accepted as evidence for the missing AOT stage;
+- blocked output remains structurally negative: toolchain identity/command and
+  image digest are `null`, image is `NotProduced`, and ISE is `NotAttempted`;
+- the qualification adds no toolchain type, raw opcode, lane identity or
+  provider token to a native/SIP contract.
 
-## Next implementation pool and external boundaries
+The JSON report, its successful parsing and all recorded digests remain
+evidence, not authority. Only the workflow log proves command execution, and no
+local evidence authorizes external AOT, image loading or ISE execution.
 
-The next pool should perform a reproducible AOT/image/ISE qualification attempt:
-pin exact SingNextOS and HybridCPU/toolchain revisions, record the invoked build
-and image commands, hash any produced admission/image artifacts, and record ISE
-acceptance or the exact unavailable stage. If the merged external tree still
-lacks the required toolchain/loader path, update `EXT-HCPU-001` with that concrete
-reproduction and keep it honestly `ExternalBlocked`; do not add a local success
-substitute or toolchain-specific public API.
+## Deferred external-contract gates
+
+- If a future execution provider changes the current synchronous definitive
+  lifecycle into an asynchronous contract, stale completion must not transition
+  a recycled process and park must wait for exact provider completion.
+- If a future external operation-cancellation receipt is introduced, cancellation
+  must not return an owned buffer before Phase-2/4 closure.
+- When an assembly-consuming HybridCPU AOT/loader toolchain is supplied, rerun
+  `EXT-HCPU-001` and require an image digest plus exact ISE acceptance/execution
+  evidence before changing its status.
+
+These are not missing local Phase-6 success paths. The corresponding external
+interfaces do not exist in the audited baselines, so SingNextOS keeps them
+fail-closed rather than inventing completions or toolchain behavior.
+
+## Phase-6 disposition and next implementation pool
+
+Phase 6 is complete under its stated acceptance rule: locally owned execution,
+scheduler-policy and reusable event/wait semantics are implemented, and the
+external boot path has a reproducible, explicitly `ExternalBlocked`
+qualification record without a fabricated success substitute or a
+toolchain-specific public API.
+
+The next implementation pool starts Phase 7 with one narrow semantic DSC1 bulk
+compute feature/profile contract over existing owned-region and completion
+boundaries. Begin with a bounded operation rather than a universal accelerator
+API; keep the host path `ModelOnly` and the HybridCPU provider unavailable unless
+a stable neutral executable facade is actually present.
 
 Real timer binding remains `ExternalBlocked` under `EXT-HCPU-002`. Real
 HybridCPU scheduler-policy admission remains `ExternalBlocked` under
@@ -470,9 +553,9 @@ HybridCPU scheduler-policy admission remains `ExternalBlocked` under
 grant-scoped DMA prepare/acquire visibility evidence, but no neutral DMA
 submit/completion/cancel surface.
 Executable DMA therefore remains `ExternalBlocked` under `EXT-HCPU-004`.
-Reproducible AOT/image/ISE qualification remains
-`ExternalBlocked` under `EXT-HCPU-001`. None of those boundaries is replaced
-with a locally fabricated success path.
+AOT/image/ISE integration remains `ExternalBlocked` under `EXT-HCPU-001`, with
+the first unavailable stage now recorded as `ManagedAssemblyToHybridCpuAot`.
+None of those boundaries is replaced with a locally fabricated success path.
 
 ## Acceptance criteria
 

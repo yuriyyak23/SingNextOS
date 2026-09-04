@@ -20,7 +20,14 @@
 > blocks final reclaim. Wait cancellation is not source/platform cancellation,
 > completion, ownership return or a WFE/SEV ABI. These slices prove no
 > HybridCPU placement, budget enforcement, executable DMA, scheduler quality,
-> hard real-time, boot or security property beyond their tested evidence.
+> hard real-time, boot or security property beyond their tested evidence. The
+> final Phase-6 qualification slice digest-binds the managed kernel candidate
+> and its local admission proof, then records
+> `ManagedAssemblyToHybridCpuAot = ExternalBlocked`, image `NotProduced` and ISE
+> `NotAttempted`. HybridCPU's existing VLIW-input compiler `ProgramImage` is not
+> misreported as managed AOT or SingNextOS boot evidence. The report's
+> `ReproductionCommands` are a deterministic recipe; the workflow log is the
+> execution receipt, and neither JSON nor digest becomes platform authority.
 
 ## Current status at SingNextOS `af791aba...`
 
@@ -345,14 +352,18 @@ A feature bit only advertises provider support for a contract family. It is neve
 
 The current external requirement split remains authoritative:
 
-- `EXT-HCPU-001` — AOT/image/ISE qualification;
+- `EXT-HCPU-001` — reproducible managed-kernel qualification record; external
+  AOT/image/ISE remains blocked at `ManagedAssemblyToHybridCpuAot`;
 - `EXT-HCPU-002` — console/timer/MMIO/IRQ/DMA HAL bindings;
 - `EXT-HCPU-003` — neutral domain binding;
 - `EXT-HCPU-004` — owned-region mapping/revocation/direct access;
 - `EXT-HCPU-005` — scoped compute providers;
 - `EXT-HCPU-006` — virtualization/nested/evidence/SecureCompute discovery.
 
-The presence of local v1 implementations does not close external requirements 003–006. It closes only the SingNextOS-owned **abstraction and host conformance** portion.
+For the historical v1 snapshot, local implementations closed only the
+SingNextOS-owned **abstraction and host conformance** portion. Later partial
+external closures and remaining boundaries are classified by the current
+roadmap and each individual requirement file.
 
 ## Non-goals
 

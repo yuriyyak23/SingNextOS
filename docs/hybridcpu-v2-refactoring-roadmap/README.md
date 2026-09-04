@@ -40,7 +40,10 @@ The Track A merge matters. Current master already contains:
 
 Therefore this roadmap treats SIP response/client teardown as **current foundation**, not as an unimplemented first phase.
 
-`docs/whitebook/hybridcpu-ise/09_DEVELOPMENT_DIRECTION.md` still describes Track A as incomplete from an older baseline. Its invariants remain useful, but its status ordering must be rebased to the current master as part of Phase 0.
+`docs/whitebook/hybridcpu-ise/09_DEVELOPMENT_DIRECTION.md` retains its original
+baseline as historical context and now carries a current-status overlay. Its
+invariants remain useful, while this roadmap and current source/tests are
+authoritative for delivered phase status.
 
 ## Architectural verdict carried forward from the audit
 
@@ -66,7 +69,7 @@ The main missing element is not a new ISA or a new OS object model. It is a prod
 | 3 | [`03_REAL_HYBRIDCPU_DOMAIN_BINDING.md`](03_REAL_HYBRIDCPU_DOMAIN_BINDING.md) | First real Sing domain ↔ neutral HybridCPU execution/memory/I/O binding. |
 | 4 | [`04_MEMORY_OWNERSHIP_COHERENCE.md`](04_MEMORY_OWNERSHIP_COHERENCE.md) | Exact region slices, non-coherent-safe handoff, revoke/rebind and zero-copy-as-optimization semantics. |
 | 5 | [`05_DEVICE_DMA_IRQ_IO.md`](05_DEVICE_DMA_IRQ_IO.md) | Device/MMIO/IRQ/DMA authority as bounded grants, never ambient device access. |
-| 6 | [`06_EXECUTION_SCHEDULER_EVENTS_BOOT.md`](06_EXECUTION_SCHEDULER_EVENTS_BOOT.md) | Domain lifecycle/budget/event integration plus external AOT/ISE qualification. |
+| 6 | [`06_EXECUTION_SCHEDULER_EVENTS_BOOT.md`](06_EXECUTION_SCHEDULER_EVENTS_BOOT.md) | **Complete locally:** domain lifecycle, model policy and reusable exact event/wait integration; reproducible AOT/ISE attempt stops honestly at `EXT-HCPU-001`. |
 | 7 | [`07_COMPUTE_ACCELERATORS.md`](07_COMPUTE_ACCELERATORS.md) | One narrow semantic DSC1/MatrixTile/L7 provider over owned regions and completion. |
 | 8 | [`08_VIRTUALIZATION_NESTED_DOMAINS.md`](08_VIRTUALIZATION_NESTED_DOMAINS.md) | Neutral `VirtualizationService` over child domains; VMX remains a compatibility projection. |
 | 9 | [`09_EVIDENCE_SECURECOMPUTE.md`](09_EVIDENCE_SECURECOMPUTE.md) | Classified evidence and fail-closed SecureCompute feature gating. |
@@ -92,9 +95,13 @@ The main missing element is not a new ISA or a new OS object model. It is a prod
 | SecureCompute | fail-closed target | descriptor/policy architecture, not production-positive backend | Phase 9 |
 | evidence | no provider API | evidence/visibility concepts exist; hardware-rooted attestation not proven | Phase 9 |
 | GPU/display | no materialized service/provider | generic DMA/accelerator primitives, no proven display path | Phase 11 |
-| boot/AOT | native entry/build/admission only | external toolchain/ISE is required | Phase 6 |
+| boot/AOT | deterministic managed kernel build/admission report with exact per-run digests; host boot harness is not a HybridCPU image | no published managed-assembly AOT/loader path at audited `9e001bf...`; image `NotProduced`, ISE `NotAttempted` | Phase 6 complete with `EXT-HCPU-001` ExternalBlocked |
 | scheduler interaction | typed budget/priority/latency/throughput intent produces an exact local registration only after host `ModelOnly` acceptance; no HybridCPU enforcement claim | scheduling budget and lane legality remain HybridCPU-owned; external policy admission is unavailable | Phase 6 |
 | feature discovery | versioned semantic manifest plus legacy flags; `NeutralDomains` is v2 | richer hardware/runtime/domain states exist internally | Phase 1 foundation; version bumps remain phase-local |
+
+The Phase-6 qualification JSON, workflow log and `SHA256SUMS` sidecar are
+reproducibility evidence only. They do not authorize AOT, image loading or ISE
+execution.
 
 ## Minimal high-value implementation slice
 

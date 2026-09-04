@@ -2,11 +2,29 @@
 
 ## Goal
 
-Этот раздел задаёт dependency order для SingNextOS после текущего SIP protocol hardening и local Platform Authority Bridge v1. Он не обещает одновременную реализацию всех системных services. Его задача — не позволить filesystem/network/GUI/compatibility work создать параллельные низкоуровневые security/memory mechanisms в обход capability, ownership и platform authority boundaries.
+Этот раздел задаёт dependency order для SingNextOS и сохраняет исходный
+pre-Phase-0 baseline как исторический контекст. Он не обещает одновременную
+реализацию всех системных services. Его задача — не позволить
+filesystem/network/GUI/compatibility work создать параллельные низкоуровневые
+security/memory mechanisms в обход capability, ownership и platform authority
+boundaries.
 
-## Current baseline delta
+> Current-status overlay (2026-09-04): the qualification iteration starts from
+> SingNextOS `108195c...` and audits HybridCPU-v2 `9e001bf...`, superseding the
+> delivery-status claims in the historical baseline below. Phases 1–5 and the
+> locally owned Phase-6 lifecycle, scheduler-policy and event/wait slices are
+> complete. This qualification changeset reproducibly digest-binds the managed
+> kernel build and admission artifacts, but the external path stops at
+> `ManagedAssemblyToHybridCpuAot`. `EXT-HCPU-001` remains `ExternalBlocked`; the
+> image stage is `NotProduced` and ISE execution is `NotAttempted`. Phase 7 is
+> next.
 
-Текущий roadmap baseline перед Phase 0 implementation — `faafa6848d832e2ddd3ac1cdb82ec518f8dd5cb3`. Он включает Track A merge `7977043e98db50673d4d7053c6ddcb9f1beea91b` и local Platform Authority Bridge work из PR #12/#13.
+## Historical baseline delta
+
+Roadmap baseline перед Phase 0 implementation был
+`faafa6848d832e2ddd3ac1cdb82ec518f8dd5cb3`. Он включает Track A merge
+`7977043e98db50673d4d7053c6ddcb9f1beea91b` и local Platform Authority Bridge
+work из PR #12/#13.
 
 На этом baseline уже реализованы:
 
@@ -109,7 +127,13 @@ Constraints remain:
 
 ### Status
 
-**ExternalBlocked.** Local domain binding is current; HybridCPU-backed provider is not.
+**Current for the exact neutral lifecycle; externally incomplete for later
+feature families.** `HybridCpuPlatformAuthorityProvider` now binds an exact
+SingNextOS process subject to the neutral HybridCPU runtime and provides
+synchronous definitive `Start / Park / Resume / Close` transitions. HybridCPU
+scheduler-policy admission remains `ExternalBlocked`, and the provider does not
+turn this lifecycle binding into executable DMA, compute, virtualization or
+security authority.
 
 ### Required outcomes
 
@@ -169,15 +193,19 @@ Tracked by `EXT-HCPU-005`.
 
 ## Track F — scheduler/event integration
 
-**BridgeRequired after real execution-domain binding.** Consume platform event/scheduler facilities behind high-level abstractions:
+**Current for the locally owned Phase-6 contour; partially HybridCPU-bound.**
+Exact process-scoped execution lifecycle, binding-scoped semantic
+budget/priority/latency/throughput intent, IRQ and model DMA-completion delivery
+through one generation-bound endpoint, and cancellable `ValueTask` consumption
+are implemented. The scheduler policy is host `ModelOnly`; the HybridCPU
+provider correctly reports that family unavailable. HybridCPU supplies the
+exact neutral IRQ binding, but no generic timer/event wait or DMA-completion
+surface.
 
-- yield;
-- event wait/signal;
-- barriers;
-- timer/interrupt delivery;
-- execution budget/priority hints.
-
-Public API remains `Task`/`ValueTask`/cancellation/event/channel-oriented. Do not expose `WFE`, `SEV`, VT IDs or lane placement as native ABI.
+Public API remains `Task`/`ValueTask`/cancellation/event/channel-oriented and
+does not expose `WFE`, `SEV`, VT IDs or lane placement as native ABI. Real timer
+delivery remains under `EXT-HCPU-002`; scheduler-policy admission remains under
+`EXT-HCPU-003`; boot/AOT/ISE remains under `EXT-HCPU-001`.
 
 ## Track G — evidence and replay diagnostics
 
