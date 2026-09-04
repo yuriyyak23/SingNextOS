@@ -36,6 +36,18 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDmaPrepareEvidence prepareEvidence,
         PlatformDomainIdentity expectedSubject)
     {
+        // Keep the bridge lock order stable: DSC1 state precedes DMA state.
+        // RuntimeKernel holds its platform-memory-use gate outside both.
+        lock (_dsc1Gate)
+        lock (_dmaCompletionGate)
+            return SubmitDmaGrantLocked(grant, prepareEvidence, expectedSubject);
+    }
+
+    private KernelResult<PlatformDmaSubmission> SubmitDmaGrantLocked(
+        PlatformDmaGrant grant,
+        PlatformDmaPrepareEvidence prepareEvidence,
+        PlatformDomainIdentity expectedSubject)
+    {
         var validation = ValidateDmaGrant(grant, expectedSubject);
         if (!validation.IsSuccess)
         {
@@ -138,7 +150,49 @@ public sealed partial class PlatformAuthorityBridge
                 requestValidation.Message ?? "The bridge constructed malformed provider DMA submission state.");
         }
 
-        var providerResult = submissionProvider.SubmitDma(request);
+        if (_nextDmaOperationId == 0)
+        {
+            return KernelResult<PlatformDmaSubmission>.Fail(
+                KernelError.CapacityExhausted,
+                "Local DMA operation identity space is exhausted.");
+        }
+
+        try
+        {
+            _activeDmaSubmissions.EnsureCapacity(_activeDmaSubmissions.Count + 1);
+            _dmaSubmissionFaultPins.EnsureCapacity(_dmaSubmissionFaultPins.Count + 1);
+        }
+        catch (OutOfMemoryException)
+        {
+            return KernelResult<PlatformDmaSubmission>.Fail(
+                KernelError.CapacityExhausted,
+                "Local DMA submission tracking capacity is exhausted before provider admission.");
+        }
+
+        // All exact grant/evidence checks precede the cross-mechanism query so
+        // forged inputs cannot use the interlock as a mapping-use oracle.
+        var mappingUse = ValidateDmaMappingUseAdmissionLocked(grant);
+        if (!mappingUse.IsSuccess)
+        {
+            return KernelResult<PlatformDmaSubmission>.Fail(
+                mappingUse.Error,
+                mappingUse.Message!);
+        }
+
+        var operationId = new PlatformDmaOperationId(NextLocalDmaOperationId());
+        PlatformAuthorityResult<PlatformProviderDmaSubmission> providerResult;
+        try
+        {
+            providerResult = submissionProvider.SubmitDma(request);
+        }
+        catch (Exception exception)
+        {
+            _dmaSubmissionFaultPins.Add(grant.GrantId);
+            return KernelResult<PlatformDmaSubmission>.Fail(
+                KernelError.PlatformFaulted,
+                $"The DMA provider threw during submission; acceptance is ambiguous and the exact mapping remains pinned: {exception.Message}");
+        }
+
         if (!providerResult.IsSuccess)
         {
             if (providerResult.Status == PlatformAuthorityStatus.Faulted)
@@ -162,33 +216,60 @@ public sealed partial class PlatformAuthorityBridge
         }
 
         var submission = new PlatformDmaSubmission(
-            new PlatformDmaOperationId(NextLocalDmaOperationId()),
+            operationId,
             new PlatformDmaOperationGeneration(1),
             grant.GrantId,
             grant.Generation,
             visibilityState.LocalCycle,
             grant.Range,
             grant.Direction);
-        visibilityState.Consumed = true;
-        _activeDmaSubmissions.Add(
-            grant.GrantId,
-            new DmaSubmissionRecord(submission, providerSubmission));
+        try
+        {
+            var record = new DmaSubmissionRecord(submission, providerSubmission);
+            _activeDmaSubmissions.Add(grant.GrantId, record);
+            visibilityState.Consumed = true;
+        }
+        catch (Exception exception) when (
+            exception is OutOfMemoryException or InvalidOperationException)
+        {
+            _dmaSubmissionFaultPins.Add(grant.GrantId);
+            return KernelResult<PlatformDmaSubmission>.Fail(
+                KernelError.PlatformFaulted,
+                $"The provider accepted DMA but exact local tracking failed; the mapping remains fault-pinned: {exception.Message}");
+        }
+
         return KernelResult<PlatformDmaSubmission>.Ok(submission);
     }
 
-    internal bool HasActiveDmaSubmission(PlatformDmaGrantId grantId) =>
-        _activeDmaSubmissions.ContainsKey(grantId);
+    internal bool HasActiveDmaSubmission(PlatformDmaGrantId grantId)
+    {
+        lock (_dmaCompletionGate)
+            return _activeDmaSubmissions.ContainsKey(grantId);
+    }
 
-    internal bool HasPendingDmaSubmission(PlatformDmaGrantId grantId) =>
-        _activeDmaSubmissions.TryGetValue(grantId, out var record) &&
-        !record.CompletionProven;
+    internal bool HasPendingDmaSubmission(PlatformDmaGrantId grantId)
+    {
+        lock (_dmaCompletionGate)
+        {
+            return _activeDmaSubmissions.TryGetValue(grantId, out var record) &&
+                   !record.CompletionProven;
+        }
+    }
 
-    internal bool HasCompletedDmaSubmission(PlatformDmaGrantId grantId) =>
-        _activeDmaSubmissions.TryGetValue(grantId, out var record) &&
-        record.CompletionProven;
+    internal bool HasCompletedDmaSubmission(PlatformDmaGrantId grantId)
+    {
+        lock (_dmaCompletionGate)
+        {
+            return _activeDmaSubmissions.TryGetValue(grantId, out var record) &&
+                   record.CompletionProven;
+        }
+    }
 
-    internal bool HasFaultPinnedDmaSubmission(PlatformDmaGrantId grantId) =>
-        _dmaSubmissionFaultPins.Contains(grantId);
+    internal bool HasFaultPinnedDmaSubmission(PlatformDmaGrantId grantId)
+    {
+        lock (_dmaCompletionGate)
+            return _dmaSubmissionFaultPins.Contains(grantId);
+    }
 
     private ulong NextLocalDmaOperationId()
     {

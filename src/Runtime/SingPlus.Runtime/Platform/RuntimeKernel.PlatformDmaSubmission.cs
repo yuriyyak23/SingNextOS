@@ -11,6 +11,15 @@ public sealed partial class RuntimeKernel
         PlatformDmaGrant grant,
         PlatformDmaPrepareEvidence prepareEvidence)
     {
+        lock (_platformMemoryUseGate)
+            return SubmitPlatformDmaLocked(subject, grant, prepareEvidence);
+    }
+
+    private KernelResult<PlatformDmaSubmission> SubmitPlatformDmaLocked(
+        ProcessHandle subject,
+        PlatformDmaGrant grant,
+        PlatformDmaPrepareEvidence prepareEvidence)
+    {
         var resolved = Processes.Resolve(subject);
         if (!resolved.IsSuccess)
         {

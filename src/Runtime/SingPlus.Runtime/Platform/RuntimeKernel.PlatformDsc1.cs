@@ -25,7 +25,9 @@ public sealed partial class RuntimeKernel
             AcceptedSubmission = submission;
     }
 
-    private readonly object _dsc1PayloadGate = new();
+    // Serializes local memory-use admission and release across DSC1 and DMA.
+    // Provider-specific bridge gates remain responsible for their own ledgers.
+    private readonly object _platformMemoryUseGate = new();
     private readonly Dictionary<PlatformDsc1SubmissionId, Dsc1PayloadRecord>
         _dsc1PayloadOperations = [];
 
@@ -48,7 +50,7 @@ public sealed partial class RuntimeKernel
         ArgumentNullException.ThrowIfNull(sourceBuffer);
         ArgumentNullException.ThrowIfNull(destinationBuffer);
 
-        lock (_dsc1PayloadGate)
+        lock (_platformMemoryUseGate)
         {
             return SubmitPlatformDsc1CopyLocked(
                 subject,
@@ -150,6 +152,22 @@ public sealed partial class RuntimeKernel
                 "DSC1 Copy source and destination ranges must have equal byte lengths.");
         }
 
+        // Validate exact mapping authority and the conservative cross-mechanism
+        // interlock before acquiring managed-buffer reservations or snapshotting
+        // source bytes. SubmitDsc1ModelCopy repeats this immediately before the
+        // provider call so that the bridge remains self-defending.
+        var mappingUse = PlatformAuthority.ValidateDsc1MappingUseAdmission(
+            binding,
+            PlatformIdentity(process),
+            source,
+            destination);
+        if (!mappingUse.IsSuccess)
+        {
+            return KernelResult<PlatformDsc1CopySubmission>.Fail(
+                mappingUse.Error,
+                mappingUse.Message!);
+        }
+
         RuntimeBufferLease<byte>? sourceLease = null;
         RuntimeBufferLease<byte>? destinationLease = null;
         byte[]? stagedOutput = null;
@@ -231,7 +249,7 @@ public sealed partial class RuntimeKernel
         ProcessHandle subject,
         PlatformDsc1CopySubmission submission)
     {
-        lock (_dsc1PayloadGate)
+        lock (_platformMemoryUseGate)
             return ObservePlatformDsc1CopyLocked(subject, submission);
     }
 
@@ -275,7 +293,7 @@ public sealed partial class RuntimeKernel
         ProcessHandle subject,
         PlatformDsc1CopySubmission submission)
     {
-        lock (_dsc1PayloadGate)
+        lock (_platformMemoryUseGate)
             return CancelPlatformDsc1CopyLocked(subject, submission);
     }
 
@@ -441,7 +459,7 @@ public sealed partial class RuntimeKernel
 
     private KernelResult AdvancePlatformDsc1ForProcess(ProcessHandle subject)
     {
-        lock (_dsc1PayloadGate)
+        lock (_platformMemoryUseGate)
         {
             var resolved = Processes.Resolve(subject);
             if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
@@ -455,7 +473,7 @@ public sealed partial class RuntimeKernel
     private KernelResult AdvancePlatformDsc1ForMapping(
         PlatformRegionMapping mapping)
     {
-        lock (_dsc1PayloadGate)
+        lock (_platformMemoryUseGate)
         {
             return CancelAndReleaseDsc1Operations(
                 PlatformAuthority.Dsc1OperationsForMapping(mapping));
@@ -465,7 +483,7 @@ public sealed partial class RuntimeKernel
     private KernelResult CascadePlatformDsc1CapabilityRevocation(
         CapabilityId capabilityId)
     {
-        lock (_dsc1PayloadGate)
+        lock (_platformMemoryUseGate)
         {
             return CancelAndReleaseDsc1Operations(
                 PlatformAuthority.Dsc1OperationsForCapability(capabilityId));

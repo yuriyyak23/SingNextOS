@@ -15,7 +15,7 @@ public sealed partial class RuntimeKernel
         PlatformDsc1CopySubmission submission,
         KernelEventEndpoint eventEndpoint)
     {
-        lock (_dsc1PayloadGate)
+        lock (_platformMemoryUseGate)
         {
             var resolved = Processes.Resolve(subject);
             if (!resolved.IsSuccess)

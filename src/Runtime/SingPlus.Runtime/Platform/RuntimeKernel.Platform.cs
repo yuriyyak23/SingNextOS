@@ -40,7 +40,7 @@ public sealed partial class RuntimeKernel
         ProcessHandle subject,
         PlatformDomainBinding binding)
     {
-        lock (_dsc1PayloadGate)
+        lock (_platformMemoryUseGate)
             return RevokePlatformDomainLocked(subject, binding);
     }
 
@@ -331,7 +331,7 @@ public sealed partial class RuntimeKernel
         ProcessHandle owner,
         PlatformRegionMapping mapping)
     {
-        lock (_dsc1PayloadGate)
+        lock (_platformMemoryUseGate)
             return RevokePlatformRegionMappingLocked(owner, mapping);
     }
 

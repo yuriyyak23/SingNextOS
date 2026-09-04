@@ -10,6 +10,20 @@ public sealed partial class RuntimeKernel
         PlatformDmaSubmission submission,
         PlatformDmaCompletionEvidence completionEvidence)
     {
+        lock (_platformMemoryUseGate)
+        {
+            return FinalizePlatformDmaPostCompletionVisibilityLocked(
+                subject,
+                submission,
+                completionEvidence);
+        }
+    }
+
+    private KernelResult<PlatformDmaPostCompletionVisibilityEvidence> FinalizePlatformDmaPostCompletionVisibilityLocked(
+        ProcessHandle subject,
+        PlatformDmaSubmission submission,
+        PlatformDmaCompletionEvidence completionEvidence)
+    {
         var resolved = Processes.Resolve(subject);
         if (!resolved.IsSuccess)
         {

@@ -55,6 +55,14 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDmaGrant grant,
         PlatformDomainIdentity expectedSubject)
     {
+        lock (_dmaCompletionGate)
+            return PrepareDmaGrantVisibilityLocked(grant, expectedSubject);
+    }
+
+    private KernelResult<PlatformDmaPrepareEvidence> PrepareDmaGrantVisibilityLocked(
+        PlatformDmaGrant grant,
+        PlatformDomainIdentity expectedSubject)
+    {
         var validation = ValidateDmaGrant(grant, expectedSubject);
         if (!validation.IsSuccess)
         {
@@ -129,6 +137,14 @@ public sealed partial class PlatformAuthorityBridge
     }
 
     internal KernelResult<PlatformDmaAcquireEvidence> AcquireDmaGrantVisibility(
+        PlatformDmaGrant grant,
+        PlatformDomainIdentity expectedSubject)
+    {
+        lock (_dmaCompletionGate)
+            return AcquireDmaGrantVisibilityLocked(grant, expectedSubject);
+    }
+
+    private KernelResult<PlatformDmaAcquireEvidence> AcquireDmaGrantVisibilityLocked(
         PlatformDmaGrant grant,
         PlatformDomainIdentity expectedSubject)
     {
@@ -225,14 +241,19 @@ public sealed partial class PlatformAuthorityBridge
 
     internal bool HasPreparedUnacquiredDmaVisibilityCycle(
         PlatformDmaGrant grant,
-        PlatformDomainIdentity expectedSubject) =>
-        ValidateDmaGrant(grant, expectedSubject).IsSuccess &&
-        !HasFaultPinnedDmaSubmission(grant.GrantId) &&
-        !HasActiveDmaSubmission(grant.GrantId) &&
-        _dmaVisibilityStates.TryGetValue(grant.GrantId, out var state) &&
-        state.LocalCycle.Value != 0 &&
-        !state.Acquired &&
-        !state.Consumed;
+        PlatformDomainIdentity expectedSubject)
+    {
+        lock (_dmaCompletionGate)
+        {
+            return ValidateDmaGrant(grant, expectedSubject).IsSuccess &&
+                   !HasFaultPinnedDmaSubmission(grant.GrantId) &&
+                   !HasActiveDmaSubmission(grant.GrantId) &&
+                   _dmaVisibilityStates.TryGetValue(grant.GrantId, out var state) &&
+                   state.LocalCycle.Value != 0 &&
+                   !state.Acquired &&
+                   !state.Consumed;
+        }
+    }
 
     private ulong NextLocalDmaVisibilityCycle()
     {

@@ -55,8 +55,9 @@ A lower layer may define target direction but cannot override a current denial, 
 | provider contract | `src/Platform/SingPlus.Platform.Abstractions/PlatformAuthorityContracts.cs` | current features are only `NeutralDomainBinding` and `DirectOwnedRegionMapping`; opaque provider leases/generation; read/write mapping access |
 | privileged bridge | `src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.cs` | separate local/provider identities, feature checks, stale/revoked/wrong-domain fail-closed validation |
 | kernel integration | `src/Runtime/SingPlus.Runtime/Platform/RuntimeKernel.Platform.cs` | exact `MemoryRegion` capability + rights + owner/generation are validated before provider mapping; reservation rollback on provider failure |
+| cross-mechanism memory-use admission | `src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.MappingUse.cs`, `RuntimeKernel.PlatformDmaSubmission.cs`, `RuntimeKernel.PlatformDmaPostCompletion.cs`, `RuntimeKernel.PlatformDsc1.cs` | conservative exact-mapping DMA↔DSC1 exclusion; ordinary pre-accept rollback; exact completion/visibility/terminal-settlement release; exact fault pinning or containing-domain quarantine |
 | host reference provider | `src/Platform/SingPlus.Platform.Host/HostPlatformAuthorityProvider.cs` | deterministic host-only implementation of the two current feature bits |
-| bridge tests | `tests/SingPlus.Tests/Platform/PlatformAuthorityBridgeTests.cs` | no local `CapabilityId` in provider API, capability-before-provider, stale/cross-domain rejection, mapping lifecycle interlocks |
+| bridge tests | `tests/SingPlus.Tests/Platform/PlatformAuthorityBridgeTests.cs`, `PlatformDmaDsc1MappingInterlockTests.cs` | no local `CapabilityId` in provider API, capability-before-provider, stale/cross-domain rejection, mapping lifecycle and cross-mechanism interlocks |
 
 ### What these sources do not prove
 
@@ -65,6 +66,8 @@ The local bridge and host tests do not prove:
 - a HybridCPU-backed provider;
 - actual MMU/IOMMU/page-table remap;
 - DMA queue/fence/drain semantics;
+- provider-side DMA↔DSC1 conflict enforcement or range/cache-line compatibility;
+- a CPU/managed-alias mutation epoch that invalidates stale DMA prepare evidence;
 - CPU/device/GPU global coherence;
 - display/GPU surface presentation;
 - MatrixTile/DSC/L7 platform provider bindings;
@@ -159,9 +162,11 @@ Repository search at this baseline does not find current `IWindowService`, `ICom
 
 The referenced HybridCPU ISE/compiler material is architecture and audit
 background only. It is not accepted as current executable integration evidence,
-and Phase-7 Slices 1–2 neither consume nor change `HybridCPU_Compiler_v2` or ISE
+and Phase-7 Slices 1–3 neither consume nor change `HybridCPU_Compiler_v2` or ISE
 implementation types. Slice 2 only projects exact local DSC1 terminal settlement
-onto the existing generation-bound kernel event primitive.
+onto the existing generation-bound kernel event primitive. Slice 3 adds only a
+SingNextOS bridge-private, whole-mapping DMA↔DSC1 admission/release interlock;
+it is not derived from an internal ISE conflict type.
 
 ## External requirement traceability
 
@@ -170,8 +175,8 @@ onto the existing generation-bound kernel event primitive.
 | `EXT-HCPU-001` | external AOT/image/ISE qualification still required |
 | `EXT-HCPU-002` | real console/timer/MMIO/IRQ/DMA platform binding still required |
 | `EXT-HCPU-003` | local neutral binding abstraction now exists, but real HybridCPU provider is still external-blocked |
-| `EXT-HCPU-004` | local exact owned-region mapping abstraction/interlock now exists, but real mapping/revocation/DMA semantics are external-blocked |
-| `EXT-HCPU-005` | local bounded DSC1 Copy v1 + Host `ModelOnly` lifecycle and exact observation wakeup exist; neutral executable HybridCPU compute/visibility binding remains external-blocked |
+| `EXT-HCPU-004` | local exact owned-region mapping plus conservative whole-mapping DMA↔DSC1 use interlock exists; real mapping/revocation/DMA, CPU mutation epoch and provider-side conflict semantics are external-blocked |
+| `EXT-HCPU-005` | local bounded DSC1 Copy v1 + Host `ModelOnly` lifecycle, exact observation wakeup and DMA interlock exist; neutral executable HybridCPU compute/custody/visibility binding remains external-blocked |
 | `EXT-HCPU-006` | virtualization/nested/evidence/SecureCompute provider discovery remains external-blocked |
 
 ## Key decision-to-source map

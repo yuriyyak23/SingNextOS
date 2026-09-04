@@ -17,12 +17,16 @@ boundaries.
 > kernel build and admission artifacts, but the external path stops at
 > `ManagedAssemblyToHybridCpuAot`. `EXT-HCPU-001` remains `ExternalBlocked`; the
 > image stage is `NotProduced` and ISE execution is `NotAttempted`. Phase-7
-> Slices 1–2 now provide bounded DSC1 `UInt8` Copy as a Host `ModelOnly`
+> Slices 1–3 now provide bounded DSC1 `UInt8` Copy as a Host `ModelOnly`
 > reference lifecycle over separate compute capability, owned regions and
 > exact completion/cancellation closure, plus an observation-driven wakeup
 > through the existing generation-bound `KernelEventEndpoint`. Output/custody
 > settles before event commit, and notification cancellation never replaces
-> provider drain.
+> provider drain. Private RuntimeKernel admission serialization plus bridge
+> lifecycle-ledger checks now also prevent
+> active or ambiguously accepted DMA and DSC1 from sharing the same full mapping
+> identity until their exact release boundary. It is not range-level coherence
+> or an executable provider claim.
 > HybridCPU executable compute remains unavailable under `EXT-HCPU-005`; no
 > ISE/compiler code is consumed or changed.
 
@@ -158,7 +162,13 @@ Tracked by `EXT-HCPU-003`.
 
 **CurrentModelBound locally; ExternalBlocked for real direct mapping.**
 
-Current local mapping requires exact `MemoryRegion` capability and current region ownership, then reserves the region against transfer/loan/release.
+Current local mapping requires exact `MemoryRegion` capability and current
+region ownership, then reserves the region against transfer/loan/release. The
+local runtime also conservatively excludes active DMA and DSC1 use of the same
+complete mapping identity while permitting independently authorized distinct
+mappings. It retains ambiguous/faulted uses rather than reclaiming through
+uncertain external state, or quarantines their containing platform domain when
+an exact operation identity cannot be retained.
 
 ### Required external closure
 
@@ -169,17 +179,21 @@ Current local mapping requires exact `MemoryRegion` capability and current regio
 - truthful coherence/direct-access capability statement.
 
 Do not infer page remap, IOMMU or cache behavior from the local interface.
+In particular, this policy neither proves range/cache-line compatibility nor
+versions CPU alias mutations after DMA preparation. Executable reuse still
+needs a provider-side drain and mutation/visibility epoch or fresh-prepare rule.
 
 Tracked by `EXT-HCPU-004`.
 
 ## Track E — first narrow ISE compute provider
 
-**In progress locally; ExternalBlocked for ISE execution.** Phase-7 Slices 1–2
-implements the bounded DSC1 Copy contract, a `RuntimeKernel` CPU-staged
+**In progress locally; ExternalBlocked for ISE execution.** Phase-7 Slices 1–3
+implement the bounded DSC1 Copy contract, a `RuntimeKernel` CPU-staged
 reference copy admitted by a Host `ModelOnly` lifecycle provider, and
 generation-bound observation wakeup through the existing event endpoint,
-alongside fail-closed feature selection. A real provider still depends on an
-actual stable neutral external interface, not internal ISE breadth.
+alongside fail-closed feature selection and a conservative whole-mapping
+DMA↔DSC1 interlock. A real provider still depends on an actual stable neutral
+external interface, not internal ISE breadth.
 
 Candidates remain:
 
@@ -199,6 +213,22 @@ stale/forged identity, malformed completion and cancellation cannot publish
 output. Exact terminal observation may publish one local `Completion` wakeup
 only after output/reservation settlement; operation closure still precedes
 mapping/domain/local reclaim.
+
+An accepted or ambiguously accepted local DSC1 operation excludes active DMA
+on each complete source/destination mapping, and an active/ambiguous DMA
+submission excludes DSC1 on its complete mapping. Same-mapping read/read and
+non-overlapping byte ranges remain conflicts; accepted lifetimes on distinct
+mappings may overlap although admission is coarse-serialized.
+DMA completion retains its use until post-completion visibility, while DSC1
+retains both uses through completed/cancelled local settlement. Faulted or
+ambiguous state retains its exact use where identifiable, or quarantines the
+containing platform domain otherwise. This adds no provider ABI and proves no
+cross-engine coherence or hardware execution.
+
+The next local Phase-7 slice is the generated typed `ComputeService` SIP ingress
+for the exact source-read and destination-exclusive authorities, with atomic
+validation/rollback and ownership return. It should not broaden the compute
+operation set or invent a universal accelerator contract.
 
 ### MatrixTile v1
 

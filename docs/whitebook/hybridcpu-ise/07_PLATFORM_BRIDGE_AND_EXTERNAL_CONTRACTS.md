@@ -40,6 +40,17 @@
 > committed only after completed output or cancelled custody is locally settled.
 > Pending/error paths publish nothing, and notification cancellation never
 > substitutes for DSC1 cancellation, provider drain or reclaim authority.
+> Phase-7 Slice 3 adds no public/provider API: a private RuntimeKernel admission
+> gate and bridge lifecycle-ledger checks conservatively exclude simultaneous
+> DMA and DSC1 use
+> of the same full mapping identity. Same-mapping read/read and disjoint byte
+> subranges are rejected; independently authorized distinct mappings remain
+> usable. DMA completion alone retains its use until post-completion visibility,
+> while DSC1 retains both uses until terminal closure and local payload release.
+> Faulted/ambiguous state retains the exact use where identifiable, or
+> quarantines the containing platform domain otherwise. This proves no provider-
+> side conflict model, range/cache-line compatibility, CPU-alias epoch or
+> coherence.
 
 ## Current status at SingNextOS `af791aba...`
 
@@ -256,6 +267,40 @@ The HybridCPU provider intentionally does not implement this interface and
 reports `Dsc1BulkCompute` unavailable. MatrixTile, arithmetic/reduction DSC1,
 DSC2 and L7-SDC remain future candidates described in chapters 04–05 and
 `EXT-HCPU-005`. Internal ISE types are not platform contracts.
+
+The local runtime and bridge now admit DMA submission and DSC1 Copy under a
+conservative whole-mapping interlock. A coarse private RuntimeKernel gate spans
+admission/release, while the bridge derives conflicts from its existing
+lifecycle ledgers under their own gates. Accepted DMA work publishes an exact
+operation use; ambiguous acceptance or submit-path invariant failure retains a
+grant-scoped fault pin. DSC1 acquires both source and destination uses
+atomically. Ordinary pre-accept denial rolls back without blocking later work.
+DSC1 releases after
+completed/cancelled settlement, output publication or teardown discard, both
+buffer-lease releases and exact local release commit. DMA releases only after
+exact completion and the required direction-aware post-completion visibility;
+completion by itself is not release evidence. Fault, malformed evidence or a
+provider throw retains the affected exact uses where they remain identifiable,
+or quarantines the containing platform domain when exact operation identity
+cannot be retained.
+
+This is deliberately not a range-level conflict protocol. Two uses of the same
+mapping conflict even when both read or their byte subranges are disjoint.
+Accepted lifetimes on distinct mappings may overlap only after their independent
+local authority checks; provider admission itself remains coarse-serialized.
+A DMA grant or prepared visibility cycle without submission
+does not hold this active-use pin. Because current buffers have no mutation
+epoch for CPU aliases, an intervening CPU/DSC1 write can leave old DMA prepare
+evidence temporally stale without being represented in the interlock. Real
+executable reuse requires an external epoch/re-prepare and provider drain
+contract under `EXT-HCPU-004`/`005`.
+
+The local model/test contour assumes provider calls inside these private gates
+are bounded and do not wait on cross-thread re-entry. Host supplies DSC1
+`ModelOnly`; combined DMA↔DSC1 behavior is exercised by a faithful test provider
+and is not Host executable-DMA evidence. An executable provider needs a bounded
+provisional reservation/reconciliation protocol before this coarse locking
+shape can be relaxed or treated as a liveness guarantee.
 
 ### Virtualization, evidence and SecureCompute
 

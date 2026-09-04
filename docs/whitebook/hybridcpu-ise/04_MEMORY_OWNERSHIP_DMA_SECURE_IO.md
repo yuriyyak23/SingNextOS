@@ -1,5 +1,21 @@
 # 04. Memory, Ownership, DMA And Secure I/O
 
+> Current-status overlay: Phase-7 Slice 3 adds private RuntimeKernel admission
+> serialization plus bridge lifecycle-ledger checks between bounded DMA
+> submission and DSC1 Copy. An active or
+> ambiguously accepted use excludes the other mechanism from the same complete
+> `PlatformRegionMapping` identity, even for read/read or non-overlapping byte
+> subranges. Accepted lifetimes on distinct independently authorized mappings
+> may overlap, although admission is coarse-serialized; under
+> current `RegionAuthority`, one live mapping per region means those mappings
+> also name distinct owned regions. DMA releases its use only after exact
+> direction-aware post-completion visibility, and DSC1 only after terminal
+> settlement plus local publication/discard and buffer-reservation release.
+> Faulted or ambiguous lifetimes keep their exact use pinned where identifiable,
+> or quarantine the containing platform domain otherwise. This is local
+> admission policy, not range/cache-line analysis, coherence, IOMMU or
+> accelerator evidence.
+
 ## Why this is the strongest SingNextOS/HybridCPU integration seam
 
 SingNextOS уже имеет наиболее важный software primitive для безопасной ISE-интеграции: **linear ownership of regions**. HybridCPU memory/I/O/SecureCompute documentation, в свою очередь, требует owner/domain/range/grant/lifetime/policy checks и явно отвергает идею, что raw pointer, buffer ID или compatibility handle сами по себе дают authority.
@@ -119,6 +135,38 @@ Kernel/platform bridge derives external range mappings internally. SIP never sup
 - direction allowed by both local and external policy;
 - no private-region DMA if secure policy forbids it;
 - exact completion/commit semantics.
+
+### Current cross-mechanism mapping-use rule
+
+For the local model, DMA grant creation and visibility preparation do not yet
+mean that a device operation is active. Accepted submission starts an exact
+operation use; ambiguous provider acceptance or a fail-closed submit-path
+invariant fault creates an exact grant-scoped fault pin instead. Either blocks
+DSC1 source and destination admission on that mapping. Exact completion is
+insufficient to release an accepted use: the operation must also finish its
+direction-aware post-completion visibility transition. Any malformed, faulted
+or ambiguous terminal state keeps the exact use pinned where it remains
+identifiable, or leaves the containing platform domain quarantined otherwise.
+
+DSC1 stages both exact mapping uses before provider submission and rolls them
+back only for an ordinary result that proves no accepted work. Completed or
+cancelled closure releases them after output is published or discarded and the
+local buffer leases are returned. Pending/denied observation or cancellation
+does not release an already accepted use; malformed/faulted/throw paths retain
+the exact use or quarantine its containing platform domain fail closed.
+
+The current policy intentionally excludes the entire mapping across DMA and
+DSC1. It does not infer that read/read or disjoint byte ranges are safe across
+engines. Conversely, distinct mapping identities are not sufficient authority
+on their own: the usual process, capability, ownership, binding, generation and
+access checks still apply independently.
+
+A prepared-but-unsubmitted DMA cycle remains outside this active-use interlock.
+The current managed buffer model also has no CPU-alias mutation epoch, and a
+`Span<T>` acquired before a runtime reservation cannot be revoked. Consequently
+an old prepare result is not executable proof after an intervening CPU or DSC1
+write. A future hardware path must bind prepare evidence to the current mutation
+epoch or require a fresh prepare before submission.
 
 ## Lane6 DSC as ownership-native compute
 
