@@ -2,19 +2,18 @@
 
 > Current-status overlay: Phase-7 Slice 3 adds private RuntimeKernel admission
 > serialization plus bridge lifecycle-ledger checks between bounded DMA
-> submission and DSC1 Copy. An active or
-> ambiguously accepted use excludes the other mechanism from the same complete
-> `PlatformRegionMapping` identity, even for read/read or non-overlapping byte
-> subranges. Accepted lifetimes on distinct independently authorized mappings
-> may overlap, although admission is coarse-serialized; under
-> current `RegionAuthority`, one live mapping per region means those mappings
-> also name distinct owned regions. DMA releases its use only after exact
-> direction-aware post-completion visibility, and DSC1 only after terminal
-> settlement plus local publication/discard and buffer-reservation release.
-> Faulted or ambiguous lifetimes keep their exact use pinned where identifiable,
-> or quarantine the containing platform domain otherwise. This is local
-> admission policy, not range/cache-line analysis, coherence, IOMMU or
-> accelerator evidence.
+> submission and DSC1 Copy. An active or ambiguously accepted use excludes the
+> other mechanism from the same complete `PlatformRegionMapping` identity, even
+> for read/read or non-overlapping byte subranges. Phase-7 Slice 4 additionally
+> adds the generated typed `ComputeService` ownership ingress: exactly one
+> source read-borrow plus one destination exclusive MOVE/return pair is carried
+> through deterministic SIP metadata and the existing `RegionAuthority` ledger.
+> Slice 4 stops before platform mapping/DSC1 submission and therefore adds no
+> HybridCPU execution, coherence or external-memory claim. DMA releases its use
+> only after exact direction-aware post-completion visibility, and DSC1 only
+> after terminal settlement plus local publication/discard and buffer-reservation
+> release. Faulted or ambiguous external lifetimes keep their exact use pinned
+> where identifiable, or quarantine the containing platform domain otherwise.
 
 ## Why this is the strongest SingNextOS/HybridCPU integration seam
 
@@ -108,6 +107,14 @@ Preferred semantics:
 
 Shared mutable memory should require a distinct explicit abstraction, not reuse `BorrowLease<T>`. It needs named synchronization and coherency policy and should remain exceptional.
 
+The delivered `ComputeService` request transport now uses exactly this local
+borrow model for its source buffer. The destination uses ordinary exclusive
+ownership transfer through `RegionAuthority`, not a new shared-mutable grant.
+The two authorities are transported together only by the dedicated generated
+`OwnershipPair` shape, which permits exactly one Borrow plus one Consume. This
+transport fact does not create an external read grant or write mapping; that is
+a later composition boundary.
+
 ## DMA authority
 
 A `DmaCapability` is necessary OS permission, but not a DMA descriptor and not platform authority.
@@ -183,19 +190,34 @@ HybridCPU's code-confirmed DSC1 contour is unusually well matched to SingNextOS 
 - staged compute before commit
 - destination rollback on partial physical write failure
 
-This makes DSC1 a high-value candidate for a future `System.Compute.Bulk` service where input/output regions are passed by borrow/ownership and the caller never sees lane6.
-
-Example conceptual contract:
+SingNextOS now has a concrete product SIP for the first narrow local ingress:
 
 ```csharp
-ValueTask<OwnedRegion<T>> TransformAsync(
-    [Consumes] OwnedRegion<T> destination,
-    BorrowedRegion<T> source,
-    BulkComputeOperation operation,
-    ComputeCapability capability);
+ValueTask<OwnedBuffer<byte>> CopyAsync(
+    [Borrows] OwnedBuffer<byte> source,
+    [Consumes] OwnedBuffer<byte> destination);
 ```
 
-The exact API must wait for response ownership transport and external bridge, but the authority model is already clear.
+The method requires the semantic `Compute / compute:dsc1-copy:v1 / Execute`
+capability and returns destination ownership through the existing correlated
+ownership-response transport. Source borrow and destination MOVE remain
+independent authority transitions in `RegionAuthority`; the generated pair
+transport only makes their request admission atomic enough to avoid a partial
+source loan on ordinary destination preflight/transfer failure.
+
+This current API is intentionally narrower than the conceptual generic
+`TransformAsync<T>` shape. It exposes only whole `OwnedBuffer<byte>` authorities
+and no operation selector, range descriptor, platform mapping, provider token,
+lane or opcode. `Add`, `Mul`, `Fma`, `Reduce` and MatrixTile remain separate
+future work.
+
+The SIP ingress is not yet composed with `SubmitPlatformDsc1Copy`. A local
+service-model responder used by transport tests is not accelerator execution.
+The next sequential local slice, after the ingress PR is merged, must bind these
+request authorities to the existing bounded DSC1 lifecycle and delay source
+borrow return and destination ownership response until exact terminal settlement
+and external-use closure. The real HybridCPU executable facade remains
+`ExternalBlocked` under `EXT-HCPU-005`.
 
 Important current limit: HybridCPU DSC1 is synchronous/all-or-none in the confirmed contour. DSC2 queues, async overlap and coherent DMA/cache are future/denied. SingNextOS must not advertise async hardware overlap merely because its public API is `ValueTask`-based; `ValueTask` can represent logical asynchronous scheduling without claiming ISE hardware overlap.
 
