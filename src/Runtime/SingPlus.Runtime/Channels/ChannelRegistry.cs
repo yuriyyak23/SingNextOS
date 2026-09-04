@@ -64,7 +64,33 @@ public sealed class ChannelRegistry
         return KernelResult<ChannelEndpoint>.Ok(new ChannelEndpoint(handle, domain, owner.Generation, record.State, record.Sequence, record.Capacity));
     }
 
-    internal KernelResult<ChannelEnvelope> Send(SingProcess sender, SingProcess receiver, ChannelEndpointHandle endpoint, uint messageId, object? payload, IReadOnlyCollection<CapabilityId>? capabilityIds)
+    internal KernelResult<ChannelEnvelope> Send(
+        SingProcess sender,
+        SingProcess receiver,
+        ChannelEndpointHandle endpoint,
+        uint messageId,
+        object? payload,
+        IReadOnlyCollection<CapabilityId>? capabilityIds) =>
+        SendCore(sender, receiver, endpoint, messageId, payload, secondaryPayload: null, capabilityIds);
+
+    internal KernelResult<ChannelEnvelope> SendOwnershipPair(
+        SingProcess sender,
+        SingProcess receiver,
+        ChannelEndpointHandle endpoint,
+        uint messageId,
+        object firstOwnershipPayload,
+        object secondOwnershipPayload,
+        IReadOnlyCollection<CapabilityId>? capabilityIds) =>
+        SendCore(sender, receiver, endpoint, messageId, firstOwnershipPayload, secondOwnershipPayload, capabilityIds);
+
+    private KernelResult<ChannelEnvelope> SendCore(
+        SingProcess sender,
+        SingProcess receiver,
+        ChannelEndpointHandle endpoint,
+        uint messageId,
+        object? payload,
+        object? secondaryPayload,
+        IReadOnlyCollection<CapabilityId>? capabilityIds)
     {
         var validation = Resolve(endpoint);
         if (!validation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(validation.Error, validation.Message!);
@@ -78,53 +104,149 @@ public sealed class ChannelRegistry
         if (!record.Protocol.TryTransition(record.State, messageId, out var transition)) return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidProtocolTransition, $"Message {messageId} is illegal in state '{record.State}'.");
         var capabilityValidation = ValidateCapabilities(sender, message, capabilityIds);
         if (!capabilityValidation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(capabilityValidation.Error, capabilityValidation.Message!);
-        var payloadValidation = ValidateRequestPayload(message.RequestPayload, payload);
+        var payloadValidation = ValidateRequestPayload(message.RequestPayload, payload, secondaryPayload);
         if (!payloadValidation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(payloadValidation.Error, payloadValidation.Message!);
 
         object? queuedPayload = payload;
-        if (message.Borrows.Count != 0)
+        object? queuedSecondaryPayload = secondaryPayload;
+        if (message.RequestPayload.Kind == RequestPayloadKind.OwnershipPair)
         {
-            var borrowed = (ITransferableOwnedPayload)payload!;
-            if (!borrowed.IsValidForRuntime) return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidRegionState, "Borrowing messages require a valid owned payload.");
-            var owner = new RegionOwner(sender.DomainId, sender.Generation);
-            var borrower = new RegionOwner(receiver.DomainId, receiver.Generation);
-            var borrowValidation = _regions.Validate(borrowed.Handle, owner);
-            if (!borrowValidation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(borrowValidation.Error, borrowValidation.Message!);
-            var acquired = _regions.AcquireLoan(borrowed.Handle, owner, borrower);
-            if (!acquired.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(acquired.Error, acquired.Message!);
-            var grant = acquired.Value!;
-            try
-            {
-                queuedPayload = borrowed.CreateBorrowLeaseForRuntime(grant.Handle, grant.Lifetime);
-            }
-            catch (InvalidOperationException exception)
-            {
-                _ = _regions.RevokeLoan(grant.Handle, owner);
-                return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidRegionState, exception.Message);
-            }
+            var pair = PrepareOwnershipPair(sender, receiver, message.RequestPayload, payload!, secondaryPayload!);
+            if (!pair.IsSuccess)
+                return KernelResult<ChannelEnvelope>.Fail(pair.Error, pair.Message!);
+            queuedPayload = pair.Value!.First;
+            queuedSecondaryPayload = pair.Value.Second;
         }
-
-        if (message.Consumes.Count != 0)
+        else
         {
-            var owned = (ITransferableOwnedPayload)payload!;
-            if (!owned.IsValidForRuntime) return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidRegionState, "Consuming messages require a valid owned payload.");
-            var oldHandle = owned.Handle;
-            var owner = new RegionOwner(sender.DomainId, sender.Generation);
-            var regionValidation = _regions.Validate(oldHandle, owner);
-            if (!regionValidation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(regionValidation.Error, regionValidation.Message!);
-            var transfer = _regions.Transfer(oldHandle, owner, new RegionOwner(receiver.DomainId, receiver.Generation));
-            if (!transfer.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(transfer.Error, transfer.Message!);
-            queuedPayload = owned.TransferForRuntime(transfer.Value);
-            _regions.ReplacePayload(oldHandle, transfer.Value, (ITransferableOwnedPayload)queuedPayload);
-            sender.RemoveRegion(oldHandle);
-            receiver.AddRegion(transfer.Value);
+            if (message.Borrows.Count != 0)
+            {
+                var borrowed = (ITransferableOwnedPayload)payload!;
+                if (!borrowed.IsValidForRuntime) return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidRegionState, "Borrowing messages require a valid owned payload.");
+                var owner = new RegionOwner(sender.DomainId, sender.Generation);
+                var borrower = new RegionOwner(receiver.DomainId, receiver.Generation);
+                var borrowValidation = _regions.Validate(borrowed.Handle, owner);
+                if (!borrowValidation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(borrowValidation.Error, borrowValidation.Message!);
+                var acquired = _regions.AcquireLoan(borrowed.Handle, owner, borrower);
+                if (!acquired.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(acquired.Error, acquired.Message!);
+                var grant = acquired.Value!;
+                try
+                {
+                    queuedPayload = borrowed.CreateBorrowLeaseForRuntime(grant.Handle, grant.Lifetime);
+                }
+                catch (InvalidOperationException exception)
+                {
+                    _ = _regions.RevokeLoan(grant.Handle, owner);
+                    return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidRegionState, exception.Message);
+                }
+            }
+
+            if (message.Consumes.Count != 0)
+            {
+                var owned = (ITransferableOwnedPayload)payload!;
+                if (!owned.IsValidForRuntime) return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidRegionState, "Consuming messages require a valid owned payload.");
+                var oldHandle = owned.Handle;
+                var owner = new RegionOwner(sender.DomainId, sender.Generation);
+                var regionValidation = _regions.Validate(oldHandle, owner);
+                if (!regionValidation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(regionValidation.Error, regionValidation.Message!);
+                try
+                {
+                    owned.ValidateTransferForRuntime();
+                }
+                catch (InvalidOperationException exception)
+                {
+                    return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidRegionState, exception.Message);
+                }
+                var transfer = _regions.Transfer(oldHandle, owner, new RegionOwner(receiver.DomainId, receiver.Generation));
+                if (!transfer.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(transfer.Error, transfer.Message!);
+                queuedPayload = owned.TransferForRuntime(transfer.Value);
+                _regions.ReplacePayload(oldHandle, transfer.Value, (ITransferableOwnedPayload)queuedPayload);
+                sender.RemoveRegion(oldHandle);
+                receiver.AddRegion(transfer.Value);
+            }
         }
 
         record.Sequence++;
-        var envelope = new ChannelEnvelope(record.Sequence, messageId, queuedPayload);
+        var envelope = new ChannelEnvelope(record.Sequence, messageId, queuedPayload, queuedSecondaryPayload);
         record.Queue.Enqueue(envelope);
         record.State = transition.ToState;
         return KernelResult<ChannelEnvelope>.Ok(envelope);
+    }
+
+    private KernelResult<(object First, object Second)> PrepareOwnershipPair(
+        SingProcess sender,
+        SingProcess receiver,
+        RequestPayloadDescriptorV1 expected,
+        object firstPayload,
+        object secondPayload)
+    {
+        var slots = expected.OwnershipPair;
+        if (slots.Count != 2 || firstPayload is not ITransferableOwnedPayload first || secondPayload is not ITransferableOwnedPayload second)
+            return KernelResult<(object, object)>.Fail(KernelError.UnsupportedPayload, "OwnershipPair requires exactly two ownership payloads.");
+
+        if (first.Handle.RegionId == second.Handle.RegionId)
+            return KernelResult<(object, object)>.Fail(KernelError.InvalidRegionState, "Borrow and consume authorities must refer to distinct regions.");
+
+        var owner = new RegionOwner(sender.DomainId, sender.Generation);
+        var borrower = new RegionOwner(receiver.DomainId, receiver.Generation);
+        var payloads = new[] { first, second };
+        for (var index = 0; index < payloads.Length; index++)
+        {
+            var current = payloads[index];
+            if (!current.IsValidForRuntime)
+                return KernelResult<(object, object)>.Fail(KernelError.InvalidRegionState, $"OwnershipPair payload '{slots[index].ParameterName}' is not a live ownership token.");
+            var authority = _regions.Validate(current.Handle, owner);
+            if (!authority.IsSuccess)
+                return KernelResult<(object, object)>.Fail(authority.Error, authority.Message!);
+            if (slots[index].Disposition == OwnershipRequestDisposition.Consume)
+            {
+                try
+                {
+                    current.ValidateTransferForRuntime();
+                }
+                catch (InvalidOperationException exception)
+                {
+                    return KernelResult<(object, object)>.Fail(KernelError.InvalidRegionState, exception.Message);
+                }
+            }
+        }
+
+        var borrowIndex = slots[0].Disposition == OwnershipRequestDisposition.Borrow ? 0 : 1;
+        var consumeIndex = 1 - borrowIndex;
+        var borrowed = payloads[borrowIndex];
+        var consumed = payloads[consumeIndex];
+        var acquired = _regions.AcquireLoan(borrowed.Handle, owner, borrower);
+        if (!acquired.IsSuccess)
+            return KernelResult<(object, object)>.Fail(acquired.Error, acquired.Message!);
+
+        var grant = acquired.Value!;
+        object borrowedLease;
+        try
+        {
+            borrowedLease = borrowed.CreateBorrowLeaseForRuntime(grant.Handle, grant.Lifetime);
+        }
+        catch (InvalidOperationException exception)
+        {
+            _ = _regions.RevokeLoan(grant.Handle, owner);
+            return KernelResult<(object, object)>.Fail(KernelError.InvalidRegionState, exception.Message);
+        }
+
+        var oldConsumedHandle = consumed.Handle;
+        var transfer = _regions.Transfer(oldConsumedHandle, owner, borrower);
+        if (!transfer.IsSuccess)
+        {
+            _ = _regions.RevokeLoan(grant.Handle, owner);
+            return KernelResult<(object, object)>.Fail(transfer.Error, transfer.Message!);
+        }
+
+        var moved = consumed.TransferForRuntime(transfer.Value);
+        _regions.ReplacePayload(oldConsumedHandle, transfer.Value, (ITransferableOwnedPayload)moved);
+        sender.RemoveRegion(oldConsumedHandle);
+        receiver.AddRegion(transfer.Value);
+
+        return borrowIndex == 0
+            ? KernelResult<(object, object)>.Ok((borrowedLease, moved))
+            : KernelResult<(object, object)>.Ok((moved, borrowedLease));
     }
 
     internal KernelResult<ChannelEnvelope> Receive(SingProcess receiver, ChannelEndpointHandle endpoint)
@@ -194,8 +316,14 @@ public sealed class ChannelRegistry
         return KernelResult.Ok();
     }
 
-    private static KernelResult ValidateRequestPayload(RequestPayloadDescriptorV1 expected, object? payload)
+    private static KernelResult ValidateRequestPayload(
+        RequestPayloadDescriptorV1 expected,
+        object? payload,
+        object? secondaryPayload)
     {
+        if (expected.Kind != RequestPayloadKind.OwnershipPair && secondaryPayload is not null)
+            return KernelResult.Fail(KernelError.UnsupportedPayload, "Only OwnershipPair requests may carry a secondary payload slot.");
+
         switch (expected.Kind)
         {
             case RequestPayloadKind.None:
@@ -236,6 +364,15 @@ public sealed class ChannelRegistry
                 return owned.PayloadKind == expected.OwnershipPayloadKind
                     ? KernelResult.Ok()
                     : KernelResult.Fail(KernelError.UnsupportedPayload, $"Expected ownership payload kind {expected.OwnershipPayloadKind}, got {owned.PayloadKind}.");
+
+            case RequestPayloadKind.OwnershipPair:
+                if (payload is not ITransferableOwnedPayload first || secondaryPayload is not ITransferableOwnedPayload second || expected.OwnershipPair.Count != 2)
+                    return KernelResult.Fail(KernelError.UnsupportedPayload, "Message requires the declared two-slot ownership request payload.");
+                if (first.PayloadKind != expected.OwnershipPair[0].PayloadKind)
+                    return KernelResult.Fail(KernelError.UnsupportedPayload, $"Expected ownership-pair slot 0 kind {expected.OwnershipPair[0].PayloadKind}, got {first.PayloadKind}.");
+                if (second.PayloadKind != expected.OwnershipPair[1].PayloadKind)
+                    return KernelResult.Fail(KernelError.UnsupportedPayload, $"Expected ownership-pair slot 1 kind {expected.OwnershipPair[1].PayloadKind}, got {second.PayloadKind}.");
+                return KernelResult.Ok();
 
             default:
                 return KernelResult.Fail(KernelError.UnsupportedPayload, "Request payload kind is not supported.");

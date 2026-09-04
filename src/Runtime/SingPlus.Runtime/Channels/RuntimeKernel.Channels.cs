@@ -82,7 +82,27 @@ public sealed partial class RuntimeKernel
         ChannelEndpointHandle endpoint,
         uint messageId,
         object? payload = null,
-        IReadOnlyCollection<CapabilityId>? capabilities = null)
+        IReadOnlyCollection<CapabilityId>? capabilities = null) =>
+        SendCore(sender, receiver, endpoint, messageId, payload, secondaryPayload: null, capabilities);
+
+    public KernelResult<ChannelEnvelope> SendOwnershipPair(
+        ProcessHandle sender,
+        ProcessHandle receiver,
+        ChannelEndpointHandle endpoint,
+        uint messageId,
+        object firstOwnershipPayload,
+        object secondOwnershipPayload,
+        IReadOnlyCollection<CapabilityId>? capabilities = null) =>
+        SendCore(sender, receiver, endpoint, messageId, firstOwnershipPayload, secondOwnershipPayload, capabilities);
+
+    private KernelResult<ChannelEnvelope> SendCore(
+        ProcessHandle sender,
+        ProcessHandle receiver,
+        ChannelEndpointHandle endpoint,
+        uint messageId,
+        object? payload,
+        object? secondaryPayload,
+        IReadOnlyCollection<CapabilityId>? capabilities)
     {
         var senderProcess = Processes.Resolve(sender);
         if (!senderProcess.IsSuccess)
@@ -95,13 +115,22 @@ public sealed partial class RuntimeKernel
         if (!responsePreflight.IsSuccess)
             return KernelResult<ChannelEnvelope>.Fail(responsePreflight.Error, responsePreflight.Message!);
 
-        var send = Channels.Send(
-            senderProcess.Value!,
-            receiverProcess.Value!,
-            endpoint,
-            messageId,
-            payload,
-            capabilities);
+        var send = secondaryPayload is null
+            ? Channels.Send(
+                senderProcess.Value!,
+                receiverProcess.Value!,
+                endpoint,
+                messageId,
+                payload,
+                capabilities)
+            : Channels.SendOwnershipPair(
+                senderProcess.Value!,
+                receiverProcess.Value!,
+                endpoint,
+                messageId,
+                payload!,
+                secondaryPayload,
+                capabilities);
         if (!send.IsSuccess) return send;
 
         Responses.RegisterRequest(endpoint, send.Value!, sender, receiver);

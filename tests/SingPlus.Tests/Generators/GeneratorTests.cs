@@ -76,7 +76,7 @@ public interface IConsoleService
     [Theory]
     [InlineData("void Bad([Consumes] int value);", "SINGGEN001")]
     [InlineData("void Bad(OwnedBuffer<byte> value);", "SINGGEN002")]
-    [InlineData("void Bad([Consumes] OwnedBuffer<byte> first, [Borrows] OwnedRegion<int> second);", "SINGGEN003")]
+    [InlineData("void Bad([Consumes] OwnedBuffer<byte> first, [Consumes] OwnedRegion<int> second);", "SINGGEN003")]
     [InlineData("[ReturnsOwnership] int Bad();", "SINGGEN004")]
     [InlineData("OwnedRegion<int> Bad();", "SINGGEN004")]
     [Trait("Category", "Generators")]

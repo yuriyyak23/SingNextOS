@@ -9,13 +9,45 @@ public enum OwnershipPayloadKind
     OwnedRegion = 2
 }
 
+public enum OwnershipRequestDisposition
+{
+    None = 0,
+    Borrow = 1,
+    Consume = 2
+}
+
+public sealed class OwnershipRequestDescriptorV1
+{
+    public OwnershipRequestDescriptorV1(
+        string parameterName,
+        OwnershipPayloadKind payloadKind,
+        OwnershipRequestDisposition disposition)
+    {
+        if (string.IsNullOrWhiteSpace(parameterName))
+            throw new ArgumentException("Ownership request parameter name is required.", nameof(parameterName));
+        if (payloadKind == OwnershipPayloadKind.None)
+            throw new ArgumentException("Ownership request requires a concrete payload kind.", nameof(payloadKind));
+        if (disposition is not OwnershipRequestDisposition.Borrow and not OwnershipRequestDisposition.Consume)
+            throw new ArgumentOutOfRangeException(nameof(disposition));
+
+        ParameterName = parameterName;
+        PayloadKind = payloadKind;
+        Disposition = disposition;
+    }
+
+    public string ParameterName { get; }
+    public OwnershipPayloadKind PayloadKind { get; }
+    public OwnershipRequestDisposition Disposition { get; }
+}
+
 public enum RequestPayloadKind
 {
     None = 0,
     Primitive = 1,
     Enum = 2,
     Bounded = 3,
-    Ownership = 4
+    Ownership = 4,
+    OwnershipPair = 5
 }
 
 public sealed class RequestPayloadDescriptorV1
@@ -37,6 +69,8 @@ public sealed class RequestPayloadDescriptorV1
         typeof(decimal).FullName!
     };
 
+    private readonly OwnershipRequestDescriptorV1[] _ownershipPair;
+
     public RequestPayloadDescriptorV1(
         RequestPayloadKind kind,
         string? parameterName = null,
@@ -45,6 +79,7 @@ public sealed class RequestPayloadDescriptorV1
         OwnershipPayloadKind ownershipPayloadKind = OwnershipPayloadKind.None)
     {
         Kind = kind;
+        _ownershipPair = [];
 
         if (kind == RequestPayloadKind.None)
         {
@@ -54,6 +89,9 @@ public sealed class RequestPayloadDescriptorV1
             TypeName = string.Empty;
             return;
         }
+
+        if (kind == RequestPayloadKind.OwnershipPair)
+            throw new ArgumentException("OwnershipPair request payloads require the dedicated pair constructor.", nameof(kind));
 
         if (string.IsNullOrWhiteSpace(parameterName)) throw new ArgumentException("Request payload parameter name is required.", nameof(parameterName));
         if (string.IsNullOrWhiteSpace(typeName)) throw new ArgumentException("Request payload type name is required.", nameof(typeName));
@@ -87,6 +125,23 @@ public sealed class RequestPayloadDescriptorV1
         }
     }
 
+    public RequestPayloadDescriptorV1(
+        OwnershipRequestDescriptorV1 first,
+        OwnershipRequestDescriptorV1 second)
+    {
+        ArgumentNullException.ThrowIfNull(first);
+        ArgumentNullException.ThrowIfNull(second);
+        if (string.Equals(first.ParameterName, second.ParameterName, StringComparison.Ordinal))
+            throw new ArgumentException("Ownership-pair parameter names must be distinct.");
+        if (first.Disposition == second.Disposition)
+            throw new ArgumentException("OwnershipPair requires exactly one Borrow and exactly one Consume disposition.");
+
+        Kind = RequestPayloadKind.OwnershipPair;
+        ParameterName = string.Empty;
+        TypeName = string.Empty;
+        _ownershipPair = [first, second];
+    }
+
     public static RequestPayloadDescriptorV1 None { get; } = new(RequestPayloadKind.None);
 
     public RequestPayloadKind Kind { get; }
@@ -94,6 +149,7 @@ public sealed class RequestPayloadDescriptorV1
     public string TypeName { get; }
     public int MaxBytes { get; }
     public OwnershipPayloadKind OwnershipPayloadKind { get; }
+    public IReadOnlyList<OwnershipRequestDescriptorV1> OwnershipPair => _ownershipPair;
 }
 
 public sealed class ProtocolMessageDescriptorV1
@@ -120,21 +176,36 @@ public sealed class ProtocolMessageDescriptorV1
         _consumes = NormalizeOwnershipNames(consumes, nameof(consumes));
         _borrows = NormalizeOwnershipNames(borrows, nameof(borrows));
 
-        if (_consumes.Length > 1 || _borrows.Length > 1)
-            throw new ArgumentException("The current channel transport supports at most one ownership-bearing payload per message.");
-        if (_consumes.Length != 0 && _borrows.Length != 0)
-            throw new ArgumentException("A single ownership-bearing payload cannot be both consumed and borrowed.");
+        if (_consumes.Length > 1 || _borrows.Length > 1 || _consumes.Length + _borrows.Length > 2)
+            throw new ArgumentException("The current channel transport supports either one ownership payload or one Borrow+Consume ownership pair per message.");
 
         RequestPayload = requestPayload ?? RequestPayloadDescriptorV1.None;
-        var hasOwnershipInput = _consumes.Length + _borrows.Length == 1;
-        if (hasOwnershipInput != (RequestPayload.Kind == RequestPayloadKind.Ownership))
-            throw new ArgumentException("Consumes/Borrows lifecycle metadata must correspond exactly to an Ownership request payload.", nameof(requestPayload));
-        if (hasOwnershipInput)
+        var ownershipInputCount = _consumes.Length + _borrows.Length;
+        switch (ownershipInputCount)
         {
-            var lifecycleParameter = _consumes.Length == 1 ? _consumes[0] : _borrows[0];
-            if (!string.Equals(lifecycleParameter, RequestPayload.ParameterName, StringComparison.Ordinal))
-                throw new ArgumentException("Ownership lifecycle metadata must name the request payload parameter.", nameof(requestPayload));
+            case 0:
+                if (RequestPayload.Kind is RequestPayloadKind.Ownership or RequestPayloadKind.OwnershipPair)
+                    throw new ArgumentException("Ownership request payload metadata requires matching Consumes/Borrows lifecycle metadata.", nameof(requestPayload));
+                break;
+
+            case 1:
+                if (RequestPayload.Kind != RequestPayloadKind.Ownership)
+                    throw new ArgumentException("A single ownership lifecycle entry must correspond exactly to an Ownership request payload.", nameof(requestPayload));
+                var lifecycleParameter = _consumes.Length == 1 ? _consumes[0] : _borrows[0];
+                if (!string.Equals(lifecycleParameter, RequestPayload.ParameterName, StringComparison.Ordinal))
+                    throw new ArgumentException("Ownership lifecycle metadata must name the request payload parameter.", nameof(requestPayload));
+                break;
+
+            case 2:
+                if (_consumes.Length != 1 || _borrows.Length != 1)
+                    throw new ArgumentException("An ownership pair requires exactly one consumed and exactly one borrowed payload.");
+                if (RequestPayload.Kind != RequestPayloadKind.OwnershipPair || RequestPayload.OwnershipPair.Count != 2)
+                    throw new ArgumentException("Borrow+Consume lifecycle metadata must correspond exactly to an OwnershipPair request payload.", nameof(requestPayload));
+                ValidatePairSlot(RequestPayload.OwnershipPair, _borrows[0], OwnershipRequestDisposition.Borrow);
+                ValidatePairSlot(RequestPayload.OwnershipPair, _consumes[0], OwnershipRequestDisposition.Consume);
+                break;
         }
+
         if (returnsOwnership != (returnOwnershipPayloadKind != OwnershipPayloadKind.None))
             throw new ArgumentException("ReturnsOwnership metadata must declare a concrete returned ownership payload kind.", nameof(returnOwnershipPayloadKind));
 
@@ -151,6 +222,16 @@ public sealed class ProtocolMessageDescriptorV1
     public OwnershipPayloadKind OwnershipPayloadKind => RequestPayload.OwnershipPayloadKind;
     public OwnershipPayloadKind ReturnOwnershipPayloadKind { get; }
     public RequestPayloadDescriptorV1 RequestPayload { get; }
+
+    private static void ValidatePairSlot(
+        IReadOnlyList<OwnershipRequestDescriptorV1> slots,
+        string parameterName,
+        OwnershipRequestDisposition disposition)
+    {
+        var matches = slots.Where(slot => slot.Disposition == disposition).ToArray();
+        if (matches.Length != 1 || !string.Equals(matches[0].ParameterName, parameterName, StringComparison.Ordinal))
+            throw new ArgumentException($"OwnershipPair {disposition} metadata must name the matching lifecycle parameter.");
+    }
 
     private static string[] NormalizeOwnershipNames(IEnumerable<string>? names, string parameterName)
     {
@@ -227,4 +308,8 @@ public sealed record ChannelEndpoint(
     ulong Sequence,
     int Capacity);
 
-public sealed record ChannelEnvelope(ulong Sequence, uint MessageId, object? Payload);
+public sealed record ChannelEnvelope(
+    ulong Sequence,
+    uint MessageId,
+    object? Payload,
+    object? SecondaryPayload = null);

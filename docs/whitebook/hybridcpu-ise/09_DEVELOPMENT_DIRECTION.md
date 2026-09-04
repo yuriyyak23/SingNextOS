@@ -17,18 +17,15 @@ boundaries.
 > kernel build and admission artifacts, but the external path stops at
 > `ManagedAssemblyToHybridCpuAot`. `EXT-HCPU-001` remains `ExternalBlocked`; the
 > image stage is `NotProduced` and ISE execution is `NotAttempted`. Phase-7
-> Slices 1–3 now provide bounded DSC1 `UInt8` Copy as a Host `ModelOnly`
-> reference lifecycle over separate compute capability, owned regions and
-> exact completion/cancellation closure, plus an observation-driven wakeup
-> through the existing generation-bound `KernelEventEndpoint`. Output/custody
-> settles before event commit, and notification cancellation never replaces
-> provider drain. Private RuntimeKernel admission serialization plus bridge
-> lifecycle-ledger checks now also prevent
-> active or ambiguously accepted DMA and DSC1 from sharing the same full mapping
-> identity until their exact release boundary. It is not range-level coherence
-> or an executable provider claim.
-> HybridCPU executable compute remains unavailable under `EXT-HCPU-005`; no
-> ISE/compiler code is consumed or changed.
+> Slices 1–4 now provide bounded DSC1 `UInt8` Copy as a Host `ModelOnly`
+> platform lifecycle, exact completion/cancellation and observation wakeup,
+> conservative DMA↔DSC1 whole-mapping exclusion, and a generated product
+> `ComputeService` SIP ingress carrying exactly one source read-borrow plus one
+> destination exclusive MOVE/return pair. Slice 4 is local authority transport
+> only: it is not yet composed with `SubmitPlatformDsc1Copy`, creates no platform
+> mapping and makes no executable-provider claim. HybridCPU executable compute
+> remains unavailable under `EXT-HCPU-005`; no ISE/compiler code is consumed or
+> changed.
 
 ## Historical baseline delta
 
@@ -187,15 +184,19 @@ Tracked by `EXT-HCPU-004`.
 
 ## Track E — first narrow ISE compute provider
 
-**In progress locally; ExternalBlocked for ISE execution.** Phase-7 Slices 1–3
-implement the bounded DSC1 Copy contract, a `RuntimeKernel` CPU-staged
-reference copy admitted by a Host `ModelOnly` lifecycle provider, and
-generation-bound observation wakeup through the existing event endpoint,
-alongside fail-closed feature selection and a conservative whole-mapping
-DMA↔DSC1 interlock. A real provider still depends on an actual stable neutral
-external interface, not internal ISE breadth.
+**In progress locally; ExternalBlocked for ISE execution.** Phase-7 Slices 1–4
+now prove four separate local layers for the bounded DSC1 Copy family:
 
-Candidates remain:
+1. a `RuntimeKernel` CPU-staged reference copy admitted by a Host `ModelOnly`
+   lifecycle provider;
+2. generation-bound terminal observation wakeup through the existing event
+   endpoint;
+3. conservative whole-mapping DMA↔DSC1 admission/release interlock;
+4. generated typed product `ComputeService` SIP ingress with exact source-read
+   borrow and destination-exclusive consume/ownership-return semantics.
+
+A real provider still depends on an actual stable neutral external interface,
+not internal ISE breadth.
 
 ### DSC1 BulkCompute
 
@@ -208,8 +209,9 @@ Copy / Add / Mul / Fma / Reduce
 Do not claim DSC2 queues or coherent async overlap.
 
 Current local v1 supports only `UInt8/AllOrNone Copy`, disjoint owned regions
-and at most 1 MiB. It does not yet expose Add/Mul/Fma/Reduce. Provider denial,
-stale/forged identity, malformed completion and cancellation cannot publish
+and at most 1 MiB in the platform lifecycle. It does not expose
+Add/Mul/Fma/Reduce through the product service. Provider denial, stale/forged
+identity, malformed completion and cancellation cannot publish platform-model
 output. Exact terminal observation may publish one local `Completion` wakeup
 only after output/reservation settlement; operation closure still precedes
 mapping/domain/local reclaim.
@@ -218,17 +220,56 @@ An accepted or ambiguously accepted local DSC1 operation excludes active DMA
 on each complete source/destination mapping, and an active/ambiguous DMA
 submission excludes DSC1 on its complete mapping. Same-mapping read/read and
 non-overlapping byte ranges remain conflicts; accepted lifetimes on distinct
-mappings may overlap although admission is coarse-serialized.
-DMA completion retains its use until post-completion visibility, while DSC1
-retains both uses through completed/cancelled local settlement. Faulted or
-ambiguous state retains its exact use where identifiable, or quarantines the
-containing platform domain otherwise. This adds no provider ABI and proves no
-cross-engine coherence or hardware execution.
+mappings may overlap although admission is coarse-serialized. DMA completion
+retains its use until post-completion visibility, while DSC1 retains both uses
+through completed/cancelled local settlement. Faulted or ambiguous state
+retains its exact use where identifiable, or quarantines the containing
+platform domain otherwise. This adds no provider ABI and proves no cross-engine
+coherence or hardware execution.
 
-The next local Phase-7 slice is the generated typed `ComputeService` SIP ingress
-for the exact source-read and destination-exclusive authorities, with atomic
-validation/rollback and ownership return. It should not broaden the compute
-operation set or invent a universal accelerator contract.
+The generated product ingress is now current:
+
+```text
+Compute/Execute capability
++ [Borrows] OwnedBuffer<byte> source
++ [Consumes] OwnedBuffer<byte> destination
+-> dedicated generated Borrow+Consume OwnershipPair
+-> destination ownership returned only through typed response publication
+```
+
+The pair transport remains narrow: exactly one Borrow and one Consume. It is
+not a variadic/general multi-payload ABI. Capability and both
+`RegionAuthority` owner/generation/state checks occur before the corresponding
+ownership transitions; same-region aliasing is denied; destination transfer is
+preflighted before source loan; and a later ordinary destination-transfer
+failure revokes the newly acquired source loan. Responder teardown returns the
+borrower-domain source loan before reclaim and reclaims the service-owned
+consumed destination instead of resurrecting the caller's old token.
+
+This ingress is **not yet connected to the platform DSC1 lifecycle**. A local
+service-model responder used by transport tests is not Host accelerator
+execution and not HybridCPU evidence. Consequently Slice 4 does not satisfy
+`EXT-HCPU-005` and does not weaken its `ExternalBlocked` classification.
+
+The next sequential Phase-7 slice, after the ingress PR is merged, is to compose
+these two existing local boundaries without broadening the operation set:
+
+```text
+typed source borrow + destination MOVE
+-> service-side exact local authority
+-> required platform domain/mapping authority
+-> existing SubmitPlatformDsc1Copy / Observe / Cancel
+-> terminal output/custody settlement
+-> close exact platform uses
+-> return source borrow
+-> publish destination ownership response
+```
+
+The composition must prove that stale/forged/replayed/wrong-generation
+requests and malformed/ambiguous/terminal-faulted provider states cannot return
+borrow or destination ownership early. Executable HybridCPU remains blocked
+until a real neutral facade independently supplies executable custody,
+visibility and drain semantics.
 
 ### MatrixTile v1
 
@@ -419,7 +460,7 @@ Current assists are bounded warming mechanisms. First OS use should remain prefe
 
 ## Definition of Done for a hardware-backed service
 
-A service is not “HybridCPU integrated” because a host provider or opcode exists.
+A service is not “HybridCPU integrated” because a host provider, generated SIP or opcode exists.
 
 Required closure:
 
