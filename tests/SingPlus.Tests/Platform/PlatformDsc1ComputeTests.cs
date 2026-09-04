@@ -1095,7 +1095,7 @@ public sealed class PlatformDsc1ComputeTests
 
         Assert.False(terminate.IsSuccess);
         Assert.Equal(KernelError.PlatformBindingDraining, terminate.Error);
-        Assert.True(wait.IsCanceled);
+        Assert.ThrowsAny<OperationCanceledException>(() => wait.GetAwaiter().GetResult());
         Assert.Equal(1, provider.CancelCalls);
         Assert.Equal(0, provider.ObserveCalls);
 
