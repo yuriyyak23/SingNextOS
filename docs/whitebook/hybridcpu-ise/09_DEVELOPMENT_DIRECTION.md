@@ -13,19 +13,19 @@ boundaries.
 > SingNextOS `108195c...` and audits HybridCPU-v2 `9e001bf...`, superseding the
 > delivery-status claims in the historical baseline below. Phases 1–5 and the
 > locally owned Phase-6 lifecycle, scheduler-policy and event/wait slices are
-> complete. This qualification changeset reproducibly digest-binds the managed
-> kernel build and admission artifacts, but the external path stops at
-> `ManagedAssemblyToHybridCpuAot`. `EXT-HCPU-001` remains `ExternalBlocked`; the
-> image stage is `NotProduced` and ISE execution is `NotAttempted`. Phase-7
-> Slices 1–4 now provide bounded DSC1 `UInt8` Copy as a Host `ModelOnly`
-> platform lifecycle, exact completion/cancellation and observation wakeup,
-> conservative DMA↔DSC1 whole-mapping exclusion, and a generated product
-> `ComputeService` SIP ingress carrying exactly one source read-borrow plus one
-> destination exclusive MOVE/return pair. Slice 4 is local authority transport
-> only: it is not yet composed with `SubmitPlatformDsc1Copy`, creates no platform
-> mapping and makes no executable-provider claim. HybridCPU executable compute
-> remains unavailable under `EXT-HCPU-005`; no ISE/compiler code is consumed or
-> changed.
+> complete. `EXT-HCPU-001` remains `ExternalBlocked`; the image stage is
+> `NotProduced` and ISE execution is `NotAttempted`. Phase-7 Slices 1–5 now
+> provide the complete local Host `ModelOnly` bounded DSC1 `UInt8` Copy path:
+> exact platform lifecycle and observation wakeup, conservative DMA↔DSC1
+> whole-mapping exclusion, generated product `ComputeService` Borrow+Consume
+> ingress, and service→platform→correlated ownership-response composition.
+> Because the SIP source remains caller-owned while current platform DSC1 is
+> single-subject/owner-bound, the service snapshots the bounded source borrow
+> into service-owned staging and keeps the original borrow live through exact
+> DSC1 terminal settlement and temporary mapping closure. This is not zero-copy,
+> direct borrowed-region execution or hardware evidence. HybridCPU executable
+> compute remains unavailable under `EXT-HCPU-005`; no ISE/compiler code is
+> consumed or changed.
 
 ## Historical baseline delta
 
@@ -50,7 +50,7 @@ work из PR #12/#13.
 - region mapping reservation that blocks incompatible ownership lifecycle;
 - capability revocation cascade into platform mapping drain/revoke.
 
-Это закрывает **Track A как Current local foundation** и сохраняет Platform Authority Bridge как **CurrentModelBound**. Оно не закрывает `EXT-HCPU-003`/`004`: реального HybridCPU provider, IOMMU/DMA/rebind/coherence semantics в репозитории нет.
+Это закрывает **Track A как Current local foundation** и сохраняет Platform Authority Bridge как **CurrentModelBound**. Оно не закрывает внешние provider requirements: локальная модель не доказывает реальную MMU/IOMMU/DMA/compute/coherence authority.
 
 ## Architecture target
 
@@ -80,7 +80,7 @@ No layer substitutes for another.
 
 ### Status
 
-**Current / completed local foundation.** PR #14 closes typed response publication and PR #15 closes generated client/runtime adapter plus teardown semantics. Later platform completion work must compose with this response model rather than introduce a second publication authority.
+**Current / completed local foundation.** PR #14 closes typed response publication and PR #15 closes generated client/runtime adapter plus teardown semantics. Later platform completion work composes with this response model rather than introducing a second publication authority.
 
 ### Current outcomes
 
@@ -98,34 +98,18 @@ No layer substitutes for another.
 
 ### Status
 
-**CurrentModelBound.** The local/host-backed bridge is current, but its current feature-bit and synchronous revoke surface needs Platform Contract vNext lifecycle/completion before real HybridCPU integration.
+**CurrentModelBound.** The local/host-backed bridge is current. New bridge
+families are added only for concrete use cases; provider tokens and platform
+identities never become public SIP authority.
 
-Current v1 exposes:
-
-```text
-NeutralDomainBinding
-DirectOwnedRegionMapping
-```
-
-and a deterministic host provider.
-
-### Next local evolution
-
-Add new bridge families only when concrete external/use-case requirements exist. Avoid pre-creating broad abstractions for every ISE feature.
-
-Immediate next work is the phased roadmap sequence:
-
-```text
-Platform Contract vNext
- -> explicit revocation/completion lifecycle
- -> real neutral HybridCPU domain binding
- -> exact non-coherent-safe region mapping
- -> bounded DMA vertical slice
-```
+The current implementation has evolved beyond the historical v1 planning
+snapshot with versioned feature discovery, lifecycle/completion, exact mapping,
+DMA/visibility, events and bounded DSC1 Host-model families. Those later
+families remain feature-scoped rather than forming a universal HAL.
 
 Constraints remain:
 
-- no HybridCPU internal type references;
+- no HybridCPU internal type references in public/native contracts;
 - no raw lanes/opcodes;
 - no VMCS authority store;
 - no provider token leakage to SIPs;
@@ -136,12 +120,11 @@ Constraints remain:
 ### Status
 
 **Current for the exact neutral lifecycle; externally incomplete for later
-feature families.** `HybridCpuPlatformAuthorityProvider` now binds an exact
+feature families.** `HybridCpuPlatformAuthorityProvider` binds an exact
 SingNextOS process subject to the neutral HybridCPU runtime and provides
 synchronous definitive `Start / Park / Resume / Close` transitions. HybridCPU
-scheduler-policy admission remains `ExternalBlocked`, and the provider does not
-turn this lifecycle binding into executable DMA, compute, virtualization or
-security authority.
+scheduler-policy admission remains `ExternalBlocked`, and this lifecycle binding
+does not become executable DMA, compute, virtualization or security authority.
 
 ### Required outcomes
 
@@ -157,129 +140,134 @@ Tracked by `EXT-HCPU-003`.
 
 ### Status
 
-**CurrentModelBound locally; ExternalBlocked for real direct mapping.**
+**CurrentModelBound locally; externally incomplete for real reusable direct
+mapping.**
 
 Current local mapping requires exact `MemoryRegion` capability and current
 region ownership, then reserves the region against transfer/loan/release. The
-local runtime also conservatively excludes active DMA and DSC1 use of the same
-complete mapping identity while permitting independently authorized distinct
-mappings. It retains ambiguous/faulted uses rather than reclaiming through
-uncertain external state, or quarantines their containing platform domain when
-an exact operation identity cannot be retained.
+runtime conservatively excludes active DMA and DSC1 use of the same complete
+mapping identity while permitting independently authorized distinct mappings.
+It retains ambiguous/faulted uses or quarantines their containing platform
+domain rather than reclaiming through uncertain external state.
 
 ### Required external closure
 
-- exact range/access mapping;
+- exact hardware-backed range/access mapping where needed;
 - revoke/unmap;
 - stale binding rejection;
 - drain/cancel before ownership rebind/reclaim;
-- truthful coherence/direct-access capability statement.
+- truthful coherence/direct-access capability statement;
+- mutation/visibility epoch or mandatory fresh-prepare rule for executable reuse.
 
 Do not infer page remap, IOMMU or cache behavior from the local interface.
-In particular, this policy neither proves range/cache-line compatibility nor
-versions CPU alias mutations after DMA preparation. Executable reuse still
-needs a provider-side drain and mutation/visibility epoch or fresh-prepare rule.
-
 Tracked by `EXT-HCPU-004`.
 
 ## Track E — first narrow ISE compute provider
 
-**In progress locally; ExternalBlocked for ISE execution.** Phase-7 Slices 1–4
-now prove four separate local layers for the bounded DSC1 Copy family:
+**Local Host-model vertical path complete through Slice 5; ExternalBlocked for
+ISE/HybridCPU executable compute.**
 
-1. a `RuntimeKernel` CPU-staged reference copy admitted by a Host `ModelOnly`
-   lifecycle provider;
-2. generation-bound terminal observation wakeup through the existing event
-   endpoint;
+Phase-7 now proves five local layers for one bounded DSC1 Copy family:
+
+1. `RuntimeKernel` CPU-staged reference copy admitted by Host `ModelOnly` DSC1
+   submit/completion/cancel lifecycle;
+2. generation-bound observation wakeup through the existing event endpoint;
 3. conservative whole-mapping DMA↔DSC1 admission/release interlock;
-4. generated typed product `ComputeService` SIP ingress with exact source-read
-   borrow and destination-exclusive consume/ownership-return semantics.
-
-A real provider still depends on an actual stable neutral external interface,
-not internal ISE breadth.
+4. generated typed product `ComputeService` ingress with exact source-read
+   Borrow plus destination-exclusive Consume/ownership-return semantics;
+5. `RuntimeComputeServiceHost` composition from that typed ingress through the
+   existing platform DSC1 lifecycle and back to correlated ownership response.
 
 ### DSC1 BulkCompute
 
-Strong fit for owned regions and all-or-none semantics:
+The architectural family remains:
 
 ```text
 Copy / Add / Mul / Fma / Reduce
 ```
 
-Do not claim DSC2 queues or coherent async overlap.
+but the delivered local product service intentionally exposes **Copy only**.
+There is no justification to add Add/Mul/Fma/Reduce, DSC2 queues or coherent
+async overlap while executable Copy itself remains externally blocked.
 
-Current local v1 supports only `UInt8/AllOrNone Copy`, disjoint owned regions
-and at most 1 MiB in the platform lifecycle. It does not expose
-Add/Mul/Fma/Reduce through the product service. Provider denial, stale/forged
-identity, malformed completion and cancellation cannot publish platform-model
-output. Exact terminal observation may publish one local `Completion` wakeup
-only after output/reservation settlement; operation closure still precedes
-mapping/domain/local reclaim.
+The current bounded platform lifecycle retains accepted source/destination uses
+through exact terminal settlement and local publication/discard. DMA and DSC1
+continue to conflict conservatively on the same complete mapping identity.
+Faulted/ambiguous state retains exact use where identifiable or quarantines the
+containing platform domain. This remains local bridge policy, not provider-side
+coherence evidence.
 
-An accepted or ambiguously accepted local DSC1 operation excludes active DMA
-on each complete source/destination mapping, and an active/ambiguous DMA
-submission excludes DSC1 on its complete mapping. Same-mapping read/read and
-non-overlapping byte ranges remain conflicts; accepted lifetimes on distinct
-mappings may overlap although admission is coarse-serialized. DMA completion
-retains its use until post-completion visibility, while DSC1 retains both uses
-through completed/cancelled local settlement. Faulted or ambiguous state
-retains its exact use where identifiable, or quarantines the containing
-platform domain otherwise. This adds no provider ABI and proves no cross-engine
-coherence or hardware execution.
+### Typed service composition
 
-The generated product ingress is now current:
+The public request remains:
 
 ```text
-Compute/Execute capability
+caller exact Compute/Execute capability
 + [Borrows] OwnedBuffer<byte> source
 + [Consumes] OwnedBuffer<byte> destination
--> dedicated generated Borrow+Consume OwnershipPair
--> destination ownership returned only through typed response publication
+-> generated Borrow+Consume OwnershipPair
 ```
 
-The pair transport remains narrow: exactly one Borrow and one Consume. It is
-not a variadic/general multi-payload ABI. Capability and both
-`RegionAuthority` owner/generation/state checks occur before the corresponding
-ownership transitions; same-region aliasing is denied; destination transfer is
-preflighted before source loan; and a later ordinary destination-transfer
-failure revokes the newly acquired source loan. Responder teardown returns the
-borrower-domain source loan before reclaim and reclaims the service-owned
-consumed destination instead of resurrecting the caller's old token.
-
-This ingress is **not yet connected to the platform DSC1 lifecycle**. A local
-service-model responder used by transport tests is not Host accelerator
-execution and not HybridCPU evidence. Consequently Slice 4 does not satisfy
-`EXT-HCPU-005` and does not weaken its `ExternalBlocked` classification.
-
-The next sequential Phase-7 slice, after the ingress PR is merged, is to compose
-these two existing local boundaries without broadening the operation set:
+After delivery, source and destination cannot be placed directly into one
+current platform DSC1 request without violating the owner-bound mapping model:
+source remains owned by the caller while destination has moved to the service.
+The service therefore uses a bounded copy adaptation:
 
 ```text
-typed source borrow + destination MOVE
--> service-side exact local authority
--> required platform domain/mapping authority
+live caller source BorrowLease
+-> snapshot into service-owned staging
+-> exact temporary staging Read mapping
++ exact temporary service destination Write mapping
 -> existing SubmitPlatformDsc1Copy / Observe / Cancel
--> terminal output/custody settlement
--> close exact platform uses
--> return source borrow
--> publish destination ownership response
 ```
 
-The composition must prove that stale/forged/replayed/wrong-generation
-requests and malformed/ambiguous/terminal-faulted provider states cannot return
-borrow or destination ownership early. Executable HybridCPU remains blocked
-until a real neutral facade independently supplies executable custody,
-visibility and drain semantics.
+The original source borrow remains live until accepted DSC1 use is terminal and
+both temporary mappings are closed. On `Completed`, staging/capabilities are
+released, the source borrow returns, and destination ownership publishes only
+through the existing correlated response transfer. On exact `Cancelled`, the
+same platform cleanup happens before borrow return; the response is cancelled
+and service-owned destination is released instead of being published as
+success. Ordinary bounded/pre-submit denial also cleans up and performs no fake
+success. Ambiguous `PlatformFaulted` admission remains pinned and does not
+return borrow or destination authority through uncertain external state.
+
+This ordering is the important local proof:
+
+```text
+accepted platform use closed
+BEFORE source borrow return
+BEFORE successful destination ownership response
+```
+
+The bounded source snapshot is not zero-copy and does not claim that an
+executable provider can consume a caller borrow directly. It is an explicit
+adaptation to the current single-subject platform contract.
+
+End-to-end tests drive the generated typed runtime client and cover immediate
+Host completion, deferred completion, exact cancellation, bounded-shape failure
+with zero provider submit calls, wrong internal service compute authority and
+post-cleanup platform-domain revocation.
+
+### External closure
+
+A real provider still depends on a stable neutral executable interface, not
+internal ISE breadth. Required missing terms include exact neutral source/
+destination custody, accepted-work identity, observe/cancel/drain semantics,
+output CPU visibility/acquire proof and close-before-rebind/reclaim.
+
+Tracked by `EXT-HCPU-005`.
 
 ### MatrixTile v1
 
-Strong fit for AI/HPC but needs typed shape/numeric/layout contracts and owned-region ingress/egress.
+Strong future fit for AI/HPC but requires separately scoped typed shape/numeric/
+layout contracts and executable memory custody. It is not folded into DSC1 merely
+because both may use lane-6 resources internally.
 
 ### Scoped L7-SDC accelerator
 
-Strong device story, but memory ordering/coherence requires explicit provider contract.
-
-Tracked by `EXT-HCPU-005`.
+Also future/scoped. Memory ordering and command-footprint authority require an
+explicit provider contract and are not inferred from the completed local DSC1
+Host-model path.
 
 ## Track F — scheduler/event integration
 
@@ -287,11 +275,9 @@ Tracked by `EXT-HCPU-005`.
 Exact process-scoped execution lifecycle, binding-scoped semantic
 budget/priority/latency/throughput intent, IRQ and model DMA-completion delivery
 plus model DSC1 terminal delivery through one generation-bound endpoint, and
-cancellable `ValueTask` consumption are implemented. The scheduler policy and
-DSC1 lifecycle are host `ModelOnly`; the HybridCPU provider correctly reports
-those unavailable where no neutral interface exists. HybridCPU supplies the
-exact neutral IRQ binding, but no generic timer/event wait, DMA-completion or
-compute-completion surface.
+cancellable `ValueTask` consumption are implemented. Scheduler policy and DSC1
+lifecycle are Host `ModelOnly`; the HybridCPU provider correctly reports those
+unavailable where no neutral interface exists.
 
 Public API remains `Task`/`ValueTask`/cancellation/event/channel-oriented and
 does not expose `WFE`, `SEV`, VT IDs or lane placement as native ABI. Real timer
@@ -350,9 +336,12 @@ Until then confidential-domain API may exist only as a target shape that reports
 
 ## Track J — native system services
 
-**BridgeRequired downstream.** Filesystem, networking, process management, GUI/compositor, richer device services and compatibility stacks build on the same substrate.
+**BridgeRequired downstream.** Filesystem, networking, process management,
+GUI/compositor, richer device services and compatibility stacks build on the
+same substrate.
 
-The normative native API/UI model is defined in [`12_NATIVE_API_AND_UI_CONTRACTS.md`](12_NATIVE_API_AND_UI_CONTRACTS.md).
+The normative native API/UI model is defined in
+[`12_NATIVE_API_AND_UI_CONTRACTS.md`](12_NATIVE_API_AND_UI_CONTRACTS.md).
 
 ### Native API rule
 
@@ -367,7 +356,8 @@ High-level functions are not added as a huge kernel syscall surface.
 
 ### Filesystem/storage
 
-Prefer capability-backed file/session objects and owned regions for large I/O where supported. Copy/sanitization remains valid when required.
+Prefer capability-backed file/session objects and owned regions for large I/O
+where supported. Copy/sanitization remains valid when required.
 
 ### Network
 
@@ -399,7 +389,9 @@ Notification
 Shell
 ```
 
-Implementation order may be incremental, but no GUI implementation should bypass capability/ownership rules with a privileged global shared framebuffer or ambient global-input authority.
+Implementation order may be incremental, but no GUI implementation should
+bypass capability/ownership rules with a privileged global shared framebuffer
+or ambient global-input authority.
 
 ### Surface presentation
 
@@ -414,7 +406,8 @@ APP exclusive-write
  -> APP reacquires write authority
 ```
 
-This is a software contract target. Concrete GPU DMA/remap/coherence remains external/future until provider evidence exists.
+This is a software contract target. Concrete GPU DMA/remap/coherence remains
+external/future until provider evidence exists.
 
 ## Track K — compatibility personalities
 
@@ -426,7 +419,8 @@ legacy API
  -> native Sing+ service contracts
 ```
 
-Compatibility must not redefine native process, filesystem, network, GUI, capability or ownership semantics.
+Compatibility must not redefine native process, filesystem, network, GUI,
+capability or ownership semantics.
 
 ## Driver strategy
 
@@ -442,7 +436,8 @@ Recommended progression:
 
 ## Real-time research track
 
-HybridCPU typed-slot/replay/evidence properties make real-time research attractive, but exact-cycle hard real-time is not a current OS guarantee.
+HybridCPU typed-slot/replay/evidence properties make real-time research
+attractive, but exact-cycle hard real-time is not a current OS guarantee.
 
 Future RT profile requires explicit contracts for:
 
@@ -456,11 +451,14 @@ Future RT profile requires explicit contracts for:
 
 ## Assist research track
 
-Current assists are bounded warming mechanisms. First OS use should remain prefetch/warming policy. GC/security memory mutation or scanning is a different authority class and cannot be inferred from assist existence.
+Current assists are bounded warming mechanisms. First OS use should remain
+prefetch/warming policy. GC/security memory mutation or scanning is a different
+authority class and cannot be inferred from assist existence.
 
 ## Definition of Done for a hardware-backed service
 
-A service is not “HybridCPU integrated” because a host provider, generated SIP or opcode exists.
+A service is not “HybridCPU integrated” because a Host provider, generated SIP,
+local vertical composition or opcode exists.
 
 Required closure:
 
@@ -469,18 +467,19 @@ local contract shape proven
 + local capability/ownership negative tests
 + external feature discovery positive
 + external denial/stale tests
-+ exact domain/range binding
-+ execution result semantics
-+ explicit publication/commit proof
++ exact domain/range/custody binding
++ executable result semantics
++ explicit visibility/publication proof
 + cleanup/revocation proof
 + deterministic integration artifact
 ```
 
-If any piece is missing, classify honestly as `CurrentModelBound`, `BridgeRequired`, `ExternalBlocked`, `ProjectionOnly` or `FutureGated` as appropriate.
+If any piece is missing, classify honestly as `CurrentModelBound`,
+`BridgeRequired`, `ExternalBlocked`, `ProjectionOnly` or `FutureGated`.
 
 ## Priority decision
 
-Near-term implementation now starts after completed Track A and follows the roadmap dependency order:
+The authority-first dependency order remains:
 
 ```text
 1. Platform Contract vNext feature/completion model
@@ -493,4 +492,10 @@ Near-term implementation now starts after completed Track A and follows the road
 8. compatibility personalities only downstream
 ```
 
-The UI/API architecture is specified now so later services converge on one ABI, but specification does not imply current implementation.
+For Phase 7 specifically, the narrow local Copy vertical path is now complete
+through typed service composition. Do not grow arithmetic/queue breadth while
+its real neutral executable provider remains `ExternalBlocked`; the next Phase-7
+closure belongs to the external facade recorded in `EXT-HCPU-005`.
+
+The UI/API architecture is specified now so later services converge on one ABI,
+but specification does not imply current implementation.
