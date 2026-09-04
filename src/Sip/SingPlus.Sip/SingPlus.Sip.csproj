@@ -8,5 +8,6 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../../contracts/SingPlus.Contracts/SingPlus.Contracts.csproj" />
+    <ProjectReference Include="../../../sdk/SingPlus.Sip.Sdk/SingPlus.Sip.Sdk.csproj" />
   </ItemGroup>
 </Project>
