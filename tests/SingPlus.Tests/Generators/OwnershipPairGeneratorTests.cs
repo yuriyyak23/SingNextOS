@@ -39,7 +39,7 @@ public interface IComputeService
         foreach (var key in first.Keys) Assert.Equal(first[key], second[key]);
 
         Assert.Contains(first.Values, text =>
-            text.Contains("RequestPayloadKind)5", StringComparison.Ordinal) &&
+            text.Contains("OwnershipRequestDescriptorV1", StringComparison.Ordinal) &&
             text.Contains("OwnershipRequestDisposition)1", StringComparison.Ordinal) &&
             text.Contains("OwnershipRequestDisposition)2", StringComparison.Ordinal));
         Assert.Contains(first.Values, text =>
