@@ -1,108 +1,69 @@
 # HybridCPU-v2 + Compiler CXL 3.x/4.x Refactoring Roadmap
 
-Status: proposed cross-project implementation roadmap stored in SingNextOS docs.
+Status: proposed cross-project implementation roadmap. Baseline refreshed after the Virtualization + SecureCompute + CXL end-to-end audit on 2026-09-13.
 
 ## Scope
 
-This roadmap covers only future changes in:
+This roadmap covers future changes owned by `yuriyyak23/HybridCPU-v2`, including `HybridCPU-v2/Compilers`, and the external contract that SingNextOS expects from that project. SingNextOS implementation work is split into `../virtualization-securecompute-cxl-refactoring-roadmap/`.
 
-- `yuriyyak23/HybridCPU-v2`;
-- `HybridCPU-v2/Compilers`.
+CXL remains a fabric/memory/provider substrate below existing authority. It is not a new CPU lane, ISA authority class, replay authority, or application-visible identity.
 
-It defines how HybridCPU-v2 and its compiler should consume the SingNextOS CXL 3.x/4.x substrate documented in `../cxl-refactoring-roadmap/`.
-
-This roadmap does **not** schedule additional SingNextOS implementation work. SingNextOS is treated as the external authority/runtime provider whose stable contracts are consumed by HybridCPU-v2.
-
-## Architectural direction
-
-CXL is **not** introduced as a new CPU lane, ISA execution class, replay authority, or application-visible transport identity.
-
-The intended dependency is:
+## Target dependency
 
 ```text
 HybridCPU compiler semantic intent
-        -> HybridCPU ISA / descriptor carriers
-        -> HybridCPU runtime legality + replay model
-        -> HybridCPU ExternalRuntime bridge
-        -> SingNextOS external-operation contract
-        -> SingNextOS provider selection / authority / CXL backend
-        -> CXL.io / CXL.cache / CXL.mem hardware path
+  -> HybridCPU ISA / descriptor carriers
+  -> HybridCPU runtime legality + replay model
+  -> versioned ExternalRuntime child + secure contracts
+  -> SingNextOS platform authority / external-operation lifecycle
+  -> SingNextOS CXL providers
+  -> CXL.io / CXL.cache / CXL.mem
 ```
-
-The compiler and CPU may express semantic constraints such as:
-
-- external execution required;
-- staged publication required/preferred;
-- coherent access required/optional;
-- device-readable / device-writable region intent;
-- replay effect classification;
-- cancellation or idempotence requirements.
-
-They must not encode raw CXL topology such as HDM decoder IDs, DPA, switch routes, CXL port IDs, FM bindings, or fabric-internal identities.
 
 ## Mandatory invariants
 
-- CXL does not become a new `LegalityAuthoritySource` merely because it is the transport/provider.
-- SingNextOS admission receipts are runtime authority inputs; replay certificates remain replay/reuse evidence, not OS authority.
-- coherence != ownership.
-- coherence != publication.
-- device completion != visibility.
-- visibility != architectural publication.
-- publication != ownership return unless the operation contract explicitly says so.
-- replay certificate != permission to re-submit an external side effect.
-- `GuardPlane` checks remain before reuse/materialization where existing HybridCPU contracts require them.
-- stale OS/provider generation must fail closed before the next external hardware effect or before architectural publication, according to lifecycle stage.
-- direct coherent writes are not the default optimization path.
-- zero-copy is a proven optimization, not an ABI promise.
-- fault/reset/reconfiguration are first-class execution outcomes.
+- CXL must not become a new `LegalityAuthoritySource`.
+- evidence != authority; replay certificate != runtime permission.
+- coherence != ownership; completion != visibility; visibility != publication; publication != ownership return.
+- stale domain/mapping/security/provider generation fails closed before the next provider effect or publication.
+- `ProviderUnavailable != ProviderClosed != ProviderEffectContained`; reclaim requires Closed or Contained.
+- direct coherent output and zero-copy remain proven optimizations, not ABI promises.
+- Virtualization and SecureCompute remain separate authorities and compose through exact bindings rather than a monolithic secure-VM authority root.
+- compiler IR may express semantic requirements but may not mint runtime authority or expose CXL topology.
 
-## Existing HybridCPU-v2 mechanisms to preserve and extend
+## Existing mechanisms to preserve
 
-The roadmap is built around current executable mechanisms, including:
-
-- `LegalityDecision` / `LegalityAuthoritySource`;
-- `GuardPlane` and guard-before-reuse;
-- structural/replay certificates;
-- `LoopBuffer` / replay phase / `ReplayToken` rollback contour;
-- lane6 `DmaStreamCompute`;
-- lane7 `SystemSingleton` / L7-SDC;
-- external accelerator descriptor, guard, token, fence and commit models;
-- `AcceleratorCommitCoordinator` staged publication;
-- mapping/domain epoch checks already modeled around external accelerators;
+- `LegalityDecision` / `LegalityAuthoritySource` and `GuardPlane`;
+- structural/replay certificates and rollback contours;
+- lane6 `DmaStreamCompute` and lane7 L7-SDC without merging their semantics;
+- external-operation descriptors, fences and staged commit/publication;
+- mapping/domain epoch checks;
 - retire/publication separation;
-- `HybridCPU_ExternalRuntime` and its contracts;
-- compiler IR slot/resource classes, typed-slot admission and bundle construction.
+- `HybridCPU_ExternalRuntime` and V3 child-domain contracts;
+- neutral SecureCompute admission in ISE;
+- compiler typed-slot/resource admission and bundle construction.
 
 ## Phase index
 
-1. `00-baseline-gap-matrix-and-decisions.md` — freeze code-grounded boundaries and non-goals.
-2. `01-cross-project-runtime-contract.md` — define the HybridCPU-facing SingNextOS external-operation ABI.
-3. `02-legality-guardplane-and-authority.md` — refactor legality so OS admission is consumed without creating CXL authority inside CPU legality.
-4. `03-replay-effect-model-and-invalidation.md` — connect SingNextOS lifecycle/effect receipts to replay and deterministic execution.
-5. `04-lane7-l7-sdc-external-operation-bridge.md` — migrate L7-SDC to provider-neutral SingNextOS external execution.
-6. `05-lane6-dmastreamcompute-integration.md` — align DSC with OS-mediated DMA/external execution without merging lane6 and lane7 semantics.
-7. `06-commit-visibility-publication-and-fences.md` — refactor commit/fence behavior around DeviceComplete/Visible/Published.
-8. `07-compiler-ir-semantic-intent.md` — add provider-neutral external-memory/execution intent to compiler IR.
-9. `08-compiler-lowering-admission-and-bundling.md` — lower intent to existing carriers and preserve typed-slot legality.
-10. `09-externalruntime-singnextos-adapter.md` — implement the runtime bridge and generation/effect receipts.
-11. `10-cxl-memory-and-coherent-access-semantics.md` — define compiler/CPU behavior for CXL-backed memory without exposing CXL topology.
-12. `11-fault-reset-reconfiguration-and-cancellation.md` — first-class stale/reset/fabric-change handling.
-13. `12-validation-negative-tests-and-conformance.md` — executable acceptance matrix.
-14. `13-migration-order-pr-slicing-and-exit-criteria.md` — implementation sequence and PR slicing.
+1. `00-baseline-gap-matrix-and-decisions.md`
+2. `01-cross-project-runtime-contract.md`
+3. `02-legality-guardplane-and-authority.md`
+4. `03-replay-effect-model-and-invalidation.md`
+5. `04-lane7-l7-sdc-external-operation-bridge.md`
+6. `05-lane6-dmastreamcompute-integration.md`
+7. `06-commit-visibility-publication-and-fences.md`
+8. `07-compiler-ir-semantic-intent.md`
+9. `08-compiler-lowering-admission-and-bundling.md`
+10. `09-externalruntime-singnextos-adapter.md`
+11. `10-cxl-memory-and-coherent-access-semantics.md`
+12. `11-fault-reset-reconfiguration-and-cancellation.md`
+13. `12-validation-negative-tests-and-conformance.md`
+14. `13-migration-order-pr-slicing-and-exit-criteria.md`
+15. `14-securecompute-externalruntime-contract.md` — ProductionSecure external ABI and exact closure.
+16. `15-secure-virtualization-composition-and-events.md` — exact child/secure composition and event publication.
+17. `16-compiler-secure-virtual-intent-and-cxl-boundary.md` — compiler semantic modernization without topology leakage.
+18. `17-cross-project-validation-and-exit-criteria.md` — new end-to-end negative matrix and completion gates.
 
-## End state
+## New closure condition
 
-The desired end state is:
-
-```text
-source program
-  -> compiler emits semantic external-operation intent
-  -> existing lane6/lane7 carriers where appropriate
-  -> HybridCPU guards/replay determine CPU-side admissibility
-  -> ExternalRuntime asks SingNextOS to admit/materialize operation
-  -> SingNextOS returns opaque lifecycle/effect/generation receipts
-  -> HybridCPU waits for visibility/publication semantics
-  -> architectural retirement/publication occurs only when both CPU and OS contracts permit it
-```
-
-No CXL-specific application authority or topology is added to the CPU ISA.
+The roadmap is not complete when only child virtualization is executable. Completion additionally requires a versioned owner-bound SecureCompute external ABI, exact secure+virtualized resource composition, exhaustive secure-operation policy dispatch, and tests proving CXL-backed secure virtual execution fails closed on stale generations, reconfiguration and ambiguous closure.
