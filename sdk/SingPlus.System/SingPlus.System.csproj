@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../contracts/SingPlus.Contracts/SingPlus.Contracts.csproj" />
+    <ProjectReference Include="../../src/Sip/SingPlus.Sip/SingPlus.Sip.csproj" />
+  </ItemGroup>
+</Project>

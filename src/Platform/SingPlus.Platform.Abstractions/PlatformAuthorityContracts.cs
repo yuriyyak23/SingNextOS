@@ -1,0 +1,169 @@
+using SingPlus.Contracts;
+
+namespace SingPlus.Platform;
+
+[Flags]
+public enum PlatformAuthorityFeatures
+{
+    None = 0,
+    NeutralDomainBinding = 1 << 0,
+    DirectOwnedRegionMapping = 1 << 1
+}
+
+public enum PlatformAuthorityStatus
+{
+    Success = 0,
+    Unavailable,
+    Unsupported,
+    Denied,
+    Stale,
+    Revoked,
+    WrongDomain,
+    Faulted,
+    NotAccepted
+}
+
+[Flags]
+public enum PlatformMemoryAccess
+{
+    None = 0,
+    Read = 1 << 0,
+    Write = 1 << 1
+}
+
+public enum PlatformRegionRevocationPolicy
+{
+    DrainBeforeRevoke = 0
+}
+
+public readonly record struct PlatformDomainIdentity(
+    DomainId DomainId,
+    ProcessHandle Process)
+{
+    public ProcessId ProcessId => Process.ProcessId;
+    public ulong ProcessGeneration => Process.Generation;
+}
+
+public readonly record struct PlatformRegionIdentity(
+    RegionHandle Handle,
+    RegionOwner Owner,
+    long ByteLength);
+
+public readonly record struct PlatformProviderId(string Value);
+public readonly record struct PlatformProviderDomainLeaseId(ulong Value);
+public readonly record struct PlatformProviderRegionMappingId(ulong Value);
+public readonly record struct PlatformProviderLeaseGeneration(ulong Value);
+
+public readonly record struct PlatformProviderDomainLease(
+    PlatformProviderDomainLeaseId LeaseId,
+    PlatformProviderLeaseGeneration Generation,
+    PlatformDomainIdentity Subject);
+
+public static class PlatformDomainContract
+{
+    public const uint ContractVersion = 2;
+
+    public static PlatformAuthorityResult ValidateSubject(PlatformDomainIdentity subject)
+    {
+        if (subject.DomainId.Value == 0 ||
+            subject.ProcessId.Value == 0 ||
+            subject.ProcessGeneration == 0)
+        {
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.Denied,
+                "Platform domain subjects require materialized domain and process identities with a non-zero process generation.");
+        }
+
+        return PlatformAuthorityResult.Ok();
+    }
+
+    public static PlatformAuthorityResult ValidateLease(
+        PlatformDomainIdentity expectedSubject,
+        PlatformProviderDomainLease lease)
+    {
+        var subjectValidation = ValidateSubject(expectedSubject);
+        if (!subjectValidation.IsSuccess) return subjectValidation;
+
+        if (lease.LeaseId.Value == 0 || lease.Generation.Value == 0)
+        {
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.Faulted,
+                "Provider domain leases require non-zero lease IDs and generations.");
+        }
+
+        if (lease.Subject != expectedSubject)
+        {
+            return PlatformAuthorityResult.Fail(
+                PlatformAuthorityStatus.WrongDomain,
+                "The provider domain lease belongs to a different local process subject.");
+        }
+
+        return PlatformAuthorityResult.Ok();
+    }
+}
+
+public readonly record struct PlatformProviderRegionMappingLease(
+    PlatformProviderRegionMappingId MappingId,
+    PlatformProviderLeaseGeneration Generation,
+    PlatformProviderDomainLease DomainLease,
+    PlatformRegionIdentity Region,
+    PlatformMemoryAccess Access);
+
+public sealed record PlatformProviderDescriptor(
+    PlatformProviderId ProviderId,
+    uint ContractVersion,
+    PlatformAuthorityFeatures Features);
+
+public readonly record struct PlatformAuthorityResult(
+    PlatformAuthorityStatus Status,
+    string? Message)
+{
+    public bool IsSuccess => Status == PlatformAuthorityStatus.Success;
+
+    public static PlatformAuthorityResult Ok() => new(PlatformAuthorityStatus.Success, null);
+
+    public static PlatformAuthorityResult Fail(PlatformAuthorityStatus status, string message)
+    {
+        if (status == PlatformAuthorityStatus.Success)
+            throw new ArgumentOutOfRangeException(nameof(status));
+
+        return new PlatformAuthorityResult(status, message);
+    }
+}
+
+public readonly record struct PlatformAuthorityResult<T>(
+    PlatformAuthorityStatus Status,
+    T? Value,
+    string? Message)
+{
+    public bool IsSuccess => Status == PlatformAuthorityStatus.Success;
+
+    public static PlatformAuthorityResult<T> Ok(T value) =>
+        new(PlatformAuthorityStatus.Success, value, null);
+
+    public static PlatformAuthorityResult<T> Fail(PlatformAuthorityStatus status, string message)
+    {
+        if (status == PlatformAuthorityStatus.Success)
+            throw new ArgumentOutOfRangeException(nameof(status));
+
+        return new PlatformAuthorityResult<T>(status, default, message);
+    }
+}
+
+public interface IPlatformAuthorityProvider
+{
+    PlatformProviderDescriptor Descriptor { get; }
+
+    PlatformAuthorityResult<PlatformProviderDomainLease> BindDomain(PlatformDomainIdentity subject);
+
+    PlatformAuthorityResult RevokeDomain(PlatformProviderDomainLease lease);
+
+    PlatformAuthorityResult<PlatformProviderRegionMappingLease> MapOwnedRegion(
+        PlatformProviderDomainLease domainLease,
+        PlatformRegionIdentity region,
+        PlatformMemoryAccess access);
+
+    PlatformAuthorityResult RevokeRegionMapping(
+        PlatformProviderRegionMappingLease mapping,
+        PlatformRegionRevocationPolicy policy);
+}

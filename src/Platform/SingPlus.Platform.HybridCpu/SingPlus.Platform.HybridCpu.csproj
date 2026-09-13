@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../SingPlus.Platform.Abstractions/SingPlus.Platform.Abstractions.csproj" />
+    <ProjectReference Include="../../../tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Contracts/HybridCPU_NeutralRuntime.Contracts.csproj" />
+    <ProjectReference Include="../../../tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Model/HybridCPU_NeutralRuntime.Model.csproj" />
+  </ItemGroup>
+</Project>

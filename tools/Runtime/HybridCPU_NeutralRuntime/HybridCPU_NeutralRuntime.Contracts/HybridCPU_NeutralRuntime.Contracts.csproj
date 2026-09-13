@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>HybridCPU_NeutralRuntime.Contracts</AssemblyName>
+    <RootNamespace>YAKSys_Hybrid_CPU.Core</RootNamespace>
+  </PropertyGroup>
+</Project>
