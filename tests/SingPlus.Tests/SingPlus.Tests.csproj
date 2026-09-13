@@ -29,9 +29,5 @@
     <ProjectReference Include="../../src/Runtime/SingPlus.Runtime/SingPlus.Runtime.csproj" />
     <ProjectReference Include="../../sdk/SingPlus.System/SingPlus.System.csproj" />
     <ProjectReference Include="../../src/Drivers/SingPlus.Drivers/SingPlus.Drivers.csproj" />
-    <ProjectReference Include="../../tools/SingPlus.Admission/SingPlus.Admission.csproj" />
-    <ProjectReference Include="../../tools/SingPlus.HybridCpuQualification/SingPlus.HybridCpuQualification.csproj" />
-    <ProjectReference Include="../../tools/HybridCpu_ExecutableAdapter/HybridCpu_ExecutableAdapter.csproj" />
-    <ProjectReference Include="../../tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Contracts/HybridCPU_NeutralRuntime.Contracts.csproj" />
   </ItemGroup>
 </Project>

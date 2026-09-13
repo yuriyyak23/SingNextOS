@@ -1,6 +1,6 @@
 # Final CXL Refactoring Software Validation
 
-Update 2026-09-13: the post-roadmap audit follow-ups are closed by Phases 14–16 for the staged single-host software/model scope. Fresh no-cache restore succeeded and the complete solution passed 869/869 tests with zero failures and zero skips. `DirectCoherentWrite` is explicitly `FutureGated`; QEMU/FPGA and real-hardware proof remain excluded.
+Update 2026-09-13: the post-roadmap audit follow-ups are closed by Phases 14–16 for the staged single-host software/model scope. Fresh no-cache restore succeeded and the complete solution passed 870/870 tests with zero failures and zero skips. `DirectCoherentWrite` is explicitly `FutureGated`; QEMU/FPGA and real-hardware proof remain excluded.
 
 ## Scope verdict
 
@@ -90,11 +90,11 @@ dotnet restore SingNextOS.slnx --force --no-cache
   PASS — 26 projects
 
 focused Phase 11/14/15/16 CXL authority/lifecycle/security/reclaim validation
-  PASS — 111/111
+  PASS — 112/112
 
 dotnet test SingNextOS.slnx --no-restore --logger "console;verbosity=minimal"
-  PASS — 869/869 total
-    739 SingPlus.Tests
+  PASS — 870/870 total
+    740 SingPlus.Tests
      60 SingPlus.Platform.HybridCpu.Tests
      58 HybridCPU_NeutralRuntime.Tests
      12 HybridCpu_ExecutableAdapter.Tests

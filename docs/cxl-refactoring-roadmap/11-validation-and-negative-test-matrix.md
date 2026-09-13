@@ -107,6 +107,7 @@ Tests must ensure unrelated resources remain valid when the backend provides nar
 - stale pool release validates the complete assignment before removal and cannot change capacity;
 - stale reconfiguration tickets do not consume the current ticket;
 - endpoint generation change during reconfiguration cannot roll fabric generation back;
+- provider exception after reconfiguration completion effect faults local admission and is treated as uncontained;
 - post-submit Fabric Manager tracking requires explicit provider closure/effect containment;
 - ambiguous fabric, memory or pool creation acceptance retains dependent authority and blocks reclaim;
 - pool reassignment cannot implicitly transfer region ownership;

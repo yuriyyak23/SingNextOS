@@ -44,15 +44,16 @@ All four were reproduced from the implementation and corrected.
 - `PostSubmitTrackingWithoutProviderClosureProofIsRejected`
 - ambiguous fabric/memory/pool acceptance retains pins and blocks reclaim
 - provider exceptions after Type-2/fabric/memory acceptance are contained
+- exception after provider-side reconfiguration completion is contained as an ambiguous effect
 - pre-effect model rejections use `NotAccepted` and create no provider effect
 
 ## Executable qualification
 
 ```text
-focused Phase 11/14/15/16 matrix: 111/111 passed
+focused Phase 11/14/15/16 matrix: 112/112 passed
 fresh forced no-cache restore: passed for 26 projects
-full solution: 869/869 passed
-  739 SingPlus.Tests
+full solution: 870/870 passed
+  740 SingPlus.Tests
    60 SingPlus.Platform.HybridCpu.Tests
    58 HybridCPU_NeutralRuntime.Tests
    12 HybridCpu_ExecutableAdapter.Tests

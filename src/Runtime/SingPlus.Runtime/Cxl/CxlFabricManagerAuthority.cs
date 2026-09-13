@@ -172,7 +172,17 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
         {
             if (!_bindings.TryGetValue(bindingId, out var record) || record.State != CxlFabricResourceState.Draining || record.Ticket is null)
                 return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.InvalidTransition, "Fabric binding has no active reconfiguration.");
-            var completed = _provider.CompleteReconfiguration(record.Ticket);
+            PlatformAuthorityResult<CxlFabricBinding> completed;
+            try
+            {
+                completed = _provider.CompleteReconfiguration(record.Ticket);
+            }
+            catch (Exception exception)
+            {
+                record.State = CxlFabricResourceState.Faulted;
+                return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.ExternalEffectUncontained,
+                    $"Fabric reconfiguration completion threw after its effect boundary: {exception.Message}");
+            }
             if (!completed.IsSuccess)
             {
                 record.State = CxlFabricResourceState.Faulted;

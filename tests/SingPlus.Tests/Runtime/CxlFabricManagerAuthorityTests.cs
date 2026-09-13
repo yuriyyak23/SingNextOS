@@ -150,6 +150,21 @@ public sealed class CxlFabricManagerAuthorityTests
     }
 
     [Fact]
+    public void CompleteReconfigurationExceptionAfterProviderEffectFailsClosed()
+    {
+        var s = CreateScenario();
+        Assert.True(s.Manager.BeginReconfiguration(s.Binding).IsSuccess);
+        s.Model.CompleteReconfigurationThrowsAfterEffect = true;
+
+        var completed = s.Manager.CompleteReconfiguration(s.Binding.BindingId);
+
+        Assert.False(completed.IsSuccess);
+        Assert.Equal(KernelError.ExternalEffectUncontained, completed.Error);
+        Assert.NotEqual(s.Binding, s.Model.Query(s.Binding.BindingId).Value);
+        Assert.Equal(KernelError.PlatformBindingDraining, s.Manager.ValidateAdmission(s.Binding).Error);
+    }
+
+    [Fact]
     public void PeerAccessRequiresBothRouteSupportAndPlatformIsolation()
     {
         var s = CreateScenario(twoBindings: true);

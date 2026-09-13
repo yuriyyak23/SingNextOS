@@ -47,6 +47,7 @@ public sealed class CxlType3ModelProvider : ICxlDiscoveryProvider, ICxlIoProvide
     public bool PoolAcceptanceAmbiguous { get; set; }
     public bool FabricThrowsAfterAcceptance { get; set; }
     public bool MemoryThrowsAfterAcceptance { get; set; }
+    public bool CompleteReconfigurationThrowsAfterEffect { get; set; }
 
     public PlatformAuthorityResult RegisterEndpoint(CxlEndpointId id, PlatformDeviceIdentity device, long capacityBytes,
         CxlMemoryPersistence persistence = CxlMemoryPersistence.Volatile,
@@ -170,6 +171,8 @@ public sealed class CxlType3ModelProvider : ICxlDiscoveryProvider, ICxlIoProvide
             _reconfigurations.Remove(ticket.ReconfigurationId);
             _fabric[ticket.PreviousBinding.BindingId] = new(replacement, record.ReservedBytes);
             _draining.Remove(ticket.PreviousBinding.BindingId);
+            if (CompleteReconfigurationThrowsAfterEffect)
+                throw new InvalidOperationException("Injected provider exception after reconfiguration completion effect.");
             return PlatformAuthorityResult<CxlFabricBinding>.Ok(replacement);
         }
     }

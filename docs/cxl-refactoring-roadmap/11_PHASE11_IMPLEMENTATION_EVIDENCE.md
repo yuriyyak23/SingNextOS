@@ -21,7 +21,7 @@ dotnet restore SingNextOS.slnx --force --no-cache
 dotnet test SingNextOS.slnx --no-restore --logger "console;verbosity=minimal"
 ```
 
-Superseded qualification after fabric-exactness Phase 16 on 2026-09-13: 869/869 tests (739 `SingPlus.Tests`, 60 platform tests, 58 neutral-runtime tests, and 12 adapter tests), with zero failures and zero skips. The focused Phase 11/14/15/16 selection passed 111/111.
+Superseded qualification after fabric-exactness Phase 16 on 2026-09-13: 870/870 tests (740 `SingPlus.Tests`, 60 platform tests, 58 neutral-runtime tests, and 12 adapter tests), with zero failures and zero skips. The focused Phase 11/14/15/16 selection passed 112/112.
 
 ## Explicit non-claims
 

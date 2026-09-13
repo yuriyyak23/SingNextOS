@@ -4,7 +4,7 @@ Status: **Complete for staged single-host software/model scope.**
 
 Phase 16 later closed stale pool/ticket destruction and extended ambiguous
 creation containment across generic Fabric Manager and Type-3 paths. Its
-869/869 qualification supersedes the historical snapshot below.
+870/870 qualification supersedes the historical snapshot below.
 
 ## Delta-audit result
 

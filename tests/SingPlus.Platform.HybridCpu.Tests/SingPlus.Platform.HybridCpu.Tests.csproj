@@ -20,7 +20,5 @@
     <ProjectReference Include="../../src/Platform/SingPlus.Platform.HybridCpu/SingPlus.Platform.HybridCpu.csproj" />
     <ProjectReference Include="../../src/Runtime/SingPlus.Runtime/SingPlus.Runtime.csproj" />
     <ProjectReference Include="../../src/Sip/SingPlus.Sip/SingPlus.Sip.csproj" />
-    <ProjectReference Include="../../tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Model/HybridCPU_NeutralRuntime.Model.csproj" />
-    <ProjectReference Include="../../tools/HybridCpu_ExecutableAdapter/HybridCpu_ExecutableAdapter.csproj" />
   </ItemGroup>
 </Project>
