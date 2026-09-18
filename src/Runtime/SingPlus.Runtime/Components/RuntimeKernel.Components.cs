@@ -11,24 +11,52 @@ public sealed partial class RuntimeKernel
     {
         ArgumentNullException.ThrowIfNull(plan);
         var manifest = plan.Manifest;
-        if (!manifest.MatchesImage(plan.Image.Span))
-            return KernelResult<ComponentLifecycleSnapshot>.Fail(KernelError.ComponentDigestMismatch, "Component image digest does not match its manifest.");
-        if (_components.ContainsKey(manifest.Identity))
-            return KernelResult<ComponentLifecycleSnapshot>.Fail(KernelError.DuplicateIdentity, $"Component '{manifest.Identity.Name}' is already tracked.");
-        if (!RegistrationsMatchManifest(manifest, plan.ProvidedServices))
-            return KernelResult<ComponentLifecycleSnapshot>.Fail(KernelError.InvalidManifest, "Provided service registrations do not exactly match the component manifest.");
-        var platformRequirements = ValidatePlatformRequirements(manifest.PlatformRequirements);
-        if (!platformRequirements.IsSuccess)
-            return KernelResult<ComponentLifecycleSnapshot>.Fail(platformRequirements.Error, platformRequirements.Message!);
-        var resourcePlan = ValidateResourcePlan(manifest.ResourceRequirements, plan.Grants);
-        if (!resourcePlan.IsSuccess)
-            return KernelResult<ComponentLifecycleSnapshot>.Fail(resourcePlan.Error, resourcePlan.Message!);
-        var driverPlan = ValidateDriverResourcePlan(manifest, plan.DriverResources);
-        if (!driverPlan.IsSuccess)
-            return KernelResult<ComponentLifecycleSnapshot>.Fail(driverPlan.Error, driverPlan.Message!);
+        var evaluation = EvaluateComponentAdmissionCore(plan);
+        // Dependency availability is evidence at preflight time. Preserve the
+        // existing admission/rollback lifecycle so a hard dependency loss is
+        // recorded on the component rather than becoming a second authority
+        // decision in the evaluator.
+        if (evaluation.Error is { } evaluationError && evaluationError != KernelError.ServiceNotFound)
+            return KernelResult<ComponentLifecycleSnapshot>.Fail(evaluationError, evaluation.Message!);
 
         var processHandle = new ProcessHandle(manifest.Process.ProcessId, manifest.Process.Generation);
-        var record = new ComponentAdmissionRecord { Manifest = manifest, Process = processHandle, State = ComponentLifecycleState.Admitting };
+        var limits = manifest.BudgetRequests.Select(static request => new BudgetAmount(request.Dimension, request.Limit)).ToArray();
+        var serviceBudget = Budgets.CreateChild(
+            Budgets.SystemBudget,
+            BudgetAccountLevel.Service,
+            $"service:{manifest.Identity.Name}:{manifest.Process.Generation}",
+            limits);
+        if (!serviceBudget.IsSuccess)
+            return KernelResult<ComponentLifecycleSnapshot>.Fail(serviceBudget.Error, serviceBudget.Message!);
+        var processBudget = Budgets.CreateChild(
+            serviceBudget.Value!.Account,
+            BudgetAccountLevel.ProcessDomain,
+            $"process:{processHandle.ProcessId.Value}:{processHandle.Generation}",
+            limits);
+        if (!processBudget.IsSuccess)
+            return KernelResult<ComponentLifecycleSnapshot>.Fail(processBudget.Error, processBudget.Message!);
+        var attached = Budgets.AttachProcess(processHandle, processBudget.Value!.Account);
+        if (!attached.IsSuccess)
+            return KernelResult<ComponentLifecycleSnapshot>.Fail(attached.Error, attached.Message!);
+
+        var admittedBudgetEvidence = evaluation.Result;
+        foreach (var request in manifest.BudgetRequests)
+            admittedBudgetEvidence = MarkRequirementGranted(
+                admittedBudgetEvidence,
+                ManifestRequirementKind.Budget,
+                $"{request.Dimension}:{request.Limit}",
+                "Exact capacity was allocated in the generation-bound budget hierarchy; the reservation remains non-authoritative.");
+
+        var record = new ComponentAdmissionRecord
+        {
+            Plan = plan,
+            Manifest = manifest,
+            Process = processHandle,
+            Admission = admittedBudgetEvidence,
+            State = ComponentLifecycleState.Admitting,
+            ServiceBudget = serviceBudget.Value.Account,
+            ProcessBudget = processBudget.Value.Account,
+        };
         _components.Add(manifest.Identity, record);
 
         var created = CreateProcess(manifest.Process);
@@ -40,6 +68,11 @@ public sealed partial class RuntimeKernel
             var minted = MintCapability(grant.IssuerDomain, processHandle, grant.Requirement.ResourceKind, grant.Requirement.ResourceId, grant.Requirement.Rights);
             if (!minted.IsSuccess) return Rollback(record, minted.Error, minted.Message!);
             record.Capabilities.Add(minted.Value!.CapabilityId);
+            record.Admission = MarkRequirementGranted(
+                record.Admission,
+                ManifestRequirementKind.LocalCapability,
+                $"{grant.Requirement.ResourceKind}:{grant.Requirement.ResourceId}:{grant.Requirement.Rights}",
+                "Exact live capability was materialized by the kernel; its identity is intentionally absent from admission evidence.");
         }
 
         var admitted = AdmitProcess(processHandle);
@@ -50,6 +83,11 @@ public sealed partial class RuntimeKernel
             var binding = BindPlatformAuthorityDomain(processHandle);
             if (!binding.IsSuccess) return Rollback(record, binding.Error, binding.Message!);
             record.PlatformBinding = binding.Value!;
+            record.Admission = MarkRequirementGranted(
+                record.Admission,
+                ManifestRequirementKind.PlatformAuthorityDomain,
+                "platform-authority-domain",
+                "Exact provider-neutral authority binding was materialized; provider-private identity is omitted.");
         }
 
         if (plan.DriverResources is { } resources)
@@ -65,14 +103,31 @@ public sealed partial class RuntimeKernel
             record.Services.Add(service.Value!);
         }
 
-        foreach (var required in manifest.RequiredContracts)
+        foreach (var dependency in manifest.Dependencies)
         {
+            var required = dependency.Contract;
             var candidates = ResolveByContract(required);
             if (!candidates.IsSuccess || candidates.Value!.Length != 1)
+            {
+                if (dependency.Kind == ServiceDependencyKind.Optional)
+                {
+                    record.Admission = DegradeOptionalDependency(record.Admission, dependency, "Optional dependency did not resolve exactly once during binding.");
+                    continue;
+                }
                 return Rollback(record, KernelError.ServiceNotFound, $"Required contract '{required.Name}/{required.Version}' did not resolve exactly once.");
+            }
             var session = OpenSession(processHandle, candidates.Value[0], record.Capabilities);
-            if (!session.IsSuccess) return Rollback(record, session.Error, session.Message!);
+            if (!session.IsSuccess)
+            {
+                if (dependency.Kind == ServiceDependencyKind.Optional)
+                {
+                    record.Admission = DegradeOptionalDependency(record.Admission, dependency, $"Optional dependency binding was unavailable: {session.Error}.");
+                    continue;
+                }
+                return Rollback(record, session.Error, session.Message!);
+            }
             record.Sessions.Add(session.Value);
+            record.DependencySessions[required] = session.Value;
         }
 
         record.State = ComponentLifecycleState.Starting;
@@ -155,7 +210,13 @@ public sealed partial class RuntimeKernel
         return RevokePlatformDma(authority.Value.Process, grant);
     }
 
-    public KernelResult<ComponentLifecycleSnapshot> FaultComponent(ComponentIdentity identity)
+    public KernelResult<ComponentLifecycleSnapshot> FaultComponent(ComponentIdentity identity) =>
+        BeginComponentTeardown(identity, faulted: true);
+
+    internal KernelResult<ComponentLifecycleSnapshot> DrainComponent(ComponentIdentity identity) =>
+        BeginComponentTeardown(identity, faulted: false);
+
+    private KernelResult<ComponentLifecycleSnapshot> BeginComponentTeardown(ComponentIdentity identity, bool faulted)
     {
         if (!_components.TryGetValue(identity, out var record))
             return KernelResult<ComponentLifecycleSnapshot>.Fail(KernelError.ComponentNotFound, $"Component '{identity.Name}' was not found.");
@@ -167,8 +228,8 @@ public sealed partial class RuntimeKernel
         if (record.State == ComponentLifecycleState.Running)
         {
             record.State = ComponentLifecycleState.Draining;
-            var fault = FaultProcess(record.Process);
-            if (fault.IsSuccess)
+            var teardownResult = faulted ? FaultProcess(record.Process) : TerminateProcess(record.Process);
+            if (teardownResult.IsSuccess)
             {
                 FinalizeComponentReclaim(record);
                 return KernelResult<ComponentLifecycleSnapshot>.Ok(record.Snapshot);
@@ -178,12 +239,12 @@ public sealed partial class RuntimeKernel
             if (teardown.IsSuccess)
                 ApplyComponentTeardown(record, teardown.Value!);
 
-            if (fault.Error == KernelError.PlatformBindingDraining)
+            if (teardownResult.Error == KernelError.PlatformBindingDraining)
                 return KernelResult<ComponentLifecycleSnapshot>.Ok(record.Snapshot);
 
             record.State = ComponentLifecycleState.Faulted;
-            record.Failure = fault.Error;
-            return KernelResult<ComponentLifecycleSnapshot>.Fail(fault.Error, fault.Message!);
+            record.Failure = teardownResult.Error;
+            return KernelResult<ComponentLifecycleSnapshot>.Fail(teardownResult.Error, teardownResult.Message!);
         }
 
         return ObserveComponentTeardown(identity);
@@ -203,6 +264,44 @@ public sealed partial class RuntimeKernel
             return KernelResult<ComponentLifecycleSnapshot>.Fail(teardown.Error, teardown.Message!);
         ApplyComponentTeardown(record, teardown.Value!);
         return KernelResult<ComponentLifecycleSnapshot>.Ok(record.Snapshot);
+    }
+
+    internal KernelResult RetireReclaimableComponent(ComponentIdentity identity, ProcessHandle exactProcess)
+    {
+        if (!_components.TryGetValue(identity, out var record))
+            return KernelResult.Fail(KernelError.ComponentNotFound, $"Component '{identity.Name}' was not found.");
+        if (record.Process != exactProcess)
+            return KernelResult.Fail(KernelError.StaleGeneration, "Component process generation is stale.");
+        if (record.State != ComponentLifecycleState.Reclaimable)
+            return KernelResult.Fail(KernelError.ReplacementBlocked, "Component is not exactly reclaimable.");
+        var retiredBudget = Budgets.RetireProcessHierarchy(record.Process, record.ProcessBudget, record.ServiceBudget);
+        if (!retiredBudget.IsSuccess) return retiredBudget;
+        _components.Remove(identity);
+        return KernelResult.Ok();
+    }
+
+    internal KernelResult<EndpointSessionHandle> RebindComponentDependency(
+        ComponentIdentity identity,
+        ServiceEndpointDescriptor exactProvider)
+    {
+        if (!_components.TryGetValue(identity, out var record) || record.State != ComponentLifecycleState.Running)
+            return KernelResult<EndpointSessionHandle>.Fail(KernelError.ComponentNotFound, "Running dependent component was not found.");
+        var dependency = record.Manifest.Dependencies.SingleOrDefault(candidate => candidate.Contract == exactProvider.Contract);
+        if (dependency.Contract == default)
+            return KernelResult<EndpointSessionHandle>.Fail(KernelError.InvalidManifest, "Dependency is not declared by the component manifest.");
+
+        if (record.DependencySessions.Remove(exactProvider.Contract, out var previous))
+        {
+            _ = CloseSession(record.Process, previous);
+            record.Sessions.Remove(previous);
+        }
+
+        var session = OpenSession(record.Process, exactProvider, record.Capabilities);
+        if (!session.IsSuccess)
+            return KernelResult<EndpointSessionHandle>.Fail(session.Error, session.Message!);
+        record.DependencySessions.Add(exactProvider.Contract, session.Value);
+        record.Sessions.Add(session.Value);
+        return KernelResult<EndpointSessionHandle>.Ok(session.Value);
     }
 
     internal KernelResult<(ProcessHandle Process, PlatformDomainBinding Binding, CapabilityId ComputeCapability)> ResolveComputeComponentAuthority(ComponentIdentity identity)
@@ -374,10 +473,16 @@ public sealed partial class RuntimeKernel
         var manifest = QueryPlatformFeatures();
         foreach (var requirement in requirements)
         {
+            if (!Enum.IsDefined(requirement.Family))
+            {
+                if (requirement.Criticality == ManifestRequirementCriticality.Optional) continue;
+                return KernelResult.Fail(KernelError.PlatformUnsupported, $"Unknown mandatory platform feature {(int)requirement.Family} is unsupported.");
+            }
             var family = (PlatformFeatureFamily)requirement.Family;
             var availability = (PlatformFeatureAvailability)requirement.Availability;
             var feature = manifest.Resolve(family);
-            if (feature.ContractVersion < requirement.MinimumContractVersion || feature.Availability != availability)
+            if ((feature.ContractVersion < requirement.MinimumContractVersion || feature.Availability != availability) &&
+                requirement.Criticality == ManifestRequirementCriticality.Mandatory)
                 return KernelResult.Fail(KernelError.PlatformUnsupported, $"Component requires exact platform feature {requirement.Family} v{requirement.MinimumContractVersion}+ as {requirement.Availability}; provider reports v{feature.ContractVersion} {feature.Availability}.");
         }
         return KernelResult.Ok();
@@ -481,7 +586,7 @@ public sealed partial class RuntimeKernel
     }
 
     private static bool HasPlatformRequirement(ServiceManifestV1 manifest, ComponentPlatformFeatureFamily family, uint minimumVersion) =>
-        manifest.PlatformRequirements.Any(requirement => requirement.Family == family && requirement.MinimumContractVersion >= minimumVersion);
+        manifest.PlatformRequirements.Any(requirement => requirement.Family == family && requirement.MinimumContractVersion >= minimumVersion && requirement.Criticality == ManifestRequirementCriticality.Mandatory);
 
     private static CapabilityRights ToCapabilityRights(PlatformDeviceRights rights)
     {
@@ -526,6 +631,7 @@ public sealed partial class RuntimeKernel
         record.DeviceResources = null;
         record.Capabilities.Clear();
         record.Sessions.Clear();
+        record.DependencySessions.Clear();
         record.Services.Clear();
         record.State = ComponentLifecycleState.Reclaimable;
         record.Failure = null;

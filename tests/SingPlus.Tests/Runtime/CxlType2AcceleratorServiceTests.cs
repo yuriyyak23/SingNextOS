@@ -84,6 +84,35 @@ public sealed class CxlType2AcceleratorServiceTests
     }
 
     [Fact]
+    public void VirtualizedPlanCannotUseOrdinarySubmitWithoutExactKernelContext()
+    {
+        var s = CreateScenario();
+        var virtualized = s.Plan with { Intent = s.Plan.Intent with { RequiresVirtualizedDomain = true } };
+
+        var result = s.Service.Submit(s.Handle, virtualized, [s.Candidate], s.Subject, s.Lease,
+            s.Endpoint, s.Fabric, 1);
+
+        Assert.Equal(KernelError.PlatformDenied, result.Error);
+        Assert.Equal(0, s.Accelerator.SubmitCount);
+    }
+
+    [Fact]
+    public void ForgedType2ExecutionCannotCompleteOrPublish()
+    {
+        var s = CreateScenario();
+        var execution = s.Service.Submit(s.Handle, s.Plan, [s.Candidate], s.Subject, s.Lease,
+            s.Endpoint, s.Fabric, 1).Value!;
+        var forged = execution with { Plan = execution.Plan with { ProviderGeneration = execution.Plan.ProviderGeneration + 1 } };
+        var published = false;
+
+        var result = s.Service.CompleteVisiblePublish(s.Handle, forged, [s.Candidate], () => published = true);
+
+        Assert.Equal(KernelError.StaleGeneration, result.Error);
+        Assert.False(published);
+        Assert.True(s.Service.CompleteVisiblePublish(s.Handle, execution, [s.Candidate], () => { }).IsSuccess);
+    }
+
+    [Fact]
     public void StaleAcceleratorCancelAndReleaseCannotDeleteCurrentSubmission()
     {
         var s = CreateScenario();

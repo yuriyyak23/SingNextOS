@@ -29,10 +29,8 @@ public sealed class VirtualizationLocalModelTests
         Assert.True(delivered.IsSuccess);
         Assert.Equal(VirtualizationResourceIds.Events(vm.Value.Domain.DomainId), delivered.Value!.SourceResourceId);
 
-        Assert.Equal(KernelError.PlatformBindingDraining, scenario.Kernel.DestroyVirtualDomain(scenario.Owner, vm.Value.Domain, vm.Value.ConfigureCapability).Error);
-        Assert.Equal(KernelError.InvalidTransition, scenario.Kernel.InjectVirtualEvent(scenario.Owner, vm.Value.Domain, vm.Value.EventCapability, endpoint).Error);
-        Assert.True(scenario.Kernel.CloseGuestRegionMapping(scenario.Owner, vm.Value.Domain, vm.Value.MemoryCapability, mapping.Value.Mapping).IsSuccess);
         Assert.True(scenario.Kernel.DestroyVirtualDomain(scenario.Owner, vm.Value.Domain, vm.Value.ConfigureCapability).IsSuccess);
+        Assert.Equal(KernelError.VirtualDomainNotFound, scenario.Kernel.InjectVirtualEvent(scenario.Owner, vm.Value.Domain, vm.Value.EventCapability, endpoint).Error);
         Assert.Equal(1, scenario.Provider.RevokeVirtualDomainCallCount);
         Assert.True(scenario.Kernel.ReleaseRegion(scenario.Owner, region).IsSuccess);
     }

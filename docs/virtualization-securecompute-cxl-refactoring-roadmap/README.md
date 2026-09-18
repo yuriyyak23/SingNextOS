@@ -1,6 +1,6 @@
 # SingNextOS Virtualization + SecureCompute + CXL Refactoring Roadmap
 
-Status: proposed SingNextOS-only implementation roadmap derived from the 2026-09-13 end-to-end audit.
+Status: Phases 00-05 implemented and qualified in the SingNextOS model/runtime boundary. This status is not a ProductionSecure promotion or a production CXL transport claim.
 
 ## Scope
 
@@ -44,6 +44,12 @@ No component above becomes a replacement authority for another.
 4. `03-secure-virtualized-type2-compute.md`
 5. `04-fault-reconfiguration-teardown-and-reclaim.md`
 6. `05-validation-matrix-pr-slicing-and-exit-criteria.md`
+
+Implementation and qualification evidence is recorded in the corresponding
+`00_PHASE00_IMPLEMENTATION_EVIDENCE.md` through
+`05_PHASE05_VALIDATION_EVIDENCE.md` files.  Feature promotion remains governed
+by real provider contracts and independent production qualification; test
+providers and evidence do not create authority or raise feature claims.
 
 ## End state
 

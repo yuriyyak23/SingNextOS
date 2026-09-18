@@ -2,19 +2,30 @@ using SingPlus.Contracts;
 
 namespace SingPlus.Runtime;
 
+internal readonly record struct ServiceGenerationReference(
+    ServiceId ServiceId,
+    ServiceGeneration Generation,
+    ProcessHandle Provider);
+
+internal readonly record struct ServiceReplacementLineage(
+    ServiceGenerationReference Previous,
+    ServiceGenerationReference Replacement);
+
 internal sealed class ServiceRegistry
 {
     internal sealed class Record
     {
         public required ServiceEndpointDescriptor Descriptor { get; set; }
-        public required ProcessHandle Provider { get; init; }
-        public required IReadOnlyList<CapabilityRequirementV1> RequiredCapabilities { get; init; }
-        public required ProtocolDefinitionV1 Protocol { get; init; }
-        public ResponseProtocolDefinitionV1? ResponseProtocol { get; init; }
+        public required ProcessHandle Provider { get; set; }
+        public required IReadOnlyList<CapabilityRequirementV1> RequiredCapabilities { get; set; }
+        public required ProtocolDefinitionV1 Protocol { get; set; }
+        public ResponseProtocolDefinitionV1? ResponseProtocol { get; set; }
     }
 
     private readonly Dictionary<ServiceId, Record> _records = [];
     private readonly Dictionary<string, ServiceId> _names = new(StringComparer.Ordinal);
+    private readonly Dictionary<ServiceId, ServiceGenerationReference> _pendingReplacement = [];
+    private readonly List<ServiceReplacementLineage> _replacementLineage = [];
     private readonly object _gate = new();
     private ulong _nextId = 1;
 
@@ -30,7 +41,26 @@ internal sealed class ServiceRegistry
         {
         if (string.IsNullOrWhiteSpace(name) || contract.Name != protocol.ContractName || contract.Digest != protocol.ContractDigest)
             return KernelResult<ServiceEndpointDescriptor>.Fail(KernelError.ServiceContractMismatch, "Service identity and protocol contract do not match.");
-        if (_names.ContainsKey(name)) return KernelResult<ServiceEndpointDescriptor>.Fail(KernelError.DuplicateIdentity, $"Service '{name}' is already registered.");
+        if (_names.TryGetValue(name, out var retiredId))
+        {
+            var retired = _records[retiredId];
+            if (retired.Descriptor.Availability != ServiceAvailability.Unavailable)
+                return KernelResult<ServiceEndpointDescriptor>.Fail(KernelError.DuplicateIdentity, $"Service '{name}' is already registered.");
+
+            var replacement = retired.Descriptor with
+            {
+                Contract = contract,
+                Availability = ServiceAvailability.Accepting,
+            };
+            retired.Descriptor = replacement;
+            retired.Provider = provider;
+            retired.RequiredCapabilities = requiredCapabilities.ToArray();
+            retired.Protocol = protocol;
+            retired.ResponseProtocol = responseProtocol;
+            if (_pendingReplacement.Remove(retiredId, out var previous))
+                _replacementLineage.Add(new(previous, new(retiredId, replacement.Generation, provider)));
+            return KernelResult<ServiceEndpointDescriptor>.Ok(replacement);
+        }
 
         var id = new ServiceId(_nextId++);
         var descriptor = new ServiceEndpointDescriptor(
@@ -49,7 +79,7 @@ internal sealed class ServiceRegistry
         if (!_records.TryGetValue(descriptor.Service.Id, out var record))
             return KernelResult<Record>.Fail(KernelError.ServiceNotFound, "Service endpoint was not found.");
         if (record.Descriptor.Service != descriptor.Service ||
-            record.Descriptor.Generation != descriptor.Generation ||
+            OperabilityGeneration.Compare(record.Descriptor.Generation.Value, descriptor.Generation.Value) != GenerationMatch.Exact ||
             record.Descriptor.Contract != descriptor.Contract)
             return KernelResult<Record>.Fail(KernelError.StaleGeneration, "Service endpoint generation is stale.");
         if (record.Descriptor.Availability != ServiceAvailability.Accepting)
@@ -91,8 +121,14 @@ internal sealed class ServiceRegistry
     {
         lock (_gate)
         {
-            foreach (var record in _records.Values.Where(x => x.Provider == provider))
+            foreach (var record in _records.Values.Where(x => x.Provider == provider && x.Descriptor.Availability != ServiceAvailability.Unavailable))
+            {
+                _pendingReplacement[record.Descriptor.Service.Id] = new(
+                    record.Descriptor.Service.Id,
+                    record.Descriptor.Generation,
+                    provider);
                 record.Descriptor = record.Descriptor with { Generation = new ServiceGeneration(record.Descriptor.Generation.Value + 1), Availability = ServiceAvailability.Unavailable };
+            }
         }
     }
 
@@ -111,5 +147,10 @@ internal sealed class ServiceRegistry
     internal Record[] Snapshot()
     {
         lock (_gate) return _records.Values.ToArray();
+    }
+
+    internal ServiceReplacementLineage[] ReplacementLineageSnapshot()
+    {
+        lock (_gate) return _replacementLineage.ToArray();
     }
 }

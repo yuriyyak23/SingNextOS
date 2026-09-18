@@ -34,8 +34,8 @@ internal static partial class QualificationRecorder
     internal const int AuditedHybridCpuCompilerContractVersion = 6;
 
     private const string HybridCpuCompilerContractPath = "HybridCPU_ISE/CloseToHSL/Core/Contracts/CompilerContract.cs";
-    private const string KernelArtifactPath = "src/Kernel/SingPlus.Kernel/bin/Release/net10.0/SingPlus.Kernel.dll";
-    private const string BootArtifactPath = "src/Kernel/Boot/SingPlus.Boot/bin/Release/net10.0/SingPlus.Boot.dll";
+    private const string KernelArtifactPath = "src/Kernel/SingPlus.Kernel/bin/Release/net11.0/SingPlus.Kernel.dll";
+    private const string BootArtifactPath = "src/Kernel/Boot/SingPlus.Boot/bin/Release/net11.0/SingPlus.Boot.dll";
     private const string AdmissionArtifactPath = "artifacts/hybridcpu-aot-qualification/SingPlusAdmissionProofV1.json";
     internal const string QualificationReportArtifactPath = "artifacts/hybridcpu-aot-qualification/SingPlusHybridCpuQualificationV1.json";
     private const string FirstPassKernelArtifactPath = "artifacts/hybridcpu-aot-qualification/pass1/SingPlus.Kernel.dll";
@@ -437,9 +437,11 @@ internal static partial class QualificationRecorder
             throw new QualificationException($"Unable to query the active .NET SDK: {ex.Message}");
         }
 
-        var output = process.StandardOutput.ReadToEnd();
-        var error = process.StandardError.ReadToEnd();
+        var outputTask = process.StandardOutput.ReadToEndAsync();
+        var errorTask = process.StandardError.ReadToEndAsync();
         process.WaitForExit();
+        var output = outputTask.GetAwaiter().GetResult();
+        var error = errorTask.GetAwaiter().GetResult();
         if (process.ExitCode != 0)
         {
             throw new QualificationException(
@@ -523,9 +525,11 @@ internal static partial class QualificationRecorder
             throw new QualificationException($"Unable to start Git: {ex.Message}");
         }
 
-        var output = process.StandardOutput.ReadToEnd();
-        var error = process.StandardError.ReadToEnd();
+        var outputTask = process.StandardOutput.ReadToEndAsync();
+        var errorTask = process.StandardError.ReadToEndAsync();
         process.WaitForExit();
+        var output = outputTask.GetAwaiter().GetResult();
+        var error = errorTask.GetAwaiter().GetResult();
         if (process.ExitCode != 0)
             throw new QualificationException($"Git failed with exit code {process.ExitCode}: {error.Trim()}");
         return output.Trim();
@@ -626,7 +630,7 @@ internal static partial class QualificationRecorder
         ]);
         WriteCommand(writer, "FirstPassAdmission",
         [
-            "dotnet", "tools/SingPlus.Admission/bin/Release/net10.0/SingPlus.Admission.dll", "verify",
+            "dotnet", "tools/SingPlus.Admission/bin/Release/net11.0/SingPlus.Admission.dll", "verify",
             "--assembly", KernelArtifactPath,
             "--root", KernelEntryPoint,
             "--profile", KernelProfile,
@@ -656,7 +660,7 @@ internal static partial class QualificationRecorder
         ]);
         WriteCommand(writer, "SecondPassAdmission",
         [
-            "dotnet", "tools/SingPlus.Admission/bin/Release/net10.0/SingPlus.Admission.dll", "verify",
+            "dotnet", "tools/SingPlus.Admission/bin/Release/net11.0/SingPlus.Admission.dll", "verify",
             "--assembly", KernelArtifactPath,
             "--root", KernelEntryPoint,
             "--profile", KernelProfile,
@@ -687,6 +691,7 @@ internal static partial class QualificationRecorder
 
     private static void WriteStage(Utf8JsonWriter writer, string name, string outcome, string? reason)
     {
+        (outcome, reason) = StageOutcomeModel.Canonical(StageOutcomeModel.Parse(outcome, reason));
         writer.WriteStartObject();
         writer.WriteString("Name", name);
         writer.WriteString("Outcome", outcome);

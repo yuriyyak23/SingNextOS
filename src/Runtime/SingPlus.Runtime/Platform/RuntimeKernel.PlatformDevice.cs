@@ -107,6 +107,9 @@ public sealed partial class RuntimeKernel
         if (!resolved.IsSuccess)
             return KernelResult.Fail(resolved.Error, resolved.Message!);
 
+        var virtualIo = CloseVirtualIoForDevice(subject, lease);
+        if (!virtualIo.IsSuccess) return virtualIo;
+
         var dma = AdvancePlatformDmaGrantsForDevice(lease);
         if (!dma.IsSuccess) return dma;
 

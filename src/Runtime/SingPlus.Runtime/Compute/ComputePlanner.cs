@@ -40,7 +40,17 @@ public sealed class ComputePlanner(RegionAuthority regions)
         RegionOwner principal,
         ComputeIntent intent,
         ComputeSelectionPolicy policy,
-        IReadOnlyList<ComputeProviderCandidate> candidates)
+        IReadOnlyList<ComputeProviderCandidate> candidates) =>
+        PlanCore(principal, intent, policy, candidates, allowExactPlatformMappings: false);
+
+    internal KernelResult<ComputePlan> PlanForExactPlatformMappings(RegionOwner principal,
+        ComputeIntent intent, ComputeSelectionPolicy policy,
+        IReadOnlyList<ComputeProviderCandidate> candidates) =>
+        PlanCore(principal, intent, policy, candidates, allowExactPlatformMappings: true);
+
+    private KernelResult<ComputePlan> PlanCore(RegionOwner principal, ComputeIntent intent,
+        ComputeSelectionPolicy policy, IReadOnlyList<ComputeProviderCandidate> candidates,
+        bool allowExactPlatformMappings)
     {
         ArgumentNullException.ThrowIfNull(intent);
         ArgumentNullException.ThrowIfNull(candidates);
@@ -53,7 +63,9 @@ public sealed class ComputePlanner(RegionAuthority regions)
             var path = SelectPath(intent, policy, provider);
             if (path is null || !ProviderMeetsIntent(provider, intent)) continue;
             var uses = RequiredUses(intent, path.Value);
-            if (uses.Any(use => !regions.ProbeUse(use.Region, principal, use.Mode, use.Range).IsSuccess)) continue;
+            if (uses.Any(use => !(allowExactPlatformMappings
+                    ? regions.ProbeUseForExactPlatformMapping(use.Region, principal, use.Mode, use.Range)
+                    : regions.ProbeUse(use.Region, principal, use.Mode, use.Range)).IsSuccess)) continue;
             feasible.Add((provider, path.Value));
         }
 
@@ -83,7 +95,15 @@ public sealed class ComputePlanner(RegionAuthority regions)
     public KernelResult ValidateBeforeSubmit(
         ComputePlan plan,
         RegionOwner principal,
-        IReadOnlyList<ComputeProviderCandidate> currentCandidates)
+        IReadOnlyList<ComputeProviderCandidate> currentCandidates) =>
+        ValidateBeforeSubmitCore(plan, principal, currentCandidates, allowExactPlatformMappings: false);
+
+    internal KernelResult ValidateBeforeSubmitForExactPlatformMappings(ComputePlan plan,
+        RegionOwner principal, IReadOnlyList<ComputeProviderCandidate> currentCandidates) =>
+        ValidateBeforeSubmitCore(plan, principal, currentCandidates, allowExactPlatformMappings: true);
+
+    private KernelResult ValidateBeforeSubmitCore(ComputePlan plan, RegionOwner principal,
+        IReadOnlyList<ComputeProviderCandidate> currentCandidates, bool allowExactPlatformMappings)
     {
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(currentCandidates);
@@ -96,7 +116,9 @@ public sealed class ComputePlanner(RegionAuthority regions)
             return KernelResult.Fail(KernelError.PlatformUnsupported, "Planned provider no longer satisfies the exact semantic plan.");
         foreach (var use in plan.RequiredRegionUses)
         {
-            var probe = regions.ProbeUse(use.Region, principal, use.Mode, use.Range);
+            var probe = allowExactPlatformMappings
+                ? regions.ProbeUseForExactPlatformMapping(use.Region, principal, use.Mode, use.Range)
+                : regions.ProbeUse(use.Region, principal, use.Mode, use.Range);
             if (!probe.IsSuccess) return probe;
         }
         return ValidateGraph(plan.Dependencies);

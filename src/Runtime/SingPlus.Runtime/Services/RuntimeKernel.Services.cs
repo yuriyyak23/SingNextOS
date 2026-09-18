@@ -6,7 +6,7 @@ public sealed partial class RuntimeKernel
 {
     private EndpointSessionInvocationRegistry? _endpointSessionInvocationRegistry;
     private EndpointSessionInvocationRegistry SessionInvocations =>
-        _endpointSessionInvocationRegistry ??= new EndpointSessionInvocationRegistry();
+        _endpointSessionInvocationRegistry ??= new EndpointSessionInvocationRegistry(CancellationScopes);
 
     public KernelResult<ServiceEndpointDescriptor> RegisterService(
         ProcessHandle provider,
@@ -20,7 +20,11 @@ public sealed partial class RuntimeKernel
         if (!process.IsSuccess) return KernelResult<ServiceEndpointDescriptor>.Fail(process.Error, process.Message!);
         var effect = EnsureProcessAcceptsNewEffects(process.Value!);
         if (!effect.IsSuccess) return KernelResult<ServiceEndpointDescriptor>.Fail(effect.Error, effect.Message!);
-        return Services.Register(provider, name, contract, protocol, responseProtocol, requiredCapabilities ?? []);
+        var registered = Services.Register(provider, name, contract, protocol, responseProtocol, requiredCapabilities ?? []);
+        if (registered.IsSuccess)
+            RecordTrace(provider, TraceEventKind.ServiceLifecycle, null, "service",
+                registered.Value!.Service.Id.Value.ToString(), registered.Value.Availability.ToString(), "registered");
+        return registered;
     }
 
     public KernelResult<ServiceEndpointDescriptor[]> ResolveByContract(ServiceContractIdentity contract) =>
@@ -170,6 +174,26 @@ public sealed partial class RuntimeKernel
         return SessionInvocations.RequestCancellation(invocation, caller);
     }
 
+    public KernelResult BindSessionCancellationScope(
+        ProcessHandle caller,
+        EndpointSessionInvocationHandle invocation,
+        CancellationScopeHandle scope)
+    {
+        var session = ResolveSession(caller, invocation.Session);
+        if (!session.IsSuccess) return KernelResult.Fail(session.Error, session.Message!);
+        return SessionInvocations.BindCancellationScope(invocation, caller, scope);
+    }
+
+    public KernelResult<CancellationObservation> RequestSessionCancellation(
+        ProcessHandle caller,
+        EndpointSessionInvocationHandle invocation,
+        CancellationScopeHandle scope)
+    {
+        var session = ResolveSession(caller, invocation.Session);
+        if (!session.IsSuccess) return KernelResult<CancellationObservation>.Fail(session.Error, session.Message!);
+        return SessionInvocations.RequestCancellation(invocation, caller, scope);
+    }
+
     public KernelResult<bool> QuerySessionCancellation(
         ProcessHandle service,
         EndpointSessionInvocationHandle invocation)
@@ -245,6 +269,53 @@ public sealed partial class RuntimeKernel
             ? cancellationToken.Register(() => _ = RequestSessionCancellation(caller, invocation))
             : default;
         return await WaitForResponseAsync(caller, current.Channel, send.Value.Sequence).ConfigureAwait(false);
+    }
+
+    public async ValueTask<KernelResult<ResponseEnvelope>> InvokeSessionUntilCancellationAsync(
+        ProcessHandle caller,
+        EndpointSessionHandle handle,
+        uint messageId,
+        object? payload,
+        CancellationScopeHandle scope,
+        CancellationToken stopWaiting)
+    {
+        var temporal = CancellationScopes.Observe(caller, scope);
+        if (!temporal.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(temporal.Error, temporal.Message!);
+        if (temporal.Value!.Disposition == CancellationDisposition.Stale)
+            return KernelResult<ResponseEnvelope>.Fail(KernelError.StaleGeneration, "Cancellation scope generation is stale.");
+        if (temporal.Value.CancellationRequested)
+        {
+            _ = CancellationScopes.RecordDisposition(caller, scope, CancellationDisposition.CancelledBeforeEffect);
+            return KernelResult<ResponseEnvelope>.Fail(KernelError.DeadlineExpired, "IPC deadline expired before transfer admission.");
+        }
+
+        var session = ResolveSession(caller, handle);
+        if (!session.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(session.Error, session.Message!);
+        var claim = CancellationScopes.ClaimConsumer(
+            caller,
+            scope,
+            $"ipc:{handle.SessionId.Value}:{handle.Generation.Value}:{scope.ScopeId.Value}:{scope.Generation.Value}");
+        if (!claim.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(claim.Error, claim.Message!);
+
+        var current = session.Value!;
+        var send = Send(caller, current.Service, current.Channel, messageId, payload, current.Capabilities);
+        if (!send.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(send.Error, send.Message!);
+        var invocation = SessionInvocations.Register(
+            handle, caller, current.Service, send.Value!.Sequence, messageId, scope);
+        var response = WaitForResponseAsync(caller, current.Channel, send.Value.Sequence).AsTask();
+        if (!stopWaiting.CanBeCanceled)
+            return await response.ConfigureAwait(false);
+
+        var stopped = Task.Delay(Timeout.InfiniteTimeSpan, stopWaiting);
+        if (await Task.WhenAny(response, stopped).ConfigureAwait(false) == response)
+            return await response.ConfigureAwait(false);
+
+        var cancellation = SessionInvocations.RequestCancellation(invocation, caller, scope);
+        if (!cancellation.IsSuccess)
+            return KernelResult<ResponseEnvelope>.Fail(cancellation.Error, cancellation.Message!);
+        return KernelResult<ResponseEnvelope>.Fail(
+            KernelError.CancellationPending,
+            $"Caller wait stopped with {cancellation.Value!.Disposition}; callee or provider work may still require exact settlement.");
     }
 
     internal ValueTask<KernelResult<ResponseEnvelope>> InvokeSessionOwnershipPairAsync(

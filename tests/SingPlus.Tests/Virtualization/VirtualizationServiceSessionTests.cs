@@ -77,7 +77,7 @@ public sealed class VirtualizationServiceSessionTests
 
         Assert.Equal(KernelError.PlatformFaulted, terminated.Error);
         Assert.Equal(VirtualDomainState.Quarantined, kernel.QueryVirtualDomain(owner, authority.Domain).Value);
-        Assert.Equal(KernelError.PlatformBindingActive, kernel.ReleaseRegion(owner, region).Error);
+        Assert.Equal(KernelError.InvalidTransition, kernel.ReleaseRegion(owner, region).Error);
         Assert.True(kernel.Processes.Resolve(owner).IsSuccess);
     }
 

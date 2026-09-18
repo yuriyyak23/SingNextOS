@@ -103,3 +103,15 @@ Cancellation requests are idempotent per cancellation generation. Reusing an old
 ## Exit criteria
 
 At least IPC and one external/provider path use the common contracts, with tests proving that timeout/cancellation never fabricate effect closure or ownership return.
+
+## Implemented status (2026-09-18)
+
+- Added versioned provider-neutral monotonic deadline and generation-bound cancellation contracts, including all required typed dispositions. Observation DTOs explicitly authorize neither effects nor reclaim.
+- Added parent/child scopes with non-extending effective deadlines, explicit propagation, idempotent request, exact process-generation ownership and typed stale observations.
+- Leaf scopes are single-consumer: reuse for a different IPC/external operation is rejected before that operation's admission.
+- Integrated scopes into `ExternalOperation` admission and cancellation. Pre-effect expiry cancels locally; Submitted and pre-publication outcomes retain pins until the existing authority proves provider closure/containment; Published remains published and reports too late.
+- Added typed session invocation wait cancellation. The caller may stop waiting with `CancellationPending`, while the invocation remains tracked for exact service settlement. An admitted MOVE remains owned by the receiver and is never returned or duplicated merely because caller waiting ended.
+- Added supervisor drain timeout policies for continue, quarantine, fail replacement and require proven containment. No timeout policy fabricates reclaim.
+- Executable evidence and qualification results are recorded in `04_PHASE_04_IMPLEMENTATION_EVIDENCE.md`.
+
+FutureGated: device-family-specific cancellation adapters beyond the shared `ExternalOperation` boundary remain provider work; budget charging of scopes/waiters belongs to Phase 05; trace events and timeout metrics belong to Phases 06 and 09. No automatic wall-clock scheduler is introduced—the correctness clock is the injected monotonic runtime `TimeProvider`.

@@ -61,6 +61,7 @@ public interface IClientFixture
         GeneratorDriver driver = CSharpGeneratorDriver.Create(
             new SingPlusGenerator().AsSourceGenerator(),
             new ClientRuntimeAdapterGenerator().AsSourceGenerator());
+        driver = driver.WithUpdatedParseOptions((CSharpParseOptions)tree.Options);
         driver = driver.RunGeneratorsAndUpdateCompilation(
             compilation,
             out var outputCompilation,

@@ -1,5 +1,9 @@
 # Phase 5 — Resource Budgets, Quotas, and Admission QoS
 
+Status: implemented and qualified on 2026-09-18. See
+`05_PHASE_05_IMPLEMENTATION_EVIDENCE.md` for the audited mapping, exact guarantees,
+executed commands, and FutureGated integrations.
+
 ## Goal
 
 Bound resource consumption and establish predictable multi-service admission without introducing a new authority root or undertaking a full scheduler rewrite.

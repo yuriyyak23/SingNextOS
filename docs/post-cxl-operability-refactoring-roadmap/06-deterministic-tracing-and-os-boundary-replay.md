@@ -1,5 +1,9 @@
 # Phase 6 — Deterministic Tracing and OS-boundary Replay
 
+Status: implemented and qualified on 2026-09-18. See
+`06_PHASE_06_IMPLEMENTATION_EVIDENCE.md` for audited ownership, guarantees,
+qualification results, and FutureGated event-family integrations.
+
 ## Goal
 
 Provide causal observability and reproducible model execution at semantic OS boundaries while preserving the invariant that trace/replay evidence is never runtime permission.

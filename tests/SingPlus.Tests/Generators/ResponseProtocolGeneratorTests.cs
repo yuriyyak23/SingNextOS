@@ -68,6 +68,7 @@ public interface IResponses
             references,
             new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
         GeneratorDriver driver = CSharpGeneratorDriver.Create(new ResponseProtocolGenerator().AsSourceGenerator());
+        driver = driver.WithUpdatedParseOptions((CSharpParseOptions)tree.Options);
         driver = driver.RunGeneratorsAndUpdateCompilation(compilation, out var outputCompilation, out var generatorDiagnostics);
 
         Assert.DoesNotContain(generatorDiagnostics, diagnostic => diagnostic.Severity == DiagnosticSeverity.Error);

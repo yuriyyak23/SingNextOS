@@ -2,6 +2,17 @@ namespace SingPlus.Contracts;
 
 public readonly record struct ServiceId(ulong Value);
 public readonly record struct ServiceGeneration(ulong Value);
+public static class ServiceIdentityContract
+{
+    public const uint Version = 1;
+}
+
+public readonly record struct ServiceInstanceHandle(
+    ServiceId ServiceId,
+    ServiceGeneration Generation,
+    ProcessHandle Process,
+    DomainId Domain,
+    uint ContractVersion = ServiceIdentityContract.Version);
 public readonly record struct EndpointSessionId(ulong Value);
 public readonly record struct EndpointSessionGeneration(ulong Value);
 public readonly record struct EndpointSessionInvocationId(ulong Value);

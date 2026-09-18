@@ -2,14 +2,21 @@ using SingPlus.Contracts;
 
 namespace SingPlus.Runtime;
 
+internal sealed record CapabilityAuthorityInspectionRecord(
+    CapabilityDescriptorV1 Descriptor,
+    CapabilityId? DelegatedFrom,
+    bool Revoked);
+
 public sealed class CapabilityAuthority
 {
-    private sealed class CapabilityRecord(CapabilityDescriptorV1 descriptor)
+    private sealed class CapabilityRecord(CapabilityDescriptorV1 descriptor, CapabilityId? delegatedFrom = null)
     {
         public CapabilityDescriptorV1 Descriptor { get; } = descriptor;
+        public CapabilityId? DelegatedFrom { get; } = delegatedFrom;
         public bool Revoked { get; set; }
     }
 
+    private readonly object _gate = new();
     private readonly Dictionary<CapabilityId, CapabilityRecord> _records = [];
     private readonly Dictionary<DomainId, ulong> _domainEpochs = [];
     private ulong _nextId = 1;
@@ -22,6 +29,8 @@ public sealed class CapabilityAuthority
         CapabilityRights rights,
         ulong generation)
     {
+        lock (_gate)
+        {
         if (rights == CapabilityRights.None) throw new ArgumentOutOfRangeException(nameof(rights));
         if (string.IsNullOrWhiteSpace(resourceId)) throw new ArgumentException("Resource id is required.", nameof(resourceId));
         var id = new CapabilityId(_nextId++);
@@ -29,6 +38,7 @@ public sealed class CapabilityAuthority
         var descriptor = new CapabilityDescriptorV1(id, issuerDomainId, subjectDomainId, resourceKind, resourceId, rights, generation, epoch);
         _records.Add(id, new CapabilityRecord(descriptor));
         return descriptor;
+        }
     }
 
     internal KernelResult<CapabilityDescriptorV1> Delegate(
@@ -38,6 +48,8 @@ public sealed class CapabilityAuthority
         CapabilityRights rights,
         ulong targetGeneration)
     {
+        lock (_gate)
+        {
         if (!_records.TryGetValue(sourceId, out var source))
             return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapabilityNotFound, $"Capability {sourceId} does not exist.");
         var validation = ValidateRecord(source, delegatorDomain, source.Descriptor.Generation, CapabilityRights.Delegate);
@@ -45,36 +57,62 @@ public sealed class CapabilityAuthority
         if ((source.Descriptor.Rights & rights) != rights || rights == CapabilityRights.None)
             return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.DelegationDenied, "Delegated rights must be a non-empty subset of the source capability.");
 
-        var delegated = Mint(delegatorDomain, targetDomain, source.Descriptor.ResourceKind, source.Descriptor.ResourceId, rights, targetGeneration);
-        return KernelResult<CapabilityDescriptorV1>.Ok(delegated);
+        if (rights == CapabilityRights.None) throw new ArgumentOutOfRangeException(nameof(rights));
+        var id = new CapabilityId(_nextId++);
+        var descriptor = new CapabilityDescriptorV1(id, delegatorDomain, targetDomain, source.Descriptor.ResourceKind,
+            source.Descriptor.ResourceId, rights, targetGeneration, CurrentEpoch(targetDomain));
+        _records.Add(id, new CapabilityRecord(descriptor, sourceId));
+        return KernelResult<CapabilityDescriptorV1>.Ok(descriptor);
+        }
     }
 
     public KernelResult<CapabilityDescriptorV1> Validate(CapabilityId id, DomainId subject, ulong generation, CapabilityRights requiredRights)
     {
+        lock (_gate)
+        {
         if (!_records.TryGetValue(id, out var record))
             return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapabilityNotFound, $"Capability {id} does not exist.");
         var result = ValidateRecord(record, subject, generation, requiredRights);
         return result.IsSuccess ? KernelResult<CapabilityDescriptorV1>.Ok(record.Descriptor) : KernelResult<CapabilityDescriptorV1>.Fail(result.Error, result.Message!);
+        }
     }
 
     public KernelResult Revoke(CapabilityId id)
     {
+        lock (_gate)
+        {
         if (!_records.TryGetValue(id, out var record)) return KernelResult.Fail(KernelError.CapabilityNotFound, $"Capability {id} does not exist.");
         record.Revoked = true;
         return KernelResult.Ok();
+        }
     }
 
     public void RevokeAllForDomain(DomainId domainId)
     {
+        lock (_gate)
+        {
         _domainEpochs[domainId] = CurrentEpoch(domainId) + 1;
         foreach (var record in _records.Values)
         {
             if (record.Descriptor.SubjectDomainId == domainId) record.Revoked = true;
         }
+        }
     }
 
-    public IReadOnlyList<CapabilityDescriptorV1> SnapshotForDomain(DomainId domainId) =>
-        _records.Values.Where(r => !r.Revoked && r.Descriptor.SubjectDomainId == domainId).Select(static r => r.Descriptor).OrderBy(static d => d.CapabilityId.Value).ToArray();
+    public IReadOnlyList<CapabilityDescriptorV1> SnapshotForDomain(DomainId domainId)
+    {
+        lock (_gate)
+            return _records.Values.Where(r => !r.Revoked && r.Descriptor.SubjectDomainId == domainId).Select(static r => r.Descriptor).OrderBy(static d => d.CapabilityId.Value).ToArray();
+    }
+
+    internal CapabilityAuthorityInspectionRecord[] InspectionSnapshot()
+    {
+        lock (_gate)
+            return _records.Values
+                .Select(static record => new CapabilityAuthorityInspectionRecord(record.Descriptor, record.DelegatedFrom, record.Revoked))
+                .OrderBy(static record => record.Descriptor.CapabilityId.Value)
+                .ToArray();
+    }
 
     private KernelResult ValidateRecord(CapabilityRecord record, DomainId subject, ulong generation, CapabilityRights requiredRights)
     {

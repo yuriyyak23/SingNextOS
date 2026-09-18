@@ -1,5 +1,9 @@
 # Phase 7 — Safe High-performance IPC v2
 
+Status: implemented and qualified on 2026-09-18. See
+`07_PHASE_07_IMPLEMENTATION_EVIDENCE.md` for the authority mapping, executed
+negative tests, diagnostic measurements, and explicit FutureGated scope.
+
 ## Goal
 
 Reduce service decomposition overhead while making ownership transfer semantics more explicit and reusable across the OS.

@@ -279,15 +279,10 @@ public sealed class Phase8ResidualVirtualizationTests
         Assert.Equal(VirtualTrapKind.Timer, trap.Value!.Kind);
         Assert.Equal(root.Domain, trap.Value.Domain);
         Assert.Equal(1, scenario.Provider.TrapCalls);
-        Assert.Equal(KernelError.PlatformBindingDraining,
-            scenario.Kernel.DestroyVirtualDomain(scenario.Owner, root.Domain, root.ConfigureCapability).Error);
-        Assert.Equal(KernelError.InvalidTransition,
+        Assert.True(scenario.Kernel.DestroyVirtualDomain(scenario.Owner, root.Domain, root.ConfigureCapability).IsSuccess);
+        Assert.Equal(KernelError.VirtualDomainNotFound,
             scenario.Kernel.ObserveVirtualTrap(scenario.Owner, root.Domain, root.TrapCapability).Error);
         Assert.Equal(1, scenario.Provider.TrapCalls);
-        Assert.True(scenario.Kernel.CloseGuestRegionMapping(scenario.Owner, root.Domain,
-            root.MemoryCapability, mapping.Mapping).IsSuccess);
-        Assert.True(scenario.Kernel.DestroyVirtualDomain(scenario.Owner, root.Domain,
-            root.ConfigureCapability).IsSuccess);
     }
 
     [Fact]

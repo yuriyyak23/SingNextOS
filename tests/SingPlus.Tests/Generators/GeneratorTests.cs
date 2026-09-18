@@ -256,6 +256,7 @@ public interface IBadContract
         var tree = CSharpSyntaxTree.ParseText(source, new CSharpParseOptions(LanguageVersion.CSharp13));
         var compilation = CSharpCompilation.Create("GeneratorFixture", new[] { tree }, references, new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
         GeneratorDriver driver = CSharpGeneratorDriver.Create(new SingPlusGenerator().AsSourceGenerator());
+        driver = driver.WithUpdatedParseOptions((CSharpParseOptions)tree.Options);
         driver = driver.RunGeneratorsAndUpdateCompilation(compilation, out var outputCompilation, out var generatorDiagnostics);
         return (driver, outputCompilation, generatorDiagnostics);
     }

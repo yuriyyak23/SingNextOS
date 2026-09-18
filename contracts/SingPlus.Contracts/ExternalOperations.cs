@@ -123,6 +123,7 @@ public sealed record OperationAdmissionSnapshot(
     ExternalCancellationSupport CancellationSupport = ExternalCancellationSupport.BeforeSubmissionOnly,
     ExternalEffectClass EffectClass = ExternalEffectClass.StagedReversibleUntilPublish,
     ExternalPublicationPolicy PublicationPolicy = ExternalPublicationPolicy.Staged,
+    CancellationScopeHandle? CancellationScope = null,
     uint ContractVersion = ExternalOperationContract.Version);
 
 public enum ExternalOperationReceiptStatus

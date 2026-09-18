@@ -3,6 +3,13 @@ using SingPlus.Platform;
 
 namespace SingPlus.Runtime;
 
+internal sealed record VirtualDomainInspectionRecord(
+    VirtualDomainHandle Handle,
+    ProcessHandle Owner,
+    VirtualDomainHandle? Parent,
+    VirtualDomainState State,
+    int GuestMappingCount);
+
 internal sealed class VirtualDomainAuthority
 {
     internal sealed class Record
@@ -109,6 +116,20 @@ internal sealed class VirtualDomainAuthority
     }
 
     internal Record[] ForOwner(ProcessHandle owner) { lock (_gate) return _records.Values.Where(x => x.Owner == owner && x.State != VirtualDomainState.Closed).ToArray(); }
+
+    internal VirtualDomainInspectionRecord[] InspectionSnapshot()
+    {
+        lock (_gate)
+            return _records.Values
+                .Select(static record => new VirtualDomainInspectionRecord(
+                    record.Handle,
+                    record.Owner,
+                    record.ParentDomain,
+                    record.State,
+                    record.Mappings.Count))
+                .OrderBy(static record => record.Handle.DomainId.Value)
+                .ToArray();
+    }
 
     internal Record[] ChildrenOf(Record parent)
     {

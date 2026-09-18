@@ -26,6 +26,12 @@ public static class CapabilityResourceIds
 
     public const string Dsc1Copy = "compute:dsc1-copy:v1";
     public const string ProcessCreate = "process:create:v1";
+    public const string ServiceSupervisor = "kernel:service-supervisor:v1";
+    public const string AuthorityInspector = "kernel:authority-inspector:v1";
+    public const string BudgetAdministration = "kernel:budget-administration:v1";
+    public const string TraceInspection = "kernel:trace-inspection:v1";
+    public const string CheckpointAdministration = "kernel:checkpoint-administration:v1";
+    public const string TelemetryInspection = "kernel:telemetry-inspection:v1";
     public const string FileNamespace = "file:namespace:v1";
     public const string NetworkEndpoint = "network:endpoint:v1";
     public const string DisplayModel = "display:model:v1";

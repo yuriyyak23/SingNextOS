@@ -10,6 +10,23 @@ namespace SingPlus.Tests.Runtime;
 public sealed class ReclaimObservabilityTests
 {
     [Fact]
+    public void BlockerCauseHasOnlyPendingOrErrorVariantAndPreservesDiagnosticShape()
+    {
+        var pending = ReclaimBlockerSnapshot.Create(
+            ReclaimDependencyKind.EndpointSession, "session:1", ReclaimExternalState.Active,
+            null, "Still draining.");
+        Assert.IsType<ReclaimPendingCause>(pending.Cause);
+        Assert.Null(pending.Error);
+
+        var error = ReclaimBlockerSnapshot.Create(
+            ReclaimDependencyKind.PlatformDomain, "process:1", ReclaimExternalState.Quarantined,
+            KernelError.PlatformFaulted, "Closure failed.");
+        Assert.Equal(KernelError.PlatformFaulted, Assert.IsType<ReclaimErrorCause>(error.Cause).Error);
+        Assert.Equal(KernelError.PlatformFaulted, error.Error);
+        Assert.Equal("process:1", error.ResourceId);
+    }
+
+    [Fact]
     public void ComponentFaultShowsQuarantinedDomainAndClosedSessions()
     {
         var provider = new DiagnosticProvider { DomainRevokeStatus = PlatformAuthorityStatus.Faulted };

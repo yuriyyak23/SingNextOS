@@ -45,6 +45,7 @@ public sealed partial class RuntimeKernel
         public bool PlatformDomainClosed { get; set; } = domainBinding is null;
         public bool LocalReclaimCompleted { get; set; }
         public KernelError? BlockingError { get; set; }
+        public bool ComposedAuthorityPrepared { get; set; }
 
         public ProcessTeardownSnapshot Snapshot => new(
             Handle,
@@ -120,8 +121,113 @@ public sealed partial class RuntimeKernel
         ProcessHandle handle,
         ProcessState targetTerminalState)
     {
+        ProcessTeardownRecord record;
+        lock (_platformMemoryUseGate)
+        {
+            if (!_processTeardowns.TryGetValue(handle, out record!))
+            {
+                var initialized = InitializeProcessTeardownLocked(handle, targetTerminalState);
+                if (!initialized.IsSuccess) return KernelResult.Fail(initialized.Error, initialized.Message!);
+                record = initialized.Value!;
+            }
+            else if (record.TargetTerminalState != targetTerminalState)
+            {
+                return KernelResult.Fail(KernelError.InvalidTransition,
+                    $"Process teardown is already targeting {record.TargetTerminalState}.");
+            }
+        }
+
+        if (!record.ComposedAuthorityPrepared)
+        {
+            var prepared = PrepareComposedAuthorityTeardown(handle);
+            lock (_platformMemoryUseGate)
+            {
+                if (!prepared.IsSuccess)
+                {
+                    record.Phase = ProcessTeardownPhase.PlatformFaulted;
+                    record.BlockingError = prepared.Error;
+                    return prepared;
+                }
+                record.ComposedAuthorityPrepared = true;
+                record.Phase = ProcessTeardownPhase.LocalExitStarted;
+                record.BlockingError = null;
+            }
+        }
         lock (_platformMemoryUseGate)
             return BeginOrAdvanceProcessTeardownLocked(handle, targetTerminalState);
+    }
+
+    private KernelResult<ProcessTeardownRecord> InitializeProcessTeardownLocked(
+        ProcessHandle handle, ProcessState targetTerminalState)
+    {
+        if (targetTerminalState is not ProcessState.Exited and not ProcessState.Faulted)
+            return KernelResult<ProcessTeardownRecord>.Fail(KernelError.InvalidTransition,
+                "Process teardown target must be Exited or Faulted.");
+        var resolved = Processes.Resolve(handle);
+        if (!resolved.IsSuccess)
+            return KernelResult<ProcessTeardownRecord>.Fail(resolved.Error, resolved.Message!);
+        var process = resolved.Value!;
+        if (process.State is ProcessState.Exited or ProcessState.Faulted or ProcessState.Exiting)
+            return KernelResult<ProcessTeardownRecord>.Fail(KernelError.InvalidTransition,
+                $"Cannot begin teardown from state {process.State} without a tracked record.");
+
+        var nativeServices = DrainNativeServicesForProcess(handle);
+        if (!nativeServices.IsSuccess)
+            return KernelResult<ProcessTeardownRecord>.Fail(nativeServices.Error, nativeServices.Message!);
+        process.SetState(ProcessState.Exiting);
+        Channels.CloseAllForProcess(handle);
+        ReleaseClosedIpcBudgetsForProcess(handle);
+        CloseTraceSessionsForProcess(handle);
+        CloseTelemetrySubscriptionsForProcess(handle);
+        var sessionsClosed = CloseSessionsForProcess(handle);
+        if (!sessionsClosed.IsSuccess)
+            return KernelResult<ProcessTeardownRecord>.Fail(sessionsClosed.Error, sessionsClosed.Message!);
+        _kernelEvents.BeginCloseForProcess(handle);
+
+        var mappings = new Dictionary<PlatformRegionMappingId, PlatformRegionMapping>();
+        if (_processPlatformMappings.TryGetValue(handle, out var trackedMappings))
+            foreach (var mapping in trackedMappings) mappings[mapping.MappingId] = mapping;
+        foreach (var capabilityId in process.Capabilities.Items)
+        {
+            foreach (var mapping in PlatformAuthority.BeginCapabilityRevocation(capabilityId))
+                mappings[mapping.MappingId] = mapping;
+            _ = PlatformAuthority.BeginIrqCapabilityRevocation(capabilityId);
+            _ = PlatformAuthority.BeginMmioCapabilityRevocation(capabilityId);
+            _ = PlatformAuthority.BeginDeviceCapabilityRevocation(capabilityId);
+            _ = CapabilityAuthority.Revoke(capabilityId);
+        }
+        process.ClearCapabilities();
+        _processPlatformBindings.TryGetValue(handle, out var domainBinding);
+        var record = new ProcessTeardownRecord(handle, targetTerminalState,
+            mappings.Values.OrderBy(static mapping => mapping.MappingId.Value).ToArray(),
+            _processPlatformBindings.ContainsKey(handle) ? domainBinding : null)
+        {
+            ChannelsClosed = true,
+            LocalAuthorizationRevoked = true
+        };
+        _processTeardowns.Add(handle, record);
+        return KernelResult<ProcessTeardownRecord>.Ok(record);
+    }
+
+    private KernelResult PrepareComposedAuthorityTeardown(ProcessHandle handle)
+    {
+        var process = Processes.Resolve(handle);
+        if (!process.IsSuccess) return KernelResult.Fail(process.Error, process.Message!);
+        var owner = new RegionOwner(process.Value!.DomainId, process.Value.Generation);
+
+        var work = CloseComposedWorkForProcess(handle, owner);
+        if (!work.IsSuccess) return work;
+        var overlays = CloseSecureGuestRegionsForProcess(handle);
+        if (!overlays.IsSuccess) return overlays;
+        var virtualIo = CloseVirtualIoForProcess(handle);
+        if (!virtualIo.IsSuccess) return virtualIo;
+        var guestMappings = CloseGuestMappingsForProcess(handle);
+        if (!guestMappings.IsSuccess) return guestMappings;
+        var executions = DrainSecureExecutions(handle);
+        if (!executions.IsSuccess) return executions;
+        var secureDomains = CloseSecureDomainsForProcess(handle);
+        if (!secureDomains.IsSuccess) return secureDomains;
+        return CloseVirtualDomainsForProcess(handle);
     }
 
     private KernelResult BeginOrAdvanceProcessTeardownLocked(
@@ -187,84 +293,14 @@ public sealed partial class RuntimeKernel
             return AdvanceProcessTeardown(process, existing);
         }
 
-        if (process.State == ProcessState.Exiting)
-        {
-            return KernelResult<ProcessTeardownSnapshot>.Fail(
-                KernelError.PlatformFaulted,
-                "Process is already Exiting without a tracked teardown record.");
-        }
-
-        var secureDomains = CloseSecureDomainsForProcess(handle);
-        if (!secureDomains.IsSuccess)
-            return KernelResult<ProcessTeardownSnapshot>.Fail(secureDomains.Error, secureDomains.Message!);
-
-        // VM authority owns guest-memory reservations and an optional provider
-        // lease. Close it before capability revocation or any local region reclaim.
-        // Ambiguous provider closure quarantines the VM and aborts teardown closed.
-        var virtualDomains = CloseVirtualDomainsForProcess(handle);
-        if (!virtualDomains.IsSuccess)
-            return KernelResult<ProcessTeardownSnapshot>.Fail(virtualDomains.Error, virtualDomains.Message!);
-
-        // Native service objects mint caller-owned capabilities. Revoke and close
-        // those service-side objects before sessions/channels and provider authority
-        // are torn down, so a service crash cannot leave reusable ambient authority.
-        var nativeServices = DrainNativeServicesForProcess(handle);
-        if (!nativeServices.IsSuccess)
-            return KernelResult<ProcessTeardownSnapshot>.Fail(nativeServices.Error, nativeServices.Message!);
-
-        process.SetState(ProcessState.Exiting);
-
-        // Track A ordering guarantee: channel and event-wait cancellation happens
-        // before platform drain begins, without closing event/source authority.
-        Channels.CloseAllForProcess(handle);
-        var sessionsClosed = CloseSessionsForProcess(handle);
-        if (!sessionsClosed.IsSuccess)
-            return KernelResult<ProcessTeardownSnapshot>.Fail(sessionsClosed.Error, sessionsClosed.Message!);
-        _kernelEvents.BeginCloseForProcess(handle);
-
-        var mappings = new Dictionary<PlatformRegionMappingId, PlatformRegionMapping>();
-        if (_processPlatformMappings.TryGetValue(handle, out var trackedMappings))
-        {
-            foreach (var mapping in trackedMappings)
-                mappings[mapping.MappingId] = mapping;
-        }
-
-        foreach (var capabilityId in process.Capabilities.Items)
-        {
-            foreach (var mapping in PlatformAuthority.BeginCapabilityRevocation(capabilityId))
-                mappings[mapping.MappingId] = mapping;
-
-            _ = PlatformAuthority.BeginIrqCapabilityRevocation(capabilityId);
-            _ = PlatformAuthority.BeginMmioCapabilityRevocation(capabilityId);
-            _ = PlatformAuthority.BeginDeviceCapabilityRevocation(capabilityId);
-            _ = CapabilityAuthority.Revoke(capabilityId);
-        }
-        process.ClearCapabilities();
-
-        _processPlatformBindings.TryGetValue(handle, out var domainBinding);
-        var record = new ProcessTeardownRecord(
-            handle,
-            targetTerminalState,
-            mappings.Values
-                .OrderBy(static mapping => mapping.MappingId.Value)
-                .ToArray(),
-            _processPlatformBindings.ContainsKey(handle) ? domainBinding : null)
-        {
-            ChannelsClosed = true,
-            LocalAuthorizationRevoked = true
-        };
-
-        _processTeardowns.Add(handle, record);
-        return AdvanceProcessTeardown(process, record);
+        return KernelResult<ProcessTeardownSnapshot>.Fail(KernelError.PlatformFaulted,
+            "Process teardown lifecycle was invoked without its admission-stop record.");
     }
 
     private KernelResult<ProcessTeardownSnapshot> AdvanceProcessTeardown(
         SingProcess process,
         ProcessTeardownRecord record)
     {
-        if (record.Phase == ProcessTeardownPhase.PlatformFaulted)
-            return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
-
         var identity = PlatformIdentity(process);
         KernelError? firstBlockingError = null;
         var pendingMappings = 0;
@@ -281,6 +317,7 @@ public sealed partial class RuntimeKernel
 
         var externalOperationProgress = ExternalOperations.AdvanceForTeardown(
             new RegionOwner(process.DomainId, process.Generation));
+        ReconcileReleasedExternalOperationBudgets(record.Handle);
         if (!externalOperationProgress.IsSuccess)
         {
             if (externalOperationProgress.Error == KernelError.PlatformBindingDraining)
@@ -345,6 +382,10 @@ public sealed partial class RuntimeKernel
             var queried = PlatformAuthority.QueryRegionMappingLifecycle(mapping, identity);
             if (!queried.IsSuccess)
             {
+                if (queried.Error is KernelError.PlatformBindingNotFound or KernelError.PlatformBindingRevoked &&
+                    (!_processPlatformMappings.TryGetValue(record.Handle, out var currentMappings) ||
+                     currentMappings.All(current => current != mapping)))
+                    continue;
                 firstBlockingError ??= queried.Error;
                 continue;
             }
@@ -480,6 +521,8 @@ public sealed partial class RuntimeKernel
     private KernelResult FinalizeProcessCleanup(SingProcess process)
     {
         var handle = new ProcessHandle(process.ProcessId, process.Generation);
+        if (HasPinnedSecureExecution(handle))
+            return KernelResult.Fail(KernelError.PlatformFaulted, "Live or quarantined secure execution forbids local process reclaim.");
         Channels.CloseAllForProcess(handle);
         var eventsClosed = _kernelEvents.CloseAllForProcess(handle);
         if (!eventsClosed.IsSuccess) return eventsClosed;
@@ -490,6 +533,7 @@ public sealed partial class RuntimeKernel
             CapabilityAuthority.RevokeAllForDomain(process.DomainId);
             Regions.ReturnAllLoansForBorrowerDomain(process.DomainId);
             Regions.ReclaimAllForDomain(process.DomainId);
+            ReleaseReclaimedRegionBudgetsForProcess(handle);
             Channels.CloseAllForDomain(process.DomainId);
         }
 

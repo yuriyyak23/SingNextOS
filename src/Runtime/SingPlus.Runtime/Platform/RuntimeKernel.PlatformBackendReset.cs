@@ -21,7 +21,9 @@ public sealed partial class RuntimeKernel
             }
 
             _virtualDomains.QuarantineForPlatformBackendReset();
+            QuarantineVirtualIoForBackendReset();
             QuarantineSecureDomainsForPlatformBackendReset();
+            QuarantineSecureExecutionsForBackendReset();
             return reset;
         }
     }

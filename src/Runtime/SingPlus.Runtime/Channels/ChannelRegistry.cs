@@ -5,6 +5,7 @@ namespace SingPlus.Runtime;
 
 public sealed class ChannelRegistry
 {
+    internal readonly record struct TelemetrySummary(int Channels, int QueuedMessages);
     private sealed class ChannelRecord
     {
         public required ChannelId Id { get; init; }
@@ -34,6 +35,12 @@ public sealed class ChannelRegistry
 
     internal event Action<ChannelId>? ChannelClosed;
 
+    internal TelemetrySummary InspectionSummary(ProcessHandle owner)
+    {
+        var selected = _channels.Values.Where(record => !record.Closed && (record.LeftOwner == owner || record.RightOwner == owner)).ToArray();
+        return new(selected.Length, selected.Sum(static record => record.Queue.Count));
+    }
+
     internal (ChannelEndpointHandle Left, ChannelEndpointHandle Right) Create(ProtocolDefinitionV1 protocol, SingProcess left, SingProcess right, int capacity)
     {
         if (capacity <= 0) throw new ArgumentOutOfRangeException(nameof(capacity));
@@ -62,6 +69,28 @@ public sealed class ChannelRegistry
         var owner = handle.EndpointId.Value == 1 ? record.LeftOwner : record.RightOwner;
         var domain = handle.EndpointId.Value == 1 ? record.LeftDomain : record.RightDomain;
         return KernelResult<ChannelEndpoint>.Ok(new ChannelEndpoint(handle, domain, owner.Generation, record.State, record.Sequence, record.Capacity));
+    }
+
+    internal KernelResult ValidateV2Semantic(
+        ChannelEndpointHandle endpoint,
+        uint messageId,
+        IpcTransferSemantic semantic)
+    {
+        var resolved = Resolve(endpoint);
+        if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+        if (!resolved.Value!.Protocol.TryGetMessage(messageId, out var message))
+            return KernelResult.Fail(KernelError.InvalidMessage, "Message is not part of the protocol.");
+        var valid = semantic switch
+        {
+            IpcTransferSemantic.Copy or IpcTransferSemantic.ScatterGatherCopy =>
+                message.Consumes.Count == 0 && message.Borrows.Count == 0 && message.RequestPayload.Kind == RequestPayloadKind.Bounded,
+            IpcTransferSemantic.Move => message.Consumes.Count == 1 && message.Borrows.Count == 0,
+            IpcTransferSemantic.BorrowRead => message.Borrows.Count == 1 && message.Consumes.Count == 0,
+            IpcTransferSemantic.RequestReply => true,
+            _ => false,
+        };
+        return valid ? KernelResult.Ok() : KernelResult.Fail(KernelError.UnsupportedPayload,
+            $"Protocol message does not declare {semantic} semantics.");
     }
 
     internal KernelResult<ChannelEnvelope> Send(

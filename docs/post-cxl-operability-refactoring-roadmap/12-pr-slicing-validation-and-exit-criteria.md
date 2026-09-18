@@ -1,5 +1,7 @@
 # Phase 12 — PR Slicing, Validation, and Final Exit Criteria
 
+Status: implemented and qualified. The executable negative/end-to-end mapping is recorded in `12_FINAL_QUALIFICATION_MATRIX.md`; command evidence is in `12_PHASE_12_IMPLEMENTATION_EVIDENCE.md`.
+
 ## Goal
 
 Define implementation order, keep reviews bounded, and establish the final negative-test matrix required to declare the post-CXL operability roadmap complete.

@@ -58,6 +58,8 @@ public sealed partial class RuntimeKernel
         var events = MintCapability(ownerProcess.DomainId, owner, ResourceKind.Virtualization, VirtualizationResourceIds.Events(record.Handle.DomainId), CapabilityRights.Signal).Value!.CapabilityId;
         var traps = MintCapability(ownerProcess.DomainId, owner, ResourceKind.Virtualization, VirtualizationResourceIds.Traps(record.Handle.DomainId), CapabilityRights.Read).Value!.CapabilityId;
         record.Capabilities = [configure, memory, execute, events, traps];
+        RecordTrace(owner, TraceEventKind.VirtualDomainLifecycle, null, "virtual-domain",
+            record.Handle.DomainId.Value.ToString(), record.State.ToString(), "created");
         return KernelResult<VirtualDomainAuthoritySet>.Ok(new VirtualDomainAuthoritySet(record.Handle, record.AddressSpace, configure, memory, execute, events, traps));
     }
 
@@ -65,10 +67,14 @@ public sealed partial class RuntimeKernel
         ProcessHandle owner, VirtualDomainHandle parentDomain, CapabilityId parentCapability,
         NestedVirtualDomainRequestProfile requested)
     {
+        using var composedUse = PinComposedDomain(owner, virtualDomain: parentDomain);
+        if (!composedUse.Result.IsSuccess) return KernelResult<VirtualDomainAuthoritySet>.Fail(composedUse.Result.Error, composedUse.Result.Message!);
         var parent = ResolveVirtualCapability(owner, parentDomain, parentCapability,
             VirtualizationResourceIds.Domain(parentDomain.DomainId), CapabilityRights.Configure);
         if (!parent.IsSuccess)
             return KernelResult<VirtualDomainAuthoritySet>.Fail(parent.Error, parent.Message!);
+        if (composedUse.HasBindings)
+            return KernelResult<VirtualDomainAuthoritySet>.Fail(KernelError.PlatformUnsupported, "Nested secure execution is not admitted by Phase 00.");
         if (parent.Value!.State is not VirtualDomainState.Configured and not VirtualDomainState.Parked)
             return KernelResult<VirtualDomainAuthoritySet>.Fail(KernelError.InvalidTransition,
                 "Nested domains may be admitted only while the exact parent is configured or parked.");
@@ -133,6 +139,8 @@ public sealed partial class RuntimeKernel
 
     public KernelResult ConfigureVirtualDomain(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId configureCapability)
     {
+        using var composedUse = PinComposedDomain(owner, virtualDomain: domain);
+        if (!composedUse.Result.IsSuccess) return KernelResult.Fail(composedUse.Result.Error, composedUse.Result.Message!);
         var record = ResolveVirtualCapability(owner, domain, configureCapability, VirtualizationResourceIds.Domain(domain.DomainId), CapabilityRights.Configure);
         if (!record.IsSuccess) return KernelResult.Fail(record.Error, record.Message!);
         if (record.Value!.State != VirtualDomainState.Created) return KernelResult.Fail(KernelError.InvalidTransition, "Virtual domain can only be configured from Created.");
@@ -147,6 +155,8 @@ public sealed partial class RuntimeKernel
 
     public KernelResult<GuestRegionMapping> MapGuestRegion(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId memoryCapability, CapabilityId regionCapability, RegionHandle region, GuestAddressRange range, GuestMemoryAccess access)
     {
+        using var composedUse = PinComposedDomain(owner, virtualDomain: domain);
+        if (!composedUse.Result.IsSuccess) return KernelResult<GuestRegionMapping>.Fail(composedUse.Result.Error, composedUse.Result.Message!);
         var record = ResolveVirtualCapability(owner, domain, memoryCapability, VirtualizationResourceIds.Memory(domain.DomainId), CapabilityRights.Map);
         if (!record.IsSuccess) return KernelResult<GuestRegionMapping>.Fail(record.Error, record.Message!);
         if (record.Value!.State is not VirtualDomainState.Configured and not VirtualDomainState.Parked)
@@ -186,6 +196,14 @@ public sealed partial class RuntimeKernel
                 _ = Regions.ReleasePlatformMappingReservation(region, new(process.DomainId, owner.Generation));
                 return KernelResult<GuestRegionMapping>.Fail(parentMap.Error, parentMap.Message!);
             }
+            var composedMap = RevalidateComposedDomain(owner, virtualDomain: domain);
+            if (!composedMap.IsSuccess)
+            {
+                var cleanup = CloseParentPlatformMapping(parentMap.Value!, PlatformIdentity(process));
+                if (!cleanup.IsSuccess) record.Value.State = VirtualDomainState.Quarantined;
+                else _ = _virtualDomains.RemoveMapping(record.Value, local.Mapping);
+                return KernelResult<GuestRegionMapping>.Fail(composedMap.Error, composedMap.Message!);
+            }
             var guestMap = PlatformAuthority.MapChildGuestRegion(child, parentMap.Value!,
                 new(range.GuestAddress, range.ByteLength), ToPlatformAccess(access));
             if (!guestMap.IsSuccess)
@@ -203,11 +221,15 @@ public sealed partial class RuntimeKernel
             }
             record.Value.PlatformMappings.Add(local.Mapping.MappingId, (guestMap.Value!, parentMap.Value!));
         }
-        return KernelResult<GuestRegionMapping>.Ok(local);
+        var composedPublication = RevalidateComposedDomain(owner, virtualDomain: domain);
+        return composedPublication.IsSuccess ? KernelResult<GuestRegionMapping>.Ok(local) :
+            KernelResult<GuestRegionMapping>.Fail(composedPublication.Error, composedPublication.Message!);
     }
 
     public KernelResult CloseGuestRegionMapping(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId memoryCapability, GuestRegionMappingHandle mapping)
     {
+        using var composedUse = PinComposedDomain(owner, virtualDomain: domain, allowDraining: true);
+        if (!composedUse.Result.IsSuccess) return KernelResult.Fail(composedUse.Result.Error, composedUse.Result.Message!);
         var record = ResolveVirtualCapability(owner, domain, memoryCapability, VirtualizationResourceIds.Memory(domain.DomainId), CapabilityRights.Map);
         if (!record.IsSuccess) return KernelResult.Fail(record.Error, record.Message!);
         if (record.Value!.State is VirtualDomainState.Quarantined or VirtualDomainState.Faulted)
@@ -216,6 +238,11 @@ public sealed partial class RuntimeKernel
         var exactMapping = _virtualDomains.ResolveMapping(record.Value, mapping);
         if (!exactMapping.IsSuccess)
             return KernelResult.Fail(exactMapping.Error, exactMapping.Message!);
+        if (HasVirtualComputePin(mapping))
+            return KernelResult.Fail(KernelError.PlatformBindingDraining, "Guest mapping remains pinned by virtualized provider work.");
+
+        var secureClose = CloseSecureGuestRegionsForGuestMapping(owner, mapping);
+        if (!secureClose.IsSuccess) return secureClose;
 
         bool childPlatformMapping = record.Value.PlatformMappings.ContainsKey(mapping.MappingId);
         if (childPlatformMapping)
@@ -239,6 +266,8 @@ public sealed partial class RuntimeKernel
         ProcessHandle owner, VirtualDomainHandle domain, CapabilityId executeCapability,
         GuestRegionMappingHandle mapping, ReadOnlyMemory<byte> immutablePackage, int maximumExecutionSteps)
     {
+        using var composedUse = PinComposedDomain(owner, virtualDomain: domain);
+        if (!composedUse.Result.IsSuccess) return KernelResult.Fail(composedUse.Result.Error, composedUse.Result.Message!);
         var record = ResolveVirtualCapability(owner, domain, executeCapability,
             VirtualizationResourceIds.Domain(domain.DomainId), CapabilityRights.Execute);
         if (!record.IsSuccess) return KernelResult.Fail(record.Error, record.Message!);
@@ -259,6 +288,8 @@ public sealed partial class RuntimeKernel
 
     public KernelResult StartVirtualDomain(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId executeCapability)
     {
+        using var composedUse = PinComposedDomain(owner, virtualDomain: domain);
+        if (!composedUse.Result.IsSuccess) return KernelResult.Fail(composedUse.Result.Error, composedUse.Result.Message!);
         var record = ResolveVirtualCapability(owner, domain, executeCapability,
             VirtualizationResourceIds.Domain(domain.DomainId), CapabilityRights.Execute);
         if (!record.IsSuccess) return KernelResult.Fail(record.Error, record.Message!);
@@ -283,6 +314,8 @@ public sealed partial class RuntimeKernel
 
     public KernelResult InjectVirtualEvent(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId eventCapability, KernelEventEndpoint endpoint)
     {
+        using var composedUse = PinComposedDomain(owner, virtualDomain: domain);
+        if (!composedUse.Result.IsSuccess) return KernelResult.Fail(composedUse.Result.Error, composedUse.Result.Message!);
         var record = ResolveVirtualCapability(owner, domain, eventCapability, VirtualizationResourceIds.Events(domain.DomainId), CapabilityRights.Signal);
         if (!record.IsSuccess) return KernelResult.Fail(record.Error, record.Message!);
         if (record.Value!.State is VirtualDomainState.Draining or VirtualDomainState.Closed or VirtualDomainState.Faulted or VirtualDomainState.Quarantined)
@@ -295,6 +328,12 @@ public sealed partial class RuntimeKernel
         }
         var staged = _kernelEvents.Stage(owner, endpoint, KernelEventClass.ExternalSignal, VirtualizationResourceIds.Events(domain.DomainId));
         if (!staged.IsSuccess) return KernelResult.Fail(staged.Error, staged.Message!);
+        var composedPublication = RevalidateComposedDomain(owner, virtualDomain: domain);
+        if (!composedPublication.IsSuccess)
+        {
+            _ = _kernelEvents.RollbackExact(owner, staged.Value!);
+            return composedPublication;
+        }
         var committed = _kernelEvents.CommitExact(owner, staged.Value!);
         return committed.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(committed.Error, committed.Message!);
     }
@@ -302,6 +341,8 @@ public sealed partial class RuntimeKernel
     public KernelResult<VirtualTrapObservation> ObserveVirtualTrap(
         ProcessHandle owner, VirtualDomainHandle domain, CapabilityId trapCapability)
     {
+        using var composedUse = PinComposedDomain(owner, virtualDomain: domain);
+        if (!composedUse.Result.IsSuccess) return KernelResult<VirtualTrapObservation>.Fail(composedUse.Result.Error, composedUse.Result.Message!);
         var record = ResolveVirtualCapability(owner, domain, trapCapability,
             VirtualizationResourceIds.Traps(domain.DomainId), CapabilityRights.Read);
         if (!record.IsSuccess)
@@ -319,6 +360,8 @@ public sealed partial class RuntimeKernel
                 record.Value.State = VirtualDomainState.Quarantined;
             return KernelResult<VirtualTrapObservation>.Fail(observed.Error, observed.Message!);
         }
+        var composedPublication = RevalidateComposedDomain(owner, virtualDomain: domain);
+        if (!composedPublication.IsSuccess) return KernelResult<VirtualTrapObservation>.Fail(composedPublication.Error, composedPublication.Message!);
         return KernelResult<VirtualTrapObservation>.Ok(new(domain, observed.Value!.Sequence,
             (VirtualTrapKind)(int)observed.Value.Kind));
     }
@@ -327,6 +370,17 @@ public sealed partial class RuntimeKernel
     {
         var record = ResolveVirtualCapability(owner, domain, configureCapability, VirtualizationResourceIds.Domain(domain.DomainId), CapabilityRights.Configure);
         if (!record.IsSuccess) return KernelResult.Fail(record.Error, record.Message!);
+        lock (_secureExecutionGate)
+            if (record.Value!.State is not (VirtualDomainState.Quarantined or VirtualDomainState.Faulted or VirtualDomainState.Closed))
+                record.Value.State = VirtualDomainState.Draining;
+        var virtualIoDrain = CloseVirtualIoForDomain(owner, domain);
+        if (!virtualIoDrain.IsSuccess) return virtualIoDrain;
+        var secureGuestDrain = CloseSecureGuestRegionsForVirtualDomain(owner, domain);
+        if (!secureGuestDrain.IsSuccess) return secureGuestDrain;
+        var guestMappingDrain = CloseGuestMappingsForVirtualTree(record.Value!, owner);
+        if (!guestMappingDrain.IsSuccess) return guestMappingDrain;
+        var composedDrain = DrainSecureExecutions(owner, virtualDomain: domain);
+        if (!composedDrain.IsSuccess) return composedDrain;
         if (record.Value!.State is VirtualDomainState.Quarantined or VirtualDomainState.Faulted)
             return KernelResult.Fail(KernelError.PlatformFaulted, "A faulted or quarantined virtual domain remains pinned until externally proven closure exists.");
         if (record.Value.State != VirtualDomainState.Draining)
@@ -354,6 +408,8 @@ public sealed partial class RuntimeKernel
 
     private KernelResult TransitionVirtualDomain(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId capability, VirtualDomainState from, VirtualDomainState to, PlatformVirtualDomainTransition transition)
     {
+        using var composedUse = PinComposedDomain(owner, virtualDomain: domain);
+        if (!composedUse.Result.IsSuccess) return KernelResult.Fail(composedUse.Result.Error, composedUse.Result.Message!);
         var record = ResolveVirtualCapability(owner, domain, capability, VirtualizationResourceIds.Domain(domain.DomainId), CapabilityRights.Execute);
         if (!record.IsSuccess) return KernelResult.Fail(record.Error, record.Message!);
         if (record.Value!.State != from) return KernelResult.Fail(KernelError.InvalidTransition, $"Virtual domain cannot transition from {record.Value.State} to {to}.");
@@ -379,6 +435,11 @@ public sealed partial class RuntimeKernel
         if (!capability.IsSuccess) return KernelResult<VirtualDomainAuthority.Record>.Fail(capability.Error, capability.Message!);
         if (capability.Value!.ResourceKind != ResourceKind.Virtualization || capability.Value.ResourceId != resourceId)
             return KernelResult<VirtualDomainAuthority.Record>.Fail(KernelError.WrongCapabilityResource, "Capability does not match the exact virtual-domain resource.");
+        if (rights != CapabilityRights.Configure)
+        {
+            var composed = RevalidateComposedDomain(owner, virtualDomain: domain);
+            if (!composed.IsSuccess) return KernelResult<VirtualDomainAuthority.Record>.Fail(composed.Error, composed.Message!);
+        }
         return record;
     }
 
@@ -388,9 +449,6 @@ public sealed partial class RuntimeKernel
                      .Where(static domain => domain.ParentDomain is null)
                      .OrderBy(static domain => domain.Handle.DomainId.Value))
         {
-            if (record.State == VirtualDomainState.Quarantined)
-                return KernelResult.Fail(KernelError.PlatformFaulted, "A virtual domain is quarantined; process authority remains pinned.");
-
             record.State = VirtualDomainState.Draining;
             var nestedClose = CloseNestedDomainsForParent(record, owner);
             if (!nestedClose.IsSuccess) { record.State = VirtualDomainState.Quarantined; return nestedClose; }
@@ -401,6 +459,8 @@ public sealed partial class RuntimeKernel
             }
             foreach (var mapping in record.Mappings.Values.OrderBy(static mapping => mapping.Mapping.MappingId.Value).ToArray())
             {
+                var secureClose = CloseSecureGuestRegionsForGuestMapping(owner, mapping.Mapping);
+                if (!secureClose.IsSuccess) { record.State = VirtualDomainState.Quarantined; return secureClose; }
                 bool childPlatformMapping = record.PlatformMappings.ContainsKey(mapping.Mapping.MappingId);
                 if (childPlatformMapping)
                 {
@@ -487,6 +547,8 @@ public sealed partial class RuntimeKernel
             if (!descendants.IsSuccess) return descendants;
             foreach (var mapping in child.Mappings.Values.OrderBy(static x => x.Mapping.MappingId.Value).ToArray())
             {
+                var secureClose = CloseSecureGuestRegionsForGuestMapping(owner, mapping.Mapping);
+                if (!secureClose.IsSuccess) { child.State = VirtualDomainState.Quarantined; return secureClose; }
                 bool platformMapping = child.PlatformMappings.ContainsKey(mapping.Mapping.MappingId);
                 if (platformMapping)
                 {
@@ -508,6 +570,55 @@ public sealed partial class RuntimeKernel
             if (!closed.IsSuccess) { child.State = VirtualDomainState.Quarantined; return closed; }
             child.State = VirtualDomainState.Closed;
             foreach (var capability in child.Capabilities) _ = RevokeCapability(capability);
+        }
+        return KernelResult.Ok();
+    }
+
+    private KernelResult CloseGuestMappingsForProcess(ProcessHandle owner)
+    {
+        foreach (var record in _virtualDomains.ForOwner(owner).OrderByDescending(x => x.Handle.DomainId.Value))
+        {
+            record.State = VirtualDomainState.Draining;
+            var close = CloseGuestMappingsForRecord(record, owner);
+            if (!close.IsSuccess) { record.State = VirtualDomainState.Quarantined; return close; }
+        }
+        return KernelResult.Ok();
+    }
+
+    private KernelResult CloseGuestMappingsForVirtualTree(VirtualDomainAuthority.Record record, ProcessHandle owner)
+    {
+        foreach (var child in _virtualDomains.ChildrenOf(record))
+        {
+            var descendants = CloseGuestMappingsForVirtualTree(child, owner);
+            if (!descendants.IsSuccess) return descendants;
+        }
+        return CloseGuestMappingsForRecord(record, owner);
+    }
+
+    private KernelResult CloseGuestMappingsForRecord(VirtualDomainAuthority.Record record, ProcessHandle owner)
+    {
+        foreach (var mapping in record.Mappings.Values.OrderBy(x => x.Mapping.MappingId.Value).ToArray())
+        {
+            if (HasVirtualComputePin(mapping.Mapping))
+                return KernelResult.Fail(KernelError.PlatformBindingDraining, "Guest mapping remains pinned by virtualized provider work.");
+            var secureClose = CloseSecureGuestRegionsForGuestMapping(owner, mapping.Mapping);
+            if (!secureClose.IsSuccess) return secureClose;
+            var childPlatformMapping = record.PlatformMappings.ContainsKey(mapping.Mapping.MappingId);
+            if (childPlatformMapping)
+            {
+                var platformClose = CloseChildPlatformMapping(record, owner, mapping.Mapping.MappingId);
+                if (!platformClose.IsSuccess) return platformClose;
+            }
+            var removed = _virtualDomains.RemoveMapping(record, mapping.Mapping);
+            if (!removed.IsSuccess) return KernelResult.Fail(removed.Error, removed.Message!);
+            if (!childPlatformMapping)
+            {
+                var process = Processes.Resolve(owner);
+                if (!process.IsSuccess) return KernelResult.Fail(process.Error, process.Message!);
+                var released = Regions.ReleasePlatformMappingReservation(mapping.Region,
+                    new RegionOwner(process.Value!.DomainId, owner.Generation));
+                if (!released.IsSuccess) return released;
+            }
         }
         return KernelResult.Ok();
     }

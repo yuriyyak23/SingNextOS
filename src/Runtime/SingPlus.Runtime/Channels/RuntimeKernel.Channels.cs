@@ -84,8 +84,10 @@ public sealed partial class RuntimeKernel
         ChannelEndpointHandle endpoint,
         uint messageId,
         object? payload = null,
-        IReadOnlyCollection<CapabilityId>? capabilities = null) =>
-        SendCore(sender, receiver, endpoint, messageId, payload, secondaryPayload: null, capabilities);
+        IReadOnlyCollection<CapabilityId>? capabilities = null,
+        AdmissionQosHint qosHint = AdmissionQosHint.None,
+        TraceCausalContext? traceContext = null) =>
+        SendCore(sender, receiver, endpoint, messageId, payload, secondaryPayload: null, capabilities, qosHint, traceContext);
 
     public KernelResult<ChannelEnvelope> SendOwnershipPair(
         ProcessHandle sender,
@@ -94,8 +96,10 @@ public sealed partial class RuntimeKernel
         uint messageId,
         object firstOwnershipPayload,
         object secondOwnershipPayload,
-        IReadOnlyCollection<CapabilityId>? capabilities = null) =>
-        SendCore(sender, receiver, endpoint, messageId, firstOwnershipPayload, secondOwnershipPayload, capabilities);
+        IReadOnlyCollection<CapabilityId>? capabilities = null,
+        AdmissionQosHint qosHint = AdmissionQosHint.None,
+        TraceCausalContext? traceContext = null) =>
+        SendCore(sender, receiver, endpoint, messageId, firstOwnershipPayload, secondOwnershipPayload, capabilities, qosHint, traceContext);
 
     private KernelResult<ChannelEnvelope> SendCore(
         ProcessHandle sender,
@@ -104,7 +108,9 @@ public sealed partial class RuntimeKernel
         uint messageId,
         object? payload,
         object? secondaryPayload,
-        IReadOnlyCollection<CapabilityId>? capabilities)
+        IReadOnlyCollection<CapabilityId>? capabilities,
+        AdmissionQosHint qosHint,
+        TraceCausalContext? traceContext)
     {
         var senderProcess = Processes.Resolve(sender);
         if (!senderProcess.IsSuccess)
@@ -118,6 +124,15 @@ public sealed partial class RuntimeKernel
             var responsePreflight = Responses.CanRegisterRequest(endpoint, messageId, sender, receiver);
             if (!responsePreflight.IsSuccess)
                 return KernelResult<ChannelEnvelope>.Fail(responsePreflight.Error, responsePreflight.Message!);
+
+            var budget = ReserveAttachedBudget(sender,
+                [
+                    new(ServiceBudgetDimension.IpcMessages, 1),
+                    new(ServiceBudgetDimension.IpcBytes, EstimateIpcBytes(payload, secondaryPayload)),
+                ],
+                BudgetReservationLifetime.IpcQueued,
+                qosHint);
+            if (!budget.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(budget.Error, budget.Message!);
 
             var send = secondaryPayload is null
                 ? Channels.Send(
@@ -135,12 +150,20 @@ public sealed partial class RuntimeKernel
                     payload!,
                     secondaryPayload,
                     capabilities);
-            if (!send.IsSuccess) return send;
+            if (!send.IsSuccess)
+            {
+                _ = ReleaseAttachedBudget(sender, budget.Value);
+                return send;
+            }
 
             // A response-capable request must not become observable by the receiver
             // until its exact response correlation is registered. Receive uses the
             // same gate, so enqueue + correlation publication are one visibility step.
             Responses.RegisterRequest(endpoint, send.Value!, sender, receiver);
+            if (budget.Value is { } reservation)
+                _ipcBudgetReservations.Add((endpoint.ChannelId, send.Value!.Sequence), (sender, receiver, reservation));
+            RecordTrace(sender, TraceEventKind.IpcSent, traceContext, "ipc",
+                $"{endpoint.ChannelId.Value}:{send.Value!.Sequence}", "queued", "admitted");
             return send;
         }
     }
@@ -157,7 +180,25 @@ public sealed partial class RuntimeKernel
             if (!receive.IsSuccess) return receive;
 
             Responses.MarkDelivered(endpoint, receive.Value!, receiver);
+            if (_ipcBudgetReservations.Remove((endpoint.ChannelId, receive.Value!.Sequence), out var charge))
+                _ = ReleaseAttachedBudget(charge.Sender, charge.Reservation);
+            RecordTrace(receiver, TraceEventKind.IpcReceived, null, "ipc",
+                $"{endpoint.ChannelId.Value}:{receive.Value.Sequence}", "received", "delivered");
             return receive;
         }
+    }
+
+    private static ulong EstimateIpcBytes(object? payload, object? secondaryPayload)
+    {
+        static ulong One(object? value) => value switch
+        {
+            null => 0,
+            IBoundedPayload bounded => checked((ulong)Math.Max(0, bounded.PayloadSize)),
+            string text => checked((ulong)text.Length * 2),
+            byte[] bytes => checked((ulong)bytes.Length),
+            _ when value.GetType().IsPrimitive || value is Enum => 16,
+            _ => 64,
+        };
+        return checked(32UL + One(payload) + One(secondaryPayload));
     }
 }

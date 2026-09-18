@@ -6,6 +6,8 @@ namespace SingPlus.Runtime;
 
 public sealed partial class RuntimeKernel
 {
+    private readonly TimeProvider _operabilityTimeProvider;
+
     public RuntimeKernel()
         : this(null, null)
     {
@@ -18,6 +20,8 @@ public sealed partial class RuntimeKernel
 
     public RuntimeKernel(IPlatformAuthorityProvider? platformProvider, TimeProvider? timeProvider)
     {
+        var selectedTimeProvider = timeProvider ?? TimeProvider.System;
+        _operabilityTimeProvider = selectedTimeProvider;
         Processes = new ProcessRegistry();
         Domains = new DomainRegistry();
         CapabilityAuthority = new CapabilityAuthority();
@@ -27,7 +31,10 @@ public sealed partial class RuntimeKernel
         Channels = new ChannelRegistry(CapabilityAuthority, Regions);
         PlatformAuthority = new PlatformAuthorityBridge(platformProvider);
         Services = new ServiceRegistry();
-        EndpointSessions = new EndpointSessionRegistry(timeProvider ?? TimeProvider.System);
+        EndpointSessions = new EndpointSessionRegistry(selectedTimeProvider);
+        CancellationScopes = new CancellationScopeAuthority(selectedTimeProvider);
+        Budgets = new ResourceBudgetAuthority();
+        Traces = new DeterministicTraceAuthority(selectedTimeProvider);
     }
 
     public ProcessRegistry Processes { get; }
@@ -40,6 +47,9 @@ public sealed partial class RuntimeKernel
     public PlatformAuthorityBridge PlatformAuthority { get; }
     internal ServiceRegistry Services { get; }
     internal EndpointSessionRegistry EndpointSessions { get; }
+    public CancellationScopeAuthority CancellationScopes { get; }
+    public ResourceBudgetAuthority Budgets { get; }
+    internal DeterministicTraceAuthority Traces { get; }
 
     public KernelResult<SingProcess> CreateProcess(SingProcessManifestV1 manifest)
     {
@@ -80,6 +90,8 @@ public sealed partial class RuntimeKernel
 
         process.SetState(ProcessState.Runnable);
         process.SetState(ProcessState.Running);
+        RecordTrace(handle, TraceEventKind.ProcessLifecycle, null, "process",
+            $"{handle.ProcessId.Value}:{handle.Generation}", "running", "started");
         return KernelResult.Ok();
     }
 
@@ -103,7 +115,8 @@ public sealed partial class RuntimeKernel
     public KernelResult FaultProcess(ProcessHandle handle) =>
         BeginOrAdvanceProcessTeardown(handle, ProcessState.Faulted);
 
-    public KernelResult<CapabilityDescriptorV1> MintCapability(DomainId issuerDomain, ProcessHandle subject, ResourceKind resourceKind, string resourceId, CapabilityRights rights)
+    public KernelResult<CapabilityDescriptorV1> MintCapability(DomainId issuerDomain, ProcessHandle subject, ResourceKind resourceKind, string resourceId, CapabilityRights rights,
+        TraceCausalContext? traceContext = null)
     {
         var resolved = Processes.Resolve(subject);
         if (!resolved.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(resolved.Error, resolved.Message!);
@@ -112,10 +125,13 @@ public sealed partial class RuntimeKernel
         if (!Domains.Contains(issuerDomain)) return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.DomainNotFound, $"Issuer domain {issuerDomain} is not active.");
         var descriptor = CapabilityAuthority.Mint(issuerDomain, resolved.Value!.DomainId, resourceKind, resourceId, rights, subject.Generation);
         resolved.Value.AddCapability(descriptor.CapabilityId);
+        RecordTrace(subject, TraceEventKind.CapabilityMinted, traceContext, "capability",
+            descriptor.CapabilityId.Value.ToString(), "active", "minted");
         return KernelResult<CapabilityDescriptorV1>.Ok(descriptor);
     }
 
-    public KernelResult<CapabilityDescriptorV1> DelegateCapability(ProcessHandle delegator, ProcessHandle target, CapabilityId sourceCapability, CapabilityRights rights)
+    public KernelResult<CapabilityDescriptorV1> DelegateCapability(ProcessHandle delegator, ProcessHandle target, CapabilityId sourceCapability, CapabilityRights rights,
+        TraceCausalContext? traceContext = null)
     {
         var sourceProcess = Processes.Resolve(delegator);
         if (!sourceProcess.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(sourceProcess.Error, sourceProcess.Message!);
@@ -128,7 +144,12 @@ public sealed partial class RuntimeKernel
         if (!targetEffect.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(targetEffect.Error, targetEffect.Message!);
 
         var delegated = CapabilityAuthority.Delegate(sourceCapability, sourceProcess.Value!.DomainId, targetProcess.Value!.DomainId, rights, target.Generation);
-        if (delegated.IsSuccess) targetProcess.Value!.AddCapability(delegated.Value!.CapabilityId);
+        if (delegated.IsSuccess)
+        {
+            targetProcess.Value!.AddCapability(delegated.Value!.CapabilityId);
+            RecordTrace(target, TraceEventKind.CapabilityDelegated, traceContext, "capability",
+                delegated.Value.CapabilityId.Value.ToString(), "active", "delegated");
+        }
         return delegated;
     }
 
@@ -147,11 +168,21 @@ public sealed partial class RuntimeKernel
 
     private KernelResult RevokeCapabilityLocked(CapabilityId capabilityId)
     {
+        var traceSubjects = CapabilityAuthority.InspectionSnapshot()
+            .Where(record => record.Descriptor.CapabilityId == capabilityId)
+            .SelectMany(record => Processes.Snapshot()
+                .Where(process => process.DomainId == record.Descriptor.SubjectDomainId &&
+                                  process.Generation == record.Descriptor.Generation)
+                .Select(process => new ProcessHandle(process.ProcessId, process.Generation)))
+            .ToArray();
         var result = CapabilityAuthority.Revoke(capabilityId);
         if (!result.IsSuccess) return result;
 
         foreach (var process in Processes.Snapshot())
             process.RemoveCapability(capabilityId);
+        foreach (var subject in traceSubjects)
+            RecordTrace(subject, TraceEventKind.CapabilityRevoked, null, "capability",
+                capabilityId.Value.ToString(), "revoked", "revoked");
 
         var computeCascade = CascadePlatformDsc1CapabilityRevocation(capabilityId);
         var irqCascade = CascadePlatformIrqCapabilityRevocation(capabilityId);

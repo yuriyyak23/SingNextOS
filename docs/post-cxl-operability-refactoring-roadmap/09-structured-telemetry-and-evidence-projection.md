@@ -1,5 +1,7 @@
 # Phase 9 — Structured Telemetry and Evidence Projection
 
+Status: implemented and qualified. Evidence: `09_PHASE_09_IMPLEMENTATION_EVIDENCE.md`.
+
 ## Goal
 
 Provide useful operational observability without ambient global introspection and without conflating telemetry with authority or security evidence.
@@ -88,3 +90,5 @@ Cross-links use correlation IDs; none of the three surfaces may silently acquire
 ## Exit criteria
 
 Operational diagnosis is possible through typed, policy-controlled projections with no ambient host-evidence leak and strict telemetry/evidence separation.
+
+The implemented first slice provides point-in-time typed per-generation projections and bounded pull-sampled subscriptions. It deliberately reuses the existing typed `EvidenceRecord` path for security evidence and does not introduce a shared telemetry/evidence event bus.

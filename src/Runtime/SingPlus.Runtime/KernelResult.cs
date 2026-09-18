@@ -59,7 +59,30 @@ public enum KernelError
     RegionUseNotFound,
     RegionUseConflict,
     ExternalOperationNotFound,
-    ExternalEffectUncontained
+    ExternalEffectUncontained,
+    SupervisorDenied,
+    DependencyUnavailable,
+    ReplacementBlocked,
+    CrashLoop,
+    Quarantined,
+    ProjectionDenied,
+    SnapshotUnstable,
+    DeadlineExpired,
+    CancellationPending,
+    BudgetNotConfigured,
+    BudgetExceeded,
+    BudgetReservationNotFound,
+    TraceSessionNotFound,
+    TraceBackpressure,
+    TraceStopped,
+    ReplayDiverged,
+    CheckpointNotFound,
+    CheckpointBlocked,
+    CheckpointInvalid,
+    CheckpointIncompatible,
+    TelemetrySubscriptionNotFound,
+    TelemetryBackpressure,
+    TelemetryStopped
 }
 
 public readonly record struct KernelResult(bool IsSuccess, KernelError Error, string? Message)

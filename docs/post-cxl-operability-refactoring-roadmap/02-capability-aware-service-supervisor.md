@@ -153,3 +153,16 @@ Supervisor is not on the ordinary IPC or compute hot path after startup.
 ## Exit criteria
 
 Supervisor can start, observe, drain, stop and replace services with generation exactness; dependency graph and crash containment are executable; no stale authority crosses a restart boundary.
+
+## Implemented status (2026-09-18)
+
+- Added capability-gated control-plane supervisor contracts and runtime orchestration over the existing component admission, process teardown, capability authority, service registry and reclaim-observability paths.
+- Added deterministic acyclic dependency validation, hard-dependency startup ordering, optional-dependency degradation/late rebind and exact dependency-generation bindings.
+- Added observational health snapshots, graceful drain, planned replacement, bounded monotonic restart windows/backoff and terminal crash-loop state.
+- Replacement performs fresh component/manifest/capability admission. Retired service names reuse their existing `ServiceId` lineage while `ServiceGeneration` advances; process generation and newly minted capability identities are fresh.
+- Existing teardown and external-operation closure remain authoritative. Ambiguous/uncontained provider effects produce `Quarantined` and block replacement/reclaim; health, manifest and supervisor receipts cannot override that result.
+- Supervisor mutation requires an exact revocable `kernel:service-supervisor:v1` capability and is not placed on ordinary IPC/compute paths.
+- Public supervisor/health DTOs expose no capability token, provider-private binding, CXL topology or HybridCPU execution internals.
+- Executable evidence and qualification results are recorded in `02_PHASE_02_IMPLEMENTATION_EVIDENCE.md`.
+
+FutureGated: typed monotonic drain cancellation dispositions (Phase 04), authoritative budget reservations (Phase 05), trace/telemetry projections (Phases 06/09), checkpoint-assisted replacement (Phase 08), and isolated replacement resources for still-live exclusive effects remain outside Phase 02.

@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net11.0": {
+      "HybridCPU.ExternalRuntime.Contracts": {
+        "type": "Direct",
+        "requested": "[1.14.0, 1.14.0]",
+        "resolved": "1.14.0",
+        "contentHash": "wLH8suR5xnj9C0CmqKTvUBSp2fLQsnS18ELZbILGosnGU3KIRJTZykX6bfvL/IWNOFOzGmQVvKI3q7irmjeM/Q=="
+      },
+      "singplus.contracts": {
+        "type": "Project"
+      },
+      "singplus.platform.abstractions": {
+        "type": "Project",
+        "dependencies": {
+          "SingPlus.Contracts": "[1.0.0, )"
+        }
+      },
+      "singplus.sip": {
+        "type": "Project",
+        "dependencies": {
+          "SingPlus.Contracts": "[1.0.0, )",
+          "SingPlus.Sip.Sdk": "[1.0.0, )"
+        }
+      },
+      "singplus.sip.sdk": {
+        "type": "Project",
+        "dependencies": {
+          "SingPlus.Contracts": "[1.0.0, )"
+        }
+      }
+    }
+  }
+}

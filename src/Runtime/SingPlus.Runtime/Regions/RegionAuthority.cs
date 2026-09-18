@@ -12,6 +12,15 @@ internal readonly record struct BorrowLeaseAuthoritySnapshot(
     long ByteLength,
     BorrowLeaseLifetime Lifetime);
 
+internal sealed record RegionAuthorityInspectionRecord(
+    RegionDescriptor Region,
+    BorrowLeaseHandle? Borrow,
+    RegionOwner? Borrower,
+    RegionBackingLeaseDescriptor? BackingLease,
+    bool PlatformMappingReserved,
+    bool ExternalBorrowReadGrantReserved,
+    IReadOnlyList<RegionUseDescriptor> Uses);
+
 public sealed class RegionAuthority
 {
     private sealed class RegionUseRecord
@@ -260,6 +269,12 @@ public sealed class RegionAuthority
         return KernelResult.Ok();
     }
 
+    internal bool HasPlatformMappingReservation(RegionHandle handle, RegionOwner owner)
+    {
+        var validation = Validate(handle, owner);
+        return validation.IsSuccess && _regions[handle.RegionId].PlatformMappingReserved;
+    }
+
     internal KernelResult<RegionHandle> Transfer(RegionHandle handle, RegionOwner source, RegionOwner target)
     {
         var validation = Validate(handle, source);
@@ -328,6 +343,24 @@ public sealed class RegionAuthority
         var validation = Validate(handle, principal);
         if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
         return ValidateUseRequest(_regions[handle.RegionId], mode, range);
+    }
+
+    internal KernelResult ProbeUseForExactPlatformMapping(RegionHandle handle, RegionOwner principal,
+        RegionUseMode mode, RegionUseRange range)
+    {
+        var validation = Validate(handle, principal);
+        if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
+        return ValidateUseRequest(_regions[handle.RegionId], mode, range, allowPlatformMappingReservation: true);
+    }
+
+    internal KernelResult<RegionUseDescriptor> AcquireUseForExactPlatformMapping(RegionHandle handle,
+        RegionOwner principal, RegionUseMode mode, RegionUseRange range)
+    {
+        var validation = Validate(handle, principal);
+        if (!validation.IsSuccess)
+            return KernelResult<RegionUseDescriptor>.Fail(validation.Error, validation.Message!);
+        return AcquireUseCore(_regions[handle.RegionId], principal, mode, range,
+            allowPlatformMappingReservation: true);
     }
 
     public KernelResult<RegionUseDescriptor> AcquireBorrowUse(
@@ -467,13 +500,29 @@ public sealed class RegionAuthority
 
     public IReadOnlyList<RegionDescriptor> Snapshot() => _regions.Values.Select(Descriptor).OrderBy(static d => d.Handle.RegionId.Value).ToArray();
 
+    internal RegionAuthorityInspectionRecord[] InspectionSnapshot() =>
+        _regions.Values
+            .OrderBy(static record => record.Id.Value)
+            .Select(static record => new RegionAuthorityInspectionRecord(
+                Descriptor(record),
+                record.State == RegionState.Loaned && record.Borrower is not null
+                    ? new BorrowLeaseHandle(new RegionHandle(record.Id, record.Generation), record.BorrowGeneration)
+                    : null,
+                record.Borrower,
+                record.BackingLease,
+                record.PlatformMappingReserved,
+                record.ExternalBorrowReadGrantReserved,
+                record.Uses.Values.OrderBy(static use => use.Handle.UseId.Value).Select(UseDescriptor).ToArray()))
+            .ToArray();
+
     private KernelResult<RegionUseDescriptor> AcquireUseCore(
         RegionRecord record,
         RegionOwner principal,
         RegionUseMode mode,
-        RegionUseRange range)
+        RegionUseRange range,
+        bool allowPlatformMappingReservation = false)
     {
-        var requestValidation = ValidateUseRequest(record, mode, range);
+        var requestValidation = ValidateUseRequest(record, mode, range, allowPlatformMappingReservation);
         if (!requestValidation.IsSuccess)
             return KernelResult<RegionUseDescriptor>.Fail(requestValidation.Error, requestValidation.Message!);
         if (_nextRegionUseId == 0)
@@ -503,7 +552,8 @@ public sealed class RegionAuthority
     private static KernelResult ValidateUseRequest(
         RegionRecord record,
         RegionUseMode mode,
-        RegionUseRange range)
+        RegionUseRange range,
+        bool allowPlatformMappingReservation = false)
     {
         if (!Enum.IsDefined(mode))
             return KernelResult.Fail(KernelError.InvalidRegionState, "Region use mode is invalid.");
@@ -513,7 +563,7 @@ public sealed class RegionAuthority
             return KernelResult.Fail(KernelError.PlatformUnsupported, "DirectCoherentWrite is future-gated until CPU alias exclusion and symmetric coherent release are implemented.");
         if (!IsValidRange(record, range))
             return KernelResult.Fail(KernelError.InvalidRegionState, "Region use range is outside the exact region bounds or overflows them.");
-        if (record.PlatformMappingReserved)
+        if (record.PlatformMappingReserved && !allowPlatformMappingReservation)
             return KernelResult.Fail(KernelError.RegionUseConflict, "A separate platform mapping already reserves the whole region.");
 
         var activeUses = record.Uses.Values.Where(use =>

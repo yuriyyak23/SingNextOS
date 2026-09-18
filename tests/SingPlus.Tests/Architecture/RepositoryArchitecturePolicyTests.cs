@@ -30,6 +30,7 @@ public sealed class RepositoryArchitecturePolicyTests
         TestTooling,
         CompilerTooling,
         ExternalSemanticContract,
+        ExternalRuntimeImplementation,
     }
 
     private static readonly string Root = FindRepositoryRoot();
@@ -74,7 +75,7 @@ public sealed class RepositoryArchitecturePolicyTests
                     IsPackageReferenceAllowed(sourceLayer, packageClass),
                     $"Forbidden package edge: {Path.GetRelativePath(Root, project)} [{sourceLayer}] -> {packageId} [{packageClass}]");
 
-                if (packageClass == PackageClass.ExternalSemanticContract)
+                if (packageClass is PackageClass.ExternalSemanticContract or PackageClass.ExternalRuntimeImplementation)
                 {
                     var version = ReadPackageVersion(package);
                     Assert.True(
@@ -99,7 +100,7 @@ public sealed class RepositoryArchitecturePolicyTests
 
     [Theory]
     [InlineData(Layer.Contracts, PackageClass.TestTooling)]
-    [InlineData(Layer.PrivilegedMechanism, PackageClass.ExternalSemanticContract)]
+    [InlineData(Layer.PrivilegedMechanism, PackageClass.ExternalRuntimeImplementation)]
     [InlineData(Layer.ProviderAdapter, PackageClass.ExternalSemanticContract)]
     [InlineData(Layer.ExecutableAdapter, PackageClass.CompilerTooling)]
     public void PackagePolicyFixtureRejectsForbiddenEdges(Layer source, PackageClass packageClass) =>
@@ -109,12 +110,15 @@ public sealed class RepositoryArchitecturePolicyTests
     public void ExecutableAdapterMayConsumeOnlyExactlyPinnedExternalFacadePackages()
     {
         Assert.True(IsPackageReferenceAllowed(Layer.ExecutableAdapter, PackageClass.ExternalSemanticContract));
-        Assert.True(IsExactPackageVersion("1.0.0"));
-        Assert.True(IsExactPackageVersion("2.1.3-rc.1"));
+        Assert.True(IsPackageReferenceAllowed(Layer.PrivilegedMechanism, PackageClass.ExternalSemanticContract));
+        Assert.False(IsPackageReferenceAllowed(Layer.PrivilegedMechanism, PackageClass.ExternalRuntimeImplementation));
+        Assert.True(IsExactPackageVersion("[1.0.0]"));
+        Assert.True(IsExactPackageVersion("[2.1.3-rc.1]"));
+        Assert.False(IsExactPackageVersion("1.0.0"));
         Assert.False(IsExactPackageVersion("1.*"));
         Assert.False(IsExactPackageVersion("[1.0.0,2.0.0)"));
         Assert.False(IsExactPackageVersion("$(HybridCpuExternalRuntimeContractsVersion)"));
-        Assert.Equal(PackageClass.ExternalSemanticContract, ClassifyPackage("HybridCPU.ExternalRuntime"));
+        Assert.Equal(PackageClass.ExternalRuntimeImplementation, ClassifyPackage("HybridCPU.ExternalRuntime"));
         Assert.Throws<InvalidOperationException>(() => ClassifyPackage("HybridCPU.RuntimeKernel"));
     }
 
@@ -156,7 +160,8 @@ public sealed class RepositoryArchitecturePolicyTests
 
     private static bool IsPackageReferenceAllowed(Layer source, PackageClass packageClass) => source switch
     {
-        Layer.ExecutableAdapter => packageClass == PackageClass.ExternalSemanticContract,
+        Layer.PrivilegedMechanism => packageClass == PackageClass.ExternalSemanticContract,
+        Layer.ExecutableAdapter => packageClass is PackageClass.ExternalSemanticContract or PackageClass.ExternalRuntimeImplementation,
         Layer.Tooling => packageClass is PackageClass.TestTooling or PackageClass.CompilerTooling,
         _ => false,
     };
@@ -168,7 +173,8 @@ public sealed class RepositoryArchitecturePolicyTests
         "xunit" or
         "xunit.runner.visualstudio" => PackageClass.TestTooling,
         "microsoft.codeanalysis.csharp" => PackageClass.CompilerTooling,
-        "hybridcpu.externalruntime.contracts" or "hybridcpu.externalruntime" => PackageClass.ExternalSemanticContract,
+        "hybridcpu.externalruntime.contracts" => PackageClass.ExternalSemanticContract,
+        "hybridcpu.externalruntime" => PackageClass.ExternalRuntimeImplementation,
         _ => throw new InvalidOperationException($"Package is not architecture-classified: {packageId}"),
     };
 
@@ -179,12 +185,16 @@ public sealed class RepositoryArchitecturePolicyTests
         return package.Elements("Version").Select(static element => element.Value.Trim()).FirstOrDefault(static value => value.Length > 0);
     }
 
-    private static bool IsExactPackageVersion(string? version) =>
-        !string.IsNullOrWhiteSpace(version) &&
-        Regex.IsMatch(
-            version,
+    private static bool IsExactPackageVersion(string? version)
+    {
+        if (string.IsNullOrWhiteSpace(version)) return false;
+        if (version.Length <= 2 || version[0] != '[' || version[^1] != ']') return false;
+        var literal = version[1..^1];
+        return Regex.IsMatch(
+            literal,
             "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$",
             RegexOptions.CultureInvariant);
+    }
 
     private static Layer Classify(string path)
     {

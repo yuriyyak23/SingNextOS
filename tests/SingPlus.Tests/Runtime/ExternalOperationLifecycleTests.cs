@@ -257,6 +257,10 @@ public sealed class ExternalOperationLifecycleTests
         Assert.False(firstTeardown.IsSuccess);
         Assert.Equal(KernelError.PlatformBindingDraining, firstTeardown.Error);
         Assert.True(accepted.Kernel.RecordExternalOperationCompletion(accepted.Owner, new(binding, ExternalOperationCompletionDisposition.Cancelled)).IsSuccess);
+        var completionOnly = accepted.Kernel.TerminateProcess(accepted.Owner);
+        Assert.False(completionOnly.IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingDraining, completionOnly.Error);
+        Assert.True(accepted.Kernel.ReleaseExternalOperation(accepted.Owner, submitted.Operation, new(true, false)).IsSuccess);
         Assert.True(accepted.Kernel.TerminateProcess(accepted.Owner).IsSuccess);
         Assert.Equal(ExternalOperationState.Released, accepted.Kernel.ExternalOperations.Query(submitted.Operation).Value!.State);
     }

@@ -48,7 +48,7 @@ public sealed class ProjectDependencyBoundaryTests
     }
 
     [Fact]
-    public void ExternalRuntimeContractsPackageIsReferencedOnlyByExecutableAdapter()
+    public void ExternalRuntimeContractsPackageIsReferencedOnlyByRuntimeAndExecutableAdapter()
     {
         var consumers = Directory.EnumerateFiles(RepositoryRoot, "*.csproj", SearchOption.AllDirectories)
             .Where(path => !path.Contains("\\obj\\", StringComparison.OrdinalIgnoreCase) &&
@@ -59,7 +59,10 @@ public sealed class ProjectDependencyBoundaryTests
             .Select(path => Path.GetRelativePath(RepositoryRoot, path).Replace('\\', '/'))
             .ToArray();
 
-        Assert.Equal(["tools/HybridCpu_ExecutableAdapter/HybridCpu_ExecutableAdapter.csproj"], consumers);
+        Assert.Equal([
+            "src/Runtime/SingPlus.Runtime/SingPlus.Runtime.csproj",
+            "tools/HybridCpu_ExecutableAdapter/HybridCpu_ExecutableAdapter.csproj"
+        ], consumers.Order(StringComparer.Ordinal).ToArray());
     }
 
     [Fact]

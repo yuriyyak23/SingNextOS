@@ -1,5 +1,7 @@
 # Phase 10 — Provider Conformance and Fault-injection Framework
 
+Status: implemented and qualified. See `10_PHASE_10_IMPLEMENTATION_EVIDENCE.md`.
+
 ## Goal
 
 Turn SingNextOS provider semantics into reusable executable qualification so future GPU, NPU, storage, network, RDMA or other backends can be added without weakening authority/effect invariants.
@@ -78,6 +80,8 @@ At least two distinct provider families should consume the reusable framework be
 - generic platform memory/device or HybridCPU adapter model.
 
 The point is proving reuse across contract families rather than creating a framework tailored to one provider.
+
+The implemented common suite is consumed by both the generic `ExternalOperation` model path and the provider-neutral HybridCPU executable-adapter boundary. Fault plans remain test-only types in `SingPlus.Tests`; no production fault-injection surface was added.
 
 ## Supervisor/fault integration
 

@@ -160,10 +160,6 @@ public sealed class PlatformAuthorityBridgeChildDomainTests
         GuestRegionMapping mapping = kernel.MapGuestRegion(owner, authority.Domain, authority.MemoryCapability,
             regionCapability, region.Handle, new(0, 4096), GuestMemoryAccess.Read | GuestMemoryAccess.Write).Value!;
 
-        Assert.Equal(KernelError.PlatformBindingDraining,
-            kernel.DestroyVirtualDomain(owner, authority.Domain, authority.ConfigureCapability).Error);
-        Assert.True(kernel.CloseGuestRegionMapping(owner, authority.Domain, authority.MemoryCapability,
-            mapping.Mapping).IsSuccess);
         Assert.True(kernel.DestroyVirtualDomain(owner, authority.Domain, authority.ConfigureCapability).IsSuccess);
         Assert.True(kernel.ReleaseRegion(owner, region).IsSuccess);
         Assert.Equal(1, provider.GuestUnmapCalls);
@@ -226,6 +222,61 @@ public sealed class PlatformAuthorityBridgeChildDomainTests
         Assert.Equal(unmaps, provider.GuestUnmapCalls);
     }
 
+    [Fact]
+    public async Task VirtualIoGuestEventRequiresExactPublishedOperation()
+    {
+        var provider = new ChildProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 10, 100);
+        var create = kernel.MintCapability(process.DomainId, owner, ResourceKind.Virtualization,
+            VirtualizationResourceIds.Create, CapabilityRights.Configure).Value!.CapabilityId;
+        var authority = kernel.CreateVirtualDomain(owner, create, new(1, 4096)).Value!;
+        Assert.True(kernel.ConfigureVirtualDomain(owner, authority.Domain, authority.ConfigureCapability).IsSuccess);
+
+        var parent = new PlatformDomainBinding(new(1), new(1),
+            new(process.DomainId, owner));
+        var deviceCapability = kernel.MintCapability(process.DomainId, owner, ResourceKind.Device,
+            "device:virtual-io-event", CapabilityRights.Read | CapabilityRights.Write | CapabilityRights.Configure).Value!;
+        var device = kernel.BindPlatformDevice(owner, parent, deviceCapability.CapabilityId,
+            PlatformDeviceRights.Read | PlatformDeviceRights.Write).Value!;
+        var virtualIoResult = kernel.BindVirtualIo(owner, authority.Domain, device,
+            new(PlatformDeviceRights.Read | PlatformDeviceRights.Write, 4096));
+        Assert.True(virtualIoResult.IsSuccess, virtualIoResult.Message);
+        var virtualIo = virtualIoResult.Value;
+        var currentIo = kernel.RevalidateVirtualIo(owner, virtualIo);
+        Assert.True(currentIo.IsSuccess, currentIo.Message);
+
+        var input = kernel.AllocateBuffer<byte>(owner, 8).Value!;
+        var output = kernel.AllocateBuffer<byte>(owner, 8).Value!;
+        var dependencies = new OperationDependencySnapshot(1, 1, 1, 1);
+        var prepared = kernel.PrepareExternalOperation(owner,
+            [new(input.Handle, RegionUseMode.ReadOnly, new(0, 8)),
+             new(output.Handle, RegionUseMode.StagedOutput, new(0, 8))],
+            ExternalVisibilityRequirement.PublicationFence, ExternalPublicationPolicy.Staged).Value!;
+        Assert.True(kernel.AdmitExternalOperation(owner, prepared.Operation, dependencies).IsSuccess);
+        var submitted = kernel.RecordExternalOperationSubmission(owner, prepared.Operation, dependencies).Value!;
+        var endpoint = kernel.CreateKernelEventEndpoint(owner).Value!;
+
+        Assert.Equal(KernelError.InvalidTransition,
+            kernel.PublishVirtualIoEvent(owner, virtualIo, prepared.Operation,
+                authority.EventCapability, endpoint).Error);
+        Assert.Equal(0, provider.EventCalls);
+
+        Assert.True(kernel.RecordExternalOperationCompletion(owner,
+            new(submitted, ExternalOperationCompletionDisposition.Completed)).IsSuccess);
+        Assert.True(kernel.RecordExternalOperationVisibility(owner,
+            new(submitted, ExternalVisibilityRequirement.PublicationFence, true)).IsSuccess);
+        Assert.True(kernel.PublishExternalOperation(owner, prepared.Operation, dependencies,
+            new(ExternalPublicationPolicy.Staged), () => input.Span.CopyTo(output.Span)).IsSuccess);
+        Assert.True(kernel.PublishVirtualIoEvent(owner, virtualIo, prepared.Operation,
+            authority.EventCapability, endpoint).IsSuccess);
+
+        var delivered = await kernel.WaitForKernelEventAsync(owner, endpoint);
+        Assert.True(delivered.IsSuccess, delivered.Message);
+        Assert.Equal(1, provider.EventCalls);
+        Assert.Equal(input.Span.ToArray(), output.Span.ToArray());
+    }
+
     private static PlatformDomainIdentity Subject(ulong domain, ulong process) =>
         new(new DomainId(domain), new(new ProcessId(process), 1));
 
@@ -251,6 +302,7 @@ public sealed class PlatformAuthorityBridgeChildDomainTests
         public int RegionRevocationBeginCalls { get; private set; }
         public int CompletionCalls { get; private set; }
         public int RevokeDomainCalls { get; private set; }
+        public int EventCalls { get; private set; }
         public List<string> CallLog { get; } = [];
         public PlatformProviderChildDomainLease LastChildLease { get; private set; }
         public PlatformProviderDescriptor Descriptor { get; } = new(new("test.child"), 2,
@@ -263,7 +315,9 @@ public sealed class PlatformAuthorityBridgeChildDomainTests
             .Select(f => new PlatformFeatureDescriptor(f,
                 f is PlatformFeatureFamily.NeutralDomains or PlatformFeatureFamily.ChildDomainLifecycle or
                     PlatformFeatureFamily.OwnedRegionMapping ? 2u : 1u,
-                PlatformFeatureAvailability.RuntimeAdmission)));
+                f == PlatformFeatureFamily.BoundedVirtualIo
+                    ? PlatformFeatureAvailability.Executable
+                    : PlatformFeatureAvailability.RuntimeAdmission)));
         public PlatformAuthorityResult<PlatformProviderDomainLease> BindDomain(PlatformDomainIdentity subject) =>
             PlatformAuthorityResult<PlatformProviderDomainLease>.Ok(new(new(next++), new(7), subject));
         public PlatformAuthorityResult RevokeDomain(PlatformProviderDomainLease lease)
@@ -325,10 +379,13 @@ public sealed class PlatformAuthorityBridgeChildDomainTests
                 lease.ChildLease.LeaseId, lease.ChildLease.Generation, lease.ChildLease.ParentDomainLease.LeaseId,
                 lease.ChildLease.ParentDomainLease.Generation, true));
         }
-        public PlatformAuthorityResult<PlatformVirtualEventReceipt> InjectVirtualEvent(PlatformVirtualEventRequest request) =>
-            PlatformAuthorityResult<PlatformVirtualEventReceipt>.Ok(new(request.ChildLease.LeaseId,
+        public PlatformAuthorityResult<PlatformVirtualEventReceipt> InjectVirtualEvent(PlatformVirtualEventRequest request)
+        {
+            EventCalls++;
+            return PlatformAuthorityResult<PlatformVirtualEventReceipt>.Ok(new(request.ChildLease.LeaseId,
                 request.ChildLease.Generation, request.ChildLease.ParentDomainLease.LeaseId,
-                request.ChildLease.ParentDomainLease.Generation, 1, request.EventClass, request.SourceResourceId));
+                request.ChildLease.ParentDomainLease.Generation, (ulong)EventCalls, request.EventClass, request.SourceResourceId));
+        }
         public PlatformAuthorityResult<PlatformVirtualTrapEvidence> ObserveVirtualTrap(PlatformProviderChildDomainLease lease) =>
             PlatformAuthorityResult<PlatformVirtualTrapEvidence>.Ok(new(lease.LeaseId, lease.Generation,
                 lease.ParentDomainLease.LeaseId, lease.ParentDomainLease.Generation, 1, PlatformVirtualTrapKind.Timer));

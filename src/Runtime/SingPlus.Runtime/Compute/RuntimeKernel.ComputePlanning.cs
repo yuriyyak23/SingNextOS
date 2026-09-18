@@ -45,4 +45,31 @@ public sealed partial class RuntimeKernel
             new RegionOwner(resolved.Value!.DomainId, principal.Generation),
             currentCandidates);
     }
+
+    internal KernelResult<ComputePlan> PlanVirtualizedCompute(ProcessHandle principal, ComputeIntent intent,
+        ComputeSelectionPolicy policy, IReadOnlyList<ComputeProviderCandidate> candidates,
+        VirtualComputeContext context)
+    {
+        var exact = RevalidateVirtualComputeContext(principal, context, null);
+        if (!exact.IsSuccess) return KernelResult<ComputePlan>.Fail(exact.Error, exact.Message!);
+        var resolved = Processes.Resolve(principal);
+        if (!resolved.IsSuccess) return KernelResult<ComputePlan>.Fail(resolved.Error, resolved.Message!);
+        var effect = EnsureProcessAcceptsNewEffects(resolved.Value!);
+        if (!effect.IsSuccess) return KernelResult<ComputePlan>.Fail(effect.Error, effect.Message!);
+        return ComputePlanner.PlanForExactPlatformMappings(new(resolved.Value!.DomainId, principal.Generation),
+            intent, policy, candidates);
+    }
+
+    internal KernelResult ValidateVirtualizedComputePlanBeforeSubmit(ProcessHandle principal, ComputePlan plan,
+        IReadOnlyList<ComputeProviderCandidate> currentCandidates, VirtualComputeContext context)
+    {
+        var exact = RevalidateVirtualComputeContext(principal, context, plan);
+        if (!exact.IsSuccess) return exact;
+        var resolved = Processes.Resolve(principal);
+        if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+        var effect = EnsureProcessAcceptsNewEffects(resolved.Value!);
+        if (!effect.IsSuccess) return effect;
+        return ComputePlanner.ValidateBeforeSubmitForExactPlatformMappings(plan,
+            new(resolved.Value!.DomainId, principal.Generation), currentCandidates);
+    }
 }

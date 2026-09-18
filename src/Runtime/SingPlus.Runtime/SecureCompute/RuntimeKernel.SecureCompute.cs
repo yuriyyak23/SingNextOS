@@ -11,6 +11,8 @@ public sealed partial class RuntimeKernel
         public ProcessHandle Owner { get; } = owner;
         public PlatformAuthorityBridge.SecureDomainBinding Binding { get; } = binding;
         public SecureDomainState State { get; set; } = SecureDomainState.Created;
+        public ulong PolicyGeneration { get; set; } = 1;
+        public ulong ProtectionGeneration { get; set; } = 1;
         public List<CapabilityId> Capabilities { get; } = [];
         public Dictionary<PlatformRegionMappingId, PlatformRegionMapping> Regions { get; } = [];
     }
@@ -35,28 +37,34 @@ public sealed partial class RuntimeKernel
         var execute = MintCapability(process.Value.DomainId, owner, ResourceKind.SecureCompute, SecureComputeResourceIds.Domain(handle.DomainId), CapabilityRights.Execute).Value!.CapabilityId;
         var evidence = MintCapability(process.Value.DomainId, owner, ResourceKind.Evidence, SecureComputeResourceIds.Evidence(handle.DomainId), CapabilityRights.Read).Value!.CapabilityId;
         record.Capabilities.AddRange([configure, memory, execute, evidence]);
+        RecordTrace(owner, TraceEventKind.SecureDomainLifecycle, null, "secure-domain",
+            handle.DomainId.Value.ToString(), record.State.ToString(), "created");
         return KernelResult<SecureDomainAuthoritySet>.Ok(new(handle, configure, memory, execute, evidence));
     }
 
     public KernelResult BindSecureRegion(ProcessHandle owner, SecureDomainHandle domain, CapabilityId memoryCapability, PlatformRegionMapping mapping, PlatformSecureRegionClass regionClass)
     {
+        using var composedUse = PinComposedDomain(owner, secureDomain: domain);
+        if (!composedUse.Result.IsSuccess) return KernelResult.Fail(composedUse.Result.Error, composedUse.Result.Message!);
         var record = ResolveSecure(owner, domain, memoryCapability, SecureComputeResourceIds.Memory(domain.DomainId), CapabilityRights.Map);
         if (!record.IsSuccess) return KernelResult.Fail(record.Error, record.Message!);
         if (record.Value!.State is not (SecureDomainState.Created or SecureDomainState.Configured or SecureDomainState.Parked))
             return KernelResult.Fail(KernelError.InvalidTransition, "Secure regions can only be bound while the domain is not running or draining.");
         var result = PlatformAuthority.BindSecureRegion(record.Value.Binding, mapping, regionClass);
-        if (result.IsSuccess) { record.Value.Regions.Add(mapping.MappingId, mapping); record.Value.State = SecureDomainState.Configured; }
+        if (result.IsSuccess) { record.Value.Regions.Add(mapping.MappingId, mapping); record.Value.State = SecureDomainState.Configured; record.Value.ProtectionGeneration = checked(record.Value.ProtectionGeneration + 1); }
         return result;
     }
 
     public KernelResult CloseSecureRegion(ProcessHandle owner, SecureDomainHandle domain, CapabilityId memoryCapability, PlatformRegionMapping mapping)
     {
+        using var composedUse = PinComposedDomain(owner, secureDomain: domain, allowDraining: true);
+        if (!composedUse.Result.IsSuccess) return KernelResult.Fail(composedUse.Result.Error, composedUse.Result.Message!);
         var record = ResolveSecure(owner, domain, memoryCapability, SecureComputeResourceIds.Memory(domain.DomainId), CapabilityRights.Map);
         if (!record.IsSuccess) return KernelResult.Fail(record.Error, record.Message!);
         if (!record.Value!.Regions.TryGetValue(mapping.MappingId, out var exact) || exact != mapping)
             return KernelResult.Fail(KernelError.StaleGeneration, "Secure-region mapping is absent or stale.");
         var result = PlatformAuthority.UnbindSecureRegion(record.Value.Binding, mapping);
-        if (result.IsSuccess) record.Value.Regions.Remove(mapping.MappingId);
+        if (result.IsSuccess) { record.Value.Regions.Remove(mapping.MappingId); record.Value.ProtectionGeneration = checked(record.Value.ProtectionGeneration + 1); }
         else record.Value.State = SecureDomainState.Quarantined;
         return result;
     }
@@ -79,12 +87,19 @@ public sealed partial class RuntimeKernel
 
     public KernelResult TransitionSecureDomain(ProcessHandle owner, SecureDomainHandle domain, CapabilityId executeCapability, PlatformSecureDomainTransition transition)
     {
+        using var composedUse = PinComposedDomain(owner, secureDomain: domain);
+        if (!composedUse.Result.IsSuccess) return KernelResult.Fail(composedUse.Result.Error, composedUse.Result.Message!);
         var record = ResolveSecure(owner, domain, executeCapability, SecureComputeResourceIds.Domain(domain.DomainId), CapabilityRights.Execute);
         if (!record.IsSuccess) return KernelResult.Fail(record.Error, record.Message!);
         var expected = transition switch { PlatformSecureDomainTransition.Start => SecureDomainState.Configured, PlatformSecureDomainTransition.Park => SecureDomainState.Running, PlatformSecureDomainTransition.Resume => SecureDomainState.Parked, _ => record.Value!.State };
         if (record.Value!.State != expected) return KernelResult.Fail(KernelError.InvalidTransition, "Secure-domain transition is invalid.");
         var result = PlatformAuthority.TransitionSecureDomain(record.Value.Binding, transition);
-        if (result.IsSuccess) record.Value.State = transition switch { PlatformSecureDomainTransition.Start => SecureDomainState.Running, PlatformSecureDomainTransition.Park => SecureDomainState.Parked, PlatformSecureDomainTransition.Resume => SecureDomainState.Running, _ => SecureDomainState.Draining };
+        if (result.IsSuccess)
+        {
+            record.Value.State = transition switch { PlatformSecureDomainTransition.Start => SecureDomainState.Running, PlatformSecureDomainTransition.Park => SecureDomainState.Parked, PlatformSecureDomainTransition.Resume => SecureDomainState.Running, _ => SecureDomainState.Draining };
+            RecordTrace(owner, TraceEventKind.SecureDomainLifecycle, null, "secure-domain",
+                domain.DomainId.Value.ToString(), record.Value.State.ToString(), transition.ToString());
+        }
         return result;
     }
 
@@ -92,10 +107,17 @@ public sealed partial class RuntimeKernel
     {
         var record = ResolveSecure(owner, domain, configureCapability, SecureComputeResourceIds.Domain(domain.DomainId), CapabilityRights.Configure);
         if (!record.IsSuccess) return KernelResult.Fail(record.Error, record.Message!);
-        if (record.Value!.Regions.Count != 0) return KernelResult.Fail(KernelError.PlatformBindingActive, "Secure regions must close before secure-domain destruction.");
-        if (record.Value.State is SecureDomainState.Quarantined or SecureDomainState.Faulted)
+        lock (_secureExecutionGate)
+            if (record.Value!.State is not (SecureDomainState.Quarantined or SecureDomainState.Faulted or SecureDomainState.Closed))
+                record.Value.State = SecureDomainState.Draining;
+        var secureGuestDrain = CloseSecureGuestRegionsForSecureDomain(owner, domain);
+        if (!secureGuestDrain.IsSuccess) return secureGuestDrain;
+        var composedDrain = DrainSecureExecutions(owner, secureDomain: domain);
+        if (!composedDrain.IsSuccess) return composedDrain;
+        if (record.Value!.State is SecureDomainState.Quarantined or SecureDomainState.Faulted)
             return KernelResult.Fail(KernelError.PlatformFaulted, "Quarantined secure-domain authority remains pinned.");
         record.Value.State = SecureDomainState.Draining;
+        if (record.Value.Regions.Count != 0) return KernelResult.Fail(KernelError.PlatformBindingActive, "Secure regions must close before secure-domain destruction.");
         var drain = PlatformAuthority.TransitionSecureDomain(record.Value.Binding, PlatformSecureDomainTransition.BeginDrain);
         if (!drain.IsSuccess) { record.Value.State = SecureDomainState.Quarantined; return drain; }
         var close = PlatformAuthority.RevokeSecureDomain(record.Value.Binding);
@@ -108,8 +130,10 @@ public sealed partial class RuntimeKernel
 
     private KernelResult CloseSecureDomainsForProcess(ProcessHandle owner)
     {
-        foreach (var record in _secureDomainRecords.Values.Where(record => record.Owner == owner).OrderBy(record => record.Handle.DomainId.Value).ToArray())
+        foreach (var record in _secureDomainRecords.Values.Where(record => record.Owner == owner && record.State != SecureDomainState.Closed).OrderBy(record => record.Handle.DomainId.Value).ToArray())
         {
+            var secureGuestDrain = CloseSecureGuestRegionsForSecureDomain(owner, record.Handle);
+            if (!secureGuestDrain.IsSuccess) return secureGuestDrain;
             foreach (var mapping in record.Regions.Values.OrderBy(mapping => mapping.MappingId.Value).ToArray())
             {
                 var unbind = PlatformAuthority.UnbindSecureRegion(record.Binding, mapping);
@@ -140,6 +164,11 @@ public sealed partial class RuntimeKernel
             return KernelResult<SecureRecord>.Fail(KernelError.WrongCapabilityResource, "Capability does not authorize the exact secure-domain resource.");
         if (!_secureDomainRecords.TryGetValue(domain.DomainId, out var record)) return KernelResult<SecureRecord>.Fail(KernelError.PlatformBindingNotFound, "Secure domain was not found.");
         if (record.Handle != domain || record.Owner != owner) return KernelResult<SecureRecord>.Fail(KernelError.StaleGeneration, "Secure domain is stale or owned by another process.");
+        if (rights != CapabilityRights.Configure && rights != CapabilityRights.Read)
+        {
+            var composed = RevalidateComposedDomain(owner, secureDomain: domain);
+            if (!composed.IsSuccess) return KernelResult<SecureRecord>.Fail(composed.Error, composed.Message!);
+        }
         return KernelResult<SecureRecord>.Ok(record);
     }
 }

@@ -67,3 +67,13 @@ HybridCPU compiler semantic intent
 ## New closure condition
 
 The roadmap is not complete when only child virtualization is executable. Completion additionally requires a versioned owner-bound SecureCompute external ABI, exact secure+virtualized resource composition, exhaustive secure-operation policy dispatch, and tests proving CXL-backed secure virtual execution fails closed on stale generations, reconfiguration and ambiguous closure.
+
+## Implementation evidence
+
+- `09_10_12_SINGNEXTOS_INTEGRATION_EVIDENCE.md` records the executable
+  SingNextOS adapter, same-image provider matrix and repository deployment
+  conformance.
+- `00_17_COMPLETENESS_CORRECTNESS_AUDIT.md` records the current H00-H17 audit,
+  the repaired external-operation disposition mapping and the completed H17
+  repository-model exit matrix. No physical-provider or `ProductionSecure`
+  claim is made.

@@ -11,7 +11,9 @@ public sealed partial class PlatformAuthorityBridge
     private sealed record SecureDomainRecord(SecureDomainBinding Binding, PlatformProviderSecureDomainLease ProviderLease)
     {
         public Dictionary<PlatformRegionMappingId, PlatformProviderSecureRegionBinding> Regions { get; } = [];
-        public bool Quarantined { get; set; }
+        public HashSet<PlatformRegionMappingId> QuarantinedRegions { get; } = [];
+        public bool TerminalQuarantined { get; set; }
+        public bool Quarantined => TerminalQuarantined || QuarantinedRegions.Count != 0;
     }
     private readonly Dictionary<SecureDomainBindingId, SecureDomainRecord> _secureDomains = [];
     private ulong _nextSecureDomainBindingId = 1;
@@ -37,7 +39,7 @@ public sealed partial class PlatformAuthorityBridge
             if (!IsExactClosure(cleanup, lease))
             {
                 var quarantined = new SecureDomainBinding(new(_nextSecureDomainBindingId++), new(1), parent);
-                _secureDomains.Add(quarantined.BindingId, new(quarantined, lease) { Quarantined = true });
+                _secureDomains.Add(quarantined.BindingId, new(quarantined, lease) { TerminalQuarantined = true });
             }
             return KernelResult<SecureDomainBinding>.Fail(KernelError.PlatformFaulted,
                 IsExactClosure(cleanup, lease) ? "Provider did not prove every requested secure property." : "Malformed secure-domain admission could not be closed and remains quarantined.");
@@ -63,7 +65,14 @@ public sealed partial class PlatformAuthorityBridge
         var providerBinding = result.Value;
         if (providerBinding.BindingId.Value == 0 || providerBinding.Generation.Value == 0 || providerBinding.Domain != secure.Value.ProviderLease ||
             providerBinding.Mapping != mapped.ProviderLease || providerBinding.RegionClass != regionClass)
-        { secure.Value.Quarantined = true; return KernelResult.Fail(KernelError.PlatformFaulted, "Provider secure-region binding is malformed."); }
+        {
+            var cleanup = ((IPlatformSecureComputeProvider)_provider!).UnbindSecureRegion(providerBinding);
+            var exactlyClosed = cleanup.IsSuccess && cleanup.Value.Binding == providerBinding && cleanup.Value.Closed;
+            if (!exactlyClosed) secure.Value.TerminalQuarantined = true;
+            return KernelResult.Fail(exactlyClosed ? KernelError.PlatformBindingRevoked : KernelError.PlatformFaulted, exactlyClosed
+                ? "Provider secure-region binding was malformed and exactly compensated."
+                : "Provider secure-region binding was malformed; exact compensation failed and the secure domain is quarantined.");
+        }
         secure.Value.Regions.Add(mapping.MappingId, providerBinding);
         return KernelResult.Ok();
     }
@@ -74,12 +83,12 @@ public sealed partial class PlatformAuthorityBridge
         if (!secure.IsSuccess) return KernelResult.Fail(secure.Error, secure.Message!);
         if (!secure.Value!.Regions.TryGetValue(mapping.MappingId, out var providerBinding))
             return KernelResult.Fail(KernelError.PlatformBindingNotFound, "Secure-region binding was not found.");
-        if (secure.Value.Quarantined) return KernelResult.Fail(KernelError.PlatformFaulted, "Secure-region authority is quarantined.");
         var result = ((IPlatformSecureComputeProvider)_provider!).UnbindSecureRegion(providerBinding);
-        if (!result.IsSuccess) { secure.Value.Quarantined = true; return FromProviderFailure(result.Status, result.Message); }
+        if (!result.IsSuccess) { secure.Value.QuarantinedRegions.Add(mapping.MappingId); return FromProviderFailure(result.Status, result.Message); }
         if (result.Value.Binding != providerBinding || !result.Value.Closed)
-        { secure.Value.Quarantined = true; return KernelResult.Fail(KernelError.PlatformFaulted, "Provider secure-region closure receipt is malformed."); }
+        { secure.Value.QuarantinedRegions.Add(mapping.MappingId); return KernelResult.Fail(KernelError.PlatformFaulted, "Provider secure-region closure receipt is malformed."); }
         secure.Value.Regions.Remove(mapping.MappingId);
+        secure.Value.QuarantinedRegions.Remove(mapping.MappingId);
         return KernelResult.Ok();
     }
 
@@ -93,9 +102,9 @@ public sealed partial class PlatformAuthorityBridge
         if (secure.Value!.Quarantined) return KernelResult.Fail(KernelError.PlatformFaulted, "Secure domain is quarantined.");
         if (!Enum.IsDefined(transition)) return KernelResult.Fail(KernelError.PlatformDenied, "Secure-domain transition is invalid.");
         var result = ((IPlatformSecureComputeProvider)_provider!).TransitionSecureDomain(secure.Value!.ProviderLease, transition);
-        if (!result.IsSuccess) { secure.Value.Quarantined = true; return FromProviderFailure(result.Status, result.Message); }
+        if (!result.IsSuccess) { secure.Value.TerminalQuarantined = true; return FromProviderFailure(result.Status, result.Message); }
         if (result.Value.Domain != secure.Value.ProviderLease || result.Value.Transition != transition || !result.Value.Accepted)
-        { secure.Value.Quarantined = true; return KernelResult.Fail(KernelError.PlatformFaulted, "Provider secure-domain transition receipt is malformed."); }
+        { secure.Value.TerminalQuarantined = true; return KernelResult.Fail(KernelError.PlatformFaulted, "Provider secure-domain transition receipt is malformed."); }
         return KernelResult.Ok();
     }
 
@@ -106,9 +115,9 @@ public sealed partial class PlatformAuthorityBridge
         if (secure.Value!.Regions.Count != 0) return KernelResult.Fail(KernelError.PlatformBindingActive, "Secure regions must close before secure-domain authority.");
         if (secure.Value.Quarantined) return KernelResult.Fail(KernelError.PlatformFaulted, "Secure domain is quarantined.");
         var result = ((IPlatformSecureComputeProvider)_provider!).RevokeSecureDomain(secure.Value!.ProviderLease);
-        if (!result.IsSuccess) { secure.Value.Quarantined = true; return FromProviderFailure(result.Status, result.Message); }
+        if (!result.IsSuccess) { secure.Value.TerminalQuarantined = true; return FromProviderFailure(result.Status, result.Message); }
         if (!IsExactClosure(result, secure.Value.ProviderLease))
-        { secure.Value.Quarantined = true; return KernelResult.Fail(KernelError.PlatformFaulted, "Provider secure-domain closure receipt is malformed."); }
+        { secure.Value.TerminalQuarantined = true; return KernelResult.Fail(KernelError.PlatformFaulted, "Provider secure-domain closure receipt is malformed."); }
         _secureDomains.Remove(binding.BindingId);
         return KernelResult.Ok();
     }

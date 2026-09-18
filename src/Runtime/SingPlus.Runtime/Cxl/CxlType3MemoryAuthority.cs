@@ -16,7 +16,7 @@ public sealed record CxlMemoryPlacementSnapshot(
     CxlMemoryPlacementState State);
 
 /// <summary>Tracks Type-3 backing while the application retains ordinary region ownership.</summary>
-public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant
+public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant, ISecureGuestBackingAuthority
 {
     private sealed class Record(CxlMemoryPlacementSnapshot snapshot, RegionOwner owner, RegionBackingLeaseHandle backingLease,
         CxlEndpointSnapshot endpoint, CxlFabricBinding fabric, CxlMemoryBinding memory)
@@ -40,6 +40,7 @@ public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant
         _regions = kernel.Regions;
         _bridge = bridge ?? throw new ArgumentNullException(nameof(bridge));
         kernel.RegisterCxlTeardownParticipant(this);
+        kernel.RegisterSecureGuestBackingAuthority(this);
     }
 
     public KernelResult<CxlMemoryPlacementSnapshot> Place(
@@ -101,6 +102,13 @@ public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant
     {
         if (!_placements.TryGetValue(placementId, out var record)) return KernelResult.Ok();
         if (record.Snapshot.State == CxlMemoryPlacementState.Released) return KernelResult.Ok();
+        // A Type-3 lease backs the existing guest mapping. Do not drop it while
+        // that mapping (and therefore any secure overlay) can still reference it.
+        var region = _regions.Validate(record.Snapshot.Region, record.Owner);
+        if (!region.IsSuccess) return KernelResult.Fail(region.Error, region.Message!);
+        if (_regions.HasPlatformMappingReservation(record.Snapshot.Region, record.Owner))
+            return KernelResult.Fail(KernelError.PlatformBindingActive,
+                "Type-3 backing remains pinned by a guest/platform mapping or secure overlay.");
         record.Snapshot = record.Snapshot with { State = CxlMemoryPlacementState.Draining };
         var currentMemory = _bridge.QueryMemory(record.Memory.BindingId);
         var memory = currentMemory.IsSuccess && currentMemory.Value!.BackingLease == record.BackingLease
@@ -132,6 +140,23 @@ public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant
         {
             var closed = Close(placement.Snapshot.PlacementId);
             if (!closed.IsSuccess) return closed;
+        }
+        return KernelResult.Ok();
+    }
+
+    KernelResult ISecureGuestBackingAuthority.RevalidateForSecureGuest(RegionOwner owner, RegionHandle region)
+    {
+        foreach (var record in _placements.Values.Where(x => x.Owner == owner && x.Snapshot.Region == region).ToArray())
+        {
+            if (record.Snapshot.State != CxlMemoryPlacementState.Active)
+                return KernelResult.Fail(KernelError.PlatformFaulted,
+                    "Type-3 backing is not active for a new secure guest effect.");
+            var validation = _bridge.RevalidateBacking(record.Owner, record.BackingLease, record.Endpoint, record.Fabric, record.Memory);
+            if (!validation.IsSuccess)
+            {
+                record.Snapshot = record.Snapshot with { State = CxlMemoryPlacementState.MigrationRequired };
+                return validation;
+            }
         }
         return KernelResult.Ok();
     }

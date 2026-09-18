@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net11.0": {
+      "HybridCPU.ExternalRuntime": {
+        "type": "Direct",
+        "requested": "[1.3.0, 1.3.0]",
+        "resolved": "1.3.0",
+        "contentHash": "0gLP9ONLQ+594Bo0TPexXVfCkIbT4IYjyq/bxNchHnrWJ0wsspm4gYBOUsclk0/PbF7tbH2ZNvLfQP+WgY/JRw==",
+        "dependencies": {
+          "HybridCPU.ExternalRuntime.Contracts": "1.3.0"
+        }
+      },
+      "HybridCPU.ExternalRuntime.Contracts": {
+        "type": "Direct",
+        "requested": "[1.14.0, 1.14.0]",
+        "resolved": "1.14.0",
+        "contentHash": "wLH8suR5xnj9C0CmqKTvUBSp2fLQsnS18ELZbILGosnGU3KIRJTZykX6bfvL/IWNOFOzGmQVvKI3q7irmjeM/Q=="
+      },
+      "hybridcpu_neutralruntime.contracts": {
+        "type": "Project"
+      }
+    }
+  }
+}

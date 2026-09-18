@@ -118,3 +118,18 @@ Inspector answers “what is true now”; Phase 6 trace answers “how did we ge
 ## Exit criteria
 
 Developers can deterministically explain major ownership/reclaim/delegation failures without kernel debugger access, while the inspection plane remains read-only and visibility-scoped.
+
+## Implemented status (2026-09-18)
+
+- Added versioned, provider-neutral inspection contracts with typed node, edge, consistency, scope and blocker-reason families. All returned identities are detached SHA-256 correlation identities; DTOs contain no live capability, process, region, operation or provider handle.
+- Added a self-scoped `AuthorityInspector` and a dedicated revocable `kernel:authority-inspector:v1` read capability for cross-service/system projection. Capability validity is rechecked on every query.
+- Graphs are built on demand from the existing process, capability, region, service/session, platform diagnostic, ExternalOperation, VirtualDomain and SecureDomain authorities. The inspector owns no mutable authority graph.
+- Capability delegation parentage and service replacement lineage are retained minimally by their owning registries and projected read-only by the inspector.
+- Implemented `InspectOwner`, `InspectDependents`, `InspectCapabilityProvenance`, `WhyMoveBlocked`, `WhyReclaimBlocked`, `WhyServiceDrainBlocked` and `WhyExternalOperationPinned` with typed reasons.
+- `PointInTimeBestEffort` performs one detached capture. `AuthorityLockedSnapshot` performs a bounded double capture and succeeds only after the complete authoritative projection converges; otherwise it fails with `SnapshotUnstable`. `HistoricalReference` currently contains immutable service replacement lineage only and is never treated as live state.
+- Stale region/service generations are returned as explicit stale observations and are never merged into the current node.
+- Platform/provider identifiers are hashed or reduced to semantic resource classes. Secure backend, physical/CXL topology, provider credentials, recovery tokens and confidential payloads are not projected.
+- Budget-reservation and checkpoint-pin node kinds are reserved in the versioned schema but no instances are fabricated before the authoritative Phase 05 and Phase 08 sources exist.
+- Executable evidence and qualification results are recorded in `03_PHASE_03_IMPLEMENTATION_EVIDENCE.md`.
+
+Integrated by the later phases: the inspector now projects active budget reservations from the single Phase 05 ledger and committed checkpoint pins from the Phase 08 checkpoint owner. These are opaque, read-only nodes and do not duplicate either mutable registry. General historical references beyond service replacement lineage remain FutureGated. A production multi-writer runtime may replace bounded convergence with a kernel-wide read epoch, but the current model fails closed instead of returning an unstable strong snapshot.

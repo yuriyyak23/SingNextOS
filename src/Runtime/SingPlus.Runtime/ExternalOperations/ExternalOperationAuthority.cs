@@ -69,7 +69,25 @@ public sealed class ExternalOperationAuthority
         ExternalOperationHandle operation,
         OperationDependencySnapshot dependencies,
         ExternalServiceIdentity serviceIdentity = default,
-        ExternalCancellationSupport cancellationSupport = ExternalCancellationSupport.BeforeSubmissionOnly)
+        ExternalCancellationSupport cancellationSupport = ExternalCancellationSupport.BeforeSubmissionOnly,
+        CancellationScopeHandle? cancellationScope = null) =>
+        AdmitCore(operation, dependencies, serviceIdentity, cancellationSupport, cancellationScope, allowExactPlatformMappings: false);
+
+    internal KernelResult<OperationAdmissionSnapshot> AdmitForExactPlatformMappings(
+        ExternalOperationHandle operation,
+        OperationDependencySnapshot dependencies,
+        ExternalServiceIdentity serviceIdentity = default,
+        ExternalCancellationSupport cancellationSupport = ExternalCancellationSupport.BeforeSubmissionOnly,
+        CancellationScopeHandle? cancellationScope = null) =>
+        AdmitCore(operation, dependencies, serviceIdentity, cancellationSupport, cancellationScope, allowExactPlatformMappings: true);
+
+    private KernelResult<OperationAdmissionSnapshot> AdmitCore(
+        ExternalOperationHandle operation,
+        OperationDependencySnapshot dependencies,
+        ExternalServiceIdentity serviceIdentity,
+        ExternalCancellationSupport cancellationSupport,
+        CancellationScopeHandle? cancellationScope,
+        bool allowExactPlatformMappings)
     {
         lock (_gate)
         {
@@ -83,7 +101,10 @@ public sealed class ExternalOperationAuthority
             var acquired = new List<RegionUseDescriptor>();
             foreach (var request in record.Preparation.RegionUses)
             {
-                var use = _regions.AcquireUse(request.Region, record.Preparation.Principal, request.Mode, request.Range);
+                var use = allowExactPlatformMappings
+                    ? _regions.AcquireUseForExactPlatformMapping(request.Region, record.Preparation.Principal,
+                        request.Mode, request.Range)
+                    : _regions.AcquireUse(request.Region, record.Preparation.Principal, request.Mode, request.Range);
                 if (!use.IsSuccess)
                 {
                     foreach (var prior in acquired)
@@ -101,7 +122,8 @@ public sealed class ExternalOperationAuthority
                 serviceIdentity,
                 cancellationSupport,
                 record.Preparation.EffectPolicy.EffectClass,
-                record.Preparation.PublicationPolicy);
+                record.Preparation.PublicationPolicy,
+                cancellationScope);
             record.Admission = admission;
             Move(record, ExternalOperationState.Admitted, "Admitted");
             return KernelResult<OperationAdmissionSnapshot>.Ok(admission);
@@ -288,9 +310,7 @@ public sealed class ExternalOperationAuthority
 
             if (record.Preparation.PublicationPolicy == ExternalPublicationPolicy.Staged)
             {
-                record.Disposition = record.State == ExternalOperationState.Submitted
-                    ? ExternalOperationDisposition.ProviderLost
-                    : ExternalOperationDisposition.Discarded;
+                record.Disposition = ExternalOperationDisposition.ProviderLost;
                 foreach (var use in record.Admission?.RegionUses ?? [])
                     _ = _regions.InvalidateUse(use.Handle, record.Preparation.Principal);
             }
@@ -342,6 +362,15 @@ public sealed class ExternalOperationAuthority
         }
     }
 
+    internal ExternalOperationSnapshot[] InspectionSnapshot()
+    {
+        lock (_gate)
+            return _operations.Values
+                .Select(Snapshot)
+                .OrderBy(static operation => operation.Operation.OperationId.Value)
+                .ToArray();
+    }
+
     internal KernelResult AdvanceForTeardown(RegionOwner principal)
     {
         lock (_gate)
@@ -353,6 +382,13 @@ public sealed class ExternalOperationAuthority
                     record.Disposition = ExternalOperationDisposition.CancellationPending;
                     AddTransition(record, record.State, "TeardownDrainRequired");
                     return KernelResult.Fail(KernelError.PlatformBindingDraining, "Submitted external operation must reach exact completion or provider-loss containment before process reclaim.");
+                }
+
+                if (record.Disposition == ExternalOperationDisposition.ProviderLost)
+                {
+                    return KernelResult.Fail(
+                        KernelError.ExternalEffectUncontained,
+                        "Provider loss after submission leaves the external effect ambiguous until exact closure or containment is recorded.");
                 }
 
                 if (record.State is ExternalOperationState.DeviceComplete or ExternalOperationState.Visible && record.Disposition == ExternalOperationDisposition.Completed)
@@ -371,9 +407,16 @@ public sealed class ExternalOperationAuthority
                 var release = Release(
                     record.Preparation.Operation,
                     new ReleasePlan(
-                        ProviderResourcesClosed: record.State != ExternalOperationState.Submitted,
+                        ProviderResourcesClosed: record.State is ExternalOperationState.Prepared or ExternalOperationState.Admitted,
                         ProviderUnavailable: record.Disposition == ExternalOperationDisposition.ProviderLost));
-                if (!release.IsSuccess) return KernelResult.Fail(release.Error, release.Message!);
+                if (!release.IsSuccess)
+                {
+                    return release.Error == KernelError.InvalidTransition
+                        ? KernelResult.Fail(
+                            KernelError.PlatformBindingDraining,
+                            "External operation reached local completion or cancellation, but exact provider closure or containment remains pending.")
+                        : KernelResult.Fail(release.Error, release.Message!);
+                }
             }
             return KernelResult.Ok();
         }
@@ -411,7 +454,7 @@ public sealed class ExternalOperationAuthority
         if (record.State is ExternalOperationState.DeviceComplete or ExternalOperationState.Visible)
             return (record.Disposition is ExternalOperationDisposition.Cancelled ||
                     record.Preparation.PublicationPolicy == ExternalPublicationPolicy.Staged &&
-                    record.Disposition is ExternalOperationDisposition.Discarded or ExternalOperationDisposition.Faulted) &&
+                    record.Disposition is ExternalOperationDisposition.Discarded or ExternalOperationDisposition.Faulted or ExternalOperationDisposition.ProviderLost) &&
                    (plan.ProviderResourcesClosed || plan.ProviderEffectContained);
         if (record.State == ExternalOperationState.Submitted)
             return record.Preparation.PublicationPolicy == ExternalPublicationPolicy.Staged &&

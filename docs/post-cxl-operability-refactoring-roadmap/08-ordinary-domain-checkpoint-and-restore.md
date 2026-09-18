@@ -1,5 +1,7 @@
 # Phase 8 — Ordinary-domain Checkpoint and Restore
 
+Status: implemented and qualified. Evidence: `08_PHASE_08_IMPLEMENTATION_EVIDENCE.md`.
+
 ## Goal
 
 Add checkpoint/restore for ordinary logical SIP/domain state to support planned replacement, testing and recovery without claiming confidential or transparent hardware migration.
@@ -124,3 +126,5 @@ If restore fails, rollback policy may restart without checkpoint only if manifes
 ## Exit criteria
 
 Ordinary services can checkpoint/restore with fresh authority admission, while confidential/live-provider state remains explicitly unsupported.
+
+The implemented first slice is deliberately bounded to synchronous ordinary-service replacement and explicitly selected `OwnedBuffer<byte>` images. Live IPC, external operations, platform/device state, secure/virtual domains, and unknown owned memory fail closed. Restore always performs fresh component, capability, dependency, and budget admission at a newer process generation.

@@ -16,10 +16,16 @@ public sealed partial class RuntimeKernel
         if (resolved.Value!.Regions.Count >= resolved.Value.Manifest.ResourceLimits.MaxRegions)
             return KernelResult<OwnedBuffer<T>>.Fail(KernelError.InvalidRegionState, "Region limit exceeded.");
         var bytes = checked((long)length * Unsafe.SizeOf<T>());
+        var budget = ReserveAttachedBudget(owner,
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, checked((ulong)bytes))],
+            BudgetReservationLifetime.LocalResource);
+        if (!budget.IsSuccess) return KernelResult<OwnedBuffer<T>>.Fail(budget.Error, budget.Message!);
         var descriptor = Regions.Allocate(new RegionOwner(resolved.Value.DomainId, owner.Generation), bytes, typeof(T).FullName ?? typeof(T).Name);
         var buffer = new OwnedBuffer<T>(descriptor.Handle, new T[length]);
         Regions.RegisterPayload(descriptor.Handle, buffer);
         resolved.Value.AddRegion(descriptor.Handle);
+        if (budget.Value is { } reservation)
+            _regionBudgetReservations.Add(descriptor.Handle.RegionId, (owner, reservation));
         return KernelResult<OwnedBuffer<T>>.Ok(buffer);
     }
 
@@ -31,10 +37,17 @@ public sealed partial class RuntimeKernel
         if (!effect.IsSuccess) return KernelResult<OwnedRegion<T>>.Fail(effect.Error, effect.Message!);
         if (resolved.Value!.Regions.Count >= resolved.Value.Manifest.ResourceLimits.MaxRegions)
             return KernelResult<OwnedRegion<T>>.Fail(KernelError.InvalidRegionState, "Region limit exceeded.");
-        var descriptor = Regions.Allocate(new RegionOwner(resolved.Value.DomainId, owner.Generation), Unsafe.SizeOf<T>(), typeof(T).FullName ?? typeof(T).Name);
+        var bytes = checked((ulong)Unsafe.SizeOf<T>());
+        var budget = ReserveAttachedBudget(owner,
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, bytes)],
+            BudgetReservationLifetime.LocalResource);
+        if (!budget.IsSuccess) return KernelResult<OwnedRegion<T>>.Fail(budget.Error, budget.Message!);
+        var descriptor = Regions.Allocate(new RegionOwner(resolved.Value.DomainId, owner.Generation), checked((long)bytes), typeof(T).FullName ?? typeof(T).Name);
         var region = new OwnedRegion<T>(descriptor.Handle, initialValue);
         Regions.RegisterPayload(descriptor.Handle, region);
         resolved.Value.AddRegion(descriptor.Handle);
+        if (budget.Value is { } reservation)
+            _regionBudgetReservations.Add(descriptor.Handle.RegionId, (owner, reservation));
         return KernelResult<OwnedRegion<T>>.Ok(region);
     }
 
@@ -51,12 +64,19 @@ public sealed partial class RuntimeKernel
         var transferable = (ITransferableOwnedPayload)buffer;
         if (!transferable.IsValidForRuntime) return KernelResult<OwnedBuffer<T>>.Fail(KernelError.InvalidRegionState, "Source ownership token has already been consumed.");
         var oldHandle = buffer.Handle;
+        var targetBudget = PrepareRegionBudgetTransfer(source, target, oldHandle);
+        if (!targetBudget.IsSuccess) return KernelResult<OwnedBuffer<T>>.Fail(targetBudget.Error, targetBudget.Message!);
         var transfer = Regions.Transfer(oldHandle, new RegionOwner(sourceProcess.Value!.DomainId, source.Generation), new RegionOwner(targetProcess.Value!.DomainId, target.Generation));
-        if (!transfer.IsSuccess) return KernelResult<OwnedBuffer<T>>.Fail(transfer.Error, transfer.Message!);
+        if (!transfer.IsSuccess)
+        {
+            _ = ReleaseAttachedBudget(target, targetBudget.Value);
+            return KernelResult<OwnedBuffer<T>>.Fail(transfer.Error, transfer.Message!);
+        }
         var moved = (OwnedBuffer<T>)transferable.TransferForRuntime(transfer.Value);
         Regions.ReplacePayload(oldHandle, transfer.Value, moved);
         sourceProcess.Value.RemoveRegion(oldHandle);
         targetProcess.Value.AddRegion(transfer.Value);
+        CompleteRegionBudgetTransfer(source, target, oldHandle.RegionId, targetBudget.Value);
         return KernelResult<OwnedBuffer<T>>.Ok(moved);
     }
 
@@ -73,6 +93,7 @@ public sealed partial class RuntimeKernel
         if (!release.IsSuccess) return release;
         transferable.InvalidateForRuntime();
         resolved.Value.RemoveRegion(handle);
+        ReleaseRegionBudget(owner, handle.RegionId);
         return KernelResult.Ok();
     }
 
@@ -89,12 +110,19 @@ public sealed partial class RuntimeKernel
         var transferable = (ITransferableOwnedPayload)region;
         if (!transferable.IsValidForRuntime) return KernelResult<OwnedRegion<T>>.Fail(KernelError.InvalidRegionState, "Source ownership token has already been consumed.");
         var oldHandle = region.Handle;
+        var targetBudget = PrepareRegionBudgetTransfer(source, target, oldHandle);
+        if (!targetBudget.IsSuccess) return KernelResult<OwnedRegion<T>>.Fail(targetBudget.Error, targetBudget.Message!);
         var transfer = Regions.Transfer(oldHandle, new RegionOwner(sourceProcess.Value!.DomainId, source.Generation), new RegionOwner(targetProcess.Value!.DomainId, target.Generation));
-        if (!transfer.IsSuccess) return KernelResult<OwnedRegion<T>>.Fail(transfer.Error, transfer.Message!);
+        if (!transfer.IsSuccess)
+        {
+            _ = ReleaseAttachedBudget(target, targetBudget.Value);
+            return KernelResult<OwnedRegion<T>>.Fail(transfer.Error, transfer.Message!);
+        }
         var moved = (OwnedRegion<T>)transferable.TransferForRuntime(transfer.Value);
         Regions.ReplacePayload(oldHandle, transfer.Value, moved);
         sourceProcess.Value.RemoveRegion(oldHandle);
         targetProcess.Value.AddRegion(transfer.Value);
+        CompleteRegionBudgetTransfer(source, target, oldHandle.RegionId, targetBudget.Value);
         return KernelResult<OwnedRegion<T>>.Ok(moved);
     }
 
@@ -111,6 +139,7 @@ public sealed partial class RuntimeKernel
         if (!release.IsSuccess) return release;
         transferable.InvalidateForRuntime();
         resolved.Value.RemoveRegion(handle);
+        ReleaseRegionBudget(owner, handle.RegionId);
         return KernelResult.Ok();
     }
 
@@ -145,11 +174,15 @@ public sealed partial class RuntimeKernel
         if (!effect.IsSuccess)
             return KernelResult<RegionUseDescriptor>.Fail(effect.Error, effect.Message!);
 
-        return Regions.AcquireUse(
+        var acquired = Regions.AcquireUse(
             region,
             new RegionOwner(resolved.Value!.DomainId, principal.Generation),
             mode,
             range);
+        if (acquired.IsSuccess)
+            RecordTrace(principal, TraceEventKind.RegionUse, null, "region-use",
+                acquired.Value!.Handle.UseId.Value.ToString(), acquired.Value.State.ToString(), "acquired");
+        return acquired;
     }
 
     public KernelResult<RegionUseDescriptor> AcquireBorrowRegionUse(
@@ -169,12 +202,16 @@ public sealed partial class RuntimeKernel
         if (!effect.IsSuccess)
             return KernelResult<RegionUseDescriptor>.Fail(effect.Error, effect.Message!);
 
-        return Regions.AcquireBorrowUse(
+        var acquired = Regions.AcquireBorrowUse(
             lease,
             new RegionOwner(resolvedOwner.Value!.DomainId, owner.Generation),
             new RegionOwner(resolvedBorrower.Value!.DomainId, borrower.Generation),
             mode,
             range);
+        if (acquired.IsSuccess)
+            RecordTrace(borrower, TraceEventKind.RegionUse, null, "region-use",
+                acquired.Value!.Handle.UseId.Value.ToString(), acquired.Value.State.ToString(), "borrow-acquired");
+        return acquired;
     }
 
     public KernelResult<RegionUseDescriptor> ValidateRegionUse(
@@ -195,9 +232,13 @@ public sealed partial class RuntimeKernel
         var resolved = Processes.Resolve(principal);
         if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
 
-        return Regions.ReleaseUse(
+        var released = Regions.ReleaseUse(
             use,
             new RegionOwner(resolved.Value!.DomainId, principal.Generation));
+        if (released.IsSuccess)
+            RecordTrace(principal, TraceEventKind.RegionUse, null, "region-use",
+                use.UseId.Value.ToString(), "Released", "released");
+        return released;
     }
 
     public KernelResult InvalidateRegionUse(ProcessHandle principal, RegionUseHandle use)

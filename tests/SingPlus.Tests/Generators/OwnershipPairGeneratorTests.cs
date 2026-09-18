@@ -66,6 +66,7 @@ public interface IComputeService
             new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
 
         GeneratorDriver driver = CSharpGeneratorDriver.Create(new SingPlusGenerator().AsSourceGenerator());
+        driver = driver.WithUpdatedParseOptions((CSharpParseOptions)tree.Options);
         driver = driver.RunGeneratorsAndUpdateCompilation(
             compilation,
             out var outputCompilation,

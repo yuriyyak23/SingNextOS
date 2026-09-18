@@ -130,7 +130,7 @@ public sealed partial class PlatformAuthorityBridge
         }
 
         foreach (var record in _secureDomains.Values)
-            record.Quarantined = true;
+            record.TerminalQuarantined = true;
 
         var domainIds = _domains
             .Where(static pair => pair.Value.AuthorityState != DomainAuthorityState.Closed)

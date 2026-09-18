@@ -1,9 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework>net11.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- Host deployment qualification only: dotnet publish -c Release -r win-x64 -p:SingPlusNativeAotQualification=true -->
+    <PublishAot Condition="'$(SingPlusNativeAotQualification)' == 'true'">true</PublishAot>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../contracts/SingPlus.Contracts/SingPlus.Contracts.csproj" />

@@ -1,5 +1,7 @@
 # Phase 11 — Cross-cutting Integration, Performance, and Hardening
 
+Status: implemented and qualified. See `11_PHASE_11_IMPLEMENTATION_EVIDENCE.md`.
+
 ## Goal
 
 Integrate the ten directions into one coherent operational model, remove duplicate lifecycle logic, establish performance baselines, and harden abuse/failure boundaries before final qualification.
@@ -25,6 +27,8 @@ manifest
 ```
 
 Every stage must preserve independent authority, accounting and observation semantics.
+
+The implemented integration fixture composes the existing owners rather than adding an orchestration registry: supervisor state, budget ledgers, channel/region ownership, ExternalOperation state, trace, telemetry, inspector, and checkpoint records remain authoritative only for their own semantic facts.
 
 ## Lifecycle deduplication
 

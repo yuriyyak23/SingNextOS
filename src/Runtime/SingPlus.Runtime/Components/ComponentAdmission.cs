@@ -62,15 +62,25 @@ public sealed record ComponentLifecycleSnapshot(
     bool PlatformAuthorityLive,
     DeviceResourceSetSnapshot? DeviceResources,
     bool Reclaimable,
-    KernelError? Failure);
+    KernelError? Failure,
+    string ManifestDigest,
+    ManifestAdmissionResultV1 Admission,
+    IReadOnlyList<ServiceInstanceHandle> ServiceInstances,
+    BudgetAccountHandle ServiceBudget,
+    BudgetAccountHandle ProcessBudget);
 
 internal sealed class ComponentAdmissionRecord
 {
+    public required ComponentAdmissionPlan Plan { get; init; }
     public required ServiceManifestV1 Manifest { get; init; }
     public required ProcessHandle Process { get; init; }
+    public required ManifestAdmissionResultV1 Admission { get; set; }
+    public required BudgetAccountHandle ServiceBudget { get; init; }
+    public required BudgetAccountHandle ProcessBudget { get; init; }
     public ComponentLifecycleState State { get; set; } = ComponentLifecycleState.Declared;
     public List<CapabilityId> Capabilities { get; } = [];
     public List<EndpointSessionHandle> Sessions { get; } = [];
+    public Dictionary<ServiceContractIdentity, EndpointSessionHandle> DependencySessions { get; } = [];
     public List<ServiceEndpointDescriptor> Services { get; } = [];
     public PlatformDomainBinding? PlatformBinding { get; set; }
     public DeviceResourceSet? DeviceResources { get; set; }
@@ -80,5 +90,9 @@ internal sealed class ComponentAdmissionRecord
         Manifest.Identity, Manifest.Version, Manifest.ImageDigest, Process, Manifest.Process.DomainId, State,
         Manifest.ProvidedContracts.Select(x => x.Contract).ToArray(), Manifest.RequiredContracts.ToArray(),
         Manifest.ResourceRequirements.ToArray(), Capabilities.ToArray(), Sessions.ToArray(), PlatformBinding is not null,
-        DeviceResources?.Snapshot, State == ComponentLifecycleState.Reclaimable, Failure);
+        DeviceResources?.Snapshot, State == ComponentLifecycleState.Reclaimable, Failure,
+        Manifest.NormalizedDigest, Admission,
+        Services.Select(service => new ServiceInstanceHandle(service.Service.Id, service.Generation, Process, Manifest.Process.DomainId)).ToArray(),
+        ServiceBudget,
+        ProcessBudget);
 }

@@ -31,9 +31,13 @@ public sealed partial class PlatformAuthorityBridge
         var leaseValidation = PlatformVirtualIoContract.ValidateLease(request, result.Value!);
         if (!leaseValidation.IsSuccess)
         {
-            _ = provider.RevokeVirtualIo(result.Value!);
-            childRecord.State = PlatformChildDomainState.Faulted;
-            return KernelResult<PlatformVirtualIoBinding>.Fail(KernelError.PlatformFaulted, leaseValidation.Message!);
+            var cleanup = provider.RevokeVirtualIo(result.Value!);
+            var exactlyClosed = cleanup.IsSuccess &&
+                PlatformVirtualIoContract.ValidateClosureReceipt(result.Value!, cleanup.Value!).IsSuccess;
+            if (!exactlyClosed) childRecord.State = PlatformChildDomainState.Faulted;
+            return KernelResult<PlatformVirtualIoBinding>.Fail(KernelError.PlatformFaulted, exactlyClosed
+                ? $"{leaseValidation.Message} The malformed lease was exactly compensated."
+                : $"{leaseValidation.Message} Exact compensation failed and the child authority is quarantined.");
         }
         var binding = new PlatformVirtualIoBinding(new(_nextVirtualIoBindingId++), new(1), child, parentDevice);
         _virtualIoBindings.Add(binding.BindingId, new(binding, result.Value!));
@@ -49,9 +53,7 @@ public sealed partial class PlatformAuthorityBridge
         if (record.Binding != binding)
             return KernelResult.Fail(KernelError.WrongPlatformDomain, "Virtual-I/O binding belongs to another child or device.");
         if (record.Closure == PlatformExternalClosureState.Closed)
-            return KernelResult.Fail(KernelError.PlatformBindingRevoked, "Virtual-I/O binding is already closed.");
-        if (record.Closure == PlatformExternalClosureState.Faulted)
-            return KernelResult.Fail(KernelError.PlatformFaulted, "Virtual-I/O binding is quarantined.");
+            return KernelResult.Ok();
         if (_provider is not IPlatformVirtualIoProvider provider)
             return KernelResult.Fail(KernelError.PlatformUnsupported, "Bounded virtual-I/O provider is unavailable.");
         record.Closure = PlatformExternalClosureState.Draining;

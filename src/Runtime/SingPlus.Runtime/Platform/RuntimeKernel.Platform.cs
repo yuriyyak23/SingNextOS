@@ -178,11 +178,20 @@ public sealed partial class RuntimeKernel
                 regionValidation.Error,
                 regionValidation.Message!);
 
+        var budget = ReserveAttachedBudget(owner,
+            [new(ServiceBudgetDimension.PinnedMappedMemoryBytes, checked((ulong)regionValidation.Value!.ByteLength))],
+            BudgetReservationLifetime.PlatformMapping);
+        if (!budget.IsSuccess)
+            return KernelResult<PlatformRegionMapping>.Fail(budget.Error, budget.Message!);
+
         var reservation = Regions.ReservePlatformMapping(region, ownerIdentity);
         if (!reservation.IsSuccess)
+        {
+            _ = ReleaseAttachedBudget(owner, budget.Value);
             return KernelResult<PlatformRegionMapping>.Fail(
                 reservation.Error,
                 reservation.Message!);
+        }
 
         var platformRegion = new PlatformRegionIdentity(
             regionValidation.Value!.Handle,
@@ -199,10 +208,13 @@ public sealed partial class RuntimeKernel
         if (!mapping.IsSuccess)
         {
             _ = Regions.ReleasePlatformMappingReservation(region, ownerIdentity);
+            _ = ReleaseAttachedBudget(owner, budget.Value);
             return mapping;
         }
 
         TrackPlatformMapping(owner, mapping.Value!);
+        if (budget.Value is { } budgetReservation)
+            _mappingBudgetReservations.Add(mapping.Value.MappingId, (owner, budgetReservation));
         return mapping;
     }
 
@@ -302,9 +314,16 @@ public sealed partial class RuntimeKernel
                 sliceValidation.Message ?? "The requested region slice is invalid.");
         }
 
+        var budget = ReserveAttachedBudget(owner,
+            [new(ServiceBudgetDimension.PinnedMappedMemoryBytes, checked((ulong)length))],
+            BudgetReservationLifetime.PlatformMapping);
+        if (!budget.IsSuccess)
+            return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(budget.Error, budget.Message!);
+
         var reservation = Regions.ReservePlatformMapping(region, ownerIdentity);
         if (!reservation.IsSuccess)
         {
+            _ = ReleaseAttachedBudget(owner, budget.Value);
             return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(
                 reservation.Error,
                 reservation.Message!);
@@ -318,10 +337,13 @@ public sealed partial class RuntimeKernel
         if (!mapping.IsSuccess)
         {
             _ = Regions.ReleasePlatformMappingReservation(region, ownerIdentity);
+            _ = ReleaseAttachedBudget(owner, budget.Value);
             return mapping;
         }
 
         TrackPlatformMapping(owner, mapping.Value!.Mapping);
+        if (budget.Value is { } budgetReservation)
+            _mappingBudgetReservations.Add(mapping.Value.Mapping.MappingId, (owner, budgetReservation));
         return mapping;
     }
 
@@ -480,6 +502,8 @@ public sealed partial class RuntimeKernel
 
         if (lifecycle.LocalReservationReleased)
         {
+            var existingBudgetRelease = ReleaseMappingBudget(mapping.MappingId);
+            if (!existingBudgetRelease.IsSuccess) return existingBudgetRelease;
             UntrackPlatformMapping(mapping);
             PlatformAuthority.ForgetExactMappingMetadata(mapping);
             return KernelResult.Ok();
@@ -504,6 +528,9 @@ public sealed partial class RuntimeKernel
             _ = Regions.ReservePlatformMapping(mapping.Region, owner);
             return markReleased;
         }
+
+        var budgetRelease = ReleaseMappingBudget(mapping.MappingId);
+        if (!budgetRelease.IsSuccess) return budgetRelease;
 
         UntrackPlatformMapping(mapping);
         PlatformAuthority.ForgetExactMappingMetadata(mapping);

@@ -36,8 +36,16 @@ internal sealed record ReclaimBlockerSnapshot(
     ReclaimDependencyKind Dependency,
     string ResourceId,
     ReclaimExternalState ExternalState,
-    KernelError? Error,
-    string Reason);
+    ReclaimBlockerCause Cause,
+    string Reason)
+{
+    internal KernelError? Error => ReclaimBlockerCauseModel.ToOptionalError(Cause);
+
+    internal static ReclaimBlockerSnapshot Create(
+        ReclaimDependencyKind dependency, string resourceId, ReclaimExternalState externalState,
+        KernelError? error, string reason) =>
+        new(dependency, resourceId, externalState, ReclaimBlockerCauseModel.FromOptionalError(error), reason);
+}
 
 internal sealed record EndpointSessionDiagnosticSnapshot(
     EndpointSessionHandle Session,
@@ -276,7 +284,7 @@ public sealed partial class RuntimeKernel
         var session = sessions.FirstOrDefault(static item => item.ReclaimBlocking);
         if (session is not null)
         {
-            return new(
+            return ReclaimBlockerSnapshot.Create(
                 ReclaimDependencyKind.EndpointSession,
                 $"session:{session.Session.SessionId.Value}:gen:{session.Session.Generation.Value}",
                 ReclaimExternalState.NotApplicable,
@@ -286,7 +294,7 @@ public sealed partial class RuntimeKernel
 
         if (teardown.Phase == ProcessTeardownPhase.PlatformClosed && !teardown.LocalReclaimCompleted)
         {
-            return new(
+            return ReclaimBlockerSnapshot.Create(
                 ReclaimDependencyKind.KernelEventPublication,
                 "kernel-event-publication",
                 ReclaimExternalState.Closed,
@@ -296,7 +304,7 @@ public sealed partial class RuntimeKernel
 
         if (platform.DomainState == ReclaimExternalState.Quarantined)
         {
-            return new(
+            return ReclaimBlockerSnapshot.Create(
                 ReclaimDependencyKind.PlatformDomain,
                 $"process:{platform.Process.ProcessId.Value}:gen:{platform.Process.Generation}",
                 ReclaimExternalState.Quarantined,
@@ -311,7 +319,7 @@ public sealed partial class RuntimeKernel
                         resource.ExternalState is ReclaimExternalState.Active or ReclaimExternalState.Draining
                 ? ReclaimExternalState.ExternalStateUnknown
                 : resource.ExternalState;
-            return new(
+            return ReclaimBlockerSnapshot.Create(
                 resource.Kind,
                 resource.ResourceId,
                 state,
@@ -323,7 +331,7 @@ public sealed partial class RuntimeKernel
 
         if (platform.DomainState is ReclaimExternalState.Active or ReclaimExternalState.Draining)
         {
-            return new(
+            return ReclaimBlockerSnapshot.Create(
                 ReclaimDependencyKind.PlatformDomain,
                 $"process:{platform.Process.ProcessId.Value}:gen:{platform.Process.Generation}",
                 teardown.Phase == ProcessTeardownPhase.PlatformFaulted ? ReclaimExternalState.ExternalStateUnknown : platform.DomainState,
@@ -332,7 +340,7 @@ public sealed partial class RuntimeKernel
         }
 
         return teardown.BlockingError is { } error
-            ? new(
+            ? ReclaimBlockerSnapshot.Create(
                 ReclaimDependencyKind.PlatformDomain,
                 $"process:{platform.Process.ProcessId.Value}:gen:{platform.Process.Generation}",
                 ReclaimExternalState.ExternalStateUnknown,

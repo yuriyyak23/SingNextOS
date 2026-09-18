@@ -53,7 +53,16 @@ public sealed class Phase9GuiOwnershipTests
         var present = compositor.PresentMoveAsync(surface).AsTask();
         Assert.True(scenario.Host.ProcessNext().IsSuccess);
         Assert.True(SpinWait.SpinUntil(() => !surface.Pixels.IsValid, 1000));
-        Assert.True(scenario.Host.AcceptNext().IsSuccess);
+        // MOVE invalidates the caller's buffer before the asynchronous continuation enqueues
+        // the request. Wait for delivery, rather than treating invalidation as queue readiness.
+        KernelResult acceptance = default;
+        Assert.True(SpinWait.SpinUntil(() =>
+        {
+            acceptance = scenario.Host.AcceptNext();
+            return acceptance.IsSuccess || acceptance.Error != KernelError.InvalidMessage ||
+                acceptance.Message != "Channel queue is empty.";
+        }, 1000), "The moved present request was not delivered within the test bound.");
+        Assert.True(acceptance.IsSuccess, acceptance.Message);
         Assert.Throws<InvalidOperationException>(() => _ = surface.WritablePixels.Length);
         Assert.False(present.IsCompleted);
         Assert.True(scenario.Host.CompleteAccepted().IsSuccess);
@@ -237,6 +246,7 @@ public sealed class Phase9GuiOwnershipTests
         Assert.DoesNotContain(sdk.Descendants("ProjectReference"), item => ((string?)item.Attribute("Include") ?? "").Contains("Platform", StringComparison.OrdinalIgnoreCase));
         var directExternal = Directory.EnumerateFiles(root, "*.csproj", SearchOption.AllDirectories)
             .Where(path => !path.Contains(Path.Combine("tools", "HybridCpu_ExecutableAdapter"), StringComparison.OrdinalIgnoreCase))
+            .Where(path => !path.EndsWith(Path.Combine("src", "Runtime", "SingPlus.Runtime", "SingPlus.Runtime.csproj"), StringComparison.OrdinalIgnoreCase))
             .Where(path => File.ReadAllText(path).Contains("HybridCPU.ExternalRuntime", StringComparison.OrdinalIgnoreCase));
         Assert.Empty(directExternal);
     }

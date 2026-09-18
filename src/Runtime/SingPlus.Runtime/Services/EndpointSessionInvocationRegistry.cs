@@ -10,6 +10,7 @@ internal sealed class EndpointSessionInvocationRegistry
         public required ProcessHandle Caller { get; init; }
         public required ProcessHandle Service { get; init; }
         public required uint MessageId { get; init; }
+        public CancellationScopeHandle? CancellationScope { get; set; }
         public bool Delivered { get; set; }
         public bool ServiceAccepted { get; set; }
         public bool InFlightCancellationAllowed { get; set; }
@@ -20,13 +21,18 @@ internal sealed class EndpointSessionInvocationRegistry
 
     private readonly Dictionary<(EndpointSessionId Session, EndpointSessionGeneration SessionGeneration, EndpointSessionInvocationId Invocation), Record> _records = [];
     private readonly object _gate = new();
+    private readonly CancellationScopeAuthority _cancellationScopes;
+
+    internal EndpointSessionInvocationRegistry(CancellationScopeAuthority cancellationScopes) =>
+        _cancellationScopes = cancellationScopes;
 
     internal EndpointSessionInvocationHandle Register(
         EndpointSessionHandle session,
         ProcessHandle caller,
         ProcessHandle service,
         ulong requestSequence,
-        uint messageId)
+        uint messageId,
+        CancellationScopeHandle? cancellationScope = null)
     {
         if (requestSequence == 0) throw new ArgumentOutOfRangeException(nameof(requestSequence));
         var handle = new EndpointSessionInvocationHandle(
@@ -40,12 +46,14 @@ internal sealed class EndpointSessionInvocationRegistry
             {
                 if (existing.Caller != caller ||
                     existing.Service != service ||
-                    existing.MessageId != messageId)
+                    existing.MessageId != messageId ||
+                    cancellationScope is { } supplied && existing.CancellationScope is { } current && supplied != current)
                 {
                     throw new InvalidOperationException(
                         "Endpoint session invocation identity conflicts with existing correlation.");
                 }
 
+                existing.CancellationScope ??= cancellationScope;
                 return existing.Handle;
             }
 
@@ -54,7 +62,8 @@ internal sealed class EndpointSessionInvocationRegistry
                 Handle = handle,
                 Caller = caller,
                 Service = service,
-                MessageId = messageId
+                MessageId = messageId,
+                CancellationScope = cancellationScope
             });
         }
         return handle;
@@ -96,6 +105,57 @@ internal sealed class EndpointSessionInvocationRegistry
                 return KernelResult.Fail(KernelError.InvalidTransition, "The service already accepted this invocation without an in-flight cancellation contour.");
             record.CancellationRequested = true;
             return KernelResult.Ok();
+        }
+    }
+
+    internal KernelResult BindCancellationScope(
+        EndpointSessionInvocationHandle handle,
+        ProcessHandle caller,
+        CancellationScopeHandle scope)
+    {
+        lock (_gate)
+        {
+            var resolved = ResolveForCaller(handle, caller);
+            if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+            var temporal = _cancellationScopes.Observe(caller, scope);
+            if (!temporal.IsSuccess) return KernelResult.Fail(temporal.Error, temporal.Message!);
+            if (temporal.Value!.Disposition == CancellationDisposition.Stale)
+                return KernelResult.Fail(KernelError.StaleGeneration, "Cancellation scope generation is stale.");
+            var binding = _cancellationScopes.BindConsumer(
+                caller,
+                scope,
+                $"ipc:{handle.Session.SessionId.Value}:{handle.Session.Generation.Value}:{handle.InvocationId.Value}:{handle.Generation.Value}");
+            if (!binding.IsSuccess) return binding;
+            if (resolved.Value!.CancellationScope is { } existing && existing != scope)
+                return KernelResult.Fail(KernelError.StaleGeneration, "Invocation is already bound to another cancellation scope generation.");
+            resolved.Value.CancellationScope = scope;
+            return KernelResult.Ok();
+        }
+    }
+
+    internal KernelResult<CancellationObservation> RequestCancellation(
+        EndpointSessionInvocationHandle handle,
+        ProcessHandle caller,
+        CancellationScopeHandle scope)
+    {
+        lock (_gate)
+        {
+            var resolved = ResolveForCaller(handle, caller);
+            if (!resolved.IsSuccess) return KernelResult<CancellationObservation>.Fail(resolved.Error, resolved.Message!);
+            var record = resolved.Value!;
+            if (record.CancellationScope != scope)
+                return KernelResult<CancellationObservation>.Fail(KernelError.StaleGeneration, "Invocation is not bound to the exact cancellation scope generation.");
+            var request = _cancellationScopes.Request(caller, scope);
+            if (!request.IsSuccess || request.Value!.Disposition == CancellationDisposition.Stale)
+                return request;
+            if (record.TerminalStatus == ResponsePublicationStatus.Published)
+                return _cancellationScopes.RecordDisposition(caller, scope, CancellationDisposition.CompletedBeforeCancellation);
+            if (record.TerminalStatus == ResponsePublicationStatus.Cancelled)
+                return _cancellationScopes.RecordDisposition(caller, scope, CancellationDisposition.ProviderEffectContained);
+            if (record.ServiceAccepted && !record.InFlightCancellationAllowed)
+                return _cancellationScopes.RecordDisposition(caller, scope, CancellationDisposition.TooLateEffectMayExist);
+            record.CancellationRequested = true;
+            return request;
         }
     }
 
@@ -178,7 +238,12 @@ internal sealed class EndpointSessionInvocationRegistry
                 return KernelResult<ResponseEnvelope>.Fail(KernelError.InvalidTransition, "The service accepted cancellation and must settle the invocation as Cancelled.");
 
             var result = publication();
-            if (result.IsSuccess) record.TerminalStatus = ResponsePublicationStatus.Published;
+            if (result.IsSuccess)
+            {
+                record.TerminalStatus = ResponsePublicationStatus.Published;
+                if (record.CancellationRequested && record.CancellationScope is { } scope)
+                    _ = _cancellationScopes.RecordDisposition(record.Caller, scope, CancellationDisposition.CompletedBeforeCancellation);
+            }
             return result;
         }
     }
@@ -201,7 +266,17 @@ internal sealed class EndpointSessionInvocationRegistry
                 return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseNotDelivered, "Endpoint session invocation has not been delivered to the service.");
 
             var result = cancellation();
-            if (result.IsSuccess) record.TerminalStatus = ResponsePublicationStatus.Cancelled;
+            if (result.IsSuccess)
+            {
+                record.TerminalStatus = ResponsePublicationStatus.Cancelled;
+                if (record.CancellationScope is { } scope)
+                    _ = _cancellationScopes.RecordDisposition(
+                        record.Caller,
+                        scope,
+                        record.ServiceAccepted
+                            ? CancellationDisposition.ProviderEffectContained
+                            : CancellationDisposition.CancelledBeforeEffect);
+            }
             return result;
         }
     }

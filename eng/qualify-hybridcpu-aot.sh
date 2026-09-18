@@ -3,7 +3,7 @@
 set -euo pipefail
 
 readonly expected_hybridcpu_revision="9e001bf29df06ad3d4ff7337f81d4e5bc0a62fc9"
-readonly expected_dotnet_sdk="10.0.204"
+readonly expected_dotnet_sdk="11.0.100-rc.1.26425.128"
 readonly script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly sing_repository="$(cd -- "${script_directory}/.." && pwd -P)"
 
@@ -15,8 +15,8 @@ fi
 readonly hybridcpu_repository="$(cd -- "$1" && pwd -P)"
 readonly output_directory="${sing_repository}/artifacts/hybridcpu-aot-qualification"
 readonly first_pass_directory="${output_directory}/pass1"
-readonly kernel_assembly="${sing_repository}/src/Kernel/SingPlus.Kernel/bin/Release/net10.0/SingPlus.Kernel.dll"
-readonly boot_assembly="${sing_repository}/src/Kernel/Boot/SingPlus.Boot/bin/Release/net10.0/SingPlus.Boot.dll"
+readonly kernel_assembly="${sing_repository}/src/Kernel/SingPlus.Kernel/bin/Release/net11.0/SingPlus.Kernel.dll"
+readonly boot_assembly="${sing_repository}/src/Kernel/Boot/SingPlus.Boot/bin/Release/net11.0/SingPlus.Boot.dll"
 readonly first_kernel_assembly="${first_pass_directory}/SingPlus.Kernel.dll"
 readonly first_boot_assembly="${first_pass_directory}/SingPlus.Boot.dll"
 readonly first_admission_proof="${first_pass_directory}/SingPlusAdmissionProofV1.json"
@@ -25,8 +25,8 @@ readonly qualification_report="${output_directory}/SingPlusHybridCpuQualificatio
 readonly qualification_checksums="${output_directory}/SHA256SUMS"
 readonly boot_project="src/Kernel/Boot/SingPlus.Boot/SingPlus.Boot.csproj"
 readonly qualification_project="tools/SingPlus.HybridCpuQualification/SingPlus.HybridCpuQualification.csproj"
-readonly admission_tool="tools/SingPlus.Admission/bin/Release/net10.0/SingPlus.Admission.dll"
-readonly qualification_tool="tools/SingPlus.HybridCpuQualification/bin/Release/net10.0/SingPlus.HybridCpuQualification.dll"
+readonly admission_tool="tools/SingPlus.Admission/bin/Release/net11.0/SingPlus.Admission.dll"
+readonly qualification_tool="tools/SingPlus.HybridCpuQualification/bin/Release/net11.0/SingPlus.HybridCpuQualification.dll"
 
 if [[ "$(git -C "${sing_repository}" rev-parse --show-toplevel)" != "${sing_repository}" ]]; then
   echo "SingNextOS path is not the exact Git worktree root." >&2
@@ -110,8 +110,8 @@ sha256sum \
   artifacts/hybridcpu-aot-qualification/pass1/SingPlus.Kernel.dll \
   artifacts/hybridcpu-aot-qualification/pass1/SingPlus.Boot.dll \
   artifacts/hybridcpu-aot-qualification/pass1/SingPlusAdmissionProofV1.json \
-  src/Kernel/SingPlus.Kernel/bin/Release/net10.0/SingPlus.Kernel.dll \
-  src/Kernel/Boot/SingPlus.Boot/bin/Release/net10.0/SingPlus.Boot.dll \
+  src/Kernel/SingPlus.Kernel/bin/Release/net11.0/SingPlus.Kernel.dll \
+  src/Kernel/Boot/SingPlus.Boot/bin/Release/net11.0/SingPlus.Boot.dll \
   artifacts/hybridcpu-aot-qualification/SingPlusAdmissionProofV1.json \
   artifacts/hybridcpu-aot-qualification/SingPlusHybridCpuQualificationV1.json \
   > "${qualification_checksums}"

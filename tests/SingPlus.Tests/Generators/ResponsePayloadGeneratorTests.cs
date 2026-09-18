@@ -131,6 +131,7 @@ public interface IBadResponse
         var tree = CSharpSyntaxTree.ParseText(source, new CSharpParseOptions(LanguageVersion.CSharp13));
         var compilation = CSharpCompilation.Create("ResponseGeneratorFixture", new[] { tree }, references, new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
         GeneratorDriver driver = CSharpGeneratorDriver.Create(new ResponsePayloadGenerator().AsSourceGenerator());
+        driver = driver.WithUpdatedParseOptions((CSharpParseOptions)tree.Options);
         driver = driver.RunGeneratorsAndUpdateCompilation(compilation, out var outputCompilation, out var generatorDiagnostics);
         return (driver, outputCompilation, generatorDiagnostics);
     }

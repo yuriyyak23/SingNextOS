@@ -13,6 +13,32 @@ namespace SingPlus.Tests.Qualification;
 public sealed class HybridCpuQualificationTests
 {
     [Fact]
+    public void QualificationShellInvocationMatchesPinnedSdkAndCanonicalArtifactPaths()
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null && !File.Exists(Path.Combine(directory.FullName, "eng", "qualify-hybridcpu-aot.sh")))
+            directory = directory.Parent;
+        Assert.NotNull(directory);
+        var repository = directory.FullName;
+        var script = File.ReadAllText(Path.Combine(repository, "eng", "qualify-hybridcpu-aot.sh"));
+        using var sdk = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(repository, "global.json")));
+        var expectedSdk = sdk.RootElement.GetProperty("sdk").GetProperty("version").GetString();
+        Assert.Contains("readonly expected_dotnet_sdk=\"" + expectedSdk + "\"", script, StringComparison.Ordinal);
+        foreach (var field in new[] { "KernelArtifactPath", "BootArtifactPath" })
+        {
+            var path = (string)typeof(QualificationRecorder).GetField(field,
+                global::System.Reflection.BindingFlags.NonPublic | global::System.Reflection.BindingFlags.Static)!.GetRawConstantValue()!;
+            Assert.Contains("${sing_repository}/" + path, script, StringComparison.Ordinal);
+            Assert.Contains("\n  " + path + " \\", script.Replace("\r\n", "\n"), StringComparison.Ordinal);
+        }
+        var project = global::System.Xml.Linq.XDocument.Load(Path.Combine(repository, "tools", "SingPlus.HybridCpuQualification", "SingPlus.HybridCpuQualification.csproj"));
+        var framework = project.Descendants("TargetFramework").Single().Value;
+        foreach (var tool in new[] { "SingPlus.Admission", "SingPlus.HybridCpuQualification" })
+            Assert.Contains($"tools/{tool}/bin/Release/{framework}/{tool}.dll", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("net10.0", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
     [Trait("Category", "Qualification")]
     [Trait("Category", "Determinism")]
     public void ValidEvidenceProducesIdenticalExternalBlockedReportsWithExactHashes()
@@ -41,8 +67,8 @@ public sealed class HybridCpuQualificationTests
         Assert.Equal(fixture.HybridRevision, inputs.GetProperty("HybridCpuRevision").GetString());
         Assert.Equal(fixture.HybridRevision, inputs.GetProperty("ExpectedHybridCpuRevision").GetString());
         Assert.Equal(fixture.HybridTree, inputs.GetProperty("HybridCpuTree").GetString());
-        Assert.Equal("10.0.204", inputs.GetProperty("SingNextOsRequestedSdkVersion").GetString());
-        Assert.Equal("10.0.204", inputs.GetProperty("ActualDotNetSdkVersion").GetString());
+        Assert.Equal("11.0.100-rc.1.26425.128", inputs.GetProperty("SingNextOsRequestedSdkVersion").GetString());
+        Assert.Equal("11.0.100-rc.1.26425.128", inputs.GetProperty("ActualDotNetSdkVersion").GetString());
         Assert.Equal("10.0.201", inputs.GetProperty("HybridCpuRequestedSdkVersion").GetString());
         Assert.Equal(
             QualificationRecorder.AuditedHybridCpuCompilerContractVersion,
@@ -73,8 +99,8 @@ public sealed class HybridCpuQualificationTests
         Assert.Equal(
             new[]
             {
-                "src/Kernel/SingPlus.Kernel/bin/Release/net10.0/SingPlus.Kernel.dll",
-                "src/Kernel/Boot/SingPlus.Boot/bin/Release/net10.0/SingPlus.Boot.dll",
+                "src/Kernel/SingPlus.Kernel/bin/Release/net11.0/SingPlus.Kernel.dll",
+                "src/Kernel/Boot/SingPlus.Boot/bin/Release/net11.0/SingPlus.Boot.dll",
                 "artifacts/hybridcpu-aot-qualification/SingPlusAdmissionProofV1.json",
             },
             artifacts.Select(static artifact => artifact.GetProperty("Path").GetString()));
@@ -419,10 +445,10 @@ public sealed class HybridCpuQualificationTests
 
             var kernelPath = Path.Combine(
                 singRoot,
-                "src", "Kernel", "SingPlus.Kernel", "bin", "Release", "net10.0", "SingPlus.Kernel.dll");
+                "src", "Kernel", "SingPlus.Kernel", "bin", "Release", "net11.0", "SingPlus.Kernel.dll");
             var bootPath = Path.Combine(
                 singRoot,
-                "src", "Kernel", "Boot", "SingPlus.Boot", "bin", "Release", "net10.0", "SingPlus.Boot.dll");
+                "src", "Kernel", "Boot", "SingPlus.Boot", "bin", "Release", "net11.0", "SingPlus.Boot.dll");
             var proofPath = Path.Combine(
                 singRoot,
                 "artifacts", "hybridcpu-aot-qualification", "SingPlusAdmissionProofV1.json");
@@ -450,7 +476,7 @@ public sealed class HybridCpuQualificationTests
                 singRoot,
                 hybridRoot,
                 HybridRevision,
-                "10.0.204",
+                "11.0.100-rc.1.26425.128",
                 kernelPath,
                 bootPath,
                 proofPath,
@@ -559,7 +585,7 @@ public sealed class HybridCpuQualificationTests
             Directory.CreateDirectory(path);
             RunGit(path, "init", "--quiet");
             File.WriteAllText(Path.Combine(path, "marker.txt"), marker, new UTF8Encoding(false));
-            var sdkVersion = marker == "sing-next-os" ? "10.0.204" : "10.0.201";
+            var sdkVersion = marker == "sing-next-os" ? "11.0.100-rc.1.26425.128" : "10.0.201";
             File.WriteAllText(
                 Path.Combine(path, "global.json"),
                 $"{{\"sdk\":{{\"version\":\"{sdkVersion}\"}}}}",
