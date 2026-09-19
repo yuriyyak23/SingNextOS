@@ -3,7 +3,7 @@
     <Project Path="contracts/SingPlus.Contracts/SingPlus.Contracts.csproj" />
   </Folder>
   <Folder Name="/docs/" />
-  <Folder Name="/NeutralRuntime/" Id="07c2787e-eac7-c090-1ba3-a61ec2a24d84">
+  <Folder Name="/tools/">
     <Project Path="tools/HybridCpu_ExecutableAdapter/Boot.Contracts/HybridCpu.Boot.Contracts.csproj" />
     <Project Path="tools/HybridCpu_ExecutableAdapter.Tests/HybridCpu_ExecutableAdapter.Tests.csproj" />
     <Project Path="tools/HybridCpu_ExecutableAdapter/HybridCpu_ExecutableAdapter.csproj" />
@@ -12,9 +12,8 @@
     <Project Path="tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Model/HybridCPU_NeutralRuntime.Model.csproj" />
     <Project Path="tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Tests/HybridCPU_NeutralRuntime.Tests.csproj" />
     <Project Path="tools/SingPlus.Admission/SingPlus.Admission.csproj" />
+    <Project Path="tools/SingPlus.Boot.DebugHost/SingPlus.Boot.DebugHost.csproj" />
     <Project Path="tools/SingPlus.HybridCpuQualification/SingPlus.HybridCpuQualification.csproj" />
-  </Folder>
-  <Folder Name="/NeutralRuntime/qualification/">
     <Project Path="tools/SingPlus.SingCapQualification/SingPlus.SingCapQualification.csproj" />
   </Folder>
   <Folder Name="/sdk/">
@@ -52,5 +51,4 @@
     <Project Path="tests/SingPlus.Platform.HybridCpu.Tests/SingPlus.Platform.HybridCpu.Tests.csproj" />
     <Project Path="tests/SingPlus.Tests/SingPlus.Tests.csproj" />
   </Folder>
-  <Folder Name="/tools/" />
 </Solution>

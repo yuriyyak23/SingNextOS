@@ -10,5 +10,6 @@
   <ItemGroup>
     <ProjectReference Include="../../SingPlus.Kernel/SingPlus.Kernel.csproj" />
     <ProjectReference Include="../../Hal/SingPlus.Kernel.Hal.Host/SingPlus.Kernel.Hal.Host.csproj" />
+    <ProjectReference Include="../../../Runtime/SingPlus.Runtime/SingPlus.Runtime.csproj" />
   </ItemGroup>
 </Project>
