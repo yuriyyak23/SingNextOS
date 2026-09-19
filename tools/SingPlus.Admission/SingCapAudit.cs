@@ -76,6 +76,8 @@ public sealed class SingCapAuditV1
         {
             writer.WriteStartObject(); writer.WriteString("Schema", Schema);
             writer.WriteString("ManifestDigest", Manifest.NormalizedDigest); writer.WriteString("ImageDigest", Manifest.BaseManifest.ImageDigest);
+            writer.WritePropertyName("ManifestV1"); writer.WriteRawValue(Manifest.BaseManifest.SerializeCanonical(), skipInputValidation: false);
+            writer.WritePropertyName("ManifestV2"); writer.WriteRawValue(Manifest.SerializeCanonical(), skipInputValidation: false);
             writer.WriteString("SecurityProfile", Manifest.SecurityProfile.ToString()); writer.WriteString("SdkVersion", SdkVersion); writer.WriteString("RuntimeVersion", RuntimeVersion);
             writer.WriteString("AdmissionProofDigest", AdmissionProof.ProofDigest); writer.WriteString("AdmissionPolicyVersion", Manifest.AdmissionPolicyVersion);
             writer.WriteString("AdmissionPolicyDigest", Manifest.AdmissionPolicyDigest); writer.WriteString("ManagedCapFrameworkSurfaceVersion", Manifest.ManagedCapFrameworkSurfaceVersion);

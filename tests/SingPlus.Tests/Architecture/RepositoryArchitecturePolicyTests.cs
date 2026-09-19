@@ -19,6 +19,7 @@ public sealed class RepositoryArchitecturePolicyTests
         DriversServices,
         NativeSdk,
         Compatibility,
+        BootContracts,
         NeutralContracts,
         NeutralAuthority,
         NeutralModel,
@@ -143,14 +144,14 @@ public sealed class RepositoryArchitecturePolicyTests
 
     private static bool IsProjectReferenceAllowed(Layer source, Layer target) => source switch
     {
-        Layer.Contracts or Layer.NeutralContracts => false,
+        Layer.Contracts or Layer.BootContracts or Layer.NeutralContracts => false,
         Layer.Sip => target is Layer.Contracts or Layer.NativeSdk or Layer.Tooling,
         Layer.PlatformAbstractions => target is Layer.Contracts,
         Layer.DriversServices => target is Layer.Contracts,
         Layer.NativeSdk => target is Layer.Contracts or Layer.Sip,
-        Layer.PrivilegedMechanism => target is Layer.Contracts or Layer.Sip or Layer.PlatformAbstractions or Layer.PrivilegedMechanism,
+        Layer.PrivilegedMechanism => target is Layer.Contracts or Layer.BootContracts or Layer.Sip or Layer.PlatformAbstractions or Layer.PrivilegedMechanism,
         Layer.ProviderAdapter => target is Layer.PlatformAbstractions or Layer.NeutralContracts or Layer.NeutralAuthority or Layer.NeutralModel,
-        Layer.ExecutableAdapter => target is Layer.NeutralContracts or Layer.NeutralAuthority,
+        Layer.ExecutableAdapter => target is Layer.BootContracts or Layer.NeutralContracts or Layer.NeutralAuthority,
         Layer.Compatibility => target is Layer.NeutralContracts or Layer.NeutralModel,
         Layer.NeutralAuthority => target is Layer.NeutralContracts,
         Layer.NeutralModel => target is Layer.NeutralContracts or Layer.NeutralAuthority,
@@ -208,6 +209,7 @@ public sealed class RepositoryArchitecturePolicyTests
         if (relative.StartsWith("sdk/", StringComparison.OrdinalIgnoreCase)) return Layer.NativeSdk;
         if (relative.StartsWith("src/Runtime/", StringComparison.OrdinalIgnoreCase) || relative.StartsWith("src/Kernel/", StringComparison.OrdinalIgnoreCase)) return Layer.PrivilegedMechanism;
         if (relative.Contains("HybridCPU_NeutralRuntime.Contracts/", StringComparison.OrdinalIgnoreCase)) return Layer.NeutralContracts;
+        if (relative.Contains("HybridCpu_ExecutableAdapter/Boot.Contracts/", StringComparison.OrdinalIgnoreCase)) return Layer.BootContracts;
         if (relative.Contains("HybridCPU_NeutralRuntime.AuthorityCore/", StringComparison.OrdinalIgnoreCase)) return Layer.NeutralAuthority;
         if (relative.Contains("HybridCPU_NeutralRuntime.Model/", StringComparison.OrdinalIgnoreCase)) return Layer.NeutralModel;
         if (relative.EndsWith("HybridCPU_NeutralRuntime.csproj", StringComparison.OrdinalIgnoreCase)) return Layer.Compatibility;

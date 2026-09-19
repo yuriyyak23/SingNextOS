@@ -243,7 +243,18 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
             failure = $"'{type.ToDisplayString()}' is not an explicitly readonly value node";
             return false;
         }
+        if (IsTrustedBoundedCopyWrapper(named)) return true;
         if (!path.Add(type)) return true;
+        foreach (var field in named.GetMembers().OfType<IFieldSymbol>()
+                     .Where(static field => !field.IsStatic && !field.IsConst))
+        {
+            if (!ValidateDeepValueType(field.Type, path, out failure))
+            {
+                failure = $"{named.ToDisplayString()}.{field.Name} -> {failure}";
+                path.Remove(type);
+                return false;
+            }
+        }
         foreach (var property in named.GetMembers().OfType<IPropertySymbol>()
                      .Where(static property => !property.IsStatic && property.DeclaredAccessibility == Accessibility.Public &&
                                                property.Name is not "PayloadSize" and not "MaxPayloadSize"))
@@ -257,6 +268,19 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
         }
         path.Remove(type);
         return true;
+    }
+
+    private static bool IsTrustedBoundedCopyWrapper(INamedTypeSymbol type)
+    {
+        var ns = type.ContainingNamespace.ToDisplayString();
+        return (ns, type.Name) switch
+        {
+            ("SingPlus.Sip.Native", "BoundedBytes") => true,
+            ("SingPlus.Contracts", "SurfacePlaneSet") => true,
+            ("SingPlus.Sip.Process", "ProcessManifestValue") => true,
+            ("SingPlus.Sip.Process", "InitialCapabilitySet") => true,
+            _ => false,
+        };
     }
 
     private static void Report(SourceProductionContext output, DiagnosticDescriptor descriptor, ISymbol symbol, string message) =>

@@ -12,6 +12,7 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../HybridCpu_ExecutableAdapter/HybridCpu_ExecutableAdapter.csproj" />
+    <ProjectReference Include="../HybridCpu_ExecutableAdapter/Boot.Contracts/HybridCpu.Boot.Contracts.csproj" />
     <ProjectReference Include="../Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Contracts/HybridCPU_NeutralRuntime.Contracts.csproj" />
     <ProjectReference Include="../Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.AuthorityCore/HybridCPU_NeutralRuntime.AuthorityCore.csproj" />
   </ItemGroup>

@@ -9,6 +9,50 @@ public sealed class SingCapPhase13CrossAuthorityRaceTests
     private static readonly OperationDependencySnapshot Dependencies = new(7, 11, 13, 17);
 
     [Fact]
+    public void ConcurrentOwnedBufferMoveHasExactlyOneWinner()
+    {
+        for (var iteration = 0; iteration < 250; iteration++)
+        {
+            var kernel = new RuntimeKernel();
+            var owner = Create(kernel, (ulong)(11000 + iteration), (ulong)(21000 + iteration));
+            var buffer = kernel.AllocateBuffer<byte>(owner, 8).Value!;
+            OwnedBuffer<byte>? first = null;
+            OwnedBuffer<byte>? second = null;
+            Exception? firstFailure = null;
+            Exception? secondFailure = null;
+
+            Parallel.Invoke(
+                () => { try { first = buffer.Move(); } catch (Exception error) { firstFailure = error; } },
+                () => { try { second = buffer.Move(); } catch (Exception error) { secondFailure = error; } });
+
+            Assert.Equal(1, new[] { first, second }.Count(static moved => moved is { IsValid: true }));
+            Assert.Equal(1, new[] { firstFailure, secondFailure }.Count(static error => error is InvalidOperationException));
+            Assert.False(buffer.IsValid);
+            var winner = first ?? second!;
+            Assert.True(kernel.ReleaseRegion(owner, winner).IsSuccess);
+        }
+    }
+
+    [Fact]
+    public void ReleasedManagedRegionStorageIsNotReusedAcrossDomainsAndNewStorageIsZeroed()
+    {
+        var kernel = new RuntimeKernel();
+        var firstOwner = Create(kernel, 10991, 20991);
+        var secondOwner = Create(kernel, 10992, 20992);
+        var released = kernel.AllocateBuffer<byte>(firstOwner, 32).Value!;
+        released.Span.Fill(0xa5);
+
+        Assert.True(kernel.ReleaseRegion(firstOwner, released).IsSuccess);
+        Assert.False(released.IsValid);
+        Assert.Throws<InvalidOperationException>(() => { _ = released.Span[0]; });
+
+        var replacement = kernel.AllocateBuffer<byte>(secondOwner, 32).Value!;
+        Assert.All(replacement.Span.ToArray(), static value => Assert.Equal(0, value));
+        Assert.NotEqual(released.Handle.RegionId, replacement.Handle.RegionId);
+        Assert.True(kernel.ReleaseRegion(secondOwner, replacement).IsSuccess);
+    }
+
+    [Fact]
     public async Task CapabilitySessionSealRegionAndExternalGatesCompleteDeadlockStress()
     {
         var kernel = new RuntimeKernel();

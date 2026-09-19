@@ -8,7 +8,7 @@ namespace SingPlus.Admission;
 
 public static class AdmissionVerifier
 {
-    private const string Ruleset = "SingPlusAdmissionRulesV12|Profiles:KernelNoHeapV10,ManagedCapV1|ManagedCap:full-local-closure-module-scan,positive-exact-framework-member-surface,unknown-member-deny,ambient-reference-static-deny,native-inventory-deny|AssemblyIdentity:unique|ParentType:named-generic,nested,unsupported-reject|Root:unique-name|LocalCall:exact-metadata-signature-or-reject|KernelNoHeap:newobj,newarr,box,ldind,stind,ldobj,stobj,cpblk,initblk,localloc,calli,interop(PinvokeImpl,InternalCall,Unmanaged,NonCil,DllImport,LibraryImport,UnmanagedCallersOnly),explicit-layout-field,framework-memory-boundary|ConcreteReachableBody:required,AbstractRoot:deny|RuntimeAsyncV2:lowering-unavailable|ForbiddenApi:System.Console,System.Environment,System.GC,System.Activator,System.Threading.ThreadPool,System.Threading.Tasks.Task,System.Diagnostics.Process,System.IO.*,System.Net.*,System.Reflection.*,System.Linq.Expressions.*|ForbiddenAssemblies:System.Console,System.IO.*,System.Net.*,System.Reflection.Emit*,Microsoft.CSharp|UnknownDependency:deny|LocalSingPlusDependency:required,identity-match,raw-sha256,transitive";
+    private const string Ruleset = "SingPlusAdmissionRulesV13|Profiles:KernelNoHeapV10,ManagedCapV1|ManagedCap:full-local-closure-module-scan,positive-exact-framework-member-surface,unknown-member-deny,ambient-reference-static-recursive-value-closure-deny,native-inventory-deny|AssemblyIdentity:unique|ParentType:named-generic,nested,unsupported-reject|Root:unique-name|LocalCall:exact-metadata-signature-or-reject|KernelNoHeap:newobj,newarr,box,ldind,stind,ldobj,stobj,cpblk,initblk,localloc,calli,interop(PinvokeImpl,InternalCall,Unmanaged,NonCil,DllImport,LibraryImport,UnmanagedCallersOnly),explicit-layout-field,framework-memory-boundary|ConcreteReachableBody:required,AbstractRoot:deny|RuntimeAsyncV2:lowering-unavailable|ForbiddenApi:System.Console,System.Environment,System.GC,System.Activator,System.Threading.ThreadPool,System.Threading.Tasks.Task,System.Diagnostics.Process,System.IO.*,System.Net.*,System.Reflection.*,System.Linq.Expressions.*|ForbiddenAssemblies:System.Console,System.IO.*,System.Net.*,System.Reflection.Emit*,Microsoft.CSharp|UnknownDependency:deny|LocalSingPlusDependency:required,identity-match,raw-sha256,transitive";
 
     public static ManagedCapPolicyDescriptor GetManagedCapPolicyDescriptor()
     {
@@ -234,7 +234,7 @@ public static class AdmissionVerifier
             if ((field.Attributes & System.Reflection.FieldAttributes.Static) == 0 ||
                 (field.Attributes & System.Reflection.FieldAttributes.Literal) != 0) continue;
             var signature = model.Reader.GetBlobBytes(field.Signature);
-            if (SignatureCanCarryReference(signature))
+            if (SignatureCanCarryReference(signature) || model.FieldValueTypeCanCarryReference(handle))
                 violations.Add(new AdmissionViolation(model.GetFieldDisplayName(handle), "ambient-mutable-static-reference", Convert.ToHexString(signature).ToLowerInvariant()));
         }
     }
@@ -543,6 +543,44 @@ public static class AdmissionVerifier
 
         private static bool IsExplicitLayout(TypeDefinition type) =>
             (type.Attributes & System.Reflection.TypeAttributes.LayoutMask) == System.Reflection.TypeAttributes.ExplicitLayout;
+
+        public bool FieldValueTypeCanCarryReference(FieldDefinitionHandle handle) =>
+            FieldValueTypeCanCarryReference(handle, new HashSet<TypeDefinitionHandle>());
+
+        private bool FieldValueTypeCanCarryReference(
+            FieldDefinitionHandle handle,
+            HashSet<TypeDefinitionHandle> path)
+        {
+            var field = Reader.GetFieldDefinition(handle);
+            var blob = Reader.GetBlobReader(field.Signature);
+            _ = blob.ReadSignatureHeader();
+            if (blob.RemainingBytes == 0) return true;
+            var elementType = blob.ReadByte();
+            if (elementType != 0x11) return false; // ECMA-335 ELEMENT_TYPE_VALUETYPE
+
+            EntityHandle typeHandle;
+            try { typeHandle = blob.ReadTypeHandle(); }
+            catch (BadImageFormatException) { return true; }
+            if (typeHandle.Kind != HandleKind.TypeDefinition) return true;
+
+            var definitionHandle = (TypeDefinitionHandle)typeHandle;
+            if (!path.Add(definitionHandle)) return true;
+            var definition = Reader.GetTypeDefinition(definitionHandle);
+            foreach (var nestedFieldHandle in definition.GetFields())
+            {
+                var nestedField = Reader.GetFieldDefinition(nestedFieldHandle);
+                if ((nestedField.Attributes & System.Reflection.FieldAttributes.Static) != 0) continue;
+                var signature = Reader.GetBlobBytes(nestedField.Signature);
+                if (SignatureCanCarryReference(signature) ||
+                    FieldValueTypeCanCarryReference(nestedFieldHandle, path))
+                {
+                    path.Remove(definitionHandle);
+                    return true;
+                }
+            }
+            path.Remove(definitionHandle);
+            return false;
+        }
 
         public ResolvedMethod ResolveMethod(int token, IReadOnlyDictionary<string, AssemblyModel> models)
         {

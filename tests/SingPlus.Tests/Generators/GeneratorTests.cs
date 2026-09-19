@@ -237,6 +237,36 @@ public interface IBadContract
         Assert.Contains(diagnostics, diagnostic => diagnostic.Id == "SINGGEN011" && diagnostic.Severity == DiagnosticSeverity.Error);
     }
 
+    [Theory]
+    [InlineData("object")]
+    [InlineData("System.Collections.Generic.List<int>")]
+    [Trait("Category", "Generators")]
+    public void HiddenMutableFieldInsideReadonlyPayloadFailsClosed(string fieldType)
+    {
+        var source = $$"""
+using SingPlus.Contracts;
+using SingPlus.Sip.Sdk;
+namespace GeneratedTest;
+[BoundedPayload(64)]
+public readonly struct Packet : IBoundedPayload
+{
+    private readonly {{fieldType}} _hidden;
+    public Packet({{fieldType}} hidden) => _hidden = hidden;
+    public int PayloadSize => 1;
+    public int MaxPayloadSize => 64;
+}
+[SipContract]
+public interface IBadContract
+{
+    [Message(1)] void Bad(Packet packet);
+}
+""";
+
+        var diagnostics = RunDiagnostics(source);
+
+        Assert.Contains(diagnostics, diagnostic => diagnostic.Id == "SINGGEN011" && diagnostic.Severity == DiagnosticSeverity.Error);
+    }
+
     [Fact]
     [Trait("Category", "Generators")]
     public void RecursiveReadonlyValueGraphIsAccepted()

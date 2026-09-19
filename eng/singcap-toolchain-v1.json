@@ -14,5 +14,5 @@
   "windowsNativeToolset": "Visual Studio 2019 Build Tools 16.11.49 / MSVC 14.29.30133",
   "windowsNativeLinkerFileVersion": "14.29.30159.0",
   "admissionPolicyDigestAlgorithm": "SHA256",
-  "admissionVerifierSourceDigest": "A9061F55131009295C7F95EC06DF29A14BE8BD0C9CD9DAC40122282943AA0448"
+  "admissionVerifierSourceDigest": "991A295E05E41F9DFAF1D2C0CAEDD24013321BFEAE135F06DBA0EA6C2F87DA45"
 }

@@ -17,6 +17,9 @@
         "resolved": "1.14.0",
         "contentHash": "wLH8suR5xnj9C0CmqKTvUBSp2fLQsnS18ELZbILGosnGU3KIRJTZykX6bfvL/IWNOFOzGmQVvKI3q7irmjeM/Q=="
       },
+      "hybridcpu.boot.contracts": {
+        "type": "Project"
+      },
       "hybridcpu_neutralruntime.contracts": {
         "type": "Project"
       }

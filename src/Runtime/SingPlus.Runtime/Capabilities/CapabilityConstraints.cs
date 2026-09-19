@@ -57,6 +57,18 @@ internal readonly record struct OperationSetConstraint
 
     internal ImmutableArray<CapabilityOperation> Operations { get; }
     internal OperationSetConstraint Canonicalize() => new(Operations);
+    internal bool IsAuthorizedBy(CapabilityRights rights) => Operations.All(operation => operation switch
+    {
+        CapabilityOperation.Read => (rights & CapabilityRights.Read) != 0,
+        CapabilityOperation.Write => (rights & CapabilityRights.Write) != 0,
+        CapabilityOperation.Map => (rights & CapabilityRights.Map) != 0,
+        CapabilityOperation.Signal => (rights & CapabilityRights.Signal) != 0,
+        CapabilityOperation.Configure => (rights & CapabilityRights.Configure) != 0,
+        CapabilityOperation.Transfer => (rights & CapabilityRights.Transfer) != 0,
+        CapabilityOperation.Delegate => (rights & CapabilityRights.Delegate) != 0,
+        CapabilityOperation.Execute => (rights & CapabilityRights.Execute) != 0,
+        _ => false,
+    });
     internal static bool IsSubset(OperationSetConstraint child, OperationSetConstraint parent) =>
         child.Operations.All(parent.Operations.Contains);
 }
@@ -111,7 +123,9 @@ internal readonly record struct TargetSubjectConstraint(DomainId? DomainId, ulon
     }
     internal static bool IsSubset(TargetSubjectConstraint child, TargetSubjectConstraint parent) =>
         (!child.AllowsRetarget || parent.AllowsRetarget) &&
-        (parent.DomainId is null || child.DomainId == parent.DomainId && child.Generation == parent.Generation || parent.AllowsRetarget);
+        (parent.DomainId is null ||
+         child.DomainId is not null &&
+         (child.DomainId == parent.DomainId && child.Generation == parent.Generation || parent.AllowsRetarget));
 }
 
 internal readonly record struct SessionConstraint(EndpointSessionHandle? Session)
@@ -158,7 +172,11 @@ internal sealed record EffectiveCapabilityConstraints(
     internal EffectiveCapabilityConstraints Canonicalize()
     {
         if (Schema != CapabilityConstraintSchema.V1) throw new NotSupportedException("Unknown capability constraint schema.");
-        return new(Schema, Rights.Canonicalize(), Resource.Canonicalize(), Operations.Canonicalize(),
+        var rights = Rights.Canonicalize();
+        var operations = Operations.Canonicalize();
+        if (!operations.IsAuthorizedBy(rights.Rights))
+            throw new ArgumentException("Operation set is not authorized by the capability rights.", nameof(Operations));
+        return new(Schema, rights, Resource.Canonicalize(), operations,
             Range?.Canonicalize(), Lifetime.Canonicalize(), TargetSubject.Canonicalize(), Session.Canonicalize(),
             DelegationDepth.Canonicalize(), Quota.Canonicalize());
     }

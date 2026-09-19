@@ -143,10 +143,7 @@ public sealed class CapabilityAuthority
             var subject = new SubjectIdentity(subjectDomainId, subjectGeneration);
             var capacity = EnsureCapacity(subject);
             if (!capacity.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(capacity.Error, capacity.Message!);
-            var identity = AllocateIdentity();
-            if (!identity.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(identity.Error, identity.Message!);
-            var (id, nonce) = identity.Value;
-            var account = new QuotaAccount(new QuotaAccountReference(_nextQuotaAccountId++), quota);
+            var quotaAccountReference = new QuotaAccountReference(_nextQuotaAccountId);
             EffectiveCapabilityConstraints constraints;
             try
             {
@@ -154,12 +151,17 @@ public sealed class CapabilityAuthority
                     new(resourceKind, resourceId, resourceGeneration, null, null),
                     new(operations ?? OperationsFor(rights)), range,
                     new(notBeforeUtcTicks, expiresUtcTicks), new(null, 0, (rights & CapabilityRights.Delegate) != 0),
-                    new(session), new(delegationDepth), new(account.Reference, quota)).Canonicalize();
+                    new(session), new(delegationDepth), new(quotaAccountReference, quota)).Canonicalize();
             }
             catch (Exception exception) when (exception is ArgumentException or NotSupportedException or OverflowException)
             {
                 return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.DelegationDenied, exception.Message);
             }
+            var identity = AllocateIdentity();
+            if (!identity.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(identity.Error, identity.Message!);
+            var (id, nonce) = identity.Value;
+            var account = new QuotaAccount(quotaAccountReference, quota);
+            _nextQuotaAccountId = _nextQuotaAccountId == ulong.MaxValue ? 0 : _nextQuotaAccountId + 1;
             var record = new CapabilityRecord(id, nonce, issuerDomainId, subjectDomainId, subjectGeneration,
                 resourceKind, resourceId, resourceGeneration, rights, CurrentEpoch(subjectDomainId), null, constraints, account);
             _records.Add(id, record);
@@ -189,9 +191,6 @@ public sealed class CapabilityAuthority
                 return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.DelegationDenied, "Delegated rights must be a non-empty subset of the source capability.");
             var capacity = EnsureCapacity(new SubjectIdentity(targetDomain, targetGeneration));
             if (!capacity.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(capacity.Error, capacity.Message!);
-            var identity = AllocateIdentity();
-            if (!identity.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(identity.Error, identity.Message!);
-            var (id, nonce) = identity.Value;
             EffectiveCapabilityConstraints child;
             try
             {
@@ -215,6 +214,9 @@ public sealed class CapabilityAuthority
                 return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.DelegationDenied, "Child subject and rights must match the requested delegation.");
             if (!EffectiveCapabilityConstraints.IsSubset(child, source.Constraints))
                 return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.DelegationDenied, "Child constraints are not a canonical subset of the parent.");
+            var identity = AllocateIdentity();
+            if (!identity.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(identity.Error, identity.Message!);
+            var (id, nonce) = identity.Value;
             var record = new CapabilityRecord(id, nonce, delegatorDomain, targetDomain, targetGeneration,
                 source.ResourceKind, source.ResourceId, source.ResourceGeneration, rights,
                 CurrentEpoch(targetDomain), sourceId, child, source.QuotaAccount);

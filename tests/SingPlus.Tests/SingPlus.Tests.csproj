@@ -23,6 +23,7 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../../tools/HybridCpu_ExecutableAdapter/HybridCpu_ExecutableAdapter.csproj" />
+    <ProjectReference Include="../../tools/HybridCpu_ExecutableAdapter/Boot.Contracts/HybridCpu.Boot.Contracts.csproj" />
     <ProjectReference Include="../../tools/SingPlus.Admission/SingPlus.Admission.csproj" />
     <ProjectReference Include="../../tools/SingPlus.HybridCpuQualification/SingPlus.HybridCpuQualification.csproj" />
     <ProjectReference Include="../../contracts/SingPlus.Contracts/SingPlus.Contracts.csproj" />

@@ -1,0 +1,192 @@
+{
+  "schema": "hybridcpu-boot-traceability-v1",
+  "baselineHead": "472b7c9345605f1558958f0d00e4e2f1b4177fa4",
+  "requirements": [
+    {
+      "id": "R0-WIRE-CONTRACTS",
+      "classification": "ExecutableInScope",
+      "productionGate": "Explicit-width v1 codecs reject malformed and unsupported required input",
+      "tests": ["BootContractV1Tests"],
+      "claimLevel": "ContractOnly",
+      "evidence": "41_R0_AUDIT_EVIDENCE.md"
+    },
+    {
+      "id": "R0-REAL-RESET",
+      "classification": "FutureGatedRequiresCore",
+      "productionGate": "HybridCPU core owner implements and executes reset ABI",
+      "tests": [],
+      "claimLevel": "FutureGated",
+      "owner": "HybridCPU core/reset subsystem",
+      "missingContract": "Approved atomic core reset hook and executable ROM backend"
+    },
+    {
+      "id": "R1-RESET-MAP-MODEL",
+      "classification": "ModelOnly",
+      "productionGate": "Adapter reset snapshot and physical-map permission model pass deterministic conformance",
+      "tests": ["ResetMemoryMapModelTests"],
+      "claimLevel": "ModelValidated",
+      "evidence": "42_R1_AUDIT_EVIDENCE.md"
+    },
+    {
+      "id": "R1-CORE-RESET",
+      "classification": "FutureGatedRequiresCore",
+      "productionGate": "Core owner executes atomic architectural and microarchitectural reset",
+      "tests": [],
+      "claimLevel": "FutureGated",
+      "owner": "HybridCPU core/reset subsystem",
+      "missingContract": "Approved core reset hook, ROM fetch route, and late-completion invalidation"
+    },
+    {
+      "id": "R2-STAGE0-RECOVERY-MODEL",
+      "classification": "ModelOnly",
+      "productionGate": "Bounded recovery model copies, hashes, validates entry, and never exposes partial bytes",
+      "tests": ["Stage0RecoveryModelTests"],
+      "claimLevel": "ModelValidated",
+      "evidence": "43_R2_AUDIT_EVIDENCE.md"
+    },
+    {
+      "id": "R2-ROM-EXECUTION",
+      "classification": "FutureGatedRequiresCore",
+      "productionGate": "HybridCPU frontend executes immutable ROM bytes from the reset vector",
+      "tests": [],
+      "claimLevel": "FutureGated",
+      "owner": "HybridCPU core/frontend owner",
+      "missingContract": "Approved executable ROM backend and reset-to-fetch integration"
+    },
+    {
+      "id": "R3-TRUST-PROTECTED-STATE-MODEL",
+      "classification": "ModelOnly",
+      "productionGate": "Trust epoch, signature, rollback, atomic state, dev policy and confirmation properties pass",
+      "tests": ["TrustAndProtectedStateModelTests"],
+      "claimLevel": "ModelValidated",
+      "evidence": "44_R3_AUDIT_EVIDENCE.md"
+    },
+    {
+      "id": "R3-PRODUCTION-ROOT-STORE",
+      "classification": "FutureGatedRequiresHardware",
+      "productionGate": "Hardware root and monotonic protected state pass power-loss qualification",
+      "tests": [],
+      "claimLevel": "FutureGated",
+      "owner": "Platform security/protected-store owner",
+      "missingContract": "OTP/fuse root, atomic monotonic store, authenticated confirmation channel"
+    },
+    {
+      "id": "R4-SEMANTIC-SELECTION",
+      "classification": "ModelOnly",
+      "productionGate": "Permutation, replacement, stale, property, selector and split-brain tests pass",
+      "tests": ["CxlBootSelectionModelTests"],
+      "claimLevel": "ModelValidated",
+      "evidence": "45_R4_AUDIT_EVIDENCE.md"
+    },
+    {
+      "id": "R5-TRANSPORT-MODEL",
+      "classification": "ModelOnly",
+      "productionGate": "Bounded PCI, mailbox and optional locator fault tests pass",
+      "tests": ["PciCxlTransportModelTests"],
+      "claimLevel": "ModelValidated",
+      "evidence": "46_R5_AUDIT_EVIDENCE.md"
+    },
+    {
+      "id": "R6-TEMPORARY-APERTURE-MODEL",
+      "classification": "ModelOnly",
+      "productionGate": "Checked single-target decoder transaction, reverse compensation, and reset-staleness properties pass",
+      "tests": ["TemporaryApertureModelTests"],
+      "claimLevel": "ModelValidated",
+      "evidence": "47_R6_AUDIT_EVIDENCE.md"
+    },
+    {
+      "id": "R6-HARDWARE-HDM",
+      "classification": "FutureGatedRequiresHardware",
+      "productionGate": "Platform firmware backend programs and qualifies real decoder chain and isolation",
+      "tests": [],
+      "claimLevel": "FutureGated",
+      "owner": "Platform CXL/firmware backend owner",
+      "missingContract": "Qualified decoder transaction, aperture placement, reset ownership, DMA/IOMMU and link-fault contracts"
+    },
+    {
+      "id": "R7-STAGE1-BOOTINFO-MODEL",
+      "classification": "ModelOnly",
+      "productionGate": "Checked copy/hash/entry and immutable BootInfo validation properties pass",
+      "tests": ["Stage1LoadModelTests", "BootContractV1Tests"],
+      "claimLevel": "ModelValidated",
+      "evidence": "48_R7_AUDIT_EVIDENCE.md"
+    },
+    {
+      "id": "R7-CPU-ENTRY",
+      "classification": "FutureGatedRequiresCore",
+      "productionGate": "Core owner implements and executes register handoff and kernel entry",
+      "tests": [],
+      "claimLevel": "FutureGated",
+      "owner": "HybridCPU core/frontend/runtime owner",
+      "missingContract": "Approved executable entry hook, register ABI implementation, cache/coherency transition"
+    },
+    {
+      "id": "R8-FRESH-OS-TAKEOVER",
+      "classification": "ExecutableInScope",
+      "productionGate": "BootInfo validation, fresh provider discovery, non-adoption, and aperture retirement tests pass",
+      "tests": ["HybridBootInfoImporterTests", "CxlAuthorityBridgeTests", "RepositoryArchitecturePolicyTests"],
+      "claimLevel": "AdapterQualified",
+      "evidence": "49_R8_AUDIT_EVIDENCE.md"
+    },
+    {
+      "id": "R9-AB-RECOVERY-MODEL",
+      "classification": "ModelOnly",
+      "productionGate": "All persistence barriers preserve confirmed and signed-recovery routes and confirmation alone advances floor",
+      "tests": ["AbRecoveryModelTests", "TrustAndProtectedStateModelTests"],
+      "claimLevel": "ModelValidated",
+      "evidence": "50_R9_AUDIT_EVIDENCE.md"
+    },
+    {
+      "id": "R9-PRODUCTION-PROTECTED-STORE",
+      "classification": "FutureGatedRequiresHardware",
+      "productionGate": "Qualified atomic monotonic protected store and authenticated confirmation channel",
+      "tests": [],
+      "claimLevel": "FutureGated",
+      "owner": "Platform security/protected-store firmware owner",
+      "missingContract": "Hardware trust root, atomic power-loss store, monotonic floor, authenticated OS confirmation"
+    },
+    {
+      "id": "R10-MULTI-DEVICE-REPLICA",
+      "classification": "ModelOnly",
+      "productionGate": "Permutation, replacement, duplicate, generation and split-brain properties pass with fresh R8 admission",
+      "tests": ["CxlBootSelectionModelTests", "HybridBootInfoImporterTests", "CxlType3MemoryProviderTests"],
+      "claimLevel": "ModelValidated",
+      "evidence": "51_R10_AUDIT_EVIDENCE.md"
+    },
+    {
+      "id": "R11-ACTUAL-QEMU",
+      "classification": "FutureGatedRequiresDecision",
+      "productionGate": "Explicit future scope decision re-enables QEMU work",
+      "tests": [],
+      "claimLevel": "FutureGated",
+      "owner": "Roadmap/product owner",
+      "missingContract": "QEMU direction explicitly excluded by user",
+      "evidence": "52_R11_AUDIT_EVIDENCE.md"
+    },
+    {
+      "id": "R12-BACKEND-CAPABILITY-PROFILE",
+      "classification": "ExecutableInScope",
+      "productionGate": "Unsupported, incomplete, version-mismatched and self-declared hardware backends fail closed",
+      "tests": ["BootBackendCapabilityProfileTests", "AdapterBoundaryTests"],
+      "claimLevel": "AdapterQualified",
+      "evidence": "53_R12_AUDIT_EVIDENCE.md"
+    },
+    {
+      "id": "R12-REAL-HARDWARE",
+      "classification": "FutureGatedRequiresHardware",
+      "productionGate": "Independent hardware qualification covers all required backend capabilities",
+      "tests": [],
+      "claimLevel": "FutureGated",
+      "owner": "Platform firmware/hardware backend owners",
+      "missingContract": "Hardware access and qualified PCI/CXL/decoder/store/timer/watchdog/recovery/DMA/IOMMU backend"
+    },
+    {
+      "id": "R13-QUALIFICATION-CLOSURE",
+      "classification": "ExecutableInScope",
+      "productionGate": "T001-T050 matrix is complete, claim vocabulary is enforced, applicable suites and boundary audits pass",
+      "tests": ["HybridBootQualificationMatrixTests", "BootContractV1Tests", "HybridBootInfoImporterTests", "AdapterBoundaryTests", "RepositoryArchitecturePolicyTests"],
+      "claimLevel": "AdapterQualified",
+      "evidence": "54_R13_AUDIT_EVIDENCE.md"
+    }
+  ]
+}

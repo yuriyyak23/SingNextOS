@@ -1,0 +1,16 @@
+# R8 Implementation Evidence — SingNextOS Fresh Authority Takeover
+
+Baseline HEAD `472b7c9345605f1558958f0d00e4e2f1b4177fa4`; all pre-existing and parallel dirty-worktree changes were preserved. Audited `ICxlDiscoveryProvider`, `CxlType3ModelProvider`, `CxlType3PlacementPlanner`, `CxlAuthorityBridge`, Region authority, project dependency policy, and their tests before implementation.
+
+Implemented an executable SingNextOS early-boot importer in `SingPlus.Runtime`. It validates BootInfo magic/version/length/count/reserved fields/CRC32C/SHA-384, requires exactly one typed security-evidence record, checks its trust epoch and rollback floor, and projects only immutable diagnostic evidence. Endpoint candidates are obtained exclusively from a new OS discovery pass and re-queried through the existing `ICxlDiscoveryProvider`; BootInfo BDF/DSN/route/HPA/DPA/decoder/fabric values never select or authorize an endpoint.
+
+The takeover result contains a current `CxlEndpointSnapshot`, an importer-local admission sequence, and firmware-aperture disposition only. It contains no `OwnedRegion`, `RegionUse`, capability, provider lease, fabric binding, or provider-private value. Subsequent authority creation remains solely with the existing `CxlAuthorityBridge`, `PlatformAuthorityBridge`, and `RegionAuthority`; the importer does not duplicate their ledgers or mint authority. Device generation and admission sequence are distinct typed domains even when their numeric values collide. Boot image generation and firmware mapping generation likewise remain evidence-only domains.
+
+Temporary firmware mapping is released/invalidated where possible, explicitly marked stale when reset generation has superseded it, or quarantined on ambiguous failure. An absent mapping is valid. Device disappearance/provider refusal fails closed and still invokes retirement/quarantine; it never implies closure, reclaim, or authority. No global lock spans a provider call.
+
+The dedicated Boot contracts project is now an explicit dependency layer: it has no project dependencies; both the executable adapter and privileged SingNext runtime may consume it, while SingNext has no dependency on the executable-adapter implementation.
+
+Qualification: importer focused tests 5/0; related importer/CXL authority/Type-3/architecture regressions 43/0; solution build 0 warnings/errors; full tests adapter 58/0, neutral 58/0, HybridCPU platform 60/0, main 1205 passed/0 failed/2 skipped. Tests cover BDF/DSN/route/address changes, disappearance/refusal, mapping absent, stale aperture, numeric collisions, malformed BootInfo, missing/bad security evidence, and proof that no BootInfo field produces an authority-bearing result.
+
+Changed: `Boot.Contracts/BootEvidencePayloadCodec.cs`; `src/Runtime/SingPlus.Runtime/Boot/HybridBootInfoImporter.cs`; runtime/test project references and lock metadata; `HybridBootInfoImporterTests.cs`; the narrow repository dependency classification; this evidence and traceability matrix. Claim level: `AdapterQualified` for the SingNext importer against the local executable host provider; physical firmware/HDM behavior remains unclaimed. No HybridCPU core/ISE/ISA/compiler/architecture implementation changed.
+

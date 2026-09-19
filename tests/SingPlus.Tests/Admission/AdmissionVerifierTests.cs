@@ -383,6 +383,19 @@ public sealed class AdmissionVerifierTests
     }
 
     [Fact]
+    public void ManagedCapRejectsAmbientReferenceHiddenInsideStaticValueType()
+    {
+        const string source = "public struct HiddenState { public object Value; } public static class Fixture { private static HiddenState State; public static int Root() => State.Value is null ? 0 : 1; }";
+        using var fixture = CompileFixture(source, allowUnsafe: false);
+
+        var result = AdmissionVerifier.Verify(fixture.AssemblyPath, "Fixture::Root", "ManagedCap");
+
+        Assert.Contains(result.Violations, violation =>
+            violation.Operation == "ambient-mutable-static-reference" &&
+            violation.Method.EndsWith("Fixture::State", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void ManagedCapScansEveryMethodInLocalDependencyClosure()
     {
         var directory = Path.Combine(AppContext.BaseDirectory, "qualification-fixtures", Guid.NewGuid().ToString("N"));

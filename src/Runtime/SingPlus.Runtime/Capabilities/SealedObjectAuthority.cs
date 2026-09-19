@@ -122,7 +122,8 @@ internal sealed class SealedObjectAuthority
         {
             if (!SealTypeRegistry.TryTypeId<TSeal>(out var typeId))
                 return KernelResult.Fail(KernelError.InvalidMessage, "Unknown sealed contract marker.");
-            return _records.TryGetValue(pin.Handle.OpaqueToken, out var record) &&
+            return pin.IsOwnedBy(this) &&
+                   _records.TryGetValue(pin.Handle.OpaqueToken, out var record) &&
                    record.State == SealedObjectState.Active && record.ActivePins > 0 &&
                    record.Service == service.Service && record.ServiceGeneration == service.Generation &&
                    record.ServiceProcess == serviceProcess && record.SealTypeId == typeId
@@ -138,7 +139,8 @@ internal sealed class SealedObjectAuthority
         {
             if (!SealTypeRegistry.TryTypeId<TSeal>(out var typeId))
                 return KernelResult.Fail(KernelError.InvalidMessage, "Unknown sealed contract marker.");
-            if (!_records.TryGetValue(pin.Handle.OpaqueToken, out var record) ||
+            if (!pin.IsOwnedBy(this) ||
+                !_records.TryGetValue(pin.Handle.OpaqueToken, out var record) ||
                 record.SealTypeId != typeId || record.ActivePins == 0 ||
                 record.State != SealedObjectState.Active)
                 return KernelResult.Fail(KernelError.StaleHandle, "Sealed object is stale or already closed.");
@@ -219,5 +221,7 @@ internal sealed class SealedObjectPin<TSeal> : IDisposable where TSeal : ISealed
     internal ulong ObjectKey { get; }
     internal ulong ObjectGeneration { get; }
     internal CapabilityId Capability { get; }
+    internal bool IsOwnedBy(SealedObjectAuthority owner) =>
+        ReferenceEquals(Volatile.Read(ref _owner), owner);
     public void Dispose() => Interlocked.Exchange(ref _owner, null)?.Release(this);
 }

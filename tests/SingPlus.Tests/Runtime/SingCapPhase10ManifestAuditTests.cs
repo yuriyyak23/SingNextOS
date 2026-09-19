@@ -74,6 +74,24 @@ public sealed class SingCapPhase10ManifestAuditTests
         Assert.Throws<ArgumentException>(() => Create(baseManifest, (ComponentSecurityProfile)99, policy, schemaId: "future"));
         Assert.Throws<ArgumentException>(() => Create(baseManifest, ComponentSecurityProfile.ManagedCap, policy,
             memoryPolicy: new("unknown", 0, "bad")));
+        Assert.Throws<ArgumentException>(() => Create(baseManifest, ComponentSecurityProfile.ManagedCap, policy,
+            memoryPolicy: new("future-memory-policy", 1, FillerDigest)));
+        Assert.Throws<ArgumentException>(() => Create(baseManifest, ComponentSecurityProfile.ManagedCap, policy,
+            memoryPolicy: new("memory", 2, FillerDigest)));
+    }
+
+    [Fact]
+    public void AuditCarriesReviewableCanonicalIntentRatherThanOnlyManifestDigests()
+    {
+        var manifest = Manifest(dependencies: [Dependency("dep")]);
+        var audit = SingCapAuditV1.Create(manifest, Proof(manifest), "sdk", "runtime");
+        using var document = global::System.Text.Json.JsonDocument.Parse(audit.SerializeCanonical());
+
+        var root = document.RootElement;
+        Assert.Equal(manifest.BaseManifest.Identity.Name, root.GetProperty("ManifestV1").GetProperty("Identity").GetString());
+        Assert.Equal(manifest.SchemaId, root.GetProperty("ManifestV2").GetProperty("SchemaId").GetString());
+        Assert.Equal("dep", root.GetProperty("ManifestV2").GetProperty("DependencyContentDigests")[0][0].GetString());
+        Assert.Equal(manifest.NormalizedDigest, root.GetProperty("ManifestDigest").GetString());
     }
 
     [Fact]

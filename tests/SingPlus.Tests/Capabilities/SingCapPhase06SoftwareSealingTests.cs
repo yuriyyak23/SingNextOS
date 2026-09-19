@@ -118,6 +118,44 @@ public sealed class SingCapPhase06SoftwareSealingTests
     }
 
     [Fact]
+    public void DisposedPinCannotBorrowAnotherPinsLiveness()
+    {
+        var fixture = Fixture();
+        var handle = Seal(fixture);
+        var disposed = fixture.Seals.AcquirePin(handle, fixture.Descriptor, fixture.Service,
+            fixture.Owner, fixture.Session, 1, fixture.Capability).Value!;
+        using var live = fixture.Seals.AcquirePin(handle, fixture.Descriptor, fixture.Service,
+            fixture.Owner, fixture.Session, 1, fixture.Capability).Value!;
+        disposed.Dispose();
+
+        Assert.Equal(KernelError.StaleHandle,
+            fixture.Seals.Revalidate(disposed, fixture.Descriptor, fixture.Service).Error);
+        Assert.Equal(KernelError.StaleHandle, fixture.Seals.BeginClose(disposed).Error);
+        Assert.True(fixture.Seals.Revalidate(live, fixture.Descriptor, fixture.Service).IsSuccess);
+    }
+
+    [Fact]
+    public void PinFromAnotherAuthorityCannotUseCollidingToken()
+    {
+        var realm = new AuthorityRealmId(Guid.NewGuid());
+        var token = Guid.NewGuid();
+        var first = Fixture(new SealedObjectAuthority(realm, tokenFactory: () => token));
+        var second = Fixture(new SealedObjectAuthority(realm, tokenFactory: () => token));
+        var firstHandle = Seal(first);
+        var secondHandle = Seal(second);
+        using var firstPin = first.Seals.AcquirePin(firstHandle, first.Descriptor, first.Service,
+            first.Owner, first.Session, 1, first.Capability).Value!;
+        using var secondPin = second.Seals.AcquirePin(secondHandle, second.Descriptor, second.Service,
+            second.Owner, second.Session, 1, second.Capability).Value!;
+
+        Assert.Equal(firstHandle, secondHandle);
+        Assert.Equal(KernelError.StaleHandle,
+            second.Seals.Revalidate(firstPin, second.Descriptor, second.Service).Error);
+        Assert.Equal(KernelError.StaleHandle, second.Seals.BeginClose(firstPin).Error);
+        Assert.True(second.Seals.Revalidate(secondPin, second.Descriptor, second.Service).IsSuccess);
+    }
+
+    [Fact]
     public void ServiceRestartGenerationRejectsOldHandleEvenWithReusedObjectKey()
     {
         var fixture = Fixture();
@@ -167,11 +205,11 @@ public sealed class SingCapPhase06SoftwareSealingTests
         fixture.Seals.Seal<SocketObjectSeal>(fixture.Descriptor, fixture.Service, fixture.Owner,
             fixture.Session, 1, objectKey, fixture.Capability).Value;
 
-    private static FixtureData Fixture()
+    private static FixtureData Fixture(SealedObjectAuthority? seals = null)
     {
         var realm = new AuthorityRealmId(Guid.NewGuid());
         var service = new ProcessHandle(new(2), 1);
-        return new(new SealedObjectAuthority(realm), service, new(new(1), 1),
+        return new(seals ?? new SealedObjectAuthority(realm), service, new(new(1), 1),
             new(new(7), new(1)), Descriptor(service), new(42));
     }
 

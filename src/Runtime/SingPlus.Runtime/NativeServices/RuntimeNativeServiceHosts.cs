@@ -86,8 +86,12 @@ public sealed class RuntimeProcessServiceHost
         switch (envelope.MessageId)
         {
             case IProcessServiceProtocol.Message_CreateAsync when envelope.Payload is CreateProcessRequest request:
-                var createAuth = NativeServiceDispatch.ValidateExact(_kernel, caller, request.CreateCapability, ResourceKind.Process, CapabilityResourceIds.ProcessCreate, CapabilityRights.Execute);
-                if (!createAuth.IsSuccess) return KernelResult<object?>.Fail(createAuth.Error, createAuth.Message!);
+            {
+                var createAdmission = _kernel.AdmitSessionCapabilityEffect(caller, _service, _session,
+                    request.CreateCapability, ResourceKind.Process, CapabilityResourceIds.ProcessCreate, 1,
+                    CapabilityOperation.Execute);
+                if (!createAdmission.IsSuccess) return KernelResult<object?>.Fail(createAdmission.Error, createAdmission.Message!);
+                using var admittedCreate = createAdmission.Value!;
                 if (request.Policy != ChildProcessPolicy.Attached)
                     return KernelResult<object?>.Fail(KernelError.PlatformUnsupported, "The initial ProcessService profile supports only session-attached children; independent-child adoption is not yet defined.");
                 if (request.InitialCapabilities.Count > InitialCapabilitySet.MaxCount)
@@ -129,6 +133,7 @@ public sealed class RuntimeProcessServiceHost
                 if (!admitted.IsSuccess) { _ = _kernel.RevokeCapability(controlDescriptor.CapabilityId); _ = _kernel.TerminateProcess(child); return KernelResult<object?>.Fail(admitted.Error, admitted.Message!); }
                 _children[child] = (caller, request.Policy, controlDescriptor.CapabilityId, controlHandle);
                 return KernelResult<object?>.Ok(new ProcessAuthorityResponse(new ProcessAuthority(child, controlDescriptor.CapabilityId, controlHandle)));
+            }
             case IProcessServiceProtocol.Message_DelegateAsync when envelope.Payload is DelegateProcessCapabilityRequest delegation:
                 var delegationAuth = Control(caller, delegation.Process, delegation.ControlCapability, CapabilityRights.Delegate);
                 if (!delegationAuth.IsSuccess) return KernelResult<object?>.Fail(delegationAuth.Error, delegationAuth.Message!);
@@ -316,8 +321,11 @@ public sealed class RuntimeNetworkServiceHost
     {
         if (envelope.MessageId == INetworkServiceProtocol.Message_OpenAsync && envelope.Payload is OpenSocketRequest open)
         {
-            var authority = NativeServiceDispatch.ValidateExact(_kernel, caller, open.EndpointCapability, ResourceKind.Network, CapabilityResourceIds.NetworkEndpoint, CapabilityRights.Configure);
-            if (!authority.IsSuccess) return KernelResult<object?>.Fail(authority.Error, authority.Message!);
+            var openAdmission = _kernel.AdmitSessionCapabilityEffect(caller, _service, _session,
+                open.EndpointCapability, ResourceKind.Network, CapabilityResourceIds.NetworkEndpoint, 1,
+                CapabilityOperation.Configure);
+            if (!openAdmission.IsSuccess) return KernelResult<object?>.Fail(openAdmission.Error, openAdmission.Message!);
+            using var admittedOpen = openAdmission.Value!;
             if (string.IsNullOrWhiteSpace(open.EndpointLabel) || open.EndpointLabel.Length > 200) return KernelResult<object?>.Fail(KernelError.UnsupportedPayload, "Endpoint label is malformed for service-side policy.");
             SocketObjectId objectId;
             lock (_gate)

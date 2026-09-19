@@ -97,6 +97,43 @@ public sealed class SingCapPhase02CapabilityLedgerTests
     }
 
     [Fact]
+    public void RejectedMintDoesNotConsumeFinalCapabilityIdentity()
+    {
+        var authority = Authority(initialCapabilityId: ulong.MaxValue);
+
+        var rejected = authority.Mint(Issuer, Subject, ResourceKind.Device, "invalid",
+            CapabilityRights.Read, subjectGeneration: 7, resourceGeneration: 1,
+            range: null, session: null, quota: 1, delegationDepth: 1,
+            schema: (CapabilityConstraintSchema)ushort.MaxValue);
+        var accepted = Mint(authority);
+
+        Assert.Equal(KernelError.DelegationDenied, rejected.Error);
+        Assert.True(accepted.CapabilityId.Value == ulong.MaxValue);
+        Assert.Single(authority.InspectionSnapshot());
+    }
+
+    [Fact]
+    public void RejectedDelegationDoesNotConsumeFinalCapabilityIdentity()
+    {
+        var authority = Authority(initialCapabilityId: ulong.MaxValue - 1);
+        var source = authority.Mint(Issuer, Subject, ResourceKind.Device, "device:source",
+            CapabilityRights.Read | CapabilityRights.Delegate, 7).Value!;
+
+        var rejected = authority.Delegate(source.CapabilityId, Subject, new DomainId(21),
+            CapabilityRights.Read, 8, child => child with
+            {
+                Resource = child.Resource with { ResourceId = "device:expanded" }
+            });
+        var accepted = authority.Delegate(source.CapabilityId, Subject, new DomainId(21),
+            CapabilityRights.Read, 8);
+
+        Assert.Equal(KernelError.DelegationDenied, rejected.Error);
+        Assert.True(accepted.IsSuccess, accepted.Message);
+        Assert.Equal(ulong.MaxValue, accepted.Value!.CapabilityId.Value);
+        Assert.Equal(2, authority.InspectionSnapshot().Length);
+    }
+
+    [Fact]
     public void PerSubjectQuotaIsolationAndGlobalCapacityAreFailClosed()
     {
         var authority = Authority(limits: new(3, 1));

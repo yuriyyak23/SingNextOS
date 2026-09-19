@@ -50,11 +50,11 @@ public sealed class ServiceManifestV2
         if (!string.Equals(schemaId, CurrentSchemaId, StringComparison.Ordinal)) throw new ArgumentException("Unsupported service manifest schema id.", nameof(schemaId));
         if (schemaVersion != CurrentSchemaVersion) throw new ArgumentOutOfRangeException(nameof(schemaVersion), schemaVersion, "Unsupported service manifest schema version.");
         if (!Enum.IsDefined(securityProfile)) throw new ArgumentException("Unknown security profile.", nameof(securityProfile));
-        ValidatePolicy(memoryPolicy, nameof(memoryPolicy));
-        ValidatePolicy(authorityTableQuotaPolicy, nameof(authorityTableQuotaPolicy));
-        ValidatePolicy(runtimePolicy, nameof(runtimePolicy));
-        ValidatePolicy(delegationPolicy, nameof(delegationPolicy));
-        ValidatePolicy(aotPolicy, nameof(aotPolicy));
+        ValidatePolicy(memoryPolicy, "memory", nameof(memoryPolicy));
+        ValidatePolicy(authorityTableQuotaPolicy, "authority-table-quota", nameof(authorityTableQuotaPolicy));
+        ValidatePolicy(runtimePolicy, "runtime", nameof(runtimePolicy));
+        ValidatePolicy(delegationPolicy, "delegation", nameof(delegationPolicy));
+        ValidatePolicy(aotPolicy, "aot", nameof(aotPolicy));
         if (string.IsNullOrWhiteSpace(admissionPolicyVersion)) throw new ArgumentException("Admission policy version is required.", nameof(admissionPolicyVersion));
         ValidateDigest(admissionPolicyDigest, nameof(admissionPolicyDigest));
         if (string.IsNullOrWhiteSpace(managedCapFrameworkSurfaceVersion)) throw new ArgumentException("Framework surface version is required.", nameof(managedCapFrameworkSurfaceVersion));
@@ -132,7 +132,11 @@ public sealed class ServiceManifestV2
     private static void WriteSealed<T>(Utf8JsonWriter writer, string name, IReadOnlyList<T> items) { writer.WritePropertyName(name); writer.WriteStartArray(); foreach (var item in items) { var values = item switch { SealedTypeImportV1 x => (x.TypeIdentity, x.PolicyVersion), SealedTypeExportV1 x => (x.TypeIdentity, x.PolicyVersion), _ => throw new InvalidOperationException() }; writer.WriteStartArray(); writer.WriteStringValue(values.Item1); writer.WriteStringValue(values.Item2); writer.WriteEndArray(); } writer.WriteEndArray(); }
     private static void WritePolicy(Utf8JsonWriter writer, string name, ManifestPolicyReferenceV1 value) { writer.WritePropertyName(name); writer.WriteStartArray(); writer.WriteStringValue(value.Schema); writer.WriteNumberValue(value.Version); writer.WriteStringValue(value.PolicyDigest.ToLowerInvariant()); writer.WriteEndArray(); }
     private static T[] NormalizeSealed<T>(IEnumerable<T>? values, string name) where T : struct { var result = (values ?? []).OrderBy(static item => item.ToString(), StringComparer.Ordinal).ToArray(); var pairs = result.Select(item => item switch { SealedTypeImportV1 x => (x.TypeIdentity, x.PolicyVersion), SealedTypeExportV1 x => (x.TypeIdentity, x.PolicyVersion), _ => default }).ToArray(); if (pairs.Any(static pair => string.IsNullOrWhiteSpace(pair.TypeIdentity) || string.IsNullOrWhiteSpace(pair.PolicyVersion)) || pairs.Distinct().Count() != pairs.Length) throw new ArgumentException("Sealed type identities and policy versions must be complete and unique.", name); return result; }
-    private static void ValidatePolicy(ManifestPolicyReferenceV1 value, string name) { if (string.IsNullOrWhiteSpace(value.Schema) || value.Version <= 0 || !IsDigest(value.PolicyDigest)) throw new ArgumentException("Policy references require schema, positive version, and SHA-256 digest.", name); }
+    private static void ValidatePolicy(ManifestPolicyReferenceV1 value, string expectedSchema, string name)
+    {
+        if (!string.Equals(value.Schema, expectedSchema, StringComparison.Ordinal) || value.Version != 1 || !IsDigest(value.PolicyDigest))
+            throw new ArgumentException($"Policy reference must use the supported {expectedSchema}/v1 schema and a SHA-256 digest.", name);
+    }
     private static void ValidateDigest(string value, string name) { if (!IsDigest(value)) throw new ArgumentException("A SHA-256 hexadecimal digest is required.", name); }
     private static bool IsDigest(string? value) => value is { Length: 64 } && value.All(Uri.IsHexDigit);
 }

@@ -20,25 +20,25 @@ public sealed class HybridCpuExternalOperationProviderTests
         var submitted = scenario.Provider.Submit(admission.Request);
         Assert.Equal(Hc.ExternalOperationStage.Submitted, submitted.Receipt!.Stage);
 
-        Assert.True(scenario.Provider.RecordDeviceCompletion(semantic.Correlation).IsSuccess);
+        Assert.True(scenario.Provider.RecordDeviceCompletion(admission.Request).IsSuccess);
         var completed = scenario.Provider.Poll(admission.Request);
         Assert.IsType<Hc.ExternalOperationCompletionReceipt>(completed.Receipt);
         Assert.Equal(Hc.ExternalOperationStage.DeviceComplete, completed.Receipt!.Stage);
         Assert.Equal(0, scenario.Output.Span[0]);
 
-        Assert.True(scenario.Provider.RecordVisibility(semantic.Correlation).IsSuccess);
+        Assert.True(scenario.Provider.RecordVisibility(admission.Request).IsSuccess);
         var visible = scenario.Provider.Poll(admission.Request);
         Assert.Equal(Hc.ExternalOperationStage.Visible, visible.Receipt!.Stage);
         Assert.Equal(0, scenario.Output.Span[0]);
 
-        Assert.True(scenario.Provider.Publish(semantic.Correlation,
+        Assert.True(scenario.Provider.Publish(admission.Request,
             () => scenario.Input.Span.CopyTo(scenario.Output.Span)).IsSuccess);
         var published = scenario.Provider.Poll(admission.Request);
         Assert.IsType<Hc.ExternalOperationPublicationReceipt>(published.Receipt);
         Assert.Equal(Hc.ExternalOperationStage.Published, published.Receipt!.Stage);
         Assert.Equal(scenario.Input.Span.ToArray(), scenario.Output.Span.ToArray());
 
-        Assert.True(scenario.Provider.Release(semantic.Correlation, providerResourcesClosed: true).IsSuccess);
+        Assert.True(scenario.Provider.Release(admission.Request, providerResourcesClosed: true).IsSuccess);
         var released = scenario.Provider.Poll(admission.Request);
         Assert.IsType<Hc.ExternalOperationReleaseReceipt>(released.Receipt);
         Assert.Equal(Hc.ExternalOperationStage.Released, released.Receipt!.Stage);
@@ -57,6 +57,15 @@ public sealed class HybridCpuExternalOperationProviderTests
             request.Generations, request.Correlation, request.EffectClass,
             request.VisibilityRequirement, request.CancellationMode);
         Assert.Equal(Hc.ExternalOperationProviderPollStatus.Stale, scenario.Provider.Submit(wrong).Status);
+        Assert.Equal(Hc.ExternalOperationStage.Submitted, scenario.Provider.Submit(request).Receipt!.Stage);
+        Assert.Equal(KernelError.InvalidTransition, scenario.Provider.RecordDeviceCompletion(wrong).Error);
+        Assert.Equal(KernelError.InvalidTransition, scenario.Provider.RecordVisibility(wrong).Error);
+        var publicationRan = false;
+        Assert.Equal(KernelError.ExternalOperationNotFound,
+            scenario.Provider.Publish(wrong, () => publicationRan = true).Error);
+        Assert.False(publicationRan);
+        Assert.Equal(KernelError.ExternalOperationNotFound,
+            scenario.Provider.Release(wrong, providerResourcesClosed: true).Error);
 
         scenario.Provider.Reconfigure(Generations(Guid.NewGuid()));
         Assert.Equal(Hc.ExternalOperationProviderPollStatus.Stale, scenario.Provider.Submit(request).Status);
@@ -72,11 +81,11 @@ public sealed class HybridCpuExternalOperationProviderTests
         var semantic = Semantic();
         var request = Assert.IsType<Hc.ExternalOperationAdmissionReceipt>(scenario.Provider.Admit(semantic).Receipt).Request;
         Assert.Equal(Hc.ExternalOperationStage.Submitted, scenario.Provider.Submit(request).Receipt!.Stage);
-        Assert.True(scenario.Provider.RecordDeviceCompletion(semantic.Correlation).IsSuccess);
+        Assert.True(scenario.Provider.RecordDeviceCompletion(request).IsSuccess);
 
         var publicationRan = false;
-        var publish = scenario.Provider.Publish(semantic.Correlation, () => publicationRan = true);
-        var release = scenario.Provider.Release(semantic.Correlation, providerResourcesClosed: false);
+        var publish = scenario.Provider.Publish(request, () => publicationRan = true);
+        var release = scenario.Provider.Release(request, providerResourcesClosed: false);
 
         Assert.False(publish.IsSuccess);
         Assert.False(release.IsSuccess);
@@ -92,7 +101,7 @@ public sealed class HybridCpuExternalOperationProviderTests
         var request = Assert.IsType<Hc.ExternalOperationAdmissionReceipt>(faulted.Provider.Admit(semantic).Receipt).Request;
         Assert.Equal(Hc.ExternalOperationStage.Submitted, faulted.Provider.Submit(request).Receipt!.Stage);
         Assert.True(faulted.Provider.RecordDeviceCompletion(
-            semantic.Correlation, ExternalOperationCompletionDisposition.Faulted).IsSuccess);
+            request, ExternalOperationCompletionDisposition.Faulted).IsSuccess);
         var fault = faulted.Provider.Poll(request);
         Assert.Equal(Hc.ExternalOperationProviderPollStatus.Faulted, fault.Status);
         Assert.Equal(Hc.ExternalRuntimeOutcome.Faulted, fault.Receipt!.Outcome);
@@ -100,7 +109,7 @@ public sealed class HybridCpuExternalOperationProviderTests
         var lost = CreateScenario();
         request = Assert.IsType<Hc.ExternalOperationAdmissionReceipt>(lost.Provider.Admit(semantic).Receipt).Request;
         Assert.Equal(Hc.ExternalOperationStage.Submitted, lost.Provider.Submit(request).Receipt!.Stage);
-        Assert.False(lost.Provider.Release(semantic.Correlation, providerResourcesClosed: false,
+        Assert.False(lost.Provider.Release(request, providerResourcesClosed: false,
             providerUnavailable: true).IsSuccess);
         var unavailable = lost.Provider.Poll(request);
         Assert.Equal(Hc.ExternalOperationProviderPollStatus.Unavailable, unavailable.Status);
@@ -115,11 +124,11 @@ public sealed class HybridCpuExternalOperationProviderTests
         var semantic = Semantic();
         var request = Assert.IsType<Hc.ExternalOperationAdmissionReceipt>(scenario.Provider.Admit(semantic).Receipt).Request;
         Assert.Equal(Hc.ExternalOperationStage.Submitted, scenario.Provider.Submit(request).Receipt!.Stage);
-        Assert.True(scenario.Provider.RecordDeviceCompletion(semantic.Correlation).IsSuccess);
-        Assert.True(scenario.Provider.RecordVisibility(semantic.Correlation).IsSuccess);
-        Assert.True(scenario.Provider.Publish(semantic.Correlation,
+        Assert.True(scenario.Provider.RecordDeviceCompletion(request).IsSuccess);
+        Assert.True(scenario.Provider.RecordVisibility(request).IsSuccess);
+        Assert.True(scenario.Provider.Publish(request,
             () => scenario.Input.Span.CopyTo(scenario.Output.Span)).IsSuccess);
-        Assert.True(scenario.Provider.Release(semantic.Correlation, providerResourcesClosed: true).IsSuccess);
+        Assert.True(scenario.Provider.Release(request, providerResourcesClosed: true).IsSuccess);
 
         Assert.Equal(Hc.ExternalOperationStage.DeviceComplete, scenario.Provider.Poll(request).Receipt!.Stage);
         Assert.Equal(Hc.ExternalOperationStage.Visible, scenario.Provider.Poll(request).Receipt!.Stage);
@@ -136,12 +145,12 @@ public sealed class HybridCpuExternalOperationProviderTests
         var request = Assert.IsType<Hc.ExternalOperationAdmissionReceipt>(scenario.Provider.Admit(semantic).Receipt).Request;
         Assert.Equal(Hc.ExternalOperationStage.Submitted, scenario.Provider.Submit(request).Receipt!.Stage);
 
-        var unavailable = scenario.Provider.Release(semantic.Correlation,
+        var unavailable = scenario.Provider.Release(request,
             providerResourcesClosed: false, providerUnavailable: true);
         Assert.False(unavailable.IsSuccess);
         Assert.True(scenario.Kernel.Regions.Validate(scenario.Output.Handle, scenario.Owner).IsSuccess);
 
-        var contained = scenario.Provider.Release(semantic.Correlation, providerResourcesClosed: false,
+        var contained = scenario.Provider.Release(request, providerResourcesClosed: false,
             providerUnavailable: true, providerEffectContained: true);
         Assert.True(contained.IsSuccess, contained.Message);
     }
@@ -155,12 +164,12 @@ public sealed class HybridCpuExternalOperationProviderTests
             scenario.Provider.Admit(semantic).Receipt).Request;
         Assert.Equal(Hc.ExternalOperationStage.Submitted,
             scenario.Provider.Submit(request).Receipt!.Stage);
-        Assert.True(scenario.Provider.RecordDeviceCompletion(semantic.Correlation).IsSuccess);
-        Assert.True(scenario.Provider.RecordVisibility(semantic.Correlation).IsSuccess);
+        Assert.True(scenario.Provider.RecordDeviceCompletion(request).IsSuccess);
+        Assert.True(scenario.Provider.RecordVisibility(request).IsSuccess);
 
         Hc.ExternalOperationProviderPollResult? nested = null;
         var replacement = Generations(Guid.Parse("fa6c6d88-d2ee-4dd6-8d09-cbbf0735aac8"));
-        var published = scenario.Provider.Publish(semantic.Correlation, () =>
+        var published = scenario.Provider.Publish(request, () =>
         {
             scenario.Provider.Reconfigure(replacement);
             nested = scenario.Provider.Poll(request);

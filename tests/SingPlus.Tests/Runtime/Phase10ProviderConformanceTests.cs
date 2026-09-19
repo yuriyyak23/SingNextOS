@@ -237,8 +237,8 @@ public sealed class Phase10ProviderConformanceTests(ITestOutputHelper output)
 
             if (scenario.Fault.Mode == ProviderFaultMode.ResetDuringVisible)
             {
-                Assert.True(provider.RecordDeviceCompletion(semantic.Correlation).IsSuccess);
-                Assert.True(provider.RecordVisibility(semantic.Correlation).IsSuccess);
+                Assert.True(provider.RecordDeviceCompletion(request).IsSuccess);
+                Assert.True(provider.RecordVisibility(request).IsSuccess);
             }
             if (scenario.Fault.Mode == ProviderFaultMode.ChangeGeneration)
             {
@@ -262,7 +262,7 @@ public sealed class Phase10ProviderConformanceTests(ITestOutputHelper output)
                 staleRejected = provider.Submit(stale).Status == Hc.ExternalOperationProviderPollStatus.Stale;
             }
             if (scenario.Fault.Mode is ProviderFaultMode.DelayClosure or ProviderFaultMode.FailClosure)
-                Assert.False(provider.Release(semantic.Correlation, providerResourcesClosed: false).IsSuccess);
+                Assert.False(provider.Release(request, providerResourcesClosed: false).IsSuccess);
             if (scenario.Fault.Mode == ProviderFaultMode.ThrowAfterAcceptance)
             {
                 try { throw new InvalidOperationException("deterministic executable-adapter fault"); }

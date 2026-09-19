@@ -78,6 +78,19 @@ public sealed class SingCapPhase13ClosureTests
     }
 
     [Fact]
+    public void DefinitionOfDoneMatrixMapsEveryItemAndDoesNotHideFutureGatedWork()
+    {
+        using var document = Read("P13_DEFINITION_OF_DONE_LIVE_MATRIX.json");
+        var root = document.RootElement;
+        var items = root.GetProperty("items").EnumerateArray().ToArray();
+        Assert.Equal(Enumerable.Range(1, 16), items.Select(item => item.GetProperty("number").GetInt32()));
+        Assert.All(items, item => Assert.NotEmpty(item.GetProperty("evidence").EnumerateArray()));
+        Assert.False(root.GetProperty("singCapMComplete").GetBoolean());
+        Assert.Equal("FutureGated", Assert.Single(items,
+            item => item.GetProperty("number").GetInt32() == 11).GetProperty("status").GetString());
+    }
+
+    [Fact]
     public void InventoryMakesNoNativeIsolatedClaim()
     {
         var path = Path.Combine(RepositoryRoot(), "eng", "singcap-security-profiles-v1.json");

@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Reflection;
 using SingPlus.Contracts;
 using SingPlus.Runtime;
 
@@ -137,14 +138,38 @@ public sealed class SingCapPhase04EffectAdmissionTests
         Assert.Equal(EffectRevocationPolicy.GrandfatherAdmitted, admitted.Capability.RevocationPolicy);
     }
 
+    [Fact]
+    public void ExhaustedAttemptIdentityCannotConsumeOneShotOrQuotaAuthority()
+    {
+        var scenario = SessionScenario(CapabilityRights.Execute, quota: 1);
+        typeof(RuntimeKernel).GetField("_nextEffectAdmissionAttemptId",
+                BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(scenario.Kernel, 0UL);
+
+        var denied = scenario.Kernel.AdmitSessionCapabilityEffect(scenario.Caller, scenario.Service,
+            scenario.Session, scenario.Capability, ResourceKind.File, "file:namespace", 1,
+            CapabilityOperation.Execute, quotaAmount: 1, oneShot: true);
+        var process = scenario.Kernel.Processes.Resolve(scenario.Caller).Value!;
+
+        Assert.Equal(KernelError.CapacityExhausted, denied.Error);
+        Assert.True(scenario.Kernel.CapabilityAuthority.Validate(scenario.Capability,
+            process.DomainId, scenario.Caller.Generation, CapabilityRights.Execute).IsSuccess);
+        Assert.Equal(1UL, scenario.Kernel.CapabilityAuthority
+            .InspectConstraints(scenario.Capability)!.Value.SharedRemaining);
+        Assert.Equal(0, scenario.Kernel.EndpointSessions.ActivePinCount(scenario.Session));
+        Assert.Equal(0, scenario.Kernel.CapabilityAuthority.ActiveOperationLeaseCount);
+    }
+
     private static (RuntimeKernel Kernel, ProcessHandle Caller, ProcessHandle Service,
-        EndpointSessionHandle Session, CapabilityId Capability) SessionScenario()
+        EndpointSessionHandle Session, CapabilityId Capability) SessionScenario(
+        CapabilityRights rights = CapabilityRights.Read, ulong quota = ulong.MaxValue)
     {
         var kernel = new RuntimeKernel();
         var (_, caller) = TestFixtures.Create(kernel, 1, 10);
         var (_, service) = TestFixtures.Create(kernel, 2, 20);
-        var capability = kernel.MintCapability(new(20), caller, ResourceKind.File, "file:namespace",
-            CapabilityRights.Read).Value!.CapabilityId;
+        var capability = kernel.CapabilityAuthority.Mint(new(20), new(10), ResourceKind.File,
+            "file:namespace", rights, caller.Generation, resourceGeneration: 1,
+            range: null, session: null, quota: quota, delegationDepth: 16).Value!.CapabilityId;
         var session = kernel.EndpointSessions.Add(caller, service, [capability], [],
             new(new ChannelId(1), new EndpointId(1), 1), null).Value!.Handle;
         return (kernel, caller, service, session, capability);

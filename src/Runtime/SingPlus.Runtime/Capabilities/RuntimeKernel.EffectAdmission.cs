@@ -19,6 +19,15 @@ public sealed partial class RuntimeKernel
         var effect = EnsureProcessAcceptsNewEffects(process.Value!);
         if (!effect.IsSuccess) return KernelResult<EffectAdmissionLease>.Fail(effect.Error, effect.Message!);
 
+        EffectAdmissionAttemptId attempt;
+        lock (_effectAdmissionIdentityGate)
+        {
+            if (_nextEffectAdmissionAttemptId == 0)
+                return KernelResult<EffectAdmissionLease>.Fail(KernelError.CapacityExhausted,
+                    "Effect-admission attempt identity space is exhausted.");
+            attempt = new(_nextEffectAdmissionAttemptId++);
+        }
+
         var sessionPin = EndpointSessions.AcquirePin(session, caller, service);
         if (!sessionPin.IsSuccess)
             return KernelResult<EffectAdmissionLease>.Fail(sessionPin.Error, sessionPin.Message!);
@@ -39,15 +48,6 @@ public sealed partial class RuntimeKernel
             var finalSession = EndpointSessions.RevalidatePin(sessionPin.Value!);
             if (!finalSession.IsSuccess)
                 return KernelResult<EffectAdmissionLease>.Fail(finalSession.Error, finalSession.Message!);
-
-            EffectAdmissionAttemptId attempt;
-            lock (_effectAdmissionIdentityGate)
-            {
-                if (_nextEffectAdmissionAttemptId == 0)
-                    return KernelResult<EffectAdmissionLease>.Fail(KernelError.CapacityExhausted,
-                        "Effect-admission attempt identity space is exhausted.");
-                attempt = new(_nextEffectAdmissionAttemptId++);
-            }
 
             var admitted = new EffectAdmissionLease(attempt, capabilityLease, sessionPin.Value!);
             capabilityLease = null;

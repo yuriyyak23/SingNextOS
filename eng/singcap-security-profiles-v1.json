@@ -20,6 +20,7 @@
     { "project": "tests/SingPlus.Platform.HybridCpu.Tests/SingPlus.Platform.HybridCpu.Tests.csproj", "profile": "BuildTool/TestOnly", "owner": "SingNextOS tests", "claimLevel": "ModelOnly" },
     { "project": "tests/SingPlus.Tests/SingPlus.Tests.csproj", "profile": "BuildTool/TestOnly", "owner": "SingNextOS tests", "claimLevel": "ModelOnly" },
     { "project": "tools/HybridCpu_ExecutableAdapter.Tests/HybridCpu_ExecutableAdapter.Tests.csproj", "profile": "BuildTool/TestOnly", "owner": "HybridCPU adapter tests", "claimLevel": "ModelOnly" },
+    { "project": "tools/HybridCpu_ExecutableAdapter/Boot.Contracts/HybridCpu.Boot.Contracts.csproj", "profile": "PlatformExternal", "owner": "HybridCPU boot ABI contract boundary", "claimLevel": "ModelOnly" },
     { "project": "tools/HybridCpu_ExecutableAdapter/HybridCpu_ExecutableAdapter.csproj", "profile": "PlatformExternal", "owner": "HybridCPU executable adapter", "claimLevel": "ModelOnly" },
     { "project": "tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.AuthorityCore/HybridCPU_NeutralRuntime.AuthorityCore.csproj", "profile": "PlatformExternal", "owner": "provider-neutral runtime model", "claimLevel": "ModelOnly" },
     { "project": "tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Contracts/HybridCPU_NeutralRuntime.Contracts.csproj", "profile": "PlatformExternal", "owner": "provider-neutral contracts", "claimLevel": "ModelOnly" },

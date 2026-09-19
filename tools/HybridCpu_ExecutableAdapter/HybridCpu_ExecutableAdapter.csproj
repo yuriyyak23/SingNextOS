@@ -13,6 +13,10 @@
     <PackageReference Include="HybridCPU.ExternalRuntime.Contracts" Version="[1.14.0]" />
     <PackageReference Include="HybridCPU.ExternalRuntime" Version="[1.3.0]" />
     <ProjectReference Include="../Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Contracts/HybridCPU_NeutralRuntime.Contracts.csproj" />
+    <ProjectReference Include="Boot.Contracts/HybridCpu.Boot.Contracts.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Remove="Boot.Contracts/**/*.cs" />
   </ItemGroup>
   <Target Name="RejectForbiddenAdapterProjectReferences" BeforeTargets="ResolveProjectReferences">
     <Error

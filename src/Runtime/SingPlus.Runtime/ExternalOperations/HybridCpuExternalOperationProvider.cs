@@ -234,13 +234,13 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
         }
     }
 
-    public KernelResult RecordDeviceCompletion(Hc.ExternalRequestCorrelation correlation,
+    public KernelResult RecordDeviceCompletion(Hc.ExternalOperationRequest request,
         ExternalOperationCompletionDisposition disposition = ExternalOperationCompletionDisposition.Completed)
     {
         Entry entry;
         lock (gate)
         {
-            if (!entries.TryGetValue(correlation, out entry!) || entry.Binding is null)
+            if (!TryExact(request, out entry!) || entry.Binding is null)
                 return KernelResult.Fail(KernelError.InvalidTransition, "Exact submitted operation is required.");
             if (!entry.Request.Generations.Equals(generations))
                 return KernelResult.Fail(KernelError.StaleGeneration, "External provider generations changed before completion.");
@@ -258,12 +258,12 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
         }
     }
 
-    public KernelResult RecordVisibility(Hc.ExternalRequestCorrelation correlation, bool satisfied = true)
+    public KernelResult RecordVisibility(Hc.ExternalOperationRequest request, bool satisfied = true)
     {
         Entry entry;
         lock (gate)
         {
-            if (!entries.TryGetValue(correlation, out entry!) || entry.Binding is null)
+            if (!TryExact(request, out entry!) || entry.Binding is null)
                 return KernelResult.Fail(KernelError.InvalidTransition, "Exact submitted operation is required.");
             if (!entry.Request.Generations.Equals(generations))
                 return KernelResult.Fail(KernelError.StaleGeneration, "External provider generations changed before visibility.");
@@ -285,13 +285,13 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
         }
     }
 
-    public KernelResult Publish(Hc.ExternalRequestCorrelation correlation, Action publicationAction)
+    public KernelResult Publish(Hc.ExternalOperationRequest request, Action publicationAction)
     {
         ArgumentNullException.ThrowIfNull(publicationAction);
         Entry entry;
         lock (gate)
         {
-            if (!entries.TryGetValue(correlation, out entry!))
+            if (!TryExact(request, out entry!))
                 return KernelResult.Fail(KernelError.ExternalOperationNotFound, "Operation correlation was not admitted.");
             if (!entry.Request.Generations.Equals(generations))
                 return KernelResult.Fail(KernelError.StaleGeneration, "External provider generations changed before publication.");
@@ -313,13 +313,13 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
         }
     }
 
-    public KernelResult Release(Hc.ExternalRequestCorrelation correlation, bool providerResourcesClosed,
+    public KernelResult Release(Hc.ExternalOperationRequest request, bool providerResourcesClosed,
         bool providerUnavailable = false, bool providerEffectContained = false)
     {
         Entry entry;
         lock (gate)
         {
-            if (!entries.TryGetValue(correlation, out entry!))
+            if (!TryExact(request, out entry!))
                 return KernelResult.Fail(KernelError.ExternalOperationNotFound, "Operation correlation was not admitted.");
             if (!entry.Request.Generations.Equals(generations))
                 return KernelResult.Fail(KernelError.StaleGeneration, "External provider generations changed before release.");

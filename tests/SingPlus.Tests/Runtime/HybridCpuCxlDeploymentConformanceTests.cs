@@ -111,13 +111,13 @@ public sealed class HybridCpuCxlDeploymentConformanceTests
         var semantic = Semantic(Guid.Parse("2bbda506-529d-469f-90fe-91ac474f8096"));
         var request = Assert.IsType<Hc.ExternalOperationAdmissionReceipt>(provider.Admit(semantic).Receipt).Request;
         Assert.Equal(Hc.ExternalOperationStage.Submitted, provider.Submit(request).Receipt!.Stage);
-        Assert.True(provider.RecordDeviceCompletion(semantic.Correlation).IsSuccess);
+        Assert.True(provider.RecordDeviceCompletion(request).IsSuccess);
         Assert.Equal(Hc.ExternalOperationStage.DeviceComplete, provider.Poll(request).Receipt!.Stage);
-        Assert.True(provider.RecordVisibility(semantic.Correlation).IsSuccess);
+        Assert.True(provider.RecordVisibility(request).IsSuccess);
         Assert.Equal(Hc.ExternalOperationStage.Visible, provider.Poll(request).Receipt!.Stage);
-        Assert.True(provider.Publish(semantic.Correlation, () => input.Span.CopyTo(output.Span)).IsSuccess);
+        Assert.True(provider.Publish(request, () => input.Span.CopyTo(output.Span)).IsSuccess);
         Assert.Equal(Hc.ExternalOperationStage.Published, provider.Poll(request).Receipt!.Stage);
-        Assert.True(provider.Release(semantic.Correlation, true).IsSuccess);
+        Assert.True(provider.Release(request, true).IsSuccess);
         Assert.Equal(Hc.ExternalOperationStage.Released, provider.Poll(request).Receipt!.Stage);
     }
 

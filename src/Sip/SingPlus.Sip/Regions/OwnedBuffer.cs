@@ -118,6 +118,7 @@ public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanag
     }
 
     private readonly Storage _storage;
+    private readonly object _ownerGate = new();
     private bool _valid;
 
     internal OwnedBuffer(RegionHandle handle, T[] data) : this(handle, new Storage(data))
@@ -132,7 +133,13 @@ public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanag
     }
 
     public RegionHandle Handle { get; private set; }
-    public bool IsValid => _valid && _storage.IsAlive;
+    public bool IsValid
+    {
+        get
+        {
+            lock (_ownerGate) return _valid && _storage.IsAlive;
+        }
+    }
     public int Length
     {
         get
@@ -173,10 +180,13 @@ public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanag
 
     public OwnedBuffer<T> Move()
     {
-        EnsureOwnerAccess();
-        var moved = new OwnedBuffer<T>(Handle, _storage);
-        _valid = false;
-        return moved;
+        lock (_ownerGate)
+        {
+            EnsureOwnerAccessCore();
+            var moved = new OwnedBuffer<T>(Handle, _storage);
+            _valid = false;
+            return moved;
+        }
     }
 
     internal Span<T> GetBorrowedSpan()
@@ -196,10 +206,13 @@ public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanag
         if (access is not RuntimeBufferAccess.Read and not RuntimeBufferAccess.Write)
             throw new ArgumentOutOfRangeException(nameof(access));
 
-        EnsureOwnerAccess();
-        var lifetime = new RuntimeBufferReservationLifetime();
-        _storage.BeginRuntimeReservation(lifetime);
-        return new RuntimeBufferLease<T>(_storage, lifetime, access);
+        lock (_ownerGate)
+        {
+            EnsureOwnerAccessCore();
+            var lifetime = new RuntimeBufferReservationLifetime();
+            _storage.BeginRuntimeReservation(lifetime);
+            return new RuntimeBufferLease<T>(_storage, lifetime, access);
+        }
     }
 
     OwnershipPayloadKind ITransferableOwnedPayload.PayloadKind => OwnershipPayloadKind.OwnedBuffer;
@@ -208,33 +221,52 @@ public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanag
 
     object ITransferableOwnedPayload.TransferForRuntime(RegionHandle newHandle)
     {
-        EnsureOwnerAccess();
-        var transferred = new OwnedBuffer<T>(newHandle, _storage);
-        _valid = false;
-        return transferred;
+        lock (_ownerGate)
+        {
+            EnsureOwnerAccessCore();
+            var transferred = new OwnedBuffer<T>(newHandle, _storage);
+            _valid = false;
+            return transferred;
+        }
     }
 
     object ITransferableOwnedPayload.CreateBorrowLeaseForRuntime(BorrowLeaseHandle handle, BorrowLeaseLifetime lifetime)
     {
-        EnsureValid();
-        _storage.BeginBorrow(lifetime);
-        return new BorrowLease<T>(handle, _storage, lifetime);
+        lock (_ownerGate)
+        {
+            EnsureValidCore();
+            _storage.BeginBorrow(lifetime);
+            return new BorrowLease<T>(handle, _storage, lifetime);
+        }
     }
 
     void ITransferableOwnedPayload.InvalidateForRuntime()
     {
-        _valid = false;
-        _storage.Invalidate();
+        lock (_ownerGate)
+        {
+            _valid = false;
+            _storage.Invalidate();
+        }
     }
 
     private void EnsureValid()
     {
-        if (!IsValid) throw new InvalidOperationException("OwnedBuffer has been moved, transferred, released, or reclaimed.");
+        lock (_ownerGate) EnsureValidCore();
     }
 
     private void EnsureOwnerAccess()
     {
-        EnsureValid();
+        lock (_ownerGate) EnsureOwnerAccessCore();
+    }
+
+    private void EnsureValidCore()
+    {
+        if (!_valid || !_storage.IsAlive) throw new InvalidOperationException("OwnedBuffer has been moved, transferred, released, or reclaimed.");
+    }
+
+    private void EnsureOwnerAccessCore()
+    {
+        EnsureValidCore();
         if (_storage.IsBorrowed) throw new InvalidOperationException("OwnedBuffer is temporarily inaccessible while a runtime borrow lease is active.");
         if (_storage.IsRuntimeReserved) throw new InvalidOperationException("OwnedBuffer is temporarily inaccessible while a runtime operation owns its CPU-access reservation.");
     }

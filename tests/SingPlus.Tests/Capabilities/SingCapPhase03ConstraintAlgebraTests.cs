@@ -97,6 +97,38 @@ public sealed class SingCapPhase03ConstraintAlgebraTests
     }
 
     [Fact]
+    public void OperationCannotEscapeItsCorrespondingRightDuringMintOrDelegation()
+    {
+        var authority = Authority();
+        var rejectedMint = authority.Mint(Issuer, ParentSubject, ResourceKind.Device, "device:mint",
+            CapabilityRights.Read, 7, 11, range: null, session: null, quota: 10, delegationDepth: 2,
+            operations: [CapabilityOperation.Execute]);
+        var parent = authority.Mint(Issuer, ParentSubject, ResourceKind.Device, "device:parent",
+            CapabilityRights.Read | CapabilityRights.Execute | CapabilityRights.Delegate,
+            7, 11, range: null, session: null, quota: 10, delegationDepth: 2).Value!;
+        var rejectedChild = authority.Delegate(parent.CapabilityId, ParentSubject, ChildSubject,
+            CapabilityRights.Read, 9, child => child with
+            {
+                Operations = new([CapabilityOperation.Execute])
+            });
+
+        Assert.Equal(KernelError.DelegationDenied, rejectedMint.Error);
+        Assert.Equal(KernelError.DelegationDenied, rejectedChild.Error);
+        Assert.Single(authority.InspectionSnapshot());
+    }
+
+    [Fact]
+    public void UnconstrainedSubjectIsNotSubsetOfExactRetargetableParent()
+    {
+        var parent = new TargetSubjectConstraint(ParentSubject, 7, AllowsRetarget: true);
+        var unconstrainedChild = new TargetSubjectConstraint(null, 0);
+        var exactOtherChild = new TargetSubjectConstraint(ChildSubject, 9);
+
+        Assert.False(TargetSubjectConstraint.IsSubset(unconstrainedChild, parent));
+        Assert.True(TargetSubjectConstraint.IsSubset(exactOtherChild, parent));
+    }
+
+    [Fact]
     public void SiblingsShareOneAtomicQuotaAndCannotAmplifyAggregate()
     {
         var authority = Authority();
