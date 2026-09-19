@@ -4,8 +4,8 @@
   </Folder>
   <Folder Name="/docs/" />
   <Folder Name="/tools/">
-    <Project Path="tools/HybridCpu_ExecutableAdapter/Boot.Contracts/HybridCpu.Boot.Contracts.csproj" />
     <Project Path="tools/HybridCpu_ExecutableAdapter.Tests/HybridCpu_ExecutableAdapter.Tests.csproj" />
+    <Project Path="tools/HybridCpu_ExecutableAdapter/Boot.Contracts/HybridCpu.Boot.Contracts.csproj" />
     <Project Path="tools/HybridCpu_ExecutableAdapter/HybridCpu_ExecutableAdapter.csproj" />
     <Project Path="tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.AuthorityCore/HybridCPU_NeutralRuntime.AuthorityCore.csproj" />
     <Project Path="tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Contracts/HybridCPU_NeutralRuntime.Contracts.csproj" />
