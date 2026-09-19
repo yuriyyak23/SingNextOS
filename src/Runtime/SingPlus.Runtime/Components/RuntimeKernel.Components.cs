@@ -11,6 +11,14 @@ public sealed partial class RuntimeKernel
     {
         ArgumentNullException.ThrowIfNull(plan);
         var manifest = plan.Manifest;
+        if (plan.ManifestV2 is { } v2)
+        {
+            var declared = v2.StaticCapabilityImports.ToArray();
+            var supplied = plan.Grants.Select(static grant => grant.Requirement)
+                .OrderBy(static item => item.ResourceKind).ThenBy(static item => item.ResourceId, StringComparer.Ordinal).ThenBy(static item => item.Rights).ToArray();
+            if (!declared.SequenceEqual(supplied))
+                return KernelResult<ComponentLifecycleSnapshot>.Fail(KernelError.InvalidManifest, "Runtime grants must exactly match the V2 static capability imports.");
+        }
         var evaluation = EvaluateComponentAdmissionCore(plan);
         // Dependency availability is evidence at preflight time. Preserve the
         // existing admission/rollback lifecycle so a hard dependency loss is

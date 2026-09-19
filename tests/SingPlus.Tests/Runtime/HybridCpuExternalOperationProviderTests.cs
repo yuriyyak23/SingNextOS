@@ -146,6 +146,36 @@ public sealed class HybridCpuExternalOperationProviderTests
         Assert.True(contained.IsSuccess, contained.Message);
     }
 
+    [Fact]
+    public void PublicationCallbackReentryIsFailClosedAndGenerationChangeWaitsForBoundaryExit()
+    {
+        var scenario = CreateScenario();
+        var semantic = Semantic();
+        var request = Assert.IsType<Hc.ExternalOperationAdmissionReceipt>(
+            scenario.Provider.Admit(semantic).Receipt).Request;
+        Assert.Equal(Hc.ExternalOperationStage.Submitted,
+            scenario.Provider.Submit(request).Receipt!.Stage);
+        Assert.True(scenario.Provider.RecordDeviceCompletion(semantic.Correlation).IsSuccess);
+        Assert.True(scenario.Provider.RecordVisibility(semantic.Correlation).IsSuccess);
+
+        Hc.ExternalOperationProviderPollResult? nested = null;
+        var replacement = Generations(Guid.Parse("fa6c6d88-d2ee-4dd6-8d09-cbbf0735aac8"));
+        var published = scenario.Provider.Publish(semantic.Correlation, () =>
+        {
+            scenario.Provider.Reconfigure(replacement);
+            nested = scenario.Provider.Poll(request);
+            scenario.Input.Span.CopyTo(scenario.Output.Span);
+        });
+
+        Assert.True(published.IsSuccess, published.Message);
+        Assert.NotNull(nested);
+        Assert.Equal(Hc.ExternalOperationProviderPollStatus.Pending, nested.Status);
+        Assert.Equal(request.Generations, nested.CurrentGenerations);
+        Assert.Equal(Hc.ExternalOperationProviderPollStatus.Stale,
+            scenario.Provider.Poll(request).Status);
+        Assert.Equal(scenario.Input.Span.ToArray(), scenario.Output.Span.ToArray());
+    }
+
     private static Scenario CreateScenario()
     {
         var kernel = new RuntimeKernel();

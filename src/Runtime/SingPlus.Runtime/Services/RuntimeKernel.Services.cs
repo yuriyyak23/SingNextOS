@@ -262,9 +262,15 @@ public sealed partial class RuntimeKernel
         var session = ResolveSession(caller, handle);
         if (!session.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(session.Error, session.Message!);
         var current = session.Value!;
+        var pinned = EndpointSessions.AcquirePin(handle, caller, current.Service);
+        if (!pinned.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(pinned.Error, pinned.Message!);
+        using var sessionPin = pinned.Value!;
+        var currentPin = EndpointSessions.RevalidatePin(sessionPin);
+        if (!currentPin.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(currentPin.Error, currentPin.Message!);
         var send = Send(caller, current.Service, current.Channel, messageId, payload, current.Capabilities);
         if (!send.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(send.Error, send.Message!);
         var invocation = SessionInvocations.Register(handle, caller, current.Service, send.Value!.Sequence, messageId);
+        sessionPin.Dispose();
         using var cancellation = cancellationToken.CanBeCanceled
             ? cancellationToken.Register(() => _ = RequestSessionCancellation(caller, invocation))
             : default;
@@ -298,10 +304,16 @@ public sealed partial class RuntimeKernel
         if (!claim.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(claim.Error, claim.Message!);
 
         var current = session.Value!;
+        var pinned = EndpointSessions.AcquirePin(handle, caller, current.Service);
+        if (!pinned.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(pinned.Error, pinned.Message!);
+        using var sessionPin = pinned.Value!;
+        var currentPin = EndpointSessions.RevalidatePin(sessionPin);
+        if (!currentPin.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(currentPin.Error, currentPin.Message!);
         var send = Send(caller, current.Service, current.Channel, messageId, payload, current.Capabilities);
         if (!send.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(send.Error, send.Message!);
         var invocation = SessionInvocations.Register(
             handle, caller, current.Service, send.Value!.Sequence, messageId, scope);
+        sessionPin.Dispose();
         var response = WaitForResponseAsync(caller, current.Channel, send.Value.Sequence).AsTask();
         if (!stopWaiting.CanBeCanceled)
             return await response.ConfigureAwait(false);
@@ -337,9 +349,15 @@ public sealed partial class RuntimeKernel
         var session = ResolveSession(caller, handle);
         if (!session.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(session.Error, session.Message!);
         var current = session.Value!;
+        var pinned = EndpointSessions.AcquirePin(handle, caller, current.Service);
+        if (!pinned.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(pinned.Error, pinned.Message!);
+        using var sessionPin = pinned.Value!;
+        var currentPin = EndpointSessions.RevalidatePin(sessionPin);
+        if (!currentPin.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(currentPin.Error, currentPin.Message!);
         var send = SendOwnershipPair(caller, current.Service, current.Channel, messageId, first, second, current.Capabilities);
         if (!send.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(send.Error, send.Message!);
         var invocation = SessionInvocations.Register(handle, caller, current.Service, send.Value!.Sequence, messageId);
+        sessionPin.Dispose();
         using var cancellation = cancellationToken.CanBeCanceled
             ? cancellationToken.Register(() => _ = RequestSessionCancellation(caller, invocation))
             : default;

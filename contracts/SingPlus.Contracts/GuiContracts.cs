@@ -12,14 +12,35 @@ public readonly record struct SurfaceHandle(
     SurfaceIdentity Identity,
     SurfaceGeneration Generation);
 public readonly record struct SurfacePlaneSlice(int Offset, int Length, int RowStride);
-public sealed record SurfaceMetadata(
+public readonly struct SurfacePlaneSet : IReadOnlyList<SurfacePlaneSlice>
+{
+    public const int MaxCount = 8;
+    private readonly SurfacePlaneSlice[] _items;
+    public SurfacePlaneSet(IEnumerable<SurfacePlaneSlice>? items)
+    {
+        _items = (items ?? []).ToArray();
+        if (_items.Length is < 1 or > MaxCount) throw new ArgumentOutOfRangeException(nameof(items));
+    }
+    public int Count => _items?.Length ?? 0;
+    public SurfacePlaneSlice this[int index] => _items[index];
+    public IEnumerator<SurfacePlaneSlice> GetEnumerator() => ((IEnumerable<SurfacePlaneSlice>)(_items ?? [])).GetEnumerator();
+    System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+    public SurfacePlaneSlice[] ToArray() => _items is null ? [] : (SurfacePlaneSlice[])_items.Clone();
+}
+
+public readonly record struct SurfaceMetadata(
     SurfacePixelFormat Format,
     int Width,
     int Height,
     int Stride,
     SurfaceLayout Layout,
-    IReadOnlyList<SurfacePlaneSlice> Planes,
-    ulong ProducerGeneration);
+    SurfacePlaneSet Planes,
+    ulong ProducerGeneration)
+{
+    public SurfaceMetadata(SurfacePixelFormat format, int width, int height, int stride, SurfaceLayout layout,
+        IEnumerable<SurfacePlaneSlice> planes, ulong producerGeneration)
+        : this(format, width, height, stride, layout, new SurfacePlaneSet(planes), producerGeneration) { }
+}
 public readonly record struct SurfaceAuthority(SurfaceHandle Surface, CapabilityId PresentCapability);
 public readonly record struct PresentOperationIdentity(ulong Value);
 public readonly record struct ReleaseFence(

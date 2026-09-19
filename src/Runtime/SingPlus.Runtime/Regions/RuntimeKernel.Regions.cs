@@ -185,6 +185,30 @@ public sealed partial class RuntimeKernel
         return acquired;
     }
 
+    public KernelResult<RegionUseDescriptor> AcquireRegionUse<T>(
+        ProcessHandle principal,
+        RegionHandle region,
+        RegionUseMode mode,
+        long elementOffset,
+        long elementLength) where T : unmanaged
+    {
+        var resolved = Processes.Resolve(principal);
+        if (!resolved.IsSuccess)
+            return KernelResult<RegionUseDescriptor>.Fail(resolved.Error, resolved.Message!);
+        var effect = EnsureProcessAcceptsNewEffects(resolved.Value!);
+        if (!effect.IsSuccess)
+            return KernelResult<RegionUseDescriptor>.Fail(effect.Error, effect.Message!);
+
+        return Regions.AcquireTypedUse(
+            region,
+            new RegionOwner(resolved.Value!.DomainId, principal.Generation),
+            mode,
+            elementOffset,
+            elementLength,
+            Unsafe.SizeOf<T>(),
+            typeof(T).FullName ?? typeof(T).Name);
+    }
+
     public KernelResult<RegionUseDescriptor> AcquireBorrowRegionUse(
         ProcessHandle owner,
         ProcessHandle borrower,

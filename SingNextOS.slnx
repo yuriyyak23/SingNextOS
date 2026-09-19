@@ -51,4 +51,7 @@
     <Project Path="tests/SingPlus.Tests/SingPlus.Tests.csproj" />
   </Folder>
   <Folder Name="/tools/" />
+  <Folder Name="/tools/qualification/">
+    <Project Path="tools/SingPlus.SingCapQualification/SingPlus.SingCapQualification.csproj" />
+  </Folder>
 </Solution>

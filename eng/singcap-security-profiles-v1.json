@@ -1,0 +1,32 @@
+{
+  "schema": "singcap-security-profiles-v1",
+  "profiles": [
+    { "project": "contracts/SingPlus.Contracts/SingPlus.Contracts.csproj", "profile": "TrustedRuntime", "owner": "SingNextOS runtime TCB", "claimLevel": "ModelOnly" },
+    { "project": "sdk/SingPlus.Analyzers/SingPlus.Analyzers.csproj", "profile": "BuildTool/TestOnly", "owner": "Sing+ toolchain", "claimLevel": "ModelOnly" },
+    { "project": "sdk/SingPlus.Generators/SingPlus.Generators.csproj", "profile": "BuildTool/TestOnly", "owner": "Sing+ toolchain", "claimLevel": "ModelOnly" },
+    { "project": "sdk/SingPlus.Kernel.Sdk/SingPlus.Kernel.Sdk.csproj", "profile": "TrustedRuntime", "owner": "SingNextOS kernel TCB", "claimLevel": "ModelOnly" },
+    { "project": "sdk/SingPlus.Sip.Sdk/SingPlus.Sip.Sdk.csproj", "profile": "TrustedRuntime", "owner": "SingNextOS SIP TCB", "claimLevel": "ModelOnly" },
+    { "project": "sdk/SingPlus.System/SingPlus.System.csproj", "profile": "TrustedRuntime", "owner": "SingNextOS native-service SDK", "claimLevel": "ModelOnly" },
+    { "project": "src/Drivers/SingPlus.Drivers/SingPlus.Drivers.csproj", "profile": "TrustedRuntime", "owner": "SingNextOS driver TCB", "claimLevel": "ModelOnly" },
+    { "project": "src/Kernel/Boot/SingPlus.Boot/SingPlus.Boot.csproj", "profile": "TrustedRuntime", "owner": "SingNextOS kernel TCB", "claimLevel": "ModelOnly" },
+    { "project": "src/Kernel/Hal/SingPlus.Kernel.Hal.Host/SingPlus.Kernel.Hal.Host.csproj", "profile": "TrustedRuntime", "owner": "SingNextOS host HAL TCB", "claimLevel": "ModelOnly" },
+    { "project": "src/Kernel/SingPlus.Kernel/SingPlus.Kernel.csproj", "profile": "TrustedRuntime", "owner": "SingNextOS kernel TCB", "claimLevel": "StaticAdmission" },
+    { "project": "src/Platform/SingPlus.Platform.Abstractions/SingPlus.Platform.Abstractions.csproj", "profile": "TrustedRuntime", "owner": "SingNextOS platform TCB", "claimLevel": "ModelOnly" },
+    { "project": "src/Platform/SingPlus.Platform.Host/SingPlus.Platform.Host.csproj", "profile": "PlatformExternal", "owner": "SingNextOS host provider", "claimLevel": "ModelOnly" },
+    { "project": "src/Platform/SingPlus.Platform.HybridCpu/SingPlus.Platform.HybridCpu.csproj", "profile": "PlatformExternal", "owner": "SingNextOS HybridCPU provider adapter", "claimLevel": "ModelOnly" },
+    { "project": "src/Runtime/SingPlus.Runtime/SingPlus.Runtime.csproj", "profile": "TrustedRuntime", "owner": "SingNextOS runtime TCB", "claimLevel": "RuntimeEnforced" },
+    { "project": "src/Sip/SingPlus.Sip/SingPlus.Sip.csproj", "profile": "TrustedRuntime", "owner": "SingNextOS SIP TCB", "claimLevel": "ModelOnly" },
+    { "project": "tests/fixtures/SingCap.ManagedCap.NativeAotFixture/SingCap.ManagedCap.NativeAotFixture.csproj", "profile": "ManagedCap", "owner": "SingCap qualification", "claimLevel": "RuntimeEnforced" },
+    { "project": "tests/SingPlus.Platform.HybridCpu.Tests/SingPlus.Platform.HybridCpu.Tests.csproj", "profile": "BuildTool/TestOnly", "owner": "SingNextOS tests", "claimLevel": "ModelOnly" },
+    { "project": "tests/SingPlus.Tests/SingPlus.Tests.csproj", "profile": "BuildTool/TestOnly", "owner": "SingNextOS tests", "claimLevel": "ModelOnly" },
+    { "project": "tools/HybridCpu_ExecutableAdapter.Tests/HybridCpu_ExecutableAdapter.Tests.csproj", "profile": "BuildTool/TestOnly", "owner": "HybridCPU adapter tests", "claimLevel": "ModelOnly" },
+    { "project": "tools/HybridCpu_ExecutableAdapter/HybridCpu_ExecutableAdapter.csproj", "profile": "PlatformExternal", "owner": "HybridCPU executable adapter", "claimLevel": "ModelOnly" },
+    { "project": "tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.AuthorityCore/HybridCPU_NeutralRuntime.AuthorityCore.csproj", "profile": "PlatformExternal", "owner": "provider-neutral runtime model", "claimLevel": "ModelOnly" },
+    { "project": "tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Contracts/HybridCPU_NeutralRuntime.Contracts.csproj", "profile": "PlatformExternal", "owner": "provider-neutral contracts", "claimLevel": "ModelOnly" },
+    { "project": "tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Model/HybridCPU_NeutralRuntime.Model.csproj", "profile": "PlatformExternal", "owner": "provider-neutral runtime model", "claimLevel": "ModelOnly" },
+    { "project": "tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Tests/HybridCPU_NeutralRuntime.Tests.csproj", "profile": "BuildTool/TestOnly", "owner": "provider-neutral runtime tests", "claimLevel": "ModelOnly" },
+    { "project": "tools/SingPlus.Admission/SingPlus.Admission.csproj", "profile": "BuildTool/TestOnly", "owner": "Sing+ admission toolchain", "claimLevel": "StaticAdmission" },
+    { "project": "tools/SingPlus.HybridCpuQualification/SingPlus.HybridCpuQualification.csproj", "profile": "BuildTool/TestOnly", "owner": "HybridCPU qualification tooling", "claimLevel": "ModelOnly" },
+    { "project": "tools/SingPlus.SingCapQualification/SingPlus.SingCapQualification.csproj", "profile": "BuildTool/TestOnly", "owner": "SingCap qualification tooling", "claimLevel": "ModelOnly" }
+  ]
+}

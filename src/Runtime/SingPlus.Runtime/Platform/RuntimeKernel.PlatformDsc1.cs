@@ -172,6 +172,7 @@ public sealed partial class RuntimeKernel
         RuntimeBufferLease<byte>? destinationLease = null;
         byte[]? stagedOutput = null;
         var providerAccepted = false;
+        PlatformDsc1SubmissionId? trackedSubmissionId = null;
         try
         {
             sourceLease = sourceBuffer.ReserveForRuntime(RuntimeBufferAccess.Read);
@@ -188,12 +189,20 @@ public sealed partial class RuntimeKernel
                 destinationLease,
                 stagedOutput);
 
-            var submission = PlatformAuthority.SubmitDsc1ModelCopy(
-                binding,
-                PlatformIdentity(process),
-                computeCapability.CapabilityId,
-                source,
-                destination);
+            var submission = InvokeDsc1ProviderOutsideMemoryUseGate<PlatformDsc1CopySubmission,
+                KernelResult<PlatformDsc1CopySubmission>>(boundaryReady =>
+                    PlatformAuthority.SubmitDsc1ModelCopy(
+                    binding,
+                    PlatformIdentity(process),
+                    computeCapability.CapabilityId,
+                    source,
+                    destination,
+                    boundaryReady), reserved =>
+                    {
+                        record.Accept(reserved);
+                        _dsc1PayloadOperations.Add(reserved.SubmissionId, record);
+                        trackedSubmissionId = reserved.SubmissionId;
+                    });
             if (!submission.IsSuccess)
             {
                 return submission;
@@ -202,10 +211,6 @@ public sealed partial class RuntimeKernel
             // From this point, any unexpected local tracking failure must leak/pin
             // custody rather than return the buffers while an accepted effect exists.
             providerAccepted = true;
-            record.Accept(submission.Value!);
-            _dsc1PayloadOperations.Add(
-                submission.Value!.SubmissionId,
-                record);
             return submission;
         }
         catch (InvalidOperationException exception)
@@ -238,6 +243,8 @@ public sealed partial class RuntimeKernel
         {
             if (!providerAccepted)
             {
+                if (trackedSubmissionId is { } tracked)
+                    _dsc1PayloadOperations.Remove(tracked);
                 if (stagedOutput is not null) Array.Clear(stagedOutput);
                 destinationLease?.Dispose();
                 sourceLease?.Dispose();
@@ -273,9 +280,11 @@ public sealed partial class RuntimeKernel
                 payload.Message!);
         }
 
-        var terminal = PlatformAuthority.ObserveDsc1ModelCopy(
-            submission,
-            PlatformIdentity(resolved.Value!));
+        var terminal = InvokeDsc1ProviderOutsideMemoryUseGate(boundaryReady =>
+            PlatformAuthority.ObserveDsc1ModelCopy(
+                submission,
+                PlatformIdentity(resolved.Value!),
+                boundaryReady));
         if (!terminal.IsSuccess)
         {
             return KernelResult<PlatformDsc1CopyReceipt>.Fail(
@@ -317,9 +326,11 @@ public sealed partial class RuntimeKernel
                 payload.Message!);
         }
 
-        var terminal = PlatformAuthority.CancelDsc1ModelCopy(
-            submission,
-            PlatformIdentity(resolved.Value!));
+        var terminal = InvokeDsc1ProviderOutsideMemoryUseGate(boundaryReady =>
+            PlatformAuthority.CancelDsc1ModelCopy(
+                submission,
+                PlatformIdentity(resolved.Value!),
+                boundaryReady));
         if (!terminal.IsSuccess)
         {
             return KernelResult<PlatformDsc1CopyReceipt>.Fail(
@@ -502,9 +513,11 @@ public sealed partial class RuntimeKernel
             var payload = ResolveDsc1Payload(owner, submission);
             if (!payload.IsSuccess) return KernelResult.Fail(payload.Error, payload.Message!);
 
-            var terminal = PlatformAuthority.CancelDsc1ModelCopy(
-                submission,
-                PlatformIdentity(resolved.Value!));
+            var terminal = InvokeDsc1ProviderOutsideMemoryUseGate(boundaryReady =>
+                PlatformAuthority.CancelDsc1ModelCopy(
+                    submission,
+                    PlatformIdentity(resolved.Value!),
+                    boundaryReady));
             if (!terminal.IsSuccess)
                 return KernelResult.Fail(terminal.Error, terminal.Message!);
 
@@ -517,5 +530,44 @@ public sealed partial class RuntimeKernel
         }
 
         return KernelResult.Ok();
+    }
+
+    private T InvokeDsc1ProviderOutsideMemoryUseGate<T>(Func<Action, T> operation)
+    {
+        var released = false;
+        try
+        {
+            return operation(() =>
+            {
+                Monitor.Exit(_platformMemoryUseGate);
+                released = true;
+            });
+        }
+        finally
+        {
+            if (released)
+                Monitor.Enter(_platformMemoryUseGate);
+        }
+    }
+
+    private T InvokeDsc1ProviderOutsideMemoryUseGate<TBoundary, T>(
+        Func<Action<TBoundary>, T> operation,
+        Action<TBoundary> publishReservation)
+    {
+        var released = false;
+        try
+        {
+            return operation(reservation =>
+            {
+                publishReservation(reservation);
+                Monitor.Exit(_platformMemoryUseGate);
+                released = true;
+            });
+        }
+        finally
+        {
+            if (released)
+                Monitor.Enter(_platformMemoryUseGate);
+        }
     }
 }

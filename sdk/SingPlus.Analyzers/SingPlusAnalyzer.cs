@@ -33,11 +33,12 @@ public sealed class SingPlusAnalyzer : DiagnosticAnalyzer
     private static readonly DiagnosticDescriptor UseAfterMove = Rule("SING2002", "Ownership token used after move", "'{0}' is referenced after Move() consumed its ownership token", "Ownership");
     private static readonly DiagnosticDescriptor ContractMessage = Rule("SING3001", "Invalid SIP contract message", "SIP contract method '{0}' must declare a unique [Message(id)]", "IPC contracts");
     private static readonly DiagnosticDescriptor UnsupportedContractType = Rule("SING3002", "Unsupported SIP contract payload", "Contract member '{0}' uses an unsupported or unbounded payload type", "IPC contracts");
+    private static readonly DiagnosticDescriptor UnsafeCopiedValue = Rule("SING3003", "Unsafe SIP copied-value graph", "Contract member '{0}' contains a mutable or unclassified copied-value node", "IPC contracts");
     private static readonly DiagnosticDescriptor SelfMint = Rule("SING4001", "Capability minting is authority-only", "SIP/driver code cannot call capability authority method '{0}'", "Capabilities");
     private static readonly DiagnosticDescriptor NondeterministicArtifact = Rule("SING5001", "Nondeterministic input is forbidden", "API '{0}' is forbidden in deterministic Sing+ artifacts", "Deterministic manifests");
 
     public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics =>
-        [ManagedAllocation, CapturingClosure, DynamicCode, ForbiddenApi, Boxing, PointerDereference, FunctionPointerInvocation, AddressFormation, UnmanagedRead, UnmanagedWrite, UnsafeCall, ExplicitLayout, InteropBoundary, PointerIndex, FunctionPointerAudit, PointerBoundary, FrameworkMemoryBoundary, BorrowEscape, UseAfterMove, ContractMessage, UnsupportedContractType, SelfMint, NondeterministicArtifact];
+        [ManagedAllocation, CapturingClosure, DynamicCode, ForbiddenApi, Boxing, PointerDereference, FunctionPointerInvocation, AddressFormation, UnmanagedRead, UnmanagedWrite, UnsafeCall, ExplicitLayout, InteropBoundary, PointerIndex, FunctionPointerAudit, PointerBoundary, FrameworkMemoryBoundary, BorrowEscape, UseAfterMove, ContractMessage, UnsupportedContractType, UnsafeCopiedValue, SelfMint, NondeterministicArtifact];
 
     public override void Initialize(AnalysisContext context)
     {
@@ -363,12 +364,17 @@ public sealed class SingPlusAnalyzer : DiagnosticAnalyzer
             var valid = message is not null && message.ConstructorArguments.Length == 1 && message.ConstructorArguments[0].Value is int id && id > 0 && ids.Add(id);
             if (!valid) context.ReportDiagnostic(Diagnostic.Create(ContractMessage, method.Locations.FirstOrDefault(), method.Name));
             if (!method.ReturnsVoid && !IsSupportedContractType(method.ReturnType)) context.ReportDiagnostic(Diagnostic.Create(UnsupportedContractType, method.Locations.FirstOrDefault(), method.Name));
+            var response = UnwrapAsync(method.ReturnType);
+            if (response is not null && HasBoundedPayload(response) && !IsDeepValue(response, new HashSet<ITypeSymbol>(SymbolEqualityComparer.Default)))
+                context.ReportDiagnostic(Diagnostic.Create(UnsafeCopiedValue, method.Locations.FirstOrDefault(), method.Name));
             foreach (var parameter in method.Parameters)
             {
                 var consumes = parameter.GetAttributes().Any(static a => a.AttributeClass?.Name == "ConsumesAttribute");
                 var borrows = parameter.GetAttributes().Any(static a => a.AttributeClass?.Name == "BorrowsAttribute");
                 if (parameter.RefKind != RefKind.None || !IsSupportedContractType(parameter.Type) || (consumes && borrows))
                     context.ReportDiagnostic(Diagnostic.Create(UnsupportedContractType, parameter.Locations.FirstOrDefault(), method.Name + "." + parameter.Name));
+                else if (HasBoundedPayload(parameter.Type) && !IsDeepValue(parameter.Type, new HashSet<ITypeSymbol>(SymbolEqualityComparer.Default)))
+                    context.ReportDiagnostic(Diagnostic.Create(UnsafeCopiedValue, parameter.Locations.FirstOrDefault(), method.Name + "." + parameter.Name));
             }
         }
     }
@@ -379,5 +385,33 @@ public sealed class SingPlusAnalyzer : DiagnosticAnalyzer
         if (type.SpecialType is SpecialType.System_Boolean or SpecialType.System_Byte or SpecialType.System_SByte or SpecialType.System_Int16 or SpecialType.System_UInt16 or SpecialType.System_Int32 or SpecialType.System_UInt32 or SpecialType.System_Int64 or SpecialType.System_UInt64 or SpecialType.System_Char or SpecialType.System_Single or SpecialType.System_Double or SpecialType.System_Decimal) return true;
         if (type is INamedTypeSymbol named && named.Name is "OwnedBuffer" or "OwnedRegion") return true;
         return type.GetAttributes().Any(static a => a.AttributeClass?.Name == "BoundedPayloadAttribute");
+    }
+
+    private static bool HasBoundedPayload(ITypeSymbol type) =>
+        type.GetAttributes().Any(static attribute => attribute.AttributeClass?.Name == "BoundedPayloadAttribute");
+
+    private static ITypeSymbol? UnwrapAsync(ITypeSymbol type) =>
+        type is INamedTypeSymbol named && named.ContainingNamespace.ToDisplayString() == "System.Threading.Tasks" && named.Name is "Task" or "ValueTask"
+            ? named.TypeArguments.Length == 1 ? named.TypeArguments[0] : null
+            : type.SpecialType == SpecialType.System_Void ? null : type;
+
+    private static bool IsDeepValue(ITypeSymbol type, HashSet<ITypeSymbol> path)
+    {
+        if (type.TypeKind == TypeKind.Enum || type.SpecialType is SpecialType.System_String or
+            SpecialType.System_Boolean or SpecialType.System_Byte or SpecialType.System_SByte or
+            SpecialType.System_Int16 or SpecialType.System_UInt16 or SpecialType.System_Int32 or
+            SpecialType.System_UInt32 or SpecialType.System_Int64 or SpecialType.System_UInt64 or
+            SpecialType.System_Char or SpecialType.System_Single or SpecialType.System_Double or
+            SpecialType.System_Decimal) return true;
+        if (type is IArrayTypeSymbol || type.TypeKind is TypeKind.Pointer or TypeKind.Dynamic or TypeKind.TypeParameter)
+            return false;
+        if (type is not INamedTypeSymbol named || !named.IsValueType || !named.IsReadOnly) return false;
+        if (!path.Add(type)) return true;
+        var valid = named.GetMembers().OfType<IPropertySymbol>()
+            .Where(static property => !property.IsStatic && property.DeclaredAccessibility == Accessibility.Public &&
+                                      property.Name is not "PayloadSize" and not "MaxPayloadSize")
+            .All(property => IsDeepValue(property.Type, path));
+        path.Remove(type);
+        return valid;
     }
 }

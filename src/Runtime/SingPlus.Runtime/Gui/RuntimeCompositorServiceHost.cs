@@ -210,15 +210,15 @@ public sealed class RuntimeCompositorServiceHost
         return published.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(published.Error, published.Message!);
     }
 
-    private static KernelResult<SurfaceMetadata> ValidateMetadata(SurfaceMetadata? metadata, long bytes)
+    private static KernelResult<SurfaceMetadata> ValidateMetadata(SurfaceMetadata metadata, long bytes)
     {
-        if (metadata is null || metadata.ProducerGeneration == 0 || !Enum.IsDefined(metadata.Format) || metadata.Layout != SurfaceLayout.Linear || metadata.Width <= 0 || metadata.Height <= 0 || metadata.Stride <= 0)
+        if (metadata.ProducerGeneration == 0 || !Enum.IsDefined(metadata.Format) || metadata.Layout != SurfaceLayout.Linear || metadata.Width <= 0 || metadata.Height <= 0 || metadata.Stride <= 0)
             return KernelResult<SurfaceMetadata>.Fail(KernelError.UnsupportedPayload, "Surface semantic metadata is malformed.");
         if (metadata.Width > 8192 || metadata.Height > 8192 || metadata.Stride != checked(metadata.Width * 4) || checked((long)metadata.Stride * metadata.Height) != bytes)
             return KernelResult<SurfaceMetadata>.Fail(KernelError.UnsupportedPayload, "Surface extent/stride does not exactly match its region.");
-        if (metadata.Planes is null || metadata.Planes.Count != 1 || metadata.Planes[0] != new SurfacePlaneSlice(0, checked((int)bytes), metadata.Stride))
+        if (metadata.Planes.Count != 1 || metadata.Planes[0] != new SurfacePlaneSlice(0, checked((int)bytes), metadata.Stride))
             return KernelResult<SurfaceMetadata>.Fail(KernelError.UnsupportedPayload, "The CPU compositor requires one exact bounded linear plane.");
-        return KernelResult<SurfaceMetadata>.Ok(metadata with { Planes = metadata.Planes.ToArray() });
+        return KernelResult<SurfaceMetadata>.Ok(metadata);
     }
 
     private KernelResult Reject(EndpointSessionInvocationHandle invocation, KernelError error, string message)

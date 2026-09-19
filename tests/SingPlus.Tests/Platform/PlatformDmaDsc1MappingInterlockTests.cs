@@ -601,7 +601,7 @@ public sealed class PlatformDmaDsc1MappingInterlockTests
             {
                 Assert.True(contenderStarted.Wait(TimeSpan.FromSeconds(5)));
                 await Task.Delay(TimeSpan.FromMilliseconds(100));
-                Assert.False(waitingDma.IsCompleted);
+                Assert.True(waitingDma.IsCompleted);
                 Assert.False(contenderProviderEntered.IsSet);
             }
             finally
@@ -612,7 +612,14 @@ public sealed class PlatformDmaDsc1MappingInterlockTests
             var denied = await firstTask;
             Assert.False(denied.IsSuccess);
             Assert.Equal(KernelError.PlatformDenied, denied.Error);
-            var accepted = await waitingDma;
+            var rejected = await waitingDma;
+            Assert.False(rejected.IsSuccess);
+            Assert.Equal(KernelError.PlatformBindingActive, rejected.Error);
+            Assert.False(contenderProviderEntered.IsSet);
+            var accepted = scenario.Kernel.SubmitPlatformDma(
+                scenario.Subject,
+                dmaGrant,
+                prepared.Value!);
             Assert.True(accepted.IsSuccess, accepted.Message);
             Assert.True(contenderProviderEntered.IsSet);
         }
@@ -701,7 +708,7 @@ public sealed class PlatformDmaDsc1MappingInterlockTests
             {
                 Assert.True(contenderStarted.Wait(TimeSpan.FromSeconds(5)));
                 await Task.Delay(TimeSpan.FromMilliseconds(100));
-                Assert.False(waitingDma.IsCompleted);
+                Assert.True(waitingDma.IsCompleted);
                 Assert.False(contenderProviderEntered.IsSet);
             }
             finally

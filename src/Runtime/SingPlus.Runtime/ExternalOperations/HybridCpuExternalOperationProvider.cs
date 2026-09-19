@@ -20,6 +20,7 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
         public ExternalOperationHandle Operation { get; } = operation;
         public OperationBinding? Binding { get; set; } = binding;
         public Hc.ExternalOperationStage LastDelivered { get; set; } = Hc.ExternalOperationStage.Admitted;
+        public bool TransitionInFlight { get; set; }
     }
 
     private readonly object gate = new();
@@ -33,6 +34,7 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
     private Hc.ExternalGenerationSet? pendingGenerations;
     private int providerEffectsInFlight;
     private readonly Dictionary<Hc.ExternalRequestCorrelation, Entry> entries = [];
+    private readonly HashSet<Hc.ExternalRequestCorrelation> pendingAdmissions = [];
 
     public HybridCpuExternalOperationProvider(
         RuntimeKernel kernel,
@@ -58,6 +60,7 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
     public Hc.ExternalOperationProviderPollResult Admit(Hc.ExternalOperationSemanticRequest semantic)
     {
         ArgumentNullException.ThrowIfNull(semantic);
+        Hc.ExternalGenerationSet generationSnapshot;
         lock (gate)
         {
             if (semantic.ContractVersion != Hc.ExternalOperationContract.Version ||
@@ -66,9 +69,21 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
                 !Enum.IsDefined(semantic.CancellationMode) ||
                 !Enum.IsDefined(semantic.ReplayEffectClass))
                 return FaultWithoutAuthority(semantic);
-            if (entries.ContainsKey(semantic.Correlation))
-                return StaleFor(entries[semantic.Correlation].Request);
+            if (entries.ContainsKey(semantic.Correlation) ||
+                pendingAdmissions.Contains(semantic.Correlation))
+            {
+                if (!entries.TryGetValue(semantic.Correlation, out var duplicate))
+                    return FaultWithoutAuthority(semantic);
+                return StaleFor(duplicate.Request);
+            }
 
+            pendingAdmissions.Add(semantic.Correlation);
+            providerEffectsInFlight++;
+            generationSnapshot = generations;
+        }
+
+        try
+        {
             var publication = semantic.VisibilityRequirement == Hc.ExternalVisibilityRequirement.Coherent
                 ? ExternalPublicationPolicy.DirectCoherent
                 : ExternalPublicationPolicy.Staged;
@@ -93,37 +108,68 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
 
             var request = new Hc.ExternalOperationRequest(
                 new(new(Guid.NewGuid()), new(prepared.Value.Operation.Generation.Value)), scope,
-                semantic.ContractVersion, generations, semantic.Correlation, semantic.EffectClass,
+                semantic.ContractVersion, generationSnapshot, semantic.Correlation, semantic.EffectClass,
                 semantic.VisibilityRequirement, semantic.CancellationMode);
-            entries.Add(semantic.Correlation, new Entry(request, prepared.Value.Operation, null));
-            return Receipt(new Hc.ExternalOperationAdmissionReceipt(request, Hc.ExternalRuntimeOutcome.Succeeded));
+            lock (gate)
+            {
+                entries.Add(semantic.Correlation, new Entry(request, prepared.Value.Operation, null));
+                return new(Hc.ExternalOperationProviderPollStatus.Receipt, generationSnapshot,
+                    new Hc.ExternalOperationAdmissionReceipt(request, Hc.ExternalRuntimeOutcome.Succeeded));
+            }
+        }
+        finally
+        {
+            lock (gate)
+            {
+                pendingAdmissions.Remove(semantic.Correlation);
+                CompleteProviderEffectLocked();
+            }
         }
     }
 
     public Hc.ExternalOperationProviderPollResult Submit(Hc.ExternalOperationRequest request)
     {
+        Entry entry;
         lock (gate)
         {
-            if (!TryExact(request, out var entry)) return StaleFor(request);
+            if (!TryExact(request, out entry!)) return StaleFor(request);
             if (!request.Generations.Equals(generations)) return StaleFor(request);
+            if (!BeginTransitionLocked(entry))
+                return new(Hc.ExternalOperationProviderPollStatus.Pending, generations);
+        }
+        try
+        {
             var submitted = kernel.RecordExternalOperationSubmission(principal, entry.Operation, dependencies);
             if (!submitted.IsSuccess)
                 return Receipt(new Hc.ExternalOperationProgressReceipt(request,
                     Hc.ExternalOperationStage.Submitted, Hc.ExternalRuntimeOutcome.Faulted));
-            entry.Binding = submitted.Value!;
-            entry.LastDelivered = Hc.ExternalOperationStage.Submitted;
-            return Receipt(new Hc.ExternalOperationProgressReceipt(request,
-                Hc.ExternalOperationStage.Submitted, Hc.ExternalRuntimeOutcome.Succeeded));
+            lock (gate)
+            {
+                entry.Binding = submitted.Value!;
+                entry.LastDelivered = Hc.ExternalOperationStage.Submitted;
+                return Receipt(new Hc.ExternalOperationProgressReceipt(request,
+                    Hc.ExternalOperationStage.Submitted, Hc.ExternalRuntimeOutcome.Succeeded));
+            }
+        }
+        finally
+        {
+            lock (gate) EndTransitionLocked(entry);
         }
     }
 
     public Hc.ExternalOperationProviderPollResult Poll(Hc.ExternalOperationRequest request)
     {
+        Entry entry;
         lock (gate)
         {
-            if (!TryExact(request, out var entry) || !request.Generations.Equals(generations))
+            if (!TryExact(request, out entry!) || !request.Generations.Equals(generations))
                 return StaleFor(request);
             if (entry.LastDelivered == Hc.ExternalOperationStage.Released) return StaleFor(request);
+            if (!BeginTransitionLocked(entry))
+                return new(Hc.ExternalOperationProviderPollStatus.Pending, generations);
+        }
+        try
+        {
             var queried = kernel.QueryExternalOperation(principal, entry.Operation);
             if (!queried.IsSuccess) return StaleFor(request);
             if (queried.Value!.Disposition == ExternalOperationDisposition.ProviderLost)
@@ -140,9 +186,16 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
                 queried.Value.State == ExternalOperationState.Released &&
                 queried.Value.Disposition != ExternalOperationDisposition.Published)
                 return Receipt(new Hc.ExternalOperationAdmissionReceipt(request, Hc.ExternalRuntimeOutcome.Faulted));
-            var next = (Hc.ExternalOperationStage)((byte)entry.LastDelivered + 1);
-            entry.LastDelivered = next;
-            return Receipt(CreateReceipt(request, next));
+            lock (gate)
+            {
+                var next = (Hc.ExternalOperationStage)((byte)entry.LastDelivered + 1);
+                entry.LastDelivered = next;
+                return Receipt(CreateReceipt(request, next));
+            }
+        }
+        finally
+        {
+            lock (gate) EndTransitionLocked(entry);
         }
     }
 
@@ -154,10 +207,16 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
 
     public Hc.ExternalOperationCancellationReceipt RequestCancellation(Hc.ExternalOperationRequest request)
     {
+        Entry entry;
         lock (gate)
         {
-            if (!TryExact(request, out var entry) || !request.Generations.Equals(generations))
+            if (!TryExact(request, out entry!) || !request.Generations.Equals(generations))
                 return new(request, Hc.ExternalOperationCancellationOutcome.Stale, generations);
+            if (!BeginTransitionLocked(entry))
+                return new(request, Hc.ExternalOperationCancellationOutcome.Ambiguous, generations);
+        }
+        try
+        {
             var state = kernel.QueryExternalOperation(principal, entry.Operation);
             if (!state.IsSuccess)
                 return new(request, Hc.ExternalOperationCancellationOutcome.Stale, generations);
@@ -169,36 +228,60 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
                 ? Hc.ExternalOperationCancellationOutcome.ConfirmedTerminalAfterSubmit
                 : Hc.ExternalOperationCancellationOutcome.ConfirmedBeforeSubmit, generations);
         }
+        finally
+        {
+            lock (gate) EndTransitionLocked(entry);
+        }
     }
 
     public KernelResult RecordDeviceCompletion(Hc.ExternalRequestCorrelation correlation,
         ExternalOperationCompletionDisposition disposition = ExternalOperationCompletionDisposition.Completed)
     {
+        Entry entry;
         lock (gate)
         {
-            if (!entries.TryGetValue(correlation, out var entry) || entry.Binding is null)
+            if (!entries.TryGetValue(correlation, out entry!) || entry.Binding is null)
                 return KernelResult.Fail(KernelError.InvalidTransition, "Exact submitted operation is required.");
             if (!entry.Request.Generations.Equals(generations))
                 return KernelResult.Fail(KernelError.StaleGeneration, "External provider generations changed before completion.");
+            if (!BeginTransitionLocked(entry))
+                return KernelResult.Fail(KernelError.InvalidTransition, "Exact operation transition is already in flight.");
+        }
+        try
+        {
             var result = kernel.RecordExternalOperationCompletion(principal, new(entry.Binding.Value, disposition));
             return result.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(result.Error, result.Message!);
+        }
+        finally
+        {
+            lock (gate) EndTransitionLocked(entry);
         }
     }
 
     public KernelResult RecordVisibility(Hc.ExternalRequestCorrelation correlation, bool satisfied = true)
     {
+        Entry entry;
         lock (gate)
         {
-            if (!entries.TryGetValue(correlation, out var entry) || entry.Binding is null)
+            if (!entries.TryGetValue(correlation, out entry!) || entry.Binding is null)
                 return KernelResult.Fail(KernelError.InvalidTransition, "Exact submitted operation is required.");
             if (!entry.Request.Generations.Equals(generations))
                 return KernelResult.Fail(KernelError.StaleGeneration, "External provider generations changed before visibility.");
+            if (!BeginTransitionLocked(entry))
+                return KernelResult.Fail(KernelError.InvalidTransition, "Exact operation transition is already in flight.");
+        }
+        try
+        {
             var requirement = entry.Request.VisibilityRequirement == Hc.ExternalVisibilityRequirement.Coherent
                 ? SingPlus.Contracts.ExternalVisibilityRequirement.ConsumerDomain
                 : SingPlus.Contracts.ExternalVisibilityRequirement.PublicationFence;
             var result = kernel.RecordExternalOperationVisibility(principal,
                 new(entry.Binding.Value, requirement, satisfied));
             return result.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(result.Error, result.Message!);
+        }
+        finally
+        {
+            lock (gate) EndTransitionLocked(entry);
         }
     }
 
@@ -212,7 +295,8 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
                 return KernelResult.Fail(KernelError.ExternalOperationNotFound, "Operation correlation was not admitted.");
             if (!entry.Request.Generations.Equals(generations))
                 return KernelResult.Fail(KernelError.StaleGeneration, "External provider generations changed before publication.");
-            providerEffectsInFlight++;
+            if (!BeginTransitionLocked(entry))
+                return KernelResult.Fail(KernelError.InvalidTransition, "Exact operation transition is already in flight.");
         }
         try
         {
@@ -225,27 +309,25 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
         }
         finally
         {
-            lock (gate)
-            {
-                providerEffectsInFlight--;
-                if (providerEffectsInFlight == 0 && pendingGenerations is { } pending)
-                {
-                    generations = pending;
-                    pendingGenerations = null;
-                }
-            }
+            lock (gate) EndTransitionLocked(entry);
         }
     }
 
     public KernelResult Release(Hc.ExternalRequestCorrelation correlation, bool providerResourcesClosed,
         bool providerUnavailable = false, bool providerEffectContained = false)
     {
+        Entry entry;
         lock (gate)
         {
-            if (!entries.TryGetValue(correlation, out var entry))
+            if (!entries.TryGetValue(correlation, out entry!))
                 return KernelResult.Fail(KernelError.ExternalOperationNotFound, "Operation correlation was not admitted.");
             if (!entry.Request.Generations.Equals(generations))
                 return KernelResult.Fail(KernelError.StaleGeneration, "External provider generations changed before release.");
+            if (!BeginTransitionLocked(entry))
+                return KernelResult.Fail(KernelError.InvalidTransition, "Exact operation transition is already in flight.");
+        }
+        try
+        {
             if (providerUnavailable)
             {
                 var current = kernel.QueryExternalOperation(principal, entry.Operation);
@@ -259,6 +341,10 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
             var result = kernel.ReleaseExternalOperation(principal, entry.Operation,
                 new(providerResourcesClosed, providerUnavailable, providerEffectContained));
             return result.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(result.Error, result.Message!);
+        }
+        finally
+        {
+            lock (gate) EndTransitionLocked(entry);
         }
     }
 
@@ -276,6 +362,30 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
 
     private bool TryExact(Hc.ExternalOperationRequest request, out Entry entry) =>
         entries.TryGetValue(request.Correlation, out entry!) && entry.Request == request;
+
+    private bool BeginTransitionLocked(Entry entry)
+    {
+        if (entry.TransitionInFlight) return false;
+        entry.TransitionInFlight = true;
+        providerEffectsInFlight++;
+        return true;
+    }
+
+    private void EndTransitionLocked(Entry entry)
+    {
+        entry.TransitionInFlight = false;
+        CompleteProviderEffectLocked();
+    }
+
+    private void CompleteProviderEffectLocked()
+    {
+        providerEffectsInFlight--;
+        if (providerEffectsInFlight == 0 && pendingGenerations is { } pending)
+        {
+            generations = pending;
+            pendingGenerations = null;
+        }
+    }
 
     private Hc.ExternalOperationProviderPollResult Receipt(Hc.ExternalOperationReceipt receipt) =>
         new(Hc.ExternalOperationProviderPollStatus.Receipt, generations, receipt);

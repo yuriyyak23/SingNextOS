@@ -140,6 +140,64 @@ public sealed class NativeSystemServiceVerticalSliceTests
     }
 
     [Fact]
+    public async Task FileSealAndCapabilityMustBothMatchExactObject()
+    {
+        var (kernel, service, caller, namespaceCapability, session, _) = FileScenario();
+        var host = RuntimeFileServiceHost.CreateForSession(kernel, service, session).Value!;
+        var client = IFileServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session));
+        var firstTask = client.OpenAsync(new(namespaceCapability, "/sealed-a", true)).AsTask();
+        Assert.True(host.ProcessNext().IsSuccess); var first = (await firstTask).Authority;
+        var secondTask = client.OpenAsync(new(namespaceCapability, "/sealed-b", true)).AsTask();
+        Assert.True(host.ProcessNext().IsSuccess); var second = (await secondTask).Authority;
+
+        var guessed = client.ReadAsync(new(new(session, first.File.ObjectId, first.File.Generation), first.Capability)).AsTask();
+        Assert.Equal(KernelError.InvalidMessage, host.ProcessNext().Error);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => guessed);
+
+        var substituted = client.ReadAsync(new(first.File with { ObjectId = second.File.ObjectId }, first.Capability)).AsTask();
+        Assert.Equal(KernelError.StaleHandle, host.ProcessNext().Error);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => substituted);
+
+        var wrongCapability = client.ReadAsync(new(first.File, namespaceCapability)).AsTask();
+        Assert.Equal(KernelError.WrongCapabilityResource, host.ProcessNext().Error);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => wrongCapability);
+
+        Assert.True(kernel.RevokeCapability(first.Capability).IsSuccess);
+        var revoked = client.ReadAsync(new(first.File, first.Capability)).AsTask();
+        Assert.Equal(KernelError.CapabilityRevoked, host.ProcessNext().Error);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => revoked);
+    }
+
+    [Fact]
+    public async Task ProcessV2RequiresSealedIncarnationAndExactControlCapability()
+    {
+        var kernel = new RuntimeKernel();
+        var protocol = IProcessServiceProtocol.CreateDefinition();
+        var service = AdmitNativeComponent(kernel, 2110, 21100, "process-v2", "process-v2-component", protocol,
+            IProcessServiceResponseProtocol.Definition, ResourceKind.Process, CapabilityResourceIds.ProcessCreate, CapabilityRights.Execute).Process;
+        var caller = TestFixtures.Create(kernel, 2111, 21110).Handle;
+        var create = kernel.MintCapability(new(21110), caller, ResourceKind.Process, CapabilityResourceIds.ProcessCreate, CapabilityRights.Execute).Value!.CapabilityId;
+        var descriptor = kernel.ResolveByServiceName("process-v2").Value;
+        var session = kernel.OpenSession(caller, descriptor, [create]).Value;
+        var host = RuntimeProcessServiceHost.CreateForSession(kernel, service, session).Value!;
+        var client = IProcessServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session));
+        var creating = client.CreateAsync(new(create, TestFixtures.Manifest(2112, 21120, 1, "process-v2-child"), ChildProcessPolicy.Attached)).AsTask();
+        Assert.True(host.ProcessNext().IsSuccess); var authority = (await creating).Authority;
+
+        var guessed = client.StartV2Async(new(new(authority.Process, authority.Process.Generation, default), authority.ControlCapability)).AsTask();
+        Assert.Equal(KernelError.InvalidMessage, host.ProcessNext().Error);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => guessed);
+
+        var wrong = client.StartV2Async(new(authority.Control, create)).AsTask();
+        Assert.Equal(KernelError.WrongCapabilityResource, host.ProcessNext().Error);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => wrong);
+
+        var valid = client.StartV2Async(new(authority.Control, authority.ControlCapability)).AsTask();
+        Assert.True(host.ProcessNext().IsSuccess);
+        await valid;
+    }
+
+    [Fact]
     public async Task NetworkFacadeUsesSocketAuthorityAndNoDeviceAuthority()
     {
         var kernel = new RuntimeKernel();

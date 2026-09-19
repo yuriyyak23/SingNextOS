@@ -20,7 +20,7 @@ public sealed class RegionUseTests
     }
 
     [Fact]
-    public void ReadUsesShareButAnyWriterIsWholeRegionExclusive()
+    public void SubrangeConflictMatrixAllowsDisjointUsesAndRejectsOverlap()
     {
         var kernel = new RuntimeKernel();
         var (_, owner) = TestFixtures.Create(kernel, 1, 10);
@@ -32,17 +32,22 @@ public sealed class RegionUseTests
 
         Assert.True(firstRead.IsSuccess, firstRead.Message);
         Assert.True(secondRead.IsSuccess, secondRead.Message);
-        Assert.False(writer.IsSuccess);
-        Assert.Equal(KernelError.RegionUseConflict, writer.Error);
+        Assert.True(writer.IsSuccess, writer.Message);
+        var overlappingWriter = kernel.AcquireRegionUse(owner, buffer.Handle, RegionUseMode.ExclusiveWrite, new(6, 4));
+        Assert.False(overlappingWriter.IsSuccess);
+        Assert.Equal(KernelError.RegionUseConflict, overlappingWriter.Error);
 
         Assert.True(kernel.ReleaseRegionUse(owner, firstRead.Value!.Handle).IsSuccess);
         Assert.True(kernel.ReleaseRegionUse(owner, secondRead.Value!.Handle).IsSuccess);
+        Assert.True(kernel.ReleaseRegionUse(owner, writer.Value!.Handle).IsSuccess);
 
         var firstWriter = kernel.AcquireRegionUse(owner, buffer.Handle, RegionUseMode.ExclusiveWrite, new(0, 4));
         var disjointWriter = kernel.AcquireRegionUse(owner, buffer.Handle, RegionUseMode.StagedOutput, new(8, 4));
         Assert.True(firstWriter.IsSuccess, firstWriter.Message);
-        Assert.False(disjointWriter.IsSuccess);
-        Assert.Equal(KernelError.RegionUseConflict, disjointWriter.Error);
+        Assert.True(disjointWriter.IsSuccess, disjointWriter.Message);
+        var overlappingRead = kernel.AcquireRegionUse(owner, buffer.Handle, RegionUseMode.ReadOnly, new(2, 4));
+        Assert.False(overlappingRead.IsSuccess);
+        Assert.Equal(KernelError.RegionUseConflict, overlappingRead.Error);
     }
 
     [Fact]

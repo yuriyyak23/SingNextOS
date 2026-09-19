@@ -2,12 +2,20 @@ using System.Reflection.Metadata;
 using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
 using System.Security.Cryptography;
+using System.Text.Json;
 
 namespace SingPlus.Admission;
 
 public static class AdmissionVerifier
 {
-    private const string Ruleset = "SingPlusAdmissionRulesV10|AssemblyIdentity:unique|ParentType:named-generic,nested,unsupported-reject|Root:unique-name|LocalCall:unique-name-or-reject|KernelNoHeap:newobj,newarr,box,ldind,stind,ldobj,stobj,cpblk,initblk,localloc,calli,interop(PinvokeImpl,InternalCall,Unmanaged,NonCil,DllImport,LibraryImport,UnmanagedCallersOnly),explicit-layout-field,framework-memory-boundary|ConcreteReachableBody:required,AbstractRoot:deny|RuntimeAsyncV2:lowering-unavailable|ForbiddenApi:System.Console,System.Environment,System.GC,System.Activator,System.Threading.ThreadPool,System.Threading.Tasks.Task,System.Diagnostics.Process,System.IO.*,System.Net.*,System.Reflection.*,System.Linq.Expressions.*|ForbiddenAssemblies:System.Console,System.IO.*,System.Net.*,System.Reflection.Emit*,Microsoft.CSharp|UnknownDependency:deny|LocalSingPlusDependency:required,identity-match,raw-sha256,transitive";
+    private const string Ruleset = "SingPlusAdmissionRulesV12|Profiles:KernelNoHeapV10,ManagedCapV1|ManagedCap:full-local-closure-module-scan,positive-exact-framework-member-surface,unknown-member-deny,ambient-reference-static-deny,native-inventory-deny|AssemblyIdentity:unique|ParentType:named-generic,nested,unsupported-reject|Root:unique-name|LocalCall:exact-metadata-signature-or-reject|KernelNoHeap:newobj,newarr,box,ldind,stind,ldobj,stobj,cpblk,initblk,localloc,calli,interop(PinvokeImpl,InternalCall,Unmanaged,NonCil,DllImport,LibraryImport,UnmanagedCallersOnly),explicit-layout-field,framework-memory-boundary|ConcreteReachableBody:required,AbstractRoot:deny|RuntimeAsyncV2:lowering-unavailable|ForbiddenApi:System.Console,System.Environment,System.GC,System.Activator,System.Threading.ThreadPool,System.Threading.Tasks.Task,System.Diagnostics.Process,System.IO.*,System.Net.*,System.Reflection.*,System.Linq.Expressions.*|ForbiddenAssemblies:System.Console,System.IO.*,System.Net.*,System.Reflection.Emit*,Microsoft.CSharp|UnknownDependency:deny|LocalSingPlusDependency:required,identity-match,raw-sha256,transitive";
+
+    public static ManagedCapPolicyDescriptor GetManagedCapPolicyDescriptor()
+    {
+        var policy = ProfilePolicy.Resolve("ManagedCap");
+        return new(policy.CanonicalIdentity, SingPlusAdmissionProofV1.Digest(Ruleset + "|" + policy.CanonicalIdentity),
+            "framework-surface-v1", policy.FrameworkSurfaceDigest);
+    }
 
     public static AdmissionVerificationResult Verify(string assemblyPath, string root, string profile)
     {
@@ -16,6 +24,7 @@ public static class AdmissionVerifier
         ArgumentException.ThrowIfNullOrWhiteSpace(profile);
 
         var fullPath = Path.GetFullPath(assemblyPath);
+        var policy = ProfilePolicy.Resolve(profile);
         var models = LoadLocalAssemblies(fullPath);
         try
         {
@@ -23,10 +32,15 @@ public static class AdmissionVerifier
                 ?? throw new InvalidOperationException("Root assembly could not be loaded as managed metadata.");
             var assemblyDigest = rootModel.ContentDigest;
             var violations = new List<AdmissionViolation>();
-            var dependencies = CollectDependencies(rootModel, models, profile, violations);
-            var dependencyDigest = SingPlusAdmissionProofV1.Digest(string.Join("\n", dependencies));
-            var rulesetDigest = SingPlusAdmissionProofV1.Digest(Ruleset);
-            var reachable = Traverse(rootModel, root, profile, models, violations);
+            if (!policy.IsKnown)
+                violations.Add(new AdmissionViolation(rootModel.Name, "unknown-profile-policy", profile));
+            var closure = CollectDependencies(rootModel, models, policy, violations);
+            var dependencyEvidence = closure.Evidence.Concat(CollectNativeInventory(fullPath, policy, violations));
+            var dependencyDigest = SingPlusAdmissionProofV1.Digest(string.Join("\n", dependencyEvidence.OrderBy(static item => item, StringComparer.Ordinal)));
+            var rulesetDigest = SingPlusAdmissionProofV1.Digest(Ruleset + "|" + policy.CanonicalIdentity);
+            var reachable = policy.FullModuleScan
+                ? ScanFullClosure(rootModel, root, policy, models, closure.AssemblyNames, violations)
+                : Traverse(rootModel, root, policy, models, violations);
             var orderedViolations = violations.OrderBy(static v => v.CanonicalKey, StringComparer.Ordinal).ToArray();
             var proofSeed = string.Join("\n", new[]
             {
@@ -67,6 +81,12 @@ public static class AdmissionVerifier
             try
             {
                 var model = new AssemblyModel(Path.GetFullPath(path));
+                if (!string.Equals(model.Path, rootPath, StringComparison.OrdinalIgnoreCase) &&
+                    !model.Name.StartsWith("SingPlus.", StringComparison.Ordinal))
+                {
+                    model.Dispose();
+                    continue;
+                }
                 if (!byName.TryAdd(model.Name, model))
                 {
                     model.Dispose();
@@ -81,7 +101,7 @@ public static class AdmissionVerifier
         return byName;
     }
 
-    private static string[] CollectDependencies(AssemblyModel root, IReadOnlyDictionary<string, AssemblyModel> models, string profile, List<AdmissionViolation> violations)
+    private static DependencyClosure CollectDependencies(AssemblyModel root, IReadOnlyDictionary<string, AssemblyModel> models, ProfilePolicy policy, List<AdmissionViolation> violations)
     {
         var dependencies = new List<string>();
         var pending = new Queue<AssemblyModel>();
@@ -101,19 +121,21 @@ public static class AdmissionVerifier
                 dependencies.Add(identity + "|" + content);
                 if (IsForbiddenAssembly(name)) violations.Add(new AdmissionViolation(model.Name, "forbidden-dependency", name));
                 else if (!IsKnownDependency(name)) violations.Add(new AdmissionViolation(model.Name, "unknown-dependency-category", name));
-                else if (string.Equals(profile, "KernelNoHeap", StringComparison.Ordinal) &&
+                else if (policy.PositiveFrameworkSurface && !hasLocal && !policy.IsFrameworkAssemblyVersionAllowed(name, reference.Version))
+                    violations.Add(new AdmissionViolation(model.Name, "unclassified-framework-version", name + "|" + reference.Version));
+                else if (policy.RequireLocalSingPlusDependencies &&
                          name.StartsWith("SingPlus.", StringComparison.Ordinal) && !hasLocal)
                     violations.Add(new AdmissionViolation(model.Name, "missing-local-dependency", name));
-                else if (string.Equals(profile, "KernelNoHeap", StringComparison.Ordinal) &&
+                else if (policy.RequireLocalSingPlusDependencies &&
                          name.StartsWith("SingPlus.", StringComparison.Ordinal) && hasLocal && local!.Version != reference.Version)
                     violations.Add(new AdmissionViolation(model.Name, "local-dependency-identity-mismatch", identity));
                 if (hasLocal) pending.Enqueue(local!);
             }
         }
-        return dependencies.OrderBy(static x => x, StringComparer.Ordinal).ToArray();
+        return new DependencyClosure(dependencies.OrderBy(static x => x, StringComparer.Ordinal).ToArray(), visited);
     }
 
-    private static int Traverse(AssemblyModel rootModel, string root, string profile, IReadOnlyDictionary<string, AssemblyModel> models, List<AdmissionViolation> violations)
+    private static int Traverse(AssemblyModel rootModel, string root, ProfilePolicy policy, IReadOnlyDictionary<string, AssemblyModel> models, List<AdmissionViolation> violations)
     {
         var rootHandle = rootModel.FindMethod(root, requireUnique: true) ?? throw new InvalidOperationException($"Admission root '{root}' was not found.");
         var queue = new Queue<MethodLocation>();
@@ -125,59 +147,154 @@ public static class AdmissionVerifier
             var location = queue.Dequeue();
             if (!visited.Add(location)) continue;
             if (!models.TryGetValue(location.AssemblyName, out var model)) continue;
-            var definition = model.Reader.GetMethodDefinition(location.Handle);
-            var methodName = model.GetMethodDisplayName(location.Handle);
-            if (string.Equals(profile, "KernelNoHeap", StringComparison.Ordinal) &&
-                ManagedAsyncPeQualification.HasRuntimeAsyncMarker(definition))
-                violations.Add(new AdmissionViolation(methodName, "unsupported-async-abi", "Runtime Async V2 lowering is unavailable"));
-            if (string.Equals(profile, "KernelNoHeap", StringComparison.Ordinal) &&
-                model.IsInteropMethod(definition))
-                violations.Add(new AdmissionViolation(methodName, "interop-boundary", "Unmanaged method boundary"));
-            if (definition.RelativeVirtualAddress == 0)
-            {
-                // Abstract call targets describe dispatch contracts, not unresolved extern
-                // implementations. Preserve that integration surface; an abstract root is
-                // still not an executable body and must fail closed.
-                if (string.Equals(profile, "KernelNoHeap", StringComparison.Ordinal) &&
-                    ((definition.Attributes & System.Reflection.MethodAttributes.Abstract) == 0 ||
-                     (location.AssemblyName == rootModel.Name && location.Handle == rootHandle)))
-                    violations.Add(new AdmissionViolation(methodName, "unavailable-method-body", "Reachable method has no auditable CIL body"));
-                continue;
-            }
-            var body = model.PeReader.GetMethodBody(definition.RelativeVirtualAddress);
-            var il = body.GetILBytes()?.ToArray() ?? Array.Empty<byte>();
-            foreach (var instruction in IlReader.Read(il))
-            {
-                if (string.Equals(profile, "KernelNoHeap", StringComparison.Ordinal))
-                {
-                    if (instruction.OpCode == System.Reflection.Emit.OpCodes.Newobj)
-                        violations.Add(new AdmissionViolation(methodName, "newobj", "managed/object construction"));
-                    else if (instruction.OpCode == System.Reflection.Emit.OpCodes.Newarr)
-                        violations.Add(new AdmissionViolation(methodName, "newarr", "managed array allocation"));
-                    else if (instruction.OpCode == System.Reflection.Emit.OpCodes.Box)
-                        violations.Add(new AdmissionViolation(methodName, "box", "boxing conversion"));
-                    else if (IsUnmanagedMemoryOpcode(instruction.OpCode))
-                        violations.Add(new AdmissionViolation(methodName, "unmanaged-memory", instruction.OpCode.Name ?? "unknown"));
-                    else if (instruction.OpCode == System.Reflection.Emit.OpCodes.Calli)
-                        violations.Add(new AdmissionViolation(methodName, "function-pointer-invoke", "calli"));
-                    else if (instruction.OpCode == System.Reflection.Emit.OpCodes.Localloc)
-                        violations.Add(new AdmissionViolation(methodName, "pointer-stackalloc", "localloc"));
-                    if (instruction.OpCode.OperandType == System.Reflection.Emit.OperandType.InlineField &&
-                        instruction.MetadataToken is int fieldToken && model.IsExplicitLayoutField(fieldToken, models))
-                        violations.Add(new AdmissionViolation(methodName, "explicit-layout-field", "field access"));
-                }
-
-                if (instruction.MetadataToken is not int token || instruction.OpCode.OperandType != System.Reflection.Emit.OperandType.InlineMethod) continue;
-                var target = model.ResolveMethod(token, models);
-                if (target.DisplayName is not null && IsForbiddenApi(target.DisplayName))
-                    violations.Add(new AdmissionViolation(methodName, "forbidden-api", target.DisplayName));
-                if (string.Equals(profile, "KernelNoHeap", StringComparison.Ordinal) && target.DisplayName is not null &&
-                    IsFrameworkMemoryBoundary(target.DisplayName))
-                    violations.Add(new AdmissionViolation(methodName, "framework-memory-boundary", target.DisplayName));
-                if (target.Location is MethodLocation next) queue.Enqueue(next);
-            }
+            foreach (var next in ScanMethod(rootModel, rootHandle, model, location.Handle, policy, models, violations))
+                queue.Enqueue(next);
         }
         return visited.Count;
+    }
+
+    private static int ScanFullClosure(AssemblyModel rootModel, string root, ProfilePolicy policy,
+        IReadOnlyDictionary<string, AssemblyModel> models, IReadOnlySet<string> closure, List<AdmissionViolation> violations)
+    {
+        var rootHandle = rootModel.FindMethod(root, requireUnique: true) ?? throw new InvalidOperationException($"Admission root '{root}' was not found.");
+        var count = 0;
+        foreach (var assemblyName in closure.OrderBy(static name => name, StringComparer.Ordinal))
+        {
+            if (!models.TryGetValue(assemblyName, out var model)) continue;
+            ScanManagedCapMetadata(model, policy, violations);
+            ScanStaticState(model, violations);
+            foreach (var handle in model.Reader.MethodDefinitions)
+            {
+                count++;
+                _ = ScanMethod(rootModel, rootHandle, model, handle, policy, models, violations);
+            }
+        }
+        return count;
+    }
+
+    private static IReadOnlyList<MethodLocation> ScanMethod(AssemblyModel rootModel, MethodDefinitionHandle rootHandle,
+        AssemblyModel model, MethodDefinitionHandle handle, ProfilePolicy policy,
+        IReadOnlyDictionary<string, AssemblyModel> models, List<AdmissionViolation> violations)
+    {
+        var targets = new List<MethodLocation>();
+        var definition = model.Reader.GetMethodDefinition(handle);
+        var methodName = model.GetMethodDisplayName(handle);
+        if (policy.EnforceRestrictedCil && ManagedAsyncPeQualification.HasRuntimeAsyncMarker(definition))
+            violations.Add(new AdmissionViolation(methodName, "unsupported-async-abi", "Runtime Async V2 lowering is unavailable"));
+        if (policy.EnforceRestrictedCil && model.IsInteropMethod(definition))
+            violations.Add(new AdmissionViolation(methodName, "interop-boundary", "Unmanaged method boundary"));
+        if (definition.RelativeVirtualAddress == 0)
+        {
+            if (policy.EnforceRestrictedCil && ((definition.Attributes & System.Reflection.MethodAttributes.Abstract) == 0 ||
+                (model.Name == rootModel.Name && handle == rootHandle)))
+                violations.Add(new AdmissionViolation(methodName, "unavailable-method-body", "Audited method has no CIL body"));
+            return targets;
+        }
+        var body = model.PeReader.GetMethodBody(definition.RelativeVirtualAddress);
+        var il = body.GetILBytes()?.ToArray() ?? Array.Empty<byte>();
+        foreach (var instruction in IlReader.Read(il))
+        {
+            if (policy.EnforceRestrictedCil)
+            {
+                if (instruction.OpCode == System.Reflection.Emit.OpCodes.Newobj && policy.ForbidAllocation)
+                    violations.Add(new AdmissionViolation(methodName, "newobj", "managed/object construction"));
+                else if (instruction.OpCode == System.Reflection.Emit.OpCodes.Newarr && policy.ForbidAllocation)
+                    violations.Add(new AdmissionViolation(methodName, "newarr", "managed array allocation"));
+                else if (instruction.OpCode == System.Reflection.Emit.OpCodes.Box && policy.ForbidAllocation)
+                    violations.Add(new AdmissionViolation(methodName, "box", "boxing conversion"));
+                else if (IsUnmanagedMemoryOpcode(instruction.OpCode))
+                    violations.Add(new AdmissionViolation(methodName, "unmanaged-memory", instruction.OpCode.Name ?? "unknown"));
+                else if (instruction.OpCode == System.Reflection.Emit.OpCodes.Calli)
+                    violations.Add(new AdmissionViolation(methodName, "function-pointer-invoke", "calli"));
+                else if (instruction.OpCode == System.Reflection.Emit.OpCodes.Localloc)
+                    violations.Add(new AdmissionViolation(methodName, "pointer-stackalloc", "localloc"));
+                if (instruction.OpCode.OperandType == System.Reflection.Emit.OperandType.InlineField &&
+                    instruction.MetadataToken is int fieldToken && model.IsExplicitLayoutField(fieldToken, models))
+                    violations.Add(new AdmissionViolation(methodName, "explicit-layout-field", "field access"));
+            }
+            if (instruction.MetadataToken is not int token || instruction.OpCode.OperandType != System.Reflection.Emit.OperandType.InlineMethod) continue;
+            var target = model.ResolveMethod(token, models);
+            if (target.DisplayName is not null && IsForbiddenApi(target.DisplayName))
+                violations.Add(new AdmissionViolation(methodName, "forbidden-api", target.DisplayName));
+            if (policy.EnforceRestrictedCil && target.DisplayName is not null && IsFrameworkMemoryBoundary(target.DisplayName))
+                violations.Add(new AdmissionViolation(methodName, "framework-memory-boundary", target.DisplayName));
+            if (policy.PositiveFrameworkSurface && target.Location is null && target.DisplayName is not null &&
+                !policy.IsFrameworkMemberAllowed(target.AssemblyName, target.DisplayName, target.Signature))
+                violations.Add(new AdmissionViolation(methodName, "unclassified-framework-member", target.CanonicalIdentity));
+            if (target.Location is MethodLocation next) targets.Add(next);
+        }
+        return targets;
+    }
+
+    private static void ScanStaticState(AssemblyModel model, List<AdmissionViolation> violations)
+    {
+        foreach (var handle in model.Reader.FieldDefinitions)
+        {
+            var field = model.Reader.GetFieldDefinition(handle);
+            if ((field.Attributes & System.Reflection.FieldAttributes.Static) == 0 ||
+                (field.Attributes & System.Reflection.FieldAttributes.Literal) != 0) continue;
+            var signature = model.Reader.GetBlobBytes(field.Signature);
+            if (SignatureCanCarryReference(signature))
+                violations.Add(new AdmissionViolation(model.GetFieldDisplayName(handle), "ambient-mutable-static-reference", Convert.ToHexString(signature).ToLowerInvariant()));
+        }
+    }
+
+    private static void ScanManagedCapMetadata(AssemblyModel model, ProfilePolicy policy, List<AdmissionViolation> violations)
+    {
+        if (!policy.PositiveFrameworkSurface) return;
+        foreach (var identity in model.ExternalTypeReferences())
+            if (!policy.IsFrameworkTypeAllowed(identity.AssemblyName, identity.FullName))
+                violations.Add(new AdmissionViolation(model.Name, "unclassified-framework-type", identity.AssemblyName + "|" + identity.FullName));
+    }
+
+    private static bool SignatureCanCarryReference(ReadOnlySpan<byte> signature)
+    {
+        // FIELD (0x06), optional custom modifiers, then ECMA-335 element type.
+        for (var i = 1; i < signature.Length; i++)
+            if (signature[i] is 0x0e or 0x12 or 0x14 or 0x15 or 0x1c or 0x1d) return true;
+        return false;
+    }
+
+    private static IEnumerable<string> CollectNativeInventory(string rootPath, ProfilePolicy policy, List<AdmissionViolation> violations)
+    {
+        if (!policy.RejectUndeclaredNativeAssets) yield break;
+        var root = Path.GetFullPath(rootPath);
+        var declaredRuntimeAssets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var dependencyManifest = Path.ChangeExtension(root, ".deps.json");
+        if (File.Exists(dependencyManifest))
+        {
+            var manifestBytes = File.ReadAllBytes(dependencyManifest);
+            yield return "deps|" + SingPlusAdmissionProofV1.Digest(manifestBytes);
+            using var document = JsonDocument.Parse(manifestBytes);
+            if (document.RootElement.TryGetProperty("targets", out var targets))
+                foreach (var target in targets.EnumerateObject())
+                    foreach (var library in target.Value.EnumerateObject())
+                        if (library.Name.StartsWith("runtimepack.Microsoft.NETCore.App.Runtime.", StringComparison.Ordinal) &&
+                            library.Value.TryGetProperty("native", out var native))
+                            foreach (var asset in native.EnumerateObject())
+                                declaredRuntimeAssets.Add(Path.GetFileName(asset.Name));
+        }
+        foreach (var path in Directory.EnumerateFiles(Path.GetDirectoryName(root)!).OrderBy(static p => p, StringComparer.OrdinalIgnoreCase))
+        {
+            if (string.Equals(Path.GetFullPath(path), root, StringComparison.OrdinalIgnoreCase)) continue;
+            var extension = Path.GetExtension(path);
+            if (extension is not (".dll" or ".so" or ".dylib")) continue;
+            try
+            {
+                using var stream = File.OpenRead(path);
+                using var pe = new PEReader(stream);
+                if (pe.HasMetadata) continue;
+            }
+            catch (BadImageFormatException) { }
+            var name = Path.GetFileName(path);
+            if (declaredRuntimeAssets.Contains(name))
+            {
+                yield return "runtime-native|" + name + "|" + SingPlusAdmissionProofV1.Digest(File.ReadAllBytes(path));
+                continue;
+            }
+            violations.Add(new AdmissionViolation("native-inventory", "undeclared-native-asset", name));
+            yield return "native|" + name + "|" + SingPlusAdmissionProofV1.Digest(File.ReadAllBytes(path));
+        }
     }
 
     private static bool IsForbiddenAssembly(string name) =>
@@ -216,7 +333,78 @@ public static class AdmissionVerifier
                 "System.Runtime.InteropServices.Marshal" or "System.Runtime.InteropServices.NativeMemory";
     }
 
+    private sealed record ProfilePolicy(
+        string Name,
+        string CanonicalIdentity,
+        bool IsKnown,
+        bool FullModuleScan,
+        bool EnforceRestrictedCil,
+        bool ForbidAllocation,
+        bool PositiveFrameworkSurface,
+        bool RequireLocalSingPlusDependencies,
+        bool RejectUndeclaredNativeAssets)
+    {
+        private static readonly HashSet<string> ManagedCapMembers = new(StringComparer.Ordinal)
+        {
+            "System.Private.CoreLib|System.Object::.ctor|200001",
+            "System.Private.CoreLib|System.Math::Abs|00010808",
+            "System.Private.CoreLib|System.Math::Abs|0001080a",
+            "System.Private.CoreLib|System.Math::Abs|0001080c"
+        };
+
+        private static readonly HashSet<string> ManagedCapTypes = new(StringComparer.Ordinal)
+        {
+            "System.Object",
+            "System.Math",
+            "System.Attribute",
+            "System.Runtime.CompilerServices.CompilationRelaxationsAttribute",
+            "System.Runtime.CompilerServices.RuntimeCompatibilityAttribute",
+            "System.Runtime.CompilerServices.RefSafetyRulesAttribute",
+            "System.Diagnostics.DebuggableAttribute",
+            "System.Diagnostics.DebuggableAttribute+DebuggingModes",
+            "System.Reflection.AssemblyCompanyAttribute",
+            "System.Reflection.AssemblyConfigurationAttribute",
+            "System.Reflection.AssemblyFileVersionAttribute",
+            "System.Reflection.AssemblyInformationalVersionAttribute",
+            "System.Reflection.AssemblyProductAttribute",
+            "System.Reflection.AssemblyTitleAttribute",
+            "System.Runtime.Versioning.TargetFrameworkAttribute"
+        };
+
+        public static ProfilePolicy Resolve(string profile) => profile switch
+        {
+            "KernelNoHeap" => new(profile, "KernelNoHeapV10|net11", true, false, true, true, false, true, false),
+            "ManagedCap" => new(profile, "ManagedCapV1|net11|framework-surface-v1", true, true, true, false, true, true, true),
+            _ => new(profile, "UnknownProfile|deny", false, false, true, true, true, true, true)
+        };
+
+        public bool IsFrameworkMemberAllowed(string? assemblyName, string displayName, string signature)
+        {
+            if (assemblyName is null) return false;
+            // Calls into the local SingPlus closure are resolved to a MethodLocation. An
+            // unresolved SingPlus member is never admitted as a framework surface.
+            return ManagedCapMembers.Contains(assemblyName + "|" + displayName + "|" + signature);
+        }
+
+        public bool IsFrameworkTypeAllowed(string? assemblyName, string? fullName) =>
+            assemblyName is "System.Private.CoreLib" or "System.Runtime" && fullName is not null && ManagedCapTypes.Contains(fullName);
+
+        public bool IsFrameworkAssemblyVersionAllowed(string name, Version version) =>
+            (name == "System.Private.CoreLib" || name.StartsWith("System.", StringComparison.Ordinal)) && version.Major == 11;
+
+        public string FrameworkSurfaceDigest => SingPlusAdmissionProofV1.Digest(string.Join("\n",
+            ManagedCapMembers.Select(static item => "M|" + item).Concat(ManagedCapTypes.Select(static item => "T|System.Private.CoreLib-or-System.Runtime|" + item))
+                .OrderBy(static item => item, StringComparer.Ordinal)));
+    }
+
+    private sealed record DependencyClosure(string[] Evidence, IReadOnlySet<string> AssemblyNames);
+
     private readonly record struct MethodLocation(string AssemblyName, MethodDefinitionHandle Handle);
+
+    private readonly record struct ResolvedMethod(MethodLocation? Location, string? AssemblyName, string? DisplayName, string Signature)
+    {
+        public string CanonicalIdentity => (AssemblyName ?? "unknown") + "|" + (DisplayName ?? "unknown") + "|" + Signature;
+    }
 
     private sealed class AssemblyModel : IDisposable
     {
@@ -263,11 +451,49 @@ public static class AdmissionVerifier
             return match;
         }
 
+        public MethodDefinitionHandle? FindMethod(string identity, string signature)
+        {
+            var split = identity.Split(new[] { "::" }, 2, StringSplitOptions.None);
+            if (split.Length != 2) throw new ArgumentException("Method must use Type::Method format.", nameof(identity));
+            MethodDefinitionHandle? match = null;
+            foreach (var typeHandle in Reader.TypeDefinitions)
+            {
+                var type = Reader.GetTypeDefinition(typeHandle);
+                if (!string.Equals(FullTypeName(type), split[0], StringComparison.Ordinal)) continue;
+                foreach (var methodHandle in type.GetMethods())
+                {
+                    var method = Reader.GetMethodDefinition(methodHandle);
+                    if (!string.Equals(Reader.GetString(method.Name), split[1], StringComparison.Ordinal) ||
+                        !string.Equals(SignatureHex(method.Signature), signature, StringComparison.Ordinal)) continue;
+                    if (match is not null)
+                        throw new InvalidOperationException($"Admission method identity '{identity}|{signature}' is ambiguous.");
+                    match = methodHandle;
+                }
+            }
+            return match;
+        }
+
         public string GetMethodDisplayName(MethodDefinitionHandle handle)
         {
             var method = Reader.GetMethodDefinition(handle);
             var type = Reader.GetTypeDefinition(method.GetDeclaringType());
             return FullTypeName(type) + "::" + Reader.GetString(method.Name);
+        }
+
+        public string GetFieldDisplayName(FieldDefinitionHandle handle)
+        {
+            var field = Reader.GetFieldDefinition(handle);
+            var type = Reader.GetTypeDefinition(field.GetDeclaringType());
+            return FullTypeName(type) + "::" + Reader.GetString(field.Name);
+        }
+
+        public IEnumerable<(string? AssemblyName, string? FullName)> ExternalTypeReferences()
+        {
+            foreach (var handle in Reader.TypeReferences)
+            {
+                var identity = ResolveParentType(handle);
+                if (!string.Equals(identity.AssemblyName, Name, StringComparison.OrdinalIgnoreCase)) yield return identity;
+            }
         }
 
         public bool IsInteropMethod(MethodDefinition method)
@@ -318,16 +544,17 @@ public static class AdmissionVerifier
         private static bool IsExplicitLayout(TypeDefinition type) =>
             (type.Attributes & System.Reflection.TypeAttributes.LayoutMask) == System.Reflection.TypeAttributes.ExplicitLayout;
 
-        public (MethodLocation? Location, string? DisplayName) ResolveMethod(int token, IReadOnlyDictionary<string, AssemblyModel> models)
+        public ResolvedMethod ResolveMethod(int token, IReadOnlyDictionary<string, AssemblyModel> models)
         {
             EntityHandle handle;
             try { handle = MetadataTokens.EntityHandle(token); }
-            catch (ArgumentException) { return (null, null); }
+            catch (ArgumentException) { return new(null, null, null, string.Empty); }
 
             if (handle.Kind == HandleKind.MethodDefinition)
             {
                 var method = (MethodDefinitionHandle)handle;
-                return (new MethodLocation(Name, method), GetMethodDisplayName(method));
+                var definition = Reader.GetMethodDefinition(method);
+                return new(new MethodLocation(Name, method), Name, GetMethodDisplayName(method), SignatureHex(definition.Signature));
             }
             if (handle.Kind == HandleKind.MethodSpecification)
             {
@@ -336,21 +563,22 @@ public static class AdmissionVerifier
             }
             if (handle.Kind == HandleKind.MemberReference)
                 return ResolveMemberReference((MemberReferenceHandle)handle, models);
-            return (null, null);
+            return new(null, null, null, string.Empty);
         }
 
-        private (MethodLocation? Location, string? DisplayName) ResolveEntityMethod(EntityHandle handle, IReadOnlyDictionary<string, AssemblyModel> models)
+        private ResolvedMethod ResolveEntityMethod(EntityHandle handle, IReadOnlyDictionary<string, AssemblyModel> models)
         {
             if (handle.Kind == HandleKind.MethodDefinition)
             {
                 var method = (MethodDefinitionHandle)handle;
-                return (new MethodLocation(Name, method), GetMethodDisplayName(method));
+                var definition = Reader.GetMethodDefinition(method);
+                return new(new MethodLocation(Name, method), Name, GetMethodDisplayName(method), SignatureHex(definition.Signature));
             }
             if (handle.Kind == HandleKind.MemberReference) return ResolveMemberReference((MemberReferenceHandle)handle, models);
-            return (null, null);
+            return new(null, null, null, string.Empty);
         }
 
-        private (MethodLocation? Location, string? DisplayName) ResolveMemberReference(MemberReferenceHandle handle, IReadOnlyDictionary<string, AssemblyModel> models)
+        private ResolvedMethod ResolveMemberReference(MemberReferenceHandle handle, IReadOnlyDictionary<string, AssemblyModel> models)
         {
             var member = Reader.GetMemberReference(handle);
             var methodName = Reader.GetString(member.Name);
@@ -358,23 +586,33 @@ public static class AdmissionVerifier
             var display = type.FullName is null ? methodName : type.FullName + "::" + methodName;
             if (type.AssemblyName is null || type.FullName is null)
                 throw new InvalidOperationException($"Unsupported method parent for '{display}'.");
-            if (!models.TryGetValue(type.AssemblyName, out var targetModel)) return (null, display);
-            // Cross-assembly signature resolution is not implemented. Never audit an arbitrary overload.
-            var local = targetModel.FindMethod(type.FullName + "::" + methodName, requireUnique: true);
-            if (local is null) throw new InvalidOperationException($"Unresolved local call target '{display}'.");
-            return (new MethodLocation(targetModel.Name, local.Value), display);
+            var signature = SignatureHex(member.Signature);
+            if (type.AssemblyName == "mscorlib" || type.AssemblyName == "netstandard" ||
+                type.AssemblyName.StartsWith("System.", StringComparison.Ordinal))
+                return new(null, type.AssemblyName, display, signature);
+            if (!models.TryGetValue(type.AssemblyName, out var targetModel)) return new(null, type.AssemblyName, display, signature);
+            // Metadata signatures are required here: selecting a same-named overload would widen the audited call graph.
+            var local = targetModel.FindMethod(type.FullName + "::" + methodName, signature);
+            if (local is null) throw new InvalidOperationException($"Unresolved signature-qualified local call target '{display}|{signature}'.");
+            return new(new MethodLocation(targetModel.Name, local.Value), targetModel.Name, display, signature);
         }
+
+        private string SignatureHex(BlobHandle handle) => Convert.ToHexString(Reader.GetBlobBytes(handle)).ToLowerInvariant();
 
         private (string? AssemblyName, string? FullName) ResolveParentType(EntityHandle parent)
         {
             if (parent.Kind == HandleKind.TypeSpecification)
             {
-                var blob = Reader.GetBlobReader(Reader.GetTypeSpecification((TypeSpecificationHandle)parent).Signature);
+                var typeSignature = Reader.GetTypeSpecification((TypeSpecificationHandle)parent).Signature;
+                var blob = Reader.GetBlobReader(typeSignature);
+                var typeCode = blob.ReadSignatureTypeCode();
+                if (typeCode is SignatureTypeCode.Array or SignatureTypeCode.SZArray)
+                    return ("System.Private.CoreLib", "System.Array");
                 // A constructed named type has the same definition body for every type argument.
                 // Other TypeSpec parents require explicit importer support, never display-only admission.
-                if (blob.ReadSignatureTypeCode() != SignatureTypeCode.GenericTypeInstance ||
+                if (typeCode != SignatureTypeCode.GenericTypeInstance ||
                     blob.ReadSignatureTypeCode() != SignatureTypeCode.TypeHandle)
-                    throw new InvalidOperationException("Unsupported TypeSpecification method/field parent.");
+                    throw new InvalidOperationException($"Unsupported TypeSpecification method/field parent '{SignatureHex(typeSignature)}'.");
                 return ResolveParentType(blob.ReadTypeHandle());
             }
             if (parent.Kind == HandleKind.TypeDefinition)
@@ -418,3 +656,9 @@ public static class AdmissionVerifier
         }
     }
 }
+
+public sealed record ManagedCapPolicyDescriptor(
+    string AdmissionPolicyVersion,
+    string AdmissionPolicyDigest,
+    string FrameworkSurfaceVersion,
+    string FrameworkSurfaceDigest);

@@ -149,6 +149,21 @@ internal sealed class ServiceRegistry
         lock (_gate) return _records.Values.ToArray();
     }
 
+    internal KernelResult<ServiceEndpointDescriptor> ResolveForProvider(
+        ProcessHandle provider, string contractName)
+    {
+        lock (_gate)
+        {
+            var matches = _records.Values.Where(record => record.Provider == provider &&
+                record.Protocol.ContractName == contractName &&
+                record.Descriptor.Availability == ServiceAvailability.Accepting).ToArray();
+            return matches.Length == 1
+                ? KernelResult<ServiceEndpointDescriptor>.Ok(matches[0].Descriptor)
+                : KernelResult<ServiceEndpointDescriptor>.Fail(KernelError.ServiceNotFound,
+                    "Exact active service incarnation for the provider and contract was not found.");
+        }
+    }
+
     internal ServiceReplacementLineage[] ReplacementLineageSnapshot()
     {
         lock (_gate) return _replacementLineage.ToArray();

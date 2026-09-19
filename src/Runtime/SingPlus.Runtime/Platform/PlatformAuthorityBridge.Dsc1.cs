@@ -63,6 +63,7 @@ public sealed partial class PlatformAuthorityBridge
         public CapabilityId ComputeCapabilityId { get; } = computeCapabilityId;
         public Dsc1OperationState State { get; set; }
         public bool CancellationRequested { get; set; }
+        public bool ProviderCallInFlight { get; set; }
         public bool LocalReservationsReleased { get; set; }
 
         public void Accept(PlatformProviderDsc1Submission providerSubmission)
@@ -82,8 +83,13 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDomainIdentity expectedSubject,
         CapabilityId computeCapabilityId,
         PlatformDsc1RegionRange source,
-        PlatformDsc1RegionRange destination)
+        PlatformDsc1RegionRange destination,
+        Action<PlatformDsc1CopySubmission>? providerBoundaryReady = null)
     {
+        PlatformDsc1CopyRequest request;
+        PlatformDsc1CopySubmission localSubmission;
+        Dsc1OperationRecord operationRecord;
+        IPlatformDsc1ComputeProvider computeProvider;
         lock (_dsc1Gate)
         {
             // Repeat exact mapping-use admission at the bridge boundary. The
@@ -110,12 +116,13 @@ public sealed partial class PlatformAuthorityBridge
                     $"The platform provider does not expose DSC1 Copy contract v{PlatformDsc1ComputeContract.ContractVersion} as ModelOnly.");
             }
 
-            if (_provider is not IPlatformDsc1ComputeProvider computeProvider)
+            if (_provider is not IPlatformDsc1ComputeProvider resolvedProvider)
             {
                 return KernelResult<PlatformDsc1CopySubmission>.Fail(
                     KernelError.PlatformUnsupported,
                     "The platform provider does not implement the DSC1 Copy model contract.");
             }
+            computeProvider = resolvedProvider;
 
             if (_nextDsc1SubmissionId == 0)
             {
@@ -127,7 +134,7 @@ public sealed partial class PlatformAuthorityBridge
             var domainRecord = _domains[binding.BindingId];
             var sourceRecord = _mappings[source.Mapping.MappingId];
             var destinationRecord = _mappings[destination.Mapping.MappingId];
-            var request = new PlatformDsc1CopyRequest(
+            request = new PlatformDsc1CopyRequest(
                 domainRecord.ProviderLease,
                 new PlatformProviderDsc1RegionRange(
                     sourceRecord.ProviderLease,
@@ -148,7 +155,7 @@ public sealed partial class PlatformAuthorityBridge
                     "The bridge constructed an invalid DSC1 Copy request.");
             }
 
-            var localSubmission = new PlatformDsc1CopySubmission(
+            localSubmission = new PlatformDsc1CopySubmission(
                 new PlatformDsc1SubmissionId(_nextDsc1SubmissionId++),
                 new PlatformDsc1SubmissionGeneration(1),
                 binding,
@@ -167,72 +174,97 @@ public sealed partial class PlatformAuthorityBridge
                     "DSC1 local operation tracking capacity is exhausted.");
             }
 
-            var operationRecord = new Dsc1OperationRecord(
+            operationRecord = new Dsc1OperationRecord(
                 localSubmission,
                 computeCapabilityId);
+            operationRecord.ProviderCallInFlight = true;
             _dsc1Operations.Add(localSubmission.SubmissionId, operationRecord);
+        }
 
-            PlatformAuthorityResult<PlatformProviderDsc1Submission> providerResult;
+        providerBoundaryReady?.Invoke(localSubmission);
+
+        PlatformAuthorityResult<PlatformProviderDsc1Submission> providerResult;
+        try
+        {
+            providerResult = computeProvider.SubmitDsc1Copy(request);
+        }
+        catch (Exception exception)
+        {
+            lock (_dsc1Gate)
+            {
+                if (_dsc1Operations.Remove(localSubmission.SubmissionId) &&
+                    _domains.TryGetValue(binding.BindingId, out var domain))
+                    QuarantineDomain(domain);
+            }
+            return KernelResult<PlatformDsc1CopySubmission>.Fail(
+                KernelError.PlatformFaulted,
+                $"The DSC1 provider threw during submission; the domain is quarantined: {exception.Message}");
+        }
+
+        if (!providerResult.IsSuccess)
+        {
+            lock (_dsc1Gate)
+            {
+                _dsc1Operations.Remove(localSubmission.SubmissionId);
+                if (RequiresDomainQuarantine(providerResult.Status) &&
+                    _domains.TryGetValue(binding.BindingId, out var domain))
+                    QuarantineDomain(domain);
+            }
+            return FromProviderFailure<PlatformDsc1CopySubmission>(
+                providerResult.Status,
+                providerResult.Message);
+        }
+
+        var providerSubmission = providerResult.Value!;
+        var submissionValidation = PlatformDsc1ComputeContract.ValidateSubmission(
+            request,
+            providerSubmission);
+        if (!submissionValidation.IsSuccess)
+        {
             try
             {
-                providerResult = computeProvider.SubmitDsc1Copy(request);
+                _ = computeProvider.CancelDsc1(providerSubmission);
             }
-            catch (Exception exception)
+            catch (Exception)
+            {
+                // Best effort only: a malformed returned identity cannot
+                // identify the exact accepted effect for authoritative cleanup.
+            }
+            lock (_dsc1Gate)
             {
                 _dsc1Operations.Remove(localSubmission.SubmissionId);
-                QuarantineDomain(domainRecord);
+                if (_domains.TryGetValue(binding.BindingId, out var domain))
+                    QuarantineDomain(domain);
+            }
+            return KernelResult<PlatformDsc1CopySubmission>.Fail(
+                KernelError.PlatformFaulted,
+                "The provider returned a malformed DSC1 submission; exact closure of the requested effect is not provable and the domain is quarantined.");
+        }
+
+        lock (_dsc1Gate)
+        {
+            if (!_dsc1Operations.TryGetValue(localSubmission.SubmissionId, out var current) ||
+                !ReferenceEquals(current, operationRecord) ||
+                current.State != Dsc1OperationState.Submitting ||
+                !current.ProviderCallInFlight)
+            {
                 return KernelResult<PlatformDsc1CopySubmission>.Fail(
                     KernelError.PlatformFaulted,
-                    $"The DSC1 provider threw during submission; the domain is quarantined: {exception.Message}");
+                    "The DSC1 submission reservation changed while the provider call was in flight.");
             }
-
-            if (!providerResult.IsSuccess)
-            {
-                _dsc1Operations.Remove(localSubmission.SubmissionId);
-                if (RequiresDomainQuarantine(providerResult.Status))
-                    QuarantineDomain(domainRecord);
-
-                return FromProviderFailure<PlatformDsc1CopySubmission>(
-                    providerResult.Status,
-                    providerResult.Message);
-            }
-
-            var providerSubmission = providerResult.Value!;
-            var submissionValidation = PlatformDsc1ComputeContract.ValidateSubmission(
-                request,
-                providerSubmission);
-            if (!submissionValidation.IsSuccess)
-            {
-                try
-                {
-                    _ = computeProvider.CancelDsc1(providerSubmission);
-                }
-                catch (Exception)
-                {
-                    // Best effort only: a malformed returned identity cannot
-                    // identify the exact accepted effect for authoritative cleanup.
-                }
-
-                _dsc1Operations.Remove(localSubmission.SubmissionId);
-                // A self-consistent receipt for a malformed identity cannot prove
-                // closure of the exact request that the bridge submitted.
-                QuarantineDomain(domainRecord);
-
-                return KernelResult<PlatformDsc1CopySubmission>.Fail(
-                    KernelError.PlatformFaulted,
-                    "The provider returned a malformed DSC1 submission; exact closure of the requested effect is not provable and the domain is quarantined.");
-            }
-
+            operationRecord.ProviderCallInFlight = false;
             operationRecord.Accept(providerSubmission);
-
             return KernelResult<PlatformDsc1CopySubmission>.Ok(localSubmission);
         }
     }
 
     internal KernelResult<PlatformDsc1TerminalObservation> ObserveDsc1ModelCopy(
         PlatformDsc1CopySubmission submission,
-        PlatformDomainIdentity expectedSubject)
+        PlatformDomainIdentity expectedSubject,
+        Action? providerBoundaryReady = null)
     {
+        Dsc1OperationRecord record;
+        PlatformProviderDsc1Submission providerSubmission;
         lock (_dsc1Gate)
         {
             var recordResult = ResolveDsc1Operation(submission, expectedSubject);
@@ -243,7 +275,7 @@ public sealed partial class PlatformAuthorityBridge
                     recordResult.Message!);
             }
 
-            var record = recordResult.Value!;
+            record = recordResult.Value!;
             if (TryGetDsc1Terminal(record, out var terminal))
                 return KernelResult<PlatformDsc1TerminalObservation>.Ok(terminal);
 
@@ -253,29 +285,46 @@ public sealed partial class PlatformAuthorityBridge
                     KernelError.PlatformFaulted,
                     "The DSC1 operation is fault-pinned and cannot publish output.");
             }
-
-            var provider = (IPlatformDsc1ComputeProvider)_provider!;
-            PlatformAuthorityResult<PlatformProviderDsc1Completion> observed;
-            try
+            if (record.ProviderCallInFlight || record.State == Dsc1OperationState.Submitting)
             {
-                observed = provider.ObserveDsc1Completion(record.ProviderSubmission);
-            }
-            catch (Exception exception)
-            {
-                PinDsc1Fault(record);
                 return KernelResult<PlatformDsc1TerminalObservation>.Fail(
-                    KernelError.PlatformFaulted,
-                    $"The DSC1 provider threw while observing completion; reservations remain pinned: {exception.Message}");
+                    KernelError.PlatformBindingDraining,
+                    "The exact DSC1 operation already has a provider transition in flight.");
             }
+            record.ProviderCallInFlight = true;
+            providerSubmission = record.ProviderSubmission;
+        }
 
+        providerBoundaryReady?.Invoke();
+
+        PlatformAuthorityResult<PlatformProviderDsc1Completion> observed;
+        try
+        {
+            observed = ((IPlatformDsc1ComputeProvider)_provider!)
+                .ObserveDsc1Completion(providerSubmission);
+        }
+        catch (Exception exception)
+        {
+            lock (_dsc1Gate) PinDsc1Fault(record);
+            return KernelResult<PlatformDsc1TerminalObservation>.Fail(
+                KernelError.PlatformFaulted,
+                $"The DSC1 provider threw while observing completion; reservations remain pinned: {exception.Message}");
+        }
+        lock (_dsc1Gate)
+        {
+            record.ProviderCallInFlight = false;
             return AcceptDsc1Completion(record, observed);
         }
     }
 
     internal KernelResult<PlatformDsc1TerminalObservation> CancelDsc1ModelCopy(
         PlatformDsc1CopySubmission submission,
-        PlatformDomainIdentity expectedSubject)
+        PlatformDomainIdentity expectedSubject,
+        Action? providerBoundaryReady = null)
     {
+        Dsc1OperationRecord record;
+        PlatformProviderDsc1Submission providerSubmission;
+        bool observeOnly;
         lock (_dsc1Gate)
         {
             var recordResult = ResolveDsc1Operation(submission, expectedSubject);
@@ -286,7 +335,7 @@ public sealed partial class PlatformAuthorityBridge
                     recordResult.Message!);
             }
 
-            var record = recordResult.Value!;
+            record = recordResult.Value!;
             if (TryGetDsc1Terminal(record, out var terminal))
                 return KernelResult<PlatformDsc1TerminalObservation>.Ok(terminal);
 
@@ -296,31 +345,39 @@ public sealed partial class PlatformAuthorityBridge
                     KernelError.PlatformFaulted,
                     "The DSC1 operation is fault-pinned and cannot prove cancellation closure.");
             }
-
-            var provider = (IPlatformDsc1ComputeProvider)_provider!;
-            PlatformAuthorityResult<PlatformProviderDsc1Completion> completion;
-            try
+            if (record.ProviderCallInFlight || record.State == Dsc1OperationState.Submitting)
             {
-                if (record.CancellationRequested)
-                {
-                    completion = provider.ObserveDsc1Completion(
-                        record.ProviderSubmission);
-                }
-                else
-                {
-                    completion = provider.CancelDsc1(record.ProviderSubmission);
-                    if (completion.IsSuccess)
-                        record.CancellationRequested = true;
-                }
-            }
-            catch (Exception exception)
-            {
-                PinDsc1Fault(record);
                 return KernelResult<PlatformDsc1TerminalObservation>.Fail(
-                    KernelError.PlatformFaulted,
-                    $"The DSC1 provider threw during cancellation/drain; reservations remain pinned: {exception.Message}");
+                    KernelError.PlatformBindingDraining,
+                    "The exact DSC1 operation already has a provider transition in flight.");
             }
+            observeOnly = record.CancellationRequested;
+            record.ProviderCallInFlight = true;
+            providerSubmission = record.ProviderSubmission;
+        }
 
+        providerBoundaryReady?.Invoke();
+
+        PlatformAuthorityResult<PlatformProviderDsc1Completion> completion;
+        try
+        {
+            var provider = (IPlatformDsc1ComputeProvider)_provider!;
+            completion = observeOnly
+                ? provider.ObserveDsc1Completion(providerSubmission)
+                : provider.CancelDsc1(providerSubmission);
+        }
+        catch (Exception exception)
+        {
+            lock (_dsc1Gate) PinDsc1Fault(record);
+            return KernelResult<PlatformDsc1TerminalObservation>.Fail(
+                KernelError.PlatformFaulted,
+                $"The DSC1 provider threw during cancellation/drain; reservations remain pinned: {exception.Message}");
+        }
+        lock (_dsc1Gate)
+        {
+            record.ProviderCallInFlight = false;
+            if (!observeOnly && completion.IsSuccess)
+                record.CancellationRequested = true;
             return AcceptDsc1Completion(record, completion);
         }
     }

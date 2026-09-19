@@ -21,7 +21,7 @@ public sealed class AdmissionVerifierTests
     [Theory]
     [InlineData("public static int Probe() => 1; public static object Probe(int value) => new object();")]
     [InlineData("public static object Probe(int value) => new object(); public static int Probe() => 1;")]
-    public void CrossAssemblyOverloadedCallCannotAuditTheWrongMethod(string methods)
+    public void CrossAssemblyOverloadedCallAuditsTheSignatureQualifiedMethod(string methods)
     {
         var directory = Path.Combine(AppContext.BaseDirectory, "qualification-fixtures", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(directory);
@@ -31,10 +31,9 @@ public sealed class AdmissionVerifierTests
         Emit("public static class External { " + methods + " }", "SingPlus.Overloaded", dependencyPath, null);
         Emit("public static class Fixture { public static object Root() => External.Probe(1); }", "AdmissionFixture",
             rootPath, [MetadataReference.CreateFromFile(dependencyPath)]);
-        var error = Assert.Throws<InvalidOperationException>(() =>
-            AdmissionVerifier.Verify(rootPath, "Fixture::Root", "KernelNoHeap"));
-        Assert.Contains("External::Probe", error.Message, StringComparison.Ordinal);
-        Assert.Contains("overloaded", error.Message, StringComparison.Ordinal);
+        var result = AdmissionVerifier.Verify(rootPath, "Fixture::Root", "KernelNoHeap");
+        Assert.Contains(result.Violations, violation =>
+            violation.Method.EndsWith("External::Probe", StringComparison.Ordinal) && violation.Operation == "newobj");
     }
 
     public static IEnumerable<object[]> ForbiddenCases()
@@ -314,12 +313,141 @@ public sealed class AdmissionVerifierTests
         Assert.Equal(first.Proof.SerializeCanonical(first.Violations), second.Proof.SerializeCanonical(second.Violations));
     }
 
-    private static CompiledFixture CompileFixture(string source, string assemblyName = "AdmissionFixture", IEnumerable<MetadataReference>? additionalReferences = null)
+    [Fact]
+    [Trait("Category", "Admission")]
+    public void ManagedCapAdmitsVersionedExactFrameworkMember()
+    {
+        using var fixture = CompileFixture("public static class Fixture { public static int Root(int value) => System.Math.Abs(value); }", allowUnsafe: false);
+
+        var result = AdmissionVerifier.Verify(fixture.AssemblyPath, "Fixture::Root", "ManagedCap");
+
+        Assert.True(result.IsAdmitted, string.Join(Environment.NewLine, result.Violations.Select(static v => v.CanonicalKey)));
+    }
+
+    [Fact]
+    public void ManagedCapRejectsHarmlessLookingUnclassifiedFrameworkMember()
+    {
+        using var fixture = CompileFixture("public static class Fixture { public static int Root(int value) => System.Math.Clamp(value, 0, 10); }");
+
+        var result = AdmissionVerifier.Verify(fixture.AssemblyPath, "Fixture::Root", "ManagedCap");
+
+        Assert.Contains(result.Violations, v => v.Operation == "unclassified-framework-member" && v.Detail.Contains("System.Math::Clamp", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ManagedCapScansForbiddenBodyOutsideRootReachability()
+    {
+        using var fixture = CompileFixture("public static unsafe class Fixture { public static int Root() => 1; private static int Hidden() { int* p = stackalloc int[1]; return p[0]; } }");
+
+        var result = AdmissionVerifier.Verify(fixture.AssemblyPath, "Fixture::Root", "ManagedCap");
+
+        Assert.Contains(result.Violations, v => v.Method.EndsWith("Fixture::Hidden", StringComparison.Ordinal) &&
+            v.Operation is "pointer-stackalloc" or "unmanaged-memory");
+    }
+
+    [Theory]
+    [InlineData("private static System.Reflection.Assembly Hidden() => System.Reflection.Assembly.Load(new byte[1]);", "forbidden-api")]
+    [InlineData("private static unsafe int Hidden(delegate*<int> target) => target();", "function-pointer-invoke")]
+    public void ManagedCapRejectsHiddenRuntimeExpansionAndFunctionPointers(string hiddenMethod, string operation)
+    {
+        using var fixture = CompileFixture("public static unsafe class Fixture { public static int Root() => 1; " + hiddenMethod + " }");
+
+        var result = AdmissionVerifier.Verify(fixture.AssemblyPath, "Fixture::Root", "ManagedCap");
+
+        Assert.Contains(result.Violations, v => v.Method.EndsWith("Fixture::Hidden", StringComparison.Ordinal) && v.Operation == operation);
+    }
+
+    [Fact]
+    public void ManagedCapScansModuleInitializerAndStaticConstructor()
+    {
+        const string source = "using System.Runtime.CompilerServices; public static class Fixture { [ModuleInitializer] public static void Init() => System.GC.Collect(); static Fixture() => System.Environment.FailFast(\"x\"); public static int Root() => 1; }";
+        using var fixture = CompileFixture(source);
+
+        var result = AdmissionVerifier.Verify(fixture.AssemblyPath, "Fixture::Root", "ManagedCap");
+
+        Assert.Contains(result.Violations, v => v.Method.EndsWith("Fixture::Init", StringComparison.Ordinal) && v.Operation == "forbidden-api");
+        Assert.Contains(result.Violations, v => v.Method.EndsWith("Fixture::.cctor", StringComparison.Ordinal) && v.Operation == "forbidden-api");
+    }
+
+    [Fact]
+    public void ManagedCapRejectsAmbientMutableReferenceStaticButNotValueStatic()
+    {
+        using var referenceFixture = CompileFixture("public static class Fixture { private static object State = new object(); public static int Root() => 1; }", allowUnsafe: false);
+        using var valueFixture = CompileFixture("public static class Fixture { private static int Count; public static int Root() => Count; }", allowUnsafe: false);
+
+        var rejected = AdmissionVerifier.Verify(referenceFixture.AssemblyPath, "Fixture::Root", "ManagedCap");
+        var admitted = AdmissionVerifier.Verify(valueFixture.AssemblyPath, "Fixture::Root", "ManagedCap");
+
+        Assert.Contains(rejected.Violations, v => v.Operation == "ambient-mutable-static-reference");
+        Assert.True(admitted.IsAdmitted, string.Join(Environment.NewLine, admitted.Violations.Select(static v => v.CanonicalKey)));
+    }
+
+    [Fact]
+    public void ManagedCapScansEveryMethodInLocalDependencyClosure()
+    {
+        var directory = Path.Combine(AppContext.BaseDirectory, "qualification-fixtures", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var dependencyPath = Path.Combine(directory, "SingPlus.ManagedLeaf.dll");
+        Emit("public static unsafe class Leaf { public static int Safe() => 1; private static int Hidden() { int* p = stackalloc int[1]; return p[0]; } }",
+            "SingPlus.ManagedLeaf", dependencyPath, null);
+        var rootPath = Path.Combine(directory, "AdmissionFixture.dll");
+        Emit("public static class Fixture { public static int Root() => Leaf.Safe(); }", "AdmissionFixture", rootPath,
+            [MetadataReference.CreateFromFile(dependencyPath)]);
+        using var fixture = new CompiledFixture(directory, rootPath);
+
+        var result = AdmissionVerifier.Verify(rootPath, "Fixture::Root", "ManagedCap");
+
+        Assert.Contains(result.Violations, v => v.Method.EndsWith("Leaf::Hidden", StringComparison.Ordinal) &&
+            v.Operation is "pointer-stackalloc" or "unmanaged-memory");
+    }
+
+    [Fact]
+    public void ManagedCapRejectsUndeclaredNativeAssetAndBindsItIntoDependencyEvidence()
+    {
+        using var fixture = CompileFixture("public static class Fixture { public static int Root() => 1; }");
+        var nativePath = Path.Combine(Path.GetDirectoryName(fixture.AssemblyPath)!, "hidden-native.dll");
+        File.WriteAllBytes(nativePath, [0x4d, 0x5a, 0x00, 0x01]);
+
+        var result = AdmissionVerifier.Verify(fixture.AssemblyPath, "Fixture::Root", "ManagedCap");
+
+        Assert.Contains(result.Violations, v => v.Operation == "undeclared-native-asset" && v.Detail == "hidden-native.dll");
+    }
+
+    [Fact]
+    public void UnknownAdmissionProfileFailsClosed()
+    {
+        using var fixture = CompileFixture("public static class Fixture { public static int Root() => 1; }");
+
+        var result = AdmissionVerifier.Verify(fixture.AssemblyPath, "Fixture::Root", "ManagedCapV2");
+
+        Assert.Contains(result.Violations, v => v.Operation == "unknown-profile-policy");
+    }
+
+    [Fact]
+    public void ManagedCapRejectsDriftedFrameworkReferenceVersion()
+    {
+        var directory = Path.Combine(AppContext.BaseDirectory, "qualification-fixtures", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var dependencyPath = Path.Combine(directory, "System.Future.dll");
+        Emit("[assembly:System.Reflection.AssemblyVersion(\"12.0.0.0\")] public static class FutureApi { public static int Value() => 1; }",
+            "System.Future", dependencyPath, null, allowUnsafe: false);
+        var rootPath = Path.Combine(directory, "AdmissionFixture.dll");
+        Emit("public static class Fixture { public static int Root() => FutureApi.Value(); }", "AdmissionFixture", rootPath,
+            [MetadataReference.CreateFromFile(dependencyPath)], allowUnsafe: false);
+        using var fixture = new CompiledFixture(directory, rootPath);
+        File.Delete(dependencyPath);
+
+        var result = AdmissionVerifier.Verify(rootPath, "Fixture::Root", "ManagedCap");
+
+        Assert.Contains(result.Violations, v => v.Operation == "unclassified-framework-version" && v.Detail == "System.Future|12.0.0.0");
+    }
+
+    private static CompiledFixture CompileFixture(string source, string assemblyName = "AdmissionFixture", IEnumerable<MetadataReference>? additionalReferences = null, bool allowUnsafe = true)
     {
         var directory = Path.Combine(AppContext.BaseDirectory, "qualification-fixtures", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(directory);
         var outputPath = Path.Combine(directory, assemblyName + ".dll");
-        Emit(source, assemblyName, outputPath, additionalReferences);
+        Emit(source, assemblyName, outputPath, additionalReferences, allowUnsafe);
         return new CompiledFixture(directory, outputPath);
     }
 
@@ -335,12 +463,12 @@ public sealed class AdmissionVerifierTests
         return new CompiledFixture(directory, rootPath);
     }
 
-    private static void Emit(string source, string assemblyName, string outputPath, IEnumerable<MetadataReference>? additionalReferences)
+    private static void Emit(string source, string assemblyName, string outputPath, IEnumerable<MetadataReference>? additionalReferences, bool allowUnsafe = true)
     {
         var references = AnalyzerTests.PlatformReferences().ToList();
         if (additionalReferences is not null) references.AddRange(additionalReferences);
         var tree = CSharpSyntaxTree.ParseText(source, new CSharpParseOptions(LanguageVersion.CSharp13));
-        var options = new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, optimizationLevel: OptimizationLevel.Release, allowUnsafe: true).WithDeterministic(true);
+        var options = new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, optimizationLevel: OptimizationLevel.Release, allowUnsafe: allowUnsafe).WithDeterministic(true);
         var compilation = CSharpCompilation.Create(assemblyName, new[] { tree }, references, options);
         var emit = compilation.Emit(outputPath);
         Assert.True(emit.Success, string.Join(Environment.NewLine, emit.Diagnostics));

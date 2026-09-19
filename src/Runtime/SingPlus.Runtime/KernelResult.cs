@@ -12,6 +12,8 @@ public enum KernelError
     DomainNotFound,
     InvalidTransition,
     CapabilityNotFound,
+    WrongAuthorityRealm,
+    ForgedCapability,
     WrongCapabilitySubject,
     InsufficientRights,
     CapabilityRevoked,

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using SingPlus.Contracts;
 using SingPlus.Sip;
 
@@ -36,6 +37,7 @@ public sealed class RegionAuthority
 
     private sealed class RegionRecord
     {
+        public object Gate { get; } = new();
         public required RegionId Id { get; init; }
         public required RegionGeneration Generation { get; set; }
         public required RegionOwner Owner { get; set; }
@@ -53,49 +55,71 @@ public sealed class RegionAuthority
         public Dictionary<RegionUseId, RegionUseRecord> Uses { get; } = [];
     }
 
-    private readonly Dictionary<RegionId, RegionRecord> _regions = [];
-    private ulong _nextRegionId = 1;
-    private ulong _nextRegionUseId = 1;
-    private ulong _nextBackingLeaseId = 1;
+    private readonly ConcurrentDictionary<RegionId, RegionRecord> _regions = [];
+    private readonly ConcurrentDictionary<RegionUseId, RegionRecord> _useIndex = [];
+    private long _nextRegionId;
+    private long _nextRegionUseId;
+    private long _nextBackingLeaseId;
 
     public KernelResult<RegionBackingLeaseDescriptor> ReserveBacking(RegionHandle handle, RegionOwner owner)
     {
-        var validation = Validate(handle, owner);
+        if (!_regions.TryGetValue(handle.RegionId, out var record))
+            return KernelResult<RegionBackingLeaseDescriptor>.Fail(KernelError.RegionNotFound, "Region was not found.");
+        lock (record.Gate)
+        {
+        var validation = ValidateCore(record, handle, owner, RegionState.Owned);
         if (!validation.IsSuccess) return KernelResult<RegionBackingLeaseDescriptor>.Fail(validation.Error, validation.Message!);
-        var record = _regions[handle.RegionId];
         if (record.BackingLease is not null)
             return KernelResult<RegionBackingLeaseDescriptor>.Fail(KernelError.PlatformBindingActive, "The region already has an active backing lease.");
-        if (_nextBackingLeaseId == 0)
+        var identity = Interlocked.Increment(ref _nextBackingLeaseId);
+        if (identity <= 0)
             return KernelResult<RegionBackingLeaseDescriptor>.Fail(KernelError.CapacityExhausted, "Backing lease identity space is exhausted.");
-        var lease = new RegionBackingLeaseDescriptor(new(new(_nextBackingLeaseId++), 1), handle, owner, record.ByteLength);
+        var lease = new RegionBackingLeaseDescriptor(new(new(checked((ulong)identity)), 1), handle, owner, record.ByteLength);
         record.BackingLease = lease;
         return KernelResult<RegionBackingLeaseDescriptor>.Ok(lease);
+        }
     }
 
     public KernelResult<RegionBackingLeaseDescriptor> ValidateBacking(RegionBackingLeaseHandle handle, RegionOwner owner)
     {
-        var record = _regions.Values.SingleOrDefault(item => item.BackingLease?.Handle.LeaseId == handle.LeaseId);
-        if (record?.BackingLease is not { } lease)
+        var record = _regions.Values.FirstOrDefault(item =>
+        {
+            lock (item.Gate) return item.BackingLease?.Handle.LeaseId == handle.LeaseId;
+        });
+        if (record is null)
+            return KernelResult<RegionBackingLeaseDescriptor>.Fail(KernelError.PlatformBindingNotFound, "Region backing lease was not found.");
+        lock (record.Gate)
+        {
+        if (record.BackingLease is not { } lease)
             return KernelResult<RegionBackingLeaseDescriptor>.Fail(KernelError.PlatformBindingNotFound, "Region backing lease was not found.");
         if (lease.Handle != handle || lease.Region.Generation != record.Generation)
             return KernelResult<RegionBackingLeaseDescriptor>.Fail(KernelError.StaleGeneration, "Region backing lease generation is stale.");
         if (lease.Owner != owner)
             return KernelResult<RegionBackingLeaseDescriptor>.Fail(KernelError.WrongRegionOwner, "Region backing lease owner does not match.");
         return KernelResult<RegionBackingLeaseDescriptor>.Ok(lease);
+        }
     }
 
     public KernelResult ReleaseBacking(RegionBackingLeaseHandle handle, RegionOwner owner)
     {
         var validation = ValidateBacking(handle, owner);
         if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
-        _regions[validation.Value!.Region.RegionId].BackingLease = null;
+        var record = _regions[validation.Value!.Region.RegionId];
+        lock (record.Gate)
+        {
+            if (record.BackingLease?.Handle != handle)
+                return KernelResult.Fail(KernelError.StaleGeneration, "Region backing lease changed before release.");
+            record.BackingLease = null;
+        }
         return KernelResult.Ok();
     }
 
     internal RegionDescriptor Allocate(RegionOwner owner, long byteLength, string elementType)
     {
         if (byteLength <= 0) throw new ArgumentOutOfRangeException(nameof(byteLength));
-        var id = new RegionId(_nextRegionId++);
+        var identity = Interlocked.Increment(ref _nextRegionId);
+        if (identity <= 0) throw new InvalidOperationException("Region identity space is exhausted.");
+        var id = new RegionId(checked((ulong)identity));
         var record = new RegionRecord
         {
             Id = id,
@@ -107,7 +131,8 @@ public sealed class RegionAuthority
             MutationEpoch = new MutationEpoch(1),
             BorrowGeneration = new BorrowLeaseGeneration(0)
         };
-        _regions.Add(id, record);
+        if (!_regions.TryAdd(id, record))
+            throw new InvalidOperationException("Region identity collision.");
         record.State = RegionState.Owned;
         return Descriptor(record);
     }
@@ -115,6 +140,11 @@ public sealed class RegionAuthority
     public KernelResult<RegionDescriptor> Validate(RegionHandle handle, RegionOwner owner, RegionState requiredState = RegionState.Owned)
     {
         if (!_regions.TryGetValue(handle.RegionId, out var record)) return KernelResult<RegionDescriptor>.Fail(KernelError.RegionNotFound, $"Region {handle.RegionId.Value} was not found.");
+        lock (record.Gate) return ValidateCore(record, handle, owner, requiredState);
+    }
+
+    private static KernelResult<RegionDescriptor> ValidateCore(RegionRecord record, RegionHandle handle, RegionOwner owner, RegionState requiredState)
+    {
         if (record.Generation != handle.Generation) return KernelResult<RegionDescriptor>.Fail(KernelError.StaleGeneration, "Region generation is stale.");
         if (record.Owner != owner) return KernelResult<RegionDescriptor>.Fail(KernelError.WrongRegionOwner, "Region owner does not match.");
         if (record.State != requiredState) return KernelResult<RegionDescriptor>.Fail(KernelError.InvalidRegionState, $"Expected {requiredState}, got {record.State}.");
@@ -132,9 +162,12 @@ public sealed class RegionAuthority
     internal KernelResult<BorrowLeaseGrant> AcquireLoan(RegionHandle handle, RegionOwner owner, RegionOwner borrower)
     {
         if (owner == borrower) return KernelResult<BorrowLeaseGrant>.Fail(KernelError.InvalidRegionState, "A region cannot be loaned to its owner.");
-        var validation = Validate(handle, owner);
+        if (!_regions.TryGetValue(handle.RegionId, out var record))
+            return KernelResult<BorrowLeaseGrant>.Fail(KernelError.RegionNotFound, "Region was not found.");
+        lock (record.Gate)
+        {
+        var validation = ValidateCore(record, handle, owner, RegionState.Owned);
         if (!validation.IsSuccess) return KernelResult<BorrowLeaseGrant>.Fail(validation.Error, validation.Message!);
-        var record = _regions[handle.RegionId];
         if (record.PlatformMappingReserved) return KernelResult<BorrowLeaseGrant>.Fail(KernelError.PlatformBindingActive, "An owned region with an active platform mapping cannot be loaned.");
         if (record.ExternalBorrowReadGrantReserved) return KernelResult<BorrowLeaseGrant>.Fail(KernelError.PlatformBindingActive, "An owned region with an active external borrow read grant cannot be loaned.");
         if (record.BackingLease is not null) return KernelResult<BorrowLeaseGrant>.Fail(KernelError.PlatformBindingActive, "An owned region with an active backing lease cannot be loaned.");
@@ -151,6 +184,7 @@ public sealed class RegionAuthority
         record.BorrowLifetime = lifetime;
         record.State = RegionState.Loaned;
         return KernelResult<BorrowLeaseGrant>.Ok(new BorrowLeaseGrant(lease, lifetime));
+        }
     }
 
     internal KernelResult<BorrowLeaseAuthoritySnapshot> ValidateBorrowLease(
@@ -160,6 +194,8 @@ public sealed class RegionAuthority
     {
         if (!_regions.TryGetValue(lease.Region.RegionId, out var record))
             return KernelResult<BorrowLeaseAuthoritySnapshot>.Fail(KernelError.RegionNotFound, "Region was not found.");
+        lock (record.Gate)
+        {
         if (record.Generation != lease.Region.Generation)
             return KernelResult<BorrowLeaseAuthoritySnapshot>.Fail(KernelError.StaleGeneration, "Region generation is stale.");
         if (record.BorrowGeneration != lease.Generation)
@@ -176,6 +212,7 @@ public sealed class RegionAuthority
                 borrower,
                 record.ByteLength,
                 record.BorrowLifetime));
+        }
     }
 
     internal KernelResult ReserveExternalBorrowReadGrant(
@@ -183,15 +220,18 @@ public sealed class RegionAuthority
         RegionOwner owner,
         RegionOwner borrower)
     {
+        if (!_regions.TryGetValue(lease.Region.RegionId, out var record)) return KernelResult.Fail(KernelError.RegionNotFound, "Region was not found.");
+        lock (record.Gate)
+        {
         var validation = ValidateBorrowLease(lease, owner, borrower);
         if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
-        var record = _regions[lease.Region.RegionId];
         if (record.PlatformMappingReserved)
             return KernelResult.Fail(KernelError.PlatformBindingActive, "The borrowed region already has an owned-region platform mapping reservation.");
         if (record.ExternalBorrowReadGrantReserved)
             return KernelResult.Fail(KernelError.PlatformBindingActive, "The borrow lease already has an active external read grant.");
         record.ExternalBorrowReadGrantReserved = true;
         return KernelResult.Ok();
+        }
     }
 
     internal KernelResult ReleaseExternalBorrowReadGrantReservation(
@@ -200,20 +240,25 @@ public sealed class RegionAuthority
         RegionOwner borrower,
         BorrowLeaseLifetime expectedLifetime)
     {
+        if (!_regions.TryGetValue(lease.Region.RegionId, out var record)) return KernelResult.Fail(KernelError.RegionNotFound, "Region was not found.");
+        lock (record.Gate)
+        {
         var validation = ValidateBorrowLease(lease, owner, borrower);
         if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
-        var record = _regions[lease.Region.RegionId];
         if (!ReferenceEquals(record.BorrowLifetime, expectedLifetime))
             return KernelResult.Fail(KernelError.StaleGeneration, "Borrow lease lifetime is stale.");
         if (!record.ExternalBorrowReadGrantReserved)
             return KernelResult.Fail(KernelError.PlatformBindingNotFound, "The borrow lease does not have an active external read grant reservation.");
         record.ExternalBorrowReadGrantReserved = false;
         return KernelResult.Ok();
+        }
     }
 
     public KernelResult ReturnLoan(BorrowLeaseHandle lease, RegionOwner borrower)
     {
         if (!_regions.TryGetValue(lease.Region.RegionId, out var record)) return KernelResult.Fail(KernelError.RegionNotFound, "Region was not found.");
+        lock (record.Gate)
+        {
         if (record.Generation != lease.Region.Generation) return KernelResult.Fail(KernelError.StaleGeneration, "Region generation is stale.");
         if (record.BorrowGeneration != lease.Generation) return KernelResult.Fail(KernelError.StaleGeneration, "Borrow lease generation is stale.");
         if (record.State != RegionState.Loaned || record.Borrower != borrower || record.BorrowLifetime is null) return KernelResult.Fail(KernelError.InvalidRegionState, "Borrow lease is not active for the specified borrower.");
@@ -225,11 +270,14 @@ public sealed class RegionAuthority
         record.Borrower = null;
         record.State = RegionState.Owned;
         return KernelResult.Ok();
+        }
     }
 
     public KernelResult RevokeLoan(BorrowLeaseHandle lease, RegionOwner owner)
     {
         if (!_regions.TryGetValue(lease.Region.RegionId, out var record)) return KernelResult.Fail(KernelError.RegionNotFound, "Region was not found.");
+        lock (record.Gate)
+        {
         if (record.Generation != lease.Region.Generation) return KernelResult.Fail(KernelError.StaleGeneration, "Region generation is stale.");
         if (record.BorrowGeneration != lease.Generation) return KernelResult.Fail(KernelError.StaleGeneration, "Borrow lease generation is stale.");
         if (record.Owner != owner) return KernelResult.Fail(KernelError.WrongRegionOwner, "Region owner does not match.");
@@ -242,13 +290,16 @@ public sealed class RegionAuthority
         record.Borrower = null;
         record.State = RegionState.Owned;
         return KernelResult.Ok();
+        }
     }
 
     internal KernelResult ReservePlatformMapping(RegionHandle handle, RegionOwner owner)
     {
-        var validation = Validate(handle, owner);
+        if (!_regions.TryGetValue(handle.RegionId, out var record)) return KernelResult.Fail(KernelError.RegionNotFound, "Region was not found.");
+        lock (record.Gate)
+        {
+        var validation = ValidateCore(record, handle, owner, RegionState.Owned);
         if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
-        var record = _regions[handle.RegionId];
         if (record.PlatformMappingReserved) return KernelResult.Fail(KernelError.PlatformBindingActive, "The owned region already has an active platform mapping.");
         if (record.ExternalBorrowReadGrantReserved) return KernelResult.Fail(KernelError.PlatformBindingActive, "The region has an active external borrow read grant.");
         if (record.Uses.Values.Any(use => use.State == RegionUseState.Active &&
@@ -257,29 +308,37 @@ public sealed class RegionAuthority
             return KernelResult.Fail(KernelError.RegionUseConflict, "The whole region has an incompatible active use and cannot acquire a separate platform mapping reservation.");
         record.PlatformMappingReserved = true;
         return KernelResult.Ok();
+        }
     }
 
     internal KernelResult ReleasePlatformMappingReservation(RegionHandle handle, RegionOwner owner)
     {
-        var validation = Validate(handle, owner);
+        if (!_regions.TryGetValue(handle.RegionId, out var record)) return KernelResult.Fail(KernelError.RegionNotFound, "Region was not found.");
+        lock (record.Gate)
+        {
+        var validation = ValidateCore(record, handle, owner, RegionState.Owned);
         if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
-        var record = _regions[handle.RegionId];
         if (!record.PlatformMappingReserved) return KernelResult.Fail(KernelError.PlatformBindingNotFound, "The owned region does not have an active platform mapping.");
         record.PlatformMappingReserved = false;
         return KernelResult.Ok();
+        }
     }
 
     internal bool HasPlatformMappingReservation(RegionHandle handle, RegionOwner owner)
     {
-        var validation = Validate(handle, owner);
-        return validation.IsSuccess && _regions[handle.RegionId].PlatformMappingReserved;
+        if (!_regions.TryGetValue(handle.RegionId, out var record)) return false;
+        lock (record.Gate)
+            return ValidateCore(record, handle, owner, RegionState.Owned).IsSuccess && record.PlatformMappingReserved;
     }
 
     internal KernelResult<RegionHandle> Transfer(RegionHandle handle, RegionOwner source, RegionOwner target)
     {
-        var validation = Validate(handle, source);
+        if (!_regions.TryGetValue(handle.RegionId, out var record))
+            return KernelResult<RegionHandle>.Fail(KernelError.RegionNotFound, "Region was not found.");
+        lock (record.Gate)
+        {
+        var validation = ValidateCore(record, handle, source, RegionState.Owned);
         if (!validation.IsSuccess) return KernelResult<RegionHandle>.Fail(validation.Error, validation.Message!);
-        var record = _regions[handle.RegionId];
         if (record.PlatformMappingReserved) return KernelResult<RegionHandle>.Fail(KernelError.PlatformBindingActive, "An owned region with an active platform mapping cannot be transferred.");
         if (record.ExternalBorrowReadGrantReserved) return KernelResult<RegionHandle>.Fail(KernelError.PlatformBindingActive, "A region with an active external borrow read grant cannot be transferred.");
         if (record.BackingLease is not null) return KernelResult<RegionHandle>.Fail(KernelError.PlatformBindingActive, "A region with an active backing lease cannot be transferred.");
@@ -292,13 +351,17 @@ public sealed class RegionAuthority
         record.Generation = new RegionGeneration(record.Generation.Value + 1);
         record.State = RegionState.Owned;
         return KernelResult<RegionHandle>.Ok(new RegionHandle(record.Id, record.Generation));
+        }
     }
 
     internal KernelResult Release(RegionHandle handle, RegionOwner owner)
     {
-        var validation = Validate(handle, owner);
+        if (!_regions.TryGetValue(handle.RegionId, out var record))
+            return KernelResult.Fail(KernelError.RegionNotFound, "Region was not found.");
+        lock (record.Gate)
+        {
+        var validation = ValidateCore(record, handle, owner, RegionState.Owned);
         if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
-        var record = _regions[handle.RegionId];
         if (record.PlatformMappingReserved) return KernelResult.Fail(KernelError.PlatformBindingActive, "An owned region with an active platform mapping cannot be released.");
         if (record.ExternalBorrowReadGrantReserved) return KernelResult.Fail(KernelError.PlatformBindingActive, "A region with an active external borrow read grant cannot be released.");
         if (record.BackingLease is not null) return KernelResult.Fail(KernelError.PlatformBindingActive, "A region with an active backing lease cannot be released.");
@@ -308,17 +371,24 @@ public sealed class RegionAuthority
         record.State = RegionState.Released;
         record.Payload = null;
         return KernelResult.Ok();
+        }
     }
 
-    internal void RegisterPayload(RegionHandle handle, ITransferableOwnedPayload payload) =>
-        _regions[handle.RegionId].Payload = payload;
+    internal void RegisterPayload(RegionHandle handle, ITransferableOwnedPayload payload)
+    {
+        var record = _regions[handle.RegionId];
+        lock (record.Gate) record.Payload = payload;
+    }
 
     internal void ReplacePayload(RegionHandle oldHandle, RegionHandle newHandle, ITransferableOwnedPayload payload)
     {
         var record = _regions[newHandle.RegionId];
+        lock (record.Gate)
+        {
         if (record.Generation != newHandle.Generation || oldHandle.RegionId != newHandle.RegionId)
             throw new InvalidOperationException("Region payload handle does not match the authoritative record.");
         record.Payload = payload;
+        }
     }
 
     public KernelResult<RegionUseDescriptor> AcquireUse(
@@ -327,11 +397,52 @@ public sealed class RegionAuthority
         RegionUseMode mode,
         RegionUseRange range)
     {
-        var validation = Validate(handle, principal);
+        if (!_regions.TryGetValue(handle.RegionId, out var record))
+            return KernelResult<RegionUseDescriptor>.Fail(KernelError.RegionNotFound, "Region was not found.");
+        lock (record.Gate)
+        {
+        var validation = ValidateCore(record, handle, principal, RegionState.Owned);
         if (!validation.IsSuccess)
             return KernelResult<RegionUseDescriptor>.Fail(validation.Error, validation.Message!);
 
-        return AcquireUseCore(_regions[handle.RegionId], principal, mode, range);
+        return AcquireUseCore(record, principal, mode, range);
+        }
+    }
+
+    internal KernelResult<RegionUseDescriptor> AcquireTypedUse(
+        RegionHandle handle,
+        RegionOwner principal,
+        RegionUseMode mode,
+        long elementOffset,
+        long elementLength,
+        int elementSize,
+        string elementType)
+    {
+        if (elementOffset < 0 || elementLength <= 0 || elementSize <= 0)
+            return KernelResult<RegionUseDescriptor>.Fail(KernelError.InvalidRegionState, "Typed region-use range is invalid.");
+        long byteOffset;
+        long byteLength;
+        try
+        {
+            byteOffset = checked(elementOffset * elementSize);
+            byteLength = checked(elementLength * elementSize);
+        }
+        catch (OverflowException)
+        {
+            return KernelResult<RegionUseDescriptor>.Fail(KernelError.InvalidRegionState, "Typed region-use byte arithmetic overflowed.");
+        }
+
+        if (!_regions.TryGetValue(handle.RegionId, out var record))
+            return KernelResult<RegionUseDescriptor>.Fail(KernelError.RegionNotFound, "Region was not found.");
+        lock (record.Gate)
+        {
+            var validation = ValidateCore(record, handle, principal, RegionState.Owned);
+            if (!validation.IsSuccess)
+                return KernelResult<RegionUseDescriptor>.Fail(validation.Error, validation.Message!);
+            if (!StringComparer.Ordinal.Equals(record.ElementType, elementType) || record.ByteLength % elementSize != 0)
+                return KernelResult<RegionUseDescriptor>.Fail(KernelError.InvalidRegionState, "Typed region-use element type or alignment does not match the Region.");
+            return AcquireUseCore(record, principal, mode, new RegionUseRange(byteOffset, byteLength));
+        }
     }
 
     public KernelResult ProbeUse(
@@ -340,27 +451,40 @@ public sealed class RegionAuthority
         RegionUseMode mode,
         RegionUseRange range)
     {
-        var validation = Validate(handle, principal);
+        if (!_regions.TryGetValue(handle.RegionId, out var record)) return KernelResult.Fail(KernelError.RegionNotFound, "Region was not found.");
+        lock (record.Gate)
+        {
+        var validation = ValidateCore(record, handle, principal, RegionState.Owned);
         if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
-        return ValidateUseRequest(_regions[handle.RegionId], mode, range);
+        return ValidateUseRequest(record, mode, range);
+        }
     }
 
     internal KernelResult ProbeUseForExactPlatformMapping(RegionHandle handle, RegionOwner principal,
         RegionUseMode mode, RegionUseRange range)
     {
-        var validation = Validate(handle, principal);
+        if (!_regions.TryGetValue(handle.RegionId, out var record)) return KernelResult.Fail(KernelError.RegionNotFound, "Region was not found.");
+        lock (record.Gate)
+        {
+        var validation = ValidateCore(record, handle, principal, RegionState.Owned);
         if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
-        return ValidateUseRequest(_regions[handle.RegionId], mode, range, allowPlatformMappingReservation: true);
+        return ValidateUseRequest(record, mode, range, allowPlatformMappingReservation: true);
+        }
     }
 
     internal KernelResult<RegionUseDescriptor> AcquireUseForExactPlatformMapping(RegionHandle handle,
         RegionOwner principal, RegionUseMode mode, RegionUseRange range)
     {
-        var validation = Validate(handle, principal);
+        if (!_regions.TryGetValue(handle.RegionId, out var record))
+            return KernelResult<RegionUseDescriptor>.Fail(KernelError.RegionNotFound, "Region was not found.");
+        lock (record.Gate)
+        {
+        var validation = ValidateCore(record, handle, principal, RegionState.Owned);
         if (!validation.IsSuccess)
             return KernelResult<RegionUseDescriptor>.Fail(validation.Error, validation.Message!);
-        return AcquireUseCore(_regions[handle.RegionId], principal, mode, range,
+        return AcquireUseCore(record, principal, mode, range,
             allowPlatformMappingReservation: true);
+        }
     }
 
     public KernelResult<RegionUseDescriptor> AcquireBorrowUse(
@@ -370,6 +494,10 @@ public sealed class RegionAuthority
         RegionUseMode mode,
         RegionUseRange range)
     {
+        if (!_regions.TryGetValue(lease.Region.RegionId, out var record))
+            return KernelResult<RegionUseDescriptor>.Fail(KernelError.RegionNotFound, "Region was not found.");
+        lock (record.Gate)
+        {
         var validation = ValidateBorrowLease(lease, owner, borrower);
         if (!validation.IsSuccess)
             return KernelResult<RegionUseDescriptor>.Fail(validation.Error, validation.Message!);
@@ -380,7 +508,8 @@ public sealed class RegionAuthority
                 "A read-only borrow lease cannot authorize a writable region use.");
         }
 
-        return AcquireUseCore(_regions[lease.Region.RegionId], borrower, mode, range);
+        return AcquireUseCore(record, borrower, mode, range);
+        }
     }
 
     public KernelResult<RegionUseDescriptor> ValidateUse(
@@ -392,6 +521,8 @@ public sealed class RegionAuthority
             return KernelResult<RegionUseDescriptor>.Fail(lookup.Error, lookup.Message!);
 
         var (region, use) = lookup.Value!;
+        lock (region.Gate)
+        {
         if (use.Principal != principal)
         {
             return KernelResult<RegionUseDescriptor>.Fail(
@@ -405,8 +536,7 @@ public sealed class RegionAuthority
                 "Region use has been released.");
         }
         if (use.State == RegionUseState.Invalidated ||
-            use.Region.Generation != region.Generation ||
-            use.MutationEpoch != region.MutationEpoch)
+            use.Region.Generation != region.Generation)
         {
             return KernelResult<RegionUseDescriptor>.Fail(
                 KernelError.StaleGeneration,
@@ -414,6 +544,7 @@ public sealed class RegionAuthority
         }
 
         return KernelResult<RegionUseDescriptor>.Ok(UseDescriptor(use));
+        }
     }
 
     public KernelResult ReleaseUse(RegionUseHandle handle, RegionOwner principal)
@@ -422,15 +553,18 @@ public sealed class RegionAuthority
         if (!lookup.IsSuccess) return KernelResult.Fail(lookup.Error, lookup.Message!);
 
         var (region, use) = lookup.Value!;
+        lock (region.Gate)
+        {
         if (use.Principal != principal)
             return KernelResult.Fail(KernelError.WrongRegionOwner, "Region use principal does not match.");
         if (use.State == RegionUseState.Released) return KernelResult.Ok();
 
         use.State = RegionUseState.Released;
-        if (!IsWriteMode(use.Mode) || use.MutationEpoch != region.MutationEpoch)
+        if (!IsWriteMode(use.Mode))
             return KernelResult.Ok();
 
-        return AdvanceMutation(region);
+        return AdvanceMutation(region, invalidateActiveUses: false);
+        }
     }
 
     public KernelResult InvalidateUse(RegionUseHandle handle, RegionOwner principal)
@@ -439,41 +573,40 @@ public sealed class RegionAuthority
         if (!lookup.IsSuccess) return KernelResult.Fail(lookup.Error, lookup.Message!);
 
         var (region, use) = lookup.Value!;
+        lock (region.Gate)
+        {
         if (use.Principal != principal)
             return KernelResult.Fail(KernelError.WrongRegionOwner, "Region use principal does not match.");
         if (use.State != RegionUseState.Active) return KernelResult.Ok();
 
         use.State = RegionUseState.Invalidated;
-        if (!IsWriteMode(use.Mode) || use.MutationEpoch != region.MutationEpoch)
+        if (!IsWriteMode(use.Mode))
             return KernelResult.Ok();
 
-        return AdvanceMutation(region);
+        return AdvanceMutation(region, invalidateActiveUses: false);
+        }
     }
 
     public IReadOnlyList<RegionUseDescriptor> SnapshotUses() =>
-        _regions.Values
-            .SelectMany(static region => region.Uses.Values)
-            .Select(UseDescriptor)
-            .OrderBy(static use => use.Handle.UseId.Value)
-            .ToArray();
+        OrderedRecords().SelectMany(SnapshotUses).OrderBy(static use => use.Handle.UseId.Value).ToArray();
 
     internal IReadOnlyList<RegionHandle> ReturnAllLoansForBorrowerDomain(DomainId borrowerDomainId)
     {
-        var candidates = _regions.Values
-            .Where(r => r.State == RegionState.Loaned && r.Borrower?.DomainId == borrowerDomainId)
-            .ToArray();
-        if (candidates.Any(static r => r.ExternalBorrowReadGrantReserved))
-            throw new InvalidOperationException("External borrow read grants must reach verified closure before borrower-domain loan reclaim.");
-
         var returned = new List<RegionHandle>();
-        foreach (var record in candidates)
+        foreach (var record in OrderedRecords())
         {
+            lock (record.Gate)
+            {
+            if (record.State != RegionState.Loaned || record.Borrower?.DomainId != borrowerDomainId) continue;
+            if (record.ExternalBorrowReadGrantReserved)
+                throw new InvalidOperationException("External borrow read grants must reach verified closure before borrower-domain loan reclaim.");
             returned.Add(new RegionHandle(record.Id, record.Generation));
             AdvanceMutationOrThrow(record);
             record.BorrowLifetime?.InvalidateForRuntime();
             record.BorrowLifetime = null;
             record.Borrower = null;
             record.State = RegionState.Owned;
+            }
         }
         return returned.OrderBy(static h => h.RegionId.Value).ToArray();
     }
@@ -481,8 +614,11 @@ public sealed class RegionAuthority
     internal IReadOnlyList<RegionHandle> ReclaimAllForDomain(DomainId domainId)
     {
         var reclaimed = new List<RegionHandle>();
-        foreach (var record in _regions.Values.Where(r => r.Owner.DomainId == domainId && r.State is RegionState.Owned or RegionState.Loaned))
+        foreach (var record in OrderedRecords())
         {
+            lock (record.Gate)
+            {
+            if (record.Owner.DomainId != domainId || record.State is not (RegionState.Owned or RegionState.Loaned)) continue;
             if (record.PlatformMappingReserved) throw new InvalidOperationException("Platform-mapped regions must be revoked before domain reclaim.");
             if (record.ExternalBorrowReadGrantReserved) throw new InvalidOperationException("External borrow read grants must be revoked before domain reclaim.");
             if (record.BackingLease is not null) throw new InvalidOperationException("External backing leases must reach verified closure before domain reclaim.");
@@ -494,16 +630,33 @@ public sealed class RegionAuthority
             record.Payload = null;
             record.Borrower = null;
             record.State = RegionState.Released;
+            }
         }
         return reclaimed.OrderBy(static h => h.RegionId.Value).ToArray();
     }
 
-    public IReadOnlyList<RegionDescriptor> Snapshot() => _regions.Values.Select(Descriptor).OrderBy(static d => d.Handle.RegionId.Value).ToArray();
+    public IReadOnlyList<RegionDescriptor> Snapshot() => OrderedRecords().Select(Snapshot).ToArray();
 
     internal RegionAuthorityInspectionRecord[] InspectionSnapshot() =>
-        _regions.Values
-            .OrderBy(static record => record.Id.Value)
-            .Select(static record => new RegionAuthorityInspectionRecord(
+        OrderedRecords()
+            .Select(SnapshotInspection)
+            .ToArray();
+
+    private RegionRecord[] OrderedRecords() => _regions.Values.OrderBy(static record => record.Id.Value).ToArray();
+
+    private static RegionDescriptor Snapshot(RegionRecord record)
+    {
+        lock (record.Gate) return Descriptor(record);
+    }
+
+    private static RegionUseDescriptor[] SnapshotUses(RegionRecord record)
+    {
+        lock (record.Gate) return record.Uses.Values.Select(UseDescriptor).ToArray();
+    }
+
+    private static RegionAuthorityInspectionRecord SnapshotInspection(RegionRecord record)
+    {
+        lock (record.Gate) return new RegionAuthorityInspectionRecord(
                 Descriptor(record),
                 record.State == RegionState.Loaned && record.Borrower is not null
                     ? new BorrowLeaseHandle(new RegionHandle(record.Id, record.Generation), record.BorrowGeneration)
@@ -512,8 +665,8 @@ public sealed class RegionAuthority
                 record.BackingLease,
                 record.PlatformMappingReserved,
                 record.ExternalBorrowReadGrantReserved,
-                record.Uses.Values.OrderBy(static use => use.Handle.UseId.Value).Select(UseDescriptor).ToArray()))
-            .ToArray();
+                record.Uses.Values.OrderBy(static use => use.Handle.UseId.Value).Select(UseDescriptor).ToArray());
+    }
 
     private KernelResult<RegionUseDescriptor> AcquireUseCore(
         RegionRecord record,
@@ -525,19 +678,20 @@ public sealed class RegionAuthority
         var requestValidation = ValidateUseRequest(record, mode, range, allowPlatformMappingReservation);
         if (!requestValidation.IsSuccess)
             return KernelResult<RegionUseDescriptor>.Fail(requestValidation.Error, requestValidation.Message!);
-        if (_nextRegionUseId == 0)
+        var identity = Interlocked.Increment(ref _nextRegionUseId);
+        if (identity <= 0)
             return KernelResult<RegionUseDescriptor>.Fail(KernelError.CapacityExhausted, "Region use identity space is exhausted.");
 
         if (IsWriteMode(mode))
         {
-            var mutation = AdvanceMutation(record);
+            var mutation = AdvanceMutation(record, invalidateActiveUses: false);
             if (!mutation.IsSuccess)
                 return KernelResult<RegionUseDescriptor>.Fail(mutation.Error, mutation.Message!);
         }
 
         var use = new RegionUseRecord
         {
-            Handle = new RegionUseHandle(new RegionUseId(_nextRegionUseId++), 1),
+            Handle = new RegionUseHandle(new RegionUseId(checked((ulong)identity)), 1),
             Region = new RegionHandle(record.Id, record.Generation),
             Principal = principal,
             Range = range,
@@ -546,6 +700,8 @@ public sealed class RegionAuthority
             State = RegionUseState.Active
         };
         record.Uses.Add(use.Handle.UseId, use);
+        if (!_useIndex.TryAdd(use.Handle.UseId, record))
+            throw new InvalidOperationException("Region use identity collision.");
         return KernelResult<RegionUseDescriptor>.Ok(UseDescriptor(use));
     }
 
@@ -568,10 +724,9 @@ public sealed class RegionAuthority
 
         var activeUses = record.Uses.Values.Where(use =>
             use.State == RegionUseState.Active &&
-            use.MutationEpoch == record.MutationEpoch &&
             use.Region.Generation == record.Generation);
-        return activeUses.Any(existing => !AreCompatible(existing.Mode, mode))
-            ? KernelResult.Fail(KernelError.RegionUseConflict, "The whole region already has an incompatible active use.")
+        return activeUses.Any(existing => RangesOverlap(existing.Range, range) && !AreCompatible(existing.Mode, mode))
+            ? KernelResult.Fail(KernelError.RegionUseConflict, "The requested subrange overlaps an incompatible active use.")
             : KernelResult.Ok();
     }
 
@@ -580,10 +735,13 @@ public sealed class RegionAuthority
         if (handle.UseId.Value == 0 || handle.Generation != 1)
             return KernelResult<(RegionRecord, RegionUseRecord)>.Fail(KernelError.RegionUseNotFound, "Region use handle is invalid.");
 
-        foreach (var region in _regions.Values)
+        if (_useIndex.TryGetValue(handle.UseId, out var region))
         {
-            if (region.Uses.TryGetValue(handle.UseId, out var use) && use.Handle == handle)
-                return KernelResult<(RegionRecord, RegionUseRecord)>.Ok((region, use));
+            lock (region.Gate)
+            {
+                if (region.Uses.TryGetValue(handle.UseId, out var use) && use.Handle == handle)
+                    return KernelResult<(RegionRecord, RegionUseRecord)>.Ok((region, use));
+            }
         }
 
         return KernelResult<(RegionRecord, RegionUseRecord)>.Fail(KernelError.RegionUseNotFound, "Region use was not found.");
@@ -593,6 +751,13 @@ public sealed class RegionAuthority
         range.Offset >= 0 &&
         range.Length > 0 &&
         range.Offset <= record.ByteLength - range.Length;
+
+    private static bool RangesOverlap(RegionUseRange left, RegionUseRange right)
+    {
+        var leftEnd = checked(left.Offset + left.Length);
+        var rightEnd = checked(right.Offset + right.Length);
+        return left.Offset < rightEnd && right.Offset < leftEnd;
+    }
 
     private static bool IsWriteMode(RegionUseMode mode) => mode is
         RegionUseMode.ExclusiveWrite or
@@ -605,22 +770,23 @@ public sealed class RegionAuthority
 
     private static bool HasActiveUse(RegionRecord record) => record.Uses.Values.Any(use =>
         use.State == RegionUseState.Active &&
-        use.MutationEpoch == record.MutationEpoch &&
         use.Region.Generation == record.Generation);
 
     private static bool HasActiveWriteUse(RegionRecord record) => record.Uses.Values.Any(use =>
         use.State == RegionUseState.Active &&
-        use.MutationEpoch == record.MutationEpoch &&
         use.Region.Generation == record.Generation &&
         IsWriteMode(use.Mode));
 
-    private static KernelResult AdvanceMutation(RegionRecord record)
+    private static KernelResult AdvanceMutation(RegionRecord record, bool invalidateActiveUses = true)
     {
         if (record.MutationEpoch.Value == ulong.MaxValue)
             return KernelResult.Fail(KernelError.CapacityExhausted, "Region mutation epoch is exhausted.");
 
-        foreach (var use in record.Uses.Values.Where(static use => use.State == RegionUseState.Active))
-            use.State = RegionUseState.Invalidated;
+        if (invalidateActiveUses)
+        {
+            foreach (var use in record.Uses.Values.Where(static use => use.State == RegionUseState.Active))
+                use.State = RegionUseState.Invalidated;
+        }
         record.MutationEpoch = new MutationEpoch(record.MutationEpoch.Value + 1);
         return KernelResult.Ok();
     }

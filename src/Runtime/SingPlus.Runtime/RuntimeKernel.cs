@@ -25,6 +25,7 @@ public sealed partial class RuntimeKernel
         Processes = new ProcessRegistry();
         Domains = new DomainRegistry();
         CapabilityAuthority = new CapabilityAuthority();
+        SealedObjects = new SealedObjectAuthority(CapabilityAuthority.RealmId);
         Regions = new RegionAuthority();
         ExternalOperations = new ExternalOperationAuthority(Regions);
         ComputePlanner = new ComputePlanner(Regions);
@@ -40,6 +41,7 @@ public sealed partial class RuntimeKernel
     public ProcessRegistry Processes { get; }
     public DomainRegistry Domains { get; }
     public CapabilityAuthority CapabilityAuthority { get; }
+    internal SealedObjectAuthority SealedObjects { get; }
     public RegionAuthority Regions { get; }
     public ExternalOperationAuthority ExternalOperations { get; }
     public ComputePlanner ComputePlanner { get; }
@@ -116,18 +118,45 @@ public sealed partial class RuntimeKernel
         BeginOrAdvanceProcessTeardown(handle, ProcessState.Faulted);
 
     public KernelResult<CapabilityDescriptorV1> MintCapability(DomainId issuerDomain, ProcessHandle subject, ResourceKind resourceKind, string resourceId, CapabilityRights rights,
-        TraceCausalContext? traceContext = null)
+        TraceCausalContext? traceContext = null, ulong resourceGeneration = 1)
     {
         var resolved = Processes.Resolve(subject);
         if (!resolved.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(resolved.Error, resolved.Message!);
         var effect = EnsureProcessAcceptsNewEffects(resolved.Value!);
         if (!effect.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(effect.Error, effect.Message!);
         if (!Domains.Contains(issuerDomain)) return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.DomainNotFound, $"Issuer domain {issuerDomain} is not active.");
-        var descriptor = CapabilityAuthority.Mint(issuerDomain, resolved.Value!.DomainId, resourceKind, resourceId, rights, subject.Generation);
+        var minted = CapabilityAuthority.Mint(issuerDomain, resolved.Value!.DomainId, resourceKind, resourceId, rights, subject.Generation, resourceGeneration);
+        if (!minted.IsSuccess) return minted;
+        var descriptor = minted.Value!;
         resolved.Value.AddCapability(descriptor.CapabilityId);
         RecordTrace(subject, TraceEventKind.CapabilityMinted, traceContext, "capability",
             descriptor.CapabilityId.Value.ToString(), "active", "minted");
         return KernelResult<CapabilityDescriptorV1>.Ok(descriptor);
+    }
+
+    public KernelResult<CapabilityHandleV2> MintCapabilityV2(
+        DomainId issuerDomain, ProcessHandle subject, ResourceKind resourceKind,
+        string resourceId, CapabilityRights rights, TraceCausalContext? traceContext = null,
+        ulong resourceGeneration = 1)
+    {
+        var minted = MintCapability(issuerDomain, subject, resourceKind, resourceId, rights,
+            traceContext, resourceGeneration);
+        if (!minted.IsSuccess)
+            return KernelResult<CapabilityHandleV2>.Fail(minted.Error, minted.Message!);
+        var process = Processes.Resolve(subject);
+        if (!process.IsSuccess)
+            return KernelResult<CapabilityHandleV2>.Fail(process.Error, process.Message!);
+        return CapabilityAuthority.GetHandleV2(minted.Value!.CapabilityId,
+            process.Value!.DomainId, subject.Generation);
+    }
+
+    public KernelResult<CapabilityHandleV2> UpgradeCapabilityV1(
+        ProcessHandle subject, CapabilityId capabilityId)
+    {
+        var process = Processes.Resolve(subject);
+        if (!process.IsSuccess)
+            return KernelResult<CapabilityHandleV2>.Fail(process.Error, process.Message!);
+        return CapabilityAuthority.GetHandleV2(capabilityId, process.Value!.DomainId, subject.Generation);
     }
 
     public KernelResult<CapabilityDescriptorV1> DelegateCapability(ProcessHandle delegator, ProcessHandle target, CapabilityId sourceCapability, CapabilityRights rights,
@@ -153,11 +182,46 @@ public sealed partial class RuntimeKernel
         return delegated;
     }
 
-    public KernelResult<CapabilityDescriptorV1> ValidateCapability(ProcessHandle subject, CapabilityId capabilityId, CapabilityRights rights)
+    public KernelResult<CapabilityHandleV2> DelegateCapabilityV2(
+        ProcessHandle delegator, ProcessHandle target, CapabilityHandleV2 sourceCapability,
+        CapabilityRights rights, TraceCausalContext? traceContext = null)
+    {
+        var sourceId = CapabilityAuthority.ResolveCapabilityId(sourceCapability);
+        if (!sourceId.IsSuccess)
+            return KernelResult<CapabilityHandleV2>.Fail(sourceId.Error, sourceId.Message!);
+        var delegated = DelegateCapability(delegator, target, sourceId.Value, rights, traceContext);
+        if (!delegated.IsSuccess)
+            return KernelResult<CapabilityHandleV2>.Fail(delegated.Error, delegated.Message!);
+        var targetProcess = Processes.Resolve(target);
+        if (!targetProcess.IsSuccess)
+            return KernelResult<CapabilityHandleV2>.Fail(targetProcess.Error, targetProcess.Message!);
+        return CapabilityAuthority.GetHandleV2(delegated.Value!.CapabilityId,
+            targetProcess.Value!.DomainId, target.Generation);
+    }
+
+    public KernelResult<CapabilityDescriptorV1> ValidateCapability(ProcessHandle subject, CapabilityId capabilityId, CapabilityRights rights,
+        ulong? expectedResourceGeneration = null)
     {
         var resolved = Processes.Resolve(subject);
         if (!resolved.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(resolved.Error, resolved.Message!);
-        return CapabilityAuthority.Validate(capabilityId, resolved.Value!.DomainId, subject.Generation, rights);
+        return CapabilityAuthority.Validate(capabilityId, resolved.Value!.DomainId, subject.Generation, rights, expectedResourceGeneration);
+    }
+
+    public KernelResult<CapabilityInspectionDescriptorV2> ValidateCapability(
+        ProcessHandle subject, CapabilityHandleV2 capability, CapabilityRights rights,
+        ulong? expectedResourceGeneration = null)
+    {
+        var resolved = Processes.Resolve(subject);
+        if (!resolved.IsSuccess)
+            return KernelResult<CapabilityInspectionDescriptorV2>.Fail(resolved.Error, resolved.Message!);
+        return CapabilityAuthority.Validate(capability, resolved.Value!.DomainId,
+            subject.Generation, rights, expectedResourceGeneration);
+    }
+
+    public KernelResult RevokeCapability(CapabilityHandleV2 capability)
+    {
+        var id = CapabilityAuthority.ResolveCapabilityId(capability);
+        return id.IsSuccess ? RevokeCapability(id.Value) : KernelResult.Fail(id.Error, id.Message!);
     }
 
     public KernelResult RevokeCapability(CapabilityId capabilityId)

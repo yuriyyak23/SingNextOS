@@ -9,7 +9,7 @@ public readonly record struct RegisterSurfaceRequest(
     RegionHandle Buffer,
     SurfaceMetadata Metadata) : IBoundedPayload
 {
-    public int PayloadSize => 96 + (Metadata.Planes?.Count ?? 0) * 16;
+    public int PayloadSize => 96 + Metadata.Planes.Count * 16;
     public int MaxPayloadSize => 512;
 }
 

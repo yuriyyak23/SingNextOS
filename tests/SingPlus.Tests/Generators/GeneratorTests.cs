@@ -70,6 +70,7 @@ public interface IConsoleService
         Assert.Contains(first.Values, text => text.Contains("request=3|3|packet|GeneratedTest.ConsolePacket|64|0", StringComparison.Ordinal));
         Assert.Contains(first.Values, text => text.Contains("request=4|1|level|System.Int32|0|0", StringComparison.Ordinal));
         Assert.Contains(first.Values, text => text.Contains("request=5|2|mode|GeneratedTest.ConsoleMode|0|0", StringComparison.Ordinal));
+        Assert.Contains(first.Values, text => text.Contains("Write_ValueSchema", StringComparison.Ordinal) && text.Contains("request=ownership:", StringComparison.Ordinal));
         Assert.Contains(first.Values, text => text.Contains("cancel=6|Busy|Ready", StringComparison.Ordinal));
         Assert.Contains(first.Values, text => text.Contains("ProtocolCancellationTransitionV1", StringComparison.Ordinal));
         Assert.Contains(first.Values, text => text.Contains("ContractDigest", StringComparison.Ordinal));
@@ -205,6 +206,60 @@ public interface IBadContract
 
         Assert.Contains(diagnostics, diagnostic => diagnostic.Id == "SINGGEN006" && diagnostic.Severity == DiagnosticSeverity.Error);
         Assert.Contains(diagnostics, diagnostic => diagnostic.Id == "SINGGEN007" && diagnostic.Severity == DiagnosticSeverity.Error);
+    }
+
+    [Theory]
+    [InlineData("int[]")]
+    [InlineData("System.Collections.Generic.List<int>")]
+    [InlineData("object")]
+    [Trait("Category", "Generators")]
+    public void DeepMutableGraphInsideReadonlyRecordFailsClosed(string memberType)
+    {
+        var source = $$"""
+using SingPlus.Contracts;
+using SingPlus.Sip.Sdk;
+namespace GeneratedTest;
+[BoundedPayload(64)]
+public readonly record struct Packet({{memberType}} Value) : IBoundedPayload
+{
+    public int PayloadSize => 1;
+    public int MaxPayloadSize => 64;
+}
+[SipContract]
+public interface IBadContract
+{
+    [Message(1)] void Bad(Packet packet);
+}
+""";
+
+        var diagnostics = RunDiagnostics(source);
+
+        Assert.Contains(diagnostics, diagnostic => diagnostic.Id == "SINGGEN011" && diagnostic.Severity == DiagnosticSeverity.Error);
+    }
+
+    [Fact]
+    [Trait("Category", "Generators")]
+    public void RecursiveReadonlyValueGraphIsAccepted()
+    {
+        const string source = """
+using SingPlus.Contracts;
+using SingPlus.Sip.Sdk;
+namespace GeneratedTest;
+public readonly record struct Inner(int Value);
+[BoundedPayload(64)]
+public readonly record struct Packet(Inner Value, string Label) : IBoundedPayload
+{
+    public int PayloadSize => 16;
+    public int MaxPayloadSize => 64;
+}
+[SipContract]
+public interface IGoodContract
+{
+    [Message(1)] void Send(Packet packet);
+}
+""";
+
+        _ = RunValid(source);
     }
 
     [Theory]

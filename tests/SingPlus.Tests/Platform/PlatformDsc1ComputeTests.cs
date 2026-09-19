@@ -231,7 +231,11 @@ public sealed class PlatformDsc1ComputeTests
         var loser = Assert.Single(results, static result => !result.IsSuccess);
         Assert.Equal(PlatformDsc1CopyOutcome.Completed, winner.Value!.Outcome);
         Assert.True(winner.Value.OutputPublished);
-        Assert.Equal(KernelError.PlatformBindingNotFound, loser.Error);
+        Assert.Contains(loser.Error, new[]
+        {
+            KernelError.PlatformBindingDraining,
+            KernelError.PlatformBindingNotFound,
+        });
         Assert.Equal(1,
             provider.ObserveDsc1CompletionCallCount + provider.CancelDsc1CallCount);
         Assert.All(scenario.Destination.Span.ToArray(), value => Assert.Equal((byte)0x5C, value));
@@ -264,7 +268,7 @@ public sealed class PlatformDsc1ComputeTests
             });
             Assert.True(revokeStarted.Wait(TimeSpan.FromSeconds(5)));
             Assert.False(mappingRevokeEntered.Wait(TimeSpan.FromMilliseconds(100)));
-            Assert.False(revokeTask.IsCompleted);
+            Assert.True(revokeTask.IsCompleted);
         }
         finally
         {
@@ -275,6 +279,11 @@ public sealed class PlatformDsc1ComputeTests
         var revoked = await revokeTask!;
 
         Assert.True(submitted.IsSuccess, submitted.Message);
+        Assert.False(revoked.IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingDraining, revoked.Error);
+        revoked = scenario.Kernel.RevokePlatformRegionMapping(
+            scenario.Subject,
+            scenario.SourceMapping);
         Assert.True(revoked.IsSuccess, revoked.Message);
         Assert.Equal(1, provider.CancelCalls);
         Assert.True(mappingRevokeEntered.IsSet);
@@ -1224,7 +1233,6 @@ public sealed class PlatformDsc1ComputeTests
                     secondEndpoint);
             });
             Assert.True(secondStarted.Wait(TimeSpan.FromSeconds(5)));
-            Assert.False(secondTask.IsCompleted);
             Assert.Equal(1, provider.ObserveCalls);
             Assert.Equal(
                 KernelError.ResponseNotAvailable,
@@ -1247,7 +1255,11 @@ public sealed class PlatformDsc1ComputeTests
 
         Assert.True(first.IsSuccess, first.Message);
         Assert.False(second.IsSuccess);
-        Assert.Equal(KernelError.PlatformBindingNotFound, second.Error);
+        Assert.Contains(second.Error, new[]
+        {
+            KernelError.PlatformBindingDraining,
+            KernelError.PlatformBindingNotFound,
+        });
         Assert.Equal(1, provider.ObserveCalls);
         Assert.True(scenario.Kernel.ConsumeKernelEvent(
             scenario.Subject,

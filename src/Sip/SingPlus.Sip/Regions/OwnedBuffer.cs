@@ -157,6 +157,20 @@ public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanag
         return new BorrowedSpan<T>(this);
     }
 
+    public ReadBorrow<T> BorrowRead(int offset, int length)
+    {
+        EnsureOwnerAccess();
+        ValidateElementRange(offset, length);
+        return new ReadBorrow<T>(this, offset, length);
+    }
+
+    public WriteBorrow<T> BorrowWrite(int offset, int length)
+    {
+        EnsureOwnerAccess();
+        ValidateElementRange(offset, length);
+        return new WriteBorrow<T>(this, offset, length);
+    }
+
     public OwnedBuffer<T> Move()
     {
         EnsureOwnerAccess();
@@ -169,6 +183,12 @@ public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanag
     {
         EnsureOwnerAccess();
         return _storage.Data.AsSpan();
+    }
+
+    internal Span<T> GetBorrowedSpan(int offset, int length)
+    {
+        EnsureOwnerAccess();
+        return _storage.Data.AsSpan(offset, length);
     }
 
     internal RuntimeBufferLease<T> ReserveForRuntime(RuntimeBufferAccess access)
@@ -217,6 +237,12 @@ public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanag
         EnsureValid();
         if (_storage.IsBorrowed) throw new InvalidOperationException("OwnedBuffer is temporarily inaccessible while a runtime borrow lease is active.");
         if (_storage.IsRuntimeReserved) throw new InvalidOperationException("OwnedBuffer is temporarily inaccessible while a runtime operation owns its CPU-access reservation.");
+    }
+
+    private void ValidateElementRange(int offset, int length)
+    {
+        if (offset < 0 || length <= 0 || offset > _storage.Data.Length - length)
+            throw new ArgumentOutOfRangeException(nameof(length), "Borrow range must be a non-empty subrange of the buffer.");
     }
 }
 
@@ -281,5 +307,34 @@ public readonly ref struct BorrowedSpan<T> where T : unmanaged
 
     public Span<T> Span => _owner.GetBorrowedSpan();
     public int Length => Span.Length;
+    public ref T this[int index] => ref Span[index];
+}
+
+
+public readonly ref struct ReadBorrow<T> where T : unmanaged
+{
+    private readonly OwnedBuffer<T> _owner;
+    private readonly int _offset;
+    private readonly int _length;
+
+    internal ReadBorrow(OwnedBuffer<T> owner, int offset, int length) =>
+        (_owner, _offset, _length) = (owner, offset, length);
+
+    public ReadOnlySpan<T> Span => _owner.GetBorrowedSpan(_offset, _length);
+    public int Length => _length;
+    public ref readonly T this[int index] => ref Span[index];
+}
+
+public readonly ref struct WriteBorrow<T> where T : unmanaged
+{
+    private readonly OwnedBuffer<T> _owner;
+    private readonly int _offset;
+    private readonly int _length;
+
+    internal WriteBorrow(OwnedBuffer<T> owner, int offset, int length) =>
+        (_owner, _offset, _length) = (owner, offset, length);
+
+    public Span<T> Span => _owner.GetBorrowedSpan(_offset, _length);
+    public int Length => _length;
     public ref T this[int index] => ref Span[index];
 }

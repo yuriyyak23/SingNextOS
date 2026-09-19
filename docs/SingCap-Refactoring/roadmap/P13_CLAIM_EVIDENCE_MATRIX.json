@@ -1,0 +1,23 @@
+{
+  "schema": "SingCapClaimEvidenceMatrixV1",
+  "baseline": "a67eea1aafc72054d22f1586b62c6883cdc71681",
+  "features": [
+    { "feature": "single capability ledger and opaque realm identity", "level": "RuntimeEnforced", "evidence": "P02 tests and PHASE_02_IMPLEMENTATION_EVIDENCE.md" },
+    { "feature": "canonical constraint algebra and shared quota lineage", "level": "RuntimeEnforced", "evidence": "P03 property/concurrency tests" },
+    { "feature": "derivation, subtree revoke and exact effect admission", "level": "RuntimeEnforced", "evidence": "P04 race/compensation tests" },
+    { "feature": "opaque V2 handles and V1 projection", "level": "RuntimeEnforced", "evidence": "P05 forgery/restart tests" },
+    { "feature": "identity-only software sealing", "level": "RuntimeEnforced", "evidence": "P06 socket and P11 file/process tests" },
+    { "feature": "Region range, borrow and generation hardening", "level": "RuntimeEnforced", "evidence": "P07 ownership/property/concurrency tests" },
+    { "feature": "generated SIP sentries and bounded value schemas", "level": "RuntimeEnforced", "evidence": "P08 generator/analyzer/runtime tests" },
+    { "feature": "ManagedCap closed-world admission", "level": "QualifiedManaged", "evidence": "P09 full-module negative corpus and NativeAOT fixture" },
+    { "feature": "manifest V2 and deterministic supply-chain audit", "level": "StaticAdmission", "evidence": "P10 manifest/audit tests" },
+    { "feature": "network, file and process service migration", "level": "RuntimeEnforced", "evidence": "P11 confused-deputy review and integration tests" },
+    { "feature": "HybridCPU provider-neutral adapter alignment", "level": "RuntimeEnforced", "evidence": "P12 exact artifact, callback and lifecycle qualification" },
+    { "feature": "authority performance characterization", "level": "ModelOnly", "evidence": "P13_PERFORMANCE_BASELINE.json; local diagnostic baseline only" },
+    { "feature": "hardware capability enforcement", "level": "ModelOnly", "evidence": "unsupported; FutureGated" }
+  ],
+  "maximumReleaseClaim": "QualifiedManaged",
+  "productionCandidateGranted": false,
+  "reasonProductionCandidateWithheld": "Local model/provider qualification does not prove hardware isolation, physical provider behavior, separately instrumented lock wait, or multi-host production SLOs.",
+  "prohibitedClaims": ["CHERI-equivalent", "hardware capability enforcement"]
+}

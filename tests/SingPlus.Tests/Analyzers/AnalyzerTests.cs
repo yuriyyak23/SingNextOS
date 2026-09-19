@@ -346,6 +346,25 @@ public sealed class AnalyzerTests
         Assert.Contains(diagnostics, d => d.Id == "SING2002");
     }
 
+    [Fact]
+    [Trait("Category", "NegativeCompilation")]
+    public async Task SipAnalyzerRejectsMutableGraphHiddenInsideReadonlyBoundedRecord()
+    {
+        const string source = """
+using System;
+using System.Collections.Generic;
+[AttributeUsage(AttributeTargets.Interface)] sealed class SipContractAttribute : Attribute { }
+[AttributeUsage(AttributeTargets.Method)] sealed class MessageAttribute(int id) : Attribute { }
+[AttributeUsage(AttributeTargets.Struct)] sealed class BoundedPayloadAttribute(int max) : Attribute { }
+[BoundedPayload(64)] readonly record struct Packet(List<int> Values);
+[SipContract] interface IService { [Message(1)] void Send(Packet packet); }
+""";
+
+        var diagnostics = await Analyze(source, "Sip", "SipRegion");
+
+        Assert.Contains(diagnostics, static diagnostic => diagnostic.Id == "SING3003");
+    }
+
     private static async Task<ImmutableArray<Diagnostic>> Analyze(string source, string profile, string memoryProfile, LanguageVersion languageVersion = LanguageVersion.CSharp13,
         IEnumerable<MetadataReference>? additionalReferences = null)
     {

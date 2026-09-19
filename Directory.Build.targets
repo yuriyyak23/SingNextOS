@@ -1,9 +1,12 @@
 <Project>
   <Target Name="SingPlusAdmissionVerify" AfterTargets="Build" Condition="'$(SingPlusEnableAdmission)' == 'true' and '$(SingPlusAdmissionRoot)' != '' and '$(DesignTimeBuild)' != 'true'">
     <PropertyGroup>
-      <_SingPlusAdmissionTool>$(MSBuildThisFileDirectory)tools/SingPlus.Admission/bin/$(Configuration)/net11.0/SingPlus.Admission.dll</_SingPlusAdmissionTool>
+      <_SingPlusAdmissionToolDirectory>$(MSBuildThisFileDirectory)tools/SingPlus.Admission/bin/$(Configuration)/net11.0</_SingPlusAdmissionToolDirectory>
+      <_SingPlusAdmissionToolDirectory Condition="'$(SingPlusAdmissionToolBaseOutputPath)' != ''">$(MSBuildThisFileDirectory)tools/SingPlus.Admission/$(SingPlusAdmissionToolBaseOutputPath)/$(Configuration)/net11.0</_SingPlusAdmissionToolDirectory>
+      <_SingPlusAdmissionToolDirectory Condition="'$(RuntimeIdentifier)' != ''">$(_SingPlusAdmissionToolDirectory)/$(RuntimeIdentifier)</_SingPlusAdmissionToolDirectory>
+      <_SingPlusAdmissionTool>$(_SingPlusAdmissionToolDirectory)/SingPlus.Admission.dll</_SingPlusAdmissionTool>
       <_SingPlusAdmissionProof>$(IntermediateOutputPath)SingPlusAdmissionProofV1.json</_SingPlusAdmissionProof>
     </PropertyGroup>
-    <Exec Command="dotnet &quot;$(_SingPlusAdmissionTool)&quot; verify --assembly &quot;$(TargetPath)&quot; --root &quot;$(SingPlusAdmissionRoot)&quot; --profile &quot;$(SingPlusMemoryProfile)&quot; --proof &quot;$(_SingPlusAdmissionProof)&quot;" />
+    <Exec Command="&quot;$(DOTNET_HOST_PATH)&quot; &quot;$(_SingPlusAdmissionTool)&quot; verify --assembly &quot;$(TargetPath)&quot; --root &quot;$(SingPlusAdmissionRoot)&quot; --profile &quot;$(SingPlusMemoryProfile)&quot; --proof &quot;$(_SingPlusAdmissionProof)&quot;" />
   </Target>
 </Project>

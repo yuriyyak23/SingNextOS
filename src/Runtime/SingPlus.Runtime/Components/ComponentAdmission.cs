@@ -27,6 +27,17 @@ public sealed record ComponentProvidedServiceRegistration(
 public sealed class ComponentAdmissionPlan
 {
     public ComponentAdmissionPlan(
+        ServiceManifestV2 manifest,
+        ReadOnlyMemory<byte> image,
+        IEnumerable<ComponentCapabilityGrant>? grants = null,
+        IEnumerable<ComponentProvidedServiceRegistration>? providedServices = null,
+        ComponentDriverResourcePlan? driverResources = null)
+        : this(manifest?.BaseManifest ?? throw new ArgumentNullException(nameof(manifest)), image, grants, providedServices, driverResources)
+    {
+        ManifestV2 = manifest;
+    }
+
+    public ComponentAdmissionPlan(
         ServiceManifestV1 manifest,
         ReadOnlyMemory<byte> image,
         IEnumerable<ComponentCapabilityGrant>? grants = null,
@@ -41,6 +52,7 @@ public sealed class ComponentAdmissionPlan
     }
 
     public ServiceManifestV1 Manifest { get; }
+    public ServiceManifestV2? ManifestV2 { get; }
     public ReadOnlyMemory<byte> Image { get; }
     public IReadOnlyList<ComponentCapabilityGrant> Grants { get; }
     public IReadOnlyList<ComponentProvidedServiceRegistration> ProvidedServices { get; }

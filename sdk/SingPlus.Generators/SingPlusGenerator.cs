@@ -35,6 +35,9 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
     private static readonly DiagnosticDescriptor RequestPayloadTypeDiagnostic = new(
         "SINGGEN008", "Unsupported request payload type", "{0}", "SingPlus.Contracts", DiagnosticSeverity.Error, isEnabledByDefault: true);
 
+    private static readonly DiagnosticDescriptor DeepValueSchemaDiagnostic = new(
+        "SINGGEN011", "Unsafe SIP copied-value graph", "{0}", "SingPlus.Contracts", DiagnosticSeverity.Error, isEnabledByDefault: true);
+
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
         var contracts = context.SyntaxProvider.ForAttributeWithMetadataName(
@@ -130,6 +133,11 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
                         Report(output, BoundedPayloadDiagnostic, parameter, $"Bounded payload '{parameter.Name}' must be a non-generic named value type so runtime shape identity is stable.");
                         valid = false;
                     }
+                    else if (!ValidateDeepValueType(parameter.Type, new HashSet<ITypeSymbol>(SymbolEqualityComparer.Default), out var schemaFailure))
+                    {
+                        Report(output, DeepValueSchemaDiagnostic, parameter, $"Bounded payload '{parameter.Name}' is not a closed copied-value schema: {schemaFailure}");
+                        valid = false;
+                    }
                 }
                 else if (implementsBoundedPayload)
                 {
@@ -198,8 +206,57 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
                 Report(output, ReturnsOwnershipDiagnostic, method, $"Message '{method.Name}' returns an ownership-bearing payload and must declare ReturnsOwnership.");
                 valid = false;
             }
+
+
+            var responseType = UnwrapAsync(method.ReturnType);
+            if (returnKind == 0 && responseType is not null && BoundedPayloadAttribute(responseType) is not null &&
+                !ValidateDeepValueType(responseType, new HashSet<ITypeSymbol>(SymbolEqualityComparer.Default), out var responseFailure))
+            {
+                Report(output, DeepValueSchemaDiagnostic, method, $"Response payload for '{method.Name}' is not a closed copied-value schema: {responseFailure}");
+                valid = false;
+            }
         }
         return valid;
+    }
+
+    private static ITypeSymbol? UnwrapAsync(ITypeSymbol type)
+    {
+        if (type.SpecialType == SpecialType.System_Void) return null;
+        if (type is INamedTypeSymbol named && named.ContainingNamespace.ToDisplayString() == "System.Threading.Tasks" &&
+            named.Name is "Task" or "ValueTask")
+            return named.TypeArguments.Length == 1 ? named.TypeArguments[0] : null;
+        return type;
+    }
+
+    private static bool ValidateDeepValueType(ITypeSymbol type, HashSet<ITypeSymbol> path, out string failure)
+    {
+        failure = string.Empty;
+        if (type.TypeKind == TypeKind.Enum || IsPrimitivePayload(type) || type.SpecialType == SpecialType.System_String)
+            return true;
+        if (type is IArrayTypeSymbol || type.TypeKind is TypeKind.Pointer or TypeKind.Dynamic or TypeKind.TypeParameter)
+        {
+            failure = $"'{type.ToDisplayString()}' is an unbounded or mutable graph node";
+            return false;
+        }
+        if (type is not INamedTypeSymbol named || !named.IsValueType || !named.IsReadOnly)
+        {
+            failure = $"'{type.ToDisplayString()}' is not an explicitly readonly value node";
+            return false;
+        }
+        if (!path.Add(type)) return true;
+        foreach (var property in named.GetMembers().OfType<IPropertySymbol>()
+                     .Where(static property => !property.IsStatic && property.DeclaredAccessibility == Accessibility.Public &&
+                                               property.Name is not "PayloadSize" and not "MaxPayloadSize"))
+        {
+            if (!ValidateDeepValueType(property.Type, path, out failure))
+            {
+                failure = $"{named.ToDisplayString()}.{property.Name} -> {failure}";
+                path.Remove(type);
+                return false;
+            }
+        }
+        path.Remove(type);
+        return true;
     }
 
     private static void Report(SourceProductionContext output, DiagnosticDescriptor descriptor, ISymbol symbol, string message) =>
@@ -396,6 +453,8 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
                 ? "Kind=5;OwnershipPair=" + string.Join(",", request.OwnershipPair.Select(static slot => slot.ParameterName + ":" + slot.OwnershipPayloadKind + ":" + slot.Disposition))
                 : "Kind=" + request.Kind.ToString(CultureInfo.InvariantCulture) + ";Parameter=" + request.ParameterName + ";Type=" + request.TypeName + ";MaxBytes=" + request.MaxBytes.ToString(CultureInfo.InvariantCulture) + ";OwnershipKind=" + request.OwnershipPayloadKind.ToString(CultureInfo.InvariantCulture);
             b.Append("    public const string ").Append(message.Name).Append("_RequestPayload = ").Append(Literal(requestMetadata)).AppendLine(";");
+            b.Append("    public const string ").Append(message.Name).Append("_ValueSchema = ")
+                .Append(Literal("request=" + message.RequestValueSchema + ";response=" + message.ResponseValueSchema)).AppendLine(";");
         }
         b.AppendLine("}");
         return b.ToString();
@@ -471,6 +530,7 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
                 {
                     lines.Add("request=" + m.Id.ToString(CultureInfo.InvariantCulture) + "|" + request.Kind.ToString(CultureInfo.InvariantCulture) + "|" + request.ParameterName + "|" + request.TypeName + "|" + request.MaxBytes.ToString(CultureInfo.InvariantCulture) + "|" + request.OwnershipPayloadKind.ToString(CultureInfo.InvariantCulture));
                 }
+                lines.Add("value-schema=" + m.Id.ToString(CultureInfo.InvariantCulture) + "|" + m.RequestValueSchema + "|" + m.ResponseValueSchema);
             }
             lines.AddRange(transitions.Select(static t => "transition=" + t.MessageId.ToString(CultureInfo.InvariantCulture) + "|" + t.From + "|" + t.To));
             lines.AddRange(cancellationTransitions.Select(static t => "cancel=" + t.MessageId.ToString(CultureInfo.InvariantCulture) + "|" + t.From + "|" + t.To));
@@ -490,6 +550,8 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
         public bool ReturnsOwnership { get; private set; }
         public int ReturnOwnershipPayloadKind { get; private set; }
         public RequestPayloadModel RequestPayload { get; private set; } = new();
+        public string RequestValueSchema { get; private set; } = "none";
+        public string ResponseValueSchema { get; private set; } = "none";
         public IReadOnlyList<TransitionModel> Transitions { get; private set; } = Array.Empty<TransitionModel>();
         public IReadOnlyList<TransitionModel> CancellationTransitions { get; private set; } = Array.Empty<TransitionModel>();
 
@@ -521,6 +583,8 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
                 ReturnsOwnership = method.GetAttributes().Any(static a => a.AttributeClass?.Name == "ReturnsOwnershipAttribute"),
                 ReturnOwnershipPayloadKind = OwnershipKind(method.ReturnType, unwrapAsync: true),
                 RequestPayload = CreateRequestPayload(method),
+                RequestValueSchema = method.Parameters.Length == 0 ? "none" : string.Join("+", method.Parameters.Select(static parameter => CanonicalValueSchema(parameter.Type))),
+                ResponseValueSchema = CanonicalValueSchema(UnwrapAsync(method.ReturnType)),
                 Transitions = transitions,
                 CancellationTransitions = cancellationTransitions
             };
@@ -580,6 +644,25 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
                 TypeName = RuntimeTypeName((INamedTypeSymbol)parameter.Type)
             };
         }
+    }
+
+    private static string CanonicalValueSchema(ITypeSymbol? type)
+    {
+        if (type is null || type.SpecialType == SpecialType.System_Void) return "none";
+        if (type.TypeKind == TypeKind.Enum) return "enum:" + type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+        if (IsPrimitivePayload(type)) return "primitive:" + type.SpecialType;
+        if (type.SpecialType == SpecialType.System_String) return "string:outer-bounded";
+        if (OwnershipKind(type, unwrapAsync: false) != 0) return "ownership:" + type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+        if (type is not INamedTypeSymbol named) return "unsupported:" + type.ToDisplayString();
+        var members = named.GetMembers().OfType<IPropertySymbol>()
+            .Where(static property => !property.IsStatic && property.DeclaredAccessibility == Accessibility.Public &&
+                                      property.Name is not "PayloadSize" and not "MaxPayloadSize")
+            .OrderBy(static property => property.Name, StringComparer.Ordinal)
+            .Select(property => property.Name + "=" + CanonicalValueSchema(property.Type));
+        var bound = BoundedPayloadAttribute(type) is { } attribute
+            ? ":max=" + BoundedPayloadMaxBytes(attribute).ToString(CultureInfo.InvariantCulture)
+            : string.Empty;
+        return "value:" + type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat) + bound + "{" + string.Join(",", members) + "}";
     }
 
     private sealed class ParameterModel { public string Name { get; set; } = string.Empty; public string Type { get; set; } = string.Empty; }
