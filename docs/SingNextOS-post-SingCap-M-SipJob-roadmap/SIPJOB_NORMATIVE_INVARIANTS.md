@@ -1,165 +1,304 @@
 # SipJob Normative Invariants
 
-This file is normative for all P14 phases. A P14 implementation that violates any invariant below is not a SipJob optimization; it is a new security model and must not be merged under this roadmap.
+This document defines the invariants that every `SipJob` implementation, generator, analyzer, runtime path, cache, scheduler integration, test fixture, and qualification claim must satisfy.
 
-## SJOB-001 — Job metadata is evidence, never authority
+Keywords **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
-`SipJobPlan`, `SipJobHandle`, `PlanDigest`, `StageDescriptor`, `EdgeDescriptor`, `JobRunFrame`, stage completion records and plan caches may correlate exact live authority, but they MUST NOT answer “is this caller allowed?” independently.
+## SJOB-001 — No new authority universe
 
-Allowed reference graph:
+`SipJob`, `SipJobPlan`, `SipJobHandle`, `JobRunFrame`, stage/edge descriptors, plan digests, graph verifier state, binding caches, worker-local state, completion summaries, and scheduling hints MUST NOT become independent authority ledgers.
 
-```text
-JobRunFrame
-  -> OperationAuthorityLease (CapabilityAuthority-owned)
-  -> EndpointSessionPin (EndpointSessionRegistry-owned)
-  -> RegionUse/Borrow/Region handle (RegionAuthority-owned)
-  -> SealedObjectPin (SealedObjectAuthority-owned)
-  -> ExternalOperation correlation (ExternalOperationAuthority-owned)
-```
+Authority remains exclusively with existing owners, including:
 
-Forbidden:
+- `CapabilityAuthority`;
+- `ProcessRegistry`;
+- `EndpointSessionRegistry`;
+- `RegionAuthority`;
+- `SealedObjectAuthority`;
+- `ExternalOperationAuthority`;
+- existing invocation/response/publication owners;
+- existing platform/provider legality and admission owners.
 
-```text
-JobCapabilityAuthority
-JobRegionAuthority
-JobSessionAuthority
-JobSealAuthority
-JobPublicationAuthority
-```
+Possession of a Job handle or plan MUST NOT make an otherwise-denied operation executable.
 
-## SJOB-002 — no raw CLR graph crossing
+**Required proof:** execute an admitted plan after revoking each underlying authority class in isolation; execution MUST fail closed at the current owner without modifying the cached plan into an authority-bearing object.
 
-A Job edge MUST be one of the generated, closed forms already acceptable to SIP or explicitly qualified by P14:
+## SJOB-002 — ManagedCap Job boundaries contain only closed admitted values
 
-```text
-primitive / enum / bounded generated copied value
-opaque generated handle
-OwnedBuffer<T> / OwnedRegion<T>
-BorrowLease / qualified Region projection
-sealed handle
-trusted runtime-only stage evidence (never projected to ManagedCap)
-```
+Raw mutable CLR references MUST NOT cross a ManagedCap SIP/Job boundary.
 
-Forbidden across ManagedCap boundaries:
+Forbidden edge/frame values include:
 
-```text
-arbitrary object
-mutable class graph
-service implementation instance
-delegate/function object
-IServiceProvider / service locator
-Task carrying hidden authority object graph
-reflection handle used to reach private service state
-```
+- service implementation instances;
+- arbitrary mutable reference graphs;
+- delegates, delegate targets, closures;
+- `IServiceProvider` or service locators;
+- capability-bearing ambient objects;
+- generic `object`/reflection containers capable of carrying unadmitted references;
+- mutable framework objects whose aliasing semantics are not represented by the SIP schema;
+- service-created `Task`, `ValueTask`, custom awaitable, or async-state-machine object.
 
-## SJOB-003 — generated sentry cannot be skipped
+Generated copied-value projections MUST preserve ordinary SIP isolation. Shared runtime placement does not authorize passing the caller's mutable reference when ordinary SIP would create an isolated projection/copy.
 
-Every cross-compartment Job stage transition MUST execute an operation-specific generated trusted sentry or an exactly equivalent generated static thunk. The thunk validates/project current authority and does not expose enumerable capability context.
+TCB-private dispatch state MAY hold implementation references if it is unreachable from ManagedCap state and never placed into a Job descriptor/frame/edge.
 
-## SJOB-004 — fusion is transport elision only
+**Required proof:** generator/admission negative fixtures for every forbidden reference form, including async capture of `this`, mutable closures, delegate fields, generic object containers, and mutable static roots.
 
-Fusion MAY remove intermediate:
+## SJOB-003 — Every fused stage enters through an operation-specific generated sentry
 
-```text
-ChannelEnvelope allocation
-queue enqueue/dequeue
-ordinary response envelope
-TaskCompletionSource/waiter
-scheduler wake-up
-service discovery already bound by the plan
-```
+A fused stage MUST NOT call a service implementation method directly.
 
-Fusion MUST NOT remove required:
+The operation-specific generated sentry/static thunk MUST remain the trusted compartment transition and MUST consume the same admitted contract/schema metadata used by the ordinary SIP path.
 
-```text
-session generation/state check or exact pin semantics
-capability operation admission
-seal identity/lifecycle check
-Region ownership/use transition
-protocol state transition
-external-effect lifecycle gate
-publication/release gate
-```
+Runtime dynamic IL generation, runtime source compilation, unrestricted reflection dispatch, and unqualified delegate injection are prohibited on the ManagedCap path.
 
-## SJOB-005 — exact authority source per stage
+**Required proof:** static/generated-manifest test demonstrating a fixed operation→thunk mapping plus a runtime negative test that no direct implementation invocation is reachable from the Job executor.
 
-Every authority requirement declares its source class:
+## SJOB-004 — Fusion may erase transport work, not authoritative semantics
 
-```text
-CallerExplicit
-DelegatedFromCaller
-ServiceManifestStatic
-PreviousStageDeclaredReturn
-KernelOnly
-```
+A fused path MAY remove:
 
-No stage may use privilege merely because the trusted Job executor happens to possess it. `PreviousStageDeclaredReturn` is valid only when the source SIP contract explicitly returns/delegates that authority.
+- intermediate `ChannelEnvelope`/response materialization;
+- queue enqueue/dequeue;
+- transport-only waiter/TCS allocation;
+- transport-only scheduler wakeups;
+- redundant discovery when a live binding is safely cached.
 
-## SJOB-006 — plan binding caches where to check, not “authorized=true”
+It MUST NOT remove or collapse:
 
-A bound plan may cache exact record references/keys, generated thunk IDs, schemas and expected generations/epochs. Each run must still revalidate live generation/state/epoch/lease rules. Any cache invalidation ambiguity fails closed or materializes the ordinary SIP path.
+- capability/effect admission;
+- exact generation validation;
+- session lifecycle semantics;
+- sealing validation;
+- Region ownership/use transitions;
+- protocol transitions;
+- external-effect lifecycle;
+- required copy-isolation semantics;
+- observable invocation/cancellation transitions;
+- publication/release gates.
 
-## SJOB-007 — ownership is linear on every terminal path
+Semantic equivalence is defined over the ordered authoritative transition trace, not only the final result.
 
-For each Region-bearing edge, the verifier must prove that every success/fault/cancel terminal path yields a defined legal state:
+**Required proof:** differential trace comparison between ordinary SIP and fused execution after filtering a fixed whitelist of transport-only events.
 
-```text
-exactly one mutable owner after MOVE
-no use-after-MOVE
-no double consume
-borrow closed/revoked according to lifetime
-active RegionUse settled or quarantined
-no reclaim while external ambiguity remains
-```
+## SJOB-005 — Every authority requirement names an existing authority source
 
-Failure is not implicit inverse MOVE.
+Each stage authority requirement MUST identify an existing authority source class and the exact live identity needed to validate it.
 
-## SJOB-008 — Job is not a transaction
+The Job executor MUST NOT infer authority from:
 
-A Job may defer externally visible publication where existing staged semantics allow it, but it cannot roll back arbitrary service-private mutation. Provider submission cannot be undone by metadata rollback. The plan must expose barriers where irreversible effects may begin.
+- plan possession;
+- prior stage success;
+- cache hit;
+- runtime co-location;
+- service implementation identity;
+- worker identity;
+- HybridCPU lane/provider metadata.
 
-## SJOB-009 — admission is segmented
+An edge may carry `PreviousStageDeclaredReturn` only when the originating SIP contract explicitly returns transferable authority/evidence in a supported closed form.
 
-One-shot rights, quotas and effect-specific leases are acquired at the latest safe segment admission point, not blindly for the entire future graph. Conditional/unreached stages MUST NOT consume authority simply because they appear in a plan.
+**Required proof:** forge or mutate each authority-source descriptor independently; verifier or runtime admission MUST reject the plan/execution.
 
-## SJOB-010 — async does not retain stack views
+## SJOB-006 — Cache stores where/how to validate, never `authorized=true`
 
-No `Span<T>`, `ReadOnlySpan<T>` or ref-like projection survives suspension. Heap-safe leases remain authoritative references; after resume the runtime revalidates and rematerializes the stack view.
+A verification or binding cache MUST NOT cache authorization success as executable authority.
 
-## SJOB-011 — explicit FusionBarrier classes
+Every run MUST perform live revalidation required by the corresponding owner.
 
-At minimum the planner/executor recognizes:
+Cache identity MUST be realm/incarnation safe. The binding key, where applicable, MUST include or be cryptographically/deterministically bound to all semantics that can invalidate execution, including:
 
 ```text
-ExternalEffect
-Publication
-OwnershipSettlement
-AsyncProviderWait
-CrossRuntime
-UnqualifiedNative
-ConfidentialDomain
-IndependentCancellation
-ExternallyObservableInvocation
+authority/runtime realm
+process/service incarnation
+session generation
+capability lineage/reference and revocation/resource generation
+seal generation
+contract/schema/thunk digest
+admission-policy/toolchain tuple
+Job plan digest
+provider generation/contract version only for stages that depend on it
 ```
 
-A barrier may force ordinary invocation materialization or segment commit. Unknown barrier requirement fails closed.
+A field may be omitted only if executable evidence proves that an existing opaque reference already binds it non-reusably.
 
-## SJOB-012 — ordinary SIP fallback is semantic reference
+**Required proof:** restart/ABA/replay suite with reused numeric IDs and stale Job handles.
 
-For every fused stage sequence there must be a normal-SIP execution mode used as a conformance oracle. Same valid inputs/authority must yield equivalent declared outputs/ownership/publication semantics, modulo performance/tracing identifiers.
+## SJOB-007 — Region ownership/use is linear on every terminal path
 
-## SJOB-013 — no dynamic code generation in ManagedCap path
+`RegionAuthority` remains the sole memory ownership/use truth.
 
-P14 may dynamically select/combine **precompiled, admission-qualified generated thunks**. It MUST NOT require `Reflection.Emit`, runtime IL generation, arbitrary assembly loading, unmanaged calli or policy-bypassing dynamic code.
+For each Region-bearing edge, the Job MUST preserve the complete sequence of authoritative transitions that ordinary SIP would perform. Matching only the final owner is insufficient.
 
-## SJOB-014 — protocol state remains authoritative
+A fused MOVE MUST NOT:
 
-Direct dispatch may bypass the physical channel queue only after validating/applying the same protocol-state transition owned by the existing protocol/session machinery. Job plan metadata cannot independently advance protocol state.
+- double-transfer;
+- skip an ordinary intermediate owner state;
+- create an implicit inverse MOVE on failure;
+- reuse a stale generation;
+- reclaim before all dependent uses close;
+- hide shared mutable state;
+- treat a cached owner field as authoritative.
 
-## SJOB-015 — independently observable lifecycle requires materialization
+BORROW lifetime MUST dominate every consumer and every async/parallel continuation that can rematerialize a valid view.
 
-If an intermediate stage requires independent cancellation, external observation, provider callback, response publication or durable correlation, its invocation lifecycle must be materialized in the existing invocation/response owners rather than hidden as a lightweight Job-only state.
+**Required proof:** property/race tests covering success, exception, cancel-before-stage, cancel-during-stage, service restart, reclaim race, branch failure, join failure, and provider ambiguity.
 
-## SJOB-016 — claims are contour-specific
+## SJOB-008 — SipJob is not an ACID transaction
 
-Qualification of linear synchronous same-runtime fusion does not qualify DAG, parallelism, provider fusion, split-runtime execution, NativeIsolated fusion, confidential execution or HybridCPU acceleration. Each remains at its declared feature-gate claim level.
+A Job MUST NOT claim atomic rollback of arbitrary service/private state or committed external effects.
+
+The runtime MUST distinguish:
+
+- reversible prepare state;
+- committed authority consumption;
+- private service mutation;
+- Region transfer/use settlement;
+- provider submission/completion;
+- publication;
+- release.
+
+Irreversible private service mutation is a segment commit/barrier condition because later operations may observe it even before an external response is published.
+
+**Required proof:** a stage mutates persistent private state, a later stage faults/cancels, and both ordinary and fused executions preserve the mutation according to the same admissible ordering.
+
+## SJOB-009 — Composed admission separates reversible prepare from consumptive commit
+
+The normative sequence is:
+
+```text
+resolve non-authoritative identities
+prepare/probe reversible participants
+pin/reserve reversible participants
+final live revalidate
+commit consumptive/non-compensatable participants
+execute outside authority locks
+settle
+release/compensate only what its owner defines as reversible
+```
+
+A current operation-authority acquisition that consumes quota or one-shot state during acquisition MUST be treated as a commit linearization, not as a reversible prepare lease.
+
+Reverse-order compensation MUST NOT invent rollback semantics that the authority owner does not provide.
+
+If a fused segment needs multiple independently fallible non-compensatable commits without owner-provided reservations that make the remaining commit sequence safe, the segment MUST materialize/fallback rather than synthesize a Job-local transaction manager.
+
+**Required proof:** one-shot/quota races, partial prepare failure, session close, seal close, Region reclaim, and two-concurrent-Jobs tests.
+
+## SJOB-010 — Async state never smuggles implementation graphs across the boundary
+
+An async stage MAY be qualified only when:
+
+- no stack-only view survives across an await;
+- all leases/pins that must survive are explicit heap-safe TCB-owned handles;
+- service-created awaitables/state machines stay inside the generated sentry/compartment;
+- `JobRunFrame` stores only TCB-owned correlation/completion state and admitted closed projections;
+- cancellation and resumption revalidate all state whose owner requires revalidation.
+
+JIT and NativeAOT async contours require separate executable evidence unless the qualification artifact explicitly proves both.
+
+**Required proof:** incomplete-await fixtures capturing `this`, mutable state, delegates, and service dependencies; inspect generated metadata/IL/AOT artifacts and runtime reachability.
+
+## SJOB-011 — Fusion barriers are explicit and conservative
+
+The planner MUST materialize or terminate a fused segment when required by any of these classes:
+
+- external effect whose lifecycle must be independently represented;
+- externally observable publication;
+- ownership settlement boundary;
+- async/provider wait whose state cannot remain TCB-private under the qualified contour;
+- cross-runtime boundary;
+- independent cancellation/invocation observability;
+- NativeIsolated boundary;
+- confidential/secure domain boundary;
+- irreversible private service mutation when later execution could falsely imply rollback;
+- any unknown descriptor/barrier version;
+- any authority sequence that cannot be composed without creating a second transaction/ledger.
+
+Protocol transitions are not automatically materialization barriers, but they MUST linearize at the same semantic point and MUST NOT be deferred merely because transport is fused.
+
+**Required proof:** one negative test per barrier class and a fail-closed test for unknown barrier values.
+
+## SJOB-012 — Ordinary SIP is the semantic and conformance oracle
+
+Every qualified Job contour MUST have an ordinary-SIP differential path using the same contracts and authority inputs.
+
+The oracle MUST compare, as applicable:
+
+- result/error/cancellation class;
+- ordered semantic transition trace;
+- protocol state;
+- Region owner/generation/use state;
+- capability/quota/one-shot state;
+- invocation/publication state;
+- externally visible private-state consequences;
+- release/cleanup state.
+
+Fallback MUST use ordinary SIP or reject. It MUST NOT silently weaken checks to preserve performance.
+
+## SJOB-013 — Dynamic composition selects only precompiled admitted thunks
+
+ManagedCap dynamic composition MAY choose among a finite set of precompiled, manifest-bound, admission-qualified stage thunks.
+
+It MUST NOT introduce:
+
+- dynamic IL generation;
+- runtime code compilation;
+- arbitrary reflection invocation;
+- caller-supplied delegates;
+- service-locator-based implementation discovery.
+
+The thunk identity and schema/contract digest MUST participate in plan verification and cache identity.
+
+**Required proof:** malformed/unknown thunk IDs and mismatched digests reject before service code.
+
+## SJOB-014 — Protocol state remains independently authoritative
+
+Protocol-state machines remain owned by their existing runtime owner.
+
+Fusion MUST NOT:
+
+- infer a transition from stage order;
+- delay a transition to Job completion when ordinary SIP linearizes it earlier;
+- allow a parallel external invocation to observe an impossible protocol state;
+- cache a protocol state as authority in the Job frame.
+
+**Required proof:** competing ordinary invocation is injected before/after each fused protocol transition; the set of legal outcomes must match the ordinary-SIP ordering model.
+
+## SJOB-015 — Completion, visibility, publication, settlement, and release are distinct
+
+The following MUST remain separable states:
+
+```text
+stage execution completed
+provider execution completed
+memory/device visibility established
+result publication committed
+Region ownership settled
+external-operation lifecycle settled
+pins/leases released
+```
+
+No Job-level `Completed` bit may substitute for these owners.
+
+Provider completion evidence or CPU certificate MUST NOT become a SingNext capability.
+
+**Required proof:** delay each state boundary independently in test instrumentation and verify that the next state does not become visible early.
+
+## SJOB-016 — Qualification and claims are contour-specific
+
+A qualified contour MUST NOT automatically qualify an adjacent contour.
+
+The following dimensions are independently gated where applicable:
+
+- synchronous vs async;
+- copied value vs BORROW vs MOVE;
+- linear vs read-only DAG vs parallel DAG;
+- same-runtime vs split-runtime;
+- no external effect vs external-effect stage;
+- JIT vs NativeAOT;
+- generic managed execution vs specific HybridCPU/provider acceleration;
+- normal managed domain vs NativeIsolated/confidential domain.
+
+Claims MUST identify the exact source/toolchain/policy/provider tuple and the exact enabled feature gates.
+
+No theoretical complexity claim, model-only property, or presence of metadata may be presented as measured or runtime-enforced evidence.

@@ -1,140 +1,260 @@
-# P14-1 — Immutable SipJob Plan, Stage Metadata and Graph Verifier
+# P14-1 — SipJob Plan, Descriptor Model, and Graph Verifier
 
-## Goal
+## 1. Goal
 
-Define a non-authoritative immutable plan model assembled from existing generated SIP metadata and introduce a verifier for a deliberately narrow **linear same-runtime MVP**.
+Define immutable non-authoritative metadata for a bounded linear Job and implement a closed-world verifier that can prove a plan refers only to admitted contracts, schemas, precompiled thunks, authority sources, and edge semantics.
 
-## Scope
+P14-1 does not execute fused service code.
 
-Initial supported graph:
+## 2. MVP contour
 
-```text
-Entry -> Stage0 -> Stage1 [-> Stage2 -> Stage3] -> Exit
-```
-
-No branch/join, provider effect fusion, split-runtime path or arbitrary loop in the first gate. Maximum stage/edge counts are bounded and included in admission policy.
-
-## Proposed internal model
-
-Conceptual shapes (exact names may differ):
+The verifier initially accepts only:
 
 ```text
-SipJobPlan
-  PlanId / PlanDigest
-  ContractTupleDigest
-  StageDescriptor[]
-  EdgeDescriptor[]
-  EntrySchema / ExitSchema
-  RequiredFeatureGates
-  MaximumResources
-
-StageDescriptor
-  StageId
-  ServiceContractIdentity + exact digest/version
-  MessageId
-  GeneratedSentryThunkId
-  StageInputShape / StageOutputShape
-  AuthorityRequirement[] + AuthoritySource
-  OwnershipTransition[]
-  StageEffectClass
-  EffectRevocationPolicy
-  ProtocolTransitionDescriptor
-
-EdgeDescriptor
-  SourceStage / TargetStage
-  EdgeKind = BoundedValue | Borrow | Move | DeclaredHandle
-  schema/type/range constraints
+2..4 stages
+linear chain
+same qualified managed runtime
+synchronous stage declarations
+precompiled generated SIP operations
+bounded closed copied/value edges
+no Region BORROW/MOVE
+no external effect
+no async
+no DAG
+no provider hint
+one final externally visible publication
+no independently observable intermediate invocation
 ```
 
-The plan stores no `OperationAuthorityLease`, active session pin or “authorized” bit.
+Anything outside this contour is rejected or routed to ordinary SIP by the caller/planner.
 
-## Graph verifier
+## 3. Descriptor rules
 
-The verifier must prove before binding/execution:
+All descriptors MUST be immutable value data with no ambient authority.
+
+### 3.1 `SipJobPlanDescriptor`
+
+Contains only values such as:
 
 ```text
-all stage contract digests and message IDs exist in the admitted generated catalog
-all edge schemas exactly match producer/consumer declarations
-no raw CLR/reference graph edge
-all authority sources are explicit
-no undeclared returned authority flows into a later stage
-no unsupported effect/barrier appears in a linear-only gate
-stage/edge/resource cardinalities are bounded
-no cycles in P14-1
-all required feature gates are enabled for the target runtime tuple
+PlanFormatVersion
+StageDescriptors[]
+EdgeDescriptors[]
+DeclaredGateSet
+PlanDigest
+Optional semantic policy IDs whose schemas are versioned and digest-bound
 ```
 
-## Plan digest
+### 3.2 `StageDescriptor`
 
-Canonical digest binds at least:
+Minimum semantic fields:
 
 ```text
-schema version
-ordered stages/edges
-contract digests
-message IDs
-generated sentry IDs
-edge kinds and schemas
-authority-source classes
-ownership declarations
-effect/barrier classes
-feature-gate requirements
+StageId
+ContractId + ContractDigest
+OperationId
+RequestSchemaId + Digest
+ResponseSchemaId + Digest
+GeneratedThunkId + ThunkDigest
+DeclaredAuthorityRequirements[]
+DeclaredOwnershipUseRequirements[]
+DeclaredProtocolTransitionId
+DeclaredInvocationObservability
+DeclaredCancellationPolicyId
+DeclaredEffectClass
+DeclaredExecutionClass (semantic only; initially None/ManagedDefault)
 ```
 
-Digest is evidence/cache identity only.
+The descriptor MUST NOT contain:
 
-## No implementation reference leakage
+- implementation instance;
+- runtime delegate;
+- `Type`/`MethodInfo` used for unrestricted dispatch;
+- `IServiceProvider`;
+- service locator key that bypasses closed-world binding;
+- raw `Task`/`ValueTask`;
+- provider-private handle.
 
-The public/ManagedCap surface may expose an opaque Job plan/binding handle or a generated typed builder, but not actual service objects/delegates. The trusted runtime maps `GeneratedSentryThunkId` to precompiled trusted code internally.
+### 3.3 `EdgeDescriptor`
 
-## Primary paths
+Initial edge kind:
 
 ```text
-contracts/SingPlus.Contracts/ (opaque metadata/handles only if needed)
-sdk/SingPlus.Generators/
-sdk/SingPlus.Analyzers/
-src/Runtime/SingPlus.Runtime/Services/ or new tightly scoped Jobs/
-tools/SingPlus.Admission/
-tests/SingPlus.Tests/Jobs/
+ClosedCopiedValue
 ```
 
-## PR slices
-
-- P14-1.1: versioned plan/stage/edge internal contracts.
-- P14-1.2: deterministic canonicalization/digest.
-- P14-1.3: linear graph verifier and bounded-resource policy.
-- P14-1.4: generator output linking exact SIP method to generated stage metadata.
-- P14-1.5: AdmissionVerifier rules rejecting raw CLR/dynamic stage references.
-
-## Tests
-
-Positive:
+Future edge kinds are versioned and independently gated:
 
 ```text
-2/3/4-stage valid linear plan
-bounded copied-value edge
-opaque handle edge
-exact matching contract digest/message ID
+RegionBorrow
+RegionMove
+MaterializedSipBoundary
+ExternalEffectBoundary
 ```
 
-Negative:
+Every edge records:
 
 ```text
-raw object/class/delegate edge
-stage substitution by name only
-wrong contract digest/version
-undeclared authority return
-cycle
-unbounded stage count
-unknown edge type
-required feature gate disabled
-plan digest tamper/replay across incompatible runtime tuple
+ProducerStageId
+ConsumerStageId
+ValueSchemaId + Digest
+OwnershipUseSemanticsId
+IsolationSemanticsId
+PublicationSemanticsId
+BarrierClassId
+CancellationScopeId
 ```
 
-## Performance gate
+## 4. Authority source descriptors
 
-Plan verification/binding is not on the per-element hot path. Measure cold bind separately from steady-state run. No reflection-based per-run method resolution.
+An authority requirement identifies how runtime validation locates an existing authority owner. It never contains an authorization result.
 
-## Exit criteria
+Allowed source classes are a closed enum, for example:
 
-`FG-JOB-LINEAR` can be enabled only in test/experimental builds after P14-8 qualification. The plan model is demonstrably non-authoritative and contains no ManagedCap-visible raw implementation references.
+```text
+CallerProvidedCapabilityReference
+SessionBoundCapabilityReference
+PreviousStageDeclaredReturn
+RegionAuthorityHandle
+SealedObjectReference
+ExternalOperationReference
+ExistingProtocolStateOwnerReference
+```
+
+`PreviousStageDeclaredReturn` is allowed only if the generated operation contract explicitly declares a supported transferable result form.
+
+Unknown source class → reject.
+
+## 5. Canonical PlanDigest
+
+The digest MUST bind every field capable of changing execution/security/lifecycle semantics, including:
+
+```text
+format versions
+ordered stages
+ordered edges
+contract/operation IDs and digests
+request/response schema digests
+thunk IDs/digests
+authority source descriptors
+ownership/use semantics
+protocol transition IDs
+invocation observability
+cancellation scopes/policies
+effect classes
+barrier classes
+join policy when DAG is later enabled
+settlement/publication policies
+semantic execution classes
+required feature-gate set
+```
+
+Unknown fields in a newer descriptor version are not silently ignored. Either the exact version is supported or the plan is rejected.
+
+A semantic mutation of one field MUST change the digest.
+
+## 6. Verification algorithm
+
+```text
+VerifyPlan(plan):
+    require supported PlanFormatVersion
+    require stage count within gate bounds
+    require graph shape allowed by active gate
+    require every stage ID unique
+    require every edge references existing stages
+    require acyclic + exact linear ordering for MVP
+
+    for stage in stages:
+        require contract/operation present in closed manifest
+        require request/response schema digest exact
+        require precompiled thunk ID/digest exact
+        require authority source classes supported
+        require effect class supported by active gate
+        require protocol/cancellation policy supported
+        require no reference-bearing descriptor fields
+
+    for edge in edges:
+        require producer output schema compatible with consumer input schema
+        require edge kind enabled
+        require isolation/ownership semantics enabled
+        require barrier class recognized
+
+    recompute canonical PlanDigest
+    require exact match
+
+    return VerifiedPlanMetadata  // evidence only, not authority
+```
+
+`VerifiedPlanMetadata` MUST NOT contain `Authorized=true` as a permission shortcut. It may record static facts such as manifest lookups and canonical descriptor offsets.
+
+## 7. Graph verifier properties
+
+The MVP verifier MUST prove:
+
+- exactly one entry and one exit;
+- each non-entry stage has one predecessor;
+- each non-exit stage has one successor;
+- no cycles;
+- no orphan stages;
+- no duplicate edge;
+- no hidden side edge;
+- only the final output is externally published in the MVP contour;
+- no intermediate invocation is declared independently observable;
+- no stage requires a disabled gate.
+
+## 8. Closed-value semantics
+
+A copied/value edge does not mean "pass the same CLR reference".
+
+The generator/verifier must identify a closed projection form whose ordinary SIP semantics can be reproduced directly. For reference-backed mutable source data, the fused path must still perform the generated snapshot/deep-copy/projection required for isolation.
+
+The MVP should prefer primitive/immutable/blittable/generated record-like projections where aliasing is fully specified.
+
+## 9. Static rejection cases
+
+CI MUST include malformed plans for:
+
+- unknown plan/descriptor version;
+- unknown stage operation;
+- mismatched contract digest;
+- mismatched schema digest;
+- mismatched thunk digest;
+- duplicate stage ID;
+- cycle;
+- hidden disconnected stage;
+- unsupported Region edge;
+- external effect under linear-MVP gate;
+- async declaration;
+- provider-private execution field;
+- implementation reference/delegate/service locator;
+- generic object payload;
+- mutable reference payload with no admitted projection;
+- unknown barrier/cancellation/publication policy.
+
+Expected result: fail before service code.
+
+## 10. No runtime binding authority
+
+P14-1 verifier may resolve manifest metadata but MUST NOT retain live service implementation references or authority leases in the plan.
+
+Actual runtime binding is introduced only in P14-2/P14-6 and remains TCB-private plus revalidated.
+
+## 11. PR decomposition
+
+1. descriptor contracts + canonical serialization;
+2. closed manifest/thunk catalog view;
+3. linear graph verifier;
+4. digest tests/property tests;
+5. negative admission/analyzer fixtures.
+
+No PR enables fused execution by itself.
+
+## 12. Exit criteria
+
+- canonical immutable descriptors exist;
+- MVP linear graph verifier is exhaustive for supported forms;
+- plan digest changes for every semantic mutation;
+- no descriptor can carry an implementation/ambient-authority object;
+- unknown versions fail closed;
+- all negative fixtures pass;
+- `FG-JOB-LINEAR` remains non-executing until P14-2.

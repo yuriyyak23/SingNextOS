@@ -1,120 +1,318 @@
-# P14-5 — Fusion Barriers, Async/Cancellation and Feature-Gated Read-Only DAG
+# P14-5 — Fusion Barriers, Async Stages, Read-Only DAG, and Parallel Execution
 
-## Goal
+## 1. Goal
 
-Introduce explicit points where fusion must stop/materialize, support safe suspension/resume, and add **read-only DAG fan-out only behind feature gates**.
+Define conservative segmentation boundaries and then add async/read-only DAG/parallel contours as independently gated extensions.
 
-## FusionBarrier model
-
-At minimum support the following classes:
+This phase is deliberately split into four qualification sub-phases:
 
 ```text
-ExternalEffect
-Publication
-OwnershipSettlement
-AsyncProviderWait
-CrossRuntime
-UnqualifiedNative
-ConfidentialDomain
-IndependentCancellation
-ExternallyObservableInvocation
+P14-5A  barrier classification and materialization
+P14-5B  async stage contour
+P14-5C  deterministic read-only DAG semantics
+P14-5D  parallel DAG execution
 ```
 
-The planner may fuse across a boundary only when no required barrier class is present and all required feature gates are enabled. Unknown/unsupported class fails closed.
+No sub-phase inherits qualification from another except explicit prerequisites.
 
-## Inline vs materialized stages
+---
 
-### Inline stage
+# P14-5A — Fusion barriers
 
-Allowed only when it has no independent externally visible invocation lifecycle. It may use lightweight `JobStageAttempt` evidence inside the trusted executor.
+## 2. Barrier principle
 
-### Materialized stage
+A `FusionBarrier` does not mean the Job ends. It means the next semantic boundary must be materialized or handled through the existing lifecycle owner rather than being erased as an internal fused edge.
 
-Required when a stage needs independent cancellation, observer-visible invocation, provider callback, response publication, durable correlation or other ordinary lifecycle semantics. It registers in the existing `EndpointSessionInvocationRegistry`/response lifecycle rather than a Job-private substitute.
+A barrier is required whenever eliminating the ordinary boundary would erase independently meaningful state or would require a Job-local transaction/authority model.
 
-## Async stage
+## 3. Required barrier classes
 
-`FG-ASYNC-STAGE` allows suspension only with heap-safe authoritative handles/leases. Rules:
+### 3.1 `ExternalEffectBoundary`
+
+Required before/around provider/device/network effects whose prepare/admit/submit/complete/visibility/release lifecycle is independently authoritative.
+
+### 3.2 `PublicationBoundary`
+
+Required when an intermediate result is externally observable or existing protocol semantics require response publication before subsequent work.
+
+### 3.3 `OwnershipSettlementBoundary`
+
+Required when ordinary SIP establishes an ownership state that must become independently authoritative before the next stage and cannot be represented solely as an internal continuation.
+
+This does not permit collapsing Region transitions; P14-3 remains normative.
+
+### 3.4 `AsyncWaitBoundary`
+
+Required when the async wait cannot remain within a qualified TCB-private sentry continuation or when session/Region/provider lifecycle must be independently materialized during suspension.
+
+### 3.5 `CrossRuntimeBoundary`
+
+Always materialize through ordinary transport semantics. No raw-reference fusion across runtimes.
+
+### 3.6 `IndependentCancellationBoundary`
+
+Required when the intermediate invocation has an independently observable cancellation identity/lifecycle.
+
+### 3.7 `ObservableInvocationBoundary`
+
+Required when external code can observe, cancel, query, or depend on the invocation as a separate object/lifecycle.
+
+### 3.8 `NativeIsolatedBoundary`
+
+FutureGated. Materialize through the existing isolated transition.
+
+### 3.9 `ConfidentialDomainBoundary`
+
+FutureGated. Materialize through the existing secure/confidential-domain transition. No qualification inherited from managed fusion.
+
+### 3.10 `IrreversiblePrivateMutationBoundary`
+
+Required whenever continuing fusion would imply that a later failure rolls back a private service mutation that ordinary execution leaves committed.
+
+A private mutation does not have to be externally published immediately to be irreversible; future requests may observe it.
+
+### 3.11 `UnsupportedAuthorityCommitBoundary`
+
+Required where P14-4 cannot safely compose multiple non-compensatable commits using existing owner semantics.
+
+### 3.12 `UnknownBoundary`
+
+Unknown/new barrier classes fail closed and materialize/reject. They are never treated as `None`.
+
+## 4. Protocol transitions are not transport
+
+A protocol transition is always authoritative but is not automatically a materialization barrier.
+
+The direct path may keep execution fused only if it commits the protocol transition at the same semantic point and preserves the same outcomes for competing external invocations.
+
+If an independently observable protocol action requires publication/materialization, the relevant barrier class applies.
+
+## 5. Barrier planner tests
+
+For every class above:
+
+- construct an otherwise-fusible two-stage plan;
+- insert exactly one barrier condition;
+- assert planner produces the defined materialized segment split;
+- assert no security check disappears across the split;
+- assert unknown barrier version fails closed.
+
+---
+
+# P14-5B — Async stages
+
+## 6. Async TCB boundary
+
+An async service implementation commonly creates a compiler-generated state machine containing `this`, locals, dependencies, and mutable references. This state MUST remain inside the generated sentry/compartment.
+
+The Job executor MUST NOT store the service-produced `Task`, `ValueTask`, custom awaitable, closure, or state-machine object as a Job edge value.
+
+Allowed Job-side suspended state:
 
 ```text
-no Span/ref-like value across await
-save JobRunId + StageId + exact lease/pin references/correlations
-release locks before suspension
-on resume revalidate current required lease/session/Region state
-rematerialize Span on stack
-continue or fail closed according to static policy
+opaque TCB-owned invocation correlation
+opaque owner-issued pins/leases that are explicitly safe across suspension
+closed projected input/output state
+cancellation correlation
+semantic stage ID
 ```
 
-## Cancellation
+Forbidden:
 
-A Job may bind one `CancellationScopeHandle`, but cancellation disposition remains stage/effect-specific. “Cancel Job” never fabricates cancellation of an admitted/irreversible provider effect. Join logic must settle all branch-owned borrows/uses before terminal publication.
+```text
+service implementation reference
+async state machine reference
+awaiter containing service-private graph
+captured dependency/delegate
+raw Region backing object
+```
 
-## Read-only DAG feature gate
+## 7. Async lease/pin rules
 
-`FG-READONLY-DAG` is **not part of the initial linear release**. It may be enabled only after P14-3 and P14-4 are qualified.
+A stack-only view (`Span<T>`, ref struct, stack borrow proxy) MUST NOT survive across an await.
 
-Initial DAG restrictions:
+If a Region use must survive suspension:
+
+- the authoritative heap-safe lease/use handle is explicit;
+- view rematerialization revalidates lease state as required by existing Region semantics;
+- cancellation/fault closes the use exactly once;
+- service restart/session close behavior is defined and tested.
+
+## 8. Async cancellation linearization
+
+Required races:
+
+```text
+cancel before service starts
+cancel just before await suspension
+cancel while suspended
+cancel concurrent with completion
+completion before cancel publication
+provider completion but visibility pending
+session close while suspended
+```
+
+The result must match ordinary SIP's allowed outcome set. The Job must not publish success merely because an awaited task completed if publication/session/provider conditions are no longer satisfied.
+
+## 9. Async JIT/NativeAOT qualification
+
+JIT and NativeAOT are separately recorded gates/tuples. Qualification must include the generated state-machine/linkage behavior of the actual runtime mode.
+
+---
+
+# P14-5C — Deterministic read-only DAG
+
+## 10. Scope
+
+The first DAG contour is deliberately restrictive:
 
 ```text
 acyclic graph
-bounded nodes/edges/fan-out/fan-in
-fan-out edges are read-only Region uses/borrows or immutable bounded values
-no shared mutable multi-writer edge
-no MOVE to more than one successor
-join stage has deterministic declared inputs
-all branches share explicit cancellation/join settlement policy
+single logical Job entry
+immutable/copied-value fan-out OR qualified read-only Region BORROW fan-out
+no MOVE fan-out
+no shared writable state
+no branch-to-branch mutable communication
+explicit deterministic join policy
+bounded branch count
 ```
 
-Example:
+Shared-mutable DAG remains FutureGated.
+
+## 11. Fan-out rules
+
+### Copied/immutable value fan-out
+
+Each branch receives a closed value whose aliasing semantics are immutable/value-like or separately projected according to schema.
+
+### Read-only Region fan-out
+
+All branches may share the same authoritative read-only use only when existing Region semantics permit it.
+
+The shared lease lifetime dominates every branch capable of accessing the Region.
+
+No branch can release the shared lease independently while siblings remain active.
+
+## 12. Region conflict matrix
+
+Initial DAG verifier:
+
+| A | B | Result |
+|---|---|---|
+| read-only BORROW | read-only BORROW | allowed if same lifetime scope and Region rules permit |
+| MOVE | any sibling use | reject |
+| write/use mutation | sibling read | reject |
+| write | write | reject |
+| unknown use class | any | reject |
+
+## 13. Branch cancellation/failure
+
+The plan declares a closed join/cancellation policy ID. Examples may include all-success semantics, but arbitrary callback policies are not allowed.
+
+For each branch outcome:
+
+- branch-local reversible resources close once;
+- shared resources remain until all dependent branches settle;
+- committed private mutations are not rolled back;
+- authority consumed by an already-entered branch is not refunded by Job code;
+- unstarted branches do not consume their operation authority;
+- output publication waits for the declared join condition.
+
+## 14. Deterministic join
+
+Join behavior MUST NOT depend on worker scheduling order.
+
+The public fault/cancel/result selection rule must be deterministic from the declared policy and branch semantic outcomes, not from whichever branch happened to finish first unless "first completion" is itself an explicit separately qualified observable contract.
+
+The initial gate SHOULD avoid first-completion/racing joins.
+
+## 15. Lifetime domination proof
+
+For every shared Region use or shared TCB resource:
 
 ```text
-             -> Hash ---------
-Input Region                  -> Join/Publish
-             -> Classify -----
+Acquire
+  dominates all dependent branches
+Join/branch-settlement
+  post-dominates all dependent accesses
+Release
+  occurs after that post-dominator
 ```
 
-Both branches may obtain compatible read-only uses from the same Region only if the P07 conflict matrix admits them.
+Graph verification plus runtime property tests must agree on the same lifetime scope.
 
-## Parallel DAG gate
+---
 
-`FG-DAG-PARALLEL` is separate from DAG correctness. First qualify DAG semantics with deterministic/single-worker scheduling. Parallel execution additionally requires race/contention evidence and must not change authority/ownership outcomes.
+# P14-5D — Parallel DAG execution
 
-## Explicitly FutureGated
+## 16. Scope
 
-The following remain OFF beyond this roadmap's release target unless a later roadmap qualifies them:
+Parallel execution is a scheduler optimization over already-qualified deterministic read-only DAG semantics.
+
+It does not create additional authority and must not alter branch/join outcomes.
+
+## 17. Worker/scheduler rules
+
+- workers carry no ambient Job authority;
+- a work item contains only stage ID + TCB-private correlation/closed state;
+- worker migration does not change authority semantics;
+- branch admission remains at the generated sentry/owner boundaries;
+- no worker-local owner cache can substitute for live revalidation;
+- scheduling hints are semantic only; physical HybridCPU placement remains P14-7/provider-owned.
+
+## 18. False sharing/cache effects
+
+Qualification measures, but does not change semantics based on:
+
+- cache-line contention;
+- false sharing in Job runtime bookkeeping;
+- branch migration;
+- work stealing;
+- lock contention;
+- GC pressure.
+
+A performance issue may disable/restrict the parallel gate; it may not justify weaker isolation or ownership checks.
+
+## 19. Executable proof matrix
+
+For branch counts `2/4/8` and workers `1/2/4/8/16/32`, cover:
 
 ```text
-shared mutable DAG
-multi-writer graph
-implicit lock-sharing object graphs
-confidential-domain fusion
-NativeIsolated fusion without independent isolation proof
+all success
+one branch fault
+multiple faults
+one cancel
+cancel + fault
+service restart in one branch
+shared Region reclaim attempt
+join failure path
 ```
 
-## PR slices
+Assertions:
 
-- P14-5.1: barrier classification in generated plan metadata.
-- P14-5.2: materialization fallback at barriers.
-- P14-5.3: async stage state machine and lease revalidation.
-- P14-5.4: Job cancellation/join settlement.
-- P14-5.5: read-only DAG verifier + deterministic executor behind `FG-READONLY-DAG`.
-- P14-5.6: optional parallel read-only branches behind `FG-DAG-PARALLEL`.
+- result/fault/cancel class independent of scheduling order;
+- no authority consumed by never-started branch;
+- no shared lease released early;
+- no ownership settlement before required join state;
+- no leaked pins/leases after partial completion;
+- no hidden mutable branch communication.
 
-## Tests
+## 20. PR decomposition
 
-```text
-unknown barrier => reject/materialize
-independently cancellable stage => materialized lifecycle
-Span cannot survive suspension
-cancel before stage admission
-cancel after local stage admission
-provider cancellation ambiguity remains pinned/quarantined where applicable
-read/read fan-out accepted
-read/write or write/write fan-out rejected
-branch failure closes its borrows and join settles remaining branches
-parallel vs serial DAG yields same ownership/publication result
-```
+1. P14-5A barrier enum/planner/materialization tests;
+2. P14-5B async sentry containment + cancellation tests;
+3. P14-5C read-only DAG verifier + serial executor;
+4. P14-5C property/lifetime qualification;
+5. P14-5D parallel scheduler integration;
+6. P14-5D contention/performance/race qualification.
 
-## Exit criteria
+Each sub-contour has its own gate and can be reverted independently.
 
-Fusion boundaries are explicit and auditable. Read-only DAG is still a separately switchable contour with its own evidence; mutable DAG remains FutureGated.
+## 21. Exit criteria
+
+- all barrier classes fail closed and are tested;
+- irreversible private mutation cannot be hidden behind fake rollback semantics;
+- async state cannot escape the service compartment through Job state;
+- read-only DAG has deterministic join/lifetime semantics;
+- parallel execution does not alter authority or result ordering semantics;
+- shared-mutable DAG remains disabled/FutureGated.

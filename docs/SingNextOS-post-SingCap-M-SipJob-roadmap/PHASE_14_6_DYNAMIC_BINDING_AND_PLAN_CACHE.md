@@ -1,134 +1,239 @@
-# P14-6 — Dynamic Plan Binding from Precompiled Qualified Stages and Safe Caching
+# P14-6 — Dynamic Binding, Precompiled Thunk Selection, and Non-Authoritative Caches
 
-## Goal
+## 1. Goal
 
-Allow runtime selection/aggregation of a subset of admitted SIP stages without dynamic code generation and without caching authority decisions.
+Allow runtime selection among precompiled qualified stages and cache expensive static/binding work without caching authorization or creating an ambient service locator.
 
-## Dynamic composition model
+Dynamic binding means **selection from a closed admitted catalog**, not dynamic code generation.
 
-Allowed:
+## 2. Two cache classes
 
-```text
-precompiled generated StageThunk A
-precompiled generated StageThunk B
-precompiled generated StageThunk C
+The implementation SHOULD separate two conceptual caches.
 
-runtime selects A -> C -> B
-verifier builds immutable plan
-binder resolves exact service/session/thunk candidates
-```
+### 2.1 Verification cache
 
-Forbidden:
+Caches static facts derived from immutable plan/manifests:
 
 ```text
-Reflection.Emit
-runtime IL generation
-arbitrary Assembly.Load
-unqualified dynamic delegate supplied by ManagedCap code
-MethodInfo.Invoke as steady-state Job dispatch
-string-only service/method binding without digest/signature identity
+PlanDigest -> verified descriptor offsets
+contract/schema compatibility
+required gate set
+thunk IDs/digests
+static graph/lifetime/barrier analysis
 ```
 
-## Qualified stage catalog
+It contains no live subject/session/capability authorization.
 
-Introduce one TCB-private deterministic catalog derived from admitted generated artifacts. The catalog is **not authority**. It maps exact immutable identities to trusted code locations/binding factories, for example:
+### 2.2 Live binding cache
+
+Caches where/how to find current runtime objects:
 
 ```text
-(contract digest, message id, generated thunk schema version)
-    -> trusted stage thunk descriptor
+opaque process/service/session references
+TCB-private thunk binding
+lookup handles for authority owners
+provider-neutral contract binding where applicable
 ```
 
-Catalog entries are invalidated/rebuilt on runtime/toolchain/admission-policy tuple change.
+A live binding is a performance hint. Every run performs owner-required revalidation.
 
-## Job binding
+## 3. Full binding identity
 
-Binding resolves:
+The cache key must prevent ABA/restart aliasing.
+
+It MUST bind, directly or through an existing non-reusable opaque handle, every relevant identity:
 
 ```text
-exact service identity/incarnation
-exact generated stage thunk
-exact EndpointSession handles or creation policy
-candidate exact capability references for each declared requirement
-expected seal/Region schema constraints
-feature-gate availability
+RuntimeRealm / AuthorityRealm
+RuntimeIncarnation
+ProcessHandle + generation/incarnation
+ServiceHandle + generation/incarnation
+SessionHandle + generation
+Capability authority reference/lineage identity
+Capability resource generation/revocation epoch where exposed by existing model
+Seal identity + generation
+ContractId + digest
+Request/response schema digests
+ThunkId + digest
+AdmissionPolicyDigest
+Generator/toolchain tuple where required for compatibility
+PlanDigest
+Provider contract/generation only for provider-dependent stages
 ```
 
-A binding contains no durable authorization result.
+A numeric ID alone is not sufficient if it can be reused after restart.
 
-## Cache rules
+## 4. No cached authorization
 
-`FG-PLAN-CACHE` may cache:
+Forbidden cache fields/semantics:
 
 ```text
-plan verification result keyed by canonical digest + runtime policy tuple
-exact binding keys/references
-contract/schema/thunk lookup
+Authorized = true
+CapabilityStillValid = true
+SessionStillActive = true
+RegionOwner = X as execution permission
+SealStillLive = true
+ProviderAllowed = true
 ```
 
-Every run still validates live:
+Allowed examples:
 
 ```text
-process/service/session generation
-capability revocation/lineage/resource generation
-seal generation/state
-Region generation/use state
-feature-gate/runtime incarnation
+CapabilityOwnerLookupRef
+SessionRegistryLookupRef
+RegionHandle for live validation
+ThunkCatalogIndex
+ManifestOffset
+ServiceBindingKey
 ```
 
-Stale/ambiguous cache entry fails closed or rebinds.
+## 5. Dynamic stage selection
 
-## Split-runtime fallback
+A dynamic plan may select a stage only when:
 
-`FG-SPLIT-RUNTIME` permits one logical plan to become:
+1. the operation exists in the closed thunk catalog;
+2. contract/schema/thunk digests exactly match;
+3. required gates are enabled for the exact contour;
+4. the selected binding belongs to the expected runtime/authority realm;
+5. live execution revalidates all owners.
+
+Caller-supplied delegate, reflection type name, assembly path, service locator key, or arbitrary method token is not a valid selection mechanism.
+
+## 6. Restart/ABA handling
+
+Required scenarios:
+
+### Runtime recreation
+
+Old Job handle/cache entry must not execute against a recreated runtime with reused local IDs.
+
+### Service restart
+
+Same logical service name with a new incarnation requires rebinding and live session/capability checks.
+
+### Session ID reuse
+
+New generation must not be accepted by a cache entry bound to an older generation.
+
+### Capability rederive/revoke
+
+A new lineage/reference does not inherit cached validation from the old capability.
+
+### Seal recreation
+
+Same logical object key with new generation invalidates the old binding.
+
+### Plan/thunk/schema change
+
+Any digest change creates a different verification/binding identity.
+
+### Provider restart
+
+Only provider-dependent entries include provider generation/contract identity. Provider evidence never grants local authority.
+
+## 7. Stale cache behavior
+
+On stale/missing live state:
 
 ```text
-[fused local segment]
-      -> ordinary SIP transport barrier
-[remote/other-runtime segment]
-      -> ordinary SIP transport barrier
-[fused local segment]
+cache miss / stale detection
+    -> attempt normal trusted rebind
+    -> perform live validation
+    -> execute only if current owners admit
 ```
 
-The plan must not expose transport placement as authority. Relocation/topology change can alter materialization boundaries without changing the SIP contract.
+If safe rebinding is impossible, route to ordinary SIP or reject. Never "refresh" a stale generation by guessing the current value.
 
-## Job handle semantics
+## 8. Job handle semantics
 
-If an opaque reusable handle is exposed, it behaves like identity/binding selection, not permission. `ExecuteJob(handle, ...)` still performs current exact authority admission. Wrong caller/session/incarnation or stale binding is denied.
-
-## Primary paths
+A reusable `SipJobHandle` identifies:
 
 ```text
-sdk/SingPlus.Generators/
-tools/SingPlus.Admission/
-src/Runtime/SingPlus.Runtime/Services/
-new internal Jobs catalog/binder/cache
+verified plan identity
+optional cache key/lookup accelerator
 ```
 
-## PR slices
+It does not contain permission. The following must still fail after handle creation:
 
-- P14-6.1: deterministic generated stage catalog.
-- P14-6.2: runtime plan binder.
-- P14-6.3: stale-safe plan verification/binding cache.
-- P14-6.4: opaque Job binding handle (only if needed).
-- P14-6.5: split-runtime segmentation using ordinary SIP fallback.
+- revoked capability;
+- closed session;
+- restarted service;
+- reclaimed Region;
+- closed seal;
+- disabled gate;
+- incompatible runtime/toolchain/provider tuple.
 
-## Tests
+## 9. Cache lifetime and memory safety
+
+TCB-private cache entries may be reference-bearing internally, but:
+
+- no entry is exposed to ManagedCap code;
+- eviction/restart releases TCB-private references;
+- weak/strong rooting strategy is documented to avoid pinning retired service incarnations forever;
+- cache eviction cannot trigger user/provider callbacks under authority locks;
+- cached service implementation references, if required internally, are scoped to exact incarnation and never used as authority evidence.
+
+## 10. Plan replay
+
+A serialized/stored plan may be replayed only as static metadata.
+
+Replay MUST rebind current runtime identities and live authority. A plan generated in realm/incarnation A must not carry executable authority into realm/incarnation B.
+
+If plan format or policy tuple is incompatible, replay fails closed.
+
+## 11. Executable proof set
+
+### ABA suite
+
+Create resource/service/session/capability/seal identities, cache binding, tear them down, recreate semantically similar objects with reused numeric/local IDs where possible, then execute old handle.
+
+Expected: stale deny/rebind; never accidental execution.
+
+### Cache vs revoke
+
+Warm cache, revoke capability, run repeatedly. Every run denied despite cache hit.
+
+### Cache vs restart
+
+Warm cache, restart service/runtime, run old handle. Old implementation reference must not be entered.
+
+### Digest mutation
+
+Change one contract/schema/thunk/policy/plan semantic field. Cache entry must not match.
+
+### No dynamic codegen
+
+Instrument/scan runtime path for prohibited dynamic IL/reflection dispatch. Unknown selection must reject, not generate code.
+
+## 12. Performance requirements
+
+Measure separately:
 
 ```text
-same name/different digest substitution denied
-service restart invalidates binding
-runtime restart invalidates old realm/binding
-capability revoke after cache creation still denies execution
-Region generation change after cache creation still denies execution
-AdmissionVerifier rejects dynamic codegen/assembly load path
-split-runtime and same-runtime produce equivalent declared semantics
-feature gate change invalidates incompatible cache
+cold verification
+warm verification-cache hit
+cold live binding
+warm live-binding hit
+live authority revalidation cost
+stale-entry rebind cost
 ```
 
-## Performance gate
+A warm cache speedup must not be attributed to eliminated security checks if live admission still occurs.
 
-Report cold verify/bind, warm cached bind and steady-state run separately. Cache speedups do not justify skipped live checks.
+## 13. PR decomposition
 
-## Exit criteria
+1. verification-cache identity and canonical keys;
+2. live-binding cache with gate OFF;
+3. restart/ABA invalidation tests;
+4. dynamic precompiled thunk selection;
+5. replay/stale-handle tests;
+6. performance counters and qualification.
 
-Runtime can select arbitrary **admitted precompiled** stage subsets within bounded plan rules, and no dynamic-code or stale-positive-authorization shortcut is introduced.
+## 14. Exit criteria
+
+- cache cannot grant authority;
+- complete realm/incarnation identity is represented;
+- ABA/restart/replay tests pass;
+- dynamic composition selects only precompiled admitted thunks;
+- no service-locator/dynamic-IL path exists;
+- fallback remains ordinary SIP or rejection.

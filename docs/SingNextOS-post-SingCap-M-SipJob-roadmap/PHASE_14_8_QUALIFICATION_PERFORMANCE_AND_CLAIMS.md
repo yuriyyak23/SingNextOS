@@ -1,177 +1,395 @@
-# P14-8 — Security, Concurrency, Performance and Claim Closure
+# P14-8 — Security Qualification, Performance Characterization, and Claim Closure
 
-## Goal
+## 1. Goal
 
-Release no SipJob contour until fused execution has adversarial, race, ownership, fallback and performance evidence against the ordinary SIP semantic reference.
+Close each enabled `SipJob` contour with executable security/conformance evidence, statistically meaningful performance data, supply-chain binding, and claims no broader than the tested tuple.
 
-## Required claim levels
+Performance never substitutes for security qualification.
 
-Use the existing conservative vocabulary:
+## 2. Qualification order
 
-```text
-ModelOnly
-StaticAdmission
-RuntimeEnforced
-QualifiedManaged
-ProductionCandidate
-```
-
-Each feature gate receives its own level. Qualification of `FG-JOB-LINEAR` does not raise `FG-READONLY-DAG`, async, provider, split-runtime or HybridCPU acceleration claims.
-
-## Security matrix
-
-At minimum:
+For each contour:
 
 ```text
-forged/replayed Job plan/binding handle
-runtime/service/process restart stale binding
-contract/message/thunk substitution
-raw CLR/delegate/service-object injection
-confused-deputy executor-owned capability attempt
-capability ancestor revoke vs stage/segment admission
-session close vs segment commit
-seal close/service restart vs stage admission
-Region MOVE/reclaim vs Job admission
-one-shot/quota competition
-failure after MOVE ownership settlement
-cancel before/after stage admission
-async suspend/restart/revalidation
-feature-gate downgrade while cached plan exists
-split-runtime fallback semantic equivalence
-provider completion/publication/release races where gate enabled
+1. static closed-world admission
+2. runtime negative tests
+3. deterministic race/property tests
+4. ordinary-vs-fused semantic-trace differential tests
+5. leak/cleanup checks
+6. performance characterization
+7. supply-chain/manifest closure
+8. claim review
+9. optional ProductionCandidate promotion
 ```
 
-Every race asserts both the permitted winner and zero leaked pins/leases/uses/fabricated closure.
+Any failure in steps 1-5 blocks promotion regardless of performance.
 
-## Normal-vs-fused differential suite
+## 3. Required comparison paths
 
-For every representative SIP chain execute:
+Every benchmark report must identify at least:
+
+### A. Direct-call diagnostic baseline
+
+Plain in-process direct call without SIP security/transport semantics.
+
+Purpose: lower-bound diagnostic only. It is not a valid replacement for SIP/Job and must not be used to claim that security checks are overhead that should be removed.
+
+### B. Ordinary full SIP
+
+Normal session/request/reply path including existing envelope/queue/waiter/publication semantics.
+
+### C. Fused SipJob
+
+Exact enabled Job gates under test.
+
+### D. Forced-materialization Job
+
+Same Job plan but barriers force ordinary intermediate SIP boundaries. Helps separate graph/planner overhead from fusion savings.
+
+### E. Split-runtime fallback
+
+Where applicable, ordinary cross-runtime execution using the current transport boundary.
+
+### F. Provider-accelerated contour
+
+Only for P14-7, and always reported separately from Job fusion.
+
+## 4. Workload matrix
+
+### 4.1 Stage count
 
 ```text
-A) ordinary SIP boundaries
-B) fused Job path
-C) mixed path with forced materialization after every stage
-D) split-runtime path where available
+2 / 4 / 8 / 16 stages
 ```
 
-Compare declared observable semantics:
+At least one test must use a tiny stage body so transport/security/runtime overhead is visible, and one must use a meaningful compute body to show amortization.
 
-```text
-result/error class
-protocol state
-capability consumption/quota
-Region owner/generation/use state
-sealed object lifecycle
-cancellation disposition
-final response publication
-external operation lifecycle state
-```
+### 4.2 Value payloads
 
-## Benchmark matrix
-
-### Chain length
-
-```text
-2 / 3 / 4 / 8 stages
-```
-
-### Payload/data shapes
+Closed copied/value forms:
 
 ```text
 empty/control
-small bounded copied value
-64 B / 4 KiB / 64 KiB / 1 MiB Region BORROW
-64 B / 4 KiB / 64 KiB / 1 MiB Region MOVE
+small scalar/record
+4 KiB
+64 KiB
+bounded maximum admitted copied value
 ```
 
-### Execution contours
+Record security-required copied bytes separately from transport metadata bytes.
+
+### 4.3 Region payloads
+
+For separately qualified BORROW/MOVE gates:
 
 ```text
-direct unsafe method baseline (measurement reference only, not security equivalent)
-ordinary full SIP
-fused linear Job
-forced-materialization Job
-read-only DAG serial (when gate enabled)
-read-only DAG parallel (when gate enabled)
-split-runtime Job (when gate enabled)
-provider stage (when gate enabled; provider latency reported separately)
+4 KiB
+64 KiB
+1 MiB
+16 MiB or another >1 MiB point supported by the test environment
 ```
 
-### Measurements
+### 4.4 DAG
+
+For read-only DAG:
 
 ```text
+fan-out 2 / 4 / 8
+serial DAG executor
+parallel DAG executor where qualified
+```
+
+### 4.5 Workers
+
+```text
+1 / 2 / 4 / 8 / 16 / 32 workers
+```
+
+Do not run worker counts that exceed the environment without recording CPU/topology context; oversubscription is a separate datum, not a silent default.
+
+### 4.6 Fault/cancel/lifecycle paths
+
+Benchmark and validate at least:
+
+```text
+success
+service fault
+cancel before stage
+cancel at sentry/admission boundary
+cancel during async stage when qualified
+fault after committed MOVE
+branch failure/join failure
+service restart/stale binding
+provider deny
+provider ambiguous completion where qualified
+```
+
+## 5. Mandatory metrics
+
+### Latency/throughput
+
+```text
+median (p50)
+p95
+p99
 throughput
-median/p95/p99/max observed latency
+```
+
+Max may be reported but is not a substitute for tail percentiles.
+
+### Allocation/GC
+
+```text
 allocations/op
-GC bytes/op
-queue enqueue/dequeue count
-ChannelEnvelope/ResponseEnvelope count
-Task/ValueTask completion-source allocation count
-materialized invocation count
-capability validation/admission count
-session pin/revalidation count
-Region transition/use count
-worker/context switches where measurable
-CPU/cache counters where tooling is reliable
+allocated bytes/op
+GC bytes/op (or harness-equivalent managed allocation/collection byte metric)
+GC collections by generation where meaningful
+GC pause/time evidence where material
 ```
 
-Run shared and unrelated authority workloads at 1/2/4/8/16/32 workers, consistent with P13.
-
-## Performance acceptance principles
-
-No fixed speedup is promised in advance. Release gates should instead enforce:
-
-1. fused path removes the intended intermediate transport materialization, proven by counters/traces;
-2. no hidden per-element capability/Region lookup regression;
-3. unrelated Job/Region work is not accidentally serialized by a new global Job lock;
-4. disabled gates/fallback do not regress ordinary SIP beyond an agreed bounded tolerance;
-5. performance report separates Job overhead from provider/hardware latency.
-
-Any numeric regression thresholds must be calibrated on the release hardware/toolchain and stored with the exact tuple, not copied from the P13 machine.
-
-## Read-only DAG release rule
-
-`FG-READONLY-DAG` stays OFF unless all of the following pass:
+### Transport/runtime counters
 
 ```text
-acyclic bounded graph verifier
-read/read Region conflict proof
-deterministic branch/join settlement
-cancel/fault cleanup property tests
-serial-vs-parallel semantic equivalence
-1/2/4/8/16/32 worker contention report
-no shared mutable/raw CLR graph path
+ChannelEnvelope count/op
+ResponseRegistry/ResponseEnvelope materialization count/op
+enqueue/dequeue count/op
+waiter/TaskCompletionSource count/op
+materialized invocation count/op
+scheduler suspend/resume/wakeup transitions/op
+worker migration/work-steal count for parallel DAG
 ```
 
-`FG-MUTABLE-DAG` remains FutureGated even if read-only DAG qualifies.
-
-## Claim/evidence artifacts
-
-Produce machine-readable artifacts analogous to P13:
+### Authority/security counters
 
 ```text
-P14_FEATURE_CLAIM_EVIDENCE_MATRIX.json
-P14_SECURITY_QUALIFICATION_MATRIX.json
-P14_PERFORMANCE_BASELINE.json
-P14_TCB_AND_SUPPLY_CHAIN_REVIEW.md
-P14_FUSION_CONFORMANCE_MATRIX.json
+capability lookups/op
+capability enumeration/scans/op where the ordinary path performs them
+capability admission/commit operations/op
+session lookups/pins/revalidations/op
+seal validation/pin operations/op
+Region use acquisitions/releases/op
+Region transfers/op
+Region generation advances/op
+protocol transitions/op
+publication operations/op
 ```
 
-Record exact SingNextOS SHA, HybridCPU source/package SHA, .NET tuple, admission-policy digest and generated-plan schema version.
-
-## Release criteria
-
-Minimum release contour:
+### Cache/discovery counters
 
 ```text
-QualifiedManaged: linear same-runtime generated ManagedCap Job
-with bounded values and separately qualified BORROW/MOVE gates,
-one final external publication, no raw CLR edges,
-no external provider inside an inline fused segment unless its gate is separately qualified.
+service discovery lookups/op
+verification-cache hits/misses
+live-binding-cache hits/misses
+stale rebinds/op
 ```
 
-No `ProductionCandidate` claim is granted merely because tests pass on one workstation. Hardware behavior, independent VM/process isolation, side channels, real-time guarantees, multi-host behavior, NativeIsolated fusion, confidential-domain fusion and mutable DAG remain separately gated or FutureGated.
+### Contention
 
-## Rollback
+```text
+lock acquisitions/op
+aggregate lock wait
+p95/p99 lock wait where measurable
+contention/failure/retry counts
+```
 
-Feature gates default off. A failed qualification release disables the affected gate and uses ordinary SIP materialization; it does not reinterpret a previously stronger handle as weaker authority.
+### Data movement
+
+```text
+security-required copied bytes/op
+transport metadata bytes/op
+provider staging bytes/op where applicable
+```
+
+## 6. Expected fast-path savings
+
+The implementation may reasonably target elimination/reduction of:
+
+- intermediate `ChannelEnvelope`/response materialization;
+- enqueue/dequeue;
+- intermediate waiter/TCS allocation;
+- scheduler transitions caused solely by the materialized intermediate boundary;
+- repeated service discovery after a safe live binding cache hit;
+- repeated static manifest/graph verification after a safe verification-cache hit.
+
+The implementation MUST NOT claim elimination of:
+
+- capability/effect admission;
+- session/generation checks required by owner semantics;
+- Region ownership/use transitions;
+- sealing;
+- protocol transitions;
+- isolation-required value copy/projection;
+- external-operation lifecycle;
+- publication/visibility gates.
+
+A reduced authority lookup count must be explained. Reusing an owner-issued pin/lease can remove redundant lookups only when its existing semantics guarantee the required property; caching `authorized=true` is prohibited.
+
+## 7. Security differential matrix
+
+For every promoted gate compare ordinary vs fused state after each test:
+
+```text
+public result/error/cancel class
+authoritative semantic event order
+capability quota/one-shot/revocation state
+session state/generation
+protocol state
+Region owner/generation/use state
+seal state
+invocation/publication state
+external-operation state
+remaining pins/leases/cache roots
+```
+
+A final-state-only comparison is insufficient for Region/protocol/capability sequencing.
+
+## 8. Race/property qualification
+
+Required deterministic injection around:
+
+```text
+session pin/revalidation
+capability commit
+seal revalidation
+Region use/transfer
+protocol transition
+implementation entry/exit
+external submit
+provider completion/visibility
+publication
+release
+```
+
+Run concurrency stress in addition to deterministic hooks, not instead of them.
+
+## 9. Repetition/statistics
+
+Benchmark artifacts must record:
+
+- warmup policy;
+- iteration count;
+- process/runtime configuration;
+- GC mode;
+- CPU count/topology relevant to workers;
+- runtime mode JIT/NativeAOT;
+- confidence/variance summary appropriate to the harness;
+- exact binary/source tuple.
+
+No fixed speedup threshold is required by architecture. Promotion should require that the claimed optimization is measured and repeatable for the stated workload, not that an arbitrary percentage is met.
+
+A contour with no meaningful performance benefit may remain correct but should not be promoted/advertised as a useful fast path for that workload.
+
+## 10. Performance interpretation rules
+
+### Empty/control stages
+
+Best case for exposing envelope/queue/waiter costs. Also most likely to show that security checks are a large fraction of remaining fused cost. Do not characterize those checks as removable overhead.
+
+### Large BORROW/MOVE
+
+Expected savings may plateau because data is already shared/moved without per-element capability lookup. Memory bandwidth, Region transition, cache locality, and provider staging may dominate.
+
+### Copied values
+
+A fused path may still need security-required copying. Report copied bytes so reduced envelope serialization is not mislabeled as zero-copy.
+
+### Parallel DAG
+
+Throughput gains must be considered together with p99 latency, contention, false sharing, scheduler transitions, and branch cleanup cost.
+
+## 11. HybridCPU/provider reporting
+
+For accelerated contours report two deltas:
+
+```text
+ordinary SIP -> fused managed Job
+fused managed Job -> fused + qualified provider acceleration
+```
+
+Also report platform admission, provider staging, completion, visibility, and publication costs.
+
+Do not merge these into one undifferentiated "SipJob speedup" number.
+
+## 12. Claim levels
+
+### `ModelOnly`
+
+Allowed claim: architecture/model is specified.
+
+### `StaticAdmission`
+
+Allowed claim: unsupported forms are rejected by the exact generator/analyzer/admission tuple.
+
+### `RuntimeEnforced`
+
+Allowed claim: current runtime owners enforce the specified contour with negative/race evidence.
+
+### `QualifiedManaged`
+
+Allowed claim: exact managed contour passed semantic differential, race/property, cleanup, and performance characterization on the pinned tuple.
+
+### `ProductionCandidate`
+
+Requires additionally:
+
+- production-shaped configuration;
+- gate default/fallback policy;
+- observability counters;
+- operational rollback by gate disablement;
+- no unresolved blocker/critical security finding;
+- supply-chain artifact closure;
+- claim text reviewed against exact enabled gates.
+
+## 13. Prohibited claim inflation
+
+Do not claim:
+
+- `zero-copy` when copied-value isolation or provider staging remains;
+- `O(1)` authority cost from theoretical reasoning alone;
+- `transactional` or `atomic Job` semantics;
+- hardware/secure/confidential enforcement from metadata/model-only support;
+- all DAGs from read-only DAG qualification;
+- async from synchronous qualification;
+- NativeAOT from JIT qualification;
+- HybridCPU acceleration from generic scheduling-hint support;
+- production readiness from workstation microbenchmarks.
+
+## 14. Qualification artifacts
+
+Produce machine-readable artifacts analogous in discipline to existing security/performance qualification outputs, containing:
+
+```text
+exact tuple
+feature-gate set
+contour description
+security test summary
+semantic differential summary
+race/property summary
+performance summary
+known exclusions/FutureGated features
+claim level
+```
+
+Raw benchmark results should remain available for review, not only aggregated prose.
+
+## 15. Rollback/fallback qualification
+
+Before `ProductionCandidate`:
+
+- disabling each gate restores ordinary SIP without data migration;
+- stale Job handles after disablement cannot force fast-path execution;
+- split/materialized fallback is tested;
+- gate disablement during restart/deployment does not create an authority bypass;
+- observability identifies whether a request executed fused or materialized without exposing sensitive authority data.
+
+## 16. Final exit criteria
+
+P14 reaches implementation closure only when every enabled contour has:
+
+- exact source/toolchain/provider tuple;
+- executable static/runtime/race/differential evidence;
+- terminal-path cleanup proof;
+- measured performance counters showing what was and was not removed;
+- a claim no broader than its exact gate set;
+- tested ordinary-SIP fallback;
+- no implicit qualification of FutureGated contours.
