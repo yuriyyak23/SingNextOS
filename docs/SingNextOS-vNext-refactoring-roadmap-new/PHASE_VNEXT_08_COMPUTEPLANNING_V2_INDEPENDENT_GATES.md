@@ -1,0 +1,54 @@
+# P08 — COMPUTEPLANNING V2 INDEPENDENT GATES
+
+## Purpose
+
+Extend compute planning with semantic resource requirements while preserving independent effect, resource, ownership, provider and CPU-legality gates.
+
+## Preconditions
+
+- P07 closed.
+
+## Architectural decisions
+
+- ComputePlan is non-authoritative and may contain only semantic execution/resource requirements and provider candidate evidence.
+- No lane/opcode/slot/queue/token/topology enters source-facing ABI.
+- Plan selection may use load/performance evidence but execution revalidates all exact owners and generations.
+- Fallback between providers requires explicit semantic compatibility; no unit laundering.
+
+## State / linearization model
+
+Planner has no authoritative mutable state. Cached plans are hints keyed by versions/generations and always revalidated live.
+
+## Negative-space obligations
+
+- stale plan after grant revocation;
+- stale provider generation;
+- resource class reinterpretation during fallback;
+- effect/resource gate accidentally fused;
+- provider-private identifier leakage into public contracts.
+
+## Required executable tests
+
+- Same intent chooses different provider without changing authority.
+- Stale plan/cache fails live revalidation.
+- Independent truth-table tests for each gate false while others true.
+- Public reflection test forbidding provider-private fields.
+- Incompatible fallback rejected.
+
+## Expected code / contract owners
+
+- ComputePlanner / ComputeIntent / ComputePlan contracts
+- existing authority owners only for validation
+
+## Claim boundary
+
+`RuntimeEnforced`. This phase MUST NOT claim a stronger contour without P16 evidence.
+
+## Exit criteria
+
+- Plan remains policy/evidence.
+- All gates can independently deny submit.
+
+## Prerequisite for next phase
+
+P09 maps semantic envelopes to HybridCPU/provider boundary without granting authority.

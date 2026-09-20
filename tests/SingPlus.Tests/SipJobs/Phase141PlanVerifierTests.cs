@@ -126,6 +126,19 @@ public sealed class Phase141PlanVerifierTests
     }
 
     [Fact]
+    public void DirectDescriptorNullStageOrEdgeFailsClosedWithoutThrowing()
+    {
+        var (plan, catalog) = ValidPlan();
+        var nullStage = new SipJobPlanDescriptor(
+            plan.FormatVersion, [null!, plan.Stages[1]], plan.Edges, plan.DeclaredGateSet, plan.PlanDigest);
+        var nullEdge = new SipJobPlanDescriptor(
+            plan.FormatVersion, plan.Stages, [null!], plan.DeclaredGateSet, plan.PlanDigest);
+
+        Assert.Equal(SipJobPlanError.Malformed, SipJobPlanVerifier.Verify(nullStage, catalog).Failure!.Value.Error);
+        Assert.Equal(SipJobPlanError.Malformed, SipJobPlanVerifier.Verify(nullEdge, catalog).Failure!.Value.Error);
+    }
+
+    [Fact]
     public void ReadOnlyRegionBorrowDescriptorIsCanonicalButDoesNotEnableRuntimeGate()
     {
         var (closedPlan, catalog) = ValidPlan();

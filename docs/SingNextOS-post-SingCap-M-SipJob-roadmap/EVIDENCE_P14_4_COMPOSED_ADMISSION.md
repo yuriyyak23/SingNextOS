@@ -8,6 +8,8 @@ The repeat audit re-captured baseline HEAD/status and preserved the complete pre
 
 Focused P14-4, capability-effect admission, P14-0, and P14-8 tests passed 28/28. Runtime and full solution builds succeeded with 0 warnings and 0 errors. Full non-GUI results were 1337 passed, the same 8 unrelated failures, and 2 skipped in `SingPlus.Tests`; the other assemblies passed 60/60, 90/90, and 58/58.
 
+The strict ordered re-audit at current qualification HEAD `6227ea7cf258ef6ffce52001d4d2ffee07355b35` re-read the live effect-admission owner composition and repeated the P14-4/capability/P14-0/P14-8 lane: 28 passed, 0 failed. The immediately preceding exact full non-GUI run on the same rebuilt executable tree recorded 1350 passed, the same 8 unrelated failures, and 2 skipped in `SingPlus.Tests`; Runtime and full solution builds were already 0-warning/0-error after the only runtime change in this tree. Artifact hashes, both roadmap JSON documents, tuple-to-HEAD binding, default-OFF gate policy and `git diff --check` were then revalidated. No additional P14-4 defect was confirmed, and no code or claim promotion was made in this pass.
+
 ## Candidate and dirty-worktree preservation
 
 - Baseline HEAD: `52ccf45c05498a9143a599bb54499919a2cbcf8c`.

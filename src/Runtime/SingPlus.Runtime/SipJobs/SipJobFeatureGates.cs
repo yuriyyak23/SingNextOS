@@ -61,7 +61,10 @@ internal static class SipJobFeatureGates
         if (name is not null && Known.TryGetValue(name, out gate))
             return true;
 
-        gate = default;
+        // Do not leak a valid contour through the out parameter on failure.
+        // Linear is enum zero, so default would be ambiguous to a buggy caller
+        // that failed to branch on the TryResolve result.
+        gate = (SipJobFeatureGate)(-1);
         return false;
     }
 

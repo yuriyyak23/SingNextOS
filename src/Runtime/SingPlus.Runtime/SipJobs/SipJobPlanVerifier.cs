@@ -203,6 +203,8 @@ internal static class SipJobPlanVerifier
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(catalog);
 
+        if (plan.Stages.Any(static stage => stage is null) || plan.Edges.Any(static edge => edge is null))
+            return Fail(SipJobPlanError.Malformed, "Plan descriptor collections cannot contain null entries.");
         if (plan.FormatVersion != FormatVersion)
             return Fail(SipJobPlanError.UnknownVersion, "Unsupported plan format version.");
         if (plan.Stages.Length is < 2 or > 4)

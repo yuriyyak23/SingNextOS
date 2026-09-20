@@ -20,7 +20,9 @@ public sealed class Phase140ArchitecturalFreezeTests
     [InlineData("FG-JOB-LINEAR ")]
     public void UnknownOrNonCanonicalGateFailsClosed(string? name)
     {
-        Assert.False(SipJobFeatureGates.TryResolve(name, out _));
+        Assert.False(SipJobFeatureGates.TryResolve(name, out var resolved));
+        Assert.False(Enum.IsDefined(resolved));
+        Assert.NotEqual(SipJobFeatureGate.Linear, resolved);
         Assert.False(SipJobFeatureGates.IsEnabled(name));
     }
 

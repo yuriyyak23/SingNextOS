@@ -104,6 +104,25 @@ public sealed class Phase142ClosedValueDirectContourTests
     }
 
     [Fact]
+    public async Task UnexpectedSentryExceptionSettlesOwnerStateAndNeverRunsSecondStage()
+    {
+        var scenario = CreateScenario(stage1Throws: true);
+        var executor = new TestTwoStageExecutor(
+            TestGateSet.Enable("FG-JOB-LINEAR", "FG-DIRECT-SENTRY"));
+
+        var result = await executor.RunResult(
+            scenario.Plan, scenario.Catalog, scenario.Stage1Binding, scenario.FinalRoute, new SipJobClosedInt(3));
+
+        Assert.Equal(KernelError.ServiceUnavailable, result.Error);
+        Assert.Equal(
+            [SemanticEvent.Stage1SessionValidated, SemanticEvent.Stage1ImplementationEntered],
+            scenario.SemanticTrace);
+        Assert.Equal(0, scenario.TransportRequests);
+        Assert.Equal(0, scenario.FinalPublications);
+        Assert.Equal(0, scenario.Kernel.EndpointSessions.ActivePinCount(scenario.Stage1Session));
+    }
+
+    [Fact]
     public async Task CloseAfterInlineBeginWinsBeforeSentryAndDeferredOwnerCleanupClosesChannel()
     {
         var scenario = CreateScenario(closeStage1AfterBegin: true);
@@ -211,6 +230,7 @@ public sealed class Phase142ClosedValueDirectContourTests
 
     private static Scenario CreateScenario(
         bool stage1Fault = false,
+        bool stage1Throws = false,
         bool closeStage1AfterBegin = false,
         bool requestCancellationAfterBegin = false,
         bool faultStage1AfterBegin = false)
@@ -234,6 +254,7 @@ public sealed class Phase142ClosedValueDirectContourTests
         var scenario = new Scenario(kernel, caller, stage1Service, stage2Service, session1, session2, stage1CallerEndpoint, plan, catalog);
         scenario.Initialize(
             stage1Fault,
+            stage1Throws,
             closeStage1AfterBegin,
             requestCancellationAfterBegin,
             faultStage1AfterBegin);
@@ -347,12 +368,13 @@ public sealed class Phase142ClosedValueDirectContourTests
 
         internal void Initialize(
             bool stage1Fault,
+            bool stage1Throws,
             bool closeStage1AfterBegin,
             bool requestCancellationAfterBegin,
             bool faultStage1AfterBegin)
         {
-            _stage1Host = new QualificationHost(this, stage: 1, delta: 1, fault: stage1Fault);
-            _stage2Host = new QualificationHost(this, stage: 2, delta: 1, fault: false);
+            _stage1Host = new QualificationHost(this, stage: 1, delta: 1, fault: stage1Fault, throws: stage1Throws);
+            _stage2Host = new QualificationHost(this, stage: 2, delta: 1, fault: false, throws: false);
             Stage1Binding = new QualificationBinding(
                 Kernel,
                 Caller,
@@ -444,8 +466,21 @@ public sealed class Phase142ClosedValueDirectContourTests
                 }
                 trace.Add(SemanticEvent.Stage1SessionValidated);
                 var context = lease.Context;
-                var generated = ISipJobClosedValueQualificationServiceGeneratedOperationSentries.InvokeRuntime_TransformAsync(
-                    target, in context, input);
+                GeneratedSipSentryResult<SipJobClosedInt> generated;
+                try
+                {
+                    generated = ISipJobClosedValueQualificationServiceGeneratedOperationSentries.InvokeRuntime_TransformAsync(
+                        target, in context, input);
+                }
+                catch (Exception)
+                {
+                    var faultSettled = kernel.SettleInlineSessionInvocation(service, lease, succeeded: false);
+                    return faultSettled.IsSuccess
+                        ? KernelResult<SipJobClosedInt>.Fail(
+                            KernelError.ServiceUnavailable,
+                            "Generated sentry target faulted before producing a typed result.")
+                        : KernelResult<SipJobClosedInt>.Fail(faultSettled.Error, faultSettled.Message!);
+                }
                 var settled = kernel.SettleInlineSessionInvocation(service, lease, generated.IsSuccess);
                 if (!settled.IsSuccess)
                     return KernelResult<SipJobClosedInt>.Fail(settled.Error, settled.Message!);
@@ -467,9 +502,10 @@ public sealed class Phase142ClosedValueDirectContourTests
         private readonly int _stage;
         private readonly int _delta;
         private readonly bool _fault;
+        private readonly bool _throws;
 
-        internal QualificationHost(Scenario scenario, int stage, int delta, bool fault) =>
-            (_scenario, _stage, _delta, _fault) = (scenario, stage, delta, fault);
+        internal QualificationHost(Scenario scenario, int stage, int delta, bool fault, bool throws) =>
+            (_scenario, _stage, _delta, _fault, _throws) = (scenario, stage, delta, fault, throws);
 
         internal KernelResult ProcessNext()
         {
@@ -498,6 +534,8 @@ public sealed class Phase142ClosedValueDirectContourTests
             SipJobClosedInt request)
         {
             RecordEntered();
+            if (_throws)
+                throw new InvalidOperationException("Deterministic qualification exception.");
             if (_fault)
                 return GeneratedSipSentryResult<SipJobClosedInt>.Failure(
                     (int)KernelError.InvalidTransition,

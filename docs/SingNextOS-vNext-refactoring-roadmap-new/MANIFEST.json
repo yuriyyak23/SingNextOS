@@ -1,0 +1,143 @@
+{
+  "title": "SingNextOS-vNext-refactoring-roadmap-new",
+  "status": "audit-applied corrected roadmap",
+  "baseline": {
+    "SingNextOS": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+    "HybridCPU-v2": "794c4a53494f503855ac8cf209efab23fde083b2",
+    "date": "2026-09-20"
+  },
+  "architecture_decision": "No independent TemporalResourceAuthority; resource-use permission reuses CapabilityAuthority; quantitative capacity/lease/settlement remains in ResourceBudgetAuthority.",
+  "phase_count": 18,
+  "files": [
+    {
+      "file": "AUDIT_CORRECTIONS.md",
+      "bytes": 3172,
+      "sha256": "f5bb2a37ba3f58319eec1c7795b23f134643f2f064f09221e9f1d0727dfcd759"
+    },
+    {
+      "file": "AUTHORITY_OWNER_MAP.md",
+      "bytes": 3146,
+      "sha256": "d23389bd2958957863c19fa164de7f5509ab3194233243a6c5c0d19728d39471"
+    },
+    {
+      "file": "BASELINE.json",
+      "bytes": 814,
+      "sha256": "75be208e60dcbe2918d6eab9db66d428cf34684daf4e9dd90a5edc7ea1f85dfb"
+    },
+    {
+      "file": "PHASE_VNEXT_00_ARCHITECTURAL_FREEZE_AND_LIVE_BASELINE.md",
+      "bytes": 2257,
+      "sha256": "5713194bd9d7b8e52683ec24dd10d1ad87cb77b7ea1435a63fe4f77aee2b78d8"
+    },
+    {
+      "file": "PHASE_VNEXT_01_RESOURCE_MODEL_AND_DIMENSIONAL_ALGEBRA.md",
+      "bytes": 2048,
+      "sha256": "ad8dafbcbecfe500e3c93e68963891c1c7d67fd2f8868eb7dd37670db1c10a41"
+    },
+    {
+      "file": "PHASE_VNEXT_02_RESOURCE_USE_GRANTS_IN_EXISTING_CAPABILITYAUTHORITY.md",
+      "bytes": 2456,
+      "sha256": "db84936e490abacc3d3624af88f2a0ac848b926b14741745a27fb0067f0f4015"
+    },
+    {
+      "file": "PHASE_VNEXT_03_ATOMIC_RESOURCE_LEASE_AND_SETTLEMENT_CORE.md",
+      "bytes": 2604,
+      "sha256": "c6e4ccf38b74c8224c22e57dd90c06b4805d60af85cb5721cd3486432f2fa8cb"
+    },
+    {
+      "file": "PHASE_VNEXT_04_CROSS_OWNER_ADMISSION_COMMIT_PROTOCOL.md",
+      "bytes": 2495,
+      "sha256": "0fef09081428985fd4983522ff9dbf0bb6098ec2d63833031c9c0b7cfebbb86f"
+    },
+    {
+      "file": "PHASE_VNEXT_05_SIP_AND_MANIFEST_RESOURCE_CONTRACTS.md",
+      "bytes": 2040,
+      "sha256": "dc7a8b442400bedd0907e0a96b4572a2018d6ea676b3eb29b844dc87f6eca194"
+    },
+    {
+      "file": "PHASE_VNEXT_06_ENDPOINTSESSION_RESOURCE_DONATION.md",
+      "bytes": 2480,
+      "sha256": "f6e46d95d8b2fb4da5c6f161b8bbaca9bb78af3bc443a41aad9c3d60a2376938"
+    },
+    {
+      "file": "PHASE_VNEXT_07_EXTERNALOPERATION_RESOURCE_BINDING.md",
+      "bytes": 2341,
+      "sha256": "bcd09e3f555ca87aac691dc2a49d9399269205090d206cc7a2eb3e3bf6e6d7c1"
+    },
+    {
+      "file": "PHASE_VNEXT_08_COMPUTEPLANNING_V2_INDEPENDENT_GATES.md",
+      "bytes": 1858,
+      "sha256": "8f4d38c9fc084db6d85ddc9bbd9184fc4b371eb0f0913ea81ab9d85a964cdf11"
+    },
+    {
+      "file": "PHASE_VNEXT_09_HYBRIDCPU_PROVIDER_NEUTRAL_INTEGRATION.md",
+      "bytes": 2339,
+      "sha256": "2e8ce439810e4795dd1a6f38e874d70c0c68d3b456a1fffd069641349d566681"
+    },
+    {
+      "file": "PHASE_VNEXT_10_RESOURCE_SCHEDULER_AND_PROVIDER_AGENTS.md",
+      "bytes": 1899,
+      "sha256": "687f6362707fff17b3187de591d40dc3bbd73617e504b916c26a70b5755ea4a4"
+    },
+    {
+      "file": "PHASE_VNEXT_11_TEMPORAL_UPPER_BOUNDS_AND_GUARANTEE_DISCIPLINE.md",
+      "bytes": 2343,
+      "sha256": "beb06af310f45ce2dc2a92acaeefe45c2affd5995482802e28a46f03d0bf3d67"
+    },
+    {
+      "file": "PHASE_VNEXT_12_SIPJOB_RESOURCE_AWARE_COMPOSITION.md",
+      "bytes": 2123,
+      "sha256": "ce5b22f0a1bf1d63a989f14fadd893d6430a439b0c69809e702fbaffa016b385"
+    },
+    {
+      "file": "PHASE_VNEXT_13_NON_COMPUTE_RESOURCE_FAMILIES.md",
+      "bytes": 2168,
+      "sha256": "731f909f203958841d881bfd75e8ff0f1078d6ff9ea6f0d2ec7e3c47114fa762"
+    },
+    {
+      "file": "PHASE_VNEXT_14_RESTART_CHECKPOINT_AND_RECONCILIATION.md",
+      "bytes": 2197,
+      "sha256": "2288961c7b3db8d7505708d17f1eec6cbacc1e8f90e649be1e969b9c7a0aa513"
+    },
+    {
+      "file": "PHASE_VNEXT_15_OBSERVABILITY_AUDIT_AND_TELEMETRY.md",
+      "bytes": 1870,
+      "sha256": "4adf756901156320cf6461dbef1ad0f18ff9af423e6ee5849dd31ff5f48cdded"
+    },
+    {
+      "file": "PHASE_VNEXT_16_QUALIFICATION_PERFORMANCE_AND_CLAIMS.md",
+      "bytes": 2187,
+      "sha256": "6088e6e7531c711e6bd1c26e29d4c00a9de86366f6877e22df38161339909e09"
+    },
+    {
+      "file": "PHASE_VNEXT_17_MIGRATION_CLEANUP_AND_CUTOVER.md",
+      "bytes": 2332,
+      "sha256": "fdd57cbebaca6b31f3ae02739d5193d371254db7465396bee6bf0d2f3373b1c9"
+    },
+    {
+      "file": "README.md",
+      "bytes": 8902,
+      "sha256": "00156ee7297738e7a66518344be30e3b614d28a6a0ed7f9646fbe4d03420b1aa"
+    },
+    {
+      "file": "RESOURCE_MODEL.md",
+      "bytes": 2923,
+      "sha256": "0699016e785f153b29f62eeff3f47414206a86041e7bd2c3fa74b7b7ec626fa1"
+    },
+    {
+      "file": "TRACEABILITY_MATRIX.md",
+      "bytes": 2225,
+      "sha256": "971a541b082552fb5b1460de7d98d228d5b62458f047c0a97f3b90b73d4fa2e8"
+    },
+    {
+      "file": "VNEXT_FEATURE_GATES.md",
+      "bytes": 3021,
+      "sha256": "17a86a3e4fd46307b6142c89676a47630e409724c9d7704eeeea2c928f942606"
+    },
+    {
+      "file": "VNEXT_NORMATIVE_INVARIANTS.md",
+      "bytes": 7876,
+      "sha256": "06a0e395bf69f846dbdaed621127dc2a09c0650e3869e5d50d30e161e7212f0c"
+    }
+  ]
+}

@@ -69,6 +69,8 @@ public sealed class Phase142TrustedBindingTests
         Assert.True(scenario.Kernel.CloseSession(scenario.Caller, scenario.Session).IsSuccess);
 
         Assert.Equal(KernelError.SessionClosed, table.ValidateRoute(registered.Handle, registered.Key).Error);
+        Assert.Equal(0, table.Count);
+        Assert.Equal(KernelError.StaleHandle, table.ValidateRoute(registered.Handle, registered.Key).Error);
     }
 
     [Fact]
@@ -82,7 +84,7 @@ public sealed class Phase142TrustedBindingTests
         Assert.True(scenario.Kernel.FaultProcess(scenario.Service).IsSuccess);
 
         Assert.False(table.ValidateRoute(registered.Handle, registered.Key).IsSuccess);
-        Assert.True(table.Retire(registered.Handle).IsSuccess);
+        Assert.Equal(0, table.Count);
         Assert.Equal(KernelError.StaleHandle, table.ValidateRoute(registered.Handle, registered.Key).Error);
         Assert.Equal(KernelError.StaleHandle, table.Retire(registered.Handle).Error);
     }

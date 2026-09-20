@@ -409,15 +409,19 @@ public sealed partial class RuntimeKernel
         {
             InlineBorrowQualificationHook?.At(InlineBorrowQualificationPoint.BeforeRegionUseRelease);
             var released = ReleaseRegionUse(service, lease.Use.Handle);
-            if (!released.IsSuccess) return released;
             InlineBorrowQualificationHook?.At(InlineBorrowQualificationPoint.AfterRegionUseRelease);
             InlineBorrowQualificationHook?.At(InlineBorrowQualificationPoint.BeforeBorrowReturn);
             var returned = ReturnBorrow(service, lease.Borrow.Handle);
-            if (!returned.IsSuccess) return returned;
             InlineBorrowQualificationHook?.At(InlineBorrowQualificationPoint.AfterBorrowReturn);
             InlineBorrowQualificationHook?.At(InlineBorrowQualificationPoint.BeforeInvocationSettlement);
-            var settled = SessionInvocations.CompleteInline(context.Invocation, service, succeeded);
+            var cleanupSucceeded = released.IsSuccess && returned.IsSuccess;
+            var settled = SessionInvocations.CompleteInline(
+                context.Invocation,
+                service,
+                succeeded && cleanupSucceeded);
             InlineBorrowQualificationHook?.At(InlineBorrowQualificationPoint.AfterInvocationSettlement);
+            if (!released.IsSuccess) return released;
+            if (!returned.IsSuccess) return returned;
             return settled;
         }
         finally

@@ -1,7 +1,9 @@
 {
   "schemaVersion": 1,
   "capturedUtcDate": "2026-09-20",
-  "singNextOsSourceSha": "52ccf45c05498a9143a599bb54499919a2cbcf8c",
+  "auditBaselineSha": "52ccf45c05498a9143a599bb54499919a2cbcf8c",
+  "singNextOsSourceSha": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "sourceDisposition": "CurrentHeadPlusPreservedDirtyWorktree",
   "roadmapSnapshotSha": "0f152a5502c58546eb0458b4be3e7cbce6c5ef3e",
   "hybridCpuSourceSha": null,
   "hybridCpuSourceDisposition": "NotLocallyAvailableUnverified",
@@ -10,13 +12,13 @@
   "targetRuntimeMode": "JIT",
   "nativeAotVersion": null,
   "artifacts": {
-    "generatorSha256": "8AE4467E185DEAF75CF18550942DE840846D17AFE55E907B775777F92069E6C1",
-    "analyzerSha256": "9F6047A641F01BF0A7781F6ADEFC95E49C6E1FC537F16044961EACF277E1DD4F",
-    "admissionVerifierSha256": "97F9FAC306D06488101AEA33E9DE326B77AE950C7998A19A00C06104FDE82032",
-    "runtimeSha256": "A26A193FE557A7397C9DCEA80C74E52C2EBCC129A70E0511BEE2ACBA1CC5CF3B",
-    "sipSha256": "CED06C81F4A1BEFFCA0D407075065F7FE9C9AABD676B461FC884A2216701C6B8",
-    "contractsSha256": "92023D5BEB886B35E1A50FB083B4503A12DDF9FAC06C8D844A17F4D4B51A37EB",
-    "platformContractSha256": "D6E1F431B6CD89FF077FF9BE27E6ED814919FA72FDB472BB5F94DCDF8D2FCF66"
+    "generator": { "path": "sdk/SingPlus.Generators/bin/Debug/net11.0/SingPlus.Generators.dll", "sha256": "037C5317FA7D7D3C929409727CA235FBE5AA8BC0A4BC6A1C6BDD69821DBC5F13" },
+    "analyzer": { "path": "sdk/SingPlus.Analyzers/bin/Debug/net11.0/SingPlus.Analyzers.dll", "sha256": "D28C20F2F4A8B9AB3B357E65CB873F5DFB8C0328AEEE2EF2B1ED768D0C1F0D24" },
+    "admissionVerifier": { "path": "tools/SingPlus.Admission/bin/Debug/net11.0/SingPlus.Admission.dll", "sha256": "0463B9310DE29132032D76C014D3261E28310F9DBA8886858156BF86EF61E6E6" },
+    "runtime": { "path": "src/Runtime/SingPlus.Runtime/bin/Debug/net11.0/SingPlus.Runtime.dll", "sha256": "6F9145B1305AA84ECC255A5974C51760559BBE2FEA7AA42446959F36AE9BBA42" },
+    "sip": { "path": "src/Sip/SingPlus.Sip/bin/Debug/net11.0/SingPlus.Sip.dll", "sha256": "36230D7E8241F7E988428645B4D1E86E76D4025AFB1402AC915C1F854118D205" },
+    "contracts": { "path": "contracts/SingPlus.Contracts/bin/Debug/net11.0/SingPlus.Contracts.dll", "sha256": "E54EBAB4CBF35669981832C9979A8465428912A6213866535D4820B6394F776E" },
+    "platformContract": { "path": "src/Platform/SingPlus.Platform.Abstractions/bin/Debug/net11.0/SingPlus.Platform.Abstractions.dll", "sha256": "5474578D9C4CF0C3685B68BC3B6F1A073638135E21658AB58C773C03F2636CE5" }
   },
   "admissionPolicyDigest": null,
   "sipSchemaManifestDigest": null,

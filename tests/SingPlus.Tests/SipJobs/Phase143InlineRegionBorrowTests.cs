@@ -208,6 +208,38 @@ public sealed class Phase143InlineRegionBorrowTests
     }
 
     [Fact]
+    public void StaleServiceDuringUseReleaseStillRunsReverseCleanupAndTerminatesLease()
+    {
+        var scenario = CreateSessionScenario();
+        var buffer = scenario.Kernel.AllocateBuffer<byte>(scenario.Caller, 4).Value!;
+        var begun = scenario.Kernel.BeginInlineBorrowSessionInvocation(
+            scenario.Caller, scenario.Service, scenario.Session, 1, buffer).Value!;
+        var points = new List<InlineBorrowQualificationPoint>();
+        scenario.Kernel.InlineBorrowQualificationHook = new RecordingHook(point =>
+        {
+            points.Add(point);
+            if (point == InlineBorrowQualificationPoint.BeforeRegionUseRelease)
+                Assert.True(scenario.Kernel.TerminateProcess(scenario.Service).IsSuccess);
+        });
+
+        var settled = scenario.Kernel.SettleInlineBorrowSessionInvocation(
+            scenario.Service, begun, succeeded: true);
+
+        Assert.False(settled.IsSuccess);
+        Assert.Contains(InlineBorrowQualificationPoint.AfterRegionUseRelease, points);
+        Assert.Contains(InlineBorrowQualificationPoint.BeforeBorrowReturn, points);
+        Assert.Contains(InlineBorrowQualificationPoint.AfterBorrowReturn, points);
+        Assert.Contains(InlineBorrowQualificationPoint.BeforeInvocationSettlement, points);
+        Assert.Contains(InlineBorrowQualificationPoint.AfterInvocationSettlement, points);
+        Assert.False(begun.Borrow.IsValid);
+        Assert.Equal(RegionState.Owned, Assert.Single(scenario.Kernel.Regions.Snapshot()).State);
+        Assert.Equal(0, scenario.Kernel.EndpointSessions.ActivePinCount(scenario.Session));
+        Assert.Throws<ObjectDisposedException>(() =>
+            scenario.Kernel.SettleInlineBorrowSessionInvocation(
+                scenario.Service, begun, succeeded: false));
+    }
+
+    [Fact]
     public void InlineBorrowMatchesOrdinaryOwnerStateWithoutQueueMaterialization()
     {
         var scenario = Create();
@@ -489,5 +521,10 @@ public sealed class Phase143InlineRegionBorrowTests
             if (point == selected && Interlocked.Exchange(ref _fired, 1) == 0)
                 action();
         }
+    }
+
+    private sealed class RecordingHook(Action<InlineBorrowQualificationPoint> action) : IInlineBorrowQualificationHook
+    {
+        public void At(InlineBorrowQualificationPoint point) => action(point);
     }
 }

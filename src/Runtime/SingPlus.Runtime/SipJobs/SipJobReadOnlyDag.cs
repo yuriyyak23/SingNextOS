@@ -14,7 +14,15 @@ internal sealed record SipJobReadOnlyDagDescriptor(
     uint Version, ImmutableArray<SipJobDagNode> Nodes, ImmutableArray<SipJobDagEdge> Edges,
     SipJobDagJoinPolicy JoinPolicy, ImmutableArray<string> DeclaredGateSet);
 internal readonly record struct SipJobDagOutcome(string StageId, SipJobDagOutcomeKind Kind, int ErrorCode);
-internal readonly record struct SipJobDagJoinResult(SipJobDagOutcomeKind Kind, string? SelectedStageId, int ErrorCode);
+internal enum SipJobDagJoinError { None = 0, Malformed, UnsupportedOutcome }
+internal readonly record struct SipJobDagJoinResult(
+    SipJobDagOutcomeKind Kind,
+    string? SelectedStageId,
+    int ErrorCode,
+    SipJobDagJoinError Error)
+{
+    internal bool IsValid => Error == SipJobDagJoinError.None;
+}
 
 internal enum SipJobReadOnlyDagError
 {
@@ -93,19 +101,28 @@ internal static class SipJobReadOnlyDagVerifier
         return new(order.MoveToImmutable(), SipJobReadOnlyDagError.None, null);
     }
 
-    internal static SipJobDagJoinResult Join(IEnumerable<SipJobDagOutcome> outcomes)
+    internal static SipJobDagJoinResult Join(ImmutableArray<SipJobDagOutcome> outcomes)
     {
+        if (outcomes.IsDefaultOrEmpty ||
+            outcomes.Any(static outcome => !Canonical(outcome.StageId)) ||
+            outcomes.Select(static outcome => outcome.StageId).Distinct(StringComparer.Ordinal).Count() != outcomes.Length)
+            return JoinFail(SipJobDagJoinError.Malformed);
+        if (outcomes.Any(static outcome => !Enum.IsDefined(outcome.Kind)))
+            return JoinFail(SipJobDagJoinError.UnsupportedOutcome);
+
         var ordered = outcomes.OrderBy(static x => x.StageId, StringComparer.Ordinal).ToArray();
         var selected = ordered.FirstOrDefault(static x => x.Kind == SipJobDagOutcomeKind.Faulted);
         if (selected.Kind != SipJobDagOutcomeKind.Faulted)
             selected = ordered.FirstOrDefault(static x => x.Kind == SipJobDagOutcomeKind.Cancelled);
         return selected.Kind is SipJobDagOutcomeKind.Faulted or SipJobDagOutcomeKind.Cancelled
-            ? new(selected.Kind, selected.StageId, selected.ErrorCode)
-            : new(SipJobDagOutcomeKind.Success, null, 0);
+            ? new(selected.Kind, selected.StageId, selected.ErrorCode, SipJobDagJoinError.None)
+            : new(SipJobDagOutcomeKind.Success, null, 0, SipJobDagJoinError.None);
     }
 
     private static bool Canonical(string value) => !string.IsNullOrWhiteSpace(value) && value == value.Trim();
     private static bool QualifiedIdentity(string value, string prefix) =>
         value.StartsWith(prefix, StringComparison.Ordinal) && value.Length > prefix.Length;
+    private static SipJobDagJoinResult JoinFail(SipJobDagJoinError error) =>
+        new(SipJobDagOutcomeKind.Success, null, 0, error);
     private static SipJobReadOnlyDagResult Fail(SipJobReadOnlyDagError error, string detail) => new([], error, detail);
 }

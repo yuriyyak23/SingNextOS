@@ -1,5 +1,11 @@
 # P14-2 evidence — Generated SIP Operation Sentry Foundation
 
+## Latest strict-cycle remediation (2026-09-20)
+
+Phase entry captured qualification HEAD `6227ea7cf258ef6ffce52001d4d2ffee07355b35`, retained audit baseline `52ccf45c05498a9143a599bb54499919a2cbcf8c`, and preserved the complete dirty P14 worktree. The repeat fault-path audit found that the qualification-only direct binding correctly settled a typed sentry failure but allowed an unexpected sentry-target exception to escape before `SettleInlineSessionInvocation`. That left terminal owner cleanup unproven for an implementation-throw path. The binding now catches the service-boundary exception, settles failure through the existing invocation owner, maps it to `ServiceUnavailable`, releases the session pin, and never enters the second stage. `UnexpectedSentryExceptionSettlesOwnerStateAndNeverRunsSecondStage` is the regression test. No production executor or new authority path was added.
+
+Focused P14-2/P14-0/P14-8 tests passed 25/25. Test-project and full solution builds succeeded with 0 warnings and 0 errors. Full non-GUI results were 1349 passed, the same 8 unrelated failures, and 2 skipped in `SingPlus.Tests`; the other assemblies passed 60/60, 90/90, and 58/58. `FG-DIRECT-SENTRY` and `FG-JOB-LINEAR` remain OFF in production; the claim remains the exact JIT `QualifiedManagedTestOnly` contour only.
+
 ## Disposition
 
 The external-audit recommendation was accepted with one qualification: the generated sentry foundation and an exact two-stage closed-value contour are executable only as JIT qualification tests under an explicit test-local gate set. Production Job direct execution remains `FutureGatedRequiresCore`; the production claim is still `StaticAdmission` for generated operation identity/linkage, while the exact test contour is `QualifiedManagedTestOnly`. `FG-DIRECT-SENTRY` remains OFF in production.

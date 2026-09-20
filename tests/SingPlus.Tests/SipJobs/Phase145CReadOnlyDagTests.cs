@@ -123,7 +123,24 @@ public sealed class Phase145CReadOnlyDagTests
     {
         var values = new[] { new SipJobDagOutcome("b", SipJobDagOutcomeKind.Cancelled, 2), new SipJobDagOutcome("a", SipJobDagOutcomeKind.Faulted, 1), new SipJobDagOutcome("c", SipJobDagOutcomeKind.Faulted, 3) };
         foreach (var permutation in Permute(values))
-            Assert.Equal(new SipJobDagJoinResult(SipJobDagOutcomeKind.Faulted, "a", 1), SipJobReadOnlyDagVerifier.Join(permutation));
+            Assert.Equal(new SipJobDagJoinResult(SipJobDagOutcomeKind.Faulted, "a", 1, SipJobDagJoinError.None),
+                SipJobReadOnlyDagVerifier.Join(permutation.ToImmutableArray()));
+    }
+
+    [Fact]
+    public void MalformedOrUnknownJoinOutcomesCannotBecomeSuccess()
+    {
+        Assert.Equal(SipJobDagJoinError.Malformed,
+            SipJobReadOnlyDagVerifier.Join(default).Error);
+        Assert.Equal(SipJobDagJoinError.Malformed,
+            SipJobReadOnlyDagVerifier.Join([
+                new("branch", SipJobDagOutcomeKind.Success, 0),
+                new("branch", SipJobDagOutcomeKind.Faulted, 1),
+            ]).Error);
+        Assert.Equal(SipJobDagJoinError.Malformed,
+            SipJobReadOnlyDagVerifier.Join([new(" branch ", SipJobDagOutcomeKind.Success, 0)]).Error);
+        Assert.Equal(SipJobDagJoinError.UnsupportedOutcome,
+            SipJobReadOnlyDagVerifier.Join([new("branch", (SipJobDagOutcomeKind)999, 0)]).Error);
     }
 
     private static SipJobReadOnlyDagDescriptor Dag(params SipJobDagEdge[] edges) => new(1,

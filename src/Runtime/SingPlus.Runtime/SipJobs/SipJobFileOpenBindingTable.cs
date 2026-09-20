@@ -78,9 +78,15 @@ internal sealed class SipJobFileOpenBindingTable(RuntimeKernel kernel)
 
         var current = ResolveCurrent(entry.Descriptor, entry.Key.ServiceProcess, entry.Key.Session);
         if (!current.IsSuccess)
+        {
+            EvictIfCurrent(handle, entry);
             return KernelResult<SipJobResolvedBindingMetadata>.Fail(current.Error, current.Message!);
+        }
         if (!Exact(current.Value!, entry.Key))
+        {
+            EvictIfCurrent(handle, entry);
             return KernelResult<SipJobResolvedBindingMetadata>.Fail(KernelError.StaleGeneration, "SipJob binding route is stale.");
+        }
 
         return KernelResult<SipJobResolvedBindingMetadata>.Ok(new(entry.Key, "Generated:IFileService.OpenAsync"));
     }
@@ -93,6 +99,22 @@ internal sealed class SipJobFileOpenBindingTable(RuntimeKernel kernel)
             return _entries.Remove(handle.OpaqueToken)
                 ? KernelResult.Ok()
                 : KernelResult.Fail(KernelError.StaleHandle, "SipJob binding is absent or already retired.");
+    }
+
+    internal int Count
+    {
+        get { lock (_gate) return _entries.Count; }
+    }
+
+    private void EvictIfCurrent(SipJobTrustedBindingHandle handle, Entry observed)
+    {
+        // Eviction only drops TCB-private lookup metadata and the strong target
+        // reference. It never invokes the target or any user/provider callback.
+        lock (_gate)
+        {
+            if (_entries.TryGetValue(handle.OpaqueToken, out var current) && ReferenceEquals(current, observed))
+                _entries.Remove(handle.OpaqueToken);
+        }
     }
 
     private KernelResult<SipJobFileOpenBindingKey> ResolveCurrent(
