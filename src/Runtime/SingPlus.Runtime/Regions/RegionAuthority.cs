@@ -365,7 +365,7 @@ public sealed class RegionAuthority
         if (record.PlatformMappingReserved) return KernelResult.Fail(KernelError.PlatformBindingActive, "An owned region with an active platform mapping cannot be released.");
         if (record.ExternalBorrowReadGrantReserved) return KernelResult.Fail(KernelError.PlatformBindingActive, "A region with an active external borrow read grant cannot be released.");
         if (record.BackingLease is not null) return KernelResult.Fail(KernelError.PlatformBindingActive, "A region with an active backing lease cannot be released.");
-        if (HasActiveWriteUse(record)) return KernelResult.Fail(KernelError.RegionUseConflict, "An owned region with an active writable use cannot be released.");
+        if (HasActiveUse(record)) return KernelResult.Fail(KernelError.RegionUseConflict, "An owned region with an active use cannot be released.");
         var mutation = AdvanceMutation(record);
         if (!mutation.IsSuccess) return mutation;
         record.State = RegionState.Released;

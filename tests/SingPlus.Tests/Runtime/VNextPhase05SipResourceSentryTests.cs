@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using System.Reflection;
 using SingPlus.Contracts;
 using SingPlus.Runtime;
 using SingPlus.Sip.Sdk;
@@ -40,6 +41,23 @@ public sealed class VNextPhase05SipResourceSentryTests
         Assert.False(result.IsSuccess);
         Assert.Equal((int)KernelError.CapabilityNotFound, result.ErrorCode);
         Assert.Equal(0, target.Calls);
+        Assert.Equal(0UL, Used(setup));
+    }
+
+    [Fact]
+    public void MissingEffectCapabilityFailsBeforeGeneratedTargetOrProvider()
+    {
+        var setup = Create();
+        var target = new Target { Submit = true };
+        var invalid = setup.Binding with { EffectCapability = new CapabilityId(ulong.MaxValue) };
+        var context = Context(setup, invalid);
+
+        var result = IVNextP05ResourceServiceGeneratedOperationSentries.InvokeRuntime_Run(target, in context);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal((int)KernelError.CapabilityNotFound, result.ErrorCode);
+        Assert.Equal(0, target.Calls);
+        Assert.Equal(0, target.ProviderCalls);
         Assert.Equal(0UL, Used(setup));
     }
 
@@ -112,6 +130,46 @@ public sealed class VNextPhase05SipResourceSentryTests
             ResourceAssuranceV1.RuntimeEnforced, SipResourceDonationPolicyV1.None));
     }
 
+    [Fact]
+    public void ManifestCannotClaimFutureGuaranteedReservation()
+    {
+        var future = new SipResourceRequirementV1(1, ResourceClassV1.ComputeTime,
+            ResourceUnitV1.Nanoseconds, 1, "host:compute-v1",
+            ResourceAssuranceV1.GuaranteedReservation, SipResourceDonationPolicyV1.None);
+
+        Assert.Throws<ArgumentException>(() => new ServiceManifestV1(new("future"), new("1"),
+            new string('a', 64), TestFixtures.Manifest(951, 1951), resourceUseRequirements: [future]));
+    }
+
+    [Fact]
+    public void ReflectionAndDefaultValuesCannotForgeLiveAdmission()
+    {
+        Assert.Empty(typeof(TrustedSipInvocationContext).GetConstructors(BindingFlags.Public | BindingFlags.Instance));
+        Assert.Empty(typeof(GeneratedSipResourceAdmission).GetConstructors(BindingFlags.Public | BindingFlags.Instance));
+        Assert.DoesNotContain(typeof(GeneratedSipResourceAdmission).GetFields(BindingFlags.Public | BindingFlags.Instance),
+            field => typeof(IDisposable).IsAssignableFrom(field.FieldType) || typeof(Delegate).IsAssignableFrom(field.FieldType));
+
+        var result = IVNextP05ResourceServiceGeneratedOperationSentries.InvokeRuntime_Run(new Target(), default);
+        Assert.False(result.IsSuccess);
+    }
+
+    [Fact]
+    public void ProviderFailureThroughGeneratedSentryQuarantinesWithoutRefund()
+    {
+        var setup = Create();
+        var target = new Target { Submit = true, ProviderFailure = true };
+        var context = Context(setup, setup.Binding);
+
+        var result = IVNextP05ResourceServiceGeneratedOperationSentries.InvokeRuntime_Run(target, in context);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(1, target.ProviderCalls);
+        Assert.Equal(10UL, Used(setup));
+        var operation = setup.Kernel.ExternalOperations.Query(setup.Operation).Value!;
+        Assert.Equal(ExternalOperationState.Submitted, operation.State);
+        Assert.Equal(ExternalOperationDisposition.ProviderLost, operation.Disposition);
+    }
+
     private static TrustedSipInvocationContext Context(Setup setup, SipResourceAdmissionBinding binding) =>
         new(setup.Process, setup.Process, default, default,
             requirement => setup.Kernel.EnterSipResourceAdmission(setup.Process, binding, requirement));
@@ -156,6 +214,7 @@ public sealed class VNextPhase05SipResourceSentryTests
         internal bool Throw { get; init; }
         internal bool Submit { get; init; }
         internal int ProviderCalls { get; private set; }
+        internal bool ProviderFailure { get; init; }
 
         public GeneratedSipSentryResult<int> Sentry_Run(in TrustedSipInvocationContext context,
             GeneratedSipResourceAdmission resourceAdmission)
@@ -167,7 +226,9 @@ public sealed class VNextPhase05SipResourceSentryTests
                 var submitted = resourceAdmission.Submit(() =>
                 {
                     ProviderCalls++;
-                    return GeneratedSipSubmitResult.Ok();
+                    return ProviderFailure
+                        ? GeneratedSipSubmitResult.Failure((int)KernelError.PlatformFaulted, "provider failed")
+                        : GeneratedSipSubmitResult.Ok();
                 });
                 if (!submitted.IsSuccess)
                     return GeneratedSipSentryResult<int>.Failure(submitted.ErrorCode, submitted.Message!);

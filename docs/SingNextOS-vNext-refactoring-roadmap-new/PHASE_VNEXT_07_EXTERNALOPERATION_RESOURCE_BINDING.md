@@ -1,5 +1,7 @@
 # P07 — EXTERNALOPERATION RESOURCE BINDING
 
+**Live disposition:** closed at internal host/JIT `RuntimeEnforced` for exact `ComputeTime/Nanoseconds` ExternalOperation↔lease correlation and settlement on HEAD `8c3f55e47555b2db99356b861ee404211d072edc`; `FG-VNX-EXTOP-RESOURCE-BIND` remains OFF. Provider receipts remain evidence, ordinary ExternalOperation/SIP fallbacks remain default, and no provider artifact is qualified. See `EVIDENCE_P07_EXTERNALOPERATION_RESOURCE_BINDING.md` and `P07_QUALIFICATION_TUPLE.json`.
+
 ## Purpose
 
 Bind one exact budget lease to one exact external-effect generation and define provider ambiguity, usage settlement and quarantine without collapsing effect, Region, publication or resource owners.

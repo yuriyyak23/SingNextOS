@@ -225,6 +225,7 @@ public sealed partial class ServiceManifestV1
                 requirement.ResourceClass != ResourceClassV1.ComputeTime ||
                 requirement.Unit != ResourceUnitV1.Nanoseconds ||
                 !Enum.IsDefined(requirement.AssuranceCeiling) ||
+                requirement.AssuranceCeiling > ResourceAssuranceV1.RuntimeEnforced ||
                 !Enum.IsDefined(requirement.DonationPolicy)))
             throw new ArgumentException("Manifest resource-use requirements must use the supported canonical P05 contour.", nameof(resourceUseRequirements));
         if (_resourceUseRequirements.Select(static requirement =>

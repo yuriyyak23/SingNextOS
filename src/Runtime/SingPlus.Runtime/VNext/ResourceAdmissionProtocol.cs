@@ -36,13 +36,14 @@ internal sealed class ResourceAdmissionCommit : IDisposable
     private int _disposed;
 
     internal ResourceAdmissionCommit(
-        RuntimeKernel kernel, ProcessHandle principal, CapabilityId resourceGrant,
+        RuntimeKernel kernel, ProcessHandle principal, ProcessHandle budgetOwner, CapabilityId resourceGrant,
         ulong resourceGeneration, ResourceEnvelopeV1 envelope, ExternalOperationHandle operation,
         BudgetReservationHandle lease, ResourceUseAuthorityLease resourceAuthority,
         OperationAuthorityLease effectAuthority)
     {
         _kernel = kernel;
         Principal = principal;
+        BudgetOwner = budgetOwner;
         ResourceGrant = resourceGrant;
         ResourceGeneration = resourceGeneration;
         Envelope = envelope;
@@ -53,6 +54,7 @@ internal sealed class ResourceAdmissionCommit : IDisposable
     }
 
     internal ProcessHandle Principal { get; }
+    internal ProcessHandle BudgetOwner { get; }
     internal CapabilityId ResourceGrant { get; }
     internal ulong ResourceGeneration { get; }
     internal ResourceEnvelopeV1 Envelope { get; }
@@ -144,8 +146,13 @@ public sealed partial class RuntimeKernel
         ulong resourceGrantGeneration,
         ResourceEnvelopeV1 envelope,
         ExternalOperationHandle operation,
-        OperationDependencySnapshot dependencies)
+        OperationDependencySnapshot dependencies,
+        ProcessHandle? budgetOwner = null,
+        BudgetReservationHandle? existingLease = null,
+        string? providerIdentity = null,
+        ulong? providerGeneration = null)
     {
+        var exactBudgetOwner = budgetOwner ?? principal;
         BudgetReservationHandle? lease = null;
         ResourceUseAuthorityLease? resourceAuthority = null;
         OperationAuthorityLease? effectAuthority = null;
@@ -170,11 +177,25 @@ public sealed partial class RuntimeKernel
                 return KernelResult<ResourceAdmissionCommit>.Fail(KernelError.StaleGeneration, "External operation preparation is stale or belongs to another principal.");
             ResourceAdmissionQualificationHook?.At(ResourceAdmissionQualificationPoint.AfterInitialValidation);
 
-            var reserved = Budgets.Reserve(principal,
-                [new(ServiceBudgetDimension.ComputeTimeNanoseconds, requested.Amount)],
-                BudgetReservationLifetime.ExternalEffect, AdmissionQosHint.None);
-            if (!reserved.IsSuccess) return KernelResult<ResourceAdmissionCommit>.Fail(reserved.Error, reserved.Message!);
-            lease = reserved.Value!.Reservation;
+            if (existingLease is { } donatedLease)
+            {
+                var snapshot = Budgets.Query(donatedLease);
+                if (!snapshot.IsSuccess || snapshot.Value!.Owner != exactBudgetOwner ||
+                    snapshot.Value.State != BudgetReservationState.Reserved ||
+                    snapshot.Value.Amounts.Count != 1 ||
+                    snapshot.Value.Amounts[0] != new BudgetAmount(ServiceBudgetDimension.ComputeTimeNanoseconds, requested.Amount))
+                    return KernelResult<ResourceAdmissionCommit>.Fail(KernelError.StaleGeneration,
+                        "Donated budget lease is stale, non-exact, or belongs to another charging lineage.");
+                lease = donatedLease;
+            }
+            else
+            {
+                var reserved = Budgets.Reserve(principal,
+                    [new(ServiceBudgetDimension.ComputeTimeNanoseconds, requested.Amount)],
+                    BudgetReservationLifetime.ExternalEffect, AdmissionQosHint.None);
+                if (!reserved.IsSuccess) return KernelResult<ResourceAdmissionCommit>.Fail(reserved.Error, reserved.Message!);
+                lease = reserved.Value!.Reservation;
+            }
             ResourceAdmissionQualificationHook?.At(ResourceAdmissionQualificationPoint.AfterBudgetReservation);
 
             process = Processes.Resolve(principal);
@@ -197,14 +218,19 @@ public sealed partial class RuntimeKernel
                 effectResourceGeneration, CapabilityOperation.Execute);
             if (!acquired.IsSuccess) return KernelResult<ResourceAdmissionCommit>.Fail(acquired.Error, acquired.Message!);
             effectAuthority = acquired.Value!;
-            var bound = Budgets.BindLease(principal, lease.Value);
+            var bound = Budgets.BindLease(exactBudgetOwner, lease.Value);
             if (!bound.IsSuccess) return KernelResult<ResourceAdmissionCommit>.Fail(bound.Error, bound.Message!);
             var admitted = ExternalOperations.Admit(operation, dependencies);
             if (!admitted.IsSuccess) return KernelResult<ResourceAdmissionCommit>.Fail(admitted.Error, admitted.Message!);
             externalCommitted = true;
+            var resourceBinding = ExternalOperations.BindResourceLease(operation, exactBudgetOwner, lease.Value,
+                requested, providerIdentity ?? requested.SemanticScope,
+                providerGeneration ?? dependencies.PlatformGeneration);
+            if (!resourceBinding.IsSuccess)
+                return KernelResult<ResourceAdmissionCommit>.Fail(resourceBinding.Error, resourceBinding.Message!);
             ResourceAdmissionQualificationHook?.At(ResourceAdmissionQualificationPoint.AfterLocalCommit);
 
-            var commit = new ResourceAdmissionCommit(this, principal, resourceGrant, resourceGrantGeneration, requested,
+            var commit = new ResourceAdmissionCommit(this, principal, exactBudgetOwner, resourceGrant, resourceGrantGeneration, requested,
                 operation, lease.Value, resourceAuthority, effectAuthority);
             resourceAuthority = null;
             effectAuthority = null;
@@ -221,9 +247,12 @@ public sealed partial class RuntimeKernel
             effectAuthority?.Dispose();
             resourceAuthority?.Dispose();
             if (externalCommitted)
+            {
                 _ = ExternalOperations.Cancel(operation, providerCancellationSupported: false);
+                _ = ExternalOperations.MarkResourceCancelledPreSubmit(operation);
+            }
             if (lease is { } reservation)
-                _ = Budgets.CancelLeasePreSubmit(principal, reservation);
+                _ = Budgets.CancelLeasePreSubmit(exactBudgetOwner, reservation);
         }
     }
 
@@ -241,12 +270,21 @@ public sealed partial class RuntimeKernel
         if (!process.IsSuccess) return FailBeforeSubmit(commit, process.Error, process.Message!);
         var submitted = ExternalOperations.RecordSubmission(commit.Operation, dependencies);
         if (!submitted.IsSuccess) return FailBeforeSubmit(commit, submitted.Error, submitted.Message!);
-        var consuming = Budgets.BeginConsumption(commit.Principal, commit.Lease);
+        var consuming = Budgets.BeginConsumption(commit.BudgetOwner, commit.Lease);
         if (!consuming.IsSuccess)
         {
             _ = ExternalOperations.RecordProviderLoss(commit.Operation);
-            _ = Budgets.QuarantineLease(commit.Principal, commit.Lease);
+            _ = Budgets.QuarantineLease(commit.BudgetOwner, commit.Lease);
+            _ = ExternalOperations.MarkResourceQuarantined(commit.Operation);
             return KernelResult<OperationBinding>.Fail(consuming.Error, consuming.Message!);
+        }
+        var resourceConsuming = ExternalOperations.MarkResourceConsumption(commit.Operation);
+        if (!resourceConsuming.IsSuccess)
+        {
+            _ = ExternalOperations.RecordProviderLoss(commit.Operation);
+            _ = Budgets.QuarantineLease(commit.BudgetOwner, commit.Lease);
+            _ = ExternalOperations.MarkResourceQuarantined(commit.Operation);
+            return KernelResult<OperationBinding>.Fail(resourceConsuming.Error, resourceConsuming.Message!);
         }
 
         try
@@ -256,13 +294,15 @@ public sealed partial class RuntimeKernel
             ResourceAdmissionQualificationHook?.At(ResourceAdmissionQualificationPoint.AfterProviderCallback);
             if (provider.IsSuccess) return submitted;
             _ = ExternalOperations.RecordProviderLoss(commit.Operation);
-            _ = Budgets.QuarantineLease(commit.Principal, commit.Lease);
+            _ = Budgets.QuarantineLease(commit.BudgetOwner, commit.Lease);
+            _ = ExternalOperations.MarkResourceQuarantined(commit.Operation);
             return KernelResult<OperationBinding>.Fail(provider.Error, provider.Message!);
         }
         catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
         {
             _ = ExternalOperations.RecordProviderLoss(commit.Operation);
-            _ = Budgets.QuarantineLease(commit.Principal, commit.Lease);
+            _ = Budgets.QuarantineLease(commit.BudgetOwner, commit.Lease);
+            _ = ExternalOperations.MarkResourceQuarantined(commit.Operation);
             return KernelResult<OperationBinding>.Fail(KernelError.PlatformFaulted, exception.Message);
         }
         finally
@@ -275,7 +315,8 @@ public sealed partial class RuntimeKernel
     internal void CompensateResourceAdmissionBeforeSubmit(ResourceAdmissionCommit commit)
     {
         _ = ExternalOperations.Cancel(commit.Operation, providerCancellationSupported: false);
-        _ = Budgets.CancelLeasePreSubmit(commit.Principal, commit.Lease);
+        _ = Budgets.CancelLeasePreSubmit(commit.BudgetOwner, commit.Lease);
+        _ = ExternalOperations.MarkResourceCancelledPreSubmit(commit.Operation);
     }
 
     private KernelResult<OperationBinding> FailBeforeSubmit(ResourceAdmissionCommit commit, KernelError error, string message)

@@ -18,6 +18,7 @@ internal sealed class EndpointSessionInvocationRegistry
         public bool CancellationAccepted { get; set; }
         public ResponsePublicationStatus? SettlementInProgress { get; set; }
         public ResponsePublicationStatus? TerminalStatus { get; set; }
+        public ResourceDonationBinding? ResourceDonation { get; set; }
     }
 
     private readonly Dictionary<(EndpointSessionId Session, EndpointSessionGeneration SessionGeneration, EndpointSessionInvocationId Invocation), Record> _records = [];
@@ -368,14 +369,87 @@ internal sealed class EndpointSessionInvocationRegistry
         }
     }
 
-    internal void CloseSession(EndpointSessionHandle session)
+    internal KernelResult<ResourceDonationBinding> BindResourceDonation(ResourceDonationBinding binding)
     {
         lock (_gate)
         {
-            foreach (var key in _records.Keys
-                         .Where(key => key.Session == session.SessionId && key.SessionGeneration == session.Generation)
-                         .ToArray())
+            var resolved = Resolve(binding.Invocation);
+            if (!resolved.IsSuccess) return KernelResult<ResourceDonationBinding>.Fail(resolved.Error, resolved.Message!);
+            var record = resolved.Value!;
+            if (record.Caller != binding.Caller || record.Service != binding.Service)
+                return KernelResult<ResourceDonationBinding>.Fail(KernelError.WrongSessionOwner, "Donation provenance does not match the exact invocation peers.");
+            if (record.TerminalStatus is not null || record.ResourceDonation is not null)
+                return KernelResult<ResourceDonationBinding>.Fail(KernelError.InvalidTransition, "Invocation is terminal or already has a resource donation.");
+            record.ResourceDonation = binding;
+            return KernelResult<ResourceDonationBinding>.Ok(binding);
+        }
+    }
+
+    internal KernelResult<ResourceDonationBinding> ResolveResourceDonation(
+        EndpointSessionInvocationHandle invocation, ProcessHandle service)
+    {
+        lock (_gate)
+        {
+            var resolved = ResolveForService(invocation, service);
+            if (!resolved.IsSuccess) return KernelResult<ResourceDonationBinding>.Fail(resolved.Error, resolved.Message!);
+            var donation = resolved.Value!.ResourceDonation;
+            return donation is not null && donation.State is ResourceDonationState.Bound or ResourceDonationState.Active
+                ? KernelResult<ResourceDonationBinding>.Ok(donation)
+                : KernelResult<ResourceDonationBinding>.Fail(KernelError.InvalidTransition, "Invocation has no live resource donation.");
+        }
+    }
+
+    internal KernelResult<ResourceDonationBinding> ActivateResourceDonation(
+        EndpointSessionInvocationHandle invocation, ProcessHandle service)
+    {
+        lock (_gate)
+        {
+            var resolved = ResolveForService(invocation, service);
+            if (!resolved.IsSuccess) return KernelResult<ResourceDonationBinding>.Fail(resolved.Error, resolved.Message!);
+            var donation = resolved.Value!.ResourceDonation;
+            if (donation is null || donation.State != ResourceDonationState.Bound)
+                return KernelResult<ResourceDonationBinding>.Fail(KernelError.InvalidTransition,
+                    "Only a bound resource donation can cross the possible-submit boundary.");
+            var active = donation with { State = ResourceDonationState.Active };
+            resolved.Value.ResourceDonation = active;
+            return KernelResult<ResourceDonationBinding>.Ok(active);
+        }
+    }
+
+    internal KernelResult<ResourceDonationBinding> CloseResourceDonation(
+        EndpointSessionInvocationHandle invocation, ProcessHandle service, ResourceDonationState terminal)
+    {
+        lock (_gate)
+        {
+            var resolved = ResolveForService(invocation, service);
+            if (!resolved.IsSuccess) return KernelResult<ResourceDonationBinding>.Fail(resolved.Error, resolved.Message!);
+            var donation = resolved.Value!.ResourceDonation;
+            if (donation is null)
+                return KernelResult<ResourceDonationBinding>.Fail(KernelError.InvalidTransition, "Invocation has no resource donation.");
+            if (donation.State is ResourceDonationState.Returned or ResourceDonationState.Quarantined or ResourceDonationState.Closed)
+                return KernelResult<ResourceDonationBinding>.Ok(donation);
+            var closed = donation with { State = terminal };
+            resolved.Value.ResourceDonation = closed;
+            return KernelResult<ResourceDonationBinding>.Ok(closed);
+        }
+    }
+
+    internal ResourceDonationBinding[] CloseSession(EndpointSessionHandle session)
+    {
+        lock (_gate)
+        {
+            var keys = _records.Keys
+                .Where(key => key.Session == session.SessionId && key.SessionGeneration == session.Generation)
+                .ToArray();
+            var donations = keys
+                .Select(key => _records[key].ResourceDonation)
+                .Where(donation => donation is not null &&
+                    donation.State is ResourceDonationState.Bound or ResourceDonationState.Active)
+                .Cast<ResourceDonationBinding>()
+                .ToArray();
+            foreach (var key in keys)
                 _records.Remove(key);
+            return donations;
         }
     }
 

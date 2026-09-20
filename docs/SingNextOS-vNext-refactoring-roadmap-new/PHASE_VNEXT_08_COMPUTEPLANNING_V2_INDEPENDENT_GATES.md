@@ -1,5 +1,7 @@
 # P08 — COMPUTEPLANNING V2 INDEPENDENT GATES
 
+**Live disposition:** closed at internal host/JIT `RuntimeEnforced` for staged `ComputeTime/Nanoseconds` resource-aware plan admission with independent effect/resource/budget/Region/provider/CPU-legality gates on HEAD `8c3f55e47555b2db99356b861ee404211d072edc`; `FG-VNX-COMPUTE-V2` remains OFF and ordinary ComputePlan behavior remains default. P09 provider mapping remains FutureGated. See `EVIDENCE_P08_COMPUTEPLAN_INDEPENDENT_GATES.md` and `P08_QUALIFICATION_TUPLE.json`.
+
 ## Purpose
 
 Extend compute planning with semantic resource requirements while preserving independent effect, resource, ownership, provider and CPU-legality gates.

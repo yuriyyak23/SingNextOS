@@ -54,3 +54,7 @@ Policy/cache state may be replicated. Authority state remains singular in existi
 ## Prerequisite for next phase
 
 P11 may use scheduler/provider execution facts only as inputs to qualified upper-bound enforcement.
+
+## Current disposition (2026-09-21)
+
+Closed for the internal host/JIT policy-only contour recorded in `EVIDENCE_P10_RESOURCE_SCHEDULER.md` and `P10_QUALIFICATION_TUPLE.json`. Scheduler observations and placement hints are generation-bound evidence only; restart clears them, live provider revalidation is mandatory, and the surface has no authority or terminal-mutation API. `FG-VNX-RESOURCE-SCHEDULER` remains OFF, ordinary planning remains default, and no upper-bound, guarantee, provider-wide or production claim is made.

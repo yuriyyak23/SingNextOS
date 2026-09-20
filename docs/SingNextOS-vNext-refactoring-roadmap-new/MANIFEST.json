@@ -100,39 +100,109 @@
       "sha256": "29f848b99df6881f512d1363e7a5cd21a0716516e4b7eecf12e04df1dfd14683"
     },
     {
+      "file": "EVIDENCE_P05_SIP_RESOURCE_CONTRACTS.md",
+      "bytes": 5583,
+      "sha256": "fc553b2af6bdbaacfe6f00e85084dc74b711ec85988c1558e9ed00ef58104d4e"
+    },
+    {
+      "file": "P05_QUALIFICATION_TUPLE.json",
+      "bytes": 1215,
+      "sha256": "56d7efbd098cdba9102b1f5c156de292abf30ada5b2377641457da6bd667f715"
+    },
+    {
       "file": "PHASE_VNEXT_05_SIP_AND_MANIFEST_RESOURCE_CONTRACTS.md",
-      "bytes": 2040,
-      "sha256": "dc7a8b442400bedd0907e0a96b4572a2018d6ea676b3eb29b844dc87f6eca194"
+      "bytes": 2540,
+      "sha256": "50bdd4cbfc766fdc9ee15f8d6fce57dd3a22553f30b4ea29010c1514f844c120"
+    },
+    {
+      "file": "EVIDENCE_P06_ENDPOINTSESSION_RESOURCE_DONATION.md",
+      "bytes": 6613,
+      "sha256": "fdd417a3cd1203d888b02ef517aa103fab325daeb6d5d2a5dab1223e90124f71"
+    },
+    {
+      "file": "P06_QUALIFICATION_TUPLE.json",
+      "bytes": 1363,
+      "sha256": "eca03531dce70490fa2bead499e80f1483652a30f2e36ff196b15ca9b4896f57"
     },
     {
       "file": "PHASE_VNEXT_06_ENDPOINTSESSION_RESOURCE_DONATION.md",
-      "bytes": 2480,
-      "sha256": "f6e46d95d8b2fb4da5c6f161b8bbaca9bb78af3bc443a41aad9c3d60a2376938"
+      "bytes": 2907,
+      "sha256": "c95f689c3c6fafebba608e8bd5af75f1f39a411d32494a1bcb0e8435c520a44f"
+    },
+    {
+      "file": "EVIDENCE_P07_EXTERNALOPERATION_RESOURCE_BINDING.md",
+      "bytes": 6761,
+      "sha256": "a3000f9a42230f3e3b3935bf8161fc18e66cf8b4b1fca8335ae0176b1933258c"
+    },
+    {
+      "file": "P07_QUALIFICATION_TUPLE.json",
+      "bytes": 1324,
+      "sha256": "e44fcac7190881e152bbcbed496a9c9606767056201f19a909b9ec92f8969cc5"
     },
     {
       "file": "PHASE_VNEXT_07_EXTERNALOPERATION_RESOURCE_BINDING.md",
-      "bytes": 2341,
-      "sha256": "bcd09e3f555ca87aac691dc2a49d9399269205090d206cc7a2eb3e3bf6e6d7c1"
+      "bytes": 2817,
+      "sha256": "380fc92a1fcd82f92c82c37d01bcbe813333f9101e94ad3be840e36e85da2d8b"
+    },
+    {
+      "file": "EVIDENCE_P08_COMPUTEPLAN_INDEPENDENT_GATES.md",
+      "bytes": 4512,
+      "sha256": "90cab62ebfd1b87014be5a2c110719a998fe5b3417e5ce57c6b8f87cd982b548"
+    },
+    {
+      "file": "P08_QUALIFICATION_TUPLE.json",
+      "bytes": 1153,
+      "sha256": "d36adf5578585e5981087077d0fe6e06e8267ec90f98a1852d9e5af214a1fad2"
     },
     {
       "file": "PHASE_VNEXT_08_COMPUTEPLANNING_V2_INDEPENDENT_GATES.md",
-      "bytes": 1858,
-      "sha256": "8f4d38c9fc084db6d85ddc9bbd9184fc4b371eb0f0913ea81ab9d85a964cdf11"
+      "bytes": 2334,
+      "sha256": "5958b1b7b356d82a978eacb16bac2c4132df83a0b3c7890020848c72a921b147"
+    },
+    {
+      "file": "EVIDENCE_P09_HYBRIDCPU_PROVIDER_NEUTRAL_INTEGRATION.md",
+      "bytes": 5093,
+      "sha256": "62965f4c0e9b56eec4fd70de51280314317f69152f932b49dc028b76afa3a542"
+    },
+    {
+      "file": "P09_QUALIFICATION_TUPLE.json",
+      "bytes": 1526,
+      "sha256": "78f8c15bc2c5c36507c9f3275b6e27f41d6b2c6a19d1c2a635dd107b6ee897ed"
     },
     {
       "file": "PHASE_VNEXT_09_HYBRIDCPU_PROVIDER_NEUTRAL_INTEGRATION.md",
-      "bytes": 2339,
-      "sha256": "2e8ce439810e4795dd1a6f38e874d70c0c68d3b456a1fffd069641349d566681"
+      "bytes": 2946,
+      "sha256": "92ce734599bec8f191d4d33d7f0fd7ab44d3f9d221481a27d0ac94b94db50c19"
+    },
+    {
+      "file": "EVIDENCE_P10_RESOURCE_SCHEDULER.md",
+      "bytes": 3888,
+      "sha256": "7c78569756241abcdc2102273fd6adbb71a35141ace77205e2b74f4150cf2db3"
+    },
+    {
+      "file": "P10_QUALIFICATION_TUPLE.json",
+      "bytes": 1136,
+      "sha256": "d9e906a932d470e94b5059304dccb641e27bfda149f551708fc548daef795c38"
     },
     {
       "file": "PHASE_VNEXT_10_RESOURCE_SCHEDULER_AND_PROVIDER_AGENTS.md",
-      "bytes": 1899,
-      "sha256": "687f6362707fff17b3187de591d40dc3bbd73617e504b916c26a70b5755ea4a4"
+      "bytes": 2425,
+      "sha256": "96e356563b92f04d1fecbe40d1dcf7632ade362243c8b1751b225fe1e81220d7"
+    },
+    {
+      "file": "EVIDENCE_P11_TEMPORAL_CLAIM_BOUNDARY.md",
+      "bytes": 3655,
+      "sha256": "b9103a9c1e3717320c52c1062167bd3416169970a664ccce27a189a7778bb4ab"
+    },
+    {
+      "file": "P11_QUALIFICATION_TUPLE.json",
+      "bytes": 996,
+      "sha256": "3ef030905fa736ab0b497539cae4b21392e2a845255278bb92da8efb83b737f1"
     },
     {
       "file": "PHASE_VNEXT_11_TEMPORAL_UPPER_BOUNDS_AND_GUARANTEE_DISCIPLINE.md",
-      "bytes": 2343,
-      "sha256": "beb06af310f45ce2dc2a92acaeefe45c2affd5995482802e28a46f03d0bf3d67"
+      "bytes": 2861,
+      "sha256": "8fac53e82ea53a8961a7522d7a23d5190f0aaf7dede7300957f3cdf20b6ebd79"
     },
     {
       "file": "PHASE_VNEXT_12_SIPJOB_RESOURCE_AWARE_COMPOSITION.md",

@@ -219,6 +219,16 @@ public sealed class ComputePlanner(RegionAuthority regions)
             return KernelResult.Fail(KernelError.InvalidMessage, "Compute intent requires distinct materialized input and output regions.");
         if (intent.Input.Range.Length <= 0 || intent.Output.Range.Length <= 0 || intent.Input.Range.Length != intent.Output.Range.Length)
             return KernelResult.Fail(KernelError.InvalidMessage, "Compute intent requires positive equal-length input and output ranges.");
+        if (intent.ResourceRequirement is { } resource)
+        {
+            ResourceEnvelopeV1 canonical;
+            try { canonical = resource.Canonicalize(); }
+            catch (Exception exception) when (exception is ArgumentException or NotSupportedException or OverflowException)
+            { return KernelResult.Fail(KernelError.InvalidMessage, exception.Message); }
+            if (canonical.ResourceClass != ResourceClassV1.ComputeTime || canonical.Unit != ResourceUnitV1.Nanoseconds)
+                return KernelResult.Fail(KernelError.InvalidMessage,
+                    "P08 resource-aware compute supports only semantic ComputeTime/Nanoseconds.");
+        }
         return KernelResult.Ok();
     }
 

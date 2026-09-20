@@ -1,5 +1,7 @@
 # P06 — ENDPOINTSESSION RESOURCE DONATION
 
+**Live disposition:** closed at internal host/JIT `RuntimeEnforced` for exact `ComputeTime/Nanoseconds` invocation donation on current HEAD `8c3f55e47555b2db99356b861ee404211d072edc`; `FG-VNX-SESSION-DONATION` remains OFF. Ordinary SIP is unchanged and default. Exact ExternalOperation↔lease reconciliation remains P07 FutureGated. See `EVIDENCE_P06_ENDPOINTSESSION_RESOURCE_DONATION.md` and `P06_QUALIFICATION_TUPLE.json`.
+
 ## Purpose
 
 Allow request-scoped resource permission/capacity delegation across `client -> server -> downstream` without budget, priority, assurance, provider-scope or refund laundering.

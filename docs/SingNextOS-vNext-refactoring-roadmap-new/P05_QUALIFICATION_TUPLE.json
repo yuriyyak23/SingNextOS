@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "phase": "P05",
+  "claim": "RuntimeEnforced",
+  "contour": "generated internal host-JIT ComputeTime/Nanoseconds SIP sentry to P04",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "phaseEntryHead": "b86cc33c16a77760c6971cc1a656c34b6cf2a10d",
+  "reviewedHead": "8c3f55e47555b2db99356b861ee404211d072edc",
+  "enabledFeatureGates": [],
+  "resourceDimension": "ComputeTimeNanoseconds",
+  "tests": [
+    { "lane": "P05-focused", "passed": 10, "failed": 0, "skipped": 0 },
+    { "lane": "generator-manifest-ordinary-sentry-P04-regression", "passed": 120, "failed": 0, "skipped": 0 },
+    { "lane": "architecture-default-gate-P05", "passed": 19, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui", "passed": 1618, "failed": 9, "skipped": 2, "disposition": "same unrelated historical failures recorded by P00-P04" }
+  ],
+  "build": { "target": "SingNextOS.slnx", "warnings": 0, "errors": 0 },
+  "ordinaryFallback": "unchanged; no production SIP operation carries RequiresResource",
+  "exclusions": [
+    "SIP resource gate remains OFF",
+    "no donation or production SIP migration",
+    "no NativeAOT, provider, hardware, guarantee, or production qualification"
+  ]
+}

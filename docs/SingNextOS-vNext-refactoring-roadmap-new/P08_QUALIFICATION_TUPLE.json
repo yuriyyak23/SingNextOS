@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "phase": "P08",
+  "claim": "RuntimeEnforced",
+  "contour": "internal host-JIT staged ComputePlan with semantic ComputeTime/Nanoseconds and independent gates",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "phaseEntryHead": "8c3f55e47555b2db99356b861ee404211d072edc",
+  "reviewedHead": "8c3f55e47555b2db99356b861ee404211d072edc",
+  "enabledFeatureGates": [],
+  "independentGates": ["effect", "resource", "budget", "Region", "provider", "cpu-runtime-legality"],
+  "tests": [
+    { "lane": "P08-focused", "passed": 5, "failed": 0, "skipped": 0 },
+    { "lane": "planner-P04-P08-regression", "passed": 54, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui", "passed": 1636, "failed": 9, "skipped": 2, "disposition": "same unrelated baseline failures" }
+  ],
+  "build": { "target": "SingNextOS.slnx", "warnings": 0, "errors": 0 },
+  "ordinaryFallback": "unchanged resource-unaware ComputePlan path remains default",
+  "exclusions": [
+    "FG-VNX-COMPUTE-V2 remains OFF",
+    "no provider/HybridCPU adapter qualification",
+    "no NativeAOT, hardware, guarantee, upper-bound, or production claim"
+  ]
+}

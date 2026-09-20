@@ -213,6 +213,11 @@ public sealed partial class RuntimeKernel
         var validation = ValidateExternalOperationPrincipal(principal, operation, requireNewEffect: false);
         if (!validation.IsSuccess) return KernelResult<ExternalOperationSnapshot>.Fail(validation.Error, validation.Message!);
         var lost = ExternalOperations.RecordProviderLoss(operation);
+        if (lost.IsSuccess && ExternalOperations.QueryResourceBinding(operation) is { IsSuccess: true, Value: { } resource })
+        {
+            _ = Budgets.QuarantineLease(resource.BudgetOwner, resource.Lease);
+            _ = ExternalOperations.MarkResourceQuarantined(operation);
+        }
         if (lost.IsSuccess)
             RecordTrace(principal, TraceEventKind.ExternalOperationFaulted, null, "external-operation",
                 operation.OperationId.Value.ToString(), "provider-lost", "effect-closure-ambiguous");

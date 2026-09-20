@@ -2,7 +2,7 @@ using SingPlus.Contracts;
 
 namespace SingPlus.Runtime;
 
-public sealed class ExternalOperationAuthority
+public sealed partial class ExternalOperationAuthority
 {
     private sealed class Record
     {
@@ -12,6 +12,7 @@ public sealed class ExternalOperationAuthority
         public OperationAdmissionSnapshot? Admission { get; set; }
         public OperationBinding? Binding { get; set; }
         public ExternalEffectBoundaryState EffectBoundary { get; set; }
+        public ExternalOperationResourceBinding? ResourceBinding { get; set; }
         public List<ExternalOperationTransition> Transitions { get; } = [];
         public ulong NextTransitionSequence { get; set; } = 1;
     }
@@ -359,6 +360,27 @@ public sealed class ExternalOperationAuthority
             return resolved.IsSuccess
                 ? KernelResult<ExternalOperationSnapshot>.Ok(Snapshot(resolved.Value!))
                 : KernelResult<ExternalOperationSnapshot>.Fail(resolved.Error, resolved.Message!);
+        }
+    }
+
+    internal KernelResult ValidatePreparedUses(
+        ExternalOperationHandle operation,
+        RegionOwner principal,
+        IReadOnlyList<OperationRegionUseRequest> exactUses)
+    {
+        ArgumentNullException.ThrowIfNull(exactUses);
+        lock (_gate)
+        {
+            var resolved = Resolve(operation);
+            if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+            var record = resolved.Value!;
+            if (record.State != ExternalOperationState.Prepared || record.Preparation.Principal != principal)
+                return KernelResult.Fail(KernelError.StaleGeneration,
+                    "Compute ExternalOperation is stale or belongs to another exact principal generation.");
+            return record.Preparation.RegionUses.SequenceEqual(exactUses)
+                ? KernelResult.Ok()
+                : KernelResult.Fail(KernelError.InvalidRegionState,
+                    "Compute ExternalOperation Region uses do not exactly match the live plan.");
         }
     }
 

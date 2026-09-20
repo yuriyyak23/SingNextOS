@@ -58,3 +58,7 @@ Time state is owned by the budget/lease subsystem plus a qualified measurement/e
 ## Prerequisite for next phase
 
 P12 must preserve these checks/transitions in fused execution.
+
+## Current disposition (2026-09-21)
+
+Closed as an explicit FutureGated boundary recorded in `EVIDENCE_P11_TEMPORAL_CLAIM_BOUNDARY.md` and `P11_QUALIFICATION_TUPLE.json`. Audit found accounting and deadline evidence but no exact measurement/preemption/replenishment enforcement contour, so neither temporal upper-bound nor guaranteed-reservation gate is enabled and no `EnforcedUpperBound` claim is made. P12 must preserve the existing accounting/admission transitions but cannot infer temporal enforcement from them.

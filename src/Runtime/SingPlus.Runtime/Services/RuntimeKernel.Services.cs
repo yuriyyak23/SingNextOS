@@ -162,7 +162,7 @@ public sealed partial class RuntimeKernel
         if (!session.IsSuccess) return KernelResult.Fail(session.Error, session.Message!);
         lock (_requestResponseCorrelationGate)
         {
-            SessionInvocations.CloseSession(handle);
+            CloseSessionResourceDonations(handle);
             var close = Channels.Close(session.Value!.Channel);
             return close.IsSuccess ? KernelResult.Ok() : close;
         }
@@ -426,6 +426,7 @@ public sealed partial class RuntimeKernel
         }
         finally
         {
+            CloseResourceDonationForInvocationTerminal(service, invocation.Context.Invocation);
             FinalizeInlineInvocationPin(invocation);
         }
     }
@@ -584,6 +585,7 @@ public sealed partial class RuntimeKernel
         }
         finally
         {
+            CloseResourceDonationForInvocationTerminal(service, context.Invocation);
             FinalizeInlineInvocationPin(lease);
         }
     }
@@ -607,7 +609,7 @@ public sealed partial class RuntimeKernel
         if (deferredClose is null) return;
         lock (_requestResponseCorrelationGate)
         {
-            SessionInvocations.CloseSession(session);
+            CloseSessionResourceDonations(session);
             _ = Channels.Close(deferredClose.Channel);
         }
     }
@@ -654,7 +656,7 @@ public sealed partial class RuntimeKernel
     {
         if (EndpointSessions.ExpireIfDue(handle, caller) is { } expired)
         {
-            SessionInvocations.CloseSession(handle);
+            CloseSessionResourceDonations(handle);
             _ = Channels.Close(expired.Channel);
             return KernelResult<EndpointSessionRegistry.Record>.Fail(KernelError.SessionTimedOut, "Endpoint session lifetime expired.");
         }
@@ -685,7 +687,7 @@ public sealed partial class RuntimeKernel
         {
             var nativeDrain = DrainNativeServiceSession(session.Handle);
             if (!nativeDrain.IsSuccess) return nativeDrain;
-            SessionInvocations.CloseSession(session.Handle);
+            CloseSessionResourceDonations(session.Handle);
             _ = Channels.Close(session.Channel);
         }
         Services.RetireForProvider(process);

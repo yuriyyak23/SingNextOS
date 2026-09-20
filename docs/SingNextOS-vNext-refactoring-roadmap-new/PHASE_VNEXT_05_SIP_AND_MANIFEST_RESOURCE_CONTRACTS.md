@@ -1,5 +1,7 @@
 # P05 — SIP AND MANIFEST RESOURCE CONTRACTS
 
+**Live disposition:** closed at `RuntimeEnforced` for generated, internal host/JIT ComputeTime/Nanoseconds sentry admission on current HEAD `8c3f55e47555b2db99356b861ee404211d072edc`; `FG-VNX-SIP-RESOURCE` remains OFF. The phase entered on `b86cc33c16a77760c6971cc1a656c34b6cf2a10d`; an externally-created merge commit incorporated the in-progress work without a dirty-tree conflict. Donation remains P06 FutureGated. See `EVIDENCE_P05_SIP_RESOURCE_CONTRACTS.md` and `P05_QUALIFICATION_TUPLE.json`.
+
 ## Purpose
 
 Add typed, generator-known resource requirements to SIP and manifests while preserving generated sentries as the security transition and metadata as non-authoritative.

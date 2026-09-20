@@ -18,9 +18,9 @@ public sealed class ExternalChildContractQualificationTests
             Assert.Equal(YAKSys_Hybrid_CPU.Core.NeutralRuntimeFeatureAvailability.RuntimeAdmission, feature.Availability));
         Assert.Equal(YAKSys_Hybrid_CPU.Core.NeutralRuntimeFeatureAvailability.Unavailable,
             neutral.Resolve(YAKSys_Hybrid_CPU.Core.NeutralRuntimeFeatureFamily.BoundedVirtualIo).Availability);
-        Assert.Equal("1.3.0", HybridCpuExternalRuntimePrerequisite.ContractsPackageVersion);
+        Assert.Equal("1.14.0", HybridCpuExternalRuntimePrerequisite.ContractsPackageVersion);
         Assert.Equal(
-            "7956596E820F2536542A73171205ED0B7A3366996BBDB2B51D95C2AE1FE3FC92",
+            "B96E99BDA066EE585B26A11CBFA7B68CE6BF44FC0006679483CCC1A4EEB678C2",
             HybridCpuExternalRuntimePrerequisite.ContractsPackageSha256);
         Assert.Equal("191A1976DECAF607425B3F93378BA11446B32AF2EBFD09DFF45A26944E7E765F",
             HybridCpuExternalRuntimePrerequisite.RuntimePackageSha256);
@@ -33,7 +33,7 @@ public sealed class ExternalChildContractQualificationTests
     {
         string root = FindRepositoryRoot();
         Assert.Equal(HybridCpuExternalRuntimePrerequisite.ContractsPackageSha256,
-            Hash(Path.Combine(root, ".packages", "HybridCPU.ExternalRuntime.Contracts.1.3.0.nupkg")));
+            Hash(Path.Combine(root, ".packages", "HybridCPU.ExternalRuntime.Contracts.1.14.0.nupkg")));
         Assert.Equal(HybridCpuExternalRuntimePrerequisite.RuntimePackageSha256,
             Hash(Path.Combine(root, ".packages", "HybridCPU.ExternalRuntime.1.3.0.nupkg")));
     }

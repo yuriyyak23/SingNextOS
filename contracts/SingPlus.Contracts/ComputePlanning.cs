@@ -88,7 +88,8 @@ public sealed record ComputeIntent(
     ComputeRegionOperand Output,
     ComputePublicationPreference PublicationPreference,
     bool RequiresSecureEvidence,
-    bool RequiresVirtualizedDomain);
+    bool RequiresVirtualizedDomain,
+    ResourceEnvelopeV1? ResourceRequirement = null);
 
 public readonly record struct ComputeSelectionPolicy(
     bool AllowStagedFallback,
