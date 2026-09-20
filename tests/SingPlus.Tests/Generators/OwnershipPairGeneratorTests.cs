@@ -50,6 +50,8 @@ public interface IComputeService
         Assert.Contains(first.Values, text =>
             text.Contains("Dispatch_CopyAsync", StringComparison.Ordinal) &&
             text.Contains("@source, @destination", StringComparison.Ordinal));
+        Assert.Contains(first.Values, text =>
+            text.Contains("GeneratedOperationSentries.Invoke_CopyAsync(_implementation, @source, @destination)", StringComparison.Ordinal));
     }
 
     private static Dictionary<string, string> Run()

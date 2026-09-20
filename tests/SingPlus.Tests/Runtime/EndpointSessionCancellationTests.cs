@@ -221,6 +221,55 @@ public sealed class EndpointSessionCancellationTests
         }
     }
 
+    [Fact]
+    public async Task PublicationCallbackRunsOutsideInvocationOwnerLockAndSettlementHasOneWinner()
+    {
+        var scenario = CreateSession();
+        var transport = new RuntimeSipClientTransport(
+            scenario.Kernel,
+            scenario.Caller,
+            scenario.Session);
+        var pending = transport.InvokeAsync(1).AsTask();
+        var received = scenario.Kernel.ReceiveSessionRequest(scenario.Service, scenario.Session);
+        Assert.True(received.IsSuccess, received.Message);
+        Assert.True(scenario.Kernel.AcceptSessionInvocation(
+            scenario.Service,
+            received.Value!.Invocation,
+            allowInFlightCancellation: false).IsSuccess);
+
+        var reserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        scenario.Kernel.SessionInvocationSettlementReservedHook = () =>
+        {
+            reserved.TrySetResult();
+            release.Task.GetAwaiter().GetResult();
+        };
+
+        var first = Task.Run(() => scenario.Kernel.PublishSessionResponse(
+            scenario.Service,
+            received.Value.Invocation,
+            42));
+        await reserved.Task.WaitAsync(CompletionTimeout);
+
+        var cancellationCheck = Task.Run(() => scenario.Kernel.RequestSessionCancellation(
+            scenario.Caller,
+            received.Value.Invocation));
+        var cancellationResult = await cancellationCheck.WaitAsync(CompletionTimeout);
+        Assert.Equal(KernelError.InvalidTransition, cancellationResult.Error);
+
+        var competing = scenario.Kernel.PublishSessionResponse(
+            scenario.Service,
+            received.Value.Invocation,
+            43);
+        Assert.Equal(KernelError.ResponseNotPending, competing.Error);
+
+        release.TrySetResult();
+        var published = await first.WaitAsync(CompletionTimeout);
+        Assert.True(published.IsSuccess, published.Message);
+        var response = await pending.WaitAsync(CompletionTimeout);
+        Assert.Equal(42, response.Payload);
+    }
+
     private static async Task<KernelResult<EndpointSessionRequestEnvelope>> ReceiveEventuallyAsync(
         SessionScenario scenario,
         Task start)

@@ -3,34 +3,87 @@ using SingPlus.Sip.FileSystem;
 using SingPlus.Sip.Native;
 using SingPlus.Sip.Networking;
 using SingPlus.Sip.Process;
+using SingPlus.Sip.Sdk;
 
 namespace SingPlus.Runtime;
 
+internal enum NativeSipCompletedEvent
+{
+    RequestReceived = 0,
+    InvocationAccepted,
+    SessionResolved,
+    CapabilityAdmitted,
+    ImplementationEntered,
+    ImplementationExited,
+    ResponsePublished,
+    ResponseCancelled,
+    CancellationCommitted,
+}
+
+internal interface INativeSipCompletedEventSink
+{
+    void Record(NativeSipCompletedEvent completedEvent);
+}
+
+internal enum NativeSipDeterministicPoint
+{
+    AfterRequestReceived = 0,
+    AfterInvocationAccepted,
+    AfterSessionResolved,
+    BeforeCapabilityCommit,
+    AfterCapabilityCommit,
+    BeforeImplementationEntry,
+    AfterImplementationExit,
+    BeforePublication,
+    AfterPublication,
+}
+
+internal interface INativeSipDeterministicHook
+{
+    void At(NativeSipDeterministicPoint point);
+}
+
 internal static class NativeServiceDispatch
 {
-    internal static KernelResult Dispatch(RuntimeKernel kernel, ProcessHandle service, EndpointSessionHandle session, Func<ProcessHandle, ChannelEnvelope, KernelResult<object?>> operation)
+    internal static KernelResult Dispatch(RuntimeKernel kernel, ProcessHandle service, EndpointSessionHandle session, Func<TrustedSipInvocationContext, ChannelEnvelope, KernelResult<object?>> operation, INativeSipCompletedEventSink? trace = null, INativeSipDeterministicHook? hook = null)
     {
         var received = kernel.ReceiveSessionRequest(service, session);
         if (!received.IsSuccess) return KernelResult.Fail(received.Error, received.Message!);
+        trace?.Record(NativeSipCompletedEvent.RequestReceived);
+        hook?.At(NativeSipDeterministicPoint.AfterRequestReceived);
         var invocation = received.Value!.Invocation;
         if (received.Value.CancellationRequested)
         {
             var acceptedCancellation = kernel.AcceptSessionCancellation(service, invocation);
             if (!acceptedCancellation.IsSuccess) return acceptedCancellation;
+            trace?.Record(NativeSipCompletedEvent.CancellationCommitted);
             var cancelled = kernel.CancelSessionResponse(service, invocation);
+            if (cancelled.IsSuccess) trace?.Record(NativeSipCompletedEvent.ResponseCancelled);
             return cancelled.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(cancelled.Error, cancelled.Message!);
         }
         var accepted = kernel.AcceptSessionInvocation(service, invocation, allowInFlightCancellation: false);
         if (!accepted.IsSuccess) return accepted;
+        trace?.Record(NativeSipCompletedEvent.InvocationAccepted);
+        hook?.At(NativeSipDeterministicPoint.AfterInvocationAccepted);
         var resolved = kernel.EndpointSessions.ResolveForService(session, service);
         if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
-        var result = operation(resolved.Value!.Caller, received.Value.Request);
+        trace?.Record(NativeSipCompletedEvent.SessionResolved);
+        hook?.At(NativeSipDeterministicPoint.AfterSessionResolved);
+        var context = new TrustedSipInvocationContext(resolved.Value!.Caller, service, session, invocation);
+        var result = operation(context, received.Value.Request);
         if (!result.IsSuccess)
         {
-            _ = kernel.CancelSessionResponse(service, invocation);
+            var cancelled = kernel.CancelSessionResponse(service, invocation);
+            if (cancelled.IsSuccess) trace?.Record(NativeSipCompletedEvent.ResponseCancelled);
             return KernelResult.Fail(result.Error, result.Message!);
         }
+        hook?.At(NativeSipDeterministicPoint.BeforePublication);
         var published = kernel.PublishSessionResponse(service, invocation, result.Value);
+        if (published.IsSuccess)
+        {
+            trace?.Record(NativeSipCompletedEvent.ResponsePublished);
+            hook?.At(NativeSipDeterministicPoint.AfterPublication);
+        }
         return published.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(published.Error, published.Message!);
     }
 
@@ -81,8 +134,9 @@ public sealed class RuntimeProcessServiceHost
         return KernelResult.Ok();
     }
 
-    private KernelResult<object?> Execute(ProcessHandle caller, ChannelEnvelope envelope)
+    private KernelResult<object?> Execute(TrustedSipInvocationContext context, ChannelEnvelope envelope)
     {
+        var caller = context.Caller;
         switch (envelope.MessageId)
         {
             case IProcessServiceProtocol.Message_CreateAsync when envelope.Payload is CreateProcessRequest request:
@@ -197,48 +251,37 @@ public sealed class RuntimeProcessServiceHost
     }
 }
 
-public sealed class RuntimeFileServiceHost
+public sealed class RuntimeFileServiceHost : IIFileServiceGeneratedSentryTarget_OpenAsync
 {
     private sealed record Entry(ProcessHandle Owner, FileObjectHandle Handle, CapabilityId Capability, string Path) { public byte[] Data { get; set; } = []; }
-    private readonly RuntimeKernel _kernel; private readonly ProcessHandle _service; private readonly EndpointSessionHandle _session; private readonly ServiceEndpointDescriptor _serviceDescriptor; private readonly Dictionary<FileObjectId, Entry> _files = []; private ulong _nextId;
-    private RuntimeFileServiceHost(RuntimeKernel kernel, ProcessHandle service, EndpointSessionHandle session, ServiceEndpointDescriptor serviceDescriptor) { _kernel = kernel; _service = service; _session = session; _serviceDescriptor = serviceDescriptor; }
+    private readonly RuntimeKernel _kernel; private readonly ProcessHandle _service; private readonly EndpointSessionHandle _session; private readonly ServiceEndpointDescriptor _serviceDescriptor; private readonly INativeSipCompletedEventSink? _trace; private readonly INativeSipDeterministicHook? _hook; private readonly Dictionary<FileObjectId, Entry> _files = []; private ulong _nextId;
+    private RuntimeFileServiceHost(RuntimeKernel kernel, ProcessHandle service, EndpointSessionHandle session, ServiceEndpointDescriptor serviceDescriptor, INativeSipCompletedEventSink? trace, INativeSipDeterministicHook? hook) { _kernel = kernel; _service = service; _session = session; _serviceDescriptor = serviceDescriptor; _trace = trace; _hook = hook; }
     public static KernelResult<RuntimeFileServiceHost> CreateForSession(RuntimeKernel kernel, ProcessHandle service, EndpointSessionHandle session)
+        => CreateForSession(kernel, service, session, trace: null, hook: null);
+    internal static KernelResult<RuntimeFileServiceHost> CreateForSession(RuntimeKernel kernel, ProcessHandle service, EndpointSessionHandle session, INativeSipCompletedEventSink? trace)
+        => CreateForSession(kernel, service, session, trace, hook: null);
+    internal static KernelResult<RuntimeFileServiceHost> CreateForSession(RuntimeKernel kernel, ProcessHandle service, EndpointSessionHandle session, INativeSipCompletedEventSink? trace, INativeSipDeterministicHook? hook)
     {
         var resolved = kernel.EndpointSessions.ResolveForService(session, service);
         if (!resolved.IsSuccess) return KernelResult<RuntimeFileServiceHost>.Fail(resolved.Error, resolved.Message!);
         var descriptor = kernel.Services.ResolveForProvider(service, IFileServiceProtocol.CreateDefinition().ContractName);
         if (!descriptor.IsSuccess) return KernelResult<RuntimeFileServiceHost>.Fail(descriptor.Error, descriptor.Message!);
-        var host = new RuntimeFileServiceHost(kernel, service, session, descriptor.Value!);
+        var host = new RuntimeFileServiceHost(kernel, service, session, descriptor.Value!, trace, hook);
         kernel.RegisterNativeServiceDrain(service, session, host.Drain);
         return KernelResult<RuntimeFileServiceHost>.Ok(host);
     }
-    public KernelResult ProcessNext() => NativeServiceDispatch.Dispatch(_kernel, _service, _session, Execute);
+    public KernelResult ProcessNext() => NativeServiceDispatch.Dispatch(_kernel, _service, _session, Execute, _trace, _hook);
     public KernelResult Drain()
     {
         foreach (var entry in _files.Values) { _ = _kernel.SealedObjects.Revoke(entry.Handle.Seal); var revoked = _kernel.RevokeCapability(entry.Capability); if (!revoked.IsSuccess && revoked.Error != KernelError.CapabilityRevoked) return revoked; }
         _files.Clear();
         return KernelResult.Ok();
     }
-    private KernelResult<object?> Execute(ProcessHandle caller, ChannelEnvelope envelope)
+    private KernelResult<object?> Execute(TrustedSipInvocationContext context, ChannelEnvelope envelope)
     {
         if (envelope.MessageId == IFileServiceProtocol.Message_OpenAsync && envelope.Payload is OpenFileRequest open)
-        {
-            if (string.IsNullOrWhiteSpace(open.Path) || open.Path.Length > 200) return KernelResult<object?>.Fail(KernelError.UnsupportedPayload, "File path is malformed for service-side namespace policy.");
-            var admission = _kernel.AdmitSessionCapabilityEffect(caller, _service, _session,
-                open.NamespaceCapability, ResourceKind.File, CapabilityResourceIds.FileNamespace, 1,
-                open.Create ? CapabilityOperation.Write : CapabilityOperation.Read);
-            if (!admission.IsSuccess) return KernelResult<object?>.Fail(admission.Error, admission.Message!);
-            using var admitted = admission.Value!;
-            if (_nextId == ulong.MaxValue) return KernelResult<object?>.Fail(KernelError.CapacityExhausted, "File object identity space is exhausted.");
-            var objectId = new FileObjectId(++_nextId);
-            var capability = _kernel.MintCapability(_kernel.Processes.Resolve(_service).Value!.DomainId, caller, ResourceKind.File, CapabilityResourceIds.FileObject(_session, objectId.Value), CapabilityRights.Read | CapabilityRights.Write | CapabilityRights.Configure);
-            if (!capability.IsSuccess) return KernelResult<object?>.Fail(capability.Error, capability.Message!);
-            var sealedObject = _kernel.SealedObjects.Seal<FileObjectSeal>(_serviceDescriptor, _service, caller, _session, 1, objectId.Value, capability.Value!.CapabilityId);
-            if (!sealedObject.IsSuccess) { _ = _kernel.RevokeCapability(capability.Value.CapabilityId); return KernelResult<object?>.Fail(sealedObject.Error, sealedObject.Message!); }
-            var handle = new FileObjectHandle(_session, objectId, new FileObjectGeneration(1), sealedObject.Value);
-            _files.Add(handle.ObjectId, new(caller, handle, capability.Value!.CapabilityId, open.Path));
-            return KernelResult<object?>.Ok(new FileObjectResponse(new FileObjectAuthority(handle, capability.Value.CapabilityId)));
-        }
+            return FromGenerated(IFileServiceGeneratedOperationSentries.InvokeRuntime_OpenAsync(this, in context, open));
+        var caller = context.Caller;
         if (envelope.MessageId == IFileServiceProtocol.Message_OpenV2Async && envelope.Payload is OpenFileRequestV2 openV2)
         {
             if (string.IsNullOrWhiteSpace(openV2.Path) || openV2.Path.Length > 200) return KernelResult<object?>.Fail(KernelError.UnsupportedPayload, "File path is malformed for service-side namespace policy.");
@@ -247,6 +290,8 @@ public sealed class RuntimeFileServiceHost
                 openV2.Create ? CapabilityOperation.Write : CapabilityOperation.Read);
             if (!admission.IsSuccess) return KernelResult<object?>.Fail(admission.Error, admission.Message!);
             using var admitted = admission.Value!;
+            _trace?.Record(NativeSipCompletedEvent.CapabilityAdmitted);
+            _trace?.Record(NativeSipCompletedEvent.ImplementationEntered);
             if (_nextId == ulong.MaxValue) return KernelResult<object?>.Fail(KernelError.CapacityExhausted, "File object identity space is exhausted.");
             var objectId = new FileObjectId(++_nextId);
             var capability = _kernel.MintCapabilityV2(_kernel.Processes.Resolve(_service).Value!.DomainId,
@@ -259,12 +304,63 @@ public sealed class RuntimeFileServiceHost
             if (!sealedObject.IsSuccess) { _ = _kernel.RevokeCapability(v1.Value); return KernelResult<object?>.Fail(sealedObject.Error, sealedObject.Message!); }
             var handle = new FileObjectHandle(_session, objectId, new FileObjectGeneration(1), sealedObject.Value);
             _files.Add(handle.ObjectId, new(caller, handle, v1.Value, openV2.Path));
+            _trace?.Record(NativeSipCompletedEvent.ImplementationExited);
             return KernelResult<object?>.Ok(new FileObjectResponse(new FileObjectAuthority(handle, v1.Value)));
         }
         if (envelope.Payload is FileCommand command) return Command(caller, envelope.MessageId, command, null);
         if (envelope.Payload is FileWriteRequest write) return Command(caller, envelope.MessageId, new(write.File, write.Capability), write.Data);
         return KernelResult<object?>.Fail(KernelError.UnsupportedPayload, "FileService received an unknown message or payload shape.");
     }
+
+    GeneratedSipSentryResult<FileObjectResponse> IIFileServiceGeneratedSentryTarget_OpenAsync.Sentry_OpenAsync(
+        in TrustedSipInvocationContext context,
+        OpenFileRequest request)
+    {
+        var result = Open(context, request);
+        return result.IsSuccess
+            ? GeneratedSipSentryResult<FileObjectResponse>.Success(result.Value!)
+            : GeneratedSipSentryResult<FileObjectResponse>.Failure((int)result.Error, result.Message!);
+    }
+
+    private KernelResult<FileObjectResponse> Open(TrustedSipInvocationContext context, OpenFileRequest open)
+    {
+        if (string.IsNullOrWhiteSpace(open.Path) || open.Path.Length > 200)
+            return KernelResult<FileObjectResponse>.Fail(KernelError.UnsupportedPayload, "File path is malformed for service-side namespace policy.");
+        _hook?.At(NativeSipDeterministicPoint.BeforeCapabilityCommit);
+        var admission = _kernel.AdmitSessionCapabilityEffect(context.Caller, context.Service, context.Session,
+            open.NamespaceCapability, ResourceKind.File, CapabilityResourceIds.FileNamespace, 1,
+            open.Create ? CapabilityOperation.Write : CapabilityOperation.Read);
+        if (!admission.IsSuccess) return KernelResult<FileObjectResponse>.Fail(admission.Error, admission.Message!);
+        using var admitted = admission.Value!;
+        _trace?.Record(NativeSipCompletedEvent.CapabilityAdmitted);
+        _hook?.At(NativeSipDeterministicPoint.AfterCapabilityCommit);
+        _hook?.At(NativeSipDeterministicPoint.BeforeImplementationEntry);
+        _trace?.Record(NativeSipCompletedEvent.ImplementationEntered);
+        if (_nextId == ulong.MaxValue)
+            return KernelResult<FileObjectResponse>.Fail(KernelError.CapacityExhausted, "File object identity space is exhausted.");
+        var objectId = new FileObjectId(++_nextId);
+        var capability = _kernel.MintCapability(_kernel.Processes.Resolve(context.Service).Value!.DomainId, context.Caller,
+            ResourceKind.File, CapabilityResourceIds.FileObject(context.Session, objectId.Value),
+            CapabilityRights.Read | CapabilityRights.Write | CapabilityRights.Configure);
+        if (!capability.IsSuccess) return KernelResult<FileObjectResponse>.Fail(capability.Error, capability.Message!);
+        var sealedObject = _kernel.SealedObjects.Seal<FileObjectSeal>(_serviceDescriptor, context.Service, context.Caller,
+            context.Session, 1, objectId.Value, capability.Value!.CapabilityId);
+        if (!sealedObject.IsSuccess)
+        {
+            _ = _kernel.RevokeCapability(capability.Value.CapabilityId);
+            return KernelResult<FileObjectResponse>.Fail(sealedObject.Error, sealedObject.Message!);
+        }
+        var handle = new FileObjectHandle(context.Session, objectId, new FileObjectGeneration(1), sealedObject.Value);
+        _files.Add(handle.ObjectId, new(context.Caller, handle, capability.Value!.CapabilityId, open.Path));
+        _trace?.Record(NativeSipCompletedEvent.ImplementationExited);
+        _hook?.At(NativeSipDeterministicPoint.AfterImplementationExit);
+        return KernelResult<FileObjectResponse>.Ok(new(new(handle, capability.Value.CapabilityId)));
+    }
+
+    private static KernelResult<object?> FromGenerated<T>(GeneratedSipSentryResult<T> result) =>
+        result.IsSuccess
+            ? KernelResult<object?>.Ok(result.Value)
+            : KernelResult<object?>.Fail((KernelError)result.ErrorCode, result.Message!);
     private KernelResult<object?> Command(ProcessHandle caller, uint message, FileCommand command, BoundedBytes? bytes)
     {
         var rights = message == IFileServiceProtocol.Message_ReadAsync ? CapabilityRights.Read : message == IFileServiceProtocol.Message_WriteAsync ? CapabilityRights.Write : CapabilityRights.Configure;
@@ -278,11 +374,13 @@ public sealed class RuntimeFileServiceHost
             CapabilityResourceIds.FileObject(_session, objectId.Value), 1, operation);
         if (!admission.IsSuccess) return KernelResult<object?>.Fail(admission.Error, admission.Message!);
         using var admitted = admission.Value!;
+        _trace?.Record(NativeSipCompletedEvent.CapabilityAdmitted);
         var finalSeal = _kernel.SealedObjects.Revalidate(objectPin, _serviceDescriptor, _service);
         if (!finalSeal.IsSuccess) return KernelResult<object?>.Fail(finalSeal.Error, finalSeal.Message!);
-        if (message == IFileServiceProtocol.Message_WriteAsync) { entry.Data = bytes!.Value.ToArray(); return KernelResult<object?>.Ok(null); }
-        if (message == IFileServiceProtocol.Message_ReadAsync) return KernelResult<object?>.Ok(new FileReadResponse(new BoundedBytes(entry.Data)));
-        if (message == IFileServiceProtocol.Message_CloseAsync) { var closing = _kernel.SealedObjects.BeginClose(objectPin); if (!closing.IsSuccess) return KernelResult<object?>.Fail(closing.Error, closing.Message!); _files.Remove(objectId); _ = _kernel.RevokeCapability(entry.Capability); return KernelResult<object?>.Ok(null); }
+        _trace?.Record(NativeSipCompletedEvent.ImplementationEntered);
+        if (message == IFileServiceProtocol.Message_WriteAsync) { entry.Data = bytes!.Value.ToArray(); _trace?.Record(NativeSipCompletedEvent.ImplementationExited); return KernelResult<object?>.Ok(null); }
+        if (message == IFileServiceProtocol.Message_ReadAsync) { var response = new FileReadResponse(new BoundedBytes(entry.Data)); _trace?.Record(NativeSipCompletedEvent.ImplementationExited); return KernelResult<object?>.Ok(response); }
+        if (message == IFileServiceProtocol.Message_CloseAsync) { var closing = _kernel.SealedObjects.BeginClose(objectPin); if (!closing.IsSuccess) return KernelResult<object?>.Fail(closing.Error, closing.Message!); _files.Remove(objectId); _ = _kernel.RevokeCapability(entry.Capability); _trace?.Record(NativeSipCompletedEvent.ImplementationExited); return KernelResult<object?>.Ok(null); }
         return KernelResult<object?>.Fail(KernelError.UnsupportedPayload, "Unknown file operation.");
     }
 }
@@ -317,8 +415,9 @@ public sealed class RuntimeNetworkServiceHost
         }
         return KernelResult.Ok();
     }
-    private KernelResult<object?> Execute(ProcessHandle caller, ChannelEnvelope envelope)
+    private KernelResult<object?> Execute(TrustedSipInvocationContext context, ChannelEnvelope envelope)
     {
+        var caller = context.Caller;
         if (envelope.MessageId == INetworkServiceProtocol.Message_OpenAsync && envelope.Payload is OpenSocketRequest open)
         {
             var openAdmission = _kernel.AdmitSessionCapabilityEffect(caller, _service, _session,

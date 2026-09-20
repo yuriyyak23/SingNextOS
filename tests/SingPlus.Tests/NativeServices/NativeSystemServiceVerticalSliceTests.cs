@@ -1,17 +1,242 @@
 using System.Xml.Linq;
 using System.Security.Cryptography;
+using System.Reflection;
 using SingPlus.Contracts;
 using SingPlus.Runtime;
 using SingPlus.Sip;
 using SingPlus.Sip.FileSystem;
 using SingPlus.Sip.Networking;
 using SingPlus.Sip.Process;
+using SingPlus.Sip.Sdk;
 using SingPlus.System;
 
 namespace SingPlus.Tests.NativeServices;
 
 public sealed class NativeSystemServiceVerticalSliceTests
 {
+    [Fact]
+    public void GeneratedSentryAbiIsOpaqueOutsideFriendTcbAssemblies()
+    {
+        Assert.Empty(typeof(TrustedSipInvocationContext).GetConstructors(BindingFlags.Instance | BindingFlags.Public));
+        Assert.Empty(typeof(TrustedSipInvocationContext).GetProperties(BindingFlags.Instance | BindingFlags.Public));
+        Assert.Empty(typeof(GeneratedSipSentryResult<FileObjectResponse>).GetConstructors(BindingFlags.Instance | BindingFlags.Public));
+        Assert.Empty(typeof(GeneratedSipSentryResult<FileObjectResponse>).GetProperties(BindingFlags.Instance | BindingFlags.Public));
+        Assert.Empty(typeof(GeneratedSipSentryResult<FileObjectResponse>).GetFields(BindingFlags.Instance | BindingFlags.Public));
+    }
+
+    [Fact]
+    public void GeneratedFileSentryPossessionDoesNotBypassLiveSessionAuthority()
+    {
+        var (kernel, service, caller, capability, session, _) = FileScenario();
+        var trace = new CompletedEventSink();
+        var host = RuntimeFileServiceHost.CreateForSession(kernel, service, session, trace).Value!;
+        var staleContext = new TrustedSipInvocationContext(
+            caller with { Generation = caller.Generation + 1 },
+            service,
+            session,
+            default);
+
+        var outcome = IFileServiceGeneratedOperationSentries.InvokeRuntime_OpenAsync(
+            host,
+            in staleContext,
+            new OpenFileRequest(capability, "/must-not-open", true));
+
+        Assert.False(outcome.IsSuccess);
+        Assert.Equal((int)KernelError.StaleHandle, outcome.ErrorCode);
+        Assert.DoesNotContain(NativeSipCompletedEvent.CapabilityAdmitted, trace.Events);
+        Assert.DoesNotContain(NativeSipCompletedEvent.ImplementationEntered, trace.Events);
+        Assert.Contains(typeof(IIFileServiceGeneratedSentryTarget_OpenAsync), typeof(RuntimeFileServiceHost).GetInterfaces());
+    }
+
+    [Fact]
+    public async Task OrdinaryFileSipTraceRecordsOnlyCompletedOwnerLinearizations()
+    {
+        var (kernel, service, caller, capability, session, _) = FileScenario();
+        var trace = new CompletedEventSink();
+        var host = RuntimeFileServiceHost.CreateForSession(kernel, service, session, trace).Value!;
+        var client = IFileServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session));
+
+        var pending = client.OpenAsync(new(capability, "/trace", true)).AsTask();
+        Assert.True(host.ProcessNext().IsSuccess);
+        _ = await pending;
+
+        Assert.Equal(
+            [
+                NativeSipCompletedEvent.RequestReceived,
+                NativeSipCompletedEvent.InvocationAccepted,
+                NativeSipCompletedEvent.SessionResolved,
+                NativeSipCompletedEvent.CapabilityAdmitted,
+                NativeSipCompletedEvent.ImplementationEntered,
+                NativeSipCompletedEvent.ImplementationExited,
+                NativeSipCompletedEvent.ResponsePublished,
+            ],
+            trace.Events);
+    }
+
+    [Fact]
+    public async Task RevokedFileAuthorityNeverProducesAdmissionOrImplementationTrace()
+    {
+        var (kernel, service, caller, capability, session, _) = FileScenario();
+        var trace = new CompletedEventSink();
+        var host = RuntimeFileServiceHost.CreateForSession(kernel, service, session, trace).Value!;
+        var client = IFileServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session));
+        var pending = client.OpenAsync(new(capability, "/revoked-trace", true)).AsTask();
+
+        Assert.True(kernel.RevokeCapability(capability).IsSuccess);
+        Assert.Equal(KernelError.CapabilityRevoked, host.ProcessNext().Error);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending);
+
+        Assert.Equal(
+            [
+                NativeSipCompletedEvent.RequestReceived,
+                NativeSipCompletedEvent.InvocationAccepted,
+                NativeSipCompletedEvent.SessionResolved,
+                NativeSipCompletedEvent.ResponseCancelled,
+            ],
+            trace.Events);
+        Assert.DoesNotContain(NativeSipCompletedEvent.CapabilityAdmitted, trace.Events);
+        Assert.DoesNotContain(NativeSipCompletedEvent.ImplementationEntered, trace.Events);
+    }
+
+    [Fact]
+    public async Task MalformedGeneratedFileProjectionNeverReachesAdmissionOrImplementation()
+    {
+        var (kernel, service, caller, capability, session, _) = FileScenario();
+        var trace = new CompletedEventSink();
+        var host = RuntimeFileServiceHost.CreateForSession(kernel, service, session, trace).Value!;
+        var client = IFileServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session));
+        var pending = client.OpenAsync(new(capability, " ", true)).AsTask();
+
+        Assert.Equal(KernelError.UnsupportedPayload, host.ProcessNext().Error);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending);
+        Assert.DoesNotContain(NativeSipCompletedEvent.CapabilityAdmitted, trace.Events);
+        Assert.DoesNotContain(NativeSipCompletedEvent.ImplementationEntered, trace.Events);
+        Assert.Equal(NativeSipCompletedEvent.ResponseCancelled, trace.Events[^1]);
+    }
+
+    [Fact]
+    public async Task CancellationBeforeGeneratedFileSentryCommitNeverEntersSentryTarget()
+    {
+        var (kernel, service, caller, capability, session, _) = FileScenario();
+        var trace = new CompletedEventSink();
+        var host = RuntimeFileServiceHost.CreateForSession(kernel, service, session, trace).Value!;
+        using var cancellation = new CancellationTokenSource();
+        var client = IFileServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session, cancellation.Token));
+        var pending = client.OpenAsync(new(capability, "/cancelled-before-commit", true)).AsTask();
+        cancellation.Cancel();
+
+        Assert.True(host.ProcessNext().IsSuccess);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending);
+        Assert.Equal(
+            [
+                NativeSipCompletedEvent.RequestReceived,
+                NativeSipCompletedEvent.CancellationCommitted,
+                NativeSipCompletedEvent.ResponseCancelled,
+            ],
+            trace.Events);
+        Assert.DoesNotContain(NativeSipCompletedEvent.InvocationAccepted, trace.Events);
+        Assert.DoesNotContain(NativeSipCompletedEvent.ImplementationEntered, trace.Events);
+    }
+
+    [Fact]
+    public async Task SessionCloseAfterExactResolutionPreventsGeneratedSentryAdmission()
+    {
+        var (kernel, service, caller, capability, session, _) = FileScenario();
+        var trace = new CompletedEventSink();
+        var hook = new PointHook(NativeSipDeterministicPoint.AfterSessionResolved, () =>
+            Assert.True(kernel.CloseSession(caller, session).IsSuccess));
+        var host = RuntimeFileServiceHost.CreateForSession(kernel, service, session, trace, hook).Value!;
+        var pending = IFileServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session))
+            .OpenAsync(new(capability, "/closed-after-resolution", true)).AsTask();
+
+        var processed = host.ProcessNext();
+        Assert.False(processed.IsSuccess);
+        Assert.Equal(KernelError.SessionClosed, processed.Error);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending);
+        Assert.True(hook.Fired);
+        Assert.DoesNotContain(NativeSipCompletedEvent.CapabilityAdmitted, trace.Events);
+        Assert.DoesNotContain(NativeSipCompletedEvent.ImplementationEntered, trace.Events);
+    }
+
+    [Fact]
+    public async Task ServiceFaultAfterSessionResolutionPreventsGeneratedSentryAdmission()
+    {
+        var (kernel, service, caller, capability, session, _) = FileScenario();
+        var trace = new CompletedEventSink();
+        var hook = new PointHook(NativeSipDeterministicPoint.AfterSessionResolved, () =>
+            Assert.True(kernel.FaultProcess(service).IsSuccess));
+        var host = RuntimeFileServiceHost.CreateForSession(kernel, service, session, trace, hook).Value!;
+        var pending = IFileServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session))
+            .OpenAsync(new(capability, "/faulted-service", true)).AsTask();
+
+        var processed = host.ProcessNext();
+        Assert.False(processed.IsSuccess);
+        Assert.Equal(KernelError.SessionClosed, processed.Error);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending);
+        Assert.True(hook.Fired);
+        Assert.DoesNotContain(NativeSipCompletedEvent.CapabilityAdmitted, trace.Events);
+        Assert.DoesNotContain(NativeSipCompletedEvent.ImplementationEntered, trace.Events);
+    }
+
+    [Fact]
+    public async Task RevokeImmediatelyBeforeCapabilityCommitFailsClosed()
+    {
+        var (kernel, service, caller, capability, session, _) = FileScenario();
+        var trace = new CompletedEventSink();
+        var hook = new PointHook(NativeSipDeterministicPoint.BeforeCapabilityCommit, () =>
+            Assert.True(kernel.RevokeCapability(capability).IsSuccess));
+        var host = RuntimeFileServiceHost.CreateForSession(kernel, service, session, trace, hook).Value!;
+        var pending = IFileServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session))
+            .OpenAsync(new(capability, "/revoked-at-commit", true)).AsTask();
+
+        Assert.Equal(KernelError.CapabilityRevoked, host.ProcessNext().Error);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending);
+        Assert.True(hook.Fired);
+        Assert.DoesNotContain(NativeSipCompletedEvent.CapabilityAdmitted, trace.Events);
+        Assert.DoesNotContain(NativeSipCompletedEvent.ImplementationEntered, trace.Events);
+    }
+
+    [Fact]
+    public async Task RevokeAfterCapabilityCommitPreservesAdmittedOrdinaryOutcomeAndReleasesLease()
+    {
+        var (kernel, service, caller, capability, session, _) = FileScenario();
+        var trace = new CompletedEventSink();
+        var hook = new PointHook(NativeSipDeterministicPoint.AfterCapabilityCommit, () =>
+            Assert.True(kernel.RevokeCapability(capability).IsSuccess));
+        var host = RuntimeFileServiceHost.CreateForSession(kernel, service, session, trace, hook).Value!;
+        var pending = IFileServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session))
+            .OpenAsync(new(capability, "/revoked-after-commit", true)).AsTask();
+
+        Assert.True(host.ProcessNext().IsSuccess);
+        _ = await pending;
+        Assert.True(hook.Fired);
+        Assert.Contains(NativeSipCompletedEvent.CapabilityAdmitted, trace.Events);
+        Assert.Contains(NativeSipCompletedEvent.ImplementationEntered, trace.Events);
+        Assert.Contains(NativeSipCompletedEvent.ResponsePublished, trace.Events);
+        Assert.Equal(0, kernel.CapabilityAuthority.ActiveOperationLeaseCount);
+    }
+
+    [Fact]
+    public async Task SessionCloseBeforePublicationCannotPublishAndDrainsServiceState()
+    {
+        var (kernel, service, caller, capability, session, _) = FileScenario();
+        var trace = new CompletedEventSink();
+        var hook = new PointHook(NativeSipDeterministicPoint.BeforePublication, () =>
+            Assert.True(kernel.CloseSession(caller, session).IsSuccess));
+        var host = RuntimeFileServiceHost.CreateForSession(kernel, service, session, trace, hook).Value!;
+        var pending = IFileServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session))
+            .OpenAsync(new(capability, "/closed-before-publication", true)).AsTask();
+
+        var processed = host.ProcessNext();
+        Assert.False(processed.IsSuccess);
+        Assert.Equal(KernelError.SessionClosed, processed.Error);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending);
+        Assert.True(hook.Fired);
+        Assert.Contains(NativeSipCompletedEvent.ImplementationExited, trace.Events);
+        Assert.DoesNotContain(NativeSipCompletedEvent.ResponsePublished, trace.Events);
+        Assert.True(host.Drain().IsSuccess);
+    }
+
     [Fact]
     public async Task ProcessFacadeUsesGeneratedClientSessionAndExactChildAuthority()
     {
@@ -492,5 +717,23 @@ public sealed class NativeSystemServiceVerticalSliceTests
         public ResponseEnvelope InvokeOwnershipPair(uint messageId, object firstOwnershipPayload, object secondOwnershipPayload) => throw new NotSupportedException();
         public ValueTask<ResponseEnvelope> InvokeOwnershipPairAsync(uint messageId, object firstOwnershipPayload, object secondOwnershipPayload) => throw new NotSupportedException();
         public ValueTask<ResponseEnvelope> InvokeOwnershipPairAsync(uint messageId, object firstOwnershipPayload, object secondOwnershipPayload, CancellationToken cancellationToken) => throw new NotSupportedException();
+    }
+
+    private sealed class CompletedEventSink : INativeSipCompletedEventSink
+    {
+        internal List<NativeSipCompletedEvent> Events { get; } = [];
+        public void Record(NativeSipCompletedEvent completedEvent) => Events.Add(completedEvent);
+    }
+
+    private sealed class PointHook(NativeSipDeterministicPoint target, Action action) : INativeSipDeterministicHook
+    {
+        internal bool Fired { get; private set; }
+
+        public void At(NativeSipDeterministicPoint point)
+        {
+            if (Fired || point != target) return;
+            Fired = true;
+            action();
+        }
     }
 }

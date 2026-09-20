@@ -206,25 +206,10 @@ internal sealed class ResponseRegistry
         object? publishedPayload = payload;
         if (pending.Response.Payload.Kind == ResponsePayloadKind.Ownership)
         {
-            var owned = (ITransferableOwnedPayload)payload!;
-            if (!owned.IsValidForRuntime)
-                return KernelResult<ResponseEnvelope>.Fail(KernelError.InvalidRegionState, "Ownership response requires a valid owned payload.");
-
-            var oldHandle = owned.Handle;
-            var source = new RegionOwner(responder.DomainId, responder.Generation);
-            var target = new RegionOwner(requester.DomainId, requester.Generation);
-            var regionValidation = _regions.Validate(oldHandle, source);
-            if (!regionValidation.IsSuccess)
-                return KernelResult<ResponseEnvelope>.Fail(regionValidation.Error, regionValidation.Message!);
-
-            var transfer = _regions.Transfer(oldHandle, source, target);
-            if (!transfer.IsSuccess)
-                return KernelResult<ResponseEnvelope>.Fail(transfer.Error, transfer.Message!);
-
-            publishedPayload = owned.TransferForRuntime(transfer.Value);
-            _regions.ReplacePayload(oldHandle, transfer.Value, (ITransferableOwnedPayload)publishedPayload);
-            responder.RemoveRegion(oldHandle);
-            requester.AddRegion(transfer.Value);
+            var transferred = TransferOwnership(responder, requester, (ITransferableOwnedPayload)payload!);
+            if (!transferred.IsSuccess)
+                return KernelResult<ResponseEnvelope>.Fail(transferred.Error, transferred.Message!);
+            publishedPayload = transferred.Value;
         }
 
         var envelope = new ResponseEnvelope(
@@ -234,6 +219,61 @@ internal sealed class ResponseRegistry
             publishedPayload);
         Complete(channel, pending, envelope);
         return KernelResult<ResponseEnvelope>.Ok(envelope);
+    }
+
+    // The same authoritative ownership projection used by ordinary response
+    // publication, without allocating a response envelope. Invocation settlement
+    // remains the responsibility of its existing owner.
+    internal KernelResult<OwnedBuffer<T>> TransferInlineOwnership<T>(
+        SingProcess responder,
+        SingProcess requester,
+        ChannelEndpointHandle endpoint,
+        uint messageId,
+        OwnedBuffer<T> payload) where T : unmanaged
+    {
+        ArgumentNullException.ThrowIfNull(payload);
+        if (!_channels.TryGetValue(endpoint.ChannelId, out var channel))
+            return KernelResult<OwnedBuffer<T>>.Fail(KernelError.ResponseProtocolUnavailable, "Inline ownership response requires registered response metadata.");
+        if (!channel.Protocol.TryGetMessage(messageId, out var response))
+            return KernelResult<OwnedBuffer<T>>.Fail(KernelError.ResponseProtocolMismatch, $"Response metadata for message {messageId} is missing.");
+        var responderHandle = new ProcessHandle(responder.ProcessId, responder.Generation);
+        var requesterHandle = new ProcessHandle(requester.ProcessId, requester.Generation);
+        var expectedResponder = endpoint.EndpointId.Value == 1 ? channel.LeftOwner : channel.RightOwner;
+        var expectedRequester = endpoint.EndpointId.Value == 1 ? channel.RightOwner : channel.LeftOwner;
+        if (responderHandle != expectedResponder || requesterHandle != expectedRequester)
+            return KernelResult<OwnedBuffer<T>>.Fail(KernelError.WrongEndpointOwner, "Inline ownership response parties do not match the channel.");
+        var shape = ValidatePayload(response.Payload, payload);
+        if (!shape.IsSuccess)
+            return KernelResult<OwnedBuffer<T>>.Fail(shape.Error, shape.Message!);
+        if (response.Payload.Kind != ResponsePayloadKind.Ownership)
+            return KernelResult<OwnedBuffer<T>>.Fail(KernelError.UnsupportedPayload, "Operation does not declare an ownership response.");
+        var transferred = TransferOwnership(responder, requester, payload);
+        return transferred.IsSuccess
+            ? KernelResult<OwnedBuffer<T>>.Ok((OwnedBuffer<T>)transferred.Value!)
+            : KernelResult<OwnedBuffer<T>>.Fail(transferred.Error, transferred.Message!);
+    }
+
+    private KernelResult<object> TransferOwnership(
+        SingProcess responder,
+        SingProcess requester,
+        ITransferableOwnedPayload owned)
+    {
+        if (!owned.IsValidForRuntime)
+            return KernelResult<object>.Fail(KernelError.InvalidRegionState, "Ownership response requires a valid owned payload.");
+        var oldHandle = owned.Handle;
+        var source = new RegionOwner(responder.DomainId, responder.Generation);
+        var target = new RegionOwner(requester.DomainId, requester.Generation);
+        var regionValidation = _regions.Validate(oldHandle, source);
+        if (!regionValidation.IsSuccess)
+            return KernelResult<object>.Fail(regionValidation.Error, regionValidation.Message!);
+        var transfer = _regions.Transfer(oldHandle, source, target);
+        if (!transfer.IsSuccess)
+            return KernelResult<object>.Fail(transfer.Error, transfer.Message!);
+        var moved = owned.TransferForRuntime(transfer.Value);
+        _regions.ReplacePayload(oldHandle, transfer.Value, (ITransferableOwnedPayload)moved);
+        responder.RemoveRegion(oldHandle);
+        requester.AddRegion(transfer.Value);
+        return KernelResult<object>.Ok(moved);
     }
 
     internal KernelResult<ResponseEnvelope> Cancel(

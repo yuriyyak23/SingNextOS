@@ -45,19 +45,23 @@ public interface IConsoleService
 
     [Message(6), Transition("Ready", "Busy"), CancellationTransition("Busy", "Ready")]
     void Ping();
+
+    [Message(7), Transition("Ready", "Ready")]
+    void Read([Borrows] OwnedBuffer<byte> data);
 }
 """;
 
     [Fact]
     [Trait("Category", "Generators")]
     [Trait("Category", "Determinism")]
-    public void GeneratorProducesFourDeterministicArtifactsWithCompleteRequestShapes()
+    public void GeneratorProducesFiveDeterministicArtifactsWithCompleteRequestShapes()
     {
         var first = RunValid(ContractSource);
         var second = RunValid(ContractSource);
         Assert.Equal(first.Keys.OrderBy(x => x), second.Keys.OrderBy(x => x));
         foreach (var key in first.Keys) Assert.Equal(first[key], second[key]);
         Assert.Contains(first.Keys, x => x.EndsWith(".Protocol.g.cs", StringComparison.Ordinal));
+        Assert.Contains(first.Keys, x => x.EndsWith(".Sentries.g.cs", StringComparison.Ordinal));
         Assert.Contains(first.Keys, x => x.EndsWith(".Dispatcher.g.cs", StringComparison.Ordinal));
         Assert.Contains(first.Keys, x => x.EndsWith(".Manifest.g.cs", StringComparison.Ordinal));
         Assert.Contains(first.Keys, x => x.EndsWith(".Capabilities.g.cs", StringComparison.Ordinal));
@@ -74,6 +78,35 @@ public interface IConsoleService
         Assert.Contains(first.Values, text => text.Contains("cancel=6|Busy|Ready", StringComparison.Ordinal));
         Assert.Contains(first.Values, text => text.Contains("ProtocolCancellationTransitionV1", StringComparison.Ordinal));
         Assert.Contains(first.Values, text => text.Contains("ContractDigest", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    [Trait("Category", "Generators")]
+    [Trait("Category", "Security")]
+    public void DispatcherCanEnterImplementationOnlyThroughTypedGeneratedOperationSentry()
+    {
+        var generated = RunValid(ContractSource);
+        var dispatcher = Assert.Single(generated, item => item.Key.EndsWith(".Dispatcher.g.cs", StringComparison.Ordinal)).Value;
+        var sentries = Assert.Single(generated, item => item.Key.EndsWith(".Sentries.g.cs", StringComparison.Ordinal)).Value;
+
+        Assert.Contains("GeneratedOperationSentries.Invoke_Write(_implementation, @data)", dispatcher, StringComparison.Ordinal);
+        Assert.DoesNotContain("_implementation.@", dispatcher, StringComparison.Ordinal);
+        Assert.DoesNotContain("System.Reflection", dispatcher, StringComparison.Ordinal);
+        Assert.DoesNotContain("System.Delegate", dispatcher, StringComparison.Ordinal);
+        Assert.Contains("internal interface IIConsoleServiceGeneratedSentryTarget_Write", sentries, StringComparison.Ordinal);
+        Assert.Contains("GeneratedSipSentryResult<global::SingPlus.Sip.Sdk.GeneratedSipUnit> Sentry_Write(in global::SingPlus.Sip.Sdk.TrustedSipInvocationContext context, global::SingPlus.Sip.OwnedBuffer<byte> @data)", sentries, StringComparison.Ordinal);
+        Assert.Contains("InvokeRuntime_Write(IIConsoleServiceGeneratedSentryTarget_Write target, in global::SingPlus.Sip.Sdk.TrustedSipInvocationContext context, global::SingPlus.Sip.OwnedBuffer<byte> @data)", sentries, StringComparison.Ordinal);
+        Assert.Contains("internal static void Invoke_Write(global::GeneratedTest.IConsoleService implementation", sentries, StringComparison.Ordinal);
+        Assert.Contains("=> implementation.@Write(@data);", sentries, StringComparison.Ordinal);
+        Assert.Contains("GeneratedSipSentryResult<global::SingPlus.Sip.Sdk.GeneratedSipUnit> Sentry_Read(in global::SingPlus.Sip.Sdk.TrustedSipInvocationContext context, global::SingPlus.Sip.BorrowLease<byte> @data)", sentries, StringComparison.Ordinal);
+        Assert.Contains("InvokeRuntime_Read(IIConsoleServiceGeneratedSentryTarget_Read target, in global::SingPlus.Sip.Sdk.TrustedSipInvocationContext context, global::SingPlus.Sip.BorrowLease<byte> @data)", sentries, StringComparison.Ordinal);
+        Assert.Contains("internal static void Invoke_Read(global::GeneratedTest.IConsoleService implementation, global::SingPlus.Sip.OwnedBuffer<byte> @data)", sentries, StringComparison.Ordinal);
+        Assert.DoesNotContain("GeneratedSentryTarget_Read\n{\n    global::SingPlus.Sip.Sdk.GeneratedSipSentryResult<global::SingPlus.Sip.Sdk.GeneratedSipUnit> Sentry_Read(in global::SingPlus.Sip.Sdk.TrustedSipInvocationContext context, global::SingPlus.Sip.OwnedBuffer", sentries, StringComparison.Ordinal);
+        Assert.Contains("public const string Thunk_Write", sentries, StringComparison.Ordinal);
+        Assert.Contains("public const string Thunk_Write_Digest", sentries, StringComparison.Ordinal);
+        Assert.DoesNotContain("object implementation", sentries, StringComparison.Ordinal);
+        Assert.DoesNotContain("IServiceProvider", sentries, StringComparison.Ordinal);
+        Assert.DoesNotContain("System.Reflection", sentries, StringComparison.Ordinal);
     }
 
     [Theory]

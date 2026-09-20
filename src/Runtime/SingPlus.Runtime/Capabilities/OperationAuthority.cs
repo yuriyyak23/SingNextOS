@@ -48,12 +48,14 @@ internal readonly record struct EffectAdmissionAttemptId(ulong Value);
 
 internal sealed class EffectAdmissionLease : IDisposable
 {
+    private RuntimeKernel? _runtime;
     private OperationAuthorityLease? _capability;
     private EndpointSessionPin? _session;
 
-    internal EffectAdmissionLease(EffectAdmissionAttemptId attempt, OperationAuthorityLease capability,
+    internal EffectAdmissionLease(RuntimeKernel runtime, EffectAdmissionAttemptId attempt, OperationAuthorityLease capability,
         EndpointSessionPin session)
     {
+        _runtime = runtime;
         Attempt = attempt;
         _capability = capability;
         _session = session;
@@ -65,8 +67,9 @@ internal sealed class EffectAdmissionLease : IDisposable
 
     public void Dispose()
     {
-        // Reverse acquisition order: capability lease, then session pin.
-        Interlocked.Exchange(ref _capability, null)?.Dispose();
-        Interlocked.Exchange(ref _session, null)?.Dispose();
+        var runtime = Interlocked.Exchange(ref _runtime, null);
+        var capability = Interlocked.Exchange(ref _capability, null);
+        var session = Interlocked.Exchange(ref _session, null);
+        runtime?.ReleaseEffectAdmissionResources(capability, session);
     }
 }

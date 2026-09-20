@@ -15,6 +15,7 @@ internal sealed class EndpointSessionRegistry
         public required DateTimeOffset? ExpiresAt { get; init; }
         public int ActivePins { get; set; }
         public bool CloseRequested { get; set; }
+        public bool CloseCleanupClaimed { get; set; }
         public ChannelEndpointHandle ServiceEndpoint => Channel with { EndpointId = new EndpointId(2) };
         public EndpointSessionState State { get; set; } = EndpointSessionState.Opening;
     }
@@ -172,6 +173,21 @@ internal sealed class EndpointSessionRegistry
     {
         lock (_gate) return _records.TryGetValue(handle.SessionId, out var record) && record.Handle == handle
             ? record.ActivePins : 0;
+    }
+
+    internal Record? ClaimClosedCleanup(EndpointSessionHandle handle)
+    {
+        lock (_gate)
+        {
+            if (!_records.TryGetValue(handle.SessionId, out var record) ||
+                record.Handle != handle ||
+                record.State != EndpointSessionState.Closed ||
+                !record.CloseRequested ||
+                record.CloseCleanupClaimed)
+                return null;
+            record.CloseCleanupClaimed = true;
+            return record;
+        }
     }
 }
 

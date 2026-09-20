@@ -2,10 +2,23 @@ using SingPlus.Contracts;
 
 namespace SingPlus.Runtime;
 
+internal enum EffectAdmissionQualificationPoint
+{
+    AfterSessionPin = 0,
+    AfterFinalSessionRevalidation,
+    AfterCapabilityCommit,
+}
+
+internal interface IEffectAdmissionQualificationHook
+{
+    void At(EffectAdmissionQualificationPoint point);
+}
+
 public sealed partial class RuntimeKernel
 {
     private readonly object _effectAdmissionIdentityGate = new();
     private ulong _nextEffectAdmissionAttemptId = 1;
+    internal IEffectAdmissionQualificationHook? EffectAdmissionQualificationHook { private get; set; }
 
     internal KernelResult<EffectAdmissionLease> AdmitSessionCapabilityEffect(
         ProcessHandle caller, ProcessHandle service, EndpointSessionHandle session,
@@ -35,21 +48,25 @@ public sealed partial class RuntimeKernel
         try
         {
             afterSessionPin?.Invoke();
+            EffectAdmissionQualificationHook?.At(EffectAdmissionQualificationPoint.AfterSessionPin);
+
+            // SessionPin is reversible preparation. Revalidate it before the
+            // consumptive capability commit so a losing close race cannot consume
+            // quota/one-shot authority for a stage that will never execute.
+            var finalSession = EndpointSessions.RevalidatePin(sessionPin.Value!);
+            if (!finalSession.IsSuccess)
+                return KernelResult<EffectAdmissionLease>.Fail(finalSession.Error, finalSession.Message!);
+            EffectAdmissionQualificationHook?.At(EffectAdmissionQualificationPoint.AfterFinalSessionRevalidation);
+
             var acquired = CapabilityAuthority.AcquireOperationAuthority(capability,
                 process.Value!.DomainId, caller.Generation, resourceKind, resourceId, resourceGeneration,
                 operation, session, quotaAmount, oneShot);
             if (!acquired.IsSuccess)
                 return KernelResult<EffectAdmissionLease>.Fail(acquired.Error, acquired.Message!);
             capabilityLease = acquired.Value!;
+            EffectAdmissionQualificationHook?.At(EffectAdmissionQualificationPoint.AfterCapabilityCommit);
 
-            // Reservation/revalidation commit point. The session pin prevents closure after
-            // this check; the exact capability lease is already admitted and follows its
-            // closed static revocation policy if revocation wins later.
-            var finalSession = EndpointSessions.RevalidatePin(sessionPin.Value!);
-            if (!finalSession.IsSuccess)
-                return KernelResult<EffectAdmissionLease>.Fail(finalSession.Error, finalSession.Message!);
-
-            var admitted = new EffectAdmissionLease(attempt, capabilityLease, sessionPin.Value!);
+            var admitted = new EffectAdmissionLease(this, attempt, capabilityLease, sessionPin.Value!);
             capabilityLease = null;
             sessionPin = default;
             return KernelResult<EffectAdmissionLease>.Ok(admitted);
@@ -58,7 +75,8 @@ public sealed partial class RuntimeKernel
         {
             // Reverse-order compensation for every partial preparation.
             capabilityLease?.Dispose();
-            sessionPin.Value?.Dispose();
+            if (sessionPin.Value is { } remainingPin)
+                FinalizeSessionPin(remainingPin, session);
         }
     }
 
@@ -74,5 +92,16 @@ public sealed partial class RuntimeKernel
             ? AdmitSessionCapabilityEffect(caller, service, session, id.Value, resourceKind,
                 resourceId, resourceGeneration, operation, quotaAmount, oneShot, afterSessionPin)
             : KernelResult<EffectAdmissionLease>.Fail(id.Error, id.Message!);
+    }
+
+    internal void ReleaseEffectAdmissionResources(
+        OperationAuthorityLease? capability,
+        EndpointSessionPin? session)
+    {
+        // Reverse acquisition order. Releasing the operation lease is lifecycle
+        // cleanup only; CapabilityAuthority does not refund quota or one-shot state.
+        capability?.Dispose();
+        if (session is not null)
+            FinalizeSessionPin(session, session.Handle);
     }
 }

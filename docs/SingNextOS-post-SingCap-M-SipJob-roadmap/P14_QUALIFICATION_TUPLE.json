@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "capturedUtcDate": "2026-09-20",
+  "singNextOsSourceSha": "52ccf45c05498a9143a599bb54499919a2cbcf8c",
+  "roadmapSnapshotSha": "0f152a5502c58546eb0458b4be3e7cbce6c5ef3e",
+  "hybridCpuSourceSha": null,
+  "hybridCpuSourceDisposition": "NotLocallyAvailableUnverified",
+  "dotNetSdkVersion": "11.0.100-rc.1.26425.128",
+  "runtimeVersion": "11.0.0-rc.1.26425.128",
+  "targetRuntimeMode": "JIT",
+  "nativeAotVersion": null,
+  "artifacts": {
+    "generatorSha256": "8AE4467E185DEAF75CF18550942DE840846D17AFE55E907B775777F92069E6C1",
+    "analyzerSha256": "9F6047A641F01BF0A7781F6ADEFC95E49C6E1FC537F16044961EACF277E1DD4F",
+    "admissionVerifierSha256": "97F9FAC306D06488101AEA33E9DE326B77AE950C7998A19A00C06104FDE82032",
+    "runtimeSha256": "A26A193FE557A7397C9DCEA80C74E52C2EBCC129A70E0511BEE2ACBA1CC5CF3B",
+    "sipSha256": "CED06C81F4A1BEFFCA0D407075065F7FE9C9AABD676B461FC884A2216701C6B8",
+    "contractsSha256": "92023D5BEB886B35E1A50FB083B4503A12DDF9FAC06C8D844A17F4D4B51A37EB",
+    "platformContractSha256": "D6E1F431B6CD89FF077FF9BE27E6ED814919FA72FDB472BB5F94DCDF8D2FCF66"
+  },
+  "admissionPolicyDigest": null,
+  "sipSchemaManifestDigest": null,
+  "thunkCatalogDigest": null,
+  "missingArtifactReason": "No production-enabled SipJob policy/schema/thunk manifest exists because every production gate remains OFF; test-only generated sentry/catalog evidence is recorded in phase evidence and is not a deployable manifest.",
+  "provider": {
+    "package": "HybridCPU.ExternalRuntime.Contracts",
+    "version": "1.14.0",
+    "contentHash": "wLH8suR5xnj9C0CmqKTvUBSp2fLQsnS18ELZbILGosnGU3KIRJTZykX6bfvL/IWNOFOzGmQVvKI3q7irmjeM/Q==",
+    "executionQualification": "Unclaimed"
+  },
+  "enabledFeatureGates": [],
+  "claimLevel": "MixedStaticAdmissionRuntimeOwnerPrimitiveAndQualifiedManagedTestOnly"
+}

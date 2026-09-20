@@ -16,12 +16,15 @@ internal sealed class EndpointSessionInvocationRegistry
         public bool InFlightCancellationAllowed { get; set; }
         public bool CancellationRequested { get; set; }
         public bool CancellationAccepted { get; set; }
+        public ResponsePublicationStatus? SettlementInProgress { get; set; }
         public ResponsePublicationStatus? TerminalStatus { get; set; }
     }
 
     private readonly Dictionary<(EndpointSessionId Session, EndpointSessionGeneration SessionGeneration, EndpointSessionInvocationId Invocation), Record> _records = [];
     private readonly object _gate = new();
     private readonly CancellationScopeAuthority _cancellationScopes;
+
+    internal Action? SettlementReservedHook { get; set; }
 
     internal EndpointSessionInvocationRegistry(CancellationScopeAuthority cancellationScopes) =>
         _cancellationScopes = cancellationScopes;
@@ -224,28 +227,15 @@ internal sealed class EndpointSessionInvocationRegistry
         Func<KernelResult<ResponseEnvelope>> publication)
     {
         ArgumentNullException.ThrowIfNull(publication);
-        lock (_gate)
-        {
-            var resolved = ResolveForService(handle, service);
-            if (!resolved.IsSuccess)
-                return KernelResult<ResponseEnvelope>.Fail(resolved.Error, resolved.Message!);
-            var record = resolved.Value!;
-            if (record.TerminalStatus is not null)
-                return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseNotPending, "Endpoint session invocation is already terminal.");
-            if (!record.Delivered)
-                return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseNotDelivered, "Endpoint session invocation has not been delivered to the service.");
-            if (record.CancellationAccepted)
-                return KernelResult<ResponseEnvelope>.Fail(KernelError.InvalidTransition, "The service accepted cancellation and must settle the invocation as Cancelled.");
+        var reservation = ReserveSettlement(
+            handle,
+            service,
+            ResponsePublicationStatus.Published,
+            requireCancellationAccepted: false);
+        if (!reservation.IsSuccess)
+            return KernelResult<ResponseEnvelope>.Fail(reservation.Error, reservation.Message!);
 
-            var result = publication();
-            if (result.IsSuccess)
-            {
-                record.TerminalStatus = ResponsePublicationStatus.Published;
-                if (record.CancellationRequested && record.CancellationScope is { } scope)
-                    _ = _cancellationScopes.RecordDisposition(record.Caller, scope, CancellationDisposition.CompletedBeforeCancellation);
-            }
-            return result;
-        }
+        return ExecuteSettlement(reservation.Value!, publication);
     }
 
     internal KernelResult<ResponseEnvelope> Cancel(
@@ -254,28 +244,115 @@ internal sealed class EndpointSessionInvocationRegistry
         Func<KernelResult<ResponseEnvelope>> cancellation)
     {
         ArgumentNullException.ThrowIfNull(cancellation);
+        var reservation = ReserveSettlement(
+            handle,
+            service,
+            ResponsePublicationStatus.Cancelled,
+            requireCancellationAccepted: null);
+        if (!reservation.IsSuccess)
+            return KernelResult<ResponseEnvelope>.Fail(reservation.Error, reservation.Message!);
+
+        return ExecuteSettlement(reservation.Value!, cancellation);
+    }
+
+    internal KernelResult CompleteInline(
+        EndpointSessionInvocationHandle handle,
+        ProcessHandle service,
+        bool succeeded)
+    {
+        var status = succeeded ? ResponsePublicationStatus.Published : ResponsePublicationStatus.Cancelled;
+        var reservation = ReserveSettlement(
+            handle,
+            service,
+            status,
+            requireCancellationAccepted: succeeded ? false : null);
+        if (!reservation.IsSuccess) return KernelResult.Fail(reservation.Error, reservation.Message!);
+
+        lock (_gate)
+        {
+            var record = reservation.Value!;
+            if (record.SettlementInProgress != status)
+                return KernelResult.Fail(KernelError.InvalidTransition, "Inline invocation settlement reservation was lost.");
+            record.SettlementInProgress = null;
+            record.TerminalStatus = status;
+            if (record.CancellationScope is { } scope)
+            {
+                var disposition = succeeded
+                    ? CancellationDisposition.CompletedBeforeCancellation
+                    : record.ServiceAccepted
+                        ? CancellationDisposition.ProviderEffectContained
+                        : CancellationDisposition.CancelledBeforeEffect;
+                if (!succeeded || record.CancellationRequested)
+                    _ = _cancellationScopes.RecordDisposition(record.Caller, scope, disposition);
+            }
+            return KernelResult.Ok();
+        }
+    }
+
+    private KernelResult<ResponseEnvelope> ExecuteSettlement(
+        Record reservation,
+        Func<KernelResult<ResponseEnvelope>> action)
+    {
+        try
+        {
+            SettlementReservedHook?.Invoke();
+            return CompleteSettlement(reservation, action());
+        }
+        catch
+        {
+            lock (_gate)
+                reservation.SettlementInProgress = null;
+            throw;
+        }
+    }
+
+    private KernelResult<Record> ReserveSettlement(
+        EndpointSessionInvocationHandle handle,
+        ProcessHandle service,
+        ResponsePublicationStatus status,
+        bool? requireCancellationAccepted)
+    {
         lock (_gate)
         {
             var resolved = ResolveForService(handle, service);
             if (!resolved.IsSuccess)
-                return KernelResult<ResponseEnvelope>.Fail(resolved.Error, resolved.Message!);
+                return KernelResult<Record>.Fail(resolved.Error, resolved.Message!);
             var record = resolved.Value!;
-            if (record.TerminalStatus is not null)
-                return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseNotPending, "Endpoint session invocation is already terminal.");
+            if (record.TerminalStatus is not null || record.SettlementInProgress is not null)
+                return KernelResult<Record>.Fail(KernelError.ResponseNotPending, "Endpoint session invocation is already terminal or settlement is in progress.");
             if (!record.Delivered)
-                return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseNotDelivered, "Endpoint session invocation has not been delivered to the service.");
+                return KernelResult<Record>.Fail(KernelError.ResponseNotDelivered, "Endpoint session invocation has not been delivered to the service.");
+            if (requireCancellationAccepted == false && record.CancellationAccepted)
+                return KernelResult<Record>.Fail(KernelError.InvalidTransition, "The service accepted cancellation and must settle the invocation as Cancelled.");
 
-            var result = cancellation();
+            record.SettlementInProgress = status;
+            return KernelResult<Record>.Ok(record);
+        }
+    }
+
+    private KernelResult<ResponseEnvelope> CompleteSettlement(
+        Record reservation,
+        KernelResult<ResponseEnvelope> result)
+    {
+        lock (_gate)
+        {
+            if (reservation.SettlementInProgress is not { } status)
+                throw new InvalidOperationException("Endpoint session invocation settlement reservation was lost.");
+
+            reservation.SettlementInProgress = null;
             if (result.IsSuccess)
             {
-                record.TerminalStatus = ResponsePublicationStatus.Cancelled;
-                if (record.CancellationScope is { } scope)
-                    _ = _cancellationScopes.RecordDisposition(
-                        record.Caller,
-                        scope,
-                        record.ServiceAccepted
+                reservation.TerminalStatus = status;
+                if (reservation.CancellationScope is { } scope)
+                {
+                    var disposition = status == ResponsePublicationStatus.Published
+                        ? CancellationDisposition.CompletedBeforeCancellation
+                        : reservation.ServiceAccepted
                             ? CancellationDisposition.ProviderEffectContained
-                            : CancellationDisposition.CancelledBeforeEffect);
+                            : CancellationDisposition.CancelledBeforeEffect;
+                    if (status == ResponsePublicationStatus.Cancelled || reservation.CancellationRequested)
+                        _ = _cancellationScopes.RecordDisposition(reservation.Caller, scope, disposition);
+                }
             }
             return result;
         }

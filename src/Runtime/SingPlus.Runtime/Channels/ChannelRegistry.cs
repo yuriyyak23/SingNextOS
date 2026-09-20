@@ -6,6 +6,8 @@ namespace SingPlus.Runtime;
 public sealed class ChannelRegistry
 {
     internal readonly record struct TelemetrySummary(int Channels, int QueuedMessages);
+    internal readonly record struct InlineBorrowProjection<T>(ulong Sequence, BorrowLease<T> Lease) where T : unmanaged;
+    internal readonly record struct InlineMoveProjection<T>(ulong Sequence, OwnedBuffer<T> Payload) where T : unmanaged;
     private sealed class ChannelRecord
     {
         public required ChannelId Id { get; init; }
@@ -111,6 +113,171 @@ public sealed class ChannelRegistry
         object secondOwnershipPayload,
         IReadOnlyCollection<CapabilityId>? capabilityIds) =>
         SendCore(sender, receiver, endpoint, messageId, firstOwnershipPayload, secondOwnershipPayload, capabilityIds);
+
+    // Owner-side transport-elision primitive for the narrow synchronous copied-value
+    // contour. It performs the same process/endpoint, schema and protocol transition
+    // checks as SendCore, but creates no queue entry or ManagedCap-visible envelope.
+    // Callers must still register and settle the invocation with its existing owner.
+    internal KernelResult<ulong> BeginInlineCopiedInvocation(
+        SingProcess sender,
+        SingProcess receiver,
+        ChannelEndpointHandle endpoint,
+        uint messageId,
+        object? copiedPayload)
+    {
+        var validation = Resolve(endpoint);
+        if (!validation.IsSuccess) return KernelResult<ulong>.Fail(validation.Error, validation.Message!);
+        var record = validation.Value!;
+        var expectedSender = endpoint.EndpointId.Value == 1 ? record.LeftOwner : record.RightOwner;
+        var expectedReceiver = endpoint.EndpointId.Value == 1 ? record.RightOwner : record.LeftOwner;
+        if (expectedSender != new ProcessHandle(sender.ProcessId, sender.Generation))
+            return KernelResult<ulong>.Fail(KernelError.WrongEndpointOwner, "Endpoint is not owned by the inline invocation sender.");
+        if (expectedReceiver != new ProcessHandle(receiver.ProcessId, receiver.Generation))
+            return KernelResult<ulong>.Fail(KernelError.WrongEndpointOwner, "Peer process does not own the inline invocation receiver endpoint.");
+        if (!record.Protocol.TryGetMessage(messageId, out var message))
+            return KernelResult<ulong>.Fail(KernelError.InvalidMessage, $"Message {messageId} is not part of the protocol.");
+        if (message.RequestPayload.Kind is RequestPayloadKind.Ownership or RequestPayloadKind.OwnershipPair ||
+            message.Borrows.Count != 0 || message.Consumes.Count != 0)
+            return KernelResult<ulong>.Fail(KernelError.UnsupportedPayload, "Inline invocation supports only copied closed-value payloads.");
+        if (message.RequiredCapabilities.Count != 0)
+            return KernelResult<ulong>.Fail(KernelError.MissingCapability, "Inline invocation cannot elide message-attached capability validation.");
+        if (!record.Protocol.TryTransition(record.State, messageId, out var transition))
+            return KernelResult<ulong>.Fail(KernelError.InvalidProtocolTransition, $"Message {messageId} is illegal in state '{record.State}'.");
+        var payloadValidation = ValidateRequestPayload(message.RequestPayload, copiedPayload, secondaryPayload: null);
+        if (!payloadValidation.IsSuccess)
+            return KernelResult<ulong>.Fail(payloadValidation.Error, payloadValidation.Message!);
+
+        record.Sequence++;
+        record.State = transition.ToState;
+        return KernelResult<ulong>.Ok(record.Sequence);
+    }
+
+    // Owner-side transport elision for one linear read-only BORROW edge. The
+    // returned lease is a TCB-private projection created by RegionAuthority's
+    // existing loan lifetime; it is not an ownership token or authority cache.
+    internal KernelResult<InlineBorrowProjection<T>> BeginInlineBorrowInvocation<T>(
+        SingProcess sender,
+        SingProcess receiver,
+        ChannelEndpointHandle endpoint,
+        uint messageId,
+        OwnedBuffer<T> payload) where T : unmanaged
+    {
+        ArgumentNullException.ThrowIfNull(payload);
+        var validation = Resolve(endpoint);
+        if (!validation.IsSuccess)
+            return KernelResult<InlineBorrowProjection<T>>.Fail(validation.Error, validation.Message!);
+        var record = validation.Value!;
+        var expectedSender = endpoint.EndpointId.Value == 1 ? record.LeftOwner : record.RightOwner;
+        var expectedReceiver = endpoint.EndpointId.Value == 1 ? record.RightOwner : record.LeftOwner;
+        if (expectedSender != new ProcessHandle(sender.ProcessId, sender.Generation))
+            return KernelResult<InlineBorrowProjection<T>>.Fail(KernelError.WrongEndpointOwner, "Endpoint is not owned by the inline BORROW sender.");
+        if (expectedReceiver != new ProcessHandle(receiver.ProcessId, receiver.Generation))
+            return KernelResult<InlineBorrowProjection<T>>.Fail(KernelError.WrongEndpointOwner, "Peer process does not own the inline BORROW receiver endpoint.");
+        if (!record.Protocol.TryGetMessage(messageId, out var message))
+            return KernelResult<InlineBorrowProjection<T>>.Fail(KernelError.InvalidMessage, $"Message {messageId} is not part of the protocol.");
+        if (message.RequestPayload.Kind != RequestPayloadKind.Ownership || message.Borrows.Count != 1 ||
+            message.Consumes.Count != 0)
+            return KernelResult<InlineBorrowProjection<T>>.Fail(KernelError.UnsupportedPayload, "Inline BORROW requires exactly one declared ownership payload with read-only borrow semantics.");
+        if (message.RequiredCapabilities.Count != 0)
+            return KernelResult<InlineBorrowProjection<T>>.Fail(KernelError.MissingCapability, "Inline BORROW cannot elide message-attached capability validation.");
+        if (!record.Protocol.TryTransition(record.State, messageId, out var transition))
+            return KernelResult<InlineBorrowProjection<T>>.Fail(KernelError.InvalidProtocolTransition, $"Message {messageId} is illegal in state '{record.State}'.");
+        var payloadValidation = ValidateRequestPayload(message.RequestPayload, payload, secondaryPayload: null);
+        if (!payloadValidation.IsSuccess)
+            return KernelResult<InlineBorrowProjection<T>>.Fail(payloadValidation.Error, payloadValidation.Message!);
+
+        var transferable = (ITransferableOwnedPayload)payload;
+        if (!transferable.IsValidForRuntime)
+            return KernelResult<InlineBorrowProjection<T>>.Fail(KernelError.InvalidRegionState, "Inline BORROW requires a live owned payload.");
+        var owner = new RegionOwner(sender.DomainId, sender.Generation);
+        var borrower = new RegionOwner(receiver.DomainId, receiver.Generation);
+        var authoritative = _regions.Validate(payload.Handle, owner);
+        if (!authoritative.IsSuccess)
+            return KernelResult<InlineBorrowProjection<T>>.Fail(authoritative.Error, authoritative.Message!);
+        var acquired = _regions.AcquireLoan(payload.Handle, owner, borrower);
+        if (!acquired.IsSuccess)
+            return KernelResult<InlineBorrowProjection<T>>.Fail(acquired.Error, acquired.Message!);
+        var grant = acquired.Value!;
+        BorrowLease<T> lease;
+        try
+        {
+            lease = (BorrowLease<T>)transferable.CreateBorrowLeaseForRuntime(grant.Handle, grant.Lifetime);
+        }
+        catch (InvalidOperationException exception)
+        {
+            _ = _regions.RevokeLoan(grant.Handle, owner);
+            return KernelResult<InlineBorrowProjection<T>>.Fail(KernelError.InvalidRegionState, exception.Message);
+        }
+
+        record.Sequence++;
+        record.State = transition.ToState;
+        return KernelResult<InlineBorrowProjection<T>>.Ok(new(record.Sequence, lease));
+    }
+
+    // Owner-side transport elision for one linear exclusive MOVE request. This
+    // preserves SendCore's authoritative caller-to-service transfer and protocol
+    // transition but creates no queue entry or envelope. It is not compensation
+    // for an earlier move and never transfers directly between service stages.
+    internal KernelResult<InlineMoveProjection<T>> BeginInlineMoveInvocation<T>(
+        SingProcess sender,
+        SingProcess receiver,
+        ChannelEndpointHandle endpoint,
+        uint messageId,
+        OwnedBuffer<T> payload) where T : unmanaged
+    {
+        ArgumentNullException.ThrowIfNull(payload);
+        var validation = Resolve(endpoint);
+        if (!validation.IsSuccess)
+            return KernelResult<InlineMoveProjection<T>>.Fail(validation.Error, validation.Message!);
+        var record = validation.Value!;
+        var expectedSender = endpoint.EndpointId.Value == 1 ? record.LeftOwner : record.RightOwner;
+        var expectedReceiver = endpoint.EndpointId.Value == 1 ? record.RightOwner : record.LeftOwner;
+        if (expectedSender != new ProcessHandle(sender.ProcessId, sender.Generation))
+            return KernelResult<InlineMoveProjection<T>>.Fail(KernelError.WrongEndpointOwner, "Endpoint is not owned by the inline MOVE sender.");
+        if (expectedReceiver != new ProcessHandle(receiver.ProcessId, receiver.Generation))
+            return KernelResult<InlineMoveProjection<T>>.Fail(KernelError.WrongEndpointOwner, "Peer process does not own the inline MOVE receiver endpoint.");
+        if (!record.Protocol.TryGetMessage(messageId, out var message))
+            return KernelResult<InlineMoveProjection<T>>.Fail(KernelError.InvalidMessage, $"Message {messageId} is not part of the protocol.");
+        if (message.RequestPayload.Kind != RequestPayloadKind.Ownership || message.Consumes.Count != 1 ||
+            message.Borrows.Count != 0)
+            return KernelResult<InlineMoveProjection<T>>.Fail(KernelError.UnsupportedPayload, "Inline MOVE requires exactly one consumed ownership payload.");
+        if (message.RequiredCapabilities.Count != 0)
+            return KernelResult<InlineMoveProjection<T>>.Fail(KernelError.MissingCapability, "Inline MOVE cannot elide message-attached capability validation.");
+        if (!record.Protocol.TryTransition(record.State, messageId, out var transition))
+            return KernelResult<InlineMoveProjection<T>>.Fail(KernelError.InvalidProtocolTransition, $"Message {messageId} is illegal in state '{record.State}'.");
+        var payloadValidation = ValidateRequestPayload(message.RequestPayload, payload, secondaryPayload: null);
+        if (!payloadValidation.IsSuccess)
+            return KernelResult<InlineMoveProjection<T>>.Fail(payloadValidation.Error, payloadValidation.Message!);
+
+        var transferable = (ITransferableOwnedPayload)payload;
+        if (!transferable.IsValidForRuntime)
+            return KernelResult<InlineMoveProjection<T>>.Fail(KernelError.InvalidRegionState, "Inline MOVE requires a live owned payload.");
+        var oldHandle = payload.Handle;
+        var owner = new RegionOwner(sender.DomainId, sender.Generation);
+        var target = new RegionOwner(receiver.DomainId, receiver.Generation);
+        var authoritative = _regions.Validate(oldHandle, owner);
+        if (!authoritative.IsSuccess)
+            return KernelResult<InlineMoveProjection<T>>.Fail(authoritative.Error, authoritative.Message!);
+        try
+        {
+            transferable.ValidateTransferForRuntime();
+        }
+        catch (InvalidOperationException exception)
+        {
+            return KernelResult<InlineMoveProjection<T>>.Fail(KernelError.InvalidRegionState, exception.Message);
+        }
+        var transfer = _regions.Transfer(oldHandle, owner, target);
+        if (!transfer.IsSuccess)
+            return KernelResult<InlineMoveProjection<T>>.Fail(transfer.Error, transfer.Message!);
+        var moved = (OwnedBuffer<T>)transferable.TransferForRuntime(transfer.Value);
+        _regions.ReplacePayload(oldHandle, transfer.Value, moved);
+        sender.RemoveRegion(oldHandle);
+        receiver.AddRegion(transfer.Value);
+
+        record.Sequence++;
+        record.State = transition.ToState;
+        return KernelResult<InlineMoveProjection<T>>.Ok(new(record.Sequence, moved));
+    }
 
     private KernelResult<ChannelEnvelope> SendCore(
         SingProcess sender,

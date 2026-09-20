@@ -60,6 +60,7 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
         var model = ContractModel.Create(contract);
         var hint = Sanitize(contract.ToDisplayString()) + ".";
         output.AddSource(hint + "Protocol.g.cs", SourceText.From(GenerateProtocol(model), Encoding.UTF8));
+        output.AddSource(hint + "Sentries.g.cs", SourceText.From(GenerateOperationSentries(model), Encoding.UTF8));
         output.AddSource(hint + "Dispatcher.g.cs", SourceText.From(GenerateDispatcher(model), Encoding.UTF8));
         output.AddSource(hint + "Manifest.g.cs", SourceText.From(GenerateManifest(model), Encoding.UTF8));
         output.AddSource(hint + "Capabilities.g.cs", SourceText.From(GenerateCapabilities(model), Encoding.UTF8));
@@ -429,7 +430,10 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
         b.Append("    private readonly ").Append(model.QualifiedType).AppendLine(" _implementation = implementation;");
         foreach (var message in model.Messages)
         {
-            b.Append("    public ").Append(message.ReturnType).Append(" Dispatch_").Append(message.Name).Append('(').Append(ParameterList(message.Parameters)).Append(") => _implementation.@").Append(message.Name).Append('(').Append(ArgumentList(message.Parameters)).AppendLine(");");
+            b.Append("    public ").Append(message.ReturnType).Append(" Dispatch_").Append(message.Name).Append('(').Append(ParameterList(message.Parameters)).Append(") => ")
+                .Append(model.TypeName).Append("GeneratedOperationSentries.Invoke_").Append(message.Name).Append("(_implementation");
+            if (message.Parameters.Count != 0) b.Append(", ").Append(ArgumentList(message.Parameters));
+            b.AppendLine(");");
         }
         b.AppendLine("}");
         b.AppendLine();
@@ -444,6 +448,47 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
         foreach (var message in model.Messages)
         {
             b.Append("    public ").Append(message.ReturnType).Append(" @").Append(message.Name).Append('(').Append(ParameterList(message.Parameters)).Append(") => _transport.Send_").Append(message.Name).Append('(').Append(message.Id.ToString(CultureInfo.InvariantCulture)).Append('u');
+            if (message.Parameters.Count != 0) b.Append(", ").Append(ArgumentList(message.Parameters));
+            b.AppendLine(");");
+        }
+        b.AppendLine("}");
+        return b.ToString();
+    }
+
+    private static string GenerateOperationSentries(ContractModel model)
+    {
+        var b = Header(model);
+        foreach (var message in model.Messages)
+        {
+            b.Append("internal interface I").Append(model.TypeName).Append("GeneratedSentryTarget_").Append(message.Name).AppendLine();
+            b.AppendLine("{");
+            b.Append("    global::SingPlus.Sip.Sdk.GeneratedSipSentryResult<").Append(message.SentryResponseType)
+                .Append("> Sentry_").Append(message.Name)
+                .Append("(in global::SingPlus.Sip.Sdk.TrustedSipInvocationContext context");
+            if (message.Parameters.Count != 0) b.Append(", ").Append(RuntimeSentryParameterList(message.Parameters));
+            b.AppendLine(");");
+            b.AppendLine("}");
+            b.AppendLine();
+        }
+        b.Append("internal static class ").Append(model.TypeName).AppendLine("GeneratedOperationSentries");
+        b.AppendLine("{");
+        foreach (var message in model.Messages)
+        {
+            var thunkIdentity = model.FullName + "::" + message.Id.ToString(CultureInfo.InvariantCulture) + "::" + message.Name;
+            var thunkDigest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
+                model.Digest + "|" + thunkIdentity + "|" + message.RequestValueSchema + "|" + message.ResponseValueSchema)));
+            b.Append("    public const string Thunk_").Append(message.Name).Append(" = ").Append(Literal(thunkIdentity)).AppendLine(";");
+            b.Append("    public const string Thunk_").Append(message.Name).Append("_Digest = ").Append(Literal(thunkDigest)).AppendLine(";");
+            b.Append("    internal static ").Append(message.ReturnType).Append(" Invoke_").Append(message.Name)
+                .Append('(').Append(model.QualifiedType).Append(" implementation");
+            if (message.Parameters.Count != 0) b.Append(", ").Append(ParameterList(message.Parameters));
+            b.Append(") => implementation.@").Append(message.Name).Append('(').Append(ArgumentList(message.Parameters)).AppendLine(");");
+            b.Append("    internal static global::SingPlus.Sip.Sdk.GeneratedSipSentryResult<").Append(message.SentryResponseType)
+                .Append("> InvokeRuntime_").Append(message.Name).Append("(I").Append(model.TypeName)
+                .Append("GeneratedSentryTarget_").Append(message.Name)
+                .Append(" target, in global::SingPlus.Sip.Sdk.TrustedSipInvocationContext context");
+            if (message.Parameters.Count != 0) b.Append(", ").Append(RuntimeSentryParameterList(message.Parameters));
+            b.Append(") => target.Sentry_").Append(message.Name).Append("(in context");
             if (message.Parameters.Count != 0) b.Append(", ").Append(ArgumentList(message.Parameters));
             b.AppendLine(");");
         }
@@ -492,6 +537,7 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
     }
 
     private static string ParameterList(IReadOnlyList<ParameterModel> parameters) => string.Join(", ", parameters.Select(static p => p.Type + " @" + p.Name));
+    private static string RuntimeSentryParameterList(IReadOnlyList<ParameterModel> parameters) => string.Join(", ", parameters.Select(static p => p.RuntimeSentryType + " @" + p.Name));
     private static string ArgumentList(IReadOnlyList<ParameterModel> parameters) => string.Join(", ", parameters.Select(static p => "@" + p.Name));
     private static string CapabilityExpression(CapabilityModel c) => "new global::SingPlus.Contracts.CapabilityRequirementV1((global::SingPlus.Contracts.ResourceKind)" + c.Kind.ToString(CultureInfo.InvariantCulture) + ", " + Literal(c.ResourceId) + ", (global::SingPlus.Contracts.CapabilityRights)" + c.Rights.ToString(CultureInfo.InvariantCulture) + ")";
     private static string Literal(string value) => "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", "\\r").Replace("\n", "\\n") + "\"";
@@ -567,6 +613,7 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
         public uint Id { get; private set; }
         public string Name { get; private set; } = string.Empty;
         public string ReturnType { get; private set; } = string.Empty;
+        public string SentryResponseType { get; private set; } = string.Empty;
         public IReadOnlyList<ParameterModel> Parameters { get; private set; } = Array.Empty<ParameterModel>();
         public IReadOnlyList<CapabilityModel> Capabilities { get; private set; } = Array.Empty<CapabilityModel>();
         public IReadOnlyList<string> Consumes { get; private set; } = Array.Empty<string>();
@@ -589,7 +636,12 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
                 ResourceId = (string?)a.ConstructorArguments[1].Value ?? string.Empty,
                 Rights = Convert.ToInt32(a.ConstructorArguments[2].Value, CultureInfo.InvariantCulture)
             }).OrderBy(static c => c.Kind).ThenBy(static c => c.ResourceId, StringComparer.Ordinal).ThenBy(static c => c.Rights).ToArray();
-            var parameters = method.Parameters.Select(static p => new ParameterModel { Name = p.Name, Type = p.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat) }).ToArray();
+            var parameters = method.Parameters.Select(static p => new ParameterModel
+            {
+                Name = p.Name,
+                Type = p.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
+                RuntimeSentryType = RuntimeSentryParameterType(p)
+            }).ToArray();
             var consumes = method.Parameters.Where(static p => p.GetAttributes().Any(static a => a.AttributeClass?.Name == "ConsumesAttribute")).Select(static p => p.Name).OrderBy(static p => p, StringComparer.Ordinal).ToArray();
             var borrows = method.Parameters.Where(static p => p.GetAttributes().Any(static a => a.AttributeClass?.Name == "BorrowsAttribute")).Select(static p => p.Name).OrderBy(static p => p, StringComparer.Ordinal).ToArray();
             var transitionAttributes = method.GetAttributes().Where(static a => a.AttributeClass?.Name == "TransitionAttribute").ToArray();
@@ -600,6 +652,9 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
                 Id = id,
                 Name = method.Name,
                 ReturnType = method.ReturnType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
+                SentryResponseType = UnwrapAsync(method.ReturnType) is { } responseType
+                    ? responseType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)
+                    : "global::SingPlus.Sip.Sdk.GeneratedSipUnit",
                 Parameters = parameters,
                 Capabilities = capabilities,
                 Consumes = consumes,
@@ -689,7 +744,21 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
         return "value:" + type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat) + bound + "{" + string.Join(",", members) + "}";
     }
 
-    private sealed class ParameterModel { public string Name { get; set; } = string.Empty; public string Type { get; set; } = string.Empty; }
+    private static string RuntimeSentryParameterType(IParameterSymbol parameter)
+    {
+        if (!HasAttribute(parameter, "BorrowsAttribute"))
+            return parameter.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+        if (parameter.Type is not INamedTypeSymbol { IsGenericType: true } named || named.TypeArguments.Length != 1)
+            return "global::SingPlus.Sip.Sdk.InvalidBorrowProjection";
+        return "global::SingPlus.Sip.BorrowLease<" + named.TypeArguments[0].ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat) + ">";
+    }
+
+    private sealed class ParameterModel
+    {
+        public string Name { get; set; } = string.Empty;
+        public string Type { get; set; } = string.Empty;
+        public string RuntimeSentryType { get; set; } = string.Empty;
+    }
     private sealed class CapabilityModel { public int Kind { get; set; } public string ResourceId { get; set; } = string.Empty; public int Rights { get; set; } }
     private sealed class OwnershipRequestSlotModel { public string ParameterName { get; set; } = string.Empty; public int OwnershipPayloadKind { get; set; } public int Disposition { get; set; } }
     private sealed class RequestPayloadModel { public int Kind { get; set; } public string ParameterName { get; set; } = string.Empty; public string TypeName { get; set; } = string.Empty; public int MaxBytes { get; set; } public int OwnershipPayloadKind { get; set; } public IReadOnlyList<OwnershipRequestSlotModel> OwnershipPair { get; set; } = Array.Empty<OwnershipRequestSlotModel>(); }
