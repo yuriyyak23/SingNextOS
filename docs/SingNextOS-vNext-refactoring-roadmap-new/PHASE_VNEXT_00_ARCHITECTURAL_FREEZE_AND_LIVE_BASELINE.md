@@ -1,5 +1,7 @@
 # P00 — ARCHITECTURAL FREEZE AND LIVE BASELINE
 
+**Live disposition:** closed at `ModelOnly` for reviewed HEAD `b86cc33c16a77760c6971cc1a656c34b6cf2a10d`. See `EVIDENCE_P00_ARCHITECTURAL_FREEZE.md` and `P00_QUALIFICATION_TUPLE.json`. All `FG-VNX-*` gates remain OFF.
+
 ## Purpose
 
 Freeze exact current owners and the corrected no-second-ledger architecture before code changes.

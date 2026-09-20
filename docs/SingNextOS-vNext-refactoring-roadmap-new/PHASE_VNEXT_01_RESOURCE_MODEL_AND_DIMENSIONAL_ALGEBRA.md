@@ -1,5 +1,7 @@
 # P01 — RESOURCE MODEL AND DIMENSIONAL ALGEBRA
 
+**Live disposition:** closed at `ModelOnly` for immutable contracts on reviewed HEAD `b86cc33c16a77760c6971cc1a656c34b6cf2a10d`. See `EVIDENCE_P01_RESOURCE_MODEL.md` and `P01_QUALIFICATION_TUPLE.json`. All gates remain OFF.
+
 ## Purpose
 
 Define the conceptual model before adding handles or admission paths: permission, accounting, reservation, lease, evidence, settlement and guarantee remain distinct.

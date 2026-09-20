@@ -38,6 +38,9 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
     private static readonly DiagnosticDescriptor DeepValueSchemaDiagnostic = new(
         "SINGGEN011", "Unsafe SIP copied-value graph", "{0}", "SingPlus.Contracts", DiagnosticSeverity.Error, isEnabledByDefault: true);
 
+    private static readonly DiagnosticDescriptor ResourceRequirementDiagnostic = new(
+        "SINGGEN012", "Invalid SIP resource requirement", "{0}", "SingPlus.Contracts", DiagnosticSeverity.Error, isEnabledByDefault: true);
+
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
         var contracts = context.SyntaxProvider.ForAttributeWithMetadataName(
@@ -71,6 +74,12 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
         var valid = true;
         foreach (var method in contract.GetMembers().OfType<IMethodSymbol>().Where(static m => m.MethodKind == MethodKind.Ordinary))
         {
+            var resourceAttribute = method.GetAttributes().FirstOrDefault(static a => a.AttributeClass?.Name == "RequiresResourceAttribute");
+            if (resourceAttribute is not null && !ValidResourceRequirement(resourceAttribute, out var resourceFailure))
+            {
+                Report(output, ResourceRequirementDiagnostic, method, resourceFailure);
+                valid = false;
+            }
             var ownershipParameterCount = 0;
             var borrowParameterCount = 0;
             var consumeParameterCount = 0;
@@ -290,6 +299,25 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
     private static bool HasAttribute(ISymbol symbol, string attributeName) =>
         symbol.GetAttributes().Any(a => a.AttributeClass?.Name == attributeName);
 
+    private static bool ValidResourceRequirement(AttributeData attribute, out string failure)
+    {
+        var version = Convert.ToInt32(attribute.ConstructorArguments[0].Value, CultureInfo.InvariantCulture);
+        var resourceClass = Convert.ToInt32(attribute.ConstructorArguments[1].Value, CultureInfo.InvariantCulture);
+        var unit = Convert.ToInt32(attribute.ConstructorArguments[2].Value, CultureInfo.InvariantCulture);
+        var amount = Convert.ToUInt64(attribute.ConstructorArguments[3].Value, CultureInfo.InvariantCulture);
+        var scope = (string?)attribute.ConstructorArguments[4].Value;
+        var assurance = Convert.ToInt32(attribute.ConstructorArguments[5].Value, CultureInfo.InvariantCulture);
+        var donation = Convert.ToInt32(attribute.ConstructorArguments[6].Value, CultureInfo.InvariantCulture);
+        if (version != 1) { failure = "Resource requirement version must be 1."; return false; }
+        if (resourceClass != 1 || unit != 1) { failure = "Only ComputeTime/Nanoseconds is supported in P05."; return false; }
+        if (amount == 0 || amount == ulong.MaxValue) { failure = "Resource maximum must be finite and non-zero."; return false; }
+        if (string.IsNullOrWhiteSpace(scope)) { failure = "Resource semantic scope is required."; return false; }
+        if (assurance < 1 || assurance > 4 || donation < 0 || donation > 1)
+        { failure = "Resource assurance or donation policy is unknown."; return false; }
+        failure = string.Empty;
+        return true;
+    }
+
     private static int OwnershipKind(ITypeSymbol type, bool unwrapAsync)
     {
         if (unwrapAsync && type is INamedTypeSymbol asyncType && asyncType.TypeArguments.Length == 1 &&
@@ -465,6 +493,7 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
             b.Append("    global::SingPlus.Sip.Sdk.GeneratedSipSentryResult<").Append(message.SentryResponseType)
                 .Append("> Sentry_").Append(message.Name)
                 .Append("(in global::SingPlus.Sip.Sdk.TrustedSipInvocationContext context");
+            if (message.Resource is not null) b.Append(", global::SingPlus.Sip.Sdk.GeneratedSipResourceAdmission resourceAdmission");
             if (message.Parameters.Count != 0) b.Append(", ").Append(RuntimeSentryParameterList(message.Parameters));
             b.AppendLine(");");
             b.AppendLine("}");
@@ -488,9 +517,25 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
                 .Append("GeneratedSentryTarget_").Append(message.Name)
                 .Append(" target, in global::SingPlus.Sip.Sdk.TrustedSipInvocationContext context");
             if (message.Parameters.Count != 0) b.Append(", ").Append(RuntimeSentryParameterList(message.Parameters));
-            b.Append(") => target.Sentry_").Append(message.Name).Append("(in context");
-            if (message.Parameters.Count != 0) b.Append(", ").Append(ArgumentList(message.Parameters));
-            b.AppendLine(");");
+            if (message.Resource is null)
+            {
+                b.Append(") => target.Sentry_").Append(message.Name).Append("(in context");
+                if (message.Parameters.Count != 0) b.Append(", ").Append(ArgumentList(message.Parameters));
+                b.AppendLine(");");
+            }
+            else
+            {
+                b.AppendLine(")");
+                b.AppendLine("    {");
+                b.Append("        using var admission = global::SingPlus.Sip.Sdk.GeneratedSipResourceSentry.Enter(in context, ")
+                    .Append(model.TypeName).Append("Capabilities.").Append(message.Name).AppendLine("_Resource);");
+                b.Append("        if (!admission.IsSuccess) return global::SingPlus.Sip.Sdk.GeneratedSipSentryResult<")
+                    .Append(message.SentryResponseType).AppendLine(">.Failure(admission.ErrorCode, admission.Message ?? \"Resource admission failed.\");");
+                b.Append("        return target.Sentry_").Append(message.Name).Append("(in context, admission");
+                if (message.Parameters.Count != 0) b.Append(", ").Append(ArgumentList(message.Parameters));
+                b.AppendLine(");");
+                b.AppendLine("    }");
+            }
         }
         b.AppendLine("}");
         return b.ToString();
@@ -516,6 +561,18 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
         {
             var canonical = string.Join(";", message.Capabilities.Select(static c => c.Kind + ":" + c.ResourceId + ":" + c.Rights));
             b.Append("    public const string ").Append(message.Name).Append(" = ").Append(Literal(canonical)).AppendLine(";");
+            if (message.Resource is { } resource)
+            {
+                b.Append("    public static readonly global::SingPlus.Contracts.SipResourceRequirementV1 ")
+                    .Append(message.Name).Append("_Resource = new(")
+                    .Append(resource.Version.ToString(CultureInfo.InvariantCulture)).Append(", (global::SingPlus.Contracts.ResourceClassV1)")
+                    .Append(resource.ResourceClass.ToString(CultureInfo.InvariantCulture)).Append(", (global::SingPlus.Contracts.ResourceUnitV1)")
+                    .Append(resource.Unit.ToString(CultureInfo.InvariantCulture)).Append(", ")
+                    .Append(resource.MaximumAmount.ToString(CultureInfo.InvariantCulture)).Append("UL, ")
+                    .Append(Literal(resource.SemanticScope)).Append(", (global::SingPlus.Contracts.ResourceAssuranceV1)")
+                    .Append(resource.Assurance.ToString(CultureInfo.InvariantCulture)).Append(", (global::SingPlus.Contracts.SipResourceDonationPolicyV1)")
+                    .Append(resource.DonationPolicy.ToString(CultureInfo.InvariantCulture)).AppendLine(");");
+            }
             b.Append("    public const string ").Append(message.Name).Append("_Ownership = ").Append(Literal("Consumes=" + string.Join(",", message.Consumes) + ";Borrows=" + string.Join(",", message.Borrows) + ";InputKind=" + message.RequestPayload.OwnershipPayloadKind.ToString(CultureInfo.InvariantCulture) + ";Returns=" + (message.ReturnsOwnership ? "1" : "0") + ";ReturnKind=" + message.ReturnOwnershipPayloadKind.ToString(CultureInfo.InvariantCulture))).AppendLine(";");
             var request = message.RequestPayload;
             var requestMetadata = request.Kind == 5
@@ -590,6 +647,8 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
             {
                 lines.Add("message=" + m.Id.ToString(CultureInfo.InvariantCulture) + "|" + m.Name + "|" + m.ReturnType + "|" + string.Join(",", m.Parameters.Select(static p => p.Type + " " + p.Name)));
                 lines.Add("cap=" + m.Id.ToString(CultureInfo.InvariantCulture) + "|" + string.Join(";", m.Capabilities.Select(static c => c.Kind + ":" + c.ResourceId + ":" + c.Rights)));
+                if (m.Resource is { } resource)
+                    lines.Add("resource=" + m.Id.ToString(CultureInfo.InvariantCulture) + "|" + resource.Canonical);
                 lines.Add("ownership=" + m.Id.ToString(CultureInfo.InvariantCulture) + "|" + string.Join(",", m.Consumes) + "|" + string.Join(",", m.Borrows) + "|" + (m.ReturnsOwnership ? "1" : "0") + "|" + m.ReturnOwnershipPayloadKind.ToString(CultureInfo.InvariantCulture));
                 var request = m.RequestPayload;
                 if (request.Kind == 5)
@@ -616,6 +675,7 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
         public string SentryResponseType { get; private set; } = string.Empty;
         public IReadOnlyList<ParameterModel> Parameters { get; private set; } = Array.Empty<ParameterModel>();
         public IReadOnlyList<CapabilityModel> Capabilities { get; private set; } = Array.Empty<CapabilityModel>();
+        public ResourceRequirementModel? Resource { get; private set; }
         public IReadOnlyList<string> Consumes { get; private set; } = Array.Empty<string>();
         public IReadOnlyList<string> Borrows { get; private set; } = Array.Empty<string>();
         public bool ReturnsOwnership { get; private set; }
@@ -636,6 +696,8 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
                 ResourceId = (string?)a.ConstructorArguments[1].Value ?? string.Empty,
                 Rights = Convert.ToInt32(a.ConstructorArguments[2].Value, CultureInfo.InvariantCulture)
             }).OrderBy(static c => c.Kind).ThenBy(static c => c.ResourceId, StringComparer.Ordinal).ThenBy(static c => c.Rights).ToArray();
+            var resourceAttribute = method.GetAttributes().FirstOrDefault(static a => a.AttributeClass?.Name == "RequiresResourceAttribute");
+            var resource = resourceAttribute is null ? null : ResourceRequirementModel.Create(resourceAttribute);
             var parameters = method.Parameters.Select(static p => new ParameterModel
             {
                 Name = p.Name,
@@ -657,6 +719,7 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
                     : "global::SingPlus.Sip.Sdk.GeneratedSipUnit",
                 Parameters = parameters,
                 Capabilities = capabilities,
+                Resource = resource,
                 Consumes = consumes,
                 Borrows = borrows,
                 ReturnsOwnership = method.GetAttributes().Any(static a => a.AttributeClass?.Name == "ReturnsOwnershipAttribute"),
@@ -760,6 +823,27 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
         public string RuntimeSentryType { get; set; } = string.Empty;
     }
     private sealed class CapabilityModel { public int Kind { get; set; } public string ResourceId { get; set; } = string.Empty; public int Rights { get; set; } }
+    private sealed class ResourceRequirementModel
+    {
+        public int Version { get; set; }
+        public int ResourceClass { get; set; }
+        public int Unit { get; set; }
+        public ulong MaximumAmount { get; set; }
+        public string SemanticScope { get; set; } = string.Empty;
+        public int Assurance { get; set; }
+        public int DonationPolicy { get; set; }
+        public string Canonical => Version + ":" + ResourceClass + ":" + Unit + ":" + MaximumAmount + ":" + SemanticScope + ":" + Assurance + ":" + DonationPolicy;
+        public static ResourceRequirementModel Create(AttributeData attribute) => new()
+        {
+            Version = Convert.ToInt32(attribute.ConstructorArguments[0].Value, CultureInfo.InvariantCulture),
+            ResourceClass = Convert.ToInt32(attribute.ConstructorArguments[1].Value, CultureInfo.InvariantCulture),
+            Unit = Convert.ToInt32(attribute.ConstructorArguments[2].Value, CultureInfo.InvariantCulture),
+            MaximumAmount = Convert.ToUInt64(attribute.ConstructorArguments[3].Value, CultureInfo.InvariantCulture),
+            SemanticScope = (string?)attribute.ConstructorArguments[4].Value ?? string.Empty,
+            Assurance = Convert.ToInt32(attribute.ConstructorArguments[5].Value, CultureInfo.InvariantCulture),
+            DonationPolicy = Convert.ToInt32(attribute.ConstructorArguments[6].Value, CultureInfo.InvariantCulture)
+        };
+    }
     private sealed class OwnershipRequestSlotModel { public string ParameterName { get; set; } = string.Empty; public int OwnershipPayloadKind { get; set; } public int Disposition { get; set; } }
     private sealed class RequestPayloadModel { public int Kind { get; set; } public string ParameterName { get; set; } = string.Empty; public string TypeName { get; set; } = string.Empty; public int MaxBytes { get; set; } public int OwnershipPayloadKind { get; set; } public IReadOnlyList<OwnershipRequestSlotModel> OwnershipPair { get; set; } = Array.Empty<OwnershipRequestSlotModel>(); }
     private sealed class TransitionModel { public uint MessageId { get; set; } public string From { get; set; } = string.Empty; public string To { get; set; } = string.Empty; }

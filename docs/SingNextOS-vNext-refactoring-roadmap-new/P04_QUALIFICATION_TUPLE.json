@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "phase": "P04",
+  "claim": "RuntimeEnforced",
+  "contour": "internal host-JIT process/effect/resource-grant/budget/Region/ExternalOperation admission",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "b86cc33c16a77760c6971cc1a656c34b6cf2a10d",
+  "resourceDimension": "ComputeTimeNanoseconds",
+  "enabledFeatureGates": [],
+  "tests": [
+    { "lane": "P04-focused", "passed": 13, "failed": 0, "skipped": 0 },
+    { "lane": "P02-P04-cross-owner-regression", "passed": 48, "failed": 0, "skipped": 0 },
+    { "lane": "architecture-default-gate-P04", "passed": 22, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui", "passed": 1604, "failed": 9, "skipped": 2, "disposition": "same pre-existing failures recorded by P00-P03" }
+  ],
+  "build": { "target": "SingNextOS.slnx", "warnings": 0, "errors": 0 },
+  "linearization": {
+    "resourcePermission": "CapabilityAuthority.AcquireResourceUseAuthority",
+    "quantitativeLease": "ResourceBudgetAuthority.BindLease",
+    "possibleSubmit": "ExternalOperationAuthority.RecordSubmission before provider callback"
+  },
+  "exclusions": [
+    "cross-owner feature gate remains OFF",
+    "no generated SIP, session, invocation, donation, or durable restart binding",
+    "no provider, guarantee, hardware, NativeAOT, or production qualification"
+  ]
+}

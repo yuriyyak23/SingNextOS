@@ -1,5 +1,7 @@
 # P03 — ATOMIC RESOURCE LEASE AND SETTLEMENT CORE
 
+**Live disposition:** closed at `RuntimeEnforced` for the internal host/JIT budget-owner contour on reviewed HEAD `b86cc33c16a77760c6971cc1a656c34b6cf2a10d`; the feature gate remains OFF. See `EVIDENCE_P03_RESOURCE_LEASE.md` and `P03_QUALIFICATION_TUPLE.json`.
+
 ## Purpose
 
 Extend the existing `ResourceBudgetAuthority` into the sole quantitative owner for reservation, lease binding state, consumption settlement and quarantine, while preserving `reservations admit capacity but never authorize effects`.

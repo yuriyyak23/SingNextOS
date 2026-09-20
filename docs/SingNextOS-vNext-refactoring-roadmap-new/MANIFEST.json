@@ -25,29 +25,79 @@
       "sha256": "75be208e60dcbe2918d6eab9db66d428cf34684daf4e9dd90a5edc7ea1f85dfb"
     },
     {
+      "file": "EVIDENCE_P00_ARCHITECTURAL_FREEZE.md",
+      "bytes": 7120,
+      "sha256": "5fb648d60acca290e75f8852086981f4cd8faeed4fb8afd80cccf36983c2f67d"
+    },
+    {
+      "file": "P00_QUALIFICATION_TUPLE.json",
+      "bytes": 3184,
+      "sha256": "9f5200b5ff5c57ce05744952ee2cec9738a523a2c68c313a26cfe7b1dd57cb07"
+    },
+    {
       "file": "PHASE_VNEXT_00_ARCHITECTURAL_FREEZE_AND_LIVE_BASELINE.md",
-      "bytes": 2257,
-      "sha256": "5713194bd9d7b8e52683ec24dd10d1ad87cb77b7ea1435a63fe4f77aee2b78d8"
+      "bytes": 2476,
+      "sha256": "e4d9f1556507c08e175939401448105da54a9bedc1f9f462ec35093ee6746376"
+    },
+    {
+      "file": "EVIDENCE_P01_RESOURCE_MODEL.md",
+      "bytes": 3746,
+      "sha256": "3835c450f9968c82c8ff929afc2f7ee64db88529dd91a5aeef5caf87deaf69ed"
+    },
+    {
+      "file": "P01_QUALIFICATION_TUPLE.json",
+      "bytes": 1090,
+      "sha256": "7cfba2036754402800f674dd7b93a4ebcc6f080ea6e8bc76e52171fc877c1abd"
     },
     {
       "file": "PHASE_VNEXT_01_RESOURCE_MODEL_AND_DIMENSIONAL_ALGEBRA.md",
-      "bytes": 2048,
-      "sha256": "ad8dafbcbecfe500e3c93e68963891c1c7d67fd2f8868eb7dd37670db1c10a41"
+      "bytes": 2273,
+      "sha256": "d79648f82dd7eeac7fbd3c04c6255b3f8d20b9ba4d5719dbc4502a9f4e606747"
+    },
+    {
+      "file": "EVIDENCE_P02_RESOURCE_GRANTS.md",
+      "bytes": 2902,
+      "sha256": "a34eed4fce118ac21825a941a94f95501c60fca7c4390307d15b3141339eee90"
+    },
+    {
+      "file": "P02_QUALIFICATION_TUPLE.json",
+      "bytes": 914,
+      "sha256": "9fa7bf3a7457559513c2d2acfc024f7900b4227bf6776ab9bbf227f6e8d0b5c8"
     },
     {
       "file": "PHASE_VNEXT_02_RESOURCE_USE_GRANTS_IN_EXISTING_CAPABILITYAUTHORITY.md",
-      "bytes": 2456,
-      "sha256": "db84936e490abacc3d3624af88f2a0ac848b926b14741745a27fb0067f0f4015"
+      "bytes": 2712,
+      "sha256": "b8acefc374727e91837cbe03e2eef483ac888eac11e240ea970e76b61aeefd1e"
+    },
+    {
+      "file": "EVIDENCE_P03_RESOURCE_LEASE.md",
+      "bytes": 3883,
+      "sha256": "5553749e8a5d9895c60d1a589f564701983a8737a1aeb68b0d8612adb76e7649"
+    },
+    {
+      "file": "P03_QUALIFICATION_TUPLE.json",
+      "bytes": 1024,
+      "sha256": "a4d5501f71f5cb24afb0e24a524310b24cd305e86c1bbad77ee808e7048c4eb0"
     },
     {
       "file": "PHASE_VNEXT_03_ATOMIC_RESOURCE_LEASE_AND_SETTLEMENT_CORE.md",
-      "bytes": 2604,
-      "sha256": "c6e4ccf38b74c8224c22e57dd90c06b4805d60af85cb5721cd3486432f2fa8cb"
+      "bytes": 2866,
+      "sha256": "dd6e80eaec16f77749a6eb69b0738847b1c27f3da9647888a66ba3a3f2795276"
+    },
+    {
+      "file": "EVIDENCE_P04_CROSS_OWNER_ADMISSION.md",
+      "bytes": 5462,
+      "sha256": "ee7d5f0d5461f0519ddc0e1f5d85bee0f66fee5efe6e720be183778084609f4f"
+    },
+    {
+      "file": "P04_QUALIFICATION_TUPLE.json",
+      "bytes": 1355,
+      "sha256": "0b9d2e3fad6b6112ddefb397e8e043893db4fbd424c4b97d6e5b42d2a656bd73"
     },
     {
       "file": "PHASE_VNEXT_04_CROSS_OWNER_ADMISSION_COMMIT_PROTOCOL.md",
-      "bytes": 2495,
-      "sha256": "0fef09081428985fd4983522ff9dbf0bb6098ec2d63833031c9c0b7cfebbb86f"
+      "bytes": 2947,
+      "sha256": "29f848b99df6881f512d1363e7a5cd21a0716516e4b7eecf12e04df1dfd14683"
     },
     {
       "file": "PHASE_VNEXT_05_SIP_AND_MANIFEST_RESOURCE_CONTRACTS.md",

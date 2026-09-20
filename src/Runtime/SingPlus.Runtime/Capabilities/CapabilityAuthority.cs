@@ -130,7 +130,8 @@ public sealed class CapabilityAuthority
         ulong quota, ushort delegationDepth,
         CapabilityConstraintSchema schema = CapabilityConstraintSchema.V1,
         IEnumerable<CapabilityOperation>? operations = null,
-        long notBeforeUtcTicks = 0, long expiresUtcTicks = long.MaxValue)
+        long notBeforeUtcTicks = 0, long expiresUtcTicks = long.MaxValue,
+        ResourceUseConstraintV1? resourceUse = null)
     {
         lock (_gate)
         {
@@ -151,7 +152,7 @@ public sealed class CapabilityAuthority
                     new(resourceKind, resourceId, resourceGeneration, null, null),
                     new(operations ?? OperationsFor(rights)), range,
                     new(notBeforeUtcTicks, expiresUtcTicks), new(null, 0, (rights & CapabilityRights.Delegate) != 0),
-                    new(session), new(delegationDepth), new(quotaAccountReference, quota)).Canonicalize();
+                    new(session), new(delegationDepth), new(quotaAccountReference, quota), resourceUse).Canonicalize();
             }
             catch (Exception exception) when (exception is ArgumentException or NotSupportedException or OverflowException)
             {
@@ -236,6 +237,57 @@ public sealed class CapabilityAuthority
             if (!_records.TryGetValue(id, out var record))
                 return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapabilityNotFound, $"Capability {id} does not exist.");
             return ValidateAndProject(record, subject, generation, requiredRights, expectedResourceGeneration);
+        }
+    }
+
+    internal KernelResult<ResourceUseConstraintV1> ValidateResourceUse(
+        CapabilityId id, DomainId subject, ulong subjectGeneration,
+        ulong expectedResourceGeneration, ResourceEnvelopeV1 requestedEnvelope)
+    {
+        lock (_gate)
+        {
+            if (!_records.TryGetValue(id, out var record))
+                return KernelResult<ResourceUseConstraintV1>.Fail(KernelError.CapabilityNotFound, "Resource-use grant does not exist.");
+            var live = ValidateRecord(record, subject, subjectGeneration, CapabilityRights.None, expectedResourceGeneration);
+            if (!live.IsSuccess)
+                return KernelResult<ResourceUseConstraintV1>.Fail(live.Error, live.Message!);
+            if (record.Constraints.ResourceUse is not { } grant)
+                return KernelResult<ResourceUseConstraintV1>.Fail(KernelError.InsufficientRights, "Capability has no resource-use grant.");
+            var now = _timeProvider.GetUtcNow().UtcTicks;
+            if (now < grant.NotBeforeUtcTicks || now >= grant.ExpiresUtcTicks)
+                return KernelResult<ResourceUseConstraintV1>.Fail(KernelError.DeadlineExpired, "Resource-use grant is outside its validity interval.");
+            ResourceUseConstraintV1 requested;
+            try
+            {
+                requested = grant with { Envelope = requestedEnvelope.Canonicalize() };
+            }
+            catch (Exception exception) when (exception is ArgumentException or NotSupportedException or OverflowException)
+            {
+                return KernelResult<ResourceUseConstraintV1>.Fail(KernelError.InvalidMessage, exception.Message);
+            }
+            return ResourceUseConstraintV1.IsSubset(requested, grant)
+                ? KernelResult<ResourceUseConstraintV1>.Ok(grant)
+                : KernelResult<ResourceUseConstraintV1>.Fail(KernelError.InsufficientRights, "Requested resource envelope exceeds the live grant.");
+        }
+    }
+
+    internal KernelResult<ResourceUseAuthorityLease> AcquireResourceUseAuthority(
+        CapabilityId id, DomainId subject, ulong subjectGeneration,
+        ulong expectedResourceGeneration, ResourceEnvelopeV1 requestedEnvelope)
+    {
+        lock (_gate)
+        {
+            var validation = ValidateResourceUse(id, subject, subjectGeneration,
+                expectedResourceGeneration, requestedEnvelope);
+            if (!validation.IsSuccess)
+                return KernelResult<ResourceUseAuthorityLease>.Fail(validation.Error, validation.Message!);
+            if (_nextOperationLeaseId == 0)
+                return KernelResult<ResourceUseAuthorityLease>.Fail(KernelError.CapacityExhausted,
+                    "Resource-use authority lease identity space is exhausted.");
+            var leaseId = new OperationAuthorityLeaseId(_nextOperationLeaseId++);
+            _operationLeases.Add(leaseId);
+            return KernelResult<ResourceUseAuthorityLease>.Ok(new ResourceUseAuthorityLease(
+                this, leaseId, id, subject, subjectGeneration, expectedResourceGeneration, validation.Value!));
         }
     }
 

@@ -79,6 +79,7 @@ public sealed partial class ServiceManifestV1
     private readonly PlatformRequirementV1[] _platformRequirements;
     private readonly ComponentResourceRequirementV1[] _resourceRequirements;
     private readonly ServiceBudgetRequestV1[] _budgetRequests;
+    private readonly SipResourceRequirementV1[] _resourceUseRequirements;
 
     public ServiceManifestV1(
         ComponentIdentity identity,
@@ -98,7 +99,8 @@ public sealed partial class ServiceManifestV1
         ServiceTelemetryPolicyV1? telemetryPolicy = null,
         ServiceCompatibilityConstraintsV1? compatibility = null,
         string schemaId = CurrentSchemaId,
-        int schemaVersion = CurrentSchemaVersion)
+        int schemaVersion = CurrentSchemaVersion,
+        IEnumerable<SipResourceRequirementV1>? resourceUseRequirements = null)
     {
         ArgumentNullException.ThrowIfNull(process);
         if (!string.Equals(schemaId, CurrentSchemaId, StringComparison.Ordinal)) throw new ArgumentException("Unsupported service manifest schema id.", nameof(schemaId));
@@ -211,6 +213,24 @@ public sealed partial class ServiceManifestV1
         if (_budgetRequests.Select(static request => request.Dimension).Distinct().Count() != _budgetRequests.Length)
             throw new ArgumentException("Budget dimensions must be unique.", nameof(budgetRequests));
 
+        _resourceUseRequirements = (resourceUseRequirements ?? [])
+            .OrderBy(static requirement => requirement.ResourceClass)
+            .ThenBy(static requirement => requirement.Unit)
+            .ThenBy(static requirement => requirement.SemanticScope, StringComparer.Ordinal)
+            .ToArray();
+        if (_resourceUseRequirements.Any(static requirement =>
+                requirement.Version != SipResourceRequirementV1.CurrentVersion ||
+                requirement.MaximumAmount == 0 || requirement.MaximumAmount == ulong.MaxValue ||
+                string.IsNullOrWhiteSpace(requirement.SemanticScope) ||
+                requirement.ResourceClass != ResourceClassV1.ComputeTime ||
+                requirement.Unit != ResourceUnitV1.Nanoseconds ||
+                !Enum.IsDefined(requirement.AssuranceCeiling) ||
+                !Enum.IsDefined(requirement.DonationPolicy)))
+            throw new ArgumentException("Manifest resource-use requirements must use the supported canonical P05 contour.", nameof(resourceUseRequirements));
+        if (_resourceUseRequirements.Select(static requirement =>
+                (requirement.ResourceClass, requirement.Unit, requirement.SemanticScope)).Distinct().Count() != _resourceUseRequirements.Length)
+            throw new ArgumentException("Manifest resource-use requirements must be unique by class, unit and semantic scope.", nameof(resourceUseRequirements));
+
         RestartPolicy = restartPolicy ?? ServiceRestartPolicyV1.Never;
         DrainPolicy = drainPolicy ?? ServiceDrainPolicyV1.Default;
         CheckpointPolicy = checkpointPolicy ?? ServiceCheckpointPolicyV1.Disabled;
@@ -240,6 +260,7 @@ public sealed partial class ServiceManifestV1
     public IReadOnlyList<PlatformRequirementV1> PlatformRequirements => _platformRequirements;
     public IReadOnlyList<ComponentResourceRequirementV1> ResourceRequirements => _resourceRequirements;
     public IReadOnlyList<ServiceBudgetRequestV1> BudgetRequests => _budgetRequests;
+    public IReadOnlyList<SipResourceRequirementV1> ResourceUseRequirements => _resourceUseRequirements;
     public ServiceRestartPolicyV1 RestartPolicy { get; }
     public ServiceDrainPolicyV1 DrainPolicy { get; }
     public ServiceCheckpointPolicyV1 CheckpointPolicy { get; }

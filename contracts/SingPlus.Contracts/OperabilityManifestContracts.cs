@@ -86,6 +86,7 @@ public enum ServiceBudgetDimension
     GuestMemoryBytes,
     CheckpointStorageBytes,
     TraceTelemetryBufferBytes,
+    ComputeTimeNanoseconds,
 }
 
 public readonly record struct ServiceBudgetRequestV1(ServiceBudgetDimension Dimension, ulong Limit);
@@ -105,6 +106,7 @@ public enum ManifestRequirementKind
     PlatformAuthorityDomain,
     Budget,
     Compatibility,
+    ResourceUse,
 }
 
 public enum ManifestRequirementDisposition

@@ -167,7 +167,8 @@ internal sealed record EffectiveCapabilityConstraints(
     TargetSubjectConstraint TargetSubject,
     SessionConstraint Session,
     DelegationDepthConstraint DelegationDepth,
-    QuotaConstraint Quota)
+    QuotaConstraint Quota,
+    ResourceUseConstraintV1? ResourceUse = null)
 {
     internal EffectiveCapabilityConstraints Canonicalize()
     {
@@ -178,7 +179,7 @@ internal sealed record EffectiveCapabilityConstraints(
             throw new ArgumentException("Operation set is not authorized by the capability rights.", nameof(Operations));
         return new(Schema, rights, Resource.Canonicalize(), operations,
             Range?.Canonicalize(), Lifetime.Canonicalize(), TargetSubject.Canonicalize(), Session.Canonicalize(),
-            DelegationDepth.Canonicalize(), Quota.Canonicalize());
+            DelegationDepth.Canonicalize(), Quota.Canonicalize(), ResourceUse?.Canonicalize());
     }
 
     internal static bool IsSubset(EffectiveCapabilityConstraints child, EffectiveCapabilityConstraints parent)
@@ -195,7 +196,10 @@ internal sealed record EffectiveCapabilityConstraints(
                    TargetSubjectConstraint.IsSubset(child.TargetSubject, parent.TargetSubject) &&
                    SessionConstraint.IsSubset(child.Session, parent.Session) &&
                    DelegationDepthConstraint.IsSubset(child.DelegationDepth, parent.DelegationDepth) &&
-                   QuotaConstraint.IsSubset(child.Quota, parent.Quota);
+                   QuotaConstraint.IsSubset(child.Quota, parent.Quota) &&
+                   (child.ResourceUse is null ||
+                    parent.ResourceUse is { } parentResourceUse &&
+                    ResourceUseConstraintV1.IsSubset(child.ResourceUse.Value, parentResourceUse));
         }
         catch (Exception exception) when (exception is ArgumentException or NotSupportedException or OverflowException) { return false; }
     }
@@ -214,6 +218,16 @@ internal sealed record EffectiveCapabilityConstraints(
         writer.Write(value.TargetSubject.DomainId is not null); if (value.TargetSubject.DomainId is { } target) writer.Write(target.Value); writer.Write(value.TargetSubject.Generation); writer.Write(value.TargetSubject.AllowsRetarget);
         writer.Write(value.Session.Session is not null); if (value.Session.Session is { } session) { writer.Write(session.SessionId.Value); writer.Write(session.Generation.Value); }
         writer.Write(value.DelegationDepth.RemainingDepth); writer.Write(value.Quota.Account.Value); writer.Write(value.Quota.PerHandleCeiling);
+        writer.Write(value.ResourceUse is not null);
+        if (value.ResourceUse is { } resourceUse)
+        {
+            writer.Write(resourceUse.Version); writer.Write(resourceUse.Envelope.Version);
+            writer.Write((byte)resourceUse.Envelope.Family); writer.Write((ushort)resourceUse.Envelope.ResourceClass);
+            writer.Write((byte)resourceUse.Envelope.Unit); writer.Write(resourceUse.Envelope.Amount);
+            writer.Write(resourceUse.Envelope.WindowNanoseconds); WriteString(writer, resourceUse.Envelope.SemanticScope);
+            writer.Write(resourceUse.NotBeforeUtcTicks); writer.Write(resourceUse.ExpiresUtcTicks);
+            writer.Write((byte)resourceUse.AssuranceCeiling); writer.Write(resourceUse.DelegationDepth);
+        }
         return stream.ToArray();
     }
 

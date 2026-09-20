@@ -44,6 +44,7 @@ public interface IConsoleService
     void SetMode(ConsoleMode mode);
 
     [Message(6), Transition("Ready", "Busy"), CancellationTransition("Busy", "Ready")]
+    [RequiresResource(1, ResourceClassV1.ComputeTime, ResourceUnitV1.Nanoseconds, 50, "host:compute-v1")]
     void Ping();
 
     [Message(7), Transition("Ready", "Ready")]
@@ -78,6 +79,8 @@ public interface IConsoleService
         Assert.Contains(first.Values, text => text.Contains("cancel=6|Busy|Ready", StringComparison.Ordinal));
         Assert.Contains(first.Values, text => text.Contains("ProtocolCancellationTransitionV1", StringComparison.Ordinal));
         Assert.Contains(first.Values, text => text.Contains("ContractDigest", StringComparison.Ordinal));
+        Assert.Contains(first.Values, text => text.Contains("Ping_Resource", StringComparison.Ordinal) && text.Contains("host:compute-v1", StringComparison.Ordinal));
+        Assert.Contains(first.Values, text => text.Contains("GeneratedSipResourceSentry.Enter", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -133,6 +136,30 @@ public interface IBadContract
         var diagnostics = RunDiagnostics(source);
 
         Assert.Contains(diagnostics, diagnostic => diagnostic.Id == expectedDiagnostic && diagnostic.Severity == DiagnosticSeverity.Error);
+    }
+
+    [Theory]
+    [InlineData("RequiresResource(2, ResourceClassV1.ComputeTime, ResourceUnitV1.Nanoseconds, 1, \"host:compute-v1\")")]
+    [InlineData("RequiresResource(1, ResourceClassV1.ComputeTime, ResourceUnitV1.Nanoseconds, 0, \"host:compute-v1\")")]
+    [InlineData("RequiresResource(1, ResourceClassV1.ComputeTime, ResourceUnitV1.Nanoseconds, 1, \"\")")]
+    [Trait("Category", "Generators")]
+    public void MalformedResourceRequirementsFailClosed(string attribute)
+    {
+        var source = $$"""
+using SingPlus.Contracts;
+using SingPlus.Sip.Sdk;
+namespace GeneratedTest;
+[SipContract]
+public interface IBadContract
+{
+    [Message(1), {{attribute}}]
+    void Bad();
+}
+""";
+
+        var diagnostics = RunDiagnostics(source);
+
+        Assert.Contains(diagnostics, diagnostic => diagnostic.Id == "SINGGEN012" && diagnostic.Severity == DiagnosticSeverity.Error);
     }
 
     [Fact]

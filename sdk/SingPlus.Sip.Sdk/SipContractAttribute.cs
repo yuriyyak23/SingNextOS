@@ -45,6 +45,25 @@ public sealed class RequiresCapabilityAttribute(ResourceKind resourceKind, strin
     public CapabilityRights Rights { get; } = rights;
 }
 
+[AttributeUsage(AttributeTargets.Method, AllowMultiple = false)]
+public sealed class RequiresResourceAttribute(
+    int version,
+    ResourceClassV1 resourceClass,
+    ResourceUnitV1 unit,
+    ulong maximumAmount,
+    string semanticScope,
+    ResourceAssuranceV1 assuranceCeiling = ResourceAssuranceV1.RuntimeEnforced,
+    SipResourceDonationPolicyV1 donationPolicy = SipResourceDonationPolicyV1.None) : Attribute
+{
+    public int Version { get; } = version;
+    public ResourceClassV1 ResourceClass { get; } = resourceClass;
+    public ResourceUnitV1 Unit { get; } = unit;
+    public ulong MaximumAmount { get; } = maximumAmount;
+    public string SemanticScope { get; } = semanticScope;
+    public ResourceAssuranceV1 AssuranceCeiling { get; } = assuranceCeiling;
+    public SipResourceDonationPolicyV1 DonationPolicy { get; } = donationPolicy;
+}
+
 [AttributeUsage(AttributeTargets.Parameter)]
 public sealed class ConsumesAttribute : Attribute;
 

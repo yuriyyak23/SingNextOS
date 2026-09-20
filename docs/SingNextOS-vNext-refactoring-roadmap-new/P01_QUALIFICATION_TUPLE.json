@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "phase": "P01",
+  "claim": "ModelOnly",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "b86cc33c16a77760c6971cc1a656c34b6cf2a10d",
+  "runtimeProfile": "host-JIT",
+  "initialResourceClass": "ComputeTime",
+  "canonicalUnit": "Nanoseconds",
+  "enabledFeatureGates": [],
+  "tests": [
+    { "lane": "P01-focused", "passed": 11, "failed": 0, "skipped": 0 },
+    { "lane": "P01-capability-budget-regression", "passed": 32, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui", "passed": 1579, "failed": 9, "skipped": 2, "disposition": "same pre-existing failures recorded by P00" }
+  ],
+  "builds": [
+    { "target": "contracts/SingPlus.Contracts/SingPlus.Contracts.csproj", "warnings": 0, "errors": 0 },
+    { "target": "SingNextOS.slnx", "warnings": 0, "errors": 0 }
+  ],
+  "exclusions": [
+    "no live CapabilityAuthority resource grant",
+    "no lease/reservation/settlement state machine",
+    "no enabled gate",
+    "no provider or NativeAOT qualification",
+    "no ISA, QEMU, firmware, CXL boot, or hardware claim"
+  ]
+}

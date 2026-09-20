@@ -110,6 +110,11 @@ public sealed partial class RuntimeKernel
             decisions.Add(new(ManifestRequirementKind.Budget, $"{budget.Dimension}:{budget.Limit}", ManifestRequirementCriticality.Mandatory,
                 ManifestRequirementDisposition.Requested, "Budget request requires exact generation-bound allocation by the budget ledger during admission."));
 
+        foreach (var resource in manifest.ResourceUseRequirements)
+            decisions.Add(new(ManifestRequirementKind.ResourceUse, resource.CanonicalIdentity,
+                ManifestRequirementCriticality.Mandatory, ManifestRequirementDisposition.Requested,
+                "Resource-use metadata is declarative only; generated sentry must resolve live capability and budget owners."));
+
         var degraded = decisions.Any(static decision => decision.Criticality == ManifestRequirementCriticality.Optional && decision.Disposition != ManifestRequirementDisposition.Granted);
         return new(new(manifest.NormalizedDigest, degraded ? ManifestAdmissionDisposition.Degraded : ManifestAdmissionDisposition.Granted, decisions.ToArray()));
     }

@@ -44,6 +44,33 @@ internal sealed class OperationAuthorityLease : IDisposable
     public void Dispose() => Interlocked.Exchange(ref _owner, null)?.ReleaseOperationAuthority(Id);
 }
 
+internal sealed class ResourceUseAuthorityLease : IDisposable
+{
+    private CapabilityAuthority? _owner;
+
+    internal ResourceUseAuthorityLease(CapabilityAuthority owner, OperationAuthorityLeaseId id,
+        CapabilityId capability, DomainId subject, ulong subjectGeneration,
+        ulong resourceGeneration, ResourceUseConstraintV1 grant)
+    {
+        _owner = owner;
+        Id = id;
+        Capability = capability;
+        Subject = subject;
+        SubjectGeneration = subjectGeneration;
+        ResourceGeneration = resourceGeneration;
+        Grant = grant;
+    }
+
+    internal OperationAuthorityLeaseId Id { get; }
+    internal CapabilityId Capability { get; }
+    internal DomainId Subject { get; }
+    internal ulong SubjectGeneration { get; }
+    internal ulong ResourceGeneration { get; }
+    internal ResourceUseConstraintV1 Grant { get; }
+
+    public void Dispose() => Interlocked.Exchange(ref _owner, null)?.ReleaseOperationAuthority(Id);
+}
+
 internal readonly record struct EffectAdmissionAttemptId(ulong Value);
 
 internal sealed class EffectAdmissionLease : IDisposable

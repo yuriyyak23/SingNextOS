@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "phase": "P02",
+  "claim": "RuntimeEnforced",
+  "contour": "internal CapabilityAuthority host-JIT resource-use grant validation",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "b86cc33c16a77760c6971cc1a656c34b6cf2a10d",
+  "enabledFeatureGates": [],
+  "tests": [
+    { "lane": "P02-focused", "passed": 6, "failed": 0, "skipped": 0 },
+    { "lane": "P02-capability-regression", "passed": 39, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui", "passed": 1585, "failed": 9, "skipped": 2, "disposition": "same pre-existing failures recorded by P00" }
+  ],
+  "build": { "target": "SingNextOS.slnx", "warnings": 0, "errors": 0 },
+  "exclusions": [
+    "no public or SIP resource admission",
+    "no quantitative reservation or lease",
+    "resource grant gate remains OFF",
+    "no provider, NativeAOT, hardware, or production qualification"
+  ]
+}

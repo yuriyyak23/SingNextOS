@@ -23,6 +23,7 @@ public sealed partial class ServiceManifestV1
             WritePlatformRequirements(writer);
             WriteResourceRequirements(writer);
             WriteBudgets(writer);
+            if (_resourceUseRequirements.Length != 0) WriteResourceUseRequirements(writer);
             WritePolicies(writer);
             writer.WriteEndObject();
         }
@@ -81,6 +82,18 @@ public sealed partial class ServiceManifestV1
     {
         writer.WritePropertyName(nameof(BudgetRequests)); writer.WriteStartArray();
         foreach (var item in _budgetRequests) { writer.WriteStartArray(); writer.WriteNumberValue((int)item.Dimension); writer.WriteNumberValue(item.Limit); writer.WriteEndArray(); }
+        writer.WriteEndArray();
+    }
+
+    private void WriteResourceUseRequirements(Utf8JsonWriter writer)
+    {
+        writer.WritePropertyName(nameof(ResourceUseRequirements)); writer.WriteStartArray();
+        foreach (var item in _resourceUseRequirements)
+        {
+            writer.WriteStartArray(); writer.WriteNumberValue(item.Version); writer.WriteNumberValue((int)item.ResourceClass);
+            writer.WriteNumberValue((int)item.Unit); writer.WriteNumberValue(item.MaximumAmount); writer.WriteStringValue(item.SemanticScope);
+            writer.WriteNumberValue((int)item.AssuranceCeiling); writer.WriteNumberValue((int)item.DonationPolicy); writer.WriteEndArray();
+        }
         writer.WriteEndArray();
     }
 

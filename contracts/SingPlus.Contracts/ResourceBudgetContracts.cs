@@ -51,8 +51,15 @@ public enum BudgetPressureState
 public enum BudgetReservationState
 {
     Active = 0,
-    Released,
-    Stale,
+    Reserved = Active,
+    Bound = 1,
+    Consuming = 2,
+    Settling = 3,
+    Released = 4,
+    CancelledPreSubmit = 5,
+    Quarantined = 6,
+    Reconciled = 7,
+    Stale = 8,
 }
 
 public readonly record struct BudgetAmount(ServiceBudgetDimension Dimension, ulong Amount);
@@ -82,7 +89,8 @@ public sealed record BudgetReservationSnapshot(
     BudgetReservationLifetime Lifetime,
     AdmissionQosHint QosHint,
     BudgetReservationState State,
-    uint ContractVersion = ResourceBudgetContract.Version)
+    uint ContractVersion = ResourceBudgetContract.Version,
+    IReadOnlyList<BudgetAmount>? ChargedAmounts = null)
 {
     public bool AuthorizesEffect => false;
     public bool AuthorizesReclaim => false;
