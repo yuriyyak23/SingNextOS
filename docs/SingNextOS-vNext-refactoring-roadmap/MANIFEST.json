@@ -1,0 +1,119 @@
+{
+  "title": "SingNextOS vNext refactoring roadmap",
+  "baseline": {
+    "SingNextOS": "386e247e37f4e252d1bf4fda80a57b49858fb788",
+    "HybridCPU-v2": "794c4a53494f503855ac8cf209efab23fde083b2"
+  },
+  "files": [
+    {
+      "file": "PHASE_VNEXT_00_ARCHITECTURAL_FREEZE.md",
+      "bytes": 4211,
+      "sha256": "188a666b16bed339ad242222088777799cfc9a9e99d0344e72fdeac133a73556"
+    },
+    {
+      "file": "PHASE_VNEXT_01_AUTHORITY_ALGEBRA_AND_RESOURCE_TAXONOMY.md",
+      "bytes": 2410,
+      "sha256": "cbadd1afc6df327706b64646a22cb33758080a3dbf9f91b529c1b0221b60b5b3"
+    },
+    {
+      "file": "PHASE_VNEXT_02_ACCOUNTING_AUTHORITY_SPLIT.md",
+      "bytes": 1991,
+      "sha256": "f96ba30484cb98a17eed6f18a3f872e6418ae772dbbc3de31a55d52ee7aff022"
+    },
+    {
+      "file": "PHASE_VNEXT_03_TEMPORAL_RESOURCE_AUTHORITY_CORE.md",
+      "bytes": 2032,
+      "sha256": "e7b07e3449ce09073634e925cf5de79314fc39cee592d4ece002ca511df004a0"
+    },
+    {
+      "file": "PHASE_VNEXT_04_RESOURCE_LEASE_RESERVATION_SETTLEMENT.md",
+      "bytes": 1651,
+      "sha256": "71f4576d50c0155ea624bd596be11b5c77fb7a7730da6e3e6837897b137ab6b8"
+    },
+    {
+      "file": "PHASE_VNEXT_05_SIP_AND_MANIFEST_RESOURCE_CONTRACTS.md",
+      "bytes": 1796,
+      "sha256": "96d7b588edb04a75eeb2320ac8e4c53719743c00829bd94dc29e50c36b9186a9"
+    },
+    {
+      "file": "PHASE_VNEXT_06_ENDPOINTSESSION_RESOURCE_DONATION.md",
+      "bytes": 1902,
+      "sha256": "fa2f6296e4466c7c462f6862ebb145a5a024a6ba51f47490815c23ad5b5b3a7d"
+    },
+    {
+      "file": "PHASE_VNEXT_07_EXTERNAL_OPERATION_RESOURCE_BINDING.md",
+      "bytes": 1860,
+      "sha256": "d10013fc833bb047620d33e3d76e9608dbf9f1f5f3c426b81e32c8b9d6850f2e"
+    },
+    {
+      "file": "PHASE_VNEXT_08_COMPUTE_PLANNING_V2.md",
+      "bytes": 1814,
+      "sha256": "a1a7fcdf383962fc9dca61d7563256e3e848da410cd2aaa7e8f20afb37ee7902"
+    },
+    {
+      "file": "PHASE_VNEXT_09_HYBRIDCPU_CO_DESIGN_INTEGRATION.md",
+      "bytes": 2941,
+      "sha256": "3de84f1ab5917b051c112c78a392298bc1d4d091024118f43182f2adf12831f1"
+    },
+    {
+      "file": "PHASE_VNEXT_10_RESOURCE_SCHEDULER_AND_PROVIDER_AGENTS.md",
+      "bytes": 1554,
+      "sha256": "e01016f4b4e8ed016677af25d42b4df2725e487294398c5ee2d5d96ed6a64a10"
+    },
+    {
+      "file": "PHASE_VNEXT_11_TEMPORAL_ISOLATION_DEADLINES_PREEMPTION.md",
+      "bytes": 1822,
+      "sha256": "226e27992e06333017dff7db02e85681309f23db4571e581ec2a30781116309f"
+    },
+    {
+      "file": "PHASE_VNEXT_12_SIPJOB_RESOURCE_AWARE_COMPOSITION.md",
+      "bytes": 1963,
+      "sha256": "a31cf6272ea421eaa595a0fd9b35499be072868bef989b412862fdf73c9833da"
+    },
+    {
+      "file": "PHASE_VNEXT_13_IO_FABRIC_AND_OCCUPANCY_RESOURCE_CLASSES.md",
+      "bytes": 1620,
+      "sha256": "70ac0c7bbf0490136661f6e7cc7f3a5b61ec17b2fafc4b04f497114b79f8020e"
+    },
+    {
+      "file": "PHASE_VNEXT_14_RESTART_CHECKPOINT_AND_RECONCILIATION.md",
+      "bytes": 1626,
+      "sha256": "e3483a1eaa307350092267d09bb1c7f5fc252fd99b75f0638d1323892e309cd5"
+    },
+    {
+      "file": "PHASE_VNEXT_15_OBSERVABILITY_AUDIT_AND_TELEMETRY.md",
+      "bytes": 1541,
+      "sha256": "4213ee1f845e88a28837fa43abf2e22e229cf77b64d9307af8590f1f498238eb"
+    },
+    {
+      "file": "PHASE_VNEXT_16_QUALIFICATION_PERFORMANCE_AND_CLAIMS.md",
+      "bytes": 1925,
+      "sha256": "1783e3bafada3f35894b02c93162372918b5f2f09b9ca9e7cc18a1ebdafa5420"
+    },
+    {
+      "file": "PHASE_VNEXT_17_MIGRATION_CLEANUP_AND_CUTOVER.md",
+      "bytes": 1814,
+      "sha256": "ebf2a78284499810f8b9f2bbc0f896a1317eb15f60121c22fe63fc64b039ee20"
+    },
+    {
+      "file": "README.md",
+      "bytes": 9410,
+      "sha256": "3f42aa88b6e51ebf3c97cd05b81ca158ac32010dedf6505397d7a62ccd9d0e5d"
+    },
+    {
+      "file": "TRACEABILITY_MATRIX.md",
+      "bytes": 2088,
+      "sha256": "edd2ec8e706a87999defc8f9a73440442c7977ea15a656b40f76efa49b3827ac"
+    },
+    {
+      "file": "VNEXT_FEATURE_GATES.md",
+      "bytes": 2269,
+      "sha256": "38ab8e3f8593bd63b64620c0eb39276bb0bef96204004f196b9a83278bcc6fd7"
+    },
+    {
+      "file": "VNEXT_NORMATIVE_INVARIANTS.md",
+      "bytes": 9193,
+      "sha256": "14432e1bbfaa5d49cd9cf2f28c555b71637903943cb7102ad1856ba62eccfeee"
+    }
+  ]
+}
