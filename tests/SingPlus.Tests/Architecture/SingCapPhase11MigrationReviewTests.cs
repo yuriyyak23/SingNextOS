@@ -8,7 +8,7 @@ public sealed class SingCapPhase11MigrationReviewTests
     public void ConfusedDeputyReviewIsCompleteAndDeterministicForMigratedFamilies()
     {
         var root = FindRepositoryRoot();
-        using var document = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(root, "docs", "SingCap-Refactoring", "roadmap", "P11_CONFUSED_DEPUTY_REVIEW.json")));
+        using var document = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(root, "docs", "Completed", "SingCap-Refactoring", "roadmap", "P11_CONFUSED_DEPUTY_REVIEW.json")));
         var model = document.RootElement;
         Assert.Equal("singcap-confused-deputy-review-v1", model.GetProperty("schema").GetString());
         var methods = model.GetProperty("methods").EnumerateArray().ToArray();

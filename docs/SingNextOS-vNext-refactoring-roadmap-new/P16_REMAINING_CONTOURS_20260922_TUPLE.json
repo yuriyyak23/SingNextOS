@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "phase": "P16",
+  "phaseDisposition": "Open",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "executionHead": "1890a8e921cfe903b5b44857e4661168bf7bbceb",
+  "claim": "StaticAdmission",
+  "productionQualified": false,
+  "p17MayStart": false,
+  "enabledFeatureGates": [],
+  "isaChangeCategory": [],
+  "artifacts": [
+    {
+      "path": "docs/SingNextOS-vNext-refactoring-roadmap-new/P16_REMAINING_CONTOURS_20260922.json",
+      "bytes": 4604,
+      "sha256": "65a78134950466283b11c5d2a27e953ac6568dafac6f1a328a023bc3fe19121d"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Architecture/VNextPhase16RemainingContourTests.cs",
+      "bytes": 5016,
+      "sha256": "3f16570c51e54b6514198265e5dca5075a18334e1dfa3486a259f322087ab995"
+    },
+    {
+      "path": ".packages/HybridCPU.ExternalRuntime.Contracts.1.14.0.nupkg",
+      "bytes": 74244,
+      "sha256": "b96e99bda066ee585b26a11cbfa7b68ce6bf44fc0006679483ccc1a4eeb678c2"
+    },
+    {
+      "path": "src/Runtime/SingPlus.Runtime/VNext/VNextFeatureGates.cs",
+      "bytes": 3072,
+      "sha256": "51f285e0a2c6e8cec0f7e84947daa5ef76a5234a18425614bdb0bc40162756c3"
+    },
+    {
+      "path": "src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetAuthority.cs",
+      "bytes": 28987,
+      "sha256": "e5e81623fbedd5745ea63bb6a5399c621c7f8b31fb6dc32ec5e9058042b34769"
+    },
+    {
+      "path": "src/Runtime/SingPlus.Runtime/Checkpointing/RuntimeKernel.Checkpointing.cs",
+      "bytes": 27344,
+      "sha256": "0f2796559a4d9517fade938c34542e006e7e136b97ead9fd4ccee78c7fab9950"
+    },
+    {
+      "path": "docs/SingNextOS-vNext-refactoring-roadmap-new/EVIDENCE_P09_HYBRIDCPU_PROVIDER_NEUTRAL_INTEGRATION.md",
+      "bytes": 5093,
+      "sha256": "62965f4c0e9b56eec4fd70de51280314317f69152f932b49dc028b76afa3a542"
+    },
+    {
+      "path": "docs/SingNextOS-vNext-refactoring-roadmap-new/PHASE_VNEXT_14_RESTART_CHECKPOINT_AND_RECONCILIATION.md",
+      "bytes": 2718,
+      "sha256": "91aff0cceebdf893cb0213c7965eb80679efc0cad84d40628cf576ae33fb28f6"
+    }
+  ],
+  "exclusions": [
+    "missing contracts and execution environments are not implemented by this tuple",
+    "package presence is not provider execution or source-SHA verification",
+    "all gates remain OFF",
+    "no ProductionQualified claim"
+  ]
+}

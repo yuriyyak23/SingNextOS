@@ -8,7 +8,8 @@ public sealed class HybridBootQualificationMatrixTests
     public void MatrixCoversT001ThroughT050WithoutUnsupportedClaims()
     {
         var root = FindRoot();
-        var path = Path.Combine(root, "docs", "HybridCPU-v2-Boot-Reset-CXL-Boot-ABI-Roadmap", "QUALIFICATION_CLAIM_MATRIX.json");
+        var roadmap = Path.Combine(root, "docs", "Completed", "HybridCPU-v2-Boot-Reset-CXL-Boot-ABI-Roadmap");
+        var path = Path.Combine(roadmap, "QUALIFICATION_CLAIM_MATRIX.json");
         using var document = JsonDocument.Parse(File.ReadAllText(path));
         var rootElement = document.RootElement;
         Assert.Equal("ExcludedByUser", rootElement.GetProperty("qemuDirection").GetString());
@@ -34,7 +35,7 @@ public sealed class HybridBootQualificationMatrixTests
         Assert.All(scenarios, item =>
         {
             var evidence = item.GetProperty("evidence").GetString()!;
-            Assert.True(File.Exists(Path.Combine(root, "docs", "HybridCPU-v2-Boot-Reset-CXL-Boot-ABI-Roadmap", evidence)),
+            Assert.True(File.Exists(Path.Combine(roadmap, evidence)),
                 $"{item.GetProperty("id").GetString()} evidence path does not exist: {evidence}");
         });
     }

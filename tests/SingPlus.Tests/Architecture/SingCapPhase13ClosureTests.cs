@@ -112,7 +112,7 @@ public sealed class SingCapPhase13ClosureTests
     }
 
     private static JsonDocument Read(string name) => JsonDocument.Parse(File.ReadAllBytes(
-        Path.Combine(RepositoryRoot(), "docs", "SingCap-Refactoring", "roadmap", name)));
+        Path.Combine(RepositoryRoot(), "docs", "Completed", "SingCap-Refactoring", "roadmap", name)));
 
     private static string RepositoryRoot()
     {

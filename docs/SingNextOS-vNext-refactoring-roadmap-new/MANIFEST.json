@@ -276,8 +276,8 @@
     },
     {
       "file": "PHASE_VNEXT_16_QUALIFICATION_PERFORMANCE_AND_CLAIMS.md",
-      "bytes": 2684,
-      "sha256": "f3ea419471c42037caf73ccf7c2867ea98505052767d2546e3c877a135d27ed7"
+      "bytes": 4417,
+      "sha256": "0f7170d9827953ad6420208ffe85b71301558b5f3936526bde41fae87fc3e911"
     },
     {
       "file": "PHASE_VNEXT_17_MIGRATION_CLEANUP_AND_CUTOVER.md",
@@ -296,13 +296,13 @@
     },
     {
       "file": "TRACEABILITY_MATRIX.md",
-      "bytes": 2759,
-      "sha256": "8f6bb9b01e90de8d7e7105cd24a883b26e729e38f7126324d4efe9d3c5aea187"
+      "bytes": 23548,
+      "sha256": "627367026e2df44244769314b21c065c7fe3cbac9f4e42f68aa0c548c2546006"
     },
     {
       "file": "VNEXT_TRACEABILITY.json",
-      "bytes": 11584,
-      "sha256": "a670a2d037abfd32f3674310f5e8d82e58df6e2e4f4e95901fbf6b3906826a88"
+      "bytes": 27240,
+      "sha256": "22d8ba16336592269f36877cdf00970ffa5cd48ef6f918dda7c28d85ce6816a6"
     },
     {
       "file": "VNEXT_FEATURE_GATES.md",
@@ -313,6 +313,56 @@
       "file": "VNEXT_NORMATIVE_INVARIANTS.md",
       "bytes": 7876,
       "sha256": "06a0e395bf69f846dbdaed621127dc2a09c0650e3869e5d50d30e161e7212f0c"
+    },
+    {
+      "file": "P16_REVALIDATION_20260921.md",
+      "bytes": 8699,
+      "sha256": "8659976666301f4ab6697e6e02553e609e682c181ea23f3e4cef9b6dfc8bb9f9"
+    },
+    {
+      "file": "P16_REVALIDATION_20260921_TUPLE.json",
+      "bytes": 17101,
+      "sha256": "e1cdd3f8912dff30f301c47e9cec7a2d0acbedd6179bec6c08742d187ba84a77"
+    },
+    {
+      "file": "P16_RESOURCE_BUDGET_PERFORMANCE_20260922.md",
+      "bytes": 7245,
+      "sha256": "ba0696a6c781f152530ee2de4921f6ae55165149ccca4193ab41399847607714"
+    },
+    {
+      "file": "P16_RESOURCE_BUDGET_PERFORMANCE_20260922.json",
+      "bytes": 12703,
+      "sha256": "36ab385a893337727178f7725a3d336d8371ad43a8fa56faea53ec3c3c2da917"
+    },
+    {
+      "file": "P16_RESOURCE_BUDGET_PERFORMANCE_20260922_TUPLE.json",
+      "bytes": 2352,
+      "sha256": "91c63c730e9ace3d0fa7970ab83a1f8d54668f24d61b312f7e32c8ce079af845"
+    },
+    {
+      "file": "P16_FULL_SUITE_REMEDIATION_20260922.md",
+      "bytes": 3936,
+      "sha256": "0589fc3bf83a5a17a55a39be001aef683ec9b9a953385eabe998d27ae2a0368e"
+    },
+    {
+      "file": "P16_FULL_SUITE_REMEDIATION_20260922_TUPLE.json",
+      "bytes": 2154,
+      "sha256": "5d135ba251436bec7a10d0128545841506c4ab88bcdf649a60f705c55f97586d"
+    },
+    {
+      "file": "P16_REMAINING_CONTOURS_20260922.json",
+      "bytes": 4604,
+      "sha256": "65a78134950466283b11c5d2a27e953ac6568dafac6f1a328a023bc3fe19121d"
+    },
+    {
+      "file": "P16_REMAINING_CONTOURS_20260922.md",
+      "bytes": 4198,
+      "sha256": "722434c55eef19ec67261ac3ba3935db9efe8705d65de51430ae7a8bc1fa6adb"
+    },
+    {
+      "file": "P16_REMAINING_CONTOURS_20260922_TUPLE.json",
+      "bytes": 2300,
+      "sha256": "4918980e264fa528fba9f3f4f3454941df7ad312d93c299b14941b0e259305a6"
     }
   ]
 }

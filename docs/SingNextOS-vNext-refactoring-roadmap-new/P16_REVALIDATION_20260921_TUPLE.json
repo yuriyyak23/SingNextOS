@@ -1,0 +1,374 @@
+{
+  "schemaVersion": 1,
+  "phase": "P16",
+  "phaseDisposition": "Open",
+  "claim": "StaticAdmission",
+  "productionQualified": false,
+  "p17MayStart": false,
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "phaseEntryHead": "1890a8e921cfe903b5b44857e4661168bf7bbceb",
+  "reviewedHead": "1890a8e921cfe903b5b44857e4661168bf7bbceb",
+  "entryDirtyWorktree": [],
+  "observedDirtyWorktree": [
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/EVIDENCE_P14_0_ARCHITECTURAL_FREEZE.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/EVIDENCE_P14_1_PLAN_VERIFIER.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/EVIDENCE_P14_2_DIRECT_SENTRY.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/EVIDENCE_P14_3_REGION_EDGES.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/EVIDENCE_P14_4_COMPOSED_ADMISSION.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/EVIDENCE_P14_5A_BARRIERS.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/EVIDENCE_P14_5B_ASYNC.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/EVIDENCE_P14_5C_READONLY_DAG.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/EVIDENCE_P14_5D_PARALLEL_DAG.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/EVIDENCE_P14_6_DYNAMIC_BINDING_CACHE.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/EVIDENCE_P14_7_PROVIDER_SCHEDULING.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/EVIDENCE_P14_8_QUALIFICATION.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/FEATURE_GATES.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/P14_CLAIM_TRACEABILITY.json",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/P14_CLAIM_TRACEABILITY.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/P14_QUALIFICATION_TUPLE.json",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/PHASE_14_0_ARCHITECTURAL_FREEZE.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/PHASE_14_1_PLAN_AND_GRAPH_VERIFIER.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/PHASE_14_2_DIRECT_GENERATED_SENTRY_PATH.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/PHASE_14_3_REGION_AND_OWNERSHIP_EDGES.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/PHASE_14_4_COMPOSED_ADMISSION_AND_SEGMENTS.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/PHASE_14_5_FUSION_BARRIERS_ASYNC_AND_DAG.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/PHASE_14_6_DYNAMIC_BINDING_AND_PLAN_CACHE.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/PHASE_14_7_HYBRIDCPU_SCHEDULING_INTEGRATION.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/PHASE_14_8_QUALIFICATION_PERFORMANCE_AND_CLAIMS.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/README.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/SIPJOB_NORMATIVE_INVARIANTS.md",
+    " D docs/SingNextOS-post-SingCap-M-SipJob-roadmap/TRACEABILITY_AND_CI_GATES.md",
+    " M docs/SingNextOS-vNext-refactoring-roadmap-new/PHASE_VNEXT_16_QUALIFICATION_PERFORMANCE_AND_CLAIMS.md",
+    " M docs/SingNextOS-vNext-refactoring-roadmap-new/TRACEABILITY_MATRIX.md",
+    " M docs/SingNextOS-vNext-refactoring-roadmap-new/VNEXT_TRACEABILITY.json",
+    " M tests/SingPlus.Tests/Architecture/VNextPhase16QualificationClosureTests.cs",
+    "?? docs/Completed/SingNextOS-post-SingCap-M-SipJob-roadmap/",
+    "?? docs/SingNextOS-vNext-refactoring-roadmap-new/P16_REVALIDATION_20260921.md",
+    "?? docs/singnextos_semantic_codesign_refactoring/",
+    "?? eng/qualify-vnext.ps1",
+    "?? tests/SingPlus.Tests/Architecture/VNextTraceabilityPolicy.cs"
+  ],
+  "parallelChanges": "SipJob roadmap move to docs/Completed and docs/singnextos_semantic_codesign_refactoring appeared after clean entry; neither changed by this iteration",
+  "runtime": {
+    "os": "Windows 10.0.26200",
+    "rid": "win-x64",
+    "sdk": "11.0.100-rc.1.26425.128",
+    "runtime": "11.0.0-rc.1.26425.128",
+    "mode": "JIT",
+    "configuration": "Debug",
+    "targetFramework": "net11.0"
+  },
+  "contractPackage": {
+    "id": "HybridCPU.ExternalRuntime.Contracts",
+    "version": "1.14.0",
+    "locallyRehashed": true,
+    "sourceShaAvailable": false,
+    "hybridCpuReferenceSha": "794c4a53494f503855ac8cf209efab23fde083b2",
+    "hybridCpuReferenceLocallyVerified": false
+  },
+  "enabledFeatureGates": [],
+  "isaChangeCategory": [],
+  "artifacts": [
+    {
+      "path": ".packages/HybridCPU.ExternalRuntime.Contracts.1.14.0.nupkg",
+      "bytes": 74244,
+      "sha256": "b96e99bda066ee585b26a11cbfa7b68ce6bf44fc0006679483ccc1a4eeb678c2"
+    },
+    {
+      "path": "contracts/SingPlus.Contracts/ComputePlanning.cs",
+      "bytes": 3306,
+      "sha256": "38dd7891c6ee26aa24613bbe73d39fed6bb832eb21212b4b8d9daf4bc1e409f7"
+    },
+    {
+      "path": "contracts/SingPlus.Contracts/ResourceBudgetContracts.cs",
+      "bytes": 2515,
+      "sha256": "b93f59e8de3b020cd79d7402eed11220271adead46ec08c9fafa432b010f37d9"
+    },
+    {
+      "path": "contracts/SingPlus.Contracts/ResourceControlModelContracts.cs",
+      "bytes": 5717,
+      "sha256": "31709569182f6c25f12323c30ab45c4cfd605035ace2c187cd3964246969f39d"
+    },
+    {
+      "path": "docs/SingNextOS-vNext-refactoring-roadmap-new/TRACEABILITY_MATRIX.md",
+      "bytes": 23548,
+      "sha256": "627367026e2df44244769314b21c065c7fe3cbac9f4e42f68aa0c548c2546006"
+    },
+    {
+      "path": "docs/SingNextOS-vNext-refactoring-roadmap-new/VNEXT_FEATURE_GATES.md",
+      "bytes": 3021,
+      "sha256": "17a86a3e4fd46307b6142c89676a47630e409724c9d7704eeeea2c928f942606"
+    },
+    {
+      "path": "docs/SingNextOS-vNext-refactoring-roadmap-new/VNEXT_NORMATIVE_INVARIANTS.md",
+      "bytes": 7876,
+      "sha256": "06a0e395bf69f846dbdaed621127dc2a09c0650e3869e5d50d30e161e7212f0c"
+    },
+    {
+      "path": "docs/SingNextOS-vNext-refactoring-roadmap-new/VNEXT_TRACEABILITY.json",
+      "bytes": 27240,
+      "sha256": "22d8ba16336592269f36877cdf00970ffa5cd48ef6f918dda7c28d85ce6816a6"
+    },
+    {
+      "path": "eng/qualify-vnext.ps1",
+      "bytes": 1099,
+      "sha256": "60e7eaac27d5a4a1f732d8f31b204c1035a2c79cba21555eeefc094ef6b7cf72"
+    },
+    {
+      "path": "global.json",
+      "bytes": 119,
+      "sha256": "dd2617fe4c874c0be849eb83b3c665b584c47d736ba4149109b4ae17add13fe8"
+    },
+    {
+      "path": "src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetAuthority.cs",
+      "bytes": 28987,
+      "sha256": "e5e81623fbedd5745ea63bb6a5399c621c7f8b31fb6dc32ec5e9058042b34769"
+    },
+    {
+      "path": "src/Runtime/SingPlus.Runtime/Capabilities/CapabilityAuthority.cs",
+      "bytes": 37580,
+      "sha256": "33ef29bf98dca99f6b8742495f0bf849323b6a821f39f1fe70b7ad7e1017d3a0"
+    },
+    {
+      "path": "src/Runtime/SingPlus.Runtime/Checkpointing/RuntimeKernel.Checkpointing.cs",
+      "bytes": 27344,
+      "sha256": "0f2796559a4d9517fade938c34542e006e7e136b97ead9fd4ccee78c7fab9950"
+    },
+    {
+      "path": "src/Runtime/SingPlus.Runtime/ExternalOperations/ExternalOperationAuthority.cs",
+      "bytes": 30076,
+      "sha256": "b807352cfee7cc21c3af61f08faa1e83157560e0d2c66e891754d32d38ce8d15"
+    },
+    {
+      "path": "src/Runtime/SingPlus.Runtime/packages.lock.json",
+      "bytes": 990,
+      "sha256": "f225c39fadb4401c09472936a8176fc9cbde9dc926d9415ef15c2b55e5b60f69"
+    },
+    {
+      "path": "src/Runtime/SingPlus.Runtime/Regions/RegionAuthority.cs",
+      "bytes": 41700,
+      "sha256": "d045b5ada7038cdeb3a51fb5e8f165fbb01296d0fc4174922841525a75983bb5"
+    },
+    {
+      "path": "src/Runtime/SingPlus.Runtime/SingPlus.Runtime.csproj",
+      "bytes": 924,
+      "sha256": "f0333f0a014d9aa1c0401675a5d9f731a80864f9bc206235a12a48d85072385d"
+    },
+    {
+      "path": "src/Runtime/SingPlus.Runtime/SipJobs/SipJobBarrierPlanner.cs",
+      "bytes": 2178,
+      "sha256": "09c1f3c4adb51e45215e28be2c22d8d9f100531b5f16651710240290d5cc3d4d"
+    },
+    {
+      "path": "src/Runtime/SingPlus.Runtime/Tracing/TraceReplayEngine.cs",
+      "bytes": 3042,
+      "sha256": "27abdf9324b95fed9ec64d2df3a7ceb12534cda5db869f708c4e840505f11f53"
+    },
+    {
+      "path": "src/Runtime/SingPlus.Runtime/VNext/ComputePlanResourceAdmission.cs",
+      "bytes": 2530,
+      "sha256": "654adddeb67479221d2d8f4bc806d0db886b7c3b1d7c978061246b9567c34288"
+    },
+    {
+      "path": "src/Runtime/SingPlus.Runtime/VNext/ExternalOperationResourceBinding.cs",
+      "bytes": 14295,
+      "sha256": "8de914385b48c57874ce24935b2bafb47d3ed36334b44c944f55b685a48076cc"
+    },
+    {
+      "path": "src/Runtime/SingPlus.Runtime/VNext/ResourceAdmissionProtocol.cs",
+      "bytes": 17738,
+      "sha256": "afe71e3a5c7d1849a41903f61a796d1d1e2fd5420a3e9dbebdeeadfc9f388994"
+    },
+    {
+      "path": "src/Runtime/SingPlus.Runtime/VNext/ResourceDonationProtocol.cs",
+      "bytes": 15914,
+      "sha256": "ec090c55b965a95a5efc1dc631b870cb05d67011d64ecc36f32c5b85b8ea043c"
+    },
+    {
+      "path": "src/Runtime/SingPlus.Runtime/VNext/ResourceScheduler.cs",
+      "bytes": 4621,
+      "sha256": "44edb5a8bee5645bd8cdcda34121d8dea45f5e9d63aa30a67cfa792a13134746"
+    },
+    {
+      "path": "src/Runtime/SingPlus.Runtime/VNext/VNextFeatureGates.cs",
+      "bytes": 3072,
+      "sha256": "51f285e0a2c6e8cec0f7e84947daa5ef76a5234a18425614bdb0bc40162756c3"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Architecture/VNextPhase00ArchitecturalFreezeTests.cs",
+      "bytes": 7244,
+      "sha256": "f674e0e3d0087e3ae2e7d97226881fdfab889cef26420d554829b9b1c9871d7a"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Architecture/VNextPhase16QualificationClosureTests.cs",
+      "bytes": 11176,
+      "sha256": "8eb2cd0c545c3211ab02aea4edaa28bb0a98adb696e64e760ab02cacc3e480d5"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Architecture/VNextTraceabilityPolicy.cs",
+      "bytes": 8686,
+      "sha256": "c491aa5ad7ac589ea36c22a75febd0bf8502da8901f89311508ce41d3e837691"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Capabilities/VNextPhase02ResourceGrantTests.cs",
+      "bytes": 6422,
+      "sha256": "f36275ca3b40135c0f5656ce83d30647bb2a62ab21a459c401c997ae680e64cc"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Contracts/VNextPhase01ResourceModelTests.cs",
+      "bytes": 5674,
+      "sha256": "6d0c3b77753fec8c871d8752356011b32c6ee596c1d92d9864622261fa3392a8"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Runtime/Phase06DeterministicTracingTests.cs",
+      "bytes": 9792,
+      "sha256": "b11267b595b39328dd47873ef4e0f1d318b17807cfef89ac1748b8841ad83e10"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Runtime/Phase08OrdinaryCheckpointTests.cs",
+      "bytes": 13694,
+      "sha256": "327b191da7a0847c6ebcf04bebcfa06c712bfd3254037f32db56704b97fe8457"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Runtime/VNextPhase03ResourceLeaseTests.cs",
+      "bytes": 7795,
+      "sha256": "7e2ab1b75e49acac94ff38789df78d0ff39d0ad73cd1fc2432fc924b430b0a1f"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Runtime/VNextPhase04CrossOwnerAdmissionTests.cs",
+      "bytes": 10196,
+      "sha256": "9d7361b06f787b10de5e71ed19de5a50a45904e2a0a0050153d6cf6c327d76ed"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Runtime/VNextPhase05SipResourceSentryTests.cs",
+      "bytes": 11570,
+      "sha256": "385341637f8f238b019d33310450e9e90d368161aa339e7551945597d40197a5"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Runtime/VNextPhase06ResourceDonationTests.cs",
+      "bytes": 15516,
+      "sha256": "1929a25bc2797a052b4b4d9ce8b513261af6986668008c45ce1ef246571c1cc7"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Runtime/VNextPhase07ExternalOperationResourceBindingTests.cs",
+      "bytes": 11596,
+      "sha256": "0b476298cec055ea6b999988a89a8d3498ca063d3096f4b5c93b1a37b6f123e3"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Runtime/VNextPhase08ComputePlanIndependentGatesTests.cs",
+      "bytes": 8927,
+      "sha256": "19472422b1711fc16a18baa52441ae71ba42cdc4e4ddb295b1af864c1906274d"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Runtime/VNextPhase10ResourceSchedulerTests.cs",
+      "bytes": 4094,
+      "sha256": "0ef80fd27bc042e0b5df5010c2fa2962388d1db58c30b1596028d20ced52f45a"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Runtime/VNextPhase11TemporalClaimBoundaryTests.cs",
+      "bytes": 1728,
+      "sha256": "6094f6f1a716e67040e1d59efd744c0005b0fbce770a2f8d1527eba9041f34cb"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Runtime/VNextPhase12SipJobResourceBoundaryTests.cs",
+      "bytes": 2607,
+      "sha256": "30e6c74cbcdfdbb2521dd8a9f8a0cd6b116d062cd81009589ced8b4f4e97485c"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Runtime/VNextPhase13ResourceFamilyBoundaryTests.cs",
+      "bytes": 3822,
+      "sha256": "16d72c536aafb59648ab3e978665967c5b63bc6d69f053867240f03d15b85070"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Runtime/VNextPhase15TelemetryAuthorityBoundaryTests.cs",
+      "bytes": 6728,
+      "sha256": "4d185b1cb7a51582bf547738302e5e3c7181270a5c1c4a12c82d6514226530dc"
+    }
+  ],
+  "qualification": {
+    "status": "Incomplete",
+    "finalArchitectureClosure": {
+      "command": "dotnet test tests/SingPlus.Tests/SingPlus.Tests.csproj --no-build --no-restore --filter \"FullyQualifiedName~VNextPhase16QualificationClosureTests|FullyQualifiedName~VNextPhase00ArchitecturalFreezeTests\" --verbosity minimal",
+      "passed": 40,
+      "failed": 0,
+      "skipped": 0,
+      "exitCode": 0
+    },
+    "entrypoint": {
+      "command": ".\\eng\\qualify-vnext.ps1",
+      "exitCode": 1,
+      "reason": "Mandatory full non-GUI suite failed; entrypoint correctly refused qualification"
+    },
+    "build": {
+      "command": "dotnet build SingNextOS.slnx --no-restore --verbosity minimal",
+      "exitCode": 0,
+      "warnings": 0,
+      "errors": 0
+    },
+    "focused": {
+      "command": "dotnet test tests/SingPlus.Tests/SingPlus.Tests.csproj --no-build --no-restore --filter \"FullyQualifiedName~VNext|FullyQualifiedName~Phase08OrdinaryCheckpointTests|FullyQualifiedName~Phase06DeterministicTracingTests|FullyQualifiedName~HybridCpuExternalOperationProviderTests\" --verbosity minimal",
+      "passed": 146,
+      "failed": 0,
+      "skipped": 0,
+      "exitCode": 0
+    },
+    "fullNonGui": {
+      "command": "dotnet test SingNextOS.slnx --no-build --no-restore --filter \"FullyQualifiedName!~SingPlus.Tests.Gui\" --verbosity minimal",
+      "passed": 1688,
+      "failed": 9,
+      "skipped": 2,
+      "exitCode": 1,
+      "projects": [
+        {
+          "name": "SingPlus.Tests",
+          "passed": 1480,
+          "failed": 9,
+          "skipped": 2
+        },
+        {
+          "name": "HybridCpu_ExecutableAdapter.Tests",
+          "passed": 90,
+          "failed": 0,
+          "skipped": 0
+        },
+        {
+          "name": "HybridCPU_NeutralRuntime.Tests",
+          "passed": 58,
+          "failed": 0,
+          "skipped": 0
+        },
+        {
+          "name": "SingPlus.Platform.HybridCpu.Tests",
+          "passed": 60,
+          "failed": 0,
+          "skipped": 0
+        }
+      ]
+    },
+    "diffCheck": {
+      "command": "git diff --check",
+      "exitCode": 0,
+      "note": "LF/CRLF informational warnings only"
+    },
+    "failureIdentities": [
+      "SingPlus.Tests.Architecture.SingCapPhase11MigrationReviewTests.ConfusedDeputyReviewIsCompleteAndDeterministicForMigratedFamilies",
+      "SingPlus.Tests.Architecture.SingCapPhase12ProviderMappingTests.ProviderMappingPinsExactArtifactAndKeepsEveryReceiptNonAuthoritative",
+      "SingPlus.Tests.Architecture.SingCapPhase13ClosureTests.SecurityMatrixNamesEveryMandatoryCrossAuthorityRace",
+      "SingPlus.Tests.Architecture.SingCapPhase13ClosureTests.ClaimMatrixWithholdsProductionAndHardwareClaims",
+      "SingPlus.Tests.Architecture.SingCapPhase13ClosureTests.DefinitionOfDoneMatrixMapsEveryItemAndDoesNotHideFutureGatedWork",
+      "SingPlus.Tests.Architecture.SingCapPhase13ClosureTests.PerformanceReportContainsEveryRequiredWorkerAndContentionCombination",
+      "SingPlus.Tests.Architecture.HybridBootQualificationMatrixTests.MatrixCoversT001ThroughT050WithoutUnsupportedClaims",
+      "SingPlus.Tests.SipJobs.Phase148QualificationClosureTests.TupleAndClaimMatrixCloseAllRequirementsWithoutEnablingProductionGate",
+      "SingPlus.Tests.Architecture.SingCapPhase01ToolchainTests.EveryProjectHasExactlyOneOwnedSecurityProfile"
+    ],
+    "failureAnalysis": "Eight fail opening old docs paths; all eight named JSON artifacts exist under docs/Completed. Security-profile inventory omits tools/SingPlus.Boot.DebugHost/SingPlus.Boot.DebugHost.csproj. Neither historical consumers nor inventory were edited by this iteration. SipJob failure changed from historical HEAD mismatch to missing old path after concurrent relocation."
+  },
+  "exclusions": [
+    "StaticAdmission applies only to metadata validation",
+    "all VNX rows are partial contour coverage, not complete invariant closure",
+    "no ProductionQualified, NativeAOT, real HybridCPU, hardware, QEMU, firmware or CXL boot claim",
+    "no temporal upper bound, guaranteed reservation, throughput or occupancy qualification",
+    "no executed live gate rollback or fused resource differential proof",
+    "no cold-process durable quarantine proof"
+  ]
+}

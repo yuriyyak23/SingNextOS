@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "phase": "P16",
+  "phaseDisposition": "Open",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "1890a8e921cfe903b5b44857e4661168bf7bbceb",
+  "status": "PartialCoverage",
+  "localProviderArtifact": {
+    "path": ".packages/HybridCPU.ExternalRuntime.Contracts.1.14.0.nupkg",
+    "bytes": 74244,
+    "sha256": "b96e99bda066ee585b26a11cbfa7b68ce6bf44fc0006679483ccc1a4eeb678c2",
+    "sourceShaLocallyVerified": false
+  },
+  "contours": [
+    {
+      "id": "P16-GAP-PROVIDER-RESOURCE",
+      "disposition": "FutureGated",
+      "gates": ["FG-VNX-HCPU-RESOURCE-CONTRACT", "FG-VNX-HCPU-USAGE-EVIDENCE"],
+      "owner": "additive provider-neutral ExternalRuntime contract plus SingNext P04/P07 adapter",
+      "missingPrerequisite": "versioned semantic resource envelope and exact provider-generation usage evidence with executable lease settlement/reconciliation",
+      "currentEvidence": "Contracts 1.14.0 ordinary ExternalOperation lifecycle only; package README assigns reconciliation/closure to future adapter work",
+      "unsafeBypass": "an ordinary completion receipt would impersonate quantitative resource authority or settle an unbound lease",
+      "claimCeiling": "StaticAdmission"
+    },
+    {
+      "id": "P16-GAP-CONTROLLED-SMT",
+      "disposition": "FutureGated",
+      "gates": [],
+      "owner": "qualification execution environment and performance owner",
+      "missingPrerequisite": "reported physical-core/SMT sibling topology, explicit affinity control and repeated isolated measurements",
+      "currentEvidence": "host thread and process-domain counts 1/2/4/8/16 without SMT sibling control",
+      "unsafeBypass": "logical-worker contention cannot prove SMT-specific contention or transfer across CPU topology",
+      "claimCeiling": "AccountingOnly"
+    },
+    {
+      "id": "P16-GAP-DURABLE-RESTART",
+      "disposition": "FutureGated",
+      "gates": ["FG-VNX-RESOURCE-LEASE", "FG-VNX-EXTOP-RESOURCE-BIND"],
+      "owner": "ResourceBudgetAuthority plus authenticated local recovery journal and exact provider reconciliation adapter",
+      "missingPrerequisite": "durable authenticated format, atomic journal/ledger commit, cold-process import policy and crash-after-every-transition harness",
+      "currentEvidence": "in-memory owner and ordinary checkpoint fresh-generation restore; live leases are non-checkpointable",
+      "unsafeBypass": "serialized credentials could resurrect authority or ambiguous consumption could be refunded after restart",
+      "claimCeiling": "RuntimeEnforced"
+    },
+    {
+      "id": "P16-GAP-LIVE-GATE-ROLLBACK",
+      "disposition": "FutureGated",
+      "gates": [],
+      "owner": "release/configuration gate owner plus each eligible runtime contour owner",
+      "missingPrerequisite": "at least one independently qualified ON contour, generation-bound configuration path and live-work ON-to-OFF rollback protocol",
+      "currentEvidence": "closed gate vocabulary with every gate hard OFF and no enablement path",
+      "unsafeBypass": "a test-only enable switch would create an unqualified production path and stale handles could force fast-path behavior",
+      "claimCeiling": "StaticAdmission"
+    },
+    {
+      "id": "P16-GAP-SIPJOB-DIFFERENTIAL",
+      "disposition": "FutureGated",
+      "gates": ["FG-VNX-SIPJOB-RESOURCE"],
+      "owner": "ordinary SIP authority owners plus SipJob transport planner",
+      "missingPrerequisite": "executable resource-aware fused path and ordinary-versus-fused authoritative transition trace oracle",
+      "currentEvidence": "static barrier classification only; resource-consuming stages remain on the ordinary owner boundary",
+      "unsafeBypass": "planner metadata could be mistaken for budget, lease, Region, provider or publication truth",
+      "claimCeiling": "StaticAdmission"
+    },
+    {
+      "id": "P16-GAP-TEMPORAL-CLAIMS",
+      "disposition": "FutureGated",
+      "gates": ["FG-VNX-TEMPORAL-UPPER-BOUND", "FG-VNX-GUARANTEED-RESERVATION"],
+      "owner": "runtime enforcement owner plus provider-specific capacity owner",
+      "missingPrerequisite": "executable maximum-consumption enforcement and separate minimum-capacity proof under declared contention and loss conditions",
+      "currentEvidence": "AccountingOnly observations with no threshold, preemption or provider reservation",
+      "unsafeBypass": "average latency or accounting limits would be promoted into deadline or guaranteed-capacity claims",
+      "claimCeiling": "AccountingOnly"
+    }
+  ],
+  "productionQualified": false,
+  "p17MayStart": false
+}

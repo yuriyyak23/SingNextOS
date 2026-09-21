@@ -4,6 +4,12 @@ using SingPlus.Contracts;
 using SingPlus.Runtime;
 using SingPlus.Sip;
 
+if (args.Length > 0 && string.Equals(args[0], "--vnext-resource-performance", StringComparison.Ordinal))
+{
+    Environment.ExitCode = await SingPlus.SingCapQualification.VNextResourcePerformanceQualification.RunAsync(args[1..]);
+    return;
+}
+
 const int iterationsPerWorker = 5_000;
 int[] workerCounts = [1, 2, 4, 8, 16, 32];
 var results = new List<Measurement>();

@@ -1,0 +1,286 @@
+{
+  "singnext_sha": "1890a8e921cfe903b5b44857e4661168bf7bbceb",
+  "hybridcpu_sha": "794c4a53494f503855ac8cf209efab23fde083b2",
+  "files": [
+    {
+      "name": "00_README.md",
+      "sha256": "a89851ae5182ed0b0682d2976baf98c2d8830e4b5254a843f185644738753943",
+      "bytes": 4957
+    },
+    {
+      "name": "01_BASELINE_AND_CODE_AUDIT.md",
+      "sha256": "5e16f980f7240f6dddefc3a288c04fd7cd4443f75f1cf3c5230b4521237e1db3",
+      "bytes": 6450
+    },
+    {
+      "name": "02_MASTER_REFACTORING_ROADMAP.md",
+      "sha256": "91291cebed260b4230a59e53e8267e2001e7230948def3f8e679a080665cbc42",
+      "bytes": 2440
+    },
+    {
+      "name": "03_NORMATIVE_INVARIANTS.md",
+      "sha256": "7ffc5fcd419c84f946122b7b679aea3aad430a1ed6236a588603f0fae52315c0",
+      "bytes": 4082
+    },
+    {
+      "name": "04_TARGET_ARCHITECTURE.md",
+      "sha256": "07ea35e46d61c0a785a81c4a85cf91b23ade72039e16ab8d25ee7615277fd2ae",
+      "bytes": 2628
+    },
+    {
+      "name": "05_AUTHORITY_OWNER_MAP.md",
+      "sha256": "fd10960f8ef92ab1fac2d65eaf2e96b40698701bdba6c8f2ca2ed0bf33d5560d",
+      "bytes": 1767
+    },
+    {
+      "name": "06_STATE_MACHINE_AND_TRANSITIONS.md",
+      "sha256": "df04d38196809cff44227aee60aa84a6e984a31d9357339d6c8aceab5e8f9e61",
+      "bytes": 1908
+    },
+    {
+      "name": "07_CONTRACT_AND_VERSIONING_STRATEGY.md",
+      "sha256": "8ab26f6244c9731baa43545978cf1d1fee7fe000749bba3e8d8a881209f05c14",
+      "bytes": 1372
+    },
+    {
+      "name": "08_TEST_AND_FORMAL_QUALIFICATION.md",
+      "sha256": "fea8613950097279ac270ced479e6c03ed73e7dbd23348cbc6cad481568ddcda",
+      "bytes": 1455
+    },
+    {
+      "name": "09_ADVERSARIAL_MATRIX.md",
+      "sha256": "a43be025347a2ef1608c153c67caab3727b655cc54f6f3a9ba5b8a6e88491975",
+      "bytes": 2190
+    },
+    {
+      "name": "10_CROSS_REPO_DELTA.md",
+      "sha256": "0197284a87cd726ba7125520f005b60d270bc193025bf0354c6721e80873703f",
+      "bytes": 1652
+    },
+    {
+      "name": "11_MIGRATION_ROLLBACK.md",
+      "sha256": "1192cb3f675f6786b13484e92b721963c53e6926b9996a039d8478b9f52079c2",
+      "bytes": 1052
+    },
+    {
+      "name": "12_REJECTED_ALTERNATIVES.md",
+      "sha256": "839582f14c985b59045d337748931e7ef7e81a484438e83da079abe2b8230465",
+      "bytes": 1261
+    },
+    {
+      "name": "13_CODEBASE_VERIFICATION.md",
+      "sha256": "1ed0399ff7ef84f518a746dfd48cd648a69f2ab7d6f6fb2817d5423c7ef17037",
+      "bytes": 4871
+    },
+    {
+      "name": "MATRIX_MULTIPLY_WORKED_EXAMPLE.md",
+      "sha256": "4f4b2fc7410edb84ea2059895217d2099f2fa2c247ddadc25a39bd5db9b1d0f0",
+      "bytes": 3610
+    },
+    {
+      "name": "OPEN_QUESTIONS.md",
+      "sha256": "7e0169239c4c55f5ab49ff96eb735d94b4b5d12e81e517fb4f2d9bfb1205f9a2",
+      "bytes": 1449
+    },
+    {
+      "name": "PHASE_P00_LIVE_BASELINE_SOURCE_FREEZE.md",
+      "sha256": "43d2a9e24d45235ad9f22cb7b8d3f57c9ae47d5ebd20f842db3f2938dafae2b6",
+      "bytes": 5498
+    },
+    {
+      "name": "PHASE_P01_OWNER_AND_MACHINE_RECONSTRUCTION.md",
+      "sha256": "bfec19c05ad8f1e44384361d028bafff3950481aabc0c51347190e7ae6dbeea5",
+      "bytes": 5741
+    },
+    {
+      "name": "PHASE_P02_SEMANTIC_VOCABULARY_AND_REFINEMENT.md",
+      "sha256": "c5c2d315815bec487f9d2ed7549f5ab84bb814ad30edd7cba5ced972ec52d627",
+      "bytes": 5794
+    },
+    {
+      "name": "PHASE_P03_GLOBAL_OPERATIONAL_SEMANTICS.md",
+      "sha256": "61383c678b392bbafd16c8af2e91fb23796c6ccbb1bfc2bae0c6ba70e87c5038",
+      "bytes": 5514
+    },
+    {
+      "name": "PHASE_P04_OPERATION_OBLIGATIONS.md",
+      "sha256": "db7ee8d549a467871dc310ff6444f94f56a7435e5338bcb7a138ff418a9d0a99",
+      "bytes": 5770
+    },
+    {
+      "name": "PHASE_P05_EXECUTION_GUARANTEES_AND_BINDING.md",
+      "sha256": "a052a451bb836695be5deaa482d2620c01aa9c0a478e8c6d7a9cd9ee093070bb",
+      "bytes": 5817
+    },
+    {
+      "name": "PHASE_P06_GENERATION_EXACT_ADMISSION_SENTRY.md",
+      "sha256": "9cf81d39334235296cbf34370b7bb125e5209cbb09a199fb111a96ad0eecaa08",
+      "bytes": 5739
+    },
+    {
+      "name": "PHASE_P07_EFFECT_AND_PUBLICATION_ALGEBRA.md",
+      "sha256": "872e20561424df10009a0907809103654d2b3200670a01d842025505422b1e61",
+      "bytes": 5655
+    },
+    {
+      "name": "PHASE_P08_VISIBILITY_MEMORY_SHARING_LOCALITY.md",
+      "sha256": "af5c09f6e2ff636f9e11d118022135f2f175152899ac943d7b318793b25f173f",
+      "bytes": 5690
+    },
+    {
+      "name": "PHASE_P09_RESOURCE_MEASUREMENT_RETIRE_CHARGING.md",
+      "sha256": "c690ffb8aac940eee1ac31646a82218c35caa73c1e99891ef5c269fe5d7a9ceb",
+      "bytes": 5791
+    },
+    {
+      "name": "PHASE_P10_MULTI_RESOURCE_QOS_SCHEDULING.md",
+      "sha256": "80d7400d0c0ceca2185bae8f9449b3c5372b44271cec2e1067150a7bd4773b21",
+      "bytes": 5741
+    },
+    {
+      "name": "PHASE_P11_PREEMPTION_CANCELLATION_CONTAINMENT.md",
+      "sha256": "d3b93678bef1a32505e8a5be3179456a92f2fbd4084df523cb46d73ede05f0b4",
+      "bytes": 5813
+    },
+    {
+      "name": "PHASE_P12_REPLAY_PROVIDER_REFINEMENT_ISOLATION.md",
+      "sha256": "4401f1d0a974642234ac1f92a938f5c55e2a699e7b0ab7d1687aaf2fcbf84bc5",
+      "bytes": 5750
+    },
+    {
+      "name": "PHASE_P13_LIVENESS_FAULT_QUARANTINE_RECOVERY.md",
+      "sha256": "95c1ccdfe8516a5212052ca0c23903bc9fc83ceae28ebe2a0ea78dd73c174a29",
+      "bytes": 5821
+    },
+    {
+      "name": "PHASE_P14_SCALABLE_AUTHORITY_OWNERS.md",
+      "sha256": "83926688de3585b606ef394a665a91bfc04c22e62015885177a641b3e71e1394",
+      "bytes": 5683
+    },
+    {
+      "name": "PHASE_P15_MANAGED_ROOT_DURABLE_IFC.md",
+      "sha256": "3d529d29c41cf1607f2fd2b69c0e521c4ec26900fefa0400696e2992ae38b6cf",
+      "bytes": 5765
+    },
+    {
+      "name": "PHASE_P16_SIPJOB_AND_DECLARATIVE_OPERATION_MODEL.md",
+      "sha256": "989d4dc243ed72a1a1d576d14359786372cf3bfac576a724239af65cbe4600b0",
+      "bytes": 5817
+    },
+    {
+      "name": "PHASE_P17_MATRIXMULTIPLY_HYBRIDCPU_VERTICAL.md",
+      "sha256": "13234915f569b77db784bdd6724f521e98e07eb5b0209bcd2ef0de124d4045e1",
+      "bytes": 5959
+    },
+    {
+      "name": "PHASE_P18_QUALIFICATION_PROMOTION_CUTOVER.md",
+      "sha256": "f911a7885a6b14ca76b33ab921312107cf87d697061f37c28842ec32e49fcee0",
+      "bytes": 5609
+    },
+    {
+      "name": "TASK_INDEX.md",
+      "sha256": "a6758cee13eac64b250a9f8b60bf8da270c81cf494f145b556b060f083081324",
+      "bytes": 8821
+    },
+    {
+      "name": "TRACEABILITY_MATRIX.md",
+      "sha256": "f3a631e74207c5eb3084531f062161e626b8d56f505ccbd25cb8f48ef212e94e",
+      "bytes": 2478
+    },
+    {
+      "name": "TZ_P00_LIVE_BASELINE_SOURCE_FREEZE.md",
+      "sha256": "56a082832e901457a28239bd9a56ea01a500fcbd0355b014f269bdf307df9c11",
+      "bytes": 9969
+    },
+    {
+      "name": "TZ_P01_OWNER_AND_MACHINE_RECONSTRUCTION.md",
+      "sha256": "158b4944e9b703454b0962a06090fd36be492df9aeb9b6a02ba11e9c06b82489",
+      "bytes": 10090
+    },
+    {
+      "name": "TZ_P02_SEMANTIC_VOCABULARY_AND_REFINEMENT.md",
+      "sha256": "148b725ccd474bc1d029686786829171529b91d141c5439b4dbb6116b234d767",
+      "bytes": 10197
+    },
+    {
+      "name": "TZ_P03_GLOBAL_OPERATIONAL_SEMANTICS.md",
+      "sha256": "303fbfb441f0f9b1b5335002f57c0df929829c8a458eaa6402a1324ff4dcb357",
+      "bytes": 10141
+    },
+    {
+      "name": "TZ_P04_OPERATION_OBLIGATIONS.md",
+      "sha256": "2499212f1d9ca1d0773a9a3a65aecf710a3020e5bc0a8bca50ad1952ab20fb43",
+      "bytes": 13342
+    },
+    {
+      "name": "TZ_P05_EXECUTION_GUARANTEES_AND_BINDING.md",
+      "sha256": "1e4e6f33e2efd6e8d0e84f4ed86fa99dfc510424a2601e5fe819a8aeb10a39c4",
+      "bytes": 13809
+    },
+    {
+      "name": "TZ_P06_GENERATION_EXACT_ADMISSION_SENTRY.md",
+      "sha256": "baa10bfa14088e0ee491c0b4faeb0783a4858243da7d7e1bca3d02bf0d9625b1",
+      "bytes": 13545
+    },
+    {
+      "name": "TZ_P07_EFFECT_AND_PUBLICATION_ALGEBRA.md",
+      "sha256": "6ef254916a1233cca59520c8e004c431bba624403f27f52daeb45834b5545197",
+      "bytes": 13276
+    },
+    {
+      "name": "TZ_P08_VISIBILITY_MEMORY_SHARING_LOCALITY.md",
+      "sha256": "7b1c0f37ab6624282982707882914c633aaefe6722c6085490bb236546b54f60",
+      "bytes": 13299
+    },
+    {
+      "name": "TZ_P09_RESOURCE_MEASUREMENT_RETIRE_CHARGING.md",
+      "sha256": "27467ab91ee271dfba5f214f677e43677e3edbd8cd4c89bb63d09297279c717d",
+      "bytes": 13641
+    },
+    {
+      "name": "TZ_P10_MULTI_RESOURCE_QOS_SCHEDULING.md",
+      "sha256": "e5d8eac84c68a6464dbc3bbe96db4c5bddb579621cf86ddb2777712e4ed4a4f7",
+      "bytes": 13464
+    },
+    {
+      "name": "TZ_P11_PREEMPTION_CANCELLATION_CONTAINMENT.md",
+      "sha256": "986947dc10cf350803470171d00e177ca78691a27a59a77055f4f1381f70be30",
+      "bytes": 13726
+    },
+    {
+      "name": "TZ_P12_REPLAY_PROVIDER_REFINEMENT_ISOLATION.md",
+      "sha256": "2a541502a8c2011d006297a404fd99f6ee4d66304db5e980d3638789422aeb45",
+      "bytes": 13615
+    },
+    {
+      "name": "TZ_P13_LIVENESS_FAULT_QUARANTINE_RECOVERY.md",
+      "sha256": "0674635683dbc26ed8644d24c84f375060f0dc18b1fc3a276c96562487d7cea2",
+      "bytes": 13768
+    },
+    {
+      "name": "TZ_P14_SCALABLE_AUTHORITY_OWNERS.md",
+      "sha256": "aead71bdaa8a273df2cf51732b0b42c136fcbf6cc5b4da425d38271a601d5ba1",
+      "bytes": 13492
+    },
+    {
+      "name": "TZ_P15_MANAGED_ROOT_DURABLE_IFC.md",
+      "sha256": "6acbc83f6a45570250a5b28e402ad1e1c347a9ef3b3496e09ea320da2f6f75bf",
+      "bytes": 13449
+    },
+    {
+      "name": "TZ_P16_SIPJOB_AND_DECLARATIVE_OPERATION_MODEL.md",
+      "sha256": "05fa0a94defe891bea2120cf38336ee2635990b14bfb1b4ea4abf4439046055f",
+      "bytes": 13526
+    },
+    {
+      "name": "TZ_P17_MATRIXMULTIPLY_HYBRIDCPU_VERTICAL.md",
+      "sha256": "be6dc216b986e320cf817bf31d2f4fc06068004da0aad8fe1ed406eb1f12c494",
+      "bytes": 13580
+    },
+    {
+      "name": "TZ_P18_QUALIFICATION_PROMOTION_CUTOVER.md",
+      "sha256": "269e3ff729c614b61ced011a36ad6eae94d0d07c57682af05f3d839b9955a149",
+      "bytes": 13220
+    }
+  ]
+}

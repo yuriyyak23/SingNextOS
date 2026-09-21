@@ -27,6 +27,7 @@
     { "project": "tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Model/HybridCPU_NeutralRuntime.Model.csproj", "profile": "PlatformExternal", "owner": "provider-neutral runtime model", "claimLevel": "ModelOnly" },
     { "project": "tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Tests/HybridCPU_NeutralRuntime.Tests.csproj", "profile": "BuildTool/TestOnly", "owner": "provider-neutral runtime tests", "claimLevel": "ModelOnly" },
     { "project": "tools/SingPlus.Admission/SingPlus.Admission.csproj", "profile": "BuildTool/TestOnly", "owner": "Sing+ admission toolchain", "claimLevel": "StaticAdmission" },
+    { "project": "tools/SingPlus.Boot.DebugHost/SingPlus.Boot.DebugHost.csproj", "profile": "BuildTool/TestOnly", "owner": "SingNextOS boot debug tooling", "claimLevel": "ModelOnly" },
     { "project": "tools/SingPlus.HybridCpuQualification/SingPlus.HybridCpuQualification.csproj", "profile": "BuildTool/TestOnly", "owner": "HybridCPU qualification tooling", "claimLevel": "ModelOnly" },
     { "project": "tools/SingPlus.SingCapQualification/SingPlus.SingCapQualification.csproj", "profile": "BuildTool/TestOnly", "owner": "SingCap qualification tooling", "claimLevel": "ModelOnly" }
   ]

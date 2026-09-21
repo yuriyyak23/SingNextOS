@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "phase": "P16",
+  "phaseDisposition": "Open",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "executionHead": "1890a8e921cfe903b5b44857e4661168bf7bbceb",
+  "capturedUtc": "2026-09-21T21:29:50.2076767+00:00",
+  "runtimeContour": "Windows-x64/.NET-11.0.0-preview/Release/JIT-host/ComputeTimeNanoseconds",
+  "claim": "AccountingOnly",
+  "productionQualified": false,
+  "enabledFeatureGates": [],
+  "isaChangeCategory": [],
+  "artifacts": [
+    {
+      "path": "tools/SingPlus.SingCapQualification/Program.cs",
+      "bytes": 14798,
+      "sha256": "876ed9905e3655a0bc12c5863f3d9cee40615a62d269ccef768dfa2d5cd5a1b5"
+    },
+    {
+      "path": "tools/SingPlus.SingCapQualification/VNextResourcePerformanceQualification.cs",
+      "bytes": 15560,
+      "sha256": "b4b7956d3d2f0394ccee8c994881887c75768ec3679f444a0ece57e4e3ca8be7"
+    },
+    {
+      "path": "tools/SingPlus.SingCapQualification/SingPlus.SingCapQualification.csproj",
+      "bytes": 539,
+      "sha256": "138ce77d0b899a0c777bd1460f83322b0f1b52289c638912104f57704b36e83f"
+    },
+    {
+      "path": "src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetAuthority.cs",
+      "bytes": 28987,
+      "sha256": "e5e81623fbedd5745ea63bb6a5399c621c7f8b31fb6dc32ec5e9058042b34769"
+    },
+    {
+      "path": "contracts/SingPlus.Contracts/ResourceBudgetContracts.cs",
+      "bytes": 2515,
+      "sha256": "b93f59e8de3b020cd79d7402eed11220271adead46ec08c9fafa432b010f37d9"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Architecture/VNextPhase16ResourcePerformanceQualificationTests.cs",
+      "bytes": 4624,
+      "sha256": "4bcfc9edc699f9645d293e9c6eb06a100e02e629498882b8a699312af3ac0786"
+    },
+    {
+      "path": "tests/SingPlus.Tests/SingPlus.Tests.csproj",
+      "bytes": 2970,
+      "sha256": "3b325dbcc607f60af20807ae74b5920de6daa53a06984b1b42ea4ad99cd4c656"
+    },
+    {
+      "path": "docs/SingNextOS-vNext-refactoring-roadmap-new/P16_RESOURCE_BUDGET_PERFORMANCE_20260922.json",
+      "bytes": 12703,
+      "sha256": "36ab385a893337727178f7725a3d336d8371ad43a8fa56faea53ec3c3c2da917"
+    }
+  ],
+  "exclusions": [
+    "no latency threshold, realtime, upper-bound, guarantee or production claim",
+    "no controlled SMT topology",
+    "no provider or HybridCPU execution",
+    "no NativeAOT, hardware, QEMU, firmware or CXL boot execution"
+  ]
+}

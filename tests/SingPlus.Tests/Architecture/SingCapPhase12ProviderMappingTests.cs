@@ -7,7 +7,7 @@ public sealed class SingCapPhase12ProviderMappingTests
     [Fact]
     public void ProviderMappingPinsExactArtifactAndKeepsEveryReceiptNonAuthoritative()
     {
-        var path = Path.Combine(RepositoryRoot(), "docs", "SingCap-Refactoring", "roadmap",
+        var path = Path.Combine(RepositoryRoot(), "docs", "Completed", "SingCap-Refactoring", "roadmap",
             "P12_HYBRIDCPU_PROVIDER_MAPPING.json");
         using var document = JsonDocument.Parse(File.ReadAllBytes(path));
         var root = document.RootElement;
