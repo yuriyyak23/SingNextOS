@@ -205,29 +205,79 @@
       "sha256": "8fac53e82ea53a8961a7522d7a23d5190f0aaf7dede7300957f3cdf20b6ebd79"
     },
     {
+      "file": "EVIDENCE_P12_SIPJOB_RESOURCE_BOUNDARY.md",
+      "bytes": 4034,
+      "sha256": "15e307239067feb6bc66dc0d3fcb3b8c4ee9e62e383a2566702144ea77c84ef7"
+    },
+    {
+      "file": "P12_QUALIFICATION_TUPLE.json",
+      "bytes": 1013,
+      "sha256": "8853dad90a5467cda12b0822955a2504281d2c6b37424b00595f967fbe2449ea"
+    },
+    {
       "file": "PHASE_VNEXT_12_SIPJOB_RESOURCE_AWARE_COMPOSITION.md",
-      "bytes": 2123,
-      "sha256": "ce5b22f0a1bf1d63a989f14fadd893d6430a439b0c69809e702fbaffa016b385"
+      "bytes": 2600,
+      "sha256": "b9990132106586f17b918a191f234ea342b27df67d5dfd4cb00f7a41e7203ca4"
+    },
+    {
+      "file": "EVIDENCE_P13_RESOURCE_FAMILY_BOUNDARY.md",
+      "bytes": 3545,
+      "sha256": "ab16468a34faa3a839e37cf879369a8cb84524ade8956fea7ab81a18c51d70b6"
+    },
+    {
+      "file": "P13_QUALIFICATION_TUPLE.json",
+      "bytes": 1051,
+      "sha256": "570ff375acbb0fbc002b67554f7b30ebab0d8a3336d80b26ff88bac74e6a33ca"
     },
     {
       "file": "PHASE_VNEXT_13_NON_COMPUTE_RESOURCE_FAMILIES.md",
-      "bytes": 2168,
-      "sha256": "731f909f203958841d881bfd75e8ff0f1078d6ff9ea6f0d2ec7e3c47114fa762"
+      "bytes": 2644,
+      "sha256": "bf4b2f5e96964fbf4d4b0e4fc37367438a971c7d1fa8fed7be7b14661c537150"
+    },
+    {
+      "file": "EVIDENCE_P14_RESTART_CHECKPOINT_RECONCILIATION.md",
+      "bytes": 4151,
+      "sha256": "3864364354f2a95acefb49fefc0faa626450fdf9e8195d40280e5539894f66e2"
+    },
+    {
+      "file": "P14_QUALIFICATION_TUPLE.json",
+      "bytes": 969,
+      "sha256": "7b2b1a5908bbc693834007cc7c701d1e7d07df001752abf8e18f4fa6bad52da3"
     },
     {
       "file": "PHASE_VNEXT_14_RESTART_CHECKPOINT_AND_RECONCILIATION.md",
-      "bytes": 2197,
-      "sha256": "2288961c7b3db8d7505708d17f1eec6cbacc1e8f90e649be1e969b9c7a0aa513"
+      "bytes": 2718,
+      "sha256": "91aff0cceebdf893cb0213c7965eb80679efc0cad84d40628cf576ae33fb28f6"
+    },
+    {
+      "file": "EVIDENCE_P15_OBSERVABILITY_AUTHORITY_BOUNDARY.md",
+      "bytes": 4348,
+      "sha256": "04ba4df7e5f04503897bedbdec076b99f04ec4ed49e4b27fa8910f9aabc43c27"
+    },
+    {
+      "file": "P15_QUALIFICATION_TUPLE.json",
+      "bytes": 949,
+      "sha256": "e0933d7afb1e93195dd0cff5dad6d416af9110f81101a377effac3bfacfe72f6"
     },
     {
       "file": "PHASE_VNEXT_15_OBSERVABILITY_AUDIT_AND_TELEMETRY.md",
-      "bytes": 1870,
-      "sha256": "4adf756901156320cf6461dbef1ad0f18ff9af423e6ee5849dd31ff5f48cdded"
+      "bytes": 2269,
+      "sha256": "6ea7ec801ed66b7343068cf54da01dc78f7e78f96ab3c05fcd37420e722eb920"
+    },
+    {
+      "file": "EVIDENCE_P16_QUALIFICATION_CLAIM_CLOSURE.md",
+      "bytes": 2764,
+      "sha256": "9aff2f571a3208093acbe314d16c70b32d5e2cc950c083c91248b8e0d49ef78e"
+    },
+    {
+      "file": "P16_QUALIFICATION_TUPLE.json",
+      "bytes": 772,
+      "sha256": "af64003d76749dad4e3b789ee8557cb60f5983e8e6cd793f2b2961d58b5cc8a2"
     },
     {
       "file": "PHASE_VNEXT_16_QUALIFICATION_PERFORMANCE_AND_CLAIMS.md",
-      "bytes": 2187,
-      "sha256": "6088e6e7531c711e6bd1c26e29d4c00a9de86366f6877e22df38161339909e09"
+      "bytes": 2684,
+      "sha256": "f3ea419471c42037caf73ccf7c2867ea98505052767d2546e3c877a135d27ed7"
     },
     {
       "file": "PHASE_VNEXT_17_MIGRATION_CLEANUP_AND_CUTOVER.md",
@@ -246,8 +296,13 @@
     },
     {
       "file": "TRACEABILITY_MATRIX.md",
-      "bytes": 2225,
-      "sha256": "971a541b082552fb5b1460de7d98d228d5b62458f047c0a97f3b90b73d4fa2e8"
+      "bytes": 2759,
+      "sha256": "8f6bb9b01e90de8d7e7105cd24a883b26e729e38f7126324d4efe9d3c5aea187"
+    },
+    {
+      "file": "VNEXT_TRACEABILITY.json",
+      "bytes": 11584,
+      "sha256": "a670a2d037abfd32f3674310f5e8d82e58df6e2e4f4e95901fbf6b3906826a88"
     },
     {
       "file": "VNEXT_FEATURE_GATES.md",

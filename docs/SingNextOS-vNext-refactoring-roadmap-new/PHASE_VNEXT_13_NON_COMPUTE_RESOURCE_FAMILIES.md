@@ -58,3 +58,7 @@ Each family uses `ResourceBudgetAuthority` as quantitative owner but separate ty
 ## Prerequisite for next phase
 
 P14 must define persistence/reconciliation per resource family, not generically.
+
+## Current disposition (2026-09-21)
+
+Closed as a typed `ModelOnly`/FutureGated boundary recorded in `EVIDENCE_P13_RESOURCE_FAMILY_BOUNDARY.md` and `P13_QUALIFICATION_TUPLE.json`. The common ledger proves atomic canonical vectors but no live dimension mapping or provider adapter qualifies throughput/occupancy families. Every P13 family gate remains OFF; P14 applies only to the existing ComputeTime contour and cannot generalize persistence claims to these future families.

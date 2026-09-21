@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "phase": "P15",
+  "claim": "RuntimeEnforced",
+  "contour": "host/JIT deterministic-trace replay and structured-telemetry authority non-interference",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "phaseEntryHead": "cf66d014fd0fc19cdcabca2ef1b5b974805ecda1",
+  "reviewedHead": "cf66d014fd0fc19cdcabca2ef1b5b974805ecda1",
+  "enabledFeatureGates": [],
+  "tests": [
+    { "lane": "trace-telemetry-authority-boundary", "passed": 19, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui", "passed": 1657, "failed": 9, "skipped": 2, "disposition": "same unrelated baseline failures" }
+  ],
+  "build": { "target": "SingNextOS.slnx", "warnings": 0, "errors": 0 },
+  "ordinaryFallback": "unchanged",
+  "exclusions": [
+    "FG-VNX-AUDIT-ONLY remains off",
+    "no telemetry-derived mint, submit, settlement, publication or release",
+    "no production, provider, hardware or temporal guarantee claim"
+  ]
+}

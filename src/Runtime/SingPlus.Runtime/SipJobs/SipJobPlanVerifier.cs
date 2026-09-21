@@ -22,7 +22,7 @@ internal enum SipJobEffectClass { None = 0, ExternalEffect }
 internal enum SipJobExecutionClass { None = 0, ManagedDefault }
 internal enum SipJobStageMode { Synchronous = 0, Asynchronous }
 internal enum SipJobInvocationObservability { HiddenIntermediate = 0, FinalPublication }
-internal enum SipJobBarrierClass { None = 0, ExternalEffect, Publication, OwnershipSettlement, AsyncWait, CrossRuntime, IndependentCancellation, ObservableInvocation, NativeIsolated, ConfidentialDomain, IrreversiblePrivateMutation, UnsupportedAuthorityCommit }
+internal enum SipJobBarrierClass { None = 0, ExternalEffect, Publication, OwnershipSettlement, AsyncWait, CrossRuntime, IndependentCancellation, ObservableInvocation, NativeIsolated, ConfidentialDomain, IrreversiblePrivateMutation, UnsupportedAuthorityCommit, ResourceConsumption }
 
 internal readonly record struct SipJobAuthorityRequirement(
     uint Version,

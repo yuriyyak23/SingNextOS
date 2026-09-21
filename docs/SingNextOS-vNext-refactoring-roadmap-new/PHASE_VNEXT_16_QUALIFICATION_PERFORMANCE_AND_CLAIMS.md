@@ -57,3 +57,7 @@ Qualification records are evidence artifacts, not runtime authority. Gate promot
 ## Prerequisite for next phase
 
 P17 cutover may remove transitional code only when P16 proves no live dependency on it.
+
+## Current disposition
+
+Qualification closure is fail-closed at `StaticAdmission`; see `EVIDENCE_P16_QUALIFICATION_CLAIM_CLOSURE.md`, `P16_QUALIFICATION_TUPLE.json` and `VNEXT_TRACEABILITY.json`. All gates remain OFF and the ISA-change category is empty. `ProductionQualified` is withheld because the full suite is not green and required provider/performance/NativeAOT evidence is absent. P17 may therefore exercise additive compatibility and rollback only; it may not remove transitional paths.

@@ -333,6 +333,14 @@ public sealed partial class RuntimeKernel
         foreach (var operation in ExternalOperations.InspectionSnapshot().Where(operation => operation.Principal == operationOwner && operation.State != ExternalOperationState.Released))
             result.Add(new(CheckpointResourceKind.ExternalOperation, $"operation:{operation.Operation.OperationId.Value}", CheckpointResourceClassification.NonCheckpointable, "Live or uncontained external operation is excluded."));
 
+        foreach (var reservation in Budgets.InspectionSnapshot().Where(reservation =>
+                     reservation.Owner == record.Process && reservation.Amounts.Any(amount =>
+                         amount.Dimension == ServiceBudgetDimension.ComputeTimeNanoseconds)))
+            result.Add(new(CheckpointResourceKind.Budget,
+                $"resource-lease:{reservation.Reservation.ReservationId.Value}:{reservation.Reservation.Generation.Value}",
+                CheckpointResourceClassification.NonCheckpointable,
+                "Live resource reservations and leases are never serialized or recreated from checkpoint bytes."));
+
         var selectedHandles = selected.Select(static item => item.Buffer.Handle).ToHashSet();
         foreach (var region in Regions.InspectionSnapshot().Where(region => region.Region.Owner == operationOwner && region.Region.State != RegionState.Released))
         {

@@ -56,3 +56,7 @@ Authoritative state machines remain those from ordinary SIP. SipJob stores plan/
 ## Prerequisite for next phase
 
 P13 generalizes only after the single-class ordinary and fused contours are stable.
+
+## Current disposition (2026-09-21)
+
+Closed for mandatory ordinary-boundary preservation as recorded in `EVIDENCE_P12_SIPJOB_RESOURCE_BOUNDARY.md` and `P12_QUALIFICATION_TUPLE.json`. Resource consumption is an explicit `ResourceBudgetAuthority` materialization barrier, separate from effect and publication barriers. `FG-VNX-SIPJOB-RESOURCE` remains OFF; no resource-aware fused or parallel contour is claimed. P13 may extend only the stable ordinary single-class owner path.

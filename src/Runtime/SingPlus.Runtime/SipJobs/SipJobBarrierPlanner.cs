@@ -35,6 +35,7 @@ internal static class SipJobBarrierPlanner
             SipJobBarrierClass.ConfidentialDomain => Reject("SecureDomainTransition"),
             SipJobBarrierClass.IrreversiblePrivateMutation => Materialize("GeneratedSentry"),
             SipJobBarrierClass.UnsupportedAuthorityCommit => Materialize("CapabilityAuthority"),
+            SipJobBarrierClass.ResourceConsumption => Materialize("ResourceBudgetAuthority"),
             _ => Reject("UnknownBoundary"),
         };
     }

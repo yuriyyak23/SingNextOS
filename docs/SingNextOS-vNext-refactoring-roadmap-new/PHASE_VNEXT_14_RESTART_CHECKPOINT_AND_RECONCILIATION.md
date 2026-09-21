@@ -69,3 +69,7 @@ Restore never maps persisted credential bytes directly to Active authority.
 ## Prerequisite for next phase
 
 P15 may observe these states but cannot drive them.
+
+## Current disposition (2026-09-21)
+
+Closed for the exact ordinary component checkpoint/fresh-generation restore and in-process provider quarantine contour recorded in `EVIDENCE_P14_RESTART_CHECKPOINT_RECONCILIATION.md` and `P14_QUALIFICATION_TUPLE.json`. Active ComputeTime reservations/leases are non-checkpointable; restore recreates authority through fresh admission and old handles stay stale. Cold runtime-process recovery and durable quarantine persistence remain FutureGated and are not implied by this closure.

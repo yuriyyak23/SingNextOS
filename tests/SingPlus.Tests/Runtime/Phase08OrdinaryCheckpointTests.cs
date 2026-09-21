@@ -153,6 +153,37 @@ public sealed class Phase08OrdinaryCheckpointTests
             ServiceBudgetDimension.CheckpointStorageBytes).Used);
     }
 
+    [Fact]
+    public void LiveResourceLeaseBlocksCheckpointAndOldHandleCannotBindAfterFreshRestore()
+    {
+        var kernel = new RuntimeKernel();
+        var admin = Admin(kernel, 897, 8907);
+        var component = kernel.AdmitComponent(Plan("resource-checkpoint", 807, 8007, 1)).Value!;
+        var lease = kernel.Budgets.Reserve(component.Process,
+            [new(ServiceBudgetDimension.ComputeTimeNanoseconds, 5)],
+            BudgetReservationLifetime.LocalResource, AdmissionQosHint.None).Value!.Reservation;
+
+        var blocked = kernel.CreateOrdinaryCheckpoint(admin.Process, admin.Capability,
+            component.Identity, new byte[] { 1 });
+        Assert.Equal(KernelError.CheckpointBlocked, blocked.Error);
+        var failed = kernel.QueryOrdinaryCheckpoint(admin.Process, new(new(1), new(1)),
+            admin.Capability).Value!;
+        Assert.Contains(failed.Resources, item => item.Kind == CheckpointResourceKind.Budget &&
+            item.Classification == CheckpointResourceClassification.NonCheckpointable &&
+            item.Correlation.Contains($":{lease.Generation.Value}", StringComparison.Ordinal));
+
+        Assert.True(kernel.Budgets.CancelLeasePreSubmit(component.Process, lease).IsSuccess);
+        var image = kernel.CreateOrdinaryCheckpoint(admin.Process, admin.Capability,
+            component.Identity, new byte[] { 2 }).Value!;
+        Assert.True(kernel.DrainComponent(component.Identity).Value!.Reclaimable);
+        var restored = kernel.RestoreOrdinaryCheckpoint(admin.Process, admin.Capability, image,
+            Plan("resource-checkpoint", 807, 8007, 2)).Value!;
+
+        Assert.False(kernel.Budgets.BindLease(restored.Receipt.RestoredProcess, lease).IsSuccess);
+        Assert.False(restored.Receipt.ReusedCapability);
+        Assert.False(restored.Receipt.ReusedExternalAuthority);
+    }
+
     private static ComponentAdmissionPlan Plan(
         string name,
         ulong processId,

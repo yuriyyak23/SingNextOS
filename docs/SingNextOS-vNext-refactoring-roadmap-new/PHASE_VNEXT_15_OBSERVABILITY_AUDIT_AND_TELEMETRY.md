@@ -52,3 +52,7 @@ Telemetry has no authoritative state transitions. Dropped/duplicated/reordered e
 ## Prerequisite for next phase
 
 P16 consumes telemetry as evidence only and pins claims to executable tests.
+
+## Current disposition
+
+Closed for the existing host/JIT deterministic-trace replay and structured-telemetry non-interference contour at `RuntimeEnforced`; see `EVIDENCE_P15_OBSERVABILITY_AUTHORITY_BOUNDARY.md` and `P15_QUALIFICATION_TUPLE.json`. `FG-VNX-AUDIT-ONLY` remains OFF. Fine-grained events for still-disabled vNext owner transitions remain FutureGated and are not simulated by telemetry.
