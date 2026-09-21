@@ -1,286 +1,313 @@
 {
-  "singnext_sha": "1890a8e921cfe903b5b44857e4661168bf7bbceb",
-  "hybridcpu_sha": "794c4a53494f503855ac8cf209efab23fde083b2",
+  "schema_version": 2,
+  "generated_at": "2026-09-22T01:23:00+03:00",
+  "source_policy": "live code/tests > current normative specs > evidence > roadmap > history",
+  "baseline": {
+    "SingNextOS": {
+      "sha": "cb6a94c314055e0712b8d9b8382ca1d146fe1c0e",
+      "tree": "b0a9e343df10a99e26adddbe57669ed2533d1b8e",
+      "sdk": "11.0.100-rc.1.26425.128"
+    },
+    "HybridCPU-v2": {
+      "sha": "794c4a53494f503855ac8cf209efab23fde083b2",
+      "tree": "189f59a4b95fb822618117c60c8224bed701f9a5",
+      "sdk": "10.0.201",
+      "contracts_package": "1.14.0",
+      "external_operation_schema": "1.4.0"
+    }
+  },
+  "test_execution": "NOT_RUN",
+  "isa_impact": "NONE",
   "files": [
     {
-      "name": "00_README.md",
-      "sha256": "a89851ae5182ed0b0682d2976baf98c2d8830e4b5254a843f185644738753943",
-      "bytes": 4957
+      "path": "00_README.md",
+      "sha256": "11cd75e1662d38dbd01852babbea96506c94b84c4a948253349f3704e03aa269",
+      "size": 4570
     },
     {
-      "name": "01_BASELINE_AND_CODE_AUDIT.md",
-      "sha256": "5e16f980f7240f6dddefc3a288c04fd7cd4443f75f1cf3c5230b4521237e1db3",
-      "bytes": 6450
+      "path": "01_BASELINE_AND_CODE_AUDIT.md",
+      "sha256": "18668c064cf3ed4c70a753a139d303ba8a65ded6f344be0528c248a8ad228919",
+      "size": 3179
     },
     {
-      "name": "02_MASTER_REFACTORING_ROADMAP.md",
-      "sha256": "91291cebed260b4230a59e53e8267e2001e7230948def3f8e679a080665cbc42",
-      "bytes": 2440
+      "path": "02_MASTER_REFACTORING_ROADMAP.md",
+      "sha256": "f604b0352881f59e6f592cf91e0cba3d0f4cca45c74cbc4bc8fe9076882ce448",
+      "size": 3746
     },
     {
-      "name": "03_NORMATIVE_INVARIANTS.md",
-      "sha256": "7ffc5fcd419c84f946122b7b679aea3aad430a1ed6236a588603f0fae52315c0",
-      "bytes": 4082
+      "path": "03_NORMATIVE_INVARIANTS.md",
+      "sha256": "bde5888690938425007af922dcf555be873bc931b15215a5188518b348533407",
+      "size": 1650
     },
     {
-      "name": "04_TARGET_ARCHITECTURE.md",
-      "sha256": "07ea35e46d61c0a785a81c4a85cf91b23ade72039e16ab8d25ee7615277fd2ae",
-      "bytes": 2628
+      "path": "04_TARGET_ARCHITECTURE.md",
+      "sha256": "543a2139eadf2690e0b80b5d120c9dd9a8c3dff22d652c4c1342b1a8ec196f37",
+      "size": 1121
     },
     {
-      "name": "05_AUTHORITY_OWNER_MAP.md",
-      "sha256": "fd10960f8ef92ab1fac2d65eaf2e96b40698701bdba6c8f2ca2ed0bf33d5560d",
-      "bytes": 1767
+      "path": "05_AUTHORITY_OWNER_MAP.md",
+      "sha256": "422334495778079887361aaac673f7d9d0f59f39fa5c4d4cc930b06dcd0e849c",
+      "size": 1472
     },
     {
-      "name": "06_STATE_MACHINE_AND_TRANSITIONS.md",
-      "sha256": "df04d38196809cff44227aee60aa84a6e984a31d9357339d6c8aceab5e8f9e61",
-      "bytes": 1908
+      "path": "06_STATE_MACHINE_AND_TRANSITIONS.md",
+      "sha256": "95697161405cd0409304a2ac61d93cc9e163858a6e57701f26a97bf1127ee81c",
+      "size": 1466
     },
     {
-      "name": "07_CONTRACT_AND_VERSIONING_STRATEGY.md",
-      "sha256": "8ab26f6244c9731baa43545978cf1d1fee7fe000749bba3e8d8a881209f05c14",
-      "bytes": 1372
+      "path": "07_CONTRACT_AND_VERSIONING_STRATEGY.md",
+      "sha256": "e72bd14c35abe9d53a190113c33b3c87ac07b407419b07ee0b2dc947051bbb0c",
+      "size": 1328
     },
     {
-      "name": "08_TEST_AND_FORMAL_QUALIFICATION.md",
-      "sha256": "fea8613950097279ac270ced479e6c03ed73e7dbd23348cbc6cad481568ddcda",
-      "bytes": 1455
+      "path": "08_TEST_AND_FORMAL_QUALIFICATION.md",
+      "sha256": "0c5d5f6bbcd4bd8329caac7cdf065fb19e5950906d11ba009feefb09230b9d5a",
+      "size": 832
     },
     {
-      "name": "09_ADVERSARIAL_MATRIX.md",
-      "sha256": "a43be025347a2ef1608c153c67caab3727b655cc54f6f3a9ba5b8a6e88491975",
-      "bytes": 2190
+      "path": "09_ADVERSARIAL_MATRIX.md",
+      "sha256": "9828c24377137672cf014aed93ba2bb94b0c1ef002f9ad6443af3a3fcaa8cbb7",
+      "size": 3596
     },
     {
-      "name": "10_CROSS_REPO_DELTA.md",
-      "sha256": "0197284a87cd726ba7125520f005b60d270bc193025bf0354c6721e80873703f",
-      "bytes": 1652
+      "path": "10_CROSS_REPO_DELTA.md",
+      "sha256": "82e0be5b725029368f9b98328030eda71992a817add7c030316bc92350d6414c",
+      "size": 1578
     },
     {
-      "name": "11_MIGRATION_ROLLBACK.md",
-      "sha256": "1192cb3f675f6786b13484e92b721963c53e6926b9996a039d8478b9f52079c2",
-      "bytes": 1052
+      "path": "11_MIGRATION_ROLLBACK.md",
+      "sha256": "6422e806d7384b20b6eab3ad638cdf9e56b44d602688f18de496e2d0485c352a",
+      "size": 789
     },
     {
-      "name": "12_REJECTED_ALTERNATIVES.md",
-      "sha256": "839582f14c985b59045d337748931e7ef7e81a484438e83da079abe2b8230465",
-      "bytes": 1261
+      "path": "12_REJECTED_ALTERNATIVES.md",
+      "sha256": "c4c497772f84134a50a9c1363f2a6552a6b6eff1d898d2519e49421701211218",
+      "size": 1054
     },
     {
-      "name": "13_CODEBASE_VERIFICATION.md",
-      "sha256": "1ed0399ff7ef84f518a746dfd48cd648a69f2ab7d6f6fb2817d5423c7ef17037",
-      "bytes": 4871
+      "path": "13_CODEBASE_VERIFICATION.md",
+      "sha256": "bb0a4b4b357bd6925de4147e7e5beacf0e5e562a6603c07549b5d5d92e6cf4b9",
+      "size": 3384
     },
     {
-      "name": "MATRIX_MULTIPLY_WORKED_EXAMPLE.md",
-      "sha256": "4f4b2fc7410edb84ea2059895217d2099f2fa2c247ddadc25a39bd5db9b1d0f0",
-      "bytes": 3610
+      "path": "14_AUDIT_CORRECTIONS_AND_CLASSIFICATIONS.md",
+      "sha256": "70c88550633efaba4d709e42777cc8b897d6922a79b8cab2d21533307b8b6909",
+      "size": 1413
     },
     {
-      "name": "OPEN_QUESTIONS.md",
-      "sha256": "7e0169239c4c55f5ab49ff96eb735d94b4b5d12e81e517fb4f2d9bfb1205f9a2",
-      "bytes": 1449
+      "path": "MATRIX_MULTIPLY_WORKED_EXAMPLE.md",
+      "sha256": "bbfd285e7476630c157ce7668e6b712edda254b139c4cb7a3bb2c387271f093f",
+      "size": 3411
     },
     {
-      "name": "PHASE_P00_LIVE_BASELINE_SOURCE_FREEZE.md",
-      "sha256": "43d2a9e24d45235ad9f22cb7b8d3f57c9ae47d5ebd20f842db3f2938dafae2b6",
-      "bytes": 5498
+      "path": "OPEN_QUESTIONS.md",
+      "sha256": "66e2665f6d4fea9ffa825d4f4ef1611879a0a2ec386cc2ecf0bb95380c7dc8d6",
+      "size": 1272
     },
     {
-      "name": "PHASE_P01_OWNER_AND_MACHINE_RECONSTRUCTION.md",
-      "sha256": "bfec19c05ad8f1e44384361d028bafff3950481aabc0c51347190e7ae6dbeea5",
-      "bytes": 5741
+      "path": "PHASE_P00_LIVE_BASELINE_SOURCE_FREEZE.md",
+      "sha256": "e5af586ad8350f17b6431ecc6bcf99af7eec7d03c00d8879ea4ef2d0f34de565",
+      "size": 2191
     },
     {
-      "name": "PHASE_P02_SEMANTIC_VOCABULARY_AND_REFINEMENT.md",
-      "sha256": "c5c2d315815bec487f9d2ed7549f5ab84bb814ad30edd7cba5ced972ec52d627",
-      "bytes": 5794
+      "path": "PHASE_P01_OWNER_AND_MACHINE_RECONSTRUCTION.md",
+      "sha256": "e58ecf086de4927bed4dc02d170c9a5a30f0dcaffa89f00cb7c8afc50f4157ee",
+      "size": 2332
     },
     {
-      "name": "PHASE_P03_GLOBAL_OPERATIONAL_SEMANTICS.md",
-      "sha256": "61383c678b392bbafd16c8af2e91fb23796c6ccbb1bfc2bae0c6ba70e87c5038",
-      "bytes": 5514
+      "path": "PHASE_P02_SEMANTIC_VOCABULARY_AND_REFINEMENT.md",
+      "sha256": "9ba722feaf1ef9d282fd81419ff126e549de5fdc527c9d8fa4f649b7b809e2fb",
+      "size": 2184
     },
     {
-      "name": "PHASE_P04_OPERATION_OBLIGATIONS.md",
-      "sha256": "db7ee8d549a467871dc310ff6444f94f56a7435e5338bcb7a138ff418a9d0a99",
-      "bytes": 5770
+      "path": "PHASE_P03_GLOBAL_OPERATIONAL_SEMANTICS.md",
+      "sha256": "a087a9988926914ed809bf73efb59500b86122d51025de7284c3266f6df8cd50",
+      "size": 2020
     },
     {
-      "name": "PHASE_P05_EXECUTION_GUARANTEES_AND_BINDING.md",
-      "sha256": "a052a451bb836695be5deaa482d2620c01aa9c0a478e8c6d7a9cd9ee093070bb",
-      "bytes": 5817
+      "path": "PHASE_P04_OPERATION_OBLIGATIONS.md",
+      "sha256": "28d868c738098600c2d2dc4d136adb577f09943ce77c365720c3860134742f01",
+      "size": 2109
     },
     {
-      "name": "PHASE_P06_GENERATION_EXACT_ADMISSION_SENTRY.md",
-      "sha256": "9cf81d39334235296cbf34370b7bb125e5209cbb09a199fb111a96ad0eecaa08",
-      "bytes": 5739
+      "path": "PHASE_P05_EXECUTION_GUARANTEES_AND_BINDING.md",
+      "sha256": "b1d8c769802f76cc368952836dd3e244de758cbb9b9efff1efc8cae756cd1f8c",
+      "size": 2380
     },
     {
-      "name": "PHASE_P07_EFFECT_AND_PUBLICATION_ALGEBRA.md",
-      "sha256": "872e20561424df10009a0907809103654d2b3200670a01d842025505422b1e61",
-      "bytes": 5655
+      "path": "PHASE_P06_GENERATION_EXACT_ADMISSION_SENTRY.md",
+      "sha256": "ad38f8f0c2e301897a26d0d09ed2325496d66590a9f771fe63bf3ea207c5ae34",
+      "size": 2235
     },
     {
-      "name": "PHASE_P08_VISIBILITY_MEMORY_SHARING_LOCALITY.md",
-      "sha256": "af5c09f6e2ff636f9e11d118022135f2f175152899ac943d7b318793b25f173f",
-      "bytes": 5690
+      "path": "PHASE_P07_EFFECT_AND_PUBLICATION_ALGEBRA.md",
+      "sha256": "e243d89c541199fac1474c1589974deaa8c6e553b7d03b0222193353fec3ff53",
+      "size": 2190
     },
     {
-      "name": "PHASE_P09_RESOURCE_MEASUREMENT_RETIRE_CHARGING.md",
-      "sha256": "c690ffb8aac940eee1ac31646a82218c35caa73c1e99891ef5c269fe5d7a9ceb",
-      "bytes": 5791
+      "path": "PHASE_P08_VISIBILITY_MEMORY_SHARING_LOCALITY.md",
+      "sha256": "76cd293b9321f554f4528a1bbc30bc97b5bcf97fcaa6b9df9dadcdeb3b833696",
+      "size": 2018
     },
     {
-      "name": "PHASE_P10_MULTI_RESOURCE_QOS_SCHEDULING.md",
-      "sha256": "80d7400d0c0ceca2185bae8f9449b3c5372b44271cec2e1067150a7bd4773b21",
-      "bytes": 5741
+      "path": "PHASE_P09_RESOURCE_MEASUREMENT_RETIRE_CHARGING.md",
+      "sha256": "cc10fc91783200fd128a2f218dd1abaf3e83b69331a621a76eb80e49607a62f1",
+      "size": 2207
     },
     {
-      "name": "PHASE_P11_PREEMPTION_CANCELLATION_CONTAINMENT.md",
-      "sha256": "d3b93678bef1a32505e8a5be3179456a92f2fbd4084df523cb46d73ede05f0b4",
-      "bytes": 5813
+      "path": "PHASE_P10_MULTI_RESOURCE_QOS_SCHEDULING.md",
+      "sha256": "c5acdd3ed0fe8b5f7baccc4880a854f7fea8d79a5145fa5c96d2215b3a96fa72",
+      "size": 2359
     },
     {
-      "name": "PHASE_P12_REPLAY_PROVIDER_REFINEMENT_ISOLATION.md",
-      "sha256": "4401f1d0a974642234ac1f92a938f5c55e2a699e7b0ab7d1687aaf2fcbf84bc5",
-      "bytes": 5750
+      "path": "PHASE_P11_PREEMPTION_CANCELLATION_CONTAINMENT.md",
+      "sha256": "888be734aada4f35562bff32796a215409e049953dad293c3ede43943310a4d4",
+      "size": 2538
     },
     {
-      "name": "PHASE_P13_LIVENESS_FAULT_QUARANTINE_RECOVERY.md",
-      "sha256": "95c1ccdfe8516a5212052ca0c23903bc9fc83ceae28ebe2a0ea78dd73c174a29",
-      "bytes": 5821
+      "path": "PHASE_P12_REPLAY_PROVIDER_REFINEMENT_ISOLATION.md",
+      "sha256": "303b180c1090de869980f07d9fa64b33bebbcc6b524f5e4bc122ef842f5587c2",
+      "size": 2350
     },
     {
-      "name": "PHASE_P14_SCALABLE_AUTHORITY_OWNERS.md",
-      "sha256": "83926688de3585b606ef394a665a91bfc04c22e62015885177a641b3e71e1394",
-      "bytes": 5683
+      "path": "PHASE_P13_LIVENESS_FAULT_QUARANTINE_RECOVERY.md",
+      "sha256": "404da1b5fc504be4444798793dfb0ef9abb379ff49803b8452e585c764fa3ae3",
+      "size": 2157
     },
     {
-      "name": "PHASE_P15_MANAGED_ROOT_DURABLE_IFC.md",
-      "sha256": "3d529d29c41cf1607f2fd2b69c0e521c4ec26900fefa0400696e2992ae38b6cf",
-      "bytes": 5765
+      "path": "PHASE_P14_SCALABLE_AUTHORITY_OWNERS.md",
+      "sha256": "0491e10b4a82aeb29370a8c4a7762544cac2b8a98cc2bfcb9bf1ad88b830fdd6",
+      "size": 1924
     },
     {
-      "name": "PHASE_P16_SIPJOB_AND_DECLARATIVE_OPERATION_MODEL.md",
-      "sha256": "989d4dc243ed72a1a1d576d14359786372cf3bfac576a724239af65cbe4600b0",
-      "bytes": 5817
+      "path": "PHASE_P15_MANAGED_ROOT_DURABLE_IFC.md",
+      "sha256": "8b44a3154a4002c572ce67e8f12291f684d2cbf5c71b51f0d882e52e30200657",
+      "size": 2256
     },
     {
-      "name": "PHASE_P17_MATRIXMULTIPLY_HYBRIDCPU_VERTICAL.md",
-      "sha256": "13234915f569b77db784bdd6724f521e98e07eb5b0209bcd2ef0de124d4045e1",
-      "bytes": 5959
+      "path": "PHASE_P16_SIPJOB_AND_DECLARATIVE_OPERATION_MODEL.md",
+      "sha256": "ccfc5ded0b2d40d3d6300e1bd9cb32b3952e3079770d1d56010a2a100a3d83c3",
+      "size": 2199
     },
     {
-      "name": "PHASE_P18_QUALIFICATION_PROMOTION_CUTOVER.md",
-      "sha256": "f911a7885a6b14ca76b33ab921312107cf87d697061f37c28842ec32e49fcee0",
-      "bytes": 5609
+      "path": "PHASE_P17_MATRIXMULTIPLY_HYBRIDCPU_VERTICAL.md",
+      "sha256": "2c0c6850e6a94ce9aea5a4d6e910636793d630a38c16895590a55a2a6295cbad",
+      "size": 3002
     },
     {
-      "name": "TASK_INDEX.md",
-      "sha256": "a6758cee13eac64b250a9f8b60bf8da270c81cf494f145b556b060f083081324",
-      "bytes": 8821
+      "path": "PHASE_P18_QUALIFICATION_PROMOTION_CUTOVER.md",
+      "sha256": "3ad3bbb3d3eb7b87cd2e9c092f0ac4038248579341b9ba77bdc1c2c913666d5b",
+      "size": 2150
     },
     {
-      "name": "TRACEABILITY_MATRIX.md",
-      "sha256": "f3a631e74207c5eb3084531f062161e626b8d56f505ccbd25cb8f48ef212e94e",
-      "bytes": 2478
+      "path": "TASK_INDEX.md",
+      "sha256": "7437e7e8477b76bbb2716786a83ca3b03c55794ed6178c65f6442c461e0b82d8",
+      "size": 9447
     },
     {
-      "name": "TZ_P00_LIVE_BASELINE_SOURCE_FREEZE.md",
-      "sha256": "56a082832e901457a28239bd9a56ea01a500fcbd0355b014f269bdf307df9c11",
-      "bytes": 9969
+      "path": "TASK_STATUS.json",
+      "sha256": "69199abeb3e6f8a50c811185ae5ff6142056d93b7a027ce34b23ab5c0517b909",
+      "size": 17606
     },
     {
-      "name": "TZ_P01_OWNER_AND_MACHINE_RECONSTRUCTION.md",
-      "sha256": "158b4944e9b703454b0962a06090fd36be492df9aeb9b6a02ba11e9c06b82489",
-      "bytes": 10090
+      "path": "TRACEABILITY_MATRIX.md",
+      "sha256": "f6befcc446d77a0e110cb91222d6b83dbd11c8e67f012502ba0c55369e7d7c5c",
+      "size": 2320
     },
     {
-      "name": "TZ_P02_SEMANTIC_VOCABULARY_AND_REFINEMENT.md",
-      "sha256": "148b725ccd474bc1d029686786829171529b91d141c5439b4dbb6116b234d767",
-      "bytes": 10197
+      "path": "TZ_P00_LIVE_BASELINE_SOURCE_FREEZE.md",
+      "sha256": "152f2dda20183812aa2dc29bd890b33e9db5a5f4ea3a45dd2fb79ee2a3791fd2",
+      "size": 10900
     },
     {
-      "name": "TZ_P03_GLOBAL_OPERATIONAL_SEMANTICS.md",
-      "sha256": "303fbfb441f0f9b1b5335002f57c0df929829c8a458eaa6402a1324ff4dcb357",
-      "bytes": 10141
+      "path": "TZ_P01_OWNER_AND_MACHINE_RECONSTRUCTION.md",
+      "sha256": "53930326558ba71f34da8b0840b25b3c46b6ffe45180cf882998b4b42ff4bca9",
+      "size": 11112
     },
     {
-      "name": "TZ_P04_OPERATION_OBLIGATIONS.md",
-      "sha256": "2499212f1d9ca1d0773a9a3a65aecf710a3020e5bc0a8bca50ad1952ab20fb43",
-      "bytes": 13342
+      "path": "TZ_P02_SEMANTIC_VOCABULARY_AND_REFINEMENT.md",
+      "sha256": "e42aa86cb4689884da0ac1270817a4eb446c845652e7e84162b1c1d90abe8dde",
+      "size": 10642
     },
     {
-      "name": "TZ_P05_EXECUTION_GUARANTEES_AND_BINDING.md",
-      "sha256": "1e4e6f33e2efd6e8d0e84f4ed86fa99dfc510424a2601e5fe819a8aeb10a39c4",
-      "bytes": 13809
+      "path": "TZ_P03_GLOBAL_OPERATIONAL_SEMANTICS.md",
+      "sha256": "1dc552337f64a106dbde1f4f06d110025f5d3d1f0914123a77ef3ff25516a7db",
+      "size": 10338
     },
     {
-      "name": "TZ_P06_GENERATION_EXACT_ADMISSION_SENTRY.md",
-      "sha256": "baa10bfa14088e0ee491c0b4faeb0783a4858243da7d7e1bca3d02bf0d9625b1",
-      "bytes": 13545
+      "path": "TZ_P04_OPERATION_OBLIGATIONS.md",
+      "sha256": "415967a63b69b31b9cf8e85037f118ccc45deac93af5e91f185be84809f98e8f",
+      "size": 13939
     },
     {
-      "name": "TZ_P07_EFFECT_AND_PUBLICATION_ALGEBRA.md",
-      "sha256": "6ef254916a1233cca59520c8e004c431bba624403f27f52daeb45834b5545197",
-      "bytes": 13276
+      "path": "TZ_P05_EXECUTION_GUARANTEES_AND_BINDING.md",
+      "sha256": "80afd713811a0cca707cc4375c75363346ac1b5b237b7ad36aeed9598219cf5a",
+      "size": 15533
     },
     {
-      "name": "TZ_P08_VISIBILITY_MEMORY_SHARING_LOCALITY.md",
-      "sha256": "7b1c0f37ab6624282982707882914c633aaefe6722c6085490bb236546b54f60",
-      "bytes": 13299
+      "path": "TZ_P06_GENERATION_EXACT_ADMISSION_SENTRY.md",
+      "sha256": "8bfbd57c3daf350be6733d851bc860245659435464532d5ccf9ffb65f40517a2",
+      "size": 14603
     },
     {
-      "name": "TZ_P09_RESOURCE_MEASUREMENT_RETIRE_CHARGING.md",
-      "sha256": "27467ab91ee271dfba5f214f677e43677e3edbd8cd4c89bb63d09297279c717d",
-      "bytes": 13641
+      "path": "TZ_P07_EFFECT_AND_PUBLICATION_ALGEBRA.md",
+      "sha256": "b0100a223709c84c3c0af6abab4b244f7c9da042587a233ef7c23acd4a797f2a",
+      "size": 14501
     },
     {
-      "name": "TZ_P10_MULTI_RESOURCE_QOS_SCHEDULING.md",
-      "sha256": "e5d8eac84c68a6464dbc3bbe96db4c5bddb579621cf86ddb2777712e4ed4a4f7",
-      "bytes": 13464
+      "path": "TZ_P08_VISIBILITY_MEMORY_SHARING_LOCALITY.md",
+      "sha256": "d6fcaf091a97204e520a55e5d9a7c7a2c1630e32ea5ecbd8c2838d4b7c7dbd0f",
+      "size": 13768
     },
     {
-      "name": "TZ_P11_PREEMPTION_CANCELLATION_CONTAINMENT.md",
-      "sha256": "986947dc10cf350803470171d00e177ca78691a27a59a77055f4f1381f70be30",
-      "bytes": 13726
+      "path": "TZ_P09_RESOURCE_MEASUREMENT_RETIRE_CHARGING.md",
+      "sha256": "5ca80e43292591558fa3708d8fc7f12f0f629554e9981781b8529f858be88a36",
+      "size": 14952
     },
     {
-      "name": "TZ_P12_REPLAY_PROVIDER_REFINEMENT_ISOLATION.md",
-      "sha256": "2a541502a8c2011d006297a404fd99f6ee4d66304db5e980d3638789422aeb45",
-      "bytes": 13615
+      "path": "TZ_P10_MULTI_RESOURCE_QOS_SCHEDULING.md",
+      "sha256": "5479c9f3ae1fd84daff5abe33a8a287ce055ac5760dcbb0c1d3a99f055b7e615",
+      "size": 15402
     },
     {
-      "name": "TZ_P13_LIVENESS_FAULT_QUARANTINE_RECOVERY.md",
-      "sha256": "0674635683dbc26ed8644d24c84f375060f0dc18b1fc3a276c96562487d7cea2",
-      "bytes": 13768
+      "path": "TZ_P11_PREEMPTION_CANCELLATION_CONTAINMENT.md",
+      "sha256": "6da9629fc4f6c0581e3aa7e20952928de6dd543e418b4f6a1c6f09e9e2c28c71",
+      "size": 15657
     },
     {
-      "name": "TZ_P14_SCALABLE_AUTHORITY_OWNERS.md",
-      "sha256": "aead71bdaa8a273df2cf51732b0b42c136fcbf6cc5b4da425d38271a601d5ba1",
-      "bytes": 13492
+      "path": "TZ_P12_REPLAY_PROVIDER_REFINEMENT_ISOLATION.md",
+      "sha256": "b4bc676614085b82c5f6fea4773487030b5e59c777874486665e62477265133e",
+      "size": 14717
     },
     {
-      "name": "TZ_P15_MANAGED_ROOT_DURABLE_IFC.md",
-      "sha256": "6acbc83f6a45570250a5b28e402ad1e1c347a9ef3b3496e09ea320da2f6f75bf",
-      "bytes": 13449
+      "path": "TZ_P13_LIVENESS_FAULT_QUARANTINE_RECOVERY.md",
+      "sha256": "679f2fe040d5e5b34592ff4f9c0ed41e4093d16c4eade1662f3f72cc7026f77a",
+      "size": 14578
     },
     {
-      "name": "TZ_P16_SIPJOB_AND_DECLARATIVE_OPERATION_MODEL.md",
-      "sha256": "05fa0a94defe891bea2120cf38336ee2635990b14bfb1b4ea4abf4439046055f",
-      "bytes": 13526
+      "path": "TZ_P14_SCALABLE_AUTHORITY_OWNERS.md",
+      "sha256": "0eef377931c0f5651aa054568cad595ff4ed71424478690014631390bb5699f3",
+      "size": 13168
     },
     {
-      "name": "TZ_P17_MATRIXMULTIPLY_HYBRIDCPU_VERTICAL.md",
-      "sha256": "be6dc216b986e320cf817bf31d2f4fc06068004da0aad8fe1ed406eb1f12c494",
-      "bytes": 13580
+      "path": "TZ_P15_MANAGED_ROOT_DURABLE_IFC.md",
+      "sha256": "8a6eb2415f50333568b2fbb7c08aa5ea4690f8db8bac367be96c072318dee393",
+      "size": 14336
     },
     {
-      "name": "TZ_P18_QUALIFICATION_PROMOTION_CUTOVER.md",
-      "sha256": "269e3ff729c614b61ced011a36ad6eae94d0d07c57682af05f3d839b9955a149",
-      "bytes": 13220
+      "path": "TZ_P16_SIPJOB_AND_DECLARATIVE_OPERATION_MODEL.md",
+      "sha256": "f8f5b6d28088b2ce36323137d7e7fa28445cad9c29adc71852b9ac161947542f",
+      "size": 14299
+    },
+    {
+      "path": "TZ_P17_MATRIXMULTIPLY_HYBRIDCPU_VERTICAL.md",
+      "sha256": "e9c2e53235635112e133513643530dbaa087e879a8b575c9f2d7bd4359cfb7bb",
+      "size": 17252
+    },
+    {
+      "path": "TZ_P18_QUALIFICATION_PROMOTION_CUTOVER.md",
+      "sha256": "e6dffb0d570cbf0dd2a25fac9baa25cda2b08325e80c3237050adf6f638071a6",
+      "size": 13989
     }
   ]
 }

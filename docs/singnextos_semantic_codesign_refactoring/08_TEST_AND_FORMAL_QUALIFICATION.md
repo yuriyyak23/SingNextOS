@@ -1,19 +1,10 @@
-# Test and Formal Qualification Strategy
+# Test and formal qualification
 
-## Executable evidence
-- unit tests: typed refinement, canonicalization, reject taxonomy, state transitions;
-- property tests: monotonic/narrowing algebra, no amplification, overflow/wrap boundaries;
-- concurrency tests: final revalidation races, duplicate submit/settlement/publication, ABA/generation drift;
-- fault injection: timeout/disconnect/reset/restart/reordered/duplicated evidence;
-- differential tests: ordinary SIP versus SipJob authority-visible trace;
-- provider conformance: exact guarantee/enforcement/measurement mappings;
-- performance: owner-lock wait, admission latency, manycore throughput, SMT contention, provider queue pressure.
+Evidence classes are kept separate: unit, property, concurrency, fault injection, integration, provider conformance, differential, performance, model checking, formal proof.
 
-## Formal tools by proof obligation
-- **TLA+/PlusCal:** global cross-owner state machine, liveness, quarantine/containment, multi-resource acquisition and duplicate/reordered event races.
-- **Alloy:** compact type/refinement relation checks, identity/generation uniqueness, illegal combinations and small-scope counterexamples.
-- **Ivy or protocol-focused model checker:** only if a distributed/remote provider protocol is introduced.
-- **Lean/Coq:** defer unless the typed refinement algebra or provider semantic equivalence becomes stable enough to justify machine-checked theorem investment.
-- **Model-specific exhaustive state exploration:** finite cancellation/publication/epoch-close state machines.
+- TLA+/PlusCal: final sentry cross-owner races, cancel/retire/containment, quarantine/reconciliation, optional sharding.
+- Alloy: finite structural/refinement/configuration relations if trait/lattice combinations become hard to review.
+- Property/state exploration: typed refinement, generation combinations, resource arithmetic/conservation, evidence replay.
+- Lean/Coq: deferred; no stable mathematical core currently justifies the cost.
 
-Formal models are evidence, not runtime authority.
+No test is called passed unless its executable result is recorded for the exact source/package/runtime tuple. Test fakes qualify protocol behavior only, not a real provider/ISE path.

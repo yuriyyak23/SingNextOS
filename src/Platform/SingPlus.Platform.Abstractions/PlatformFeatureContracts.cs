@@ -30,6 +30,7 @@ public enum PlatformFeatureFamily
     VirtualEvents,
     VirtualTraps,
     VmxCompatibility,
+    ExternalResourceAccounting,
 }
 
 public enum PlatformFeatureAvailability

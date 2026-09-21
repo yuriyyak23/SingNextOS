@@ -1,5 +1,7 @@
 using SingPlus.Contracts;
+using SingPlus.Platform;
 using SingPlus.Sip.Sdk;
+using System.Security.Cryptography;
 
 namespace SingPlus.Runtime;
 
@@ -39,7 +41,8 @@ internal sealed class ResourceAdmissionCommit : IDisposable
         RuntimeKernel kernel, ProcessHandle principal, ProcessHandle budgetOwner, CapabilityId resourceGrant,
         ulong resourceGeneration, ResourceEnvelopeV1 envelope, ExternalOperationHandle operation,
         BudgetReservationHandle lease, ResourceUseAuthorityLease resourceAuthority,
-        OperationAuthorityLease effectAuthority)
+        OperationAuthorityLease effectAuthority,
+        PlatformResourceCorrelation providerCorrelation)
     {
         _kernel = kernel;
         Principal = principal;
@@ -51,6 +54,7 @@ internal sealed class ResourceAdmissionCommit : IDisposable
         Lease = lease;
         ResourceAuthority = resourceAuthority;
         EffectAuthority = effectAuthority;
+        ProviderCorrelation = providerCorrelation;
     }
 
     internal ProcessHandle Principal { get; }
@@ -62,6 +66,7 @@ internal sealed class ResourceAdmissionCommit : IDisposable
     internal BudgetReservationHandle Lease { get; }
     internal ResourceUseAuthorityLease ResourceAuthority { get; }
     internal OperationAuthorityLease EffectAuthority { get; }
+    internal PlatformResourceCorrelation ProviderCorrelation { get; }
     internal bool TryStartSubmit() => Interlocked.CompareExchange(ref _submitStarted, 1, 0) == 0;
     internal bool SubmitStarted => Volatile.Read(ref _submitStarted) != 0;
 
@@ -159,6 +164,9 @@ public sealed partial class RuntimeKernel
         var externalCommitted = false;
         try
         {
+            if (_resourceBudgetRecoveryJournal is not null && !Budgets.RecoveryImportComplete)
+                return KernelResult<ResourceAdmissionCommit>.Fail(KernelError.Quarantined,
+                    "Durable resource recovery state requires accounting import or provider reconciliation before fresh admission.");
             var process = Processes.Resolve(principal);
             if (!process.IsSuccess) return KernelResult<ResourceAdmissionCommit>.Fail(process.Error, process.Message!);
             var processRecord = process.Value!;
@@ -228,10 +236,17 @@ public sealed partial class RuntimeKernel
                 providerGeneration ?? dependencies.PlatformGeneration);
             if (!resourceBinding.IsSuccess)
                 return KernelResult<ResourceAdmissionCommit>.Fail(resourceBinding.Error, resourceBinding.Message!);
+            var correlation = new PlatformResourceCorrelation(
+                new PlatformResourceCorrelationId(operation.OperationId.Value),
+                new PlatformResourceCorrelationGeneration(operation.Generation.Value));
+            var journalPrepared = AppendResourceRecovery(lease.Value, exactBudgetOwner, requested, correlation,
+                ResourceBudgetRecoveryTransition.Prepared, []);
+            if (!journalPrepared.IsSuccess)
+                return KernelResult<ResourceAdmissionCommit>.Fail(journalPrepared.Error, journalPrepared.Message!);
             ResourceAdmissionQualificationHook?.At(ResourceAdmissionQualificationPoint.AfterLocalCommit);
 
             var commit = new ResourceAdmissionCommit(this, principal, exactBudgetOwner, resourceGrant, resourceGrantGeneration, requested,
-                operation, lease.Value, resourceAuthority, effectAuthority);
+                operation, lease.Value, resourceAuthority, effectAuthority, correlation);
             resourceAuthority = null;
             effectAuthority = null;
             lease = null;
@@ -250,6 +265,11 @@ public sealed partial class RuntimeKernel
             {
                 _ = ExternalOperations.Cancel(operation, providerCancellationSupported: false);
                 _ = ExternalOperations.MarkResourceCancelledPreSubmit(operation);
+                if (lease is { } cancelled)
+                    _ = AppendResourceRecovery(cancelled, exactBudgetOwner, envelope,
+                        new PlatformResourceCorrelation(new PlatformResourceCorrelationId(operation.OperationId.Value),
+                            new PlatformResourceCorrelationGeneration(operation.Generation.Value)),
+                        ResourceBudgetRecoveryTransition.CancelledPreSubmit, []);
             }
             if (lease is { } reservation)
                 _ = Budgets.CancelLeasePreSubmit(exactBudgetOwner, reservation);
@@ -268,6 +288,10 @@ public sealed partial class RuntimeKernel
 
         var process = Processes.Resolve(commit.Principal);
         if (!process.IsSuccess) return FailBeforeSubmit(commit, process.Error, process.Message!);
+        var durableSubmit = AppendResourceRecovery(commit.Lease, commit.BudgetOwner, commit.Envelope,
+            commit.ProviderCorrelation, ResourceBudgetRecoveryTransition.PossibleSubmit, []);
+        if (!durableSubmit.IsSuccess)
+            return FailBeforeSubmit(commit, durableSubmit.Error, durableSubmit.Message!);
         var submitted = ExternalOperations.RecordSubmission(commit.Operation, dependencies);
         if (!submitted.IsSuccess) return FailBeforeSubmit(commit, submitted.Error, submitted.Message!);
         var consuming = Budgets.BeginConsumption(commit.BudgetOwner, commit.Lease);
@@ -276,6 +300,8 @@ public sealed partial class RuntimeKernel
             _ = ExternalOperations.RecordProviderLoss(commit.Operation);
             _ = Budgets.QuarantineLease(commit.BudgetOwner, commit.Lease);
             _ = ExternalOperations.MarkResourceQuarantined(commit.Operation);
+            _ = AppendResourceRecovery(commit.Lease, commit.BudgetOwner, commit.Envelope,
+                commit.ProviderCorrelation, ResourceBudgetRecoveryTransition.Quarantined, []);
             return KernelResult<OperationBinding>.Fail(consuming.Error, consuming.Message!);
         }
         var resourceConsuming = ExternalOperations.MarkResourceConsumption(commit.Operation);
@@ -284,6 +310,8 @@ public sealed partial class RuntimeKernel
             _ = ExternalOperations.RecordProviderLoss(commit.Operation);
             _ = Budgets.QuarantineLease(commit.BudgetOwner, commit.Lease);
             _ = ExternalOperations.MarkResourceQuarantined(commit.Operation);
+            _ = AppendResourceRecovery(commit.Lease, commit.BudgetOwner, commit.Envelope,
+                commit.ProviderCorrelation, ResourceBudgetRecoveryTransition.Quarantined, []);
             return KernelResult<OperationBinding>.Fail(resourceConsuming.Error, resourceConsuming.Message!);
         }
 
@@ -296,6 +324,8 @@ public sealed partial class RuntimeKernel
             _ = ExternalOperations.RecordProviderLoss(commit.Operation);
             _ = Budgets.QuarantineLease(commit.BudgetOwner, commit.Lease);
             _ = ExternalOperations.MarkResourceQuarantined(commit.Operation);
+            _ = AppendResourceRecovery(commit.Lease, commit.BudgetOwner, commit.Envelope,
+                commit.ProviderCorrelation, ResourceBudgetRecoveryTransition.Quarantined, []);
             return KernelResult<OperationBinding>.Fail(provider.Error, provider.Message!);
         }
         catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
@@ -303,6 +333,8 @@ public sealed partial class RuntimeKernel
             _ = ExternalOperations.RecordProviderLoss(commit.Operation);
             _ = Budgets.QuarantineLease(commit.BudgetOwner, commit.Lease);
             _ = ExternalOperations.MarkResourceQuarantined(commit.Operation);
+            _ = AppendResourceRecovery(commit.Lease, commit.BudgetOwner, commit.Envelope,
+                commit.ProviderCorrelation, ResourceBudgetRecoveryTransition.Quarantined, []);
             return KernelResult<OperationBinding>.Fail(KernelError.PlatformFaulted, exception.Message);
         }
         finally
@@ -317,6 +349,8 @@ public sealed partial class RuntimeKernel
         _ = ExternalOperations.Cancel(commit.Operation, providerCancellationSupported: false);
         _ = Budgets.CancelLeasePreSubmit(commit.BudgetOwner, commit.Lease);
         _ = ExternalOperations.MarkResourceCancelledPreSubmit(commit.Operation);
+        _ = AppendResourceRecovery(commit.Lease, commit.BudgetOwner, commit.Envelope,
+            commit.ProviderCorrelation, ResourceBudgetRecoveryTransition.CancelledPreSubmit, []);
     }
 
     private KernelResult<OperationBinding> FailBeforeSubmit(ResourceAdmissionCommit commit, KernelError error, string message)
@@ -325,5 +359,29 @@ public sealed partial class RuntimeKernel
         commit.EffectAuthority.Dispose();
         commit.ResourceAuthority.Dispose();
         return KernelResult<OperationBinding>.Fail(error, message);
+    }
+
+    private KernelResult AppendResourceRecovery(
+        BudgetReservationHandle lease,
+        ProcessHandle owner,
+        ResourceEnvelopeV1 envelope,
+        PlatformResourceCorrelation correlation,
+        ResourceBudgetRecoveryTransition transition,
+        IReadOnlyList<BudgetAmount> charged)
+    {
+        if (_resourceBudgetRecoveryJournal is null) return KernelResult.Ok();
+        try
+        {
+            _resourceBudgetRecoveryJournal.Append(new ResourceBudgetRecoveryPayload(
+                lease, owner,
+                [new BudgetAmount(ServiceBudgetDimension.ComputeTimeNanoseconds, envelope.Amount)],
+                correlation, transition, charged));
+            return KernelResult.Ok();
+        }
+        catch (Exception exception) when (exception is IOException or InvalidDataException or UnauthorizedAccessException or CryptographicException)
+        {
+            return KernelResult.Fail(KernelError.Quarantined,
+                $"Durable resource recovery journal failed closed: {exception.Message}");
+        }
     }
 }

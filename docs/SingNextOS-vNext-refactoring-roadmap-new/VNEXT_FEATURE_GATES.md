@@ -37,6 +37,7 @@ ProductionQualified
 | `FG-VNX-DEVICE-OCCUPANCY` | OFF | ExecutableAdapter | device memory/queue/inflight contour |
 | `FG-VNX-ENERGY` | OFF | ModelOnly | future only; no runtime claim |
 | `FG-VNX-AUDIT-ONLY` | OFF | RuntimeEnforced | telemetry collection with no decision side effects |
+| `FG-VNX-HOST-RESOURCE-ADAPTER` | OFF | ExecutableAdapter | exact host/JIT ComputeTime/Nanoseconds provider resource contour only |
 
 ## Promotion rules
 

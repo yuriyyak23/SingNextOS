@@ -1,4 +1,5 @@
 using SingPlus.Contracts;
+using SingPlus.Platform;
 
 namespace SingPlus.Runtime;
 
@@ -238,6 +239,21 @@ public sealed partial class RuntimeKernel
         var binding = begun.Value!;
         if (binding.State == ExternalResourceBindingState.Settled)
             return Budgets.Query(binding.Lease);
+
+        var correlation = new PlatformResourceCorrelation(
+            new PlatformResourceCorrelationId(binding.Operation.OperationId.Value),
+            new PlatformResourceCorrelationGeneration(binding.Operation.Generation.Value));
+        var recoveryTransition = ResourceBudgetRecoveryTransition.SettledExact;
+        IReadOnlyList<BudgetAmount> recoveryCharge = evidence.ConsumedAmount == 0
+            ? []
+            : [new BudgetAmount(ServiceBudgetDimension.ComputeTimeNanoseconds, evidence.ConsumedAmount)];
+        var journal = AppendResourceRecovery(binding.Lease, binding.BudgetOwner, binding.Envelope,
+            correlation, recoveryTransition, recoveryCharge);
+        if (!journal.IsSuccess)
+        {
+            _ = ExternalOperations.CompleteResourceSettlement(binding.Operation, binding.Lease, success: false);
+            return KernelResult<BudgetReservationSnapshot>.Fail(journal.Error, journal.Message!);
+        }
 
         var lease = Budgets.Query(binding.Lease);
         if (!lease.IsSuccess)

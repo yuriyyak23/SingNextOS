@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "phase": "P16",
+  "reviewedHead": "cb6a94c314055e0712b8d9b8382ca1d146fe1c0e",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "contour": "Windows-x64/.NET-11/JIT/host-provider/ComputeTimeNanoseconds",
+  "items": [
+    { "order": 1, "name": "provider-versioned-resource-contract", "disposition": "Complete", "claim": "StaticAdmission", "gateDefault": "OFF" },
+    { "order": 2, "name": "durable-budget-journal-restart", "disposition": "CompleteConservativeRecovery", "claim": "RuntimeEnforced", "gateDefault": "OFF" },
+    { "order": 3, "name": "narrow-runtime-provider-contour", "disposition": "CompleteHostOnly", "claim": "ExecutableAdapter", "gateDefault": "OFF" },
+    { "order": 4, "name": "production-shaped-gate-rollback", "disposition": "CompleteHostOnly", "claim": "RuntimeEnforced", "gateDefault": "OFF" },
+    { "order": 5, "name": "sipjob-resource-differential", "disposition": "CompleteTransportOnly", "claim": "RuntimeEnforced", "gateDefault": "OFF" },
+    { "order": 6, "name": "controlled-topology-performance", "disposition": "CompleteExactHost", "claim": "AccountingOnly", "gateDefault": "NotApplicable" },
+    { "order": 7, "name": "temporal-upper-bound", "disposition": "FutureGated", "claim": "AccountingOnly", "gateDefault": "OFF", "missingPrerequisite": "preemptive or contained execution owner that can stop actual ComputeTime consumption at the declared boundary" },
+    { "order": 8, "name": "guaranteed-reservation", "disposition": "FutureGated", "claim": "RuntimeEnforcedAccountingOnly", "gateDefault": "OFF", "missingPrerequisite": "provider or scheduler capacity owner proving minimum CPU capacity under declared contention and loss conditions" }
+  ],
+  "enabledByDefault": [],
+  "hybridCpuQualified": false,
+  "nativeAotQualified": false,
+  "productionQualified": false,
+  "isaChangeCategory": []
+}

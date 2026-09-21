@@ -36,6 +36,8 @@ public sealed class ResourceBudgetAuthority
     private readonly Dictionary<ProcessHandle, BudgetAccountHandle> _processAccounts = [];
     private ulong _nextAccountId = 2;
     private ulong _nextReservationId = 1;
+    private BudgetAmount[] _stagedRecoveryCharges = [];
+    private bool _recoveryImportComplete = true;
 
     internal ResourceBudgetAuthority(ulong initialReservationId = 1)
     {
@@ -54,6 +56,32 @@ public sealed class ResourceBudgetAuthority
 
     public BudgetAccountHandle SystemBudget { get; }
 
+    internal bool RecoveryImportComplete
+    {
+        get { lock (_gate) return _recoveryImportComplete; }
+    }
+
+    internal KernelResult StageConservativeRecoveryCharge(IReadOnlyList<BudgetAmount> charges)
+    {
+        lock (_gate)
+        {
+            if (_accounts.Count != 1 || _reservations.Count != 0 || _processAccounts.Count != 0)
+                return KernelResult.Fail(KernelError.InvalidTransition,
+                    "Cold recovery charge must be staged before budget hierarchy construction.");
+            if (charges.Count == 0)
+            {
+                _stagedRecoveryCharges = [];
+                _recoveryImportComplete = true;
+                return KernelResult.Ok();
+            }
+            var validation = ValidateAmounts(charges);
+            if (!validation.IsSuccess) return validation;
+            _stagedRecoveryCharges = charges.OrderBy(static amount => amount.Dimension).ToArray();
+            _recoveryImportComplete = false;
+            return KernelResult.Ok();
+        }
+    }
+
     internal bool HasProcessAccount(ProcessHandle process)
     {
         lock (_gate) return _processAccounts.ContainsKey(process);
@@ -68,7 +96,19 @@ public sealed class ResourceBudgetAuthority
             if (_accounts.Count != 1 || _reservations.Values.Any(static reservation => IsCapacityHeld(reservation.State)))
                 return KernelResult<BudgetAccountSnapshot>.Fail(KernelError.InvalidTransition, "System budget can be configured only before child allocation or reservations.");
             var root = _accounts[SystemBudget.AccountId];
+            var configured = new Dictionary<ServiceBudgetDimension, ulong>(root.Limits);
+            foreach (var amount in limits) configured[amount.Dimension] = amount.Amount;
+            foreach (var charge in _stagedRecoveryCharges)
+            {
+                if (charge.Amount > configured[charge.Dimension])
+                    return KernelResult<BudgetAccountSnapshot>.Fail(KernelError.BudgetExceeded,
+                        $"Recovered conservative {charge.Dimension} charge exceeds the new system limit.");
+            }
             foreach (var amount in limits) root.Limits[amount.Dimension] = amount.Amount;
+            foreach (var charge in _stagedRecoveryCharges)
+                root.Used[charge.Dimension] = charge.Amount;
+            _stagedRecoveryCharges = [];
+            _recoveryImportComplete = true;
             return KernelResult<BudgetAccountSnapshot>.Ok(Snapshot(root));
         }
     }

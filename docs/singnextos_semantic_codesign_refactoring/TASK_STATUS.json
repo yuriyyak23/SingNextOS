@@ -1,0 +1,578 @@
+{
+  "CD-P00-01": {
+    "phase": "P00",
+    "title": "Refresh exact SHAs/tree SHAs",
+    "classification": "STALE_OR_INCORRECT",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P00-02": {
+    "phase": "P00",
+    "title": "Recompute package/DLL hashes and lockfile identity at implementation start",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P00-03": {
+    "phase": "P00",
+    "title": "Inventory tests/contracts and record test-evidence level",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P01-01": {
+    "phase": "P01",
+    "title": "Build owner/fact matrix from live code",
+    "classification": "VERIFIED_EXISTING",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P01-02": {
+    "phase": "P01",
+    "title": "Trace submit/complete/visible/publish/settle transitions",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P01-03": {
+    "phase": "P01",
+    "title": "Architecture tests reject duplicate owners/forbidden imports",
+    "classification": "NEW_PROPOSED",
+    "repository": "Both",
+    "hybridcpu_impact": "CONTRACT_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P02-01": {
+    "phase": "P02",
+    "title": "Define dimension-specific partial orders",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "Both",
+    "hybridcpu_impact": "CONTRACT_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P02-02": {
+    "phase": "P02",
+    "title": "Define Mandatory/Advisory/Unsupported semantics",
+    "classification": "NEW_PROPOSED",
+    "repository": "Both",
+    "hybridcpu_impact": "CONTRACT_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P02-03": {
+    "phase": "P02",
+    "title": "Property-test refinement monotonicity and version failure",
+    "classification": "NEW_PROPOSED",
+    "repository": "Both",
+    "hybridcpu_impact": "CONTRACT_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P03-01": {
+    "phase": "P03",
+    "title": "Specify GlobalState as product of owner states",
+    "classification": "NEW_PROPOSED",
+    "repository": "Docs/Formal",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P03-02": {
+    "phase": "P03",
+    "title": "Define cross-owner commit points and compensation",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P03-03": {
+    "phase": "P03",
+    "title": "Model revoke/reserve/session/Region/provider races",
+    "classification": "NEW_PROPOSED",
+    "repository": "Docs/Formal",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P04-01": {
+    "phase": "P04",
+    "title": "Add versioned OperationObligationsV1 vocabulary",
+    "classification": "NEW_PROPOSED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P04-02": {
+    "phase": "P04",
+    "title": "Compose obligations from exact live owner snapshots",
+    "classification": "NEW_PROPOSED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P04-03": {
+    "phase": "P04",
+    "title": "Revalidate obligation identity at final sentry",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P04-04": {
+    "phase": "P04",
+    "title": "Negative tests: descriptor possession never authorizes",
+    "classification": "NEW_PROPOSED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P05-01": {
+    "phase": "P05",
+    "title": "Add provider-neutral ExecutionGuaranteesV1 descriptor",
+    "classification": "NEW_PROPOSED",
+    "repository": "HybridCPU Contracts + SingNext adapter",
+    "hybridcpu_impact": "CONTRACT_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P05-02": {
+    "phase": "P05",
+    "title": "Bind exact OS operation/provider/runtime contract context",
+    "classification": "NEW_PROPOSED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "CONTRACT_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P05-03": {
+    "phase": "P05",
+    "title": "Conservative compatibility mapping for Contracts 1.14.0",
+    "classification": "NEW_PROPOSED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P05-04": {
+    "phase": "P05",
+    "title": "Cross-repo ABI/conformance tests",
+    "classification": "NEW_PROPOSED",
+    "repository": "Both",
+    "hybridcpu_impact": "CONTRACT_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P06-01": {
+    "phase": "P06",
+    "title": "Extend existing prepare/revalidate/commit path",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "CONTRACT_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P06-02": {
+    "phase": "P06",
+    "title": "Bind refinement result to exact binding generation",
+    "classification": "NEW_PROPOSED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "CONTRACT_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P06-03": {
+    "phase": "P06",
+    "title": "Guarantee one submit-start winner + pre-submit compensation",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P06-04": {
+    "phase": "P06",
+    "title": "Race tests revoke/session-close/provider-drift",
+    "classification": "NEW_PROPOSED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P07-01": {
+    "phase": "P07",
+    "title": "Model orthogonal effect traits without parallel lifecycle",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P07-02": {
+    "phase": "P07",
+    "title": "Map current ExternalEffectPolicy conservatively",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P07-03": {
+    "phase": "P07",
+    "title": "Exact SingNext publication decision + provider action for staged contour",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "Both",
+    "hybridcpu_impact": "RUNTIME_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P07-04": {
+    "phase": "P07",
+    "title": "Effect-class lifecycle tests",
+    "classification": "NEW_PROPOSED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P08-01": {
+    "phase": "P08",
+    "title": "Define visibility classes and Region transition mapping",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P08-02": {
+    "phase": "P08",
+    "title": "Keep direct-coherent contour gated until alias-exclusion evidence",
+    "classification": "VERIFIED_EXISTING",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P08-03": {
+    "phase": "P08",
+    "title": "Shared-mutable/atomic authority extension only if a real contour requires it",
+    "classification": "DEFERRED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P08-04": {
+    "phase": "P08",
+    "title": "Semantic locality model without hardware IDs in authority API",
+    "classification": "NEW_PROPOSED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "CONTRACT_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P09-01": {
+    "phase": "P09",
+    "title": "Define chargeability matrix per ResourceClassV1",
+    "classification": "NEW_PROPOSED",
+    "repository": "Both",
+    "hybridcpu_impact": "RUNTIME_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P09-02": {
+    "phase": "P09",
+    "title": "Bind usage evidence to measurement contract identity",
+    "classification": "NEW_PROPOSED",
+    "repository": "Both",
+    "hybridcpu_impact": "CONTRACT_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P09-03": {
+    "phase": "P09",
+    "title": "Reconcile replay/squash/retry/SMT/blocked time explicitly",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "Both",
+    "hybridcpu_impact": "RUNTIME_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P09-04": {
+    "phase": "P09",
+    "title": "Enforce envelope and duplicate evidence invariants",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P10-01": {
+    "phase": "P10",
+    "title": "Verify/reuse atomic multi-dimensional budget reservation and add only missing envelope mapping",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P10-02": {
+    "phase": "P10",
+    "title": "Remove standalone banker/escrow protocol from critical path",
+    "classification": "REMOVE_OR_MERGE",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P10-03": {
+    "phase": "P10",
+    "title": "Preserve existing donation assurance/priority ceilings",
+    "classification": "VERIFIED_EXISTING",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P10-04": {
+    "phase": "P10",
+    "title": "Scheduler uses evidence but cannot authorize/refine mismatch",
+    "classification": "VERIFIED_EXISTING",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P11-01": {
+    "phase": "P11",
+    "title": "Define semantic preemption/cancellation obligations with conservative mapping",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "Both",
+    "hybridcpu_impact": "CONTRACT_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P11-02": {
+    "phase": "P11",
+    "title": "Extend guarantees only for executable cancellation/preemption classes",
+    "classification": "NEW_PROPOSED",
+    "repository": "HybridCPU-v2",
+    "hybridcpu_impact": "RUNTIME_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P11-03": {
+    "phase": "P11",
+    "title": "Replace global EffectEpoch with contour-scoped containment closure hook",
+    "classification": "NEW_PROPOSED",
+    "repository": "Both",
+    "hybridcpu_impact": "PROVIDER_SPECIFIC",
+    "isa_impact": "NONE"
+  },
+  "CD-P11-04": {
+    "phase": "P11",
+    "title": "Cancellation/retire/replay/containment fault tests",
+    "classification": "NEW_PROPOSED",
+    "repository": "Both",
+    "hybridcpu_impact": "RUNTIME_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P12-01": {
+    "phase": "P12",
+    "title": "Define replay/determinism lattice by extending existing replay policy",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "Both",
+    "hybridcpu_impact": "CONTRACT_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P12-02": {
+    "phase": "P12",
+    "title": "ProviderBehavior refines semantic operation contract including numeric semantics",
+    "classification": "NEW_PROPOSED",
+    "repository": "Both",
+    "hybridcpu_impact": "CONTRACT_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P12-03": {
+    "phase": "P12",
+    "title": "Typed isolation subset checks without overclaim",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "HybridCPU-v2",
+    "hybridcpu_impact": "RUNTIME_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P12-04": {
+    "phase": "P12",
+    "title": "Guarantee laundering/provider-class switch tests",
+    "classification": "NEW_PROPOSED",
+    "repository": "Both",
+    "hybridcpu_impact": "CONTRACT_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P13-01": {
+    "phase": "P13",
+    "title": "Classify fault/trust models",
+    "classification": "NEW_PROPOSED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P13-02": {
+    "phase": "P13",
+    "title": "Define eventual settlement/containment/reclaim policy",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P13-03": {
+    "phase": "P13",
+    "title": "Bound retries only under explicit fault assumptions",
+    "classification": "NEW_PROPOSED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P13-04": {
+    "phase": "P13",
+    "title": "Cold restart without authority resurrection",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P14-01": {
+    "phase": "P14",
+    "title": "Measure contention before redesign",
+    "classification": "NEW_PROPOSED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P14-02": {
+    "phase": "P14",
+    "title": "Shard only if measured gate fails target",
+    "classification": "DEFERRED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P14-03": {
+    "phase": "P14",
+    "title": "Escrow/local reservation only if sharding requires it",
+    "classification": "DEFERRED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P14-04": {
+    "phase": "P14",
+    "title": "Prove no cross-shard double-spend/ABA if optional branch lands",
+    "classification": "BLOCKED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P15-01": {
+    "phase": "P15",
+    "title": "Specify managed execution assumptions only from live AdmissionVerifier/evidence",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P15-02": {
+    "phase": "P15",
+    "title": "Root/service mint policy uses existing CapabilityAuthority",
+    "classification": "NEW_PROPOSED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P15-03": {
+    "phase": "P15",
+    "title": "Durable identity+policy+principal -> fresh ephemeral authority",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P15-04": {
+    "phase": "P15",
+    "title": "Keep IFC out of critical path",
+    "classification": "DEFERRED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P16-01": {
+    "phase": "P16",
+    "title": "Define authority-visible trace vocabulary",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P16-02": {
+    "phase": "P16",
+    "title": "Differential/weak-bisimulation ordinary SIP vs fused path",
+    "classification": "NEW_PROPOSED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P16-03": {
+    "phase": "P16",
+    "title": "Defer declarative OperationContract code generator until protocols stabilize",
+    "classification": "DEFERRED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P16-04": {
+    "phase": "P16",
+    "title": "Generated metadata cannot authorize",
+    "classification": "DEFERRED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P17-01": {
+    "phase": "P17",
+    "title": "Add MatrixMultiply semantic operation and A/B/C Region operands in SingNext",
+    "classification": "VERIFIED_GAP",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P17-02": {
+    "phase": "P17",
+    "title": "Map Matrix obligations to proven HybridCPU guarantees and exact binding",
+    "classification": "NEW_PROPOSED",
+    "repository": "Both",
+    "hybridcpu_impact": "CONTRACT_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P17-03": {
+    "phase": "P17",
+    "title": "Execute via current runtime legality and staged provider publication path",
+    "classification": "PARTIALLY_EXISTING",
+    "repository": "Both",
+    "hybridcpu_impact": "RUNTIME_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P17-04": {
+    "phase": "P17",
+    "title": "Collect bound usage/visibility/publication/settlement evidence",
+    "classification": "NEW_PROPOSED",
+    "repository": "Both",
+    "hybridcpu_impact": "RUNTIME_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P18-01": {
+    "phase": "P18",
+    "title": "Run full adversarial matrix + selected model checking",
+    "classification": "NEW_PROPOSED",
+    "repository": "Both",
+    "hybridcpu_impact": "RUNTIME_ONLY",
+    "isa_impact": "NONE"
+  },
+  "CD-P18-02": {
+    "phase": "P18",
+    "title": "Record exact SHA/package/runtime/gate/test tuple",
+    "classification": "NEW_PROPOSED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P18-03": {
+    "phase": "P18",
+    "title": "Promote only exact Matrix/staged contour",
+    "classification": "NEW_PROPOSED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  },
+  "CD-P18-04": {
+    "phase": "P18",
+    "title": "Synchronize docs/traceability and retain rollback path",
+    "classification": "NEW_PROPOSED",
+    "repository": "SingNextOS",
+    "hybridcpu_impact": "NONE",
+    "isa_impact": "NONE"
+  }
+}

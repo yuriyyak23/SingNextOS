@@ -1,46 +1,29 @@
-# Master Refactoring Roadmap
+# Master refactoring roadmap
 
-## Dependency graph
+- **P00 — Freeze exact live baseline and evidence tuple** — verdict `CLOSED_WITH_CORRECTIONS`; depends: none; critical-path: yes
+- **P01 — Reconstruct one-fact/one-owner authority map and existing machines** — verdict `CLOSED_WITH_CORRECTIONS`; depends: P00; critical-path: yes
+- **P02 — Define minimal typed semantic vocabulary and refinement algebra** — verdict `CLOSED_WITH_CORRECTIONS`; depends: P01; critical-path: yes
+- **P03 — Specify global operational semantics without a new runtime owner** — verdict `CLOSED_WITH_CORRECTIONS`; depends: P02; critical-path: yes
+- **P04 — Implement OperationObligations as immutable non-authoritative snapshot** — verdict `CLOSED_WITH_CORRECTIONS`; depends: P03; critical-path: yes
+- **P05 — Add provider/runtime guarantees and exact SemanticExecutionBinding** — verdict `CLOSED_WITH_CORRECTIONS`; depends: P04; critical-path: yes
+- **P06 — Integrate four-gate final admission sentry** — verdict `CLOSED_WITH_CORRECTIONS`; depends: P05; critical-path: yes
+- **P07 — Refine effect/publication algebra on existing lifecycle** — verdict `CLOSED_WITH_CORRECTIONS`; depends: P06; critical-path: yes
+- **P08 — Visibility, Region integration and locality** — verdict `CLOSED_WITH_CORRECTIONS`; depends: P07; critical-path: yes
+- **P09 — Resource measurement, chargeability and settlement** — verdict `CLOSED_WITH_CORRECTIONS`; depends: P08; critical-path: yes
+- **P10 — Reuse existing atomic vector reservation; minimal QoS/multi-resource changes** — verdict `CLOSED_WITH_CORRECTIONS`; depends: P09; critical-path: yes
+- **P11 — Preemption, cancellation and provider-contour containment** — verdict `CLOSED_WITH_CORRECTIONS`; depends: P10; critical-path: yes
+- **P12 — Replay, provider semantic refinement and isolation** — verdict `CLOSED_WITH_CORRECTIONS`; depends: P11; critical-path: yes
+- **P13 — Fault, liveness, quarantine and cold-restart reconciliation** — verdict `CLOSED_WITH_CORRECTIONS`; depends: P12; critical-path: yes
+- **P14 — Scalability: measure before sharding** — verdict `DEFERRED`; depends: P10 (measurement can run in parallel with P11-P13); critical-path: no/conditional
+- **P15 — Managed admission, roots, durable identity and IFC scope** — verdict `CLOSED_WITH_CORRECTIONS`; depends: P13 (can run in parallel with P14/P16); critical-path: no/conditional
+- **P16 — SipJob semantic equivalence; declarative generation optional** — verdict `CLOSED_WITH_CORRECTIONS`; depends: P12 (parallel branch; not prerequisite for P17); critical-path: no/conditional
+- **P17 — Qualify one MatrixMultiply staged-output vertical using existing HybridCPU execution substrate** — verdict `CLOSED_WITH_CORRECTIONS`; depends: P12 + P13 safety subset; independent of P14/P15/P16 optional branches; critical-path: yes
+- **P18 — Qualification, promotion, evidence tuple and rollback** — verdict `CLOSED_WITH_CORRECTIONS`; depends: P17 + P13; include P14/P15/P16 only if those optional claims are enabled; critical-path: yes
 
-```text
-P00 Source freeze + executable inventory
- -> P01 Owner/state reconstruction + traceability
- -> P02 Semantic vocabulary + typed refinement algebra
- -> P03 Global operational semantics + irreversible boundary
- -> P04 SingNext OperationObligations
- -> P05 Provider ExecutionGuarantees + SemanticExecutionBinding
- -> P06 Generation-exact admission sentry
- -> P07 Effect/publication algebra
- -> P08 Visibility/memory/shared mutation/locality
- -> P09 Resource measurement/retire/charging
- -> P10 Multi-resource/QoS/donation/scheduling
- -> P11 Preemption/cancellation/effect containment
- -> P12 Replay/determinism/provider refinement/isolation/contention
- -> P13 Liveness/quarantine/recovery/fault model
- -> P14 Scalable authority ownership
- -> P15 Managed runtime/root/durable authority/IFC decision
- -> P16 SipJob refinement + declarative OperationContract
- -> P17 MatrixMultiply end-to-end HybridCPU contour
- -> P18 Formal/adversarial qualification + migration/cutover
-```
+## Dependency-correct implementation order
 
-## Maturity transition
+**Critical staged-Matrix path:** P00 → P01 → P02 → P03 → P04 → P05 → P06 → P07 → P08(staged subset) → P09 → P10 → P11(minimum cancellation/containment semantics) → P12 → P13(safety/reconciliation subset) → P17 → P18.
 
-- **Level 1 — Adapter integration:** already present for several external-operation/provider contours.
-- **Level 2 — Semantic contract co-design:** target of P02-P06; obligations, guarantees, typed refinement and exact binding.
-- **Level 3 — Enforcement co-design:** promoted only per contour after P07-P18 evidence.
+**Parallel/conditional branches:** P14 scalability (only after measurement), P15 managed/root/durable/IFC clarification, P16 SipJob equivalence and optional generator. None is allowed to block P17 unless its specific feature is enabled in the qualified contour.
 
-### Plausible Level 3 without ISA changes
-- staged memory output with exact Region generations, explicit visibility, OS publication decision, provider publication fence and exact resource upper-bound enforcement;
-- bounded local HybridCPU compute where runtime legality, provider admission, upper-bound measurement/enforcement and cancellation/containment are executable;
-- replay barriers and generation invalidation.
-
-### Remain Level 2 unless provider proves enforcement
-- direct-coherent write while alias exclusion remains future-gated;
-- non-compensatable external network/MMIO/storage/service effects;
-- strict cache-contention/memory-bandwidth isolation;
-- guaranteed minimum capacity/deadline service;
-- byzantine remote provider without a suitable trusted enforcement/attestation boundary.
-
-## Phase gating
-Every phase has one of the architectural verdicts `CLOSED`, `CLOSED_WITH_CORRECTIONS`, `BLOCKED`, `REDESIGN_REQUIRED`, `REMOVE_OR_MERGE`. In implementation, a dependent phase MUST NOT enable its feature contour while a prerequisite is `BLOCKED`.
+This corrects the prior dependency in which P17 was downstream of the optional declarative OperationContract work in P16.

@@ -1,107 +1,113 @@
-# ТЗ P18 — Formal/adversarial qualification, feature promotion, docs synchronization and cutover
+# ТЗ P18 — Qualification, promotion, evidence tuple and rollback
 
-**Depends on:** P17.  **Baseline:** SingNextOS `1890a8e921cfe903b5b44857e4661168bf7bbceb`, HybridCPU-v2 `794c4a53494f503855ac8cf209efab23fde083b2`.
+    **Depends on:** P17 + P13; include P14/P15/P16 only if those optional claims are enabled  
+    **Baseline:** SingNextOS `cb6a94c314055e0712b8d9b8382ca1d146fe1c0e`, HybridCPU-v2 `794c4a53494f503855ac8cf209efab23fde083b2`.  
+    **Roadmap verdict:** `CLOSED_WITH_CORRECTIONS`.
 
-## CD-P18-01 — run full adversarial matrix + model checking
+    ## CD-P18-01 — Run full adversarial matrix + selected model checking
 
-- **Classification:** VERIFIED_GAP + NEW_PROPOSED.
-- **Repository:** SingNextOS unless an explicit HybridCPU contract/evidence hook is named below.
-- **Verified current anchors:** `src/Runtime/SingPlus.Runtime/VNext/VNextFeatureGates.cs; tests/SingPlus.Tests/Runtime/SingCapPhase13CrossAuthorityRaceTests.cs; HybridCPU_ExternalRuntime.Tests/ExternalOperationContractTests.cs`.
-- **Proposed surface:** CoDesignQualificationTupleV1, co-design feature gates, promotion checklist.
-- **Problem / semantic requirement:** implement this task without changing the authoritative owner map; preserve independent OS authority, provider admission, runtime legality, resource truth, Region ownership and publication truth.
-- **Proposed change:** make the minimal additive extension needed for the phase goal; reuse existing state machines and prepare/revalidate/commit seams rather than introducing a new manager/ledger.
-- **Owner implications:** no new root authority. Pure descriptors/evaluators remain non-authoritative. Any owner mutation must occur only through the existing owner API.
-- **Inputs:** exact operation/process/session/Region/resource/provider/contract generations required by the contour; no ambient cached authorization.
-- **Outputs:** typed success/reject/stale result plus evidence where applicable. Output possession cannot authorize a later operation.
-- **State/generation rules:** bind-once to exact generations; drift => stale/fail closed; no in-place generation upgrade.
-- **Linearization/concurrency:** final exact revalidation immediately before owner commit; provider callbacks outside owner locks; duplicate commit has one winner.
-- **Error/reject taxonomy:** distinguish invalid/malformed, unsupported, unauthorized, stale generation, provider unavailable/faulted, guarantee mismatch, runtime-illegal, ambiguous-post-submit, quarantine-required. Do not collapse them to generic false.
-- **Compatibility/migration:** additive versioned change, gate OFF by default; conservative mapping of older contracts may only claim guarantees actually represented/enforced.
-- **Required test assertions:**
-  1. exact current input succeeds only when all independent gates succeed;
-  2. one generation changed => no irreversible transition;
-  3. duplicate/reordered evidence cannot skip state or double-settle;
-  4. evidence/descriptor alone cannot mutate authority owner state;
-  5. feature gate OFF preserves current qualified behavior;
-  6. overflow/unknown enum/version fail closed where numeric/versioned input is present.
-- **Definition of done:** source + focused tests + negative tests + traceability + exact evidence tuple; no new ISA dependency; full touched-project build/test clean relative to recorded baseline.
-- **Dependencies/blockers:** P17; provider-specific enforcement remains BLOCKED if HybridCPU/provider cannot demonstrate the promised class.
-- **Prohibited shortcuts:** evidence=>authority; provider admission=>OS authorization; lease=>effect permission; completion=>visibility; visibility=>publication; cancellation request=>closure; provider loss=>refund; replay evidence=>resubmit; planner hint=>admission; compiler metadata=>runtime legality.
+- **Phase:** P18
+- **Classification:** `NEW_PROPOSED`
+- **Repository:** Both
+- **Exact current paths:** `all touched contracts/runtime/tests; src/Runtime/SingPlus.Runtime/VNext/VNextFeatureGates.cs; HybridCPU_ExternalRuntime.Tests; HybridCPU_ISE.Tests`
+- **Exact current symbols:** `VNextFeatureGates.IsEnabled currently always false; claim levels ModelOnly/StaticAdmission/RuntimeEnforced/ExecutableAdapter/EnforcedUpperBound/GuaranteedReservation/ProductionQualified`
+- **Existing tests/evidence:** current executable result must be produced on exact tuple; this audit did not run tests
+- **Current live behavior:** Scenarios are documented, but current executable results are not available from this audit.
+- **Actual gap:** No promotion without exact run.
+- **Required change:** Run unit/property/concurrency/fault/integration/provider conformance/differential/perf + TLA critical models. Record failures honestly.
+- **Authoritative owner:** Qualification owner
+- **Owners explicitly NOT changed:** CapabilityAuthority, ResourceBudgetAuthority, RegionAuthority, ExternalOperationAuthority, publication/response owner, HybridCPU runtime-legality owner, provider admission owner, planner/scheduler policy owner remain distinct unless explicitly named above.
+- **State/generation impact:** New descriptors are immutable and generation-bound; no in-place upgrade. Relevant generation drift => stale/fail closed. Existing owner states remain authoritative.
+- **Linearization point:** Final live-owner revalidation immediately before the relevant existing owner commit or provider submit/commit boundary. Provider callbacks must not execute while unrelated authority locks are held.
+- **Concurrency races:** revoke, session close, Region mutation/ABA, provider restart/generation drift, duplicate submit/evidence, cancel/retire and publication/settlement races as applicable.
+- **Failure/liveness behavior:** Pre-submit failure compensates only reversible reservations. After possible submit, uncertainty => quarantine/reconciliation; timeout is policy, not proof of no effect. Bounded liveness only under stated fault assumptions.
+- **API/contract/versioning impact:** Additive/provider-neutral only; unknown version/class fails closed.
+- **HybridCPU impact:** `RUNTIME_ONLY`
+- **ISA impact:** `NONE` (mandatory). No new instruction, register, pointer width, tagged memory/pointer, OS handle or OS-specific VLIW encoding.
+- **Tests required:** All scenarios in 09_ADVERSARIAL_MATRIX.md.
+- **Formal obligation:** None beyond executable/state tests unless noted.
+- **Performance/scalability impact:** No new global lock; measure any hot-path regression.
+- **Dependencies/blockers:** P17 + P13; include P14/P15/P16 only if those optional claims are enabled
+- **Definition of Done:** code/spec change is anchored to exact source tuple; focused tests exist and are actually run before claim promotion; traceability/qualification updated; feature gate default remains safe; no authority duplication; no ISA change.
+- **Prohibited shortcuts:** evidence=>authority; provider admission=>SingNext authorization; lease=>effect permission; completion=>visibility/publication; cancellation request=>closure; provider loss=>refund/reclaim; replay evidence=>fresh submit; planner hint=>admission; compiler metadata=>runtime legality; ISA/OS-handle coupling.
 
-## CD-P18-02 — record exact SHA/package/runtime/gate/test tuple
+## CD-P18-02 — Record exact SHA/package/runtime/gate/test tuple
 
-- **Classification:** VERIFIED_GAP + NEW_PROPOSED.
-- **Repository:** SingNextOS unless an explicit HybridCPU contract/evidence hook is named below.
-- **Verified current anchors:** `src/Runtime/SingPlus.Runtime/VNext/VNextFeatureGates.cs; tests/SingPlus.Tests/Runtime/SingCapPhase13CrossAuthorityRaceTests.cs; HybridCPU_ExternalRuntime.Tests/ExternalOperationContractTests.cs`.
-- **Proposed surface:** CoDesignQualificationTupleV1, co-design feature gates, promotion checklist.
-- **Problem / semantic requirement:** implement this task without changing the authoritative owner map; preserve independent OS authority, provider admission, runtime legality, resource truth, Region ownership and publication truth.
-- **Proposed change:** make the minimal additive extension needed for the phase goal; reuse existing state machines and prepare/revalidate/commit seams rather than introducing a new manager/ledger.
-- **Owner implications:** no new root authority. Pure descriptors/evaluators remain non-authoritative. Any owner mutation must occur only through the existing owner API.
-- **Inputs:** exact operation/process/session/Region/resource/provider/contract generations required by the contour; no ambient cached authorization.
-- **Outputs:** typed success/reject/stale result plus evidence where applicable. Output possession cannot authorize a later operation.
-- **State/generation rules:** bind-once to exact generations; drift => stale/fail closed; no in-place generation upgrade.
-- **Linearization/concurrency:** final exact revalidation immediately before owner commit; provider callbacks outside owner locks; duplicate commit has one winner.
-- **Error/reject taxonomy:** distinguish invalid/malformed, unsupported, unauthorized, stale generation, provider unavailable/faulted, guarantee mismatch, runtime-illegal, ambiguous-post-submit, quarantine-required. Do not collapse them to generic false.
-- **Compatibility/migration:** additive versioned change, gate OFF by default; conservative mapping of older contracts may only claim guarantees actually represented/enforced.
-- **Required test assertions:**
-  1. exact current input succeeds only when all independent gates succeed;
-  2. one generation changed => no irreversible transition;
-  3. duplicate/reordered evidence cannot skip state or double-settle;
-  4. evidence/descriptor alone cannot mutate authority owner state;
-  5. feature gate OFF preserves current qualified behavior;
-  6. overflow/unknown enum/version fail closed where numeric/versioned input is present.
-- **Definition of done:** source + focused tests + negative tests + traceability + exact evidence tuple; no new ISA dependency; full touched-project build/test clean relative to recorded baseline.
-- **Dependencies/blockers:** P17; provider-specific enforcement remains BLOCKED if HybridCPU/provider cannot demonstrate the promised class.
-- **Prohibited shortcuts:** evidence=>authority; provider admission=>OS authorization; lease=>effect permission; completion=>visibility; visibility=>publication; cancellation request=>closure; provider loss=>refund; replay evidence=>resubmit; planner hint=>admission; compiler metadata=>runtime legality.
+- **Phase:** P18
+- **Classification:** `NEW_PROPOSED`
+- **Repository:** SingNextOS
+- **Exact current paths:** `all touched contracts/runtime/tests; src/Runtime/SingPlus.Runtime/VNext/VNextFeatureGates.cs; HybridCPU_ExternalRuntime.Tests; HybridCPU_ISE.Tests`
+- **Exact current symbols:** `VNextFeatureGates.IsEnabled currently always false; claim levels ModelOnly/StaticAdmission/RuntimeEnforced/ExecutableAdapter/EnforcedUpperBound/GuaranteedReservation/ProductionQualified`
+- **Existing tests/evidence:** current executable result must be produced on exact tuple; this audit did not run tests
+- **Current live behavior:** Baseline tuple known; implementation will change source/package digests.
+- **Actual gap:** Future source invalidates evidence.
+- **Required change:** Generate machine-readable qualification tuple including SHAs, SDKs, package hashes, contract versions, gate states and test result artifacts.
+- **Authoritative owner:** Qualification owner
+- **Owners explicitly NOT changed:** CapabilityAuthority, ResourceBudgetAuthority, RegionAuthority, ExternalOperationAuthority, publication/response owner, HybridCPU runtime-legality owner, provider admission owner, planner/scheduler policy owner remain distinct unless explicitly named above.
+- **State/generation impact:** New descriptors are immutable and generation-bound; no in-place upgrade. Relevant generation drift => stale/fail closed. Existing owner states remain authoritative.
+- **Linearization point:** Final live-owner revalidation immediately before the relevant existing owner commit or provider submit/commit boundary. Provider callbacks must not execute while unrelated authority locks are held.
+- **Concurrency races:** revoke, session close, Region mutation/ABA, provider restart/generation drift, duplicate submit/evidence, cancel/retire and publication/settlement races as applicable.
+- **Failure/liveness behavior:** Pre-submit failure compensates only reversible reservations. After possible submit, uncertainty => quarantine/reconciliation; timeout is policy, not proof of no effect. Bounded liveness only under stated fault assumptions.
+- **API/contract/versioning impact:** Additive/provider-neutral only; unknown version/class fails closed.
+- **HybridCPU impact:** `NONE`
+- **ISA impact:** `NONE` (mandatory). No new instruction, register, pointer width, tagged memory/pointer, OS handle or OS-specific VLIW encoding.
+- **Tests required:** Tuple schema + locked restore.
+- **Formal obligation:** None beyond executable/state tests unless noted.
+- **Performance/scalability impact:** No new global lock; measure any hot-path regression.
+- **Dependencies/blockers:** P17 + P13; include P14/P15/P16 only if those optional claims are enabled
+- **Definition of Done:** code/spec change is anchored to exact source tuple; focused tests exist and are actually run before claim promotion; traceability/qualification updated; feature gate default remains safe; no authority duplication; no ISA change.
+- **Prohibited shortcuts:** evidence=>authority; provider admission=>SingNext authorization; lease=>effect permission; completion=>visibility/publication; cancellation request=>closure; provider loss=>refund/reclaim; replay evidence=>fresh submit; planner hint=>admission; compiler metadata=>runtime legality; ISA/OS-handle coupling.
 
-## CD-P18-03 — promote only exact Matrix/staged contour
+## CD-P18-03 — Promote only exact Matrix/staged contour
 
-- **Classification:** VERIFIED_GAP + NEW_PROPOSED.
-- **Repository:** SingNextOS unless an explicit HybridCPU contract/evidence hook is named below.
-- **Verified current anchors:** `src/Runtime/SingPlus.Runtime/VNext/VNextFeatureGates.cs; tests/SingPlus.Tests/Runtime/SingCapPhase13CrossAuthorityRaceTests.cs; HybridCPU_ExternalRuntime.Tests/ExternalOperationContractTests.cs`.
-- **Proposed surface:** CoDesignQualificationTupleV1, co-design feature gates, promotion checklist.
-- **Problem / semantic requirement:** implement this task without changing the authoritative owner map; preserve independent OS authority, provider admission, runtime legality, resource truth, Region ownership and publication truth.
-- **Proposed change:** make the minimal additive extension needed for the phase goal; reuse existing state machines and prepare/revalidate/commit seams rather than introducing a new manager/ledger.
-- **Owner implications:** no new root authority. Pure descriptors/evaluators remain non-authoritative. Any owner mutation must occur only through the existing owner API.
-- **Inputs:** exact operation/process/session/Region/resource/provider/contract generations required by the contour; no ambient cached authorization.
-- **Outputs:** typed success/reject/stale result plus evidence where applicable. Output possession cannot authorize a later operation.
-- **State/generation rules:** bind-once to exact generations; drift => stale/fail closed; no in-place generation upgrade.
-- **Linearization/concurrency:** final exact revalidation immediately before owner commit; provider callbacks outside owner locks; duplicate commit has one winner.
-- **Error/reject taxonomy:** distinguish invalid/malformed, unsupported, unauthorized, stale generation, provider unavailable/faulted, guarantee mismatch, runtime-illegal, ambiguous-post-submit, quarantine-required. Do not collapse them to generic false.
-- **Compatibility/migration:** additive versioned change, gate OFF by default; conservative mapping of older contracts may only claim guarantees actually represented/enforced.
-- **Required test assertions:**
-  1. exact current input succeeds only when all independent gates succeed;
-  2. one generation changed => no irreversible transition;
-  3. duplicate/reordered evidence cannot skip state or double-settle;
-  4. evidence/descriptor alone cannot mutate authority owner state;
-  5. feature gate OFF preserves current qualified behavior;
-  6. overflow/unknown enum/version fail closed where numeric/versioned input is present.
-- **Definition of done:** source + focused tests + negative tests + traceability + exact evidence tuple; no new ISA dependency; full touched-project build/test clean relative to recorded baseline.
-- **Dependencies/blockers:** P17; provider-specific enforcement remains BLOCKED if HybridCPU/provider cannot demonstrate the promised class.
-- **Prohibited shortcuts:** evidence=>authority; provider admission=>OS authorization; lease=>effect permission; completion=>visibility; visibility=>publication; cancellation request=>closure; provider loss=>refund; replay evidence=>resubmit; planner hint=>admission; compiler metadata=>runtime legality.
+- **Phase:** P18
+- **Classification:** `NEW_PROPOSED`
+- **Repository:** SingNextOS
+- **Exact current paths:** `all touched contracts/runtime/tests; src/Runtime/SingPlus.Runtime/VNext/VNextFeatureGates.cs; HybridCPU_ExternalRuntime.Tests; HybridCPU_ISE.Tests`
+- **Exact current symbols:** `VNextFeatureGates.IsEnabled currently always false; claim levels ModelOnly/StaticAdmission/RuntimeEnforced/ExecutableAdapter/EnforcedUpperBound/GuaranteedReservation/ProductionQualified`
+- **Existing tests/evidence:** current executable result must be produced on exact tuple; this audit did not run tests
+- **Current live behavior:** No semantic co-design implementation exists at audit baseline.
+- **Actual gap:** Overbroad provider/ProductionQualified claim prohibited.
+- **Required change:** Promote per dimension and provider only to demonstrated claim level; unsupported dimensions stay explicit.
+- **Authoritative owner:** Qualification owner
+- **Owners explicitly NOT changed:** CapabilityAuthority, ResourceBudgetAuthority, RegionAuthority, ExternalOperationAuthority, publication/response owner, HybridCPU runtime-legality owner, provider admission owner, planner/scheduler policy owner remain distinct unless explicitly named above.
+- **State/generation impact:** New descriptors are immutable and generation-bound; no in-place upgrade. Relevant generation drift => stale/fail closed. Existing owner states remain authoritative.
+- **Linearization point:** Final live-owner revalidation immediately before the relevant existing owner commit or provider submit/commit boundary. Provider callbacks must not execute while unrelated authority locks are held.
+- **Concurrency races:** revoke, session close, Region mutation/ABA, provider restart/generation drift, duplicate submit/evidence, cancel/retire and publication/settlement races as applicable.
+- **Failure/liveness behavior:** Pre-submit failure compensates only reversible reservations. After possible submit, uncertainty => quarantine/reconciliation; timeout is policy, not proof of no effect. Bounded liveness only under stated fault assumptions.
+- **API/contract/versioning impact:** Additive/provider-neutral only; unknown version/class fails closed.
+- **HybridCPU impact:** `NONE`
+- **ISA impact:** `NONE` (mandatory). No new instruction, register, pointer width, tagged memory/pointer, OS handle or OS-specific VLIW encoding.
+- **Tests required:** Claim matrix has evidence link per promotion.
+- **Formal obligation:** None beyond executable/state tests unless noted.
+- **Performance/scalability impact:** No new global lock; measure any hot-path regression.
+- **Dependencies/blockers:** P17 + P13; include P14/P15/P16 only if those optional claims are enabled
+- **Definition of Done:** code/spec change is anchored to exact source tuple; focused tests exist and are actually run before claim promotion; traceability/qualification updated; feature gate default remains safe; no authority duplication; no ISA change.
+- **Prohibited shortcuts:** evidence=>authority; provider admission=>SingNext authorization; lease=>effect permission; completion=>visibility/publication; cancellation request=>closure; provider loss=>refund/reclaim; replay evidence=>fresh submit; planner hint=>admission; compiler metadata=>runtime legality; ISA/OS-handle coupling.
 
-## CD-P18-04 — synchronize docs/traceability and retain rollback path
+## CD-P18-04 — Synchronize docs/traceability and retain rollback path
 
-- **Classification:** VERIFIED_GAP + NEW_PROPOSED.
-- **Repository:** SingNextOS unless an explicit HybridCPU contract/evidence hook is named below.
-- **Verified current anchors:** `src/Runtime/SingPlus.Runtime/VNext/VNextFeatureGates.cs; tests/SingPlus.Tests/Runtime/SingCapPhase13CrossAuthorityRaceTests.cs; HybridCPU_ExternalRuntime.Tests/ExternalOperationContractTests.cs`.
-- **Proposed surface:** CoDesignQualificationTupleV1, co-design feature gates, promotion checklist.
-- **Problem / semantic requirement:** implement this task without changing the authoritative owner map; preserve independent OS authority, provider admission, runtime legality, resource truth, Region ownership and publication truth.
-- **Proposed change:** make the minimal additive extension needed for the phase goal; reuse existing state machines and prepare/revalidate/commit seams rather than introducing a new manager/ledger.
-- **Owner implications:** no new root authority. Pure descriptors/evaluators remain non-authoritative. Any owner mutation must occur only through the existing owner API.
-- **Inputs:** exact operation/process/session/Region/resource/provider/contract generations required by the contour; no ambient cached authorization.
-- **Outputs:** typed success/reject/stale result plus evidence where applicable. Output possession cannot authorize a later operation.
-- **State/generation rules:** bind-once to exact generations; drift => stale/fail closed; no in-place generation upgrade.
-- **Linearization/concurrency:** final exact revalidation immediately before owner commit; provider callbacks outside owner locks; duplicate commit has one winner.
-- **Error/reject taxonomy:** distinguish invalid/malformed, unsupported, unauthorized, stale generation, provider unavailable/faulted, guarantee mismatch, runtime-illegal, ambiguous-post-submit, quarantine-required. Do not collapse them to generic false.
-- **Compatibility/migration:** additive versioned change, gate OFF by default; conservative mapping of older contracts may only claim guarantees actually represented/enforced.
-- **Required test assertions:**
-  1. exact current input succeeds only when all independent gates succeed;
-  2. one generation changed => no irreversible transition;
-  3. duplicate/reordered evidence cannot skip state or double-settle;
-  4. evidence/descriptor alone cannot mutate authority owner state;
-  5. feature gate OFF preserves current qualified behavior;
-  6. overflow/unknown enum/version fail closed where numeric/versioned input is present.
-- **Definition of done:** source + focused tests + negative tests + traceability + exact evidence tuple; no new ISA dependency; full touched-project build/test clean relative to recorded baseline.
-- **Dependencies/blockers:** P17; provider-specific enforcement remains BLOCKED if HybridCPU/provider cannot demonstrate the promised class.
-- **Prohibited shortcuts:** evidence=>authority; provider admission=>OS authorization; lease=>effect permission; completion=>visibility; visibility=>publication; cancellation request=>closure; provider loss=>refund; replay evidence=>resubmit; planner hint=>admission; compiler metadata=>runtime legality.
+- **Phase:** P18
+- **Classification:** `NEW_PROPOSED`
+- **Repository:** SingNextOS
+- **Exact current paths:** `all touched contracts/runtime/tests; src/Runtime/SingPlus.Runtime/VNext/VNextFeatureGates.cs; HybridCPU_ExternalRuntime.Tests; HybridCPU_ISE.Tests`
+- **Exact current symbols:** `VNextFeatureGates.IsEnabled currently always false; claim levels ModelOnly/StaticAdmission/RuntimeEnforced/ExecutableAdapter/EnforcedUpperBound/GuaranteedReservation/ProductionQualified`
+- **Existing tests/evidence:** current executable result must be produced on exact tuple; this audit did not run tests
+- **Current live behavior:** Current VNext gates are all OFF, which is a safe migration baseline.
+- **Actual gap:** New contract/gates need rollback semantics without reinterpreting in-flight work.
+- **Required change:** Gate new admission only; rollback stops new binds, drains/reconciles old generation, never maps old binding to new version in place.
+- **Authoritative owner:** Migration owner
+- **Owners explicitly NOT changed:** CapabilityAuthority, ResourceBudgetAuthority, RegionAuthority, ExternalOperationAuthority, publication/response owner, HybridCPU runtime-legality owner, provider admission owner, planner/scheduler policy owner remain distinct unless explicitly named above.
+- **State/generation impact:** New descriptors are immutable and generation-bound; no in-place upgrade. Relevant generation drift => stale/fail closed. Existing owner states remain authoritative.
+- **Linearization point:** Final live-owner revalidation immediately before the relevant existing owner commit or provider submit/commit boundary. Provider callbacks must not execute while unrelated authority locks are held.
+- **Concurrency races:** revoke, session close, Region mutation/ABA, provider restart/generation drift, duplicate submit/evidence, cancel/retire and publication/settlement races as applicable.
+- **Failure/liveness behavior:** Pre-submit failure compensates only reversible reservations. After possible submit, uncertainty => quarantine/reconciliation; timeout is policy, not proof of no effect. Bounded liveness only under stated fault assumptions.
+- **API/contract/versioning impact:** Additive/provider-neutral only; unknown version/class fails closed.
+- **HybridCPU impact:** `NONE`
+- **ISA impact:** `NONE` (mandatory). No new instruction, register, pointer width, tagged memory/pointer, OS handle or OS-specific VLIW encoding.
+- **Tests required:** Gate OFF preserves baseline; rollback during in-flight staged operation.
+- **Formal obligation:** None beyond executable/state tests unless noted.
+- **Performance/scalability impact:** No new global lock; measure any hot-path regression.
+- **Dependencies/blockers:** P17 + P13; include P14/P15/P16 only if those optional claims are enabled
+- **Definition of Done:** code/spec change is anchored to exact source tuple; focused tests exist and are actually run before claim promotion; traceability/qualification updated; feature gate default remains safe; no authority duplication; no ISA change.
+- **Prohibited shortcuts:** evidence=>authority; provider admission=>SingNext authorization; lease=>effect permission; completion=>visibility/publication; cancellation request=>closure; provider loss=>refund/reclaim; replay evidence=>fresh submit; planner hint=>admission; compiler metadata=>runtime legality; ISA/OS-handle coupling.

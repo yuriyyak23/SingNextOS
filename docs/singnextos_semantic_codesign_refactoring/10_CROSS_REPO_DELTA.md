@@ -1,23 +1,30 @@
-# Minimal Cross-Repository Delta
+# Corrected cross-repository delta
 
-## SingNextOS — required
-- Add provider-neutral obligation/refinement vocabulary to `SingPlus.Contracts` after P02 semantics freeze.
-- Extend existing ExternalOperation record with semantic binding reference; do not add a second external-operation ledger.
-- Extend existing resource admission path for vector envelopes and measurement contracts.
-- Add explicit staged publication decision record/epoch tied to exact operation generation; it is not a capability.
-- Extend cancellation/failure/visibility taxonomy only where current enums cannot express the required class.
-- Add default-off feature gates and evidence matrices.
+## SingNextOS REQUIRED
+- OperationObligationsV1 aggregate/composer and pure typed refinement consumer.
+- SemanticExecutionBinding and final revalidation integration in existing admission path.
+- Existing ExternalOperation/Region/Budget lifecycle extensions only where necessary.
+- Measurement-contract-bound settlement and staged publication decision/action correlation.
+- MatrixMultiply semantic operation/three Region operands.
 
-## HybridCPU-v2 — required only for Level-2/3 contours that need stronger claims
-Current 1.14.0 already supplies exact external operation requests, generation snapshots, CPU guard+provider admission binding, staged publication validation, replay non-authority and cancellation acknowledgement. Additive delta:
-- provider-neutral guarantee descriptor/version;
-- exact semantic binding correlation;
-- explicit measurement/retire evidence contracts where enforceable;
-- bounded preemption/containment capability only for actually implemented execution classes;
-- provider conformance tests and public API baseline updates.
+## SingNextOS OPTIONAL / DEFERRED
+- shared-mutable Region extension; sharding/escrow; generic IFC; OperationContract generator.
 
-## HybridCPU-v2 — optional
-Strict effect-epoch closure, minimum capacity guarantees, contention isolation and hard cancellation bounds may remain Unsupported. SingNext then rejects obligations requiring them or uses a different provider.
+## HybridCPU Contracts REQUIRED
+- additive ExecutionGuaranteesV1/claim-level vocabulary only for provider-neutral enforceable properties;
+- measurement/containment receipt types if needed by the selected contour;
+- no SingNext-specific IDs or private topology.
+
+## HybridCPU Runtime REQUIRED
+- adapter/conformance plumbing to source current runtime legality/visibility/replay/cancellation evidence;
+- provider/runtime measurement hooks needed for qualified resource classes;
+- optional contour-scoped containment closure implementation in existing Lane6/Lane7 runtime if that guarantee is claimed.
+
+## Provider-specific REQUIRED
+- exact Matrix provider mapping and conformance; staged output mechanism; resource measurement implementation for claimed dimensions.
+
+## HybridCPU Core / architecture
+**NOT REQUIRED.** Existing ISE runtime code may change, but architecture/ISA format/register/pointer model is unchanged.
 
 ## ISA
-**NONE.** No changes to VLIW carrier, pointer model, capability registers, load/store/fetch, lane IDs or OS handles.
+**NONE.** No new instruction or OS-specific ISA object.

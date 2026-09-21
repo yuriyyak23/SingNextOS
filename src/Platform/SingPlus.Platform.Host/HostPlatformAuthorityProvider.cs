@@ -10,7 +10,8 @@ public sealed partial class HostPlatformAuthorityProvider :
     IPlatformRegionRevocationProvider,
     IPlatformExecutionPolicyProvider,
     IPlatformDsc1ComputeProvider,
-    IPlatformVirtualizationProvider
+    IPlatformVirtualizationProvider,
+    IPlatformResourceProvider
 {
     private sealed class DomainRecord(PlatformProviderDomainLease lease)
     {
@@ -57,7 +58,8 @@ public sealed partial class HostPlatformAuthorityProvider :
         PlatformAuthorityStatus? regionRevocationFailure = null,
         IEnumerable<PlatformFeatureDescriptor>? additionalFeatures = null,
         bool deferRegionRevocationCompletion = false,
-        bool deferDsc1Completion = false)
+        bool deferDsc1Completion = false,
+        bool enableResourceAccounting = false)
     {
         if (regionRevocationFailure == PlatformAuthorityStatus.Success)
             throw new ArgumentOutOfRangeException(nameof(regionRevocationFailure));
@@ -107,6 +109,13 @@ public sealed partial class HostPlatformAuthorityProvider :
                 PlatformFeatureFamily.Dsc1BulkCompute,
                 PlatformDsc1ComputeContract.ContractVersion,
                 PlatformFeatureAvailability.ModelOnly));
+        }
+        if (enableResourceAccounting)
+        {
+            featureDescriptors.Add(new PlatformFeatureDescriptor(
+                PlatformFeatureFamily.ExternalResourceAccounting,
+                PlatformResourceContract.ContractVersion,
+                PlatformFeatureAvailability.Executable));
         }
 
         var overrides = additionalFeatures?.ToArray();

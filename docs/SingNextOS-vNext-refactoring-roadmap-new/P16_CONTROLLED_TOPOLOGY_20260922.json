@@ -1,0 +1,57 @@
+{
+  "Schema": "SingNextOS.VNext.ControlledTopology.v1",
+  "CapturedUtc": "2026-09-21T23:16:04.7464873+00:00",
+  "OperatingSystem": "Microsoft Windows 10.0.26200",
+  "Architecture": "X64",
+  "Runtime": "11.0.0",
+  "ActiveLogicalProcessorCount": 16,
+  "PhysicalCoreMasks": [
+    "0x3",
+    "0xC",
+    "0x30",
+    "0xC0",
+    "0x300",
+    "0xC00",
+    "0x3000",
+    "0xC000"
+  ],
+  "Measurements": [
+    {
+      "Scenario": "same-core-smt-siblings",
+      "LogicalProcessors": [
+        0,
+        1
+      ],
+      "IterationsPerWorker": 2000,
+      "TotalOperations": 4000,
+      "ElapsedMilliseconds": 43.5509,
+      "OperationsPerSecond": 91846.55196563102,
+      "FinalUsedAmount": 0,
+      "WorkerErrors": [
+        0,
+        0
+      ]
+    },
+    {
+      "Scenario": "separate-physical-cores",
+      "LogicalProcessors": [
+        0,
+        2
+      ],
+      "IterationsPerWorker": 2000,
+      "TotalOperations": 4000,
+      "ElapsedMilliseconds": 35.0205,
+      "OperationsPerSecond": 114218.8146942505,
+      "FinalUsedAmount": 0,
+      "WorkerErrors": [
+        0,
+        0
+      ]
+    }
+  ],
+  "Qualified": true,
+  "Claim": "AccountingOnly controlled-topology contention evidence for ResourceBudgetAuthority on this exact host/JIT profile.",
+  "Exclusions": [
+    "No provider-count, HybridCPU, NativeAOT, deadline, EnforcedUpperBound, GuaranteedReservation or ProductionQualified claim."
+  ]
+}

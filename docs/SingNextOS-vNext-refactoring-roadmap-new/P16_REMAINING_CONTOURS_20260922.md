@@ -2,13 +2,13 @@
 
 ## Disposition
 
-P16 remains **OPEN** and P17 may not start. This audit converts the remaining broad gaps into six exact, machine-validated FutureGated contours in `P16_REMAINING_CONTOURS_20260922.json`. It does not implement a missing provider contract, durable journal, gate enablement path or hardware qualification environment.
+P16 remains **OPEN** and P17 may not start. This audit converts the remaining broad gaps into six exact, machine-validated FutureGated contours in `P16_REMAINING_CONTOURS_20260922.json`. The later additive `P16_PROVIDER_RESOURCE_CONTRACT_20260922.md` implements the SingNext provider-neutral contract surface at `StaticAdmission`; an executable provider, durable journal, gate enablement path and hardware qualification environment remain outstanding.
 
 Normative baseline is `6227ea7cf258ef6ffce52001d4d2ffee07355b35`; reviewed HEAD is `1890a8e921cfe903b5b44857e4661168bf7bbceb`. Existing dirty work and completed-roadmap moves were preserved.
 
 ## Live-source findings
 
-- Provider resource contour: local Contracts 1.14.0 is exactly present at 74,244 bytes with SHA-256 `b96e99bda066ee585b26a11cbfa7b68ce6bf44fc0006679483ccc1a4eeb678c2`. Its ordinary ExternalOperation API separates admission, submit, completion, visibility, publication and release. It has no `ExternalResourceEnvelope`, `ExternalResourceUsageEvidence`, `ExternalBudgetLease` or `ExternalResourceAmount` type. Its README explicitly assigns ambiguous reconciliation/closure to future provider/adapter work. The HybridCPU source SHA remains locally unverified.
+- Provider resource contour: local Contracts 1.14.0 is exactly present at 74,244 bytes with SHA-256 `b96e99bda066ee585b26a11cbfa7b68ce6bf44fc0006679483ccc1a4eeb678c2`. Its ordinary ExternalOperation API separates admission, submit, completion, visibility, publication and release. It has no `ExternalResourceEnvelope`, `ExternalResourceUsageEvidence`, `ExternalBudgetLease` or `ExternalResourceAmount` type. SingNext now supplies additive `PlatformResourceContract` v1 in its existing platform abstraction seam, but no external provider implements it yet. Its README explicitly assigns ambiguous reconciliation/closure to future provider/adapter work. The HybridCPU source SHA remains locally unverified.
 - Durable restart: `ResourceBudgetAuthority` is an in-memory owner. `RuntimeKernel.Checkpointing` rejects live resource leases and restores through fresh admission; it has no authenticated journal/import or cold-process reconciliation protocol. Persisting current handles would violate VNX-025.
 - Controlled SMT: the executed performance artifact controls worker and process-domain counts, not physical-core/SMT sibling placement. Logical concurrency cannot be relabelled as SMT evidence.
 - Live rollback: `VNextFeatureGates` has a closed vocabulary and hard-OFF result with no enablement path. Creating a test-only ON path would bypass the evidence policy.

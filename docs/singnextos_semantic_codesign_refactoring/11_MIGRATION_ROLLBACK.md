@@ -1,11 +1,8 @@
-# Migration and Rollback Strategy
+# Migration and rollback
 
-1. Land semantic vocabulary and pure evaluators with all gates OFF.
-2. Add shadow computation: build obligations/guarantees and record mismatch telemetry without affecting current path.
-3. Add exact binding in parallel with current external-operation records; no behavior change.
-4. Enable admission sentry only for host/fake provider conformance tests.
-5. Enable one staged HybridCPU MatrixMultiply contour after exact cross-repo qualification.
-6. Keep current Level-1 adapter as fallback only if fallback still independently satisfies the original operation contract; never silently downgrade mandatory obligations.
-7. Rollback disables the new feature gate and stops creating new bindings. Existing submitted operations complete under the contract version they were admitted with; rollback must not reinterpret in-flight state.
-8. Remove compatibility fields only after source search + API baseline + telemetry prove no live consumers.
-9. Package/source drift automatically demotes qualification until re-audited.
+1. New semantic co-design gates remain OFF by default; current `VNextFeatureGates.IsEnabled` is hard-false at baseline.
+2. Land descriptors/evaluators first; then host/fake shadow comparison; then exact HybridCPU provider adapter; then one staged MatrixMultiply contour.
+3. Enabling a gate changes admission for **new** operation generations only. Existing in-flight binding is never reinterpreted under a newer contract.
+4. Rollback disables new binds, drains/reconciles current-generation operations, keeps quarantined resources until closure/settlement proof, then removes optional adapter paths.
+5. Source/package/API drift automatically demotes qualification until P18 reruns exact evidence.
+6. No rollback path serializes or resurrects ephemeral authority.

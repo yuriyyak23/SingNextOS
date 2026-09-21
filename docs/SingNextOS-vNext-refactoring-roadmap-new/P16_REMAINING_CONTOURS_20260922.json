@@ -17,8 +17,8 @@
       "disposition": "FutureGated",
       "gates": ["FG-VNX-HCPU-RESOURCE-CONTRACT", "FG-VNX-HCPU-USAGE-EVIDENCE"],
       "owner": "additive provider-neutral ExternalRuntime contract plus SingNext P04/P07 adapter",
-      "missingPrerequisite": "versioned semantic resource envelope and exact provider-generation usage evidence with executable lease settlement/reconciliation",
-      "currentEvidence": "Contracts 1.14.0 ordinary ExternalOperation lifecycle only; package README assigns reconciliation/closure to future adapter work",
+      "missingPrerequisite": "an executable provider implementing the SingNext PlatformResourceContract v1 prepare/bind/reconcile seam and exact runtime lease settlement/reconciliation adapter",
+      "currentEvidence": "SingNext PlatformResourceContract v1 now statically admits a semantic envelope, exact provider reservation/operation generations and fail-closed reconciliation outcomes; external Contracts 1.14.0 remains ordinary lifecycle only and no executable resource provider is qualified",
       "unsafeBypass": "an ordinary completion receipt would impersonate quantitative resource authority or settle an unbound lease",
       "claimCeiling": "StaticAdmission"
     },

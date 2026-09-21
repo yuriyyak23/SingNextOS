@@ -4,9 +4,12 @@ using SingPlus.Sip;
 
 namespace SingPlus.Runtime;
 
+public sealed record RuntimeKernelRecoveryOptions(string ResourceBudgetJournalPath, byte[] AuthenticationKey);
+
 public sealed partial class RuntimeKernel
 {
     private readonly TimeProvider _operabilityTimeProvider;
+    private readonly ResourceBudgetRecoveryJournal? _resourceBudgetRecoveryJournal;
 
     public RuntimeKernel()
         : this(null, null)
@@ -19,6 +22,14 @@ public sealed partial class RuntimeKernel
     }
 
     public RuntimeKernel(IPlatformAuthorityProvider? platformProvider, TimeProvider? timeProvider)
+        : this(platformProvider, timeProvider, null)
+    {
+    }
+
+    public RuntimeKernel(
+        IPlatformAuthorityProvider? platformProvider,
+        TimeProvider? timeProvider,
+        RuntimeKernelRecoveryOptions? recoveryOptions)
     {
         var selectedTimeProvider = timeProvider ?? TimeProvider.System;
         _operabilityTimeProvider = selectedTimeProvider;
@@ -35,6 +46,18 @@ public sealed partial class RuntimeKernel
         EndpointSessions = new EndpointSessionRegistry(selectedTimeProvider);
         CancellationScopes = new CancellationScopeAuthority(selectedTimeProvider);
         Budgets = new ResourceBudgetAuthority();
+        if (recoveryOptions is not null)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(recoveryOptions.ResourceBudgetJournalPath);
+            ArgumentNullException.ThrowIfNull(recoveryOptions.AuthenticationKey);
+            _resourceBudgetRecoveryJournal = new ResourceBudgetRecoveryJournal(
+                new FileResourceBudgetJournalStore(recoveryOptions.ResourceBudgetJournalPath),
+                recoveryOptions.AuthenticationKey);
+            var recovery = _resourceBudgetRecoveryJournal.Replay();
+            var staged = Budgets.StageConservativeRecoveryCharge(recovery.ConservativeRecoveryCharge);
+            if (!staged.IsSuccess)
+                throw new InvalidDataException(staged.Message ?? "Resource budget recovery charge could not be staged.");
+        }
         Traces = new DeterministicTraceAuthority(selectedTimeProvider);
     }
 
@@ -52,6 +75,9 @@ public sealed partial class RuntimeKernel
     public CancellationScopeAuthority CancellationScopes { get; }
     public ResourceBudgetAuthority Budgets { get; }
     internal DeterministicTraceAuthority Traces { get; }
+
+    internal ResourceBudgetRecoverySnapshot? ResourceBudgetRecovery =>
+        _resourceBudgetRecoveryJournal?.Replay();
 
     public KernelResult<SingProcess> CreateProcess(SingProcessManifestV1 manifest)
     {

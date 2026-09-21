@@ -10,6 +10,12 @@ if (args.Length > 0 && string.Equals(args[0], "--vnext-resource-performance", St
     return;
 }
 
+if (args.Length > 0 && string.Equals(args[0], "--vnext-controlled-topology", StringComparison.Ordinal))
+{
+    Environment.ExitCode = SingPlus.SingCapQualification.VNextControlledTopologyQualification.Run(args[1..]);
+    return;
+}
+
 const int iterationsPerWorker = 5_000;
 int[] workerCounts = [1, 2, 4, 8, 16, 32];
 var results = new List<Measurement>();
