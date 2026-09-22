@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "phase": "P17",
+  "phaseDisposition": "ClosedExactHostContour",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "executionHead": "800027893dcf1ed23d8d7fe775841dd9d01a9fff",
+  "runtimeContour": "Windows-x64/.NET-11/JIT/host-provider/ComputeTimeNanoseconds",
+  "claim": "RuntimeEnforced",
+  "productionQualified": false,
+  "enabledFeatureGates": [],
+  "isaChangeCategory": [],
+  "artifacts": [
+    { "path": "src/Runtime/SingPlus.Runtime/VNext/VNextMigrationCoordinator.cs", "bytes": 10202, "sha256": "0add723ba1e62095f6c03ca8e568ff2d968d554ee53a0a60f20523949cbc6167" },
+    { "path": "src/Runtime/SingPlus.Runtime/VNext/VNextFeatureGates.cs", "bytes": 9395, "sha256": "7aa62b822160ac6ade6b5047505d16230d0b56e0ffe5496696750e11d9bb1199" },
+    { "path": "src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.Resources.cs", "bytes": 8088, "sha256": "aa249adcd150ece3775428f357601f75b83f73874e94e5a81e7bbf08ebef1c3e" },
+    { "path": "contracts/SingPlus.Contracts/ComponentManifests.cs", "bytes": 17844, "sha256": "610920331fa82b87da3d98eed17ec224ce3635dca8c5251ee215906a6e106af7" },
+    { "path": "contracts/SingPlus.Contracts/ServiceManifestCanonicalization.cs", "bytes": 7559, "sha256": "9d652b22d7cf30540a4d995161da61ff6c6f9c655de475e6434ace61c8dda347" },
+    { "path": "src/Runtime/SingPlus.Runtime/RuntimeSipClientTransport.cs", "bytes": 6193, "sha256": "1710575fb0c8a2d948a94fcffe239f468eb8f406c041d757f6d5caceb4f21490" },
+    { "path": "src/Runtime/SingPlus.Runtime/SipJobs/SipJobResourceTransportExecutor.cs", "bytes": 2483, "sha256": "dbe44494d3dca984a5c22420ee586a08d28a7b40eef95776cd9a77ac904f4195" },
+    { "path": "tests/SingPlus.Tests/Runtime/VNextPhase17MigrationCutoverTests.cs", "bytes": 13882, "sha256": "bb408e540da505f057d6260e981c3b24eef50fe273f9f4060baee668b5e2c08b" },
+    { "path": "tests/SingPlus.Tests/Architecture/VNextPhase17QualificationClosureTests.cs", "bytes": 4284, "sha256": "0e39b29b3bbed59d76336d1b686858e40c17e3afd4219f71c84905b5afc48895" },
+    { "path": "docs/SingNextOS-vNext-refactoring-roadmap-new/P17_MIGRATION_CUTOVER_20260922.json", "bytes": 2239, "sha256": "6f24912b8d60a4b35afe689656fe96688e1037e5315e015cf17e67fb36413d2d" },
+    { "path": "docs/SingNextOS-vNext-refactoring-roadmap-new/EVIDENCE_P17_MIGRATION_CLEANUP_AND_CUTOVER.md", "bytes": 3569, "sha256": "ae6b8960dafb6f8286c968f85ad86e60824d4aa119e724d7225adc600e4d7215" },
+    { "path": "docs/SingNextOS-vNext-refactoring-roadmap-new/PHASE_VNEXT_17_MIGRATION_CLEANUP_AND_CUTOVER.md", "bytes": 4339, "sha256": "ae9ee612dd071cc31e44b52b6343cdaf323159608cfc4bb8ffc13ae079f05a81" },
+    { "path": "docs/SingNextOS-vNext-refactoring-roadmap-new/P16_BLOCKER_REMEDIATION_20260922_TUPLE.json", "bytes": 4637, "sha256": "f8bc15318612db7140067b18806e8e3e673cf3a9d0627dfa34ac09cfa8b536f8" }
+  ],
+  "removedCompatibilityPaths": [],
+  "futureGated": [
+    "HybridCPU provider mixed-version execution",
+    "NativeAOT migration qualification",
+    "temporal upper-bound and guaranteed reservation enforcement"
+  ],
+  "exclusions": [
+    "no ProductionQualified claim",
+    "no compatibility path removed",
+    "no HybridCPU, NativeAOT, hardware, QEMU, firmware or CXL boot qualification",
+    "all feature gates remain default OFF"
+  ]
+}

@@ -27,8 +27,9 @@ public readonly record struct SipResourceRequirementV1
         if (maximumAmount == 0 || maximumAmount == ulong.MaxValue)
             throw new ArgumentOutOfRangeException(nameof(maximumAmount), maximumAmount,
                 "SIP resource maximum must be finite and non-zero.");
-        if (string.IsNullOrWhiteSpace(semanticScope))
-            throw new ArgumentException("SIP resource semantic scope is required.", nameof(semanticScope));
+        if (string.IsNullOrWhiteSpace(semanticScope) ||
+            !string.Equals(semanticScope, semanticScope.Trim(), StringComparison.Ordinal))
+            throw new ArgumentException("SIP resource semantic scope must be non-empty and canonical.", nameof(semanticScope));
         if (resourceClass != ResourceClassV1.ComputeTime || unit != ResourceUnitV1.Nanoseconds)
             throw new NotSupportedException("Only the P01 compute-time/nanoseconds resource family is supported.");
 

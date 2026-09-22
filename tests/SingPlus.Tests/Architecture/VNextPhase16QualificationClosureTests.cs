@@ -165,7 +165,7 @@ public sealed class VNextPhase16QualificationClosureTests
     [Fact]
     public void EveryPhaseTupleIsPinnedAndNoTupleClaimsProductionQualification()
     {
-        for (var phase = 0; phase <= 16; phase++)
+        for (var phase = 0; phase <= 17; phase++)
         {
             var path = Path.Combine(RoadmapRoot, $"P{phase:00}_QUALIFICATION_TUPLE.json");
             Assert.True(File.Exists(path));

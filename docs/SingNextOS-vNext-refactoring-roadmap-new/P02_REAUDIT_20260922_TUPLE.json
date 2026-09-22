@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "phase": "P02",
+  "claim": "RuntimeEnforced",
+  "contour": "internal Windows-x64/JIT CapabilityAuthority resource-use grant validation; rollout-OFF",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "800027893dcf1ed23d8d7fe775841dd9d01a9fff",
+  "entryDirtyWorktree": "preserved P00/P01 re-audit outputs plus the exact pre-existing list in P00_REAUDIT_20260922_TUPLE.json",
+  "defaultFeatureGateState": "OFF",
+  "enabledFeatureGates": [],
+  "tests": [
+    { "lane": "P02-focused-plus-capability", "passed": 16, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui-current-tree", "passed": 1761, "failed": 0, "skipped": 2 }
+  ],
+  "builds": [
+    { "target": "src/Runtime/SingPlus.Runtime/SingPlus.Runtime.csproj", "warnings": 0, "errors": 0 },
+    { "target": "SingNextOS.slnx", "warnings": 0, "errors": 0 }
+  ],
+  "evidence": { "path": "P02_REAUDIT_20260922.md", "sha256": "57ecd6f2659abbdc254abd068155ba49800fe63c3074954715d4304df2673f38" },
+  "externalPrerequisites": {
+    "contractsPackage": "HybridCPU.ExternalRuntime.Contracts/1.14.0",
+    "packageQualification": "inventory-only",
+    "hybridCpuReferenceShaLocallyVerified": false
+  },
+  "exclusions": [
+    "no quantitative reservation or lease",
+    "no public/SIP rollout enabled",
+    "no provider, NativeAOT, hardware, upper-bound, guarantee or ProductionQualified claim",
+    "no ISA or microarchitecture change"
+  ]
+}

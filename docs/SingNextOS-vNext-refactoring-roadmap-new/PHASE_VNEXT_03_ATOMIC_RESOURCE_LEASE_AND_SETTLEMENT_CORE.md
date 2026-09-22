@@ -2,6 +2,8 @@
 
 **Live disposition:** closed at `RuntimeEnforced` for the internal host/JIT budget-owner contour on reviewed HEAD `b86cc33c16a77760c6971cc1a656c34b6cf2a10d`; the feature gate remains OFF. See `EVIDENCE_P03_RESOURCE_LEASE.md` and `P03_QUALIFICATION_TUPLE.json`.
 
+**Sequential re-audit (2026-09-22):** remains `RuntimeEnforced` only for the in-process owner state machine; crash-in-transition and cold owner-process restart are explicitly excluded because P03 has no such focused executable test. See `P03_REAUDIT_20260922.md` and `P03_REAUDIT_20260922_TUPLE.json`.
+
 ## Purpose
 
 Extend the existing `ResourceBudgetAuthority` into the sole quantitative owner for reservation, lease binding state, consumption settlement and quarantine, while preserving `reservations admit capacity but never authorize effects`.

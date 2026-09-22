@@ -12,8 +12,8 @@
   "artifacts": [
     {
       "path": "docs/SingNextOS-vNext-refactoring-roadmap-new/P16_REMAINING_CONTOURS_20260922.json",
-      "bytes": 4604,
-      "sha256": "65a78134950466283b11c5d2a27e953ac6568dafac6f1a328a023bc3fe19121d"
+      "bytes": 4785,
+      "sha256": "c02c0922d909b892c65a626cd3da07985918ad5ce716a61bc5819b4b294b55a2"
     },
     {
       "path": "tests/SingPlus.Tests/Architecture/VNextPhase16RemainingContourTests.cs",
@@ -27,13 +27,13 @@
     },
     {
       "path": "src/Runtime/SingPlus.Runtime/VNext/VNextFeatureGates.cs",
-      "bytes": 3072,
-      "sha256": "51f285e0a2c6e8cec0f7e84947daa5ef76a5234a18425614bdb0bc40162756c3"
+      "bytes": 9395,
+      "sha256": "7aa62b822160ac6ade6b5047505d16230d0b56e0ffe5496696750e11d9bb1199"
     },
     {
       "path": "src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetAuthority.cs",
-      "bytes": 28987,
-      "sha256": "e5e81623fbedd5745ea63bb6a5399c621c7f8b31fb6dc32ec5e9058042b34769"
+      "bytes": 30857,
+      "sha256": "8b48d88befe9798a467b6c8abf1b3c4bb238ea55409162e00fa2bb593f1ffdc2"
     },
     {
       "path": "src/Runtime/SingPlus.Runtime/Checkpointing/RuntimeKernel.Checkpointing.cs",
@@ -47,8 +47,8 @@
     },
     {
       "path": "docs/SingNextOS-vNext-refactoring-roadmap-new/PHASE_VNEXT_14_RESTART_CHECKPOINT_AND_RECONCILIATION.md",
-      "bytes": 2718,
-      "sha256": "91aff0cceebdf893cb0213c7965eb80679efc0cad84d40628cf576ae33fb28f6"
+      "bytes": 3134,
+      "sha256": "421e912c73d37b344fe243c89fcb9d68127e25539a32a794909cc08a408e7959"
     }
   ],
   "exclusions": [

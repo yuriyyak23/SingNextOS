@@ -57,15 +57,17 @@ internal static class VNextTraceabilityPolicy
                 if (!phases.Contains(tuple.RootElement.GetProperty("phase").GetString()))
                     errors.Add($"{id}: tuple phase mismatch.");
 
-                var expectedClaim = Text(row, "evidenceKind") switch
+                var claim = Text(row, "claim");
+                var supported = Text(row, "evidenceKind") switch
                 {
-                    "ModelTests" => "ModelOnly",
-                    "StaticChecks" => "StaticAdmission",
-                    "DirectOwnerTests" => "RuntimeEnforced",
-                    "HostAdapterTests" => "ExecutableAdapter",
-                    _ => null,
+                    "ModelTests" => claim == "ModelOnly",
+                    "StaticChecks" => claim is "ModelOnly" or "StaticAdmission",
+                    "DirectOwnerTests" => claim == "RuntimeEnforced",
+                    "DifferentialTests" => claim == "RuntimeEnforced",
+                    "HostAdapterTests" => claim == "ExecutableAdapter",
+                    _ => false,
                 };
-                if (expectedClaim is null || Text(row, "claim") != expectedClaim)
+                if (!supported)
                     errors.Add($"{id}: claim is not supported by its evidence kind.");
                 if (Text(row, "contour") != "Windows-x64/JIT/host-only; ComputeTime-or-static-boundary; rollout-OFF")
                     errors.Add($"{id}: unqualified contour or proof transfer.");
@@ -83,7 +85,7 @@ internal static class VNextTraceabilityPolicy
     internal static string Render(JsonElement root)
     {
         var result = new StringBuilder("# vNext traceability — current coverage index\n\n");
-        result.Append("Status: PartialCoverage. These rows identify reviewed test contours; they do not close entire invariants or phases. All rollout gates remain OFF. P16 remains open.\n\n");
+        result.Append("Status: PartialCoverage. P00-P17 are closed for their exact documented contours; FutureGated contours remain unqualified. All rollout gates remain OFF.\n\n");
         result.Append("Generated projection of `VNEXT_TRACEABILITY.json`; the closure lane compares every field and referenced evidence/tuple hash.\n\n");
         foreach (var row in root.GetProperty("rows").EnumerateArray())
         {

@@ -2,6 +2,8 @@
 
 **Live disposition:** closed at `ModelOnly` for reviewed HEAD `b86cc33c16a77760c6971cc1a656c34b6cf2a10d`. See `EVIDENCE_P00_ARCHITECTURAL_FREEZE.md` and `P00_QUALIFICATION_TUPLE.json`. All `FG-VNX-*` gates remain OFF.
 
+**Sequential re-audit (2026-09-22):** the current-tree disposition remains `ModelOnly`; see `P00_REAUDIT_20260922.md` and `P00_REAUDIT_20260922_TUPLE.json`. The older implementation evidence remains historical. Every gate still defaults OFF; later generation-bound host-contour configuration code is not a P00 claim.
+
 ## Purpose
 
 Freeze exact current owners and the corrected no-second-ledger architecture before code changes.

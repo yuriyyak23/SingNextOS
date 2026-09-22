@@ -2,6 +2,8 @@
 
 **Live disposition:** closed at `ModelOnly` for immutable contracts on reviewed HEAD `b86cc33c16a77760c6971cc1a656c34b6cf2a10d`. See `EVIDENCE_P01_RESOURCE_MODEL.md` and `P01_QUALIFICATION_TUPLE.json`. All gates remain OFF.
 
+**Sequential re-audit (2026-09-22):** current-tree closure remains `ModelOnly`; see `P01_REAUDIT_20260922.md` and `P01_REAUDIT_20260922_TUPLE.json`. Typed non-compute families are model vocabulary only and all related gates default OFF.
+
 ## Purpose
 
 Define the conceptual model before adding handles or admission paths: permission, accounting, reservation, lease, evidence, settlement and guarantee remain distinct.

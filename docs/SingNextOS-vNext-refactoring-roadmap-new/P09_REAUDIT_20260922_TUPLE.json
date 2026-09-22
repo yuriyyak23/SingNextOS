@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "phase": "P09",
+  "claim": "ExecutableAdapter",
+  "contour": "ordinary Windows-x64/.NET-11/JIT staged ExternalOperation adapter; resource/provider-source contour excluded",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "800027893dcf1ed23d8d7fe775841dd9d01a9fff",
+  "hybridCpuReferenceSha": { "value": "794c4a53494f503855ac8cf209efab23fde083b2", "locallyVerified": false },
+  "contractsPackage": { "id": "HybridCPU.ExternalRuntime.Contracts", "version": "1.14.0", "nupkgSha256": "b96e99bda066ee585b26a11cbfa7b68ce6bf44fc0006679483ccc1a4eeb678c2", "sourceAvailable": false },
+  "enabledFeatureGates": [],
+  "tests": [
+    { "lane": "exact-package-prerequisite", "passed": 5, "failed": 0, "skipped": 0 },
+    { "lane": "provider-lifecycle-P08-independent-gates", "passed": 16, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui-current-code", "passed": 1765, "failed": 0, "skipped": 2 }
+  ],
+  "defectsConfirmed": 0,
+  "evidence": { "path": "P09_REAUDIT_20260922.md", "sha256": "b5843ce4e29d230fde8c6bc5c3edb7295f8a54c44025fe3e051b40c6e5bd6e4e" },
+  "ordinaryFallback": "unchanged",
+  "futureGated": [{ "owner": "provider/runtime plus PlatformAuthorityBridge", "missing": "versioned resource request/usage schema, provider source and executable reconciliation evidence", "requiredGateState": "OFF" }],
+  "exclusions": ["no HybridCPU source-SHA/provider/NativeAOT/hardware/upper-bound/guarantee/ProductionQualified claim", "no ISA change"]
+}

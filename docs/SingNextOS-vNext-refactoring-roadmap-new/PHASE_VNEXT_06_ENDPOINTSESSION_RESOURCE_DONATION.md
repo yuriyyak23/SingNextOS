@@ -2,6 +2,8 @@
 
 **Live disposition:** closed at internal host/JIT `RuntimeEnforced` for exact `ComputeTime/Nanoseconds` invocation donation on current HEAD `8c3f55e47555b2db99356b861ee404211d072edc`; `FG-VNX-SESSION-DONATION` remains OFF. Ordinary SIP is unchanged and default. Exact ExternalOperation↔lease reconciliation remains P07 FutureGated. See `EVIDENCE_P06_ENDPOINTSESSION_RESOURCE_DONATION.md` and `P06_QUALIFICATION_TUPLE.json`.
 
+**2026-09-22 sequential re-audit:** current HEAD is `800027893dcf1ed23d8d7fe775841dd9d01a9fff`. Nested provenance was corrected to carry exact process/session/invocation identities and generations, closing an ABA ambiguity in evidence without creating authority. Current evidence is `P06_REAUDIT_20260922.md` with tuple `P06_REAUDIT_20260922_TUPLE.json`; the internal-only claim and OFF gate are unchanged.
+
 ## Purpose
 
 Allow request-scoped resource permission/capacity delegation across `client -> server -> downstream` without budget, priority, assurance, provider-scope or refund laundering.

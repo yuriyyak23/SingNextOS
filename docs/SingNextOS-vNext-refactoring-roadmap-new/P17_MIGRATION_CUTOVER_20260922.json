@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "phase": "P17",
+  "phaseDisposition": "ClosedExactHostContour",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "800027893dcf1ed23d8d7fe775841dd9d01a9fff",
+  "contour": "Windows-x64/.NET-11/JIT/host-provider/ComputeTimeNanoseconds",
+  "claim": "RuntimeEnforced",
+  "productionQualified": false,
+  "enabledFeatureGates": [],
+  "isaChangeCategory": [],
+  "compatibilityMatrix": [
+    { "id": "old-caller-new-service", "disposition": "OrdinaryFallback", "safetyReason": "legacy SIP carries no resource intent and remains on the ordinary semantic contour" },
+    { "id": "new-optional-caller-old-provider", "disposition": "OrdinaryFallback", "safetyReason": "optional transport optimization may fall back before provider submission" },
+    { "id": "new-required-caller-old-provider", "disposition": "Denied", "safetyReason": "required resource semantics cannot be weakened or guessed" },
+    { "id": "mixed-unknown-provider-version", "disposition": "Denied", "safetyReason": "only absent legacy version zero and exact resource contract v1 are understood" },
+    { "id": "exact-new-caller-new-provider", "disposition": "ResourcePath", "safetyReason": "exact provider contract and current generation-bound gate lease are independently required" },
+    { "id": "rollback-before-submit", "disposition": "OrdinaryFallback", "safetyReason": "optional work can safely return to ordinary SIP before irreversible submit" },
+    { "id": "rollback-after-possible-submit", "disposition": "Quarantined", "safetyReason": "fallback could resubmit, so exact reconciliation is required" }
+  ],
+  "retainedCompatibilityPaths": [
+    "contracts/SingPlus.Contracts/ComponentManifests.cs",
+    "contracts/SingPlus.Contracts/ServiceManifestCanonicalization.cs",
+    "src/Runtime/SingPlus.Runtime/RuntimeSipClientTransport.cs",
+    "src/Runtime/SingPlus.Runtime/SipJobs/SipJobResourceTransportExecutor.cs"
+  ],
+  "removedCompatibilityPaths": [],
+  "futureGated": [
+    "HybridCPU provider mixed-version execution lacks local source and executable resource provider",
+    "NativeAOT migration is unqualified",
+    "temporal upper-bound and guaranteed reservation remain without enforcement owners"
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "phase": "P16",
+  "claim": "ExecutableAdapter",
+  "contour": "Windows-x64/.NET-11/JIT opt-in host provider; ComputeTime/Nanoseconds; scope host:compute-v1",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "800027893dcf1ed23d8d7fe775841dd9d01a9fff",
+  "productionQualified": false,
+  "enabledFeatureGates": [],
+  "tests": [
+    { "lane": "phase-16-focused-current", "passed": 81, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui-current-code", "passed": 1765, "failed": 0, "skipped": 2 }
+  ],
+  "defectsConfirmed": 1,
+  "defectDisposition": "refreshed stale P14 digest in executable historical remaining-contours tuple; no runtime defect",
+  "evidence": {
+    "path": "P16_REAUDIT_20260922.md",
+    "bytes": 2352,
+    "sha256": "0574b0eb9bc96fa291bb60b3a24866664bb8edb7dc09447191de0d94211c8c69"
+  },
+  "ordinaryFallback": "unchanged",
+  "futureGated": [
+    { "owner": "execution-time enforcement and provider capacity authorities", "missing": "executable upper-bound/guarantee enforcement and exact provider environments", "requiredGateState": "OFF" },
+    { "owner": "HybridCPU provider/runtime", "missing": "locally verifiable source and execution environment", "requiredGateState": "OFF" }
+  ],
+  "exclusions": [
+    "controlled topology remains AccountingOnly",
+    "no ProductionQualified/GuaranteedReservation/EnforcedUpperBound claim",
+    "no HybridCPU/provider-wide/NativeAOT/hardware claim",
+    "no ISA or microarchitecture change"
+  ]
+}

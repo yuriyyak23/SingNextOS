@@ -2,6 +2,8 @@
 
 **Live disposition:** closed at internal host/JIT `RuntimeEnforced` for exact `ComputeTime/Nanoseconds` ExternalOperation↔lease correlation and settlement on HEAD `8c3f55e47555b2db99356b861ee404211d072edc`; `FG-VNX-EXTOP-RESOURCE-BIND` remains OFF. Provider receipts remain evidence, ordinary ExternalOperation/SIP fallbacks remain default, and no provider artifact is qualified. See `EVIDENCE_P07_EXTERNALOPERATION_RESOURCE_BINDING.md` and `P07_QUALIFICATION_TUPLE.json`.
 
+**2026-09-22 sequential re-audit:** current HEAD is `800027893dcf1ed23d8d7fe775841dd9d01a9fff`. Exact owner transitions and focused negative/race coverage were reconfirmed without a new production defect. Current evidence is `P07_REAUDIT_20260922.md` with tuple `P07_REAUDIT_20260922_TUPLE.json`. The claim remains internal host/JIT only, receipts remain evidence-only, and the gate remains OFF.
+
 ## Purpose
 
 Bind one exact budget lease to one exact external-effect generation and define provider ambiguity, usage settlement and quarantine without collapsing effect, Region, publication or resource owners.

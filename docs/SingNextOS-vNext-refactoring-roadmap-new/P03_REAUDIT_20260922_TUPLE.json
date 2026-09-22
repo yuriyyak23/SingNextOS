@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "phase": "P03",
+  "claim": "RuntimeEnforced",
+  "contour": "in-process Windows-x64/JIT ResourceBudgetAuthority lease state machine; rollout-OFF",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "800027893dcf1ed23d8d7fe775841dd9d01a9fff",
+  "defaultFeatureGateState": "OFF",
+  "enabledFeatureGates": [],
+  "tests": [
+    { "lane": "P03-budget-recovery-regression", "passed": 19, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui-current-tree", "passed": 1761, "failed": 0, "skipped": 2 }
+  ],
+  "evidence": { "path": "P03_REAUDIT_20260922.md", "sha256": "dfb749c8c92823869f51b4d4fb6b8898338512f963b4f8b128e265bb31c05e68" },
+  "futureGated": [
+    {
+      "owner": "ResourceBudgetAuthority recovery/journal integration",
+      "missing": "P03 fault injection at every mutation boundary and cold owner-process restart evidence",
+      "unsafeBypass": "snapshot or timeout based restoration could resurrect authority or refund ambiguous consumption",
+      "requiredGateState": "OFF"
+    }
+  ],
+  "exclusions": ["no crash/restart durability claim from P03", "no provider/NativeAOT/upper-bound/guarantee/ProductionQualified claim", "no ISA or hardware change"]
+}

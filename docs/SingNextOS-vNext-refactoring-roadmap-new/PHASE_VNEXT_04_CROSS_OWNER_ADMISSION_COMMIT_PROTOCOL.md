@@ -2,6 +2,8 @@
 
 **Live disposition:** closed at `RuntimeEnforced` for the internal host/JIT process + effect capability + compute-time resource grant + budget lease + Region + ExternalOperation contour on reviewed HEAD `b86cc33c16a77760c6971cc1a656c34b6cf2a10d`; `FG-VNX-CROSSOWNER-ADMISSION` remains OFF. Session/invocation and generated SIP entry are deliberately deferred to P05/P06. See `EVIDENCE_P04_CROSS_OWNER_ADMISSION.md` and `P04_QUALIFICATION_TUPLE.json`.
 
+**Sequential re-audit (2026-09-22):** remains `RuntimeEnforced` for the same internal contour with rollout OFF. Post-possible-submit fault-boundary coverage was completed; see `P04_REAUDIT_20260922.md` and `P04_REAUDIT_20260922_TUPLE.json`.
+
 ## Purpose
 
 Define the transaction protocol that composes effect permission, resource-use grant, budget lease, Region/session generations and external-operation preparation without pretending these owners are one state machine.

@@ -88,7 +88,11 @@ internal sealed class ResourceScheduler
                 return KernelResult.Fail(KernelError.StaleGeneration, "Scheduling hint or observation generation is stale.");
         }
 
-        var live = liveCandidates.SingleOrDefault(candidate => candidate.ProviderId == hint.ProviderId);
+        var matches = liveCandidates.Where(candidate => candidate.ProviderId == hint.ProviderId).Take(2).ToArray();
+        if (matches.Length > 1)
+            return KernelResult.Fail(KernelError.InvalidMessage,
+                "Live provider candidates contain a duplicate provider identity.");
+        var live = matches.SingleOrDefault();
         if (live is null || !live.Available || live.Faulted)
             return KernelResult.Fail(KernelError.PlatformUnavailable, "Scheduled provider is not live.");
         return live.Generation == hint.ProviderGeneration

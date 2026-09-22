@@ -36,8 +36,18 @@
     },
     {
       "file": "PHASE_VNEXT_00_ARCHITECTURAL_FREEZE_AND_LIVE_BASELINE.md",
-      "bytes": 2476,
-      "sha256": "e4d9f1556507c08e175939401448105da54a9bedc1f9f462ec35093ee6746376"
+      "bytes": 2794,
+      "sha256": "fa748e031445bfca010333d2c1e10d7f3b4ef3efdacc116c3ce9d76dadf32f60"
+    },
+    {
+      "file": "P00_REAUDIT_20260922.md",
+      "bytes": 4223,
+      "sha256": "2bab7f8503550a583dce80647c27bd26906208ad41cdaf98c6d3f32776da4eb8"
+    },
+    {
+      "file": "P00_REAUDIT_20260922_TUPLE.json",
+      "bytes": 4549,
+      "sha256": "fb360b31e8257717cd68bf8fc6900760ee1118efabf33331147131b172ea4bfe"
     },
     {
       "file": "EVIDENCE_P01_RESOURCE_MODEL.md",
@@ -51,8 +61,18 @@
     },
     {
       "file": "PHASE_VNEXT_01_RESOURCE_MODEL_AND_DIMENSIONAL_ALGEBRA.md",
-      "bytes": 2273,
-      "sha256": "d79648f82dd7eeac7fbd3c04c6255b3f8d20b9ba4d5719dbc4502a9f4e606747"
+      "bytes": 2511,
+      "sha256": "bb79ab3b26d0156aa4b55fa2712aeccb01f578b7b6ed6dad6cd930fdebb8f6cf"
+    },
+    {
+      "file": "P01_REAUDIT_20260922.md",
+      "bytes": 3008,
+      "sha256": "061da867004da4101cbea3fd74eae95ab8e37522bbbb9e58ce5f16b18846df55"
+    },
+    {
+      "file": "P01_REAUDIT_20260922_TUPLE.json",
+      "bytes": 1895,
+      "sha256": "df008b9a43feb052400f7b9dea897e9103f378bd71ec3a63061740d38af1d52d"
     },
     {
       "file": "EVIDENCE_P02_RESOURCE_GRANTS.md",
@@ -66,8 +86,18 @@
     },
     {
       "file": "PHASE_VNEXT_02_RESOURCE_USE_GRANTS_IN_EXISTING_CAPABILITYAUTHORITY.md",
-      "bytes": 2712,
-      "sha256": "b8acefc374727e91837cbe03e2eef483ac888eac11e240ea970e76b61aeefd1e"
+      "bytes": 2903,
+      "sha256": "4634c9b6f15b1e19501bb8fc511cfe03e3aa6fc70bd31d894717c8ebabca8361"
+    },
+    {
+      "file": "P02_REAUDIT_20260922.md",
+      "bytes": 2192,
+      "sha256": "57ecd6f2659abbdc254abd068155ba49800fe63c3074954715d4304df2673f38"
+    },
+    {
+      "file": "P02_REAUDIT_20260922_TUPLE.json",
+      "bytes": 1448,
+      "sha256": "e1e1d68fd151eea839eb1c585c122635c281e80aaaac72ef1b80d20053449b06"
     },
     {
       "file": "EVIDENCE_P03_RESOURCE_LEASE.md",
@@ -81,8 +111,18 @@
     },
     {
       "file": "PHASE_VNEXT_03_ATOMIC_RESOURCE_LEASE_AND_SETTLEMENT_CORE.md",
-      "bytes": 2866,
-      "sha256": "dd6e80eaec16f77749a6eb69b0738847b1c27f3da9647888a66ba3a3f2795276"
+      "bytes": 3169,
+      "sha256": "e7c6a2a6b08f2100b6a0c649a041ea47f18e7e074389fdafb3bd1feb71321d77"
+    },
+    {
+      "file": "P03_REAUDIT_20260922.md",
+      "bytes": 2138,
+      "sha256": "dfb749c8c92823869f51b4d4fb6b8898338512f963b4f8b128e265bb31c05e68"
+    },
+    {
+      "file": "P03_REAUDIT_20260922_TUPLE.json",
+      "bytes": 1228,
+      "sha256": "07b4480c16d54e30c2c09b1aa03646a097822114052c080e2973955abad2fcc1"
     },
     {
       "file": "EVIDENCE_P04_CROSS_OWNER_ADMISSION.md",
@@ -96,8 +136,18 @@
     },
     {
       "file": "PHASE_VNEXT_04_CROSS_OWNER_ADMISSION_COMMIT_PROTOCOL.md",
-      "bytes": 2947,
-      "sha256": "29f848b99df6881f512d1363e7a5cd21a0716516e4b7eecf12e04df1dfd14683"
+      "bytes": 3189,
+      "sha256": "b260003f59a875c1bd6dd5c0b71a464f22f9fbd53368669728a9e6487fba89d1"
+    },
+    {
+      "file": "P04_REAUDIT_20260922.md",
+      "bytes": 2537,
+      "sha256": "32b3912c88a86b0582e287201f0cab4b716266dbc2126ae7296cdac06ad0db57"
+    },
+    {
+      "file": "P04_REAUDIT_20260922_TUPLE.json",
+      "bytes": 1587,
+      "sha256": "8d0bf70f6f61050bda86a3f4eb8c6b59b13cc9332272b52e35c8be6731d033db"
     },
     {
       "file": "EVIDENCE_P05_SIP_RESOURCE_CONTRACTS.md",
@@ -110,9 +160,19 @@
       "sha256": "56d7efbd098cdba9102b1f5c156de292abf30ada5b2377641457da6bd667f715"
     },
     {
+      "file": "P05_REAUDIT_20260922.md",
+      "bytes": 2535,
+      "sha256": "dd8b6d2c355bf0afc802c995301e578a1021b4ffd173ee9748b2af0b46aedd92"
+    },
+    {
+      "file": "P05_REAUDIT_20260922_TUPLE.json",
+      "bytes": 1967,
+      "sha256": "435c1203fde8c69a6955ee1b2f37e880a6324a3f770965a0ec08d7f2c0cee8ee"
+    },
+    {
       "file": "PHASE_VNEXT_05_SIP_AND_MANIFEST_RESOURCE_CONTRACTS.md",
-      "bytes": 2540,
-      "sha256": "50bdd4cbfc766fdc9ee15f8d6fce57dd3a22553f30b4ea29010c1514f844c120"
+      "bytes": 2983,
+      "sha256": "ed3cb0988b3e240c5043b9226f847cf89a9019c0daaddaa2c366a8fbb8663869"
     },
     {
       "file": "EVIDENCE_P06_ENDPOINTSESSION_RESOURCE_DONATION.md",
@@ -125,9 +185,19 @@
       "sha256": "eca03531dce70490fa2bead499e80f1483652a30f2e36ff196b15ca9b4896f57"
     },
     {
+      "file": "P06_REAUDIT_20260922.md",
+      "bytes": 2585,
+      "sha256": "783b498d467365829aeafce4632fbcae21f24adef27777e80182b59abbfacf0a"
+    },
+    {
+      "file": "P06_REAUDIT_20260922_TUPLE.json",
+      "bytes": 1692,
+      "sha256": "eb71392bfb99dd9a7b2f20ea24763dfc253afd6e57e8b602a2271e49988fa75f"
+    },
+    {
       "file": "PHASE_VNEXT_06_ENDPOINTSESSION_RESOURCE_DONATION.md",
-      "bytes": 2907,
-      "sha256": "c95f689c3c6fafebba608e8bd5af75f1f39a411d32494a1bcb0e8435c520a44f"
+      "bytes": 3315,
+      "sha256": "03b0e5d39770504e62144d4734b7cec11681832e0a468182bc4a5e177dcdeb80"
     },
     {
       "file": "EVIDENCE_P07_EXTERNALOPERATION_RESOURCE_BINDING.md",
@@ -140,9 +210,19 @@
       "sha256": "e44fcac7190881e152bbcbed496a9c9606767056201f19a909b9ec92f8969cc5"
     },
     {
+      "file": "P07_REAUDIT_20260922.md",
+      "bytes": 2279,
+      "sha256": "a74304f049561e7e25bd5bf594c23cf6b3e96a2793de48f3d166c3b4185908ce"
+    },
+    {
+      "file": "P07_REAUDIT_20260922_TUPLE.json",
+      "bytes": 1386,
+      "sha256": "a9f170b2c695e54686606f1402d03687c1703b48d97e7b8db70602a00a4b23c5"
+    },
+    {
       "file": "PHASE_VNEXT_07_EXTERNALOPERATION_RESOURCE_BINDING.md",
-      "bytes": 2817,
-      "sha256": "380fc92a1fcd82f92c82c37d01bcbe813333f9101e94ad3be840e36e85da2d8b"
+      "bytes": 3214,
+      "sha256": "d9cb7f109df72e264566198b3a93baec06c16cb7aebee9c778e1f254e1113ca0"
     },
     {
       "file": "EVIDENCE_P08_COMPUTEPLAN_INDEPENDENT_GATES.md",
@@ -155,9 +235,19 @@
       "sha256": "d36adf5578585e5981087077d0fe6e06e8267ec90f98a1852d9e5af214a1fad2"
     },
     {
+      "file": "P08_REAUDIT_20260922.md",
+      "bytes": 1651,
+      "sha256": "e43e31a319b44517d82884aa134c669368eacaed98b936be7ac9a2d3656cfb1e"
+    },
+    {
+      "file": "P08_REAUDIT_20260922_TUPLE.json",
+      "bytes": 1334,
+      "sha256": "8df15d0f61106152b7f79757fc73bd5fd70ee8713f4061716e4e3fc2164b47bd"
+    },
+    {
       "file": "PHASE_VNEXT_08_COMPUTEPLANNING_V2_INDEPENDENT_GATES.md",
-      "bytes": 2334,
-      "sha256": "5958b1b7b356d82a978eacb16bac2c4132df83a0b3c7890020848c72a921b147"
+      "bytes": 2649,
+      "sha256": "dea81ed1fa56b2e26e020a86ea526707bbf895b5b32a9bf9264b2796338c95bc"
     },
     {
       "file": "EVIDENCE_P09_HYBRIDCPU_PROVIDER_NEUTRAL_INTEGRATION.md",
@@ -170,9 +260,19 @@
       "sha256": "78f8c15bc2c5c36507c9f3275b6e27f41d6b2c6a19d1c2a635dd107b6ee897ed"
     },
     {
+      "file": "P09_REAUDIT_20260922.md",
+      "bytes": 1624,
+      "sha256": "b5843ce4e29d230fde8c6bc5c3edb7295f8a54c44025fe3e051b40c6e5bd6e4e"
+    },
+    {
+      "file": "P09_REAUDIT_20260922_TUPLE.json",
+      "bytes": 1509,
+      "sha256": "a4e4674f883c9bf1706ec5e6869d9482f5e8aa2b8d629370e1b1ad45a26d9bfa"
+    },
+    {
       "file": "PHASE_VNEXT_09_HYBRIDCPU_PROVIDER_NEUTRAL_INTEGRATION.md",
-      "bytes": 2946,
-      "sha256": "92ce734599bec8f191d4d33d7f0fd7ab44d3f9d221481a27d0ac94b94db50c19"
+      "bytes": 3353,
+      "sha256": "d074a2fbf866b8d8746e764146843746f6d592116fa362c8cb979c9829f268f8"
     },
     {
       "file": "EVIDENCE_P10_RESOURCE_SCHEDULER.md",
@@ -185,9 +285,19 @@
       "sha256": "d9e906a932d470e94b5059304dccb641e27bfda149f551708fc548daef795c38"
     },
     {
+      "file": "P10_REAUDIT_20260922.md",
+      "bytes": 1595,
+      "sha256": "c5d02b98639ea0a46a89d675338765227fbe050f8b6f1071c32770fb76806b26"
+    },
+    {
+      "file": "P10_REAUDIT_20260922_TUPLE.json",
+      "bytes": 1293,
+      "sha256": "81e98ef09cfad6dc124be72372eb86d57b88c1c7672a0a7154430ccc1b235f6c"
+    },
+    {
       "file": "PHASE_VNEXT_10_RESOURCE_SCHEDULER_AND_PROVIDER_AGENTS.md",
-      "bytes": 2425,
-      "sha256": "96e356563b92f04d1fecbe40d1dcf7632ade362243c8b1751b225fe1e81220d7"
+      "bytes": 2784,
+      "sha256": "f4fa05567b6c2d7cdfff854e1ba2ee902194cb32e337897b614447c09310af15"
     },
     {
       "file": "EVIDENCE_P11_TEMPORAL_CLAIM_BOUNDARY.md",
@@ -200,9 +310,19 @@
       "sha256": "3ef030905fa736ab0b497539cae4b21392e2a845255278bb92da8efb83b737f1"
     },
     {
+      "file": "P11_REAUDIT_20260922.md",
+      "bytes": 1587,
+      "sha256": "a847e4806d020854916826ee8f1d4f610297c01b2a6f5e24b678c981acca433a"
+    },
+    {
+      "file": "P11_REAUDIT_20260922_TUPLE.json",
+      "bytes": 1160,
+      "sha256": "be285522c506c4c0be06326151c5f1b2a32b7adab3c21631405144e12ca82854"
+    },
+    {
       "file": "PHASE_VNEXT_11_TEMPORAL_UPPER_BOUNDS_AND_GUARANTEE_DISCIPLINE.md",
-      "bytes": 2861,
-      "sha256": "8fac53e82ea53a8961a7522d7a23d5190f0aaf7dede7300957f3cdf20b6ebd79"
+      "bytes": 3203,
+      "sha256": "f1b19982d48dcf8c2e8b276bb9d667a2757c28a01874ad8c9a917415f4373f20"
     },
     {
       "file": "EVIDENCE_P12_SIPJOB_RESOURCE_BOUNDARY.md",
@@ -215,9 +335,19 @@
       "sha256": "8853dad90a5467cda12b0822955a2504281d2c6b37424b00595f967fbe2449ea"
     },
     {
+      "file": "P12_REAUDIT_20260922.md",
+      "bytes": 1652,
+      "sha256": "d6ccd2ac80f4069c7b35de4c4683a870298488e5c9a0ab910b5b02e1b7b9f549"
+    },
+    {
+      "file": "P12_REAUDIT_20260922_TUPLE.json",
+      "bytes": 1197,
+      "sha256": "ef37b0195b7790e546612265c80e6794c1f88e3f7e617217836cf2044f8cdcf5"
+    },
+    {
       "file": "PHASE_VNEXT_12_SIPJOB_RESOURCE_AWARE_COMPOSITION.md",
-      "bytes": 2600,
-      "sha256": "b9990132106586f17b918a191f234ea342b27df67d5dfd4cb00f7a41e7203ca4"
+      "bytes": 3054,
+      "sha256": "1d7388fed94335171b6fb1694547d9427d644b7e5ad33e940d9750a573a2355f"
     },
     {
       "file": "EVIDENCE_P13_RESOURCE_FAMILY_BOUNDARY.md",
@@ -230,9 +360,19 @@
       "sha256": "570ff375acbb0fbc002b67554f7b30ebab0d8a3336d80b26ff88bac74e6a33ca"
     },
     {
+      "file": "P13_REAUDIT_20260922.md",
+      "bytes": 1627,
+      "sha256": "99df171841ff7cdddf9ea368e2aa5ee33b0f3b9dca5c335585a0428f6f229713"
+    },
+    {
+      "file": "P13_REAUDIT_20260922_TUPLE.json",
+      "bytes": 1215,
+      "sha256": "fae2c2c9c6da11afee0527083619d005ef796265da424ce97066a16581f26359"
+    },
+    {
       "file": "PHASE_VNEXT_13_NON_COMPUTE_RESOURCE_FAMILIES.md",
-      "bytes": 2644,
-      "sha256": "bf4b2f5e96964fbf4d4b0e4fc37367438a971c7d1fa8fed7be7b14661c537150"
+      "bytes": 3021,
+      "sha256": "c7d070727ed3ab864101d0f3e10c72fad0e0cb3952c11fffb4d97156d23f75d3"
     },
     {
       "file": "EVIDENCE_P14_RESTART_CHECKPOINT_RECONCILIATION.md",
@@ -245,9 +385,19 @@
       "sha256": "7b2b1a5908bbc693834007cc7c701d1e7d07df001752abf8e18f4fa6bad52da3"
     },
     {
+      "file": "P14_REAUDIT_20260922.md",
+      "bytes": 1803,
+      "sha256": "ecd902a672cd461aa164c47df23bdbf3fab71633eae4fc85014b708a7862ee8f"
+    },
+    {
+      "file": "P14_REAUDIT_20260922_TUPLE.json",
+      "bytes": 1187,
+      "sha256": "1f5c4be7b2f0a5e84f2196ce1ad5a29912b03acc6cebb4f701974fcd056a4826"
+    },
+    {
       "file": "PHASE_VNEXT_14_RESTART_CHECKPOINT_AND_RECONCILIATION.md",
-      "bytes": 2718,
-      "sha256": "91aff0cceebdf893cb0213c7965eb80679efc0cad84d40628cf576ae33fb28f6"
+      "bytes": 3134,
+      "sha256": "421e912c73d37b344fe243c89fcb9d68127e25539a32a794909cc08a408e7959"
     },
     {
       "file": "EVIDENCE_P15_OBSERVABILITY_AUTHORITY_BOUNDARY.md",
@@ -260,9 +410,19 @@
       "sha256": "e0933d7afb1e93195dd0cff5dad6d416af9110f81101a377effac3bfacfe72f6"
     },
     {
+      "file": "P15_REAUDIT_20260922.md",
+      "bytes": 1543,
+      "sha256": "59cdca39ca4f24456b9ba91e25eda450bc5b2040dbc8cb104ddcbfae452c265b"
+    },
+    {
+      "file": "P15_REAUDIT_20260922_TUPLE.json",
+      "bytes": 1077,
+      "sha256": "5a41ee357b0d864c18c01ee2ea5d4ac058970fd020982a6a65c9bc164be472df"
+    },
+    {
       "file": "PHASE_VNEXT_15_OBSERVABILITY_AUDIT_AND_TELEMETRY.md",
-      "bytes": 2269,
-      "sha256": "6ea7ec801ed66b7343068cf54da01dc78f7e78f96ab3c05fcd37420e722eb920"
+      "bytes": 2624,
+      "sha256": "dbd0e74a98bce6f7d8b2b8c24a3008dce3f5748260c8c1be329f883340c74264"
     },
     {
       "file": "EVIDENCE_P16_QUALIFICATION_CLAIM_CLOSURE.md",
@@ -271,18 +431,18 @@
     },
     {
       "file": "P16_QUALIFICATION_TUPLE.json",
-      "bytes": 772,
-      "sha256": "af64003d76749dad4e3b789ee8557cb60f5983e8e6cd793f2b2961d58b5cc8a2"
+      "bytes": 930,
+      "sha256": "5e00ba5f031f2510417c7ace1eae6c02190496ace61ec7d40c69e59d5f9ac865"
     },
     {
       "file": "PHASE_VNEXT_16_QUALIFICATION_PERFORMANCE_AND_CLAIMS.md",
-      "bytes": 4417,
-      "sha256": "0f7170d9827953ad6420208ffe85b71301558b5f3936526bde41fae87fc3e911"
+      "bytes": 4881,
+      "sha256": "657cda97189fcf97f81fbc6b42703b4cf04b25e6e8f55eac0117536537a431d0"
     },
     {
       "file": "PHASE_VNEXT_17_MIGRATION_CLEANUP_AND_CUTOVER.md",
-      "bytes": 2332,
-      "sha256": "fdd57cbebaca6b31f3ae02739d5193d371254db7465396bee6bf0d2f3373b1c9"
+      "bytes": 4339,
+      "sha256": "ae9ee612dd071cc31e44b52b6343cdaf323159608cfc4bb8ffc13ae079f05a81"
     },
     {
       "file": "README.md",
@@ -296,18 +456,18 @@
     },
     {
       "file": "TRACEABILITY_MATRIX.md",
-      "bytes": 23548,
-      "sha256": "627367026e2df44244769314b21c065c7fe3cbac9f4e42f68aa0c548c2546006"
+      "bytes": 25843,
+      "sha256": "a2e3296818f697e28cc58b2c5687673014dcd34b1c7577aa20e01f5455ab3194"
     },
     {
       "file": "VNEXT_TRACEABILITY.json",
-      "bytes": 27240,
-      "sha256": "22d8ba16336592269f36877cdf00970ffa5cd48ef6f918dda7c28d85ce6816a6"
+      "bytes": 29547,
+      "sha256": "7a081bcfc480de95e4621e48fbae5cceca0274114a8f56e55e558a2209e54e81"
     },
     {
       "file": "VNEXT_FEATURE_GATES.md",
-      "bytes": 3021,
-      "sha256": "17a86a3e4fd46307b6142c89676a47630e409724c9d7704eeeea2c928f942606"
+      "bytes": 3154,
+      "sha256": "f11f4df70ae65ad893acc61ff305b41598638508d0f9d0d5e6fd1fe2c4ad6502"
     },
     {
       "file": "VNEXT_NORMATIVE_INVARIANTS.md",
@@ -321,8 +481,8 @@
     },
     {
       "file": "P16_REVALIDATION_20260921_TUPLE.json",
-      "bytes": 17101,
-      "sha256": "e1cdd3f8912dff30f301c47e9cec7a2d0acbedd6179bec6c08742d187ba84a77"
+      "bytes": 18127,
+      "sha256": "e81005f55d02463cda994e3b4b98818e0ebf4eb56e58d08b0c4f958627fc1f4b"
     },
     {
       "file": "P16_RESOURCE_BUDGET_PERFORMANCE_20260922.md",
@@ -337,7 +497,7 @@
     {
       "file": "P16_RESOURCE_BUDGET_PERFORMANCE_20260922_TUPLE.json",
       "bytes": 2352,
-      "sha256": "91c63c730e9ace3d0fa7970ab83a1f8d54668f24d61b312f7e32c8ce079af845"
+      "sha256": "6073734f8910c953aea5654125b5822b4307fb97b80f83dbbb8aa083b2d541cd"
     },
     {
       "file": "P16_FULL_SUITE_REMEDIATION_20260922.md",
@@ -351,18 +511,83 @@
     },
     {
       "file": "P16_REMAINING_CONTOURS_20260922.json",
-      "bytes": 4604,
-      "sha256": "65a78134950466283b11c5d2a27e953ac6568dafac6f1a328a023bc3fe19121d"
+      "bytes": 4785,
+      "sha256": "c02c0922d909b892c65a626cd3da07985918ad5ce716a61bc5819b4b294b55a2"
     },
     {
       "file": "P16_REMAINING_CONTOURS_20260922.md",
-      "bytes": 4198,
-      "sha256": "722434c55eef19ec67261ac3ba3935db9efe8705d65de51430ae7a8bc1fa6adb"
+      "bytes": 4483,
+      "sha256": "e0709e9fcd27a422364eb529175d6da21544db832337984ef6daa5889a72ad04"
     },
     {
       "file": "P16_REMAINING_CONTOURS_20260922_TUPLE.json",
       "bytes": 2300,
-      "sha256": "4918980e264fa528fba9f3f4f3454941df7ad312d93c299b14941b0e259305a6"
+      "sha256": "9aee763db4046059e97d012bc1c34ff1343f315cd1baacccbec4643b9dad0bb5"
+    },
+    {
+      "file": "P16_PROVIDER_RESOURCE_CONTRACT_20260922.md",
+      "bytes": 3285,
+      "sha256": "3ce4d83fc6241ed2b7b5b352605603be8cc5266f952e65eb00b1d2fcece7e467"
+    },
+    {
+      "file": "P16_PROVIDER_RESOURCE_CONTRACT_20260922_TUPLE.json",
+      "bytes": 1270,
+      "sha256": "65e85181878847e622489506de5a939828a1235562da4e4d5abf26098f72760c"
+    },
+    {
+      "file": "P16_CONTROLLED_TOPOLOGY_20260922.json",
+      "bytes": 1458,
+      "sha256": "06386ccbf37523dd1e78ae37aa316d961d8241552b72c1474f42c099cfa3ccba"
+    },
+    {
+      "file": "P16_BLOCKER_REMEDIATION_20260922.json",
+      "bytes": 1947,
+      "sha256": "f28e1106fa1afe4ace48660d401ca44a5e3008a95e82c1cb190f0259af8c8fd1"
+    },
+    {
+      "file": "P16_BLOCKER_REMEDIATION_20260922.md",
+      "bytes": 6128,
+      "sha256": "7681bb36d6858df77e8f8390d6baac465fb7260a13454830cccef1a16d746963"
+    },
+    {
+      "file": "P16_BLOCKER_REMEDIATION_20260922_TUPLE.json",
+      "bytes": 4637,
+      "sha256": "f8bc15318612db7140067b18806e8e3e673cf3a9d0627dfa34ac09cfa8b536f8"
+    },
+    {
+      "file": "EVIDENCE_P17_MIGRATION_CLEANUP_AND_CUTOVER.md",
+      "bytes": 3569,
+      "sha256": "ae6b8960dafb6f8286c968f85ad86e60824d4aa119e724d7225adc600e4d7215"
+    },
+    {
+      "file": "P17_MIGRATION_CUTOVER_20260922.json",
+      "bytes": 2239,
+      "sha256": "6f24912b8d60a4b35afe689656fe96688e1037e5315e015cf17e67fb36413d2d"
+    },
+    {
+      "file": "P17_QUALIFICATION_TUPLE.json",
+      "bytes": 3280,
+      "sha256": "e12b332c35eba4d124af43b656ad07e76d23088d2b39d97f9fbf07663313876f"
+    },
+    {
+      "file": "P16_REAUDIT_20260922.md",
+      "bytes": 2352,
+      "sha256": "0574b0eb9bc96fa291bb60b3a24866664bb8edb7dc09447191de0d94211c8c69"
+    },
+    {
+      "file": "P16_REAUDIT_20260922_TUPLE.json",
+      "bytes": 1520,
+      "sha256": "7b7cfa8a10d590828a412ebfd9a0c55abb50e4b7466f0f88ba63ff8dc71c1f2e"
+    },
+    {
+      "file": "P17_REAUDIT_20260922.md",
+      "bytes": 2321,
+      "sha256": "7b92890960fb825c4203c6d9f62c16f7816bc2f9ea2858f60a49d04e47f4abe7"
+    },
+    {
+      "file": "P17_REAUDIT_20260922_TUPLE.json",
+      "bytes": 1689,
+      "sha256": "e37d33fefa8ba4d67fc801ff0e91ff467de8d5326c95afb1d767076f326bc5a0"
     }
   ]
 }

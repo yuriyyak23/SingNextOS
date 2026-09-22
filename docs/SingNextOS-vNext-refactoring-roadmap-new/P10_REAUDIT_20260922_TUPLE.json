@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "phase": "P10",
+  "claim": "RuntimeEnforced",
+  "contour": "internal Windows-x64/.NET-11/JIT policy-only scheduler cache; rollout-OFF",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "800027893dcf1ed23d8d7fe775841dd9d01a9fff",
+  "defaultFeatureGateState": "OFF",
+  "enabledFeatureGates": [],
+  "tests": [
+    { "lane": "P10-focused", "passed": 5, "failed": 0, "skipped": 0 },
+    { "lane": "P03-P04-P08-P10-regression", "passed": 26, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui", "passed": 1765, "failed": 0, "skipped": 2 }
+  ],
+  "build": { "solutionWarnings": 0, "solutionErrors": 0 },
+  "remediation": "duplicate live provider identities fail closed during scheduler revalidation",
+  "evidence": { "path": "P10_REAUDIT_20260922.md", "sha256": "c5d02b98639ea0a46a89d675338765227fbe050f8b6f1071c32770fb76806b26" },
+  "ordinaryFallback": "unchanged",
+  "futureGated": [{ "owner": "temporal enforcement and provider qualification owners", "missing": "P11 executable upper-bound enforcement and controlled provider environment", "requiredGateState": "OFF" }],
+  "exclusions": ["scheduler is policy/evidence only", "no provider/NativeAOT/upper-bound/guarantee/ProductionQualified claim", "no ISA or hardware change"]
+}

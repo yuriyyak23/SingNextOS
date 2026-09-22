@@ -60,3 +60,7 @@ P13 generalizes only after the single-class ordinary and fused contours are stab
 ## Current disposition (2026-09-21)
 
 Closed for mandatory ordinary-boundary preservation as recorded in `EVIDENCE_P12_SIPJOB_RESOURCE_BOUNDARY.md` and `P12_QUALIFICATION_TUPLE.json`. Resource consumption is an explicit `ResourceBudgetAuthority` materialization barrier, separate from effect and publication barriers. `FG-VNX-SIPJOB-RESOURCE` remains OFF; no resource-aware fused or parallel contour is claimed. P13 may extend only the stable ordinary single-class owner path.
+
+## Sequential re-audit (2026-09-22)
+
+Current HEAD is `800027893dcf1ed23d8d7fe775841dd9d01a9fff`. Mandatory ordinary materialization remains the P12 closure. Later P16 host-test evidence proves an isolated fused transport produces the same live-owner trace and conserves split leases, but the gate still defaults OFF and no production fused contour is inferred. Current evidence is `P12_REAUDIT_20260922.md` with tuple `P12_REAUDIT_20260922_TUPLE.json`.

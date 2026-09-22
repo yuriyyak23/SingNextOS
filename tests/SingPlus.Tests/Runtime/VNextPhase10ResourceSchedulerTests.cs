@@ -17,6 +17,8 @@ public sealed class VNextPhase10ResourceSchedulerTests
             scheduler.Revalidate(hint, id, [Candidate("p", 8)]).Error);
         Assert.Equal(KernelError.PlatformUnavailable,
             scheduler.Revalidate(hint, id, [Candidate("p", 7) with { Available = false }]).Error);
+        Assert.Equal(KernelError.InvalidMessage,
+            scheduler.Revalidate(hint, id, [Candidate("p", 7), Candidate("p", 7)]).Error);
     }
 
     [Fact]

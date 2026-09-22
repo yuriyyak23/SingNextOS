@@ -13,8 +13,8 @@
   "artifacts": [
     {
       "path": "tools/SingPlus.SingCapQualification/Program.cs",
-      "bytes": 14798,
-      "sha256": "876ed9905e3655a0bc12c5863f3d9cee40615a62d269ccef768dfa2d5cd5a1b5"
+      "bytes": 15029,
+      "sha256": "c4b826bd413405f32f244603206840b51d56ca78a5b709e8d9a3fb4f75d5390b"
     },
     {
       "path": "tools/SingPlus.SingCapQualification/VNextResourcePerformanceQualification.cs",
@@ -28,8 +28,8 @@
     },
     {
       "path": "src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetAuthority.cs",
-      "bytes": 28987,
-      "sha256": "e5e81623fbedd5745ea63bb6a5399c621c7f8b31fb6dc32ec5e9058042b34769"
+      "bytes": 30857,
+      "sha256": "8b48d88befe9798a467b6c8abf1b3c4bb238ea55409162e00fa2bb593f1ffdc2"
     },
     {
       "path": "contracts/SingPlus.Contracts/ResourceBudgetContracts.cs",

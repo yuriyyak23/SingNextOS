@@ -142,6 +142,7 @@ public interface IBadContract
     [InlineData("RequiresResource(2, ResourceClassV1.ComputeTime, ResourceUnitV1.Nanoseconds, 1, \"host:compute-v1\")")]
     [InlineData("RequiresResource(1, ResourceClassV1.ComputeTime, ResourceUnitV1.Nanoseconds, 0, \"host:compute-v1\")")]
     [InlineData("RequiresResource(1, ResourceClassV1.ComputeTime, ResourceUnitV1.Nanoseconds, 1, \"\")")]
+    [InlineData("RequiresResource(1, ResourceClassV1.ComputeTime, ResourceUnitV1.Nanoseconds, 1, \" host:compute-v1 \")")]
     [InlineData("RequiresResource(1, ResourceClassV1.ComputeTime, ResourceUnitV1.Nanoseconds, 1, \"host:compute-v1\", ResourceAssuranceV1.GuaranteedReservation)")]
     [Trait("Category", "Generators")]
     public void MalformedResourceRequirementsFailClosed(string attribute)

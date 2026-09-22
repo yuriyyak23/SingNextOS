@@ -212,7 +212,8 @@ public sealed partial class RuntimeKernel
         }
         var binding = new ResourceDonationBinding(downstreamInvocation, server, downstream,
             source.DerivedGrant, delegated.Value!.CapabilityId, source.ChargingOwner, split.Value!.Reservation,
-            envelope, assuranceCeiling, priorityCeiling, source.Provenance + "/" + downstream.ProcessId.Value);
+            envelope, assuranceCeiling, priorityCeiling,
+            $"{source.Provenance}/{server.ProcessId.Value}:{server.Generation}->{downstream.ProcessId.Value}:{downstream.Generation}@{downstreamInvocation.Session.SessionId.Value}:{downstreamInvocation.Session.Generation.Value}:{downstreamInvocation.InvocationId.Value}:{downstreamInvocation.Generation.Value}");
         var bound = SessionInvocations.BindResourceDonation(binding);
         if (bound.IsSuccess) return bound;
         _ = Budgets.CancelLeasePreSubmit(source.ChargingOwner, binding.Lease);

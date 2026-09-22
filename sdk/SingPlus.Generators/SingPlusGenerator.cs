@@ -311,7 +311,8 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
         if (version != 1) { failure = "Resource requirement version must be 1."; return false; }
         if (resourceClass != 1 || unit != 1) { failure = "Only ComputeTime/Nanoseconds is supported in P05."; return false; }
         if (amount == 0 || amount == ulong.MaxValue) { failure = "Resource maximum must be finite and non-zero."; return false; }
-        if (string.IsNullOrWhiteSpace(scope)) { failure = "Resource semantic scope is required."; return false; }
+        if (string.IsNullOrWhiteSpace(scope) || !string.Equals(scope, scope.Trim(), StringComparison.Ordinal))
+        { failure = "Resource semantic scope must be non-empty and canonical."; return false; }
         if (assurance < 1 || assurance > 2 || donation < 0 || donation > 1)
         { failure = "Resource assurance or donation policy is unknown."; return false; }
         failure = string.Empty;

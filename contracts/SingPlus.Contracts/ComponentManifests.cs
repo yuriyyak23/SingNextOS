@@ -222,6 +222,7 @@ public sealed partial class ServiceManifestV1
                 requirement.Version != SipResourceRequirementV1.CurrentVersion ||
                 requirement.MaximumAmount == 0 || requirement.MaximumAmount == ulong.MaxValue ||
                 string.IsNullOrWhiteSpace(requirement.SemanticScope) ||
+                !string.Equals(requirement.SemanticScope, requirement.SemanticScope.Trim(), StringComparison.Ordinal) ||
                 requirement.ResourceClass != ResourceClassV1.ComputeTime ||
                 requirement.Unit != ResourceUnitV1.Nanoseconds ||
                 !Enum.IsDefined(requirement.AssuranceCeiling) ||

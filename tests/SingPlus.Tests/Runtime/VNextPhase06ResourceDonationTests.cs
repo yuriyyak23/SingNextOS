@@ -95,7 +95,9 @@ public sealed class VNextPhase06ResourceDonationTests
 
         Assert.True(child.IsSuccess, child.Message);
         Assert.Equal(setup.Caller, child.Value!.ChargingOwner);
-        Assert.StartsWith(parent.Provenance + "/", child.Value.Provenance, StringComparison.Ordinal);
+        Assert.Equal(
+            $"{parent.Provenance}/{setup.Service.ProcessId.Value}:{setup.Service.Generation}->{setup.Downstream.ProcessId.Value}:{setup.Downstream.Generation}@{childInvocation.Context.Invocation.Session.SessionId.Value}:{childInvocation.Context.Invocation.Session.Generation.Value}:{childInvocation.Context.Invocation.InvocationId.Value}:{childInvocation.Context.Invocation.Generation.Value}",
+            child.Value.Provenance);
         Assert.Equal(100UL, Used(setup));
         Assert.Equal(70UL, Assert.Single(setup.Kernel.QueryBudget(parent.Lease).Value!.Amounts).Amount);
         Assert.Equal(30UL, Assert.Single(setup.Kernel.QueryBudget(child.Value.Lease).Value!.Amounts).Amount);

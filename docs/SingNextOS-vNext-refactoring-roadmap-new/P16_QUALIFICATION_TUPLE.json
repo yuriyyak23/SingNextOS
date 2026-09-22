@@ -1,11 +1,14 @@
 {
   "schemaVersion": 1,
   "phase": "P16",
-  "claim": "StaticAdmission",
+  "phaseDisposition": "ClosedExactHostContour",
+  "claim": "ExecutableAdapter",
   "productionQualified": false,
   "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
   "phaseEntryHead": "cf66d014fd0fc19cdcabca2ef1b5b974805ecda1",
-  "reviewedHead": "cf66d014fd0fc19cdcabca2ef1b5b974805ecda1",
+  "reviewedHead": "800027893dcf1ed23d8d7fe775841dd9d01a9fff",
+  "p17MayStart": true,
+  "closureEvidence": "P16_BLOCKER_REMEDIATION_20260922_TUPLE.json",
   "enabledFeatureGates": [],
   "isaChangeCategory": [],
   "exclusions": [
@@ -15,7 +18,7 @@
     "time does not qualify throughput or occupancy",
     "upper bound does not qualify guaranteed reservation",
     "ISA-change category is empty",
-    "full non-GUI suite has nine unrelated failures",
-    "no performance, hardware, QEMU, firmware or CXL boot claim"
+    "no temporal upper-bound or guaranteed-reservation claim",
+    "no ProductionQualified, hardware, QEMU, firmware or CXL boot claim"
   ]
 }

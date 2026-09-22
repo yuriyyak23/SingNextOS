@@ -91,13 +91,13 @@
     },
     {
       "path": "docs/SingNextOS-vNext-refactoring-roadmap-new/TRACEABILITY_MATRIX.md",
-      "bytes": 23548,
-      "sha256": "627367026e2df44244769314b21c065c7fe3cbac9f4e42f68aa0c548c2546006"
+      "bytes": 25843,
+      "sha256": "a2e3296818f697e28cc58b2c5687673014dcd34b1c7577aa20e01f5455ab3194"
     },
     {
       "path": "docs/SingNextOS-vNext-refactoring-roadmap-new/VNEXT_FEATURE_GATES.md",
-      "bytes": 3021,
-      "sha256": "17a86a3e4fd46307b6142c89676a47630e409724c9d7704eeeea2c928f942606"
+      "bytes": 3154,
+      "sha256": "f11f4df70ae65ad893acc61ff305b41598638508d0f9d0d5e6fd1fe2c4ad6502"
     },
     {
       "path": "docs/SingNextOS-vNext-refactoring-roadmap-new/VNEXT_NORMATIVE_INVARIANTS.md",
@@ -106,8 +106,8 @@
     },
     {
       "path": "docs/SingNextOS-vNext-refactoring-roadmap-new/VNEXT_TRACEABILITY.json",
-      "bytes": 27240,
-      "sha256": "22d8ba16336592269f36877cdf00970ffa5cd48ef6f918dda7c28d85ce6816a6"
+      "bytes": 29547,
+      "sha256": "7a081bcfc480de95e4621e48fbae5cceca0274114a8f56e55e558a2209e54e81"
     },
     {
       "path": "eng/qualify-vnext.ps1",
@@ -121,8 +121,8 @@
     },
     {
       "path": "src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetAuthority.cs",
-      "bytes": 28987,
-      "sha256": "e5e81623fbedd5745ea63bb6a5399c621c7f8b31fb6dc32ec5e9058042b34769"
+      "bytes": 30857,
+      "sha256": "8b48d88befe9798a467b6c8abf1b3c4bb238ea55409162e00fa2bb593f1ffdc2"
     },
     {
       "path": "src/Runtime/SingPlus.Runtime/Capabilities/CapabilityAuthority.cs",
@@ -165,34 +165,59 @@
       "sha256": "27abdf9324b95fed9ec64d2df3a7ceb12534cda5db869f708c4e840505f11f53"
     },
     {
+      "path": "src/Platform/SingPlus.Platform.Abstractions/PlatformResourceContracts.cs",
+      "bytes": 9708,
+      "sha256": "de0cd36d1b536f7bbc35e73dc89843331e994d93efffc094594e60de58c54f29"
+    },
+    {
+      "path": "src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetRecoveryJournal.cs",
+      "bytes": 21777,
+      "sha256": "84600e73a03cd85272af0ca0ba9c8344a849deb6beff9f1f399e238050e918b8"
+    },
+    {
+      "path": "src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.Resources.cs",
+      "bytes": 8088,
+      "sha256": "aa249adcd150ece3775428f357601f75b83f73874e94e5a81e7bbf08ebef1c3e"
+    },
+    {
+      "path": "src/Runtime/SingPlus.Runtime/SipJobs/SipJobResourceTransportExecutor.cs",
+      "bytes": 2483,
+      "sha256": "dbe44494d3dca984a5c22420ee586a08d28a7b40eef95776cd9a77ac904f4195"
+    },
+    {
       "path": "src/Runtime/SingPlus.Runtime/VNext/ComputePlanResourceAdmission.cs",
       "bytes": 2530,
       "sha256": "654adddeb67479221d2d8f4bc806d0db886b7c3b1d7c978061246b9567c34288"
     },
     {
       "path": "src/Runtime/SingPlus.Runtime/VNext/ExternalOperationResourceBinding.cs",
-      "bytes": 14295,
-      "sha256": "8de914385b48c57874ce24935b2bafb47d3ed36334b44c944f55b685a48076cc"
+      "bytes": 15265,
+      "sha256": "8c7cedbe7964b90f86a6ddc166ad4abaa148e6a9af32578a3918f017ebe421ef"
     },
     {
       "path": "src/Runtime/SingPlus.Runtime/VNext/ResourceAdmissionProtocol.cs",
-      "bytes": 17738,
-      "sha256": "afe71e3a5c7d1849a41903f61a796d1d1e2fd5420a3e9dbebdeeadfc9f388994"
+      "bytes": 21607,
+      "sha256": "62bff52f8910c41e1497fd936c57e9b2f5e04c4a3ad199f187e9095fb2a21673"
     },
     {
       "path": "src/Runtime/SingPlus.Runtime/VNext/ResourceDonationProtocol.cs",
-      "bytes": 15914,
-      "sha256": "ec090c55b965a95a5efc1dc631b870cb05d67011d64ecc36f32c5b85b8ea043c"
+      "bytes": 16172,
+      "sha256": "c0ca1a1bc4763677e12935ff010e6163f0d6e13f8d4e7df9c04eaffee2cd5c63"
     },
     {
       "path": "src/Runtime/SingPlus.Runtime/VNext/ResourceScheduler.cs",
-      "bytes": 4621,
-      "sha256": "44edb5a8bee5645bd8cdcda34121d8dea45f5e9d63aa30a67cfa792a13134746"
+      "bytes": 4859,
+      "sha256": "6af9b721bbd600ce5a2b48ad129b2ca6160dd22126c7415b3a836b22c630d0d8"
     },
     {
       "path": "src/Runtime/SingPlus.Runtime/VNext/VNextFeatureGates.cs",
-      "bytes": 3072,
-      "sha256": "51f285e0a2c6e8cec0f7e84947daa5ef76a5234a18425614bdb0bc40162756c3"
+      "bytes": 9395,
+      "sha256": "7aa62b822160ac6ade6b5047505d16230d0b56e0ffe5496696750e11d9bb1199"
+    },
+    {
+      "path": "src/Runtime/SingPlus.Runtime/VNext/VNextMigrationCoordinator.cs",
+      "bytes": 10202,
+      "sha256": "0add723ba1e62095f6c03ca8e568ff2d968d554ee53a0a60f20523949cbc6167"
     },
     {
       "path": "tests/SingPlus.Tests/Architecture/VNextPhase00ArchitecturalFreezeTests.cs",
@@ -202,12 +227,12 @@
     {
       "path": "tests/SingPlus.Tests/Architecture/VNextPhase16QualificationClosureTests.cs",
       "bytes": 11176,
-      "sha256": "8eb2cd0c545c3211ab02aea4edaa28bb0a98adb696e64e760ab02cacc3e480d5"
+      "sha256": "6772018e1b96276ad734971d6c2171ade4dcbf4ab6bad127544a043d817a3bec"
     },
     {
       "path": "tests/SingPlus.Tests/Architecture/VNextTraceabilityPolicy.cs",
-      "bytes": 8686,
-      "sha256": "c491aa5ad7ac589ea36c22a75febd0bf8502da8901f89311508ce41d3e837691"
+      "bytes": 8791,
+      "sha256": "e2eaec0bca802fb04716d66590a1597a12a955987cf392045892eca302604129"
     },
     {
       "path": "tests/SingPlus.Tests/Capabilities/VNextPhase02ResourceGrantTests.cs",
@@ -236,18 +261,18 @@
     },
     {
       "path": "tests/SingPlus.Tests/Runtime/VNextPhase04CrossOwnerAdmissionTests.cs",
-      "bytes": 10196,
-      "sha256": "9d7361b06f787b10de5e71ed19de5a50a45904e2a0a0050153d6cf6c327d76ed"
+      "bytes": 11363,
+      "sha256": "2671dc202ed07126ed751edff1f562d167db9915a0608c1a019dfc3a61b7c090"
     },
     {
       "path": "tests/SingPlus.Tests/Runtime/VNextPhase05SipResourceSentryTests.cs",
-      "bytes": 11570,
-      "sha256": "385341637f8f238b019d33310450e9e90d368161aa339e7551945597d40197a5"
+      "bytes": 11827,
+      "sha256": "12161f2056ae149fcef6a6a6af8d66e4558640e9922f8b35b4d3c24098047cc6"
     },
     {
       "path": "tests/SingPlus.Tests/Runtime/VNextPhase06ResourceDonationTests.cs",
-      "bytes": 15516,
-      "sha256": "1929a25bc2797a052b4b4d9ce8b513261af6986668008c45ce1ef246571c1cc7"
+      "bytes": 15867,
+      "sha256": "e6607cf8659e3d226d8351f4952cab87e8cfec0acf95c26854b31c017a61b0cc"
     },
     {
       "path": "tests/SingPlus.Tests/Runtime/VNextPhase07ExternalOperationResourceBindingTests.cs",
@@ -256,13 +281,13 @@
     },
     {
       "path": "tests/SingPlus.Tests/Runtime/VNextPhase08ComputePlanIndependentGatesTests.cs",
-      "bytes": 8927,
-      "sha256": "19472422b1711fc16a18baa52441ae71ba42cdc4e4ddb295b1af864c1906274d"
+      "bytes": 9561,
+      "sha256": "651946b1a672da97a31de297f6939707e418c8a4023d506ec3b398d80ed87ff8"
     },
     {
       "path": "tests/SingPlus.Tests/Runtime/VNextPhase10ResourceSchedulerTests.cs",
-      "bytes": 4094,
-      "sha256": "0ef80fd27bc042e0b5df5010c2fa2962388d1db58c30b1596028d20ced52f45a"
+      "bytes": 4234,
+      "sha256": "93bc3676192f94fef900c0cef367a7890cf2fa6c9a351c9e98d9d92dc435882d"
     },
     {
       "path": "tests/SingPlus.Tests/Runtime/VNextPhase11TemporalClaimBoundaryTests.cs",

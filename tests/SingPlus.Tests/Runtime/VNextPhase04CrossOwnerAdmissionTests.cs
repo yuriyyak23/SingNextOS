@@ -166,6 +166,34 @@ public sealed class VNextPhase04CrossOwnerAdmissionTests
         Assert.Equal(10UL, Used(context));
     }
 
+    [Theory]
+    [InlineData((int)ResourceAdmissionQualificationPoint.BeforeProviderCallback, 0)]
+    [InlineData((int)ResourceAdmissionQualificationPoint.AfterProviderCallback, 1)]
+    public void FaultAtEveryPostPossibleSubmitBoundaryQuarantinesWithoutRefund(
+        int faultValue, int expectedCallbacks)
+    {
+        var fault = (ResourceAdmissionQualificationPoint)faultValue;
+        var context = Create();
+        using var commit = Prepare(context).Value!;
+        var callbacks = 0;
+        context.Kernel.ResourceAdmissionQualificationHook = new Hook(point =>
+        {
+            if (point == fault) throw new InvalidOperationException($"fault:{point}");
+        });
+
+        var result = context.Kernel.SubmitResourceExternalAdmission(commit, context.Dependencies, () =>
+        {
+            callbacks++;
+            return KernelResult.Ok();
+        });
+
+        Assert.Equal(KernelError.PlatformFaulted, result.Error);
+        Assert.Equal(expectedCallbacks, callbacks);
+        Assert.Equal(BudgetReservationState.Quarantined,
+            context.Kernel.Budgets.Query(commit.Lease).Value!.State);
+        Assert.Equal(10UL, Used(context));
+    }
+
     [Fact]
     public async Task ConcurrentAdmissionsCompleteWithoutCrossOwnerDeadlock()
     {

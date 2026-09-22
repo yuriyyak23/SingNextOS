@@ -73,6 +73,21 @@ public sealed class VNextPhase08ComputePlanIndependentGatesTests
     }
 
     [Fact]
+    public void DuplicateLiveProviderIdentityFailsClosedBeforeAdmission()
+    {
+        var setup = Create(100);
+
+        var result = setup.Kernel.PrepareResourceAwareComputeSubmission(setup.Process, setup.Plan,
+            [setup.Provider, setup.Provider], setup.Effect, 1, setup.Grant, 1,
+            setup.Operation, setup.Dependencies, new Legality(true));
+
+        Assert.Equal(KernelError.InvalidMessage, result.Error);
+        Assert.Equal(0UL, Used(setup));
+        Assert.Equal(ExternalOperationState.Prepared,
+            setup.Kernel.QueryExternalOperation(setup.Process, setup.Operation).Value!.State);
+    }
+
+    [Fact]
     public void ProviderChoiceChangesWithoutChangingSemanticRequirementAndIncompatibleFallbackFails()
     {
         var setup = Create(100);

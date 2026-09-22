@@ -2,6 +2,8 @@
 
 **Live disposition:** closed at `RuntimeEnforced` for the internal host/JIT owner contour on reviewed HEAD `b86cc33c16a77760c6971cc1a656c34b6cf2a10d`; the feature gate remains OFF. See `EVIDENCE_P02_RESOURCE_GRANTS.md` and `P02_QUALIFICATION_TUPLE.json`.
 
+**Sequential re-audit (2026-09-22):** the current internal-owner disposition remains `RuntimeEnforced` with rollout OFF; see `P02_REAUDIT_20260922.md` and `P02_REAUDIT_20260922_TUPLE.json`.
+
 ## Purpose
 
 Represent permission to consume a bounded resource envelope using the existing SingCap-M capability ledger and monotonic constraint algebra; do not create a new authority ledger.

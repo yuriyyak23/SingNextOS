@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "phase": "P04",
+  "claim": "RuntimeEnforced",
+  "contour": "internal Windows-x64/JIT cross-owner admission; rollout-OFF",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "800027893dcf1ed23d8d7fe775841dd9d01a9fff",
+  "defaultFeatureGateState": "OFF",
+  "enabledFeatureGates": [],
+  "tests": [
+    { "lane": "P04-focused-after-remediation", "passed": 15, "failed": 0, "skipped": 0 },
+    { "lane": "P04-cross-owner-durable-regression", "passed": 23, "failed": 0, "skipped": 0 },
+    { "lane": "P04-closure", "passed": 55, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui-post-change", "passed": 1762, "failed": 1, "skipped": 2, "failure": "SingPlus.Tests.Platform.PlatformDsc1ComputeTests.ConcurrentEventObserversCallProviderAndPublishOnlyOnce" },
+    { "lane": "exact-failure-rerun", "passed": 5, "failed": 0, "skipped": 0 }
+  ],
+  "remediation": "added BeforeProviderCallback and AfterProviderCallback fault-boundary quarantine regressions",
+  "evidence": { "path": "P04_REAUDIT_20260922.md", "sha256": "32b3912c88a86b0582e287201f0cab4b716266dbc2126ae7296cdac06ad0db57" },
+  "futureGated": [
+    { "owner": "session/invocation owners", "missing": "P05/P06 exact session and invocation entry", "requiredGateState": "OFF" },
+    { "owner": "durable recovery integration", "missing": "process-crash proof is not P04 exception-fault evidence", "requiredGateState": "OFF" }
+  ],
+  "exclusions": ["no public rollout", "no provider/NativeAOT/upper-bound/guarantee/ProductionQualified claim", "no ISA or hardware change"]
+}

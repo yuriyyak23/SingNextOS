@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "phase": "P13",
+  "claim": "ModelOnly",
+  "contour": "typed non-compute algebra and atomic canonical vector infrastructure; no executable family mapping",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "800027893dcf1ed23d8d7fe775841dd9d01a9fff",
+  "enabledFeatureGates": [],
+  "futureGatedFamilies": ["DmaThroughput", "NetworkThroughput", "FabricThroughput", "DeviceOccupancy"],
+  "tests": [
+    { "lane": "P01-P03-P13-dimension-boundary", "passed": 21, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui-current-code", "passed": 1765, "failed": 0, "skipped": 2 }
+  ],
+  "defectsConfirmed": 0,
+  "evidence": { "path": "P13_REAUDIT_20260922.md", "sha256": "99df171841ff7cdddf9ea368e2aa5ee33b0f3b9dca5c335585a0428f6f229713" },
+  "ordinaryFallback": "ComputeTime only; unchanged",
+  "futureGated": [{ "owner": "ResourceBudgetAuthority plus each effect/provider/Region owner", "missing": "family-specific semantic mapping, usage evidence and loss/settlement qualification", "requiredGateState": "OFF" }],
+  "exclusions": ["no non-compute ExecutableAdapter", "no upper-bound/guarantee/provider/hardware/ProductionQualified claim", "no ISA change"]
+}

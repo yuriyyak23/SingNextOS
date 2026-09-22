@@ -2,7 +2,7 @@
 
 ## Disposition
 
-The ordered remediation was executed against HEAD `cb6a94c314055e0712b8d9b8382ca1d146fe1c0e`. The normative baseline remains `6227ea7cf258ef6ffce52001d4d2ffee07355b35`. The worktree was clean at iteration start; all files listed in the tuple are changes from this iteration.
+The ordered remediation was implemented in commit `800027893dcf1ed23d8d7fe775841dd9d01a9fff` and canonically qualified from that HEAD plus the additive evidence synchronization recorded by this tuple. The normative baseline remains `6227ea7cf258ef6ffce52001d4d2ffee07355b35`. The iteration began from a clean worktree; the commit appeared as an external state change and is not attributed to the qualification iteration.
 
 The exact qualified contour is Windows x64, .NET 11 JIT, the opt-in host provider and `ComputeTime/Nanoseconds` scope `host:compute-v1`. No result transfers to HybridCPU, NativeAOT, another provider, throughput, occupancy, a temporal deadline or guaranteed capacity. Every gate remains default OFF.
 
@@ -27,7 +27,13 @@ host adapter + gate + SipJob differential lane: passed 12, failed 0
 complete new P16 focused lane: passed 37, failed 0
 solution build: Exit 0; 0 warnings, 0 errors
 controlled topology tool: Exit 0; Qualified=true; two scenarios; no worker errors; FinalUsedAmount=0
+architecture/manifest/traceability closure lane: passed 45, failed 0
+canonical focused lane: passed 196, failed 0, skipped 0
+canonical full non-GUI suite: passed 1747, failed 0, skipped 2
+git diff --check: Exit 0; line-ending warnings only
 ```
+
+The canonical command was `.\eng\qualify-vnext.ps1`. Its four test projects reported 1,539 + 90 + 58 + 60 passes. The two existing suspended-child qualification tests remained explicitly skipped; they were not hidden or relabelled. All changed JSON artifacts parsed successfully and all tuple/manifest hashes were checked by executable tests.
 
 ## Authority and claim boundary
 
@@ -36,3 +42,5 @@ controlled topology tool: Exit 0; Qualified=true; two scenarios; no worker error
 The host adapter may be enabled only by explicit generation-bound configuration; repository/default state remains OFF and ordinary SIP remains the fallback. The current maximum claims are `StaticAdmission`, exact host `RuntimeEnforced`, exact host `ExecutableAdapter`, and controlled-topology `AccountingOnly`. `EnforcedUpperBound`, `GuaranteedReservation` and `ProductionQualified` remain unclaimed.
 
 No HybridCPU ISA, VLIW, pointer width, register, typed lane, opcode, compiler-to-ISE, pipeline, replay, scheduler-legality, memory-controller, retire or microarchitecture work was performed. No real HybridCPU, NativeAOT, hardware, QEMU, firmware or CXL boot execution is claimed.
+
+P16 is closed for the exact Windows-x64/.NET-11/JIT host-provider ComputeTime/Nanoseconds contour at `ExecutableAdapter`, with every feature gate default OFF. P17 may begin additively; it may not remove transitional paths without its own no-live-consumer proof. Temporal upper-bound, guaranteed reservation and HybridCPU-provider contours remain FutureGated and do not prevent closure because their gates remain OFF and their missing enforcement owners are explicit.

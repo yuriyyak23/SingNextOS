@@ -62,3 +62,7 @@ P14 must define persistence/reconciliation per resource family, not generically.
 ## Current disposition (2026-09-21)
 
 Closed as a typed `ModelOnly`/FutureGated boundary recorded in `EVIDENCE_P13_RESOURCE_FAMILY_BOUNDARY.md` and `P13_QUALIFICATION_TUPLE.json`. The common ledger proves atomic canonical vectors but no live dimension mapping or provider adapter qualifies throughput/occupancy families. Every P13 family gate remains OFF; P14 applies only to the existing ComputeTime contour and cannot generalize persistence claims to these future families.
+
+## Sequential re-audit (2026-09-22)
+
+Current HEAD is `800027893dcf1ed23d8d7fe775841dd9d01a9fff`. Typed algebra and atomic canonical vectors were reconfirmed, but no executable non-compute mapping/provider contour exists. Current evidence is `P13_REAUDIT_20260922.md` with tuple `P13_REAUDIT_20260922_TUPLE.json`; all family gates remain OFF and the claim remains `ModelOnly`.

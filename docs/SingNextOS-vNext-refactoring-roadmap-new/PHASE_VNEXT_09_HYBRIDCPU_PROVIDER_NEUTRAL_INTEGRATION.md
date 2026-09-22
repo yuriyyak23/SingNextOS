@@ -63,3 +63,7 @@ P10 may schedule among qualified semantic provider contours only.
 ## Current disposition (2026-09-21)
 
 Closed for the exact existing ordinary host/JIT `ExecutableAdapter` contour recorded in `EVIDENCE_P09_HYBRIDCPU_PROVIDER_NEUTRAL_INTEGRATION.md` and `P09_QUALIFICATION_TUPLE.json`. The local Contracts 1.14.0 package is exact-hash pinned, but the roadmap HybridCPU source SHA is not locally verifiable. Both resource-specific HybridCPU gates remain OFF because 1.14.0 has no resource request or usage-evidence schema. This closure does not transfer P08 resource enforcement into the ordinary adapter and makes no ISA, hardware, NativeAOT, guarantee or production claim.
+
+## Sequential re-audit (2026-09-22)
+
+Current HEAD is `800027893dcf1ed23d8d7fe775841dd9d01a9fff`. Local package hash and executable ordinary-adapter coverage were reconfirmed; provider source and the referenced HybridCPU SHA remain unavailable locally. Current evidence is `P09_REAUDIT_20260922.md` with tuple `P09_REAUDIT_20260922_TUPLE.json`. Both resource gates remain OFF and no stronger claim is made.

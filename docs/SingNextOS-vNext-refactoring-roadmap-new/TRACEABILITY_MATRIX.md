@@ -1,6 +1,6 @@
 # vNext traceability — current coverage index
 
-Status: PartialCoverage. These rows identify reviewed test contours; they do not close entire invariants or phases. All rollout gates remain OFF. P16 remains open.
+Status: PartialCoverage. P00-P17 are closed for their exact documented contours; FutureGated contours remain unqualified. All rollout gates remain OFF.
 
 Generated projection of `VNEXT_TRACEABILITY.json`; the closure lane compares every field and referenced evidence/tuple hash.
 
@@ -11,13 +11,13 @@ Generated projection of `VNEXT_TRACEABILITY.json`; the closure lane compares eve
 - implementation: src/Runtime/SingPlus.Runtime/Capabilities/CapabilityAuthority.cs; src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetAuthority.cs
 - tests: SingPlus.Tests.Architecture.VNextPhase00ArchitecturalFreezeTests.ProductionTreeHasNoTemporalResourceAuthorityOrDuplicateOwnerStore
 - ciLane: eng/qualify-vnext.ps1
-- evidence: EVIDENCE_P00_ARCHITECTURAL_FREEZE.md
-- evidenceSha256: 5fb648d60acca290e75f8852086981f4cd8faeed4fb8afd80cccf36983c2f67d
-- tuple: P00_QUALIFICATION_TUPLE.json
-- tupleSha256: 9f5200b5ff5c57ce05744952ee2cec9738a523a2c68c313a26cfe7b1dd57cb07
+- evidence: P00_REAUDIT_20260922.md
+- evidenceSha256: 2bab7f8503550a583dce80647c27bd26906208ad41cdaf98c6d3f32776da4eb8
+- tuple: P00_REAUDIT_20260922_TUPLE.json
+- tupleSha256: fb360b31e8257717cd68bf8fc6900760ee1118efabf33331147131b172ea4bfe
 - evidenceKind: StaticChecks
 - contour: Windows-x64/JIT/host-only; ComputeTime-or-static-boundary; rollout-OFF
-- claim: StaticAdmission
+- claim: ModelOnly
 - exclusions: no second ledger
 
 ## VNX-002
@@ -43,10 +43,10 @@ Generated projection of `VNEXT_TRACEABILITY.json`; the closure lane compares eve
 - implementation: src/Runtime/SingPlus.Runtime/Capabilities/CapabilityAuthority.cs
 - tests: SingPlus.Tests.Capabilities.VNextPhase02ResourceGrantTests.ResourceGrantIsLiveLedgerBasedAndIndependentFromEffectRights
 - ciLane: eng/qualify-vnext.ps1
-- evidence: EVIDENCE_P02_RESOURCE_GRANTS.md
-- evidenceSha256: a34eed4fce118ac21825a941a94f95501c60fca7c4390307d15b3141339eee90
-- tuple: P02_QUALIFICATION_TUPLE.json
-- tupleSha256: 9fa7bf3a7457559513c2d2acfc024f7900b4227bf6776ab9bbf227f6e8d0b5c8
+- evidence: P02_REAUDIT_20260922.md
+- evidenceSha256: 57ecd6f2659abbdc254abd068155ba49800fe63c3074954715d4304df2673f38
+- tuple: P02_REAUDIT_20260922_TUPLE.json
+- tupleSha256: e1e1d68fd151eea839eb1c585c122635c281e80aaaac72ef1b80d20053449b06
 - evidenceKind: DirectOwnerTests
 - contour: Windows-x64/JIT/host-only; ComputeTime-or-static-boundary; rollout-OFF
 - claim: RuntimeEnforced
@@ -59,10 +59,10 @@ Generated projection of `VNEXT_TRACEABILITY.json`; the closure lane compares eve
 - implementation: src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetAuthority.cs
 - tests: SingPlus.Tests.Runtime.VNextPhase03ResourceLeaseTests.LastUnitReservationHasExactlyOneWinner
 - ciLane: eng/qualify-vnext.ps1
-- evidence: EVIDENCE_P03_RESOURCE_LEASE.md
-- evidenceSha256: 5553749e8a5d9895c60d1a589f564701983a8737a1aeb68b0d8612adb76e7649
-- tuple: P03_QUALIFICATION_TUPLE.json
-- tupleSha256: a4d5501f71f5cb24afb0e24a524310b24cd305e86c1bbad77ee808e7048c4eb0
+- evidence: P03_REAUDIT_20260922.md
+- evidenceSha256: dfb749c8c92823869f51b4d4fb6b8898338512f963b4f8b128e265bb31c05e68
+- tuple: P03_REAUDIT_20260922_TUPLE.json
+- tupleSha256: 07b4480c16d54e30c2c09b1aa03646a097822114052c080e2973955abad2fcc1
 - evidenceKind: DirectOwnerTests
 - contour: Windows-x64/JIT/host-only; ComputeTime-or-static-boundary; rollout-OFF
 - claim: RuntimeEnforced
@@ -91,10 +91,10 @@ Generated projection of `VNEXT_TRACEABILITY.json`; the closure lane compares eve
 - implementation: contracts/SingPlus.Contracts/ResourceControlModelContracts.cs
 - tests: SingPlus.Tests.Contracts.VNextPhase01ResourceModelTests.SiblingDeclarativeEnvelopesCannotBeUnionedIntoParentAuthority
 - ciLane: eng/qualify-vnext.ps1
-- evidence: EVIDENCE_P01_RESOURCE_MODEL.md
-- evidenceSha256: 3835c450f9968c82c8ff929afc2f7ee64db88529dd91a5aeef5caf87deaf69ed
-- tuple: P01_QUALIFICATION_TUPLE.json
-- tupleSha256: 7cfba2036754402800f674dd7b93a4ebcc6f080ea6e8bc76e52171fc877c1abd
+- evidence: P01_REAUDIT_20260922.md
+- evidenceSha256: 061da867004da4101cbea3fd74eae95ab8e37522bbbb9e58ce5f16b18846df55
+- tuple: P01_REAUDIT_20260922_TUPLE.json
+- tupleSha256: df008b9a43feb052400f7b9dea897e9103f378bd71ec3a63061740d38af1d52d
 - evidenceKind: ModelTests
 - contour: Windows-x64/JIT/host-only; ComputeTime-or-static-boundary; rollout-OFF
 - claim: ModelOnly
@@ -107,10 +107,10 @@ Generated projection of `VNEXT_TRACEABILITY.json`; the closure lane compares eve
 - implementation: src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetAuthority.cs
 - tests: SingPlus.Tests.Runtime.VNextPhase03ResourceLeaseTests.SplitVersusConsumptionRaceNeverCreatesCapacity
 - ciLane: eng/qualify-vnext.ps1
-- evidence: EVIDENCE_P03_RESOURCE_LEASE.md
-- evidenceSha256: 5553749e8a5d9895c60d1a589f564701983a8737a1aeb68b0d8612adb76e7649
-- tuple: P03_QUALIFICATION_TUPLE.json
-- tupleSha256: a4d5501f71f5cb24afb0e24a524310b24cd305e86c1bbad77ee808e7048c4eb0
+- evidence: P03_REAUDIT_20260922.md
+- evidenceSha256: dfb749c8c92823869f51b4d4fb6b8898338512f963b4f8b128e265bb31c05e68
+- tuple: P03_REAUDIT_20260922_TUPLE.json
+- tupleSha256: 07b4480c16d54e30c2c09b1aa03646a097822114052c080e2973955abad2fcc1
 - evidenceKind: DirectOwnerTests
 - contour: Windows-x64/JIT/host-only; ComputeTime-or-static-boundary; rollout-OFF
 - claim: RuntimeEnforced
@@ -139,10 +139,10 @@ Generated projection of `VNEXT_TRACEABILITY.json`; the closure lane compares eve
 - implementation: src/Runtime/SingPlus.Runtime/VNext/ResourceDonationProtocol.cs
 - tests: SingPlus.Tests.Runtime.VNextPhase06ResourceDonationTests.StaleIdentityWideningAndAmbientReuseFailClosedBeforeCharging
 - ciLane: eng/qualify-vnext.ps1
-- evidence: EVIDENCE_P06_ENDPOINTSESSION_RESOURCE_DONATION.md
-- evidenceSha256: fdd417a3cd1203d888b02ef517aa103fab325daeb6d5d2a5dab1223e90124f71
-- tuple: P06_QUALIFICATION_TUPLE.json
-- tupleSha256: eca03531dce70490fa2bead499e80f1483652a30f2e36ff196b15ca9b4896f57
+- evidence: P06_REAUDIT_20260922.md
+- evidenceSha256: 783b498d467365829aeafce4632fbcae21f24adef27777e80182b59abbfacf0a
+- tuple: P06_REAUDIT_20260922_TUPLE.json
+- tupleSha256: eb71392bfb99dd9a7b2f20ea24763dfc253afd6e57e8b602a2271e49988fa75f
 - evidenceKind: DirectOwnerTests
 - contour: Windows-x64/JIT/host-only; ComputeTime-or-static-boundary; rollout-OFF
 - claim: RuntimeEnforced
@@ -155,10 +155,10 @@ Generated projection of `VNEXT_TRACEABILITY.json`; the closure lane compares eve
 - implementation: src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetAuthority.cs; src/Runtime/SingPlus.Runtime/VNext/ResourceDonationProtocol.cs
 - tests: SingPlus.Tests.Runtime.VNextPhase03ResourceLeaseTests.ConsumptionCannotRefundUntilExactReconciliationAndSettlement; SingPlus.Tests.Runtime.VNextPhase06ResourceDonationTests.ParallelNestedSplitsNeverAmplifyCallerCapacity
 - ciLane: eng/qualify-vnext.ps1
-- evidence: EVIDENCE_P06_ENDPOINTSESSION_RESOURCE_DONATION.md
-- evidenceSha256: fdd417a3cd1203d888b02ef517aa103fab325daeb6d5d2a5dab1223e90124f71
-- tuple: P06_QUALIFICATION_TUPLE.json
-- tupleSha256: eca03531dce70490fa2bead499e80f1483652a30f2e36ff196b15ca9b4896f57
+- evidence: P06_REAUDIT_20260922.md
+- evidenceSha256: 783b498d467365829aeafce4632fbcae21f24adef27777e80182b59abbfacf0a
+- tuple: P06_REAUDIT_20260922_TUPLE.json
+- tupleSha256: eb71392bfb99dd9a7b2f20ea24763dfc253afd6e57e8b602a2271e49988fa75f
 - evidenceKind: DirectOwnerTests
 - contour: Windows-x64/JIT/host-only; ComputeTime-or-static-boundary; rollout-OFF
 - claim: RuntimeEnforced
@@ -166,35 +166,35 @@ Generated projection of `VNEXT_TRACEABILITY.json`; the closure lane compares eve
 
 ## VNX-011
 
-- phase: P07/P08/P10/P15
+- phase: P07/P08/P10/P15/P17
 - owner: exact authority owners
-- implementation: src/Runtime/SingPlus.Runtime/VNext/ExternalOperationResourceBinding.cs
-- tests: SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.ReorderedOrDimensionChangingEvidenceCannotDriveSettlement
+- implementation: src/Runtime/SingPlus.Runtime/VNext/ExternalOperationResourceBinding.cs; src/Runtime/SingPlus.Runtime/VNext/VNextMigrationCoordinator.cs
+- tests: SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.ReorderedOrDimensionChangingEvidenceCannotDriveSettlement; SingPlus.Tests.Runtime.VNextPhase17MigrationCutoverTests.MigrationAndCleanupMetadataCannotMutateAuthorityOwners
 - ciLane: eng/qualify-vnext.ps1
-- evidence: EVIDENCE_P07_EXTERNALOPERATION_RESOURCE_BINDING.md
-- evidenceSha256: a3000f9a42230f3e3b3935bf8161fc18e66cf8b4b1fca8335ae0176b1933258c
-- tuple: P07_QUALIFICATION_TUPLE.json
-- tupleSha256: e44fcac7190881e152bbcbed496a9c9606767056201f19a909b9ec92f8969cc5
+- evidence: EVIDENCE_P17_MIGRATION_CLEANUP_AND_CUTOVER.md
+- evidenceSha256: ae6b8960dafb6f8286c968f85ad86e60824d4aa119e724d7225adc600e4d7215
+- tuple: P17_QUALIFICATION_TUPLE.json
+- tupleSha256: e12b332c35eba4d124af43b656ad07e76d23088d2b39d97f9fbf07663313876f
 - evidenceKind: DirectOwnerTests
 - contour: Windows-x64/JIT/host-only; ComputeTime-or-static-boundary; rollout-OFF
 - claim: RuntimeEnforced
-- exclusions: evidence cannot mutate owners
+- exclusions: migration evidence and cleanup proof cannot mutate owners
 
 ## VNX-012
 
-- phase: P07/P14/P16
+- phase: P07/P14/P16/P17
 - owner: ExternalOperationAuthority; ResourceBudgetAuthority
-- implementation: src/Runtime/SingPlus.Runtime/VNext/ExternalOperationResourceBinding.cs; src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetAuthority.cs; src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetRecoveryJournal.cs
-- tests: SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.ProviderLossAfterPossibleSubmitQuarantinesAndNeverRefunds; SingPlus.Tests.Runtime.VNextPhase16DurableResourceAdmissionTests.ConservativeColdChargeCannotBeRefundedOrMultipliedByOldLeaseCopies
+- implementation: src/Runtime/SingPlus.Runtime/VNext/ExternalOperationResourceBinding.cs; src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetAuthority.cs; src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetRecoveryJournal.cs; src/Runtime/SingPlus.Runtime/VNext/VNextMigrationCoordinator.cs
+- tests: SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.ProviderLossAfterPossibleSubmitQuarantinesAndNeverRefunds; SingPlus.Tests.Runtime.VNextPhase16DurableResourceAdmissionTests.ConservativeColdChargeCannotBeRefundedOrMultipliedByOldLeaseCopies; SingPlus.Tests.Runtime.VNextPhase17MigrationCutoverTests.RollbackBeforeSubmitUsesOrdinaryPathButAfterPossibleSubmitQuarantines
 - ciLane: eng/qualify-vnext.ps1
-- evidence: P16_BLOCKER_REMEDIATION_20260922.md
-- evidenceSha256: 6a4137f59df3d6a195b5bafa37c326bae35d6407ed9c79fbb8ac37549fdfc055
-- tuple: P16_BLOCKER_REMEDIATION_20260922_TUPLE.json
-- tupleSha256: 44d924bb55c48930ce5de36138f36bc63e18f2d8f1554fc9360c8bfd29c0f898
+- evidence: EVIDENCE_P17_MIGRATION_CLEANUP_AND_CUTOVER.md
+- evidenceSha256: ae6b8960dafb6f8286c968f85ad86e60824d4aa119e724d7225adc600e4d7215
+- tuple: P17_QUALIFICATION_TUPLE.json
+- tupleSha256: e12b332c35eba4d124af43b656ad07e76d23088d2b39d97f9fbf07663313876f
 - evidenceKind: DirectOwnerTests
 - contour: Windows-x64/JIT/host-only; ComputeTime-or-static-boundary; rollout-OFF
 - claim: RuntimeEnforced
-- exclusions: host/JIT conservative cold recovery only; no HybridCPU provider
+- exclusions: host/JIT conservative recovery and rollback only; no HybridCPU provider
 
 ## VNX-013
 
@@ -246,19 +246,19 @@ Generated projection of `VNEXT_TRACEABILITY.json`; the closure lane compares eve
 
 ## VNX-016
 
-- phase: P12/P16
+- phase: P12/P16/P17
 - owner: ordinary authority owners
-- implementation: src/Runtime/SingPlus.Runtime/SipJobs/SipJobBarrierPlanner.cs; src/Runtime/SingPlus.Runtime/SipJobs/SipJobResourceTransportExecutor.cs
-- tests: SingPlus.Tests.Runtime.VNextPhase12SipJobResourceBoundaryTests.ResourceConsumptionAlwaysMaterializesOrdinaryOwnerBoundary; SingPlus.Tests.Runtime.VNextPhase16SipJobResourceDifferentialTests.OrdinaryAndFusedTransportProduceEquivalentLiveOwnerTrace
+- implementation: src/Runtime/SingPlus.Runtime/SipJobs/SipJobBarrierPlanner.cs; src/Runtime/SingPlus.Runtime/SipJobs/SipJobResourceTransportExecutor.cs; src/Runtime/SingPlus.Runtime/VNext/VNextMigrationCoordinator.cs
+- tests: SingPlus.Tests.Runtime.VNextPhase12SipJobResourceBoundaryTests.ResourceConsumptionAlwaysMaterializesOrdinaryOwnerBoundary; SingPlus.Tests.Runtime.VNextPhase16SipJobResourceDifferentialTests.OrdinaryAndFusedTransportProduceEquivalentLiveOwnerTrace; SingPlus.Tests.Runtime.VNextPhase17MigrationCutoverTests.OldManifestAndGeneratedContourRemainByteShapeCompatibleAndAdmitted
 - ciLane: eng/qualify-vnext.ps1
-- evidence: P16_BLOCKER_REMEDIATION_20260922.md
-- evidenceSha256: 6a4137f59df3d6a195b5bafa37c326bae35d6407ed9c79fbb8ac37549fdfc055
-- tuple: P16_BLOCKER_REMEDIATION_20260922_TUPLE.json
-- tupleSha256: 44d924bb55c48930ce5de36138f36bc63e18f2d8f1554fc9360c8bfd29c0f898
+- evidence: EVIDENCE_P17_MIGRATION_CLEANUP_AND_CUTOVER.md
+- evidenceSha256: ae6b8960dafb6f8286c968f85ad86e60824d4aa119e724d7225adc600e4d7215
+- tuple: P17_QUALIFICATION_TUPLE.json
+- tupleSha256: e12b332c35eba4d124af43b656ad07e76d23088d2b39d97f9fbf07663313876f
 - evidenceKind: DifferentialTests
 - contour: Windows-x64/JIT/host-only; ComputeTime-or-static-boundary; rollout-OFF
 - claim: RuntimeEnforced
-- exclusions: host/JIT transport fusion only; authority boundaries remain materialized
+- exclusions: host/JIT dual-stack and transport fusion only; authority boundaries remain materialized
 
 ## VNX-017
 
@@ -267,10 +267,10 @@ Generated projection of `VNEXT_TRACEABILITY.json`; the closure lane compares eve
 - implementation: src/Runtime/SingPlus.Runtime/VNext/ComputePlanResourceAdmission.cs; src/Runtime/SingPlus.Runtime/VNext/ResourceScheduler.cs
 - tests: SingPlus.Tests.Runtime.VNextPhase08ComputePlanIndependentGatesTests.RevokedGrantAndStaleCachedPlanFailLiveRevalidation; SingPlus.Tests.Runtime.VNextPhase10ResourceSchedulerTests.PoisonedOrStaleCacheCannotPassLiveProviderRevalidation
 - ciLane: eng/qualify-vnext.ps1
-- evidence: EVIDENCE_P10_RESOURCE_SCHEDULER.md
-- evidenceSha256: 7c78569756241abcdc2102273fd6adbb71a35141ace77205e2b74f4150cf2db3
-- tuple: P10_QUALIFICATION_TUPLE.json
-- tupleSha256: d9e906a932d470e94b5059304dccb641e27bfda149f551708fc548daef795c38
+- evidence: P10_REAUDIT_20260922.md
+- evidenceSha256: c5d02b98639ea0a46a89d675338765227fbe050f8b6f1071c32770fb76806b26
+- tuple: P10_REAUDIT_20260922_TUPLE.json
+- tupleSha256: 81e98ef09cfad6dc124be72372eb86d57b88c1c7672a0a7154430ccc1b235f6c
 - evidenceKind: DirectOwnerTests
 - contour: Windows-x64/JIT/host-only; ComputeTime-or-static-boundary; rollout-OFF
 - claim: RuntimeEnforced
@@ -283,10 +283,10 @@ Generated projection of `VNEXT_TRACEABILITY.json`; the closure lane compares eve
 - implementation: src/Runtime/SingPlus.Runtime/VNext/ComputePlanResourceAdmission.cs
 - tests: SingPlus.Tests.Runtime.VNextPhase08ComputePlanIndependentGatesTests.EffectResourceBudgetOwnershipProviderAndCpuGatesDenyIndependently
 - ciLane: eng/qualify-vnext.ps1
-- evidence: EVIDENCE_P08_COMPUTEPLAN_INDEPENDENT_GATES.md
-- evidenceSha256: 90cab62ebfd1b87014be5a2c110719a998fe5b3417e5ce57c6b8f87cd982b548
-- tuple: P08_QUALIFICATION_TUPLE.json
-- tupleSha256: d36adf5578585e5981087077d0fe6e06e8267ec90f98a1852d9e5af214a1fad2
+- evidence: P08_REAUDIT_20260922.md
+- evidenceSha256: e43e31a319b44517d82884aa134c669368eacaed98b936be7ac9a2d3656cfb1e
+- tuple: P08_REAUDIT_20260922_TUPLE.json
+- tupleSha256: 8df15d0f61106152b7f79757fc73bd5fd70ee8713f4061716e4e3fc2164b47bd
 - evidenceKind: DirectOwnerTests
 - contour: Windows-x64/JIT/host-only; ComputeTime-or-static-boundary; rollout-OFF
 - claim: RuntimeEnforced
@@ -299,13 +299,13 @@ Generated projection of `VNEXT_TRACEABILITY.json`; the closure lane compares eve
 - implementation: contracts/SingPlus.Contracts/ComputePlanning.cs; contracts/SingPlus.Contracts/ResourceBudgetContracts.cs
 - tests: SingPlus.Tests.Architecture.VNextPhase00ArchitecturalFreezeTests.PublicSipManagedCapAndBudgetAbiContainsNoProviderPrivateAuthorityVocabulary
 - ciLane: eng/qualify-vnext.ps1
-- evidence: EVIDENCE_P00_ARCHITECTURAL_FREEZE.md
-- evidenceSha256: 5fb648d60acca290e75f8852086981f4cd8faeed4fb8afd80cccf36983c2f67d
-- tuple: P00_QUALIFICATION_TUPLE.json
-- tupleSha256: 9f5200b5ff5c57ce05744952ee2cec9738a523a2c68c313a26cfe7b1dd57cb07
+- evidence: P00_REAUDIT_20260922.md
+- evidenceSha256: 2bab7f8503550a583dce80647c27bd26906208ad41cdaf98c6d3f32776da4eb8
+- tuple: P00_REAUDIT_20260922_TUPLE.json
+- tupleSha256: fb360b31e8257717cd68bf8fc6900760ee1118efabf33331147131b172ea4bfe
 - evidenceKind: StaticChecks
 - contour: Windows-x64/JIT/host-only; ComputeTime-or-static-boundary; rollout-OFF
-- claim: StaticAdmission
+- claim: ModelOnly
 - exclusions: no provider-private authority ABI
 
 ## VNX-020
@@ -331,10 +331,10 @@ Generated projection of `VNEXT_TRACEABILITY.json`; the closure lane compares eve
 - implementation: src/Runtime/SingPlus.Runtime/VNext/ResourceAdmissionProtocol.cs
 - tests: SingPlus.Tests.Runtime.VNextPhase04CrossOwnerAdmissionTests.ProviderCallbackRunsWithoutOwnerLocksAndDuplicateSubmitIsDenied
 - ciLane: eng/qualify-vnext.ps1
-- evidence: EVIDENCE_P04_CROSS_OWNER_ADMISSION.md
-- evidenceSha256: ee7d5f0d5461f0519ddc0e1f5d85bee0f66fee5efe6e720be183778084609f4f
-- tuple: P04_QUALIFICATION_TUPLE.json
-- tupleSha256: 0b9d2e3fad6b6112ddefb397e8e043893db4fbd424c4b97d6e5b42d2a656bd73
+- evidence: P04_REAUDIT_20260922.md
+- evidenceSha256: 32b3912c88a86b0582e287201f0cab4b716266dbc2126ae7296cdac06ad0db57
+- tuple: P04_REAUDIT_20260922_TUPLE.json
+- tupleSha256: 8d0bf70f6f61050bda86a3f4eb8c6b59b13cc9332272b52e35c8be6731d033db
 - evidenceKind: DirectOwnerTests
 - contour: Windows-x64/JIT/host-only; ComputeTime-or-static-boundary; rollout-OFF
 - claim: RuntimeEnforced
@@ -358,19 +358,19 @@ Generated projection of `VNEXT_TRACEABILITY.json`; the closure lane compares eve
 
 ## VNX-023
 
-- phase: P11/P16
+- phase: P11/P16/P17
 - owner: qualification framework
 - implementation: tests/SingPlus.Tests/Architecture/VNextTraceabilityPolicy.cs; src/Runtime/SingPlus.Runtime/VNext/VNextFeatureGates.cs
-- tests: SingPlus.Tests.Architecture.VNextPhase16QualificationClosureTests.TraceabilityRejectsUnsupportedClaimsAndContourTransfer; SingPlus.Tests.Runtime.VNextPhase16FeatureGateRollbackTests.OnToOffMakesOldHandlesFallbackBeforeSubmitAndQuarantineAfterPossibleSubmit
+- tests: SingPlus.Tests.Architecture.VNextPhase16QualificationClosureTests.TraceabilityRejectsUnsupportedClaimsAndContourTransfer; SingPlus.Tests.Runtime.VNextPhase16FeatureGateRollbackTests.OnToOffMakesOldHandlesFallbackBeforeSubmitAndQuarantineAfterPossibleSubmit; SingPlus.Tests.Architecture.VNextPhase17QualificationClosureTests.P17TuplePinsExecutableInputsAndWithholdsUnsupportedClaims
 - ciLane: eng/qualify-vnext.ps1
-- evidence: P16_BLOCKER_REMEDIATION_20260922.md
-- evidenceSha256: 6a4137f59df3d6a195b5bafa37c326bae35d6407ed9c79fbb8ac37549fdfc055
-- tuple: P16_BLOCKER_REMEDIATION_20260922_TUPLE.json
-- tupleSha256: 44d924bb55c48930ce5de36138f36bc63e18f2d8f1554fc9360c8bfd29c0f898
+- evidence: EVIDENCE_P17_MIGRATION_CLEANUP_AND_CUTOVER.md
+- evidenceSha256: ae6b8960dafb6f8286c968f85ad86e60824d4aa119e724d7225adc600e4d7215
+- tuple: P17_QUALIFICATION_TUPLE.json
+- tupleSha256: e12b332c35eba4d124af43b656ad07e76d23088d2b39d97f9fbf07663313876f
 - evidenceKind: StaticChecks
 - contour: Windows-x64/JIT/host-only; ComputeTime-or-static-boundary; rollout-OFF
 - claim: StaticAdmission
-- exclusions: upper-bound, guarantee and ProductionQualified withheld
+- exclusions: upper-bound, guarantee, HybridCPU and ProductionQualified withheld
 
 ## VNX-024
 
@@ -396,9 +396,9 @@ Generated projection of `VNEXT_TRACEABILITY.json`; the closure lane compares eve
 - tests: SingPlus.Tests.Runtime.Phase08OrdinaryCheckpointTests.LiveResourceLeaseBlocksCheckpointAndOldHandleCannotBindAfterFreshRestore; SingPlus.Tests.Runtime.VNextPhase16DurableResourceAdmissionTests.PossibleSubmitIsDurableBeforeCallbackAndColdRestartDoesNotResurrectLease
 - ciLane: eng/qualify-vnext.ps1
 - evidence: P16_BLOCKER_REMEDIATION_20260922.md
-- evidenceSha256: 6a4137f59df3d6a195b5bafa37c326bae35d6407ed9c79fbb8ac37549fdfc055
+- evidenceSha256: 7681bb36d6858df77e8f8390d6baac465fb7260a13454830cccef1a16d746963
 - tuple: P16_BLOCKER_REMEDIATION_20260922_TUPLE.json
-- tupleSha256: 44d924bb55c48930ce5de36138f36bc63e18f2d8f1554fc9360c8bfd29c0f898
+- tupleSha256: f8bc15318612db7140067b18806e8e3e673cf3a9d0627dfa34ac09cfa8b536f8
 - evidenceKind: DirectOwnerTests
 - contour: Windows-x64/JIT/host-only; ComputeTime-or-static-boundary; rollout-OFF
 - claim: RuntimeEnforced
@@ -428,9 +428,9 @@ Generated projection of `VNEXT_TRACEABILITY.json`; the closure lane compares eve
 - tests: SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.DuplicateReceiptIsIdempotentButForgedCrossOperationAndProviderDriftFailClosed; SingPlus.Tests.Platform.VNextPhase16HostResourceAdapterTests.CancellationIsPreSubmitOnlyAndStaleGenerationsCannotBindOrReconcile
 - ciLane: eng/qualify-vnext.ps1
 - evidence: P16_BLOCKER_REMEDIATION_20260922.md
-- evidenceSha256: 6a4137f59df3d6a195b5bafa37c326bae35d6407ed9c79fbb8ac37549fdfc055
+- evidenceSha256: 7681bb36d6858df77e8f8390d6baac465fb7260a13454830cccef1a16d746963
 - tuple: P16_BLOCKER_REMEDIATION_20260922_TUPLE.json
-- tupleSha256: 44d924bb55c48930ce5de36138f36bc63e18f2d8f1554fc9360c8bfd29c0f898
+- tupleSha256: f8bc15318612db7140067b18806e8e3e673cf3a9d0627dfa34ac09cfa8b536f8
 - evidenceKind: DirectOwnerTests
 - contour: Windows-x64/JIT/host-only; ComputeTime-or-static-boundary; rollout-OFF
 - claim: RuntimeEnforced
@@ -438,16 +438,16 @@ Generated projection of `VNEXT_TRACEABILITY.json`; the closure lane compares eve
 
 ## VNX-028
 
-- phase: P03/P06/P07/P14/P16
+- phase: P03/P06/P07/P14/P16/P17
 - owner: each authority state machine
-- implementation: src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetAuthority.cs; src/Runtime/SingPlus.Runtime/VNext/ExternalOperationResourceBinding.cs; src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetRecoveryJournal.cs
-- tests: SingPlus.Tests.Runtime.VNextPhase03ResourceLeaseTests.ConsumptionCannotRefundUntilExactReconciliationAndSettlement; SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.PreSubmitDisposalCancelsExactBindingAndRefundsOnce; SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.ProviderLossAfterPossibleSubmitQuarantinesAndNeverRefunds; SingPlus.Tests.Runtime.VNextPhase16ResourceBudgetRecoveryJournalTests.TamperWrongKeyAndTornFramesFailClosed
+- implementation: src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetAuthority.cs; src/Runtime/SingPlus.Runtime/VNext/ExternalOperationResourceBinding.cs; src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetRecoveryJournal.cs; src/Runtime/SingPlus.Runtime/VNext/VNextMigrationCoordinator.cs
+- tests: SingPlus.Tests.Runtime.VNextPhase03ResourceLeaseTests.ConsumptionCannotRefundUntilExactReconciliationAndSettlement; SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.PreSubmitDisposalCancelsExactBindingAndRefundsOnce; SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.ProviderLossAfterPossibleSubmitQuarantinesAndNeverRefunds; SingPlus.Tests.Runtime.VNextPhase16ResourceBudgetRecoveryJournalTests.TamperWrongKeyAndTornFramesFailClosed; SingPlus.Tests.Runtime.VNextPhase17MigrationCutoverTests.RollbackBeforeSubmitUsesOrdinaryPathButAfterPossibleSubmitQuarantines
 - ciLane: eng/qualify-vnext.ps1
-- evidence: P16_BLOCKER_REMEDIATION_20260922.md
-- evidenceSha256: 6a4137f59df3d6a195b5bafa37c326bae35d6407ed9c79fbb8ac37549fdfc055
-- tuple: P16_BLOCKER_REMEDIATION_20260922_TUPLE.json
-- tupleSha256: 44d924bb55c48930ce5de36138f36bc63e18f2d8f1554fc9360c8bfd29c0f898
+- evidence: EVIDENCE_P17_MIGRATION_CLEANUP_AND_CUTOVER.md
+- evidenceSha256: ae6b8960dafb6f8286c968f85ad86e60824d4aa119e724d7225adc600e4d7215
+- tuple: P17_QUALIFICATION_TUPLE.json
+- tupleSha256: e12b332c35eba4d124af43b656ad07e76d23088d2b39d97f9fbf07663313876f
 - evidenceKind: DirectOwnerTests
 - contour: Windows-x64/JIT/host-only; ComputeTime-or-static-boundary; rollout-OFF
 - claim: RuntimeEnforced
-- exclusions: terminal policy complete for exact host conservative recovery; no external HybridCPU provider
+- exclusions: terminal policy complete for exact host recovery and migration rollback; no external HybridCPU provider

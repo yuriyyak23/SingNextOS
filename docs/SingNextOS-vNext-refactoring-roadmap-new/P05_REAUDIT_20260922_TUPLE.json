@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "phase": "P05",
+  "claim": "RuntimeEnforced",
+  "contour": "generated internal Windows-x64/.NET-11/JIT ComputeTime/Nanoseconds sentry-to-P04; rollout-OFF",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "800027893dcf1ed23d8d7fe775841dd9d01a9fff",
+  "defaultFeatureGateState": "OFF",
+  "enabledFeatureGates": [],
+  "tests": [
+    { "lane": "P05-focused-contract-generator-manifest", "passed": 22, "failed": 0, "skipped": 0 },
+    { "lane": "P05-broader-generator-manifest-sentry-P04", "passed": 98, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui-before-tuple-refresh", "passed": 1762, "failed": 2, "skipped": 2, "failureDisposition": "P16/P17 artifact size/hash pins intentionally detected the remediated P05 files" },
+    { "lane": "P05-closure-after-tuple-refresh", "passed": 65, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui-after-tuple-refresh", "passed": 1764, "failed": 0, "skipped": 2 }
+  ],
+  "build": { "contractsWarnings": 0, "contractsErrors": 0, "generatorWarnings": 0, "generatorErrors": 0, "solutionWarnings": 0, "solutionErrors": 0 },
+  "remediation": "reject non-trimmed semantic scope consistently in SIP contract, manifest and generator",
+  "evidence": { "path": "P05_REAUDIT_20260922.md", "sha256": "dd8b6d2c355bf0afc802c995301e578a1021b4ffd173ee9748b2af0b46aedd92" },
+  "ordinaryFallback": "unchanged unannotated generated SIP path",
+  "futureGated": [
+    { "owner": "CapabilityAuthority plus session/invocation and budget owners", "missing": "P06 provenance-preserving invocation donation", "requiredGateState": "OFF" },
+    { "owner": "production SIP and provider qualification owners", "missing": "migrated consumer plus mixed-version/provider/NativeAOT executable proof", "requiredGateState": "OFF" }
+  ],
+  "exclusions": ["no production SIP migration", "no provider/NativeAOT/upper-bound/guarantee/ProductionQualified claim", "no ISA or hardware change"]
+}

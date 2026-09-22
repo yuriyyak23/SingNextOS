@@ -1,13 +1,13 @@
 {
   "schemaVersion": 1,
   "phase": "P16",
-  "phaseDisposition": "OpenPendingCanonicalQualification",
+  "phaseDisposition": "ClosedExactHostContour",
   "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
-  "executionHead": "cb6a94c314055e0712b8d9b8382ca1d146fe1c0e",
+  "executionHead": "800027893dcf1ed23d8d7fe775841dd9d01a9fff",
   "runtimeContour": "Windows-x64/.NET-11/JIT/host-provider/ComputeTimeNanoseconds",
   "claim": "ExecutableAdapter",
   "productionQualified": false,
-  "p17MayStart": false,
+  "p17MayStart": true,
   "enabledFeatureGates": [],
   "isaChangeCategory": [],
   "artifacts": [
@@ -28,6 +28,7 @@
     { "path": "tests/SingPlus.Tests/Runtime/VNextPhase16DurableResourceAdmissionTests.cs", "bytes": 7854, "sha256": "b1da61c08bfbf8cdfdf8b9b9ae6c082ef89e604eaa49c2e726c54e225a975fd6" },
     { "path": "tests/SingPlus.Tests/Runtime/VNextPhase16FeatureGateRollbackTests.cs", "bytes": 4494, "sha256": "a79c5f0ea9d30d8a77653f6862e29b3a52ccf4c324a8b86ca0260fd0462a6754" },
     { "path": "tests/SingPlus.Tests/Runtime/VNextPhase16SipJobResourceDifferentialTests.cs", "bytes": 7955, "sha256": "4c583a56f241960870039f4e156556bca0a54aa4600b5edea0f6232b5083b85a" },
+    { "path": "tests/SingPlus.Tests/Architecture/VNextPhase16BlockerRemediationTests.cs", "bytes": 3897, "sha256": "46171a6b34c9d0ad7c26d3e27cb5cf209a68c7ac6a2dee3714acab56cc3db21e" },
     { "path": "tests/SingPlus.Tests/Architecture/VNextPhase16ControlledTopologyQualificationTests.cs", "bytes": 2782, "sha256": "9e0c1db550f6e7277cfe65a7c5c6282e78d00961c913706e4b34268a5d26b3f5" },
     { "path": "docs/SingNextOS-vNext-refactoring-roadmap-new/P16_CONTROLLED_TOPOLOGY_20260922.json", "bytes": 1458, "sha256": "06386ccbf37523dd1e78ae37aa316d961d8241552b72c1474f42c099cfa3ccba" }
   ],

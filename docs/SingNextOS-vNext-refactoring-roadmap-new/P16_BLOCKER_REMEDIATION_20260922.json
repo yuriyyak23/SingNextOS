@@ -1,6 +1,7 @@
 {
   "schemaVersion": 1,
   "phase": "P16",
+  "phaseDisposition": "ClosedExactHostContour",
   "reviewedHead": "cb6a94c314055e0712b8d9b8382ca1d146fe1c0e",
   "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
   "contour": "Windows-x64/.NET-11/JIT/host-provider/ComputeTimeNanoseconds",
@@ -18,5 +19,6 @@
   "hybridCpuQualified": false,
   "nativeAotQualified": false,
   "productionQualified": false,
+  "p17MayStart": true,
   "isaChangeCategory": []
 }

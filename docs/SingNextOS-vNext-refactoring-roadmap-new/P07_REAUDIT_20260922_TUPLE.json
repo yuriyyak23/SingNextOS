@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "phase": "P07",
+  "claim": "RuntimeEnforced",
+  "contour": "internal Windows-x64/.NET-11/JIT ComputeTime/Nanoseconds ExternalOperation-to-lease binding; rollout-OFF",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "800027893dcf1ed23d8d7fe775841dd9d01a9fff",
+  "defaultFeatureGateState": "OFF",
+  "enabledFeatureGates": [],
+  "tests": [
+    { "lane": "P07-focused", "passed": 7, "failed": 0, "skipped": 0 },
+    { "lane": "P03-P07-external-provider-model-regression", "passed": 63, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui-current-code", "passed": 1764, "failed": 0, "skipped": 2 }
+  ],
+  "defectsConfirmed": 0,
+  "evidence": { "path": "P07_REAUDIT_20260922.md", "sha256": "a74304f049561e7e25bd5bf594c23cf6b3e96a2793de48f3d166c3b4185908ce" },
+  "ordinaryFallback": "unchanged and default",
+  "futureGated": [
+    { "owner": "PlatformAuthorityBridge plus provider/runtime", "missing": "locally verifiable provider source and restart/loss reconciliation contract", "requiredGateState": "OFF" },
+    { "owner": "production migration and qualification owners", "missing": "production provider and NativeAOT executable proof", "requiredGateState": "OFF" }
+  ],
+  "exclusions": ["receipts are evidence only", "no provider/NativeAOT/upper-bound/guarantee/ProductionQualified claim", "no ISA or hardware change"]
+}

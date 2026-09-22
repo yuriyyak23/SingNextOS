@@ -56,3 +56,7 @@ P16 consumes telemetry as evidence only and pins claims to executable tests.
 ## Current disposition
 
 Closed for the existing host/JIT deterministic-trace replay and structured-telemetry non-interference contour at `RuntimeEnforced`; see `EVIDENCE_P15_OBSERVABILITY_AUTHORITY_BOUNDARY.md` and `P15_QUALIFICATION_TUPLE.json`. `FG-VNX-AUDIT-ONLY` remains OFF. Fine-grained events for still-disabled vNext owner transitions remain FutureGated and are not simulated by telemetry.
+
+## Sequential re-audit (2026-09-22)
+
+Current HEAD is `800027893dcf1ed23d8d7fe775841dd9d01a9fff`. Replay/drop/reorder/backpressure invariance and public redaction were reconfirmed without a production defect. Current evidence is `P15_REAUDIT_20260922.md` with tuple `P15_REAUDIT_20260922_TUPLE.json`; telemetry remains read-only and the gate remains OFF.

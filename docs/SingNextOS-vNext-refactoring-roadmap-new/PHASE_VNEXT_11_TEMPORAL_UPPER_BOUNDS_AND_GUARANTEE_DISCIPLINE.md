@@ -62,3 +62,7 @@ P12 must preserve these checks/transitions in fused execution.
 ## Current disposition (2026-09-21)
 
 Closed as an explicit FutureGated boundary recorded in `EVIDENCE_P11_TEMPORAL_CLAIM_BOUNDARY.md` and `P11_QUALIFICATION_TUPLE.json`. Audit found accounting and deadline evidence but no exact measurement/preemption/replenishment enforcement contour, so neither temporal upper-bound nor guaranteed-reservation gate is enabled and no `EnforcedUpperBound` claim is made. P12 must preserve the existing accounting/admission transitions but cannot infer temporal enforcement from them.
+
+## Sequential re-audit (2026-09-22)
+
+Current HEAD is `800027893dcf1ed23d8d7fe775841dd9d01a9fff`. The absence of an executable temporal owner/adapter was reconfirmed; no stronger claim is inferred from accounting or deadlines. Current evidence is `P11_REAUDIT_20260922.md` with tuple `P11_REAUDIT_20260922_TUPLE.json`. Both gates remain OFF.

@@ -61,3 +61,17 @@ Migration state is feature-gate/configuration state. Authoritative owners do not
 ## Prerequisite for next phase
 
 Terminal phase. Future resource/guarantee contours start as new gated work, not silent expansion of this qualification.
+
+## Current disposition
+
+P17 is **CLOSED FOR THE EXACT HOST CONTOUR** at `RuntimeEnforced`; `ProductionQualified remains false`.
+
+The additive dual-stack policy accepts legacy SIP v1 without resource intent, exact resource-aware SIP v2 with provider resource contract v1, and an absent/v0 resource contract as the legacy provider contour. Optional work may use ordinary fallback before submission. Required resource semantics and unknown versions fail closed. Gate rollback after possible submit yields `Quarantine` and requires exact reconciliation rather than fallback or resubmission.
+
+Old manifest canonical shape, old generated/ordinary SIP transport and old provider behavior remain supported. No compatibility path was removed. `VNextCompatibilityUsageRegistry` can produce a generation-bound no-live-consumer proof only after all tracked legacy consumers drain; any new consumer immediately invalidates the proof. Future cleanup must independently re-run that proof before deleting a path.
+
+See `EVIDENCE_P17_MIGRATION_CLEANUP_AND_CUTOVER.md`, `P17_MIGRATION_CUTOVER_20260922.json` and `P17_QUALIFICATION_TUPLE.json`. All gates remain default OFF and the ISA-change category is empty. HybridCPU/provider-source, NativeAOT, temporal upper-bound and guaranteed-reservation contours remain unqualified FutureGated work.
+
+## Sequential re-audit — 2026-09-22
+
+`P17_REAUDIT_20260922.md` and its tuple retain the host-only `RuntimeEnforced` claim. Focused P17 tests passed 16/16 after making compatibility-registry generation exhaustion atomic/fail-closed and rejecting malformed proof digests without throwing. Final solution build completed with 0 warnings/errors and the complete non-GUI suite passed 1,767 tests with 0 failures and 2 existing explicit skips. No compatibility path was removed, and a local empty-registry proof is not evidence that production has no live consumer. All gates remain default OFF and all provider, NativeAOT, temporal, guarantee and hardware exclusions remain in force.

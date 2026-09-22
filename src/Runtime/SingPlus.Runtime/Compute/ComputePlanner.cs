@@ -107,7 +107,11 @@ public sealed class ComputePlanner(RegionAuthority regions)
     {
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(currentCandidates);
-        var provider = currentCandidates.SingleOrDefault(candidate => candidate.ProviderId == plan.ProviderId);
+        var providers = currentCandidates.Where(candidate => candidate.ProviderId == plan.ProviderId).Take(2).ToArray();
+        if (providers.Length > 1)
+            return KernelResult.Fail(KernelError.InvalidMessage,
+                "Current compute candidates contain a duplicate provider identity.");
+        var provider = providers.SingleOrDefault();
         if (provider is null || !provider.Available || provider.Faulted)
             return KernelResult.Fail(KernelError.PlatformUnavailable, "Planned compute provider disappeared or faulted; re-plan before submission.");
         if (provider.Generation != plan.ProviderGeneration)

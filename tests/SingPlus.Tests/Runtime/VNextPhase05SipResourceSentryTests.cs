@@ -128,6 +128,9 @@ public sealed class VNextPhase05SipResourceSentryTests
         Assert.Throws<ArgumentOutOfRangeException>(() => new SipResourceRequirementV1(1,
             ResourceClassV1.ComputeTime, ResourceUnitV1.Nanoseconds, ulong.MaxValue, "host:compute-v1",
             ResourceAssuranceV1.RuntimeEnforced, SipResourceDonationPolicyV1.None));
+        Assert.Throws<ArgumentException>(() => new SipResourceRequirementV1(1,
+            ResourceClassV1.ComputeTime, ResourceUnitV1.Nanoseconds, 1, " host:compute-v1 ",
+            ResourceAssuranceV1.RuntimeEnforced, SipResourceDonationPolicyV1.None));
     }
 
     [Fact]
