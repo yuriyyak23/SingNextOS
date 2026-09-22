@@ -142,8 +142,13 @@ public sealed partial class RuntimeKernel
         if (!delegated.IsSuccess)
             return KernelResult<ResourceDonationBinding>.Fail(delegated.Error, delegated.Message!);
 
-        var reserved = Budgets.Reserve(caller,
-            [new(ServiceBudgetDimension.ComputeTimeNanoseconds, envelope.Amount)],
+        var budgetAmounts = ResourceEnvelopeBudgetMapping.Map([envelope]);
+        if (!budgetAmounts.IsSuccess)
+        {
+            _ = CapabilityAuthority.Revoke(delegated.Value!.CapabilityId);
+            return KernelResult<ResourceDonationBinding>.Fail(budgetAmounts.Error, budgetAmounts.Message!);
+        }
+        var reserved = Budgets.Reserve(caller, budgetAmounts.Value!,
             BudgetReservationLifetime.IpcQueued, priorityCeiling);
         if (!reserved.IsSuccess)
         {
@@ -203,8 +208,13 @@ public sealed partial class RuntimeKernel
             });
         if (!delegated.IsSuccess)
             return KernelResult<ResourceDonationBinding>.Fail(delegated.Error, delegated.Message!);
-        var split = Budgets.SplitLease(source.ChargingOwner, source.Lease,
-            [new(ServiceBudgetDimension.ComputeTimeNanoseconds, envelope.Amount)]);
+        var budgetAmounts = ResourceEnvelopeBudgetMapping.Map([envelope]);
+        if (!budgetAmounts.IsSuccess)
+        {
+            _ = CapabilityAuthority.Revoke(delegated.Value!.CapabilityId);
+            return KernelResult<ResourceDonationBinding>.Fail(budgetAmounts.Error, budgetAmounts.Message!);
+        }
+        var split = Budgets.SplitLease(source.ChargingOwner, source.Lease, budgetAmounts.Value!);
         if (!split.IsSuccess)
         {
             _ = CapabilityAuthority.Revoke(delegated.Value!.CapabilityId);

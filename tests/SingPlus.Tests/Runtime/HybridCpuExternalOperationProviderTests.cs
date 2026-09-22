@@ -138,7 +138,7 @@ public sealed class HybridCpuExternalOperationProviderTests
     }
 
     [Fact]
-    public void ProviderUnavailableIsNotClosureButExactContainmentCanRelease()
+    public void ProviderUnavailableAndContainmentClaimAreNotClosureButResourceCloseCanRelease()
     {
         var scenario = CreateScenario();
         var semantic = Semantic();
@@ -152,7 +152,12 @@ public sealed class HybridCpuExternalOperationProviderTests
 
         var contained = scenario.Provider.Release(request, providerResourcesClosed: false,
             providerUnavailable: true, providerEffectContained: true);
-        Assert.True(contained.IsSuccess, contained.Message);
+        Assert.False(contained.IsSuccess);
+        Assert.True(scenario.Kernel.Regions.Validate(scenario.Output.Handle, scenario.Owner).IsSuccess);
+
+        var closed = scenario.Provider.Release(request, providerResourcesClosed: true,
+            providerUnavailable: true);
+        Assert.True(closed.IsSuccess, closed.Message);
     }
 
     [Fact]

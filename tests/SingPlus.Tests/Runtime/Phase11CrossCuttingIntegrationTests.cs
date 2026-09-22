@@ -118,8 +118,14 @@ public sealed class Phase11CrossCuttingIntegrationTests(ITestOutputHelper output
             Definition("phase11-fault", 1103, 11103, Contract("Phase11Fault"), generation: 2));
         Assert.Equal(KernelError.ReplacementBlocked, replacement.Error);
 
+        Assert.Equal(KernelError.InvalidTransition,
+            harness.Kernel.ReleaseExternalOperation(instance.Process, operation.Operation,
+                new(false, true, true)).Error);
+        Assert.Equal(KernelError.ReplacementBlocked,
+            harness.Supervisor.Replace(instance,
+                Definition("phase11-fault", 1103, 11103, Contract("Phase11Fault"), generation: 2)).Error);
         Assert.True(harness.Kernel.ReleaseExternalOperation(instance.Process, operation.Operation,
-            new(false, true, true)).IsSuccess);
+            new(true, true)).IsSuccess);
         Assert.True(harness.Kernel.ObserveComponentTeardown(definition.Identity).Value!.Reclaimable);
     }
 

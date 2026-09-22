@@ -75,6 +75,29 @@ public sealed class VNextPhase10ResourceSchedulerTests
             second.Select(Guid.NewGuid(), ResourceClassV1.ComputeTime, 0, 0).Value!.ProviderId);
     }
 
+    [Fact]
+    public void FavorableSchedulingEvidenceCannotLegalizeMandatoryGuaranteeMismatch()
+    {
+        var scheduler = SchedulerWith(new(new("fast"), 9, 1,
+            ResourceClassV1.ComputeTime, 0, 0));
+        var request = Guid.NewGuid();
+        var hint = scheduler.Select(request, ResourceClassV1.ComputeTime, 0, 0).Value!;
+        Assert.True(scheduler.Revalidate(hint, request, [Candidate("fast", 9)]).IsSuccess);
+
+        var refinement = SemanticRefinementEvaluatorV1.Evaluate(
+            new SemanticRequirementV1<IsolationClassV1>(1,
+                SemanticRequirementStrengthV1.Mandatory, IsolationClassV1.DomainSeparated),
+            new SemanticGuaranteeV1<IsolationClassV1>(1,
+                SemanticGuaranteeSupportV1.Supported, IsolationClassV1.None),
+            SemanticPartialOrdersV1.IsolationRefines);
+
+        Assert.False(refinement.IsAccepted);
+        Assert.Equal(SemanticRefinementStatusV1.ClassMismatch, refinement.Status);
+        Assert.DoesNotContain(typeof(ResourceScheduler).GetMethods(), method =>
+            method.Name.Contains("Refine", StringComparison.OrdinalIgnoreCase) ||
+            method.Name.Contains("Guarantee", StringComparison.OrdinalIgnoreCase));
+    }
+
     private static ResourceScheduler SchedulerWith(ProviderSchedulingObservation observation)
     {
         var scheduler = new ResourceScheduler();

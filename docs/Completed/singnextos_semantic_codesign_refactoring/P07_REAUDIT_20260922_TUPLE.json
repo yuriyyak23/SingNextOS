@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "phase": "P07",
+  "recorded_at_local_date": "2026-09-22",
+  "singnextos": {
+    "head": "a0f70bc2bd031bd2b1138b2a01984309814bba5c",
+    "tree": "c9e667fda0605d993c01060b7d7dc04b73cfac80",
+    "start_user_owned_dirty_changes": []
+  },
+  "hybridcpu_contracts": {
+    "package": "HybridCPU.ExternalRuntime.Contracts",
+    "version": "1.14.0",
+    "sha256": "b96e99bda066ee585b26a11cbfa7b68ce6bf44fc0006679483ccc1a4eeb678c2",
+    "source_verified": false
+  },
+  "implementation": [
+    "contracts/SingPlus.Contracts/ExternalOperations.cs",
+    "src/Runtime/SingPlus.Runtime/ExternalOperations/ExternalOperationAuthority.cs",
+    "src/Runtime/SingPlus.Runtime/ExternalOperations/RuntimeKernel.ExternalOperations.cs",
+    "tests/SingPlus.Tests/Runtime/EffectPublicationSemanticsV1Tests.cs"
+  ],
+  "tests": {
+    "focused_lifecycle_provider": { "passed": 24, "failed": 0, "skipped": 0 },
+    "full_non_gui": { "passed": 1823, "failed": 0, "skipped": 2 }
+  },
+  "solution_build": { "exit_code": 0, "warnings": 0, "errors": 0 },
+  "claims": {
+    "effect_traits": "StaticAdmission",
+    "local_publication_owner_mechanics": "RuntimeEnforced",
+    "provider_publication_action": "FutureGated"
+  },
+  "gates": { "all_vnext": "OFF" },
+  "hybridcpu_scope": "local external-tool/package/adapter boundary only",
+  "isa_impact": "NONE"
+}

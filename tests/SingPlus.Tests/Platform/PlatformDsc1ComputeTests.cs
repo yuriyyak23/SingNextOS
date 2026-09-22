@@ -1233,6 +1233,12 @@ public sealed class PlatformDsc1ComputeTests
                     secondEndpoint);
             });
             Assert.True(secondStarted.Wait(TimeSpan.FromSeconds(5)));
+            var secondWhileWinnerIsBlocked = await secondTask.WaitAsync(
+                TimeSpan.FromSeconds(5));
+            Assert.False(secondWhileWinnerIsBlocked.IsSuccess);
+            Assert.Equal(
+                KernelError.PlatformBindingDraining,
+                secondWhileWinnerIsBlocked.Error);
             Assert.Equal(1, provider.ObserveCalls);
             Assert.Equal(
                 KernelError.ResponseNotAvailable,

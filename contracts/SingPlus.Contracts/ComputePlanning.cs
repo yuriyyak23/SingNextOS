@@ -9,7 +9,8 @@ public enum ComputeOperationKind
 {
     Copy = 0,
     Transform = 1,
-    Reduce = 2
+    Reduce = 2,
+    MatrixMultiply = 3
 }
 
 public enum ComputePublicationPreference
@@ -76,11 +77,40 @@ public sealed record ComputeProviderCandidate(
     int LatencyClass,
     int BandwidthClass,
     bool Available,
-    bool Faulted);
+    bool Faulted,
+    ComputeLocalityGuaranteeV1? LocalityGuarantee = null);
+
+public readonly record struct ComputeLocalityRequirementV1(
+    ushort Version,
+    SemanticRequirementStrengthV1 Strength,
+    LocalityClassV1 RequiredClass)
+{
+    public const ushort CurrentVersion = 1;
+}
+
+public readonly record struct ComputeLocalityGuaranteeV1(
+    ushort Version,
+    SemanticGuaranteeSupportV1 Support,
+    LocalityClassV1 ProvidedClass,
+    ulong ProviderGeneration)
+{
+    public const ushort CurrentVersion = 1;
+    public bool AuthorizesPlacement => false;
+}
 
 public readonly record struct ComputeRegionOperand(
     RegionHandle Region,
     RegionUseRange Range);
+
+public readonly record struct MatrixMultiplyShapeV1(
+    ushort Version,
+    ulong Rows,
+    ulong InnerDimension,
+    ulong Columns,
+    uint ElementSizeBytes)
+{
+    public const ushort CurrentVersion = 1;
+}
 
 public sealed record ComputeIntent(
     ComputeOperationKind Operation,
@@ -89,7 +119,10 @@ public sealed record ComputeIntent(
     ComputePublicationPreference PublicationPreference,
     bool RequiresSecureEvidence,
     bool RequiresVirtualizedDomain,
-    ResourceEnvelopeV1? ResourceRequirement = null);
+    ResourceEnvelopeV1? ResourceRequirement = null,
+    ComputeLocalityRequirementV1? LocalityRequirement = null,
+    ComputeRegionOperand? RightInput = null,
+    MatrixMultiplyShapeV1? MatrixMultiplyShape = null);
 
 public readonly record struct ComputeSelectionPolicy(
     bool AllowStagedFallback,

@@ -36,7 +36,8 @@ public sealed class Phase140ArchitecturalFreezeTests
             .ToArray();
 
         Assert.Equal(
-            [typeof(SipJobSemanticEventKind), typeof(string), typeof(ulong), typeof(SipJobSemanticOutcome)],
+            [typeof(uint), typeof(SipJobSemanticEventKind), typeof(string), typeof(ulong),
+                typeof(SipJobSemanticOutcome), typeof(string), typeof(string)],
             fieldTypes);
 
         var trace = new SipJobSemanticTrace();
@@ -48,5 +49,7 @@ public sealed class Phase140ArchitecturalFreezeTests
 
         Assert.Single(trace.Completed);
         Assert.Equal(7UL, trace.Completed[0].Generation);
+        Assert.Null(trace.Completed[0].ExternalOperationIdentity);
+        Assert.Null(trace.Completed[0].SemanticBindingIdentity);
     }
 }

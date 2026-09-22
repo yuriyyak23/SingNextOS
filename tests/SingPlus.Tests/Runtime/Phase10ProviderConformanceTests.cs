@@ -106,9 +106,12 @@ public sealed class Phase10ProviderConformanceTests(ITestOutputHelper output)
                 context.Component.Identity, new byte[] { 1 }, [new(context.Input), new(context.Output)]);
             var drained = context.Kernel.DrainComponent(context.Component.Identity);
             var blocked = !drained.IsSuccess || !drained.Value!.Reclaimable;
-            var contained = context.Kernel.ReleaseExternalOperation(context.Component.Process, operation,
-                new(false, true, true));
-            Assert.True(contained.IsSuccess, $"{family}/{scenario.Fault.Mode}: {contained.Error}: {contained.Message}");
+            var untrustedContainment = context.Kernel.ReleaseExternalOperation(context.Component.Process,
+                operation, new(false, true, true));
+            Assert.Equal(KernelError.InvalidTransition, untrustedContainment.Error);
+            var closed = context.Kernel.ReleaseExternalOperation(context.Component.Process, operation,
+                new(true, true));
+            Assert.True(closed.IsSuccess, $"{family}/{scenario.Fault.Mode}: {closed.Error}: {closed.Message}");
             var reclaimed = context.Kernel.ObserveComponentTeardown(context.Component.Identity);
             var activePins = context.Kernel.Regions.SnapshotUses().Count(use => use.State != RegionUseState.Released);
             var remainingBudget = Used(context, ServiceBudgetDimension.ExternalOperations);

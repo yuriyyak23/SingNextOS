@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "phase": "P17",
+  "recorded_at_local_date": "2026-09-23",
+  "singnextos": {
+    "head": "a0f70bc2bd031bd2b1138b2a01984309814bba5c",
+    "tree": "c9e667fda0605d993c01060b7d7dc04b73cfac80",
+    "start_user_owned_dirty_changes": []
+  },
+  "artifacts": [
+    { "path": "contracts/SingPlus.Contracts/ComputePlanning.cs", "bytes": 4246, "sha256": "56186ec6bde883c50ad363413719c92ed0336b9ee5c4d3c152239de8e597204b" },
+    { "path": "src/Runtime/SingPlus.Runtime/Compute/ComputePlanner.cs", "bytes": 22590, "sha256": "08b8087f8eeb08afa414c1055ce5934d5054bc7fbf952f74fe7731f570330d56" },
+    { "path": "tests/SingPlus.Tests/Runtime/Phase17MatrixMultiplySemanticTests.cs", "bytes": 5771, "sha256": "0c09cc1bd35b391c86b5c2bf4f27f2a81441bfc07d3f332f85fa281e1b0ed407" },
+    { "path": "docs/SingNextOS-vNext-refactoring-roadmap-new/P16_REVALIDATION_20260921_TUPLE.json", "bytes": 18127, "sha256": "78d2a593ba253df528d7590d58957250efb7d77d62e245113c903b73107d97ec" },
+    { "path": "docs/SingNextOS-vNext-refactoring-roadmap-new/MANIFEST.json", "bytes": 20227, "sha256": "cc30ca43ff5a6880e6a633efb8b45628837466a7e76be8a8f13859c14731cde7" }
+  ],
+  "tests": {
+    "focused_matrix": { "passed": 22, "failed": 0, "skipped": 0 },
+    "closure_after_hash_correction": { "passed": 4, "failed": 0, "skipped": 0 },
+    "full_non_gui": { "passed": 1885, "failed": 0, "skipped": 2 }
+  },
+  "claims": {
+    "singnext_matrix_descriptor_planner": "StaticAdmission",
+    "matrix_provider_execution": "Unsupported",
+    "matrix_runtime_legality": "Unsupported",
+    "matrix_end_to_end_vertical": "FutureGated"
+  },
+  "gates": { "all_vnext_and_matrix": "OFF" },
+  "hybridcpu_scope": "CONTRACTS_EXTERNAL_TOOL_ONLY_NO_ISE_SOURCE",
+  "isa_impact": "NONE"
+}

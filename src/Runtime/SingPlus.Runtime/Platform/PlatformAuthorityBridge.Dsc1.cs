@@ -276,9 +276,6 @@ public sealed partial class PlatformAuthorityBridge
             }
 
             record = recordResult.Value!;
-            if (TryGetDsc1Terminal(record, out var terminal))
-                return KernelResult<PlatformDsc1TerminalObservation>.Ok(terminal);
-
             if (record.State == Dsc1OperationState.Faulted)
             {
                 return KernelResult<PlatformDsc1TerminalObservation>.Fail(
@@ -291,6 +288,8 @@ public sealed partial class PlatformAuthorityBridge
                     KernelError.PlatformBindingDraining,
                     "The exact DSC1 operation already has a provider transition in flight.");
             }
+            if (TryGetDsc1Terminal(record, out var terminal))
+                return KernelResult<PlatformDsc1TerminalObservation>.Ok(terminal);
             record.ProviderCallInFlight = true;
             providerSubmission = record.ProviderSubmission;
         }
@@ -312,8 +311,14 @@ public sealed partial class PlatformAuthorityBridge
         }
         lock (_dsc1Gate)
         {
-            record.ProviderCallInFlight = false;
-            return AcceptDsc1Completion(record, observed);
+            var accepted = AcceptDsc1Completion(record, observed);
+            // A successful terminal observer remains the unique release winner
+            // until RuntimeKernel commits the exact local reservation release.
+            // Otherwise another observer can replay the terminal state and remove
+            // the record while this winner is reacquiring the outer memory gate.
+            if (!accepted.IsSuccess)
+                record.ProviderCallInFlight = false;
+            return accepted;
         }
     }
 
@@ -336,9 +341,6 @@ public sealed partial class PlatformAuthorityBridge
             }
 
             record = recordResult.Value!;
-            if (TryGetDsc1Terminal(record, out var terminal))
-                return KernelResult<PlatformDsc1TerminalObservation>.Ok(terminal);
-
             if (record.State == Dsc1OperationState.Faulted)
             {
                 return KernelResult<PlatformDsc1TerminalObservation>.Fail(
@@ -351,6 +353,8 @@ public sealed partial class PlatformAuthorityBridge
                     KernelError.PlatformBindingDraining,
                     "The exact DSC1 operation already has a provider transition in flight.");
             }
+            if (TryGetDsc1Terminal(record, out var terminal))
+                return KernelResult<PlatformDsc1TerminalObservation>.Ok(terminal);
             observeOnly = record.CancellationRequested;
             record.ProviderCallInFlight = true;
             providerSubmission = record.ProviderSubmission;
@@ -375,10 +379,12 @@ public sealed partial class PlatformAuthorityBridge
         }
         lock (_dsc1Gate)
         {
-            record.ProviderCallInFlight = false;
             if (!observeOnly && completion.IsSuccess)
                 record.CancellationRequested = true;
-            return AcceptDsc1Completion(record, completion);
+            var accepted = AcceptDsc1Completion(record, completion);
+            if (!accepted.IsSuccess)
+                record.ProviderCallInFlight = false;
+            return accepted;
         }
     }
 

@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "phase": "P12",
+  "recorded_at_local_date": "2026-09-22",
+  "singnextos": {
+    "head": "a0f70bc2bd031bd2b1138b2a01984309814bba5c",
+    "tree": "c9e667fda0605d993c01060b7d7dc04b73cfac80",
+    "start_user_owned_dirty_changes": []
+  },
+  "artifacts": [
+    { "path": "contracts/SingPlus.Contracts/ProviderBehaviorContracts.cs", "bytes": 6720, "sha256": "d2d414afade6d06431175271187292a8dcec81566675f5db4316b18142df644e" },
+    { "path": "contracts/SingPlus.Contracts/ExecutionGuarantees.cs", "bytes": 8862, "sha256": "22a4fc7845f0aeb4994c03dfc8e6223d672102d9f02c030ecd7dcc97a2a85d7f" },
+    { "path": "src/Runtime/SingPlus.Runtime/VNext/HybridCpu114SemanticCompatibility.cs", "bytes": 8777, "sha256": "051c8f2c45d27d2e3419dcd5d67f3e2398a57f56dca109299f530f0c14d52b86" },
+    { "path": "tests/SingPlus.Tests/Contracts/ProviderBehaviorRefinementV1Tests.cs", "bytes": 4563, "sha256": "7953c70c909802c0d7571f5c9852e43fd5bd8bcd52d66429a5259812d776e6c1" },
+    { "path": "tests/SingPlus.Tests/Runtime/SemanticExecutionBindingV1Tests.cs", "bytes": 8429, "sha256": "87d324beebef87eefe470b144a99afb76de7b8abe4e3515843027d77065afd54" },
+    { "path": "tests/SingPlus.Tests/Runtime/SemanticAdmissionSentryTests.cs", "bytes": 14017, "sha256": "56e40ba8e766e7eede8df8517634e7a14bb2331569b82d23195e1aa39a26b86b" },
+    { "path": "tests/SingPlus.Tests/Runtime/Phase12ReplayProviderRefinementTests.cs", "bytes": 2297, "sha256": "42830714c3aa1018e9eea8cefe5b6ae61a6738d77a14251e1b64c902ced2b755" }
+  ],
+  "tests": {
+    "focused_p12": { "passed": 22, "failed": 0, "skipped": 0 },
+    "full_non_gui": { "passed": 1857, "failed": 0, "skipped": 2 }
+  },
+  "solution_build": { "exit_code": 0, "warnings": 0, "errors": 0 },
+  "claims": {
+    "provider_behavior_refinement": "StaticAdmission",
+    "host_exact_binding_and_fresh_sentry": "RuntimeEnforced host/JIT",
+    "hybridcpu_replay_determinism_typed_isolation": "Unsupported"
+  },
+  "gates": { "all_vnext": "OFF" },
+  "hybridcpu_scope": "local external-tool/package boundary only",
+  "isa_impact": "NONE"
+}

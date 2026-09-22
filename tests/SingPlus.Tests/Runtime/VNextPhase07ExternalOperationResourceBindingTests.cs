@@ -159,14 +159,107 @@ public sealed class VNextPhase07ExternalOperationResourceBindingTests
             setup.Kernel.ExternalOperations.QueryResourceBinding(setup.Operation).Value!.State);
     }
 
+    [Fact]
+    public void ChargeabilityMatrixIsDimensionSpecificAndRetireNeverAuthorizesACharge()
+    {
+        var compute = ResourceChargeabilityMatrixV1.For(ResourceClassV1.ComputeTime);
+        var usage = new ResourceUsageBreakdownV1(1, 101, 102, 2, 3, 5, 107, 7, 109, 113);
+        Assert.Equal(ResourceUnitV1.Nanoseconds, compute.Unit);
+        Assert.Equal(17UL, compute.Normalize(usage));
+        Assert.False(compute.ChargedEvents.HasFlag(ResourceChargeEventV1.Retired));
+        Assert.False(compute.ChargedEvents.HasFlag(ResourceChargeEventV1.StalledOrBlocked));
+        Assert.False(compute.IsAuthority);
+        Assert.False(compute.IsReservationGuarantee);
+
+        Assert.Equal(7UL, ResourceChargeabilityMatrixV1.For(ResourceClassV1.DmaThroughput).Normalize(usage));
+        Assert.Equal(7UL, ResourceChargeabilityMatrixV1.For(ResourceClassV1.NetworkThroughput).Normalize(usage));
+        Assert.Equal(7UL, ResourceChargeabilityMatrixV1.For(ResourceClassV1.FabricThroughput).Normalize(usage));
+        Assert.Equal(109UL, ResourceChargeabilityMatrixV1.For(ResourceClassV1.DeviceMemoryOccupancy).Normalize(usage));
+        var queue = ResourceChargeabilityMatrixV1.For(ResourceClassV1.QueueSlotOccupancy);
+        Assert.Equal(ResourceUnitV1.Slots, queue.Unit);
+        Assert.Equal(109UL, queue.Normalize(usage));
+        var inflight = ResourceChargeabilityMatrixV1.For(ResourceClassV1.InflightOperationOccupancy);
+        Assert.Equal(ResourceUnitV1.Operations, inflight.Unit);
+        Assert.Equal(109UL, inflight.Normalize(usage));
+    }
+
+    [Fact]
+    public void ChargeabilityNormalizationRejectsUnknownVersionsClassesAndOverflow()
+    {
+        var policy = ResourceChargeabilityMatrixV1.For(ResourceClassV1.ComputeTime);
+        Assert.Throws<NotSupportedException>(() => policy.Normalize(
+            new(2, 0, 0, 1, 0, 0, 0, 0, 0, 0)));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            ResourceChargeabilityMatrixV1.For((ResourceClassV1)ushort.MaxValue));
+        Assert.Throws<OverflowException>(() => policy.Normalize(
+            new(1, 0, 0, ulong.MaxValue, 1, 0, 0, 0, 0, 0)));
+    }
+
+    [Fact]
+    public void ExactMeasurementIdentityAndNormalizedBreakdownAreRequired()
+    {
+        var setup = Create();
+        using var commit = Prepare(setup, setup.Operation).Value!;
+        var binding = setup.Kernel.SubmitResourceExternalAdmission(commit, setup.Dependencies, KernelResult.Ok).Value!;
+        Assert.True(setup.Kernel.RecordExternalOperationCompletion(setup.Process,
+            new(binding, ExternalOperationCompletionDisposition.Completed)).IsSuccess);
+        var evidence = Evidence(binding, 4, 21);
+
+        Assert.Equal(KernelError.StaleGeneration,
+            setup.Kernel.SettleResourceExternalOperation(setup.Process, evidence with
+            {
+                MeasurementContract = evidence.MeasurementContract with { ContractVersion = "2" }
+            }).Error);
+        Assert.Equal(KernelError.InvalidMessage,
+            setup.Kernel.SettleResourceExternalOperation(setup.Process, evidence with
+            {
+                Usage = evidence.Usage with { Executed = 3 }
+            }).Error);
+        Assert.Equal(10UL, Used(setup));
+        Assert.True(setup.Kernel.SettleResourceExternalOperation(setup.Process, evidence).IsSuccess);
+        Assert.Equal(4UL, Used(setup));
+    }
+
+    [Fact]
+    public void RetiredAndBlockedCountsDoNotIncreaseExecutedChargeAndConflictingDuplicateFailsClosed()
+    {
+        var setup = Create();
+        using var commit = Prepare(setup, setup.Operation).Value!;
+        var binding = setup.Kernel.SubmitResourceExternalAdmission(commit, setup.Dependencies, KernelResult.Ok).Value!;
+        Assert.True(setup.Kernel.RecordExternalOperationCompletion(setup.Process,
+            new(binding, ExternalOperationCompletionDisposition.Completed)).IsSuccess);
+        var evidence = Evidence(binding, 1, 31) with
+        {
+            Usage = new(1, 0, 0, 1, 0, 0, 900, 0, 0, 500)
+        };
+
+        Assert.True(setup.Kernel.SettleResourceExternalOperation(setup.Process, evidence).IsSuccess);
+        Assert.Equal(1UL, Used(setup));
+        Assert.Equal(KernelError.InvalidTransition,
+            setup.Kernel.SettleResourceExternalOperation(setup.Process,
+                evidence with { EvidenceId = Guid.NewGuid() }).Error);
+        Assert.Equal(1UL, Used(setup));
+    }
+
     private static KernelResult<ResourceAdmissionCommit> Prepare(Setup setup, ExternalOperationHandle operation) =>
         setup.Kernel.PrepareResourceExternalAdmission(setup.Process, setup.EffectCapability,
             ResourceKind.Compute, "compute:effect", 1, setup.ResourceGrant, 1,
             Envelope(10), operation, setup.Dependencies);
 
     private static ExternalResourceUsageEvidence Evidence(OperationBinding binding, ulong consumed, ulong sequence) =>
-        new(1, binding, "host:compute-v1", 1, ResourceClassV1.ComputeTime,
-            ResourceUnitV1.Nanoseconds, consumed, sequence);
+        new(1, binding, "host:compute-v1", 1,
+            new(1, "host:compute-v1:measurement", "1", ResourceClassV1.ComputeTime,
+                ResourceUnitV1.Nanoseconds),
+            EvidenceId(sequence), ResourceClassV1.ComputeTime, ResourceUnitV1.Nanoseconds,
+            new(1, 0, 0, consumed, 0, 0, 0, 0, 0, 0), consumed, sequence);
+
+    private static Guid EvidenceId(ulong sequence)
+    {
+        Span<byte> bytes = stackalloc byte[16];
+        BitConverter.TryWriteBytes(bytes, sequence);
+        bytes[15] = 0xA9;
+        return new Guid(bytes);
+    }
 
     private static Setup Create()
     {

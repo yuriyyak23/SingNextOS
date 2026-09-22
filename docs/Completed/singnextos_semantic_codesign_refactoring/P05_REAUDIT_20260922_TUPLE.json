@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "phase": "P05",
+  "recorded_at_local_date": "2026-09-22",
+  "singnextos": {
+    "head": "a0f70bc2bd031bd2b1138b2a01984309814bba5c",
+    "tree": "c9e667fda0605d993c01060b7d7dc04b73cfac80",
+    "start_user_owned_dirty_changes": []
+  },
+  "hybridcpu_contracts": {
+    "package": "HybridCPU.ExternalRuntime.Contracts",
+    "version": "1.14.0",
+    "sha256": "b96e99bda066ee585b26a11cbfa7b68ce6bf44fc0006679483ccc1a4eeb678c2",
+    "schema": "ExternalOperationContract/1.4.0",
+    "source_verified": false
+  },
+  "implementation": [
+    "contracts/SingPlus.Contracts/ExecutionGuarantees.cs",
+    "src/Runtime/SingPlus.Runtime/VNext/HybridCpu114SemanticCompatibility.cs",
+    "src/Runtime/SingPlus.Runtime/VNext/RuntimeKernel.SemanticExecutionBinding.cs",
+    "tests/SingPlus.Tests/Contracts/ExecutionGuaranteesV1Tests.cs",
+    "tests/SingPlus.Tests/Runtime/SemanticExecutionBindingV1Tests.cs"
+  ],
+  "supported_mapping_ceiling": "StaticAdmission",
+  "unsupported_dimensions": [
+    "measurement",
+    "resource_enforcement",
+    "isolation",
+    "contention",
+    "replay_enforcement",
+    "determinism",
+    "containment",
+    "locality"
+  ],
+  "tests": {
+    "focused_new": { "passed": 10, "failed": 0, "skipped": 0 },
+    "cross_abi_provider": { "passed": 24, "failed": 0, "skipped": 0 },
+    "package_hash": { "passed": 5, "failed": 0, "skipped": 0 },
+    "full_non_gui": {
+      "passed": 1809,
+      "failed": 0,
+      "skipped": 2,
+      "projects": {
+        "SingPlus.Tests": { "passed": 1601, "skipped": 2 },
+        "SingPlus.Platform.HybridCpu.Tests": { "passed": 60, "skipped": 0 },
+        "HybridCpu_ExecutableAdapter.Tests": { "passed": 90, "skipped": 0 },
+        "HybridCPU_NeutralRuntime.Tests": { "passed": 58, "skipped": 0 }
+      }
+    }
+  },
+  "solution_build": { "exit_code": 0, "warnings": 0, "errors": 0 },
+  "gates": { "semantic_codesign": "OFF" },
+  "maximum_claim": "StaticAdmission",
+  "hybridcpu_scope": "local external-tool/package/adapter only",
+  "isa_impact": "NONE"
+}

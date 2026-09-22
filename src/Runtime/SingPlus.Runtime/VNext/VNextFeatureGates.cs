@@ -27,6 +27,7 @@ internal enum VNextFeatureGate
     Energy,
     AuditOnly,
     HostResourceAdapter,
+    SemanticAdmissionSentry,
 }
 
 internal static class VNextFeatureGates
@@ -54,6 +55,7 @@ internal static class VNextFeatureGates
             ["FG-VNX-ENERGY"] = VNextFeatureGate.Energy,
             ["FG-VNX-AUDIT-ONLY"] = VNextFeatureGate.AuditOnly,
             ["FG-VNX-HOST-RESOURCE-ADAPTER"] = VNextFeatureGate.HostResourceAdapter,
+            ["FG-VNX-SEMANTIC-SENTRY"] = VNextFeatureGate.SemanticAdmissionSentry,
         };
 
     internal static IReadOnlyCollection<string> Names { get; } =

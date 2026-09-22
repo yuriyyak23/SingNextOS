@@ -157,6 +157,20 @@ public sealed partial class RuntimeKernel
         Action publicationAction,
         TraceCausalContext? traceContext = null)
     {
+        ArgumentNullException.ThrowIfNull(publicationAction);
+        return PublishExternalOperation(principal, operation, currentDependencies, plan,
+            _ => publicationAction(), traceContext);
+    }
+
+    public KernelResult<ExternalOperationSnapshot> PublishExternalOperation(
+        ProcessHandle principal,
+        ExternalOperationHandle operation,
+        OperationDependencySnapshot currentDependencies,
+        PublicationPlan plan,
+        Action<ExternalPublicationDecisionV1> publicationAction,
+        TraceCausalContext? traceContext = null)
+    {
+        ArgumentNullException.ThrowIfNull(publicationAction);
         var validation = ValidateExternalOperationPrincipal(principal, operation, requireNewEffect: false);
         if (!validation.IsSuccess) return KernelResult<ExternalOperationSnapshot>.Fail(validation.Error, validation.Message!);
         var published = ExternalOperations.Publish(operation, currentDependencies, plan, publicationAction);

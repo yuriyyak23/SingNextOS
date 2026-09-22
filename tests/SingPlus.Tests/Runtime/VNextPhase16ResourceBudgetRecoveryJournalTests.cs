@@ -86,6 +86,10 @@ public sealed class VNextPhase16ResourceBudgetRecoveryJournalTests
             Payload(ResourceBudgetRecoveryTransition.SettledExact, [Amount(1001)])));
         Assert.Throws<InvalidDataException>(() => journal.Append(
             Payload(ResourceBudgetRecoveryTransition.SettledConservative, [Amount(999)])));
+
+        journal.Append(Payload(ResourceBudgetRecoveryTransition.PossibleSubmit));
+        Assert.Throws<InvalidDataException>(() => journal.Append(
+            Payload(ResourceBudgetRecoveryTransition.CancelledPreSubmit)));
     }
 
     [Fact]

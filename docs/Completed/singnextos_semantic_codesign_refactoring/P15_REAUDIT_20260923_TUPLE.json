@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "phase": "P15",
+  "recorded_at_local_date": "2026-09-23",
+  "singnextos": {
+    "head": "a0f70bc2bd031bd2b1138b2a01984309814bba5c",
+    "tree": "c9e667fda0605d993c01060b7d7dc04b73cfac80",
+    "start_user_owned_dirty_changes": []
+  },
+  "artifacts": [
+    { "path": "tools/SingPlus.Admission/AdmissionProof.cs", "bytes": 3158, "sha256": "d697253621ff94520d756e28b9ea304c223092c09a0d077f4b657da06b5d6cf7" },
+    { "path": "tools/SingPlus.Admission/AdmissionVerifier.cs", "bytes": 40732, "sha256": "991a295e05e41f9dfaf1d2c0caedd24013321bfeae135f06dba0ea6c2f87da45" },
+    { "path": "tests/SingPlus.Tests/Admission/AdmissionVerifierTests.cs", "bytes": 33605, "sha256": "5c0dfb6768cfc8ef9e9d01072cb59706a39bb99b407c0b41662771ee40b46237" },
+    { "path": "src/Runtime/SingPlus.Runtime/Checkpointing/RuntimeKernel.Checkpointing.cs", "bytes": 27344, "sha256": "0f2796559a4d9517fade938c34542e006e7e136b97ead9fd4ccee78c7fab9950" },
+    { "path": "tests/SingPlus.Tests/Runtime/Phase08OrdinaryCheckpointTests.cs", "bytes": 13694, "sha256": "327b191da7a0847c6ebcf04bebcfa06c712bfd3254037f32db56704b97fe8457" },
+    { "path": "src/Runtime/SingPlus.Runtime/Capabilities/CapabilityAuthority.cs", "bytes": 37580, "sha256": "33ef29bf98dca99f6b8742495f0bf849323b6a821f39f1fe70b7ad7e1017d3a0" }
+  ],
+  "tests": {
+    "focused_p15": { "passed": 77, "failed": 0, "skipped": 0 },
+    "golden_and_admission": { "passed": 59, "failed": 0, "skipped": 0 },
+    "full_non_gui": { "passed": 1870, "failed": 0, "skipped": 2 }
+  },
+  "claims": {
+    "managed_admission": "StaticAdmission exact local JIT/IL contour",
+    "fresh_checkpoint_authority": "RuntimeEnforced exact local host/JIT contour",
+    "native_aot": "NotQualified",
+    "ifc": "Deferred"
+  },
+  "gates": { "all_vnext": "OFF" },
+  "hybridcpu_scope": "CONTRACTS_EXTERNAL_TOOL_ONLY",
+  "isa_impact": "NONE"
+}

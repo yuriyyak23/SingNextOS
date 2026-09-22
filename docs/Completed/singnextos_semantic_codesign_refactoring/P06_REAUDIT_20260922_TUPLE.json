@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "phase": "P06",
+  "recorded_at_local_date": "2026-09-22",
+  "singnextos": {
+    "head": "a0f70bc2bd031bd2b1138b2a01984309814bba5c",
+    "tree": "c9e667fda0605d993c01060b7d7dc04b73cfac80",
+    "start_user_owned_dirty_changes": []
+  },
+  "hybridcpu_contracts": {
+    "package": "HybridCPU.ExternalRuntime.Contracts",
+    "version": "1.14.0",
+    "sha256": "b96e99bda066ee585b26a11cbfa7b68ce6bf44fc0006679483ccc1a4eeb678c2",
+    "source_verified": false,
+    "runtime_legality_implementation_verified": false
+  },
+  "implementation": [
+    "src/Runtime/SingPlus.Runtime/VNext/SemanticAdmissionSentry.cs",
+    "src/Runtime/SingPlus.Runtime/VNext/ResourceAdmissionProtocol.cs",
+    "src/Runtime/SingPlus.Runtime/VNext/RuntimeKernel.SemanticObligations.cs",
+    "src/Runtime/SingPlus.Runtime/VNext/RuntimeKernel.SemanticExecutionBinding.cs",
+    "src/Runtime/SingPlus.Runtime/VNext/VNextFeatureGates.cs",
+    "tests/SingPlus.Tests/Runtime/SemanticAdmissionSentryTests.cs"
+  ],
+  "tests": {
+    "focused_semantic_architecture": { "passed": 43, "failed": 0, "skipped": 0 },
+    "full_non_gui": { "passed": 1818, "failed": 0, "skipped": 2 }
+  },
+  "solution_build": { "exit_code": 0, "warnings": 0, "errors": 0 },
+  "gates": { "FG-VNX-SEMANTIC-SENTRY": "OFF", "all_vnext": "OFF" },
+  "maximum_claim": "RuntimeEnforced local SingNext coordination only",
+  "provider_and_runtime_services": "test doubles; FutureGated",
+  "hybridcpu_scope": "local external-tool/package/adapter boundary only",
+  "isa_impact": "NONE"
+}

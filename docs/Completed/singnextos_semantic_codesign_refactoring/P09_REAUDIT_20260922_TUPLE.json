@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "phase": "P09",
+  "recorded_at_local_date": "2026-09-22",
+  "singnextos": {
+    "head": "a0f70bc2bd031bd2b1138b2a01984309814bba5c",
+    "tree": "c9e667fda0605d993c01060b7d7dc04b73cfac80",
+    "start_user_owned_dirty_changes": []
+  },
+  "artifacts": [
+    { "path": "contracts/SingPlus.Contracts/ResourceMeasurementContracts.cs", "bytes": 4953, "sha256": "7e9a3780a4722f17e6f767f85da349d713614a29a4848901a95b1d675f386fcc" },
+    { "path": "src/Runtime/SingPlus.Runtime/VNext/ExternalOperationResourceBinding.cs", "bytes": 17264, "sha256": "db9101e470bda0e18c04fb237eb54f5d4053bcce31e270b8fcddf551efd3965b" },
+    { "path": "tests/SingPlus.Tests/Runtime/VNextPhase07ExternalOperationResourceBindingTests.cs", "bytes": 16410, "sha256": "9c746d9de6f49a8e54f9cd4b9f6abd9ed03e66a8123ba3ebb7d43f4f439701d4" }
+  ],
+  "tests": {
+    "focused_measurement_settlement": { "passed": 11, "failed": 0, "skipped": 0 },
+    "full_non_gui": { "passed": 1832, "failed": 0, "skipped": 2 }
+  },
+  "solution_build": { "exit_code": 0, "warnings": 0, "errors": 0 },
+  "claims": {
+    "chargeability_matrix": "StaticAdmission",
+    "compute_time_host_settlement": "RuntimeEnforced host/JIT",
+    "provider_measurement_truth": "FutureGated",
+    "other_resource_class_settlement": "FutureGated"
+  },
+  "gates": { "all_vnext": "OFF" },
+  "hybridcpu_scope": "local external-tool/package boundary only",
+  "isa_impact": "NONE"
+}

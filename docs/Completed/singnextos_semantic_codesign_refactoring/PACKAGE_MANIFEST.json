@@ -1,0 +1,518 @@
+{
+  "schema_version": 2,
+  "generated_at": "2026-09-22T19:30:00+03:00",
+  "source_policy": "live code/tests > current normative specs > evidence > roadmap > history",
+  "baseline": {
+    "SingNextOS": {
+      "sha": "a0f70bc2bd031bd2b1138b2a01984309814bba5c",
+      "tree": "c9e667fda0605d993c01060b7d7dc04b73cfac80",
+      "sdk": "11.0.100-rc.1.26425.128"
+    },
+    "HybridCPU-v2": {
+      "sha": "794c4a53494f503855ac8cf209efab23fde083b2",
+      "tree": "189f59a4b95fb822618117c60c8224bed701f9a5",
+      "sdk": "10.0.201",
+      "contracts_package": "1.14.0",
+      "external_operation_schema": "1.4.0"
+    }
+  },
+  "test_execution": "P18_FINAL_NON_GUI_1876_PASSED_2_SKIPPED_AFTER_DSC1_RACE_REMEDIATION",
+  "isa_impact": "NONE",
+  "files": [
+    {
+      "path": "00_README.md",
+      "sha256": "11cd75e1662d38dbd01852babbea96506c94b84c4a948253349f3704e03aa269",
+      "size": 4570
+    },
+    {
+      "path": "01_BASELINE_AND_CODE_AUDIT.md",
+      "sha256": "18668c064cf3ed4c70a753a139d303ba8a65ded6f344be0528c248a8ad228919",
+      "size": 3179
+    },
+    {
+      "path": "02_MASTER_REFACTORING_ROADMAP.md",
+      "sha256": "f604b0352881f59e6f592cf91e0cba3d0f4cca45c74cbc4bc8fe9076882ce448",
+      "size": 3746
+    },
+    {
+      "path": "03_NORMATIVE_INVARIANTS.md",
+      "sha256": "bde5888690938425007af922dcf555be873bc931b15215a5188518b348533407",
+      "size": 1650
+    },
+    {
+      "path": "04_TARGET_ARCHITECTURE.md",
+      "sha256": "543a2139eadf2690e0b80b5d120c9dd9a8c3dff22d652c4c1342b1a8ec196f37",
+      "size": 1121
+    },
+    {
+      "path": "05_AUTHORITY_OWNER_MAP.md",
+      "sha256": "422334495778079887361aaac673f7d9d0f59f39fa5c4d4cc930b06dcd0e849c",
+      "size": 1472
+    },
+    {
+      "path": "06_STATE_MACHINE_AND_TRANSITIONS.md",
+      "sha256": "95697161405cd0409304a2ac61d93cc9e163858a6e57701f26a97bf1127ee81c",
+      "size": 1466
+    },
+    {
+      "path": "07_CONTRACT_AND_VERSIONING_STRATEGY.md",
+      "sha256": "e72bd14c35abe9d53a190113c33b3c87ac07b407419b07ee0b2dc947051bbb0c",
+      "size": 1328
+    },
+    {
+      "path": "08_TEST_AND_FORMAL_QUALIFICATION.md",
+      "sha256": "0c5d5f6bbcd4bd8329caac7cdf065fb19e5950906d11ba009feefb09230b9d5a",
+      "size": 832
+    },
+    {
+      "path": "09_ADVERSARIAL_MATRIX.md",
+      "sha256": "9828c24377137672cf014aed93ba2bb94b0c1ef002f9ad6443af3a3fcaa8cbb7",
+      "size": 3596
+    },
+    {
+      "path": "10_CROSS_REPO_DELTA.md",
+      "sha256": "82e0be5b725029368f9b98328030eda71992a817add7c030316bc92350d6414c",
+      "size": 1578
+    },
+    {
+      "path": "11_MIGRATION_ROLLBACK.md",
+      "sha256": "6422e806d7384b20b6eab3ad638cdf9e56b44d602688f18de496e2d0485c352a",
+      "size": 789
+    },
+    {
+      "path": "12_REJECTED_ALTERNATIVES.md",
+      "sha256": "c4c497772f84134a50a9c1363f2a6552a6b6eff1d898d2519e49421701211218",
+      "size": 1054
+    },
+    {
+      "path": "13_CODEBASE_VERIFICATION.md",
+      "sha256": "bb0a4b4b357bd6925de4147e7e5beacf0e5e562a6603c07549b5d5d92e6cf4b9",
+      "size": 3384
+    },
+    {
+      "path": "14_AUDIT_CORRECTIONS_AND_CLASSIFICATIONS.md",
+      "sha256": "70c88550633efaba4d709e42777cc8b897d6922a79b8cab2d21533307b8b6909",
+      "size": 1413
+    },
+    {
+      "path": "MATRIX_MULTIPLY_WORKED_EXAMPLE.md",
+      "sha256": "bbfd285e7476630c157ce7668e6b712edda254b139c4cb7a3bb2c387271f093f",
+      "size": 3411
+    },
+    {
+      "path": "OPEN_QUESTIONS.md",
+      "sha256": "66e2665f6d4fea9ffa825d4f4ef1611879a0a2ec386cc2ecf0bb95380c7dc8d6",
+      "size": 1272
+    },
+    {
+      "path": "PHASE_P00_LIVE_BASELINE_SOURCE_FREEZE.md",
+      "sha256": "e5af586ad8350f17b6431ecc6bcf99af7eec7d03c00d8879ea4ef2d0f34de565",
+      "size": 2191
+    },
+    {
+      "path": "PHASE_P01_OWNER_AND_MACHINE_RECONSTRUCTION.md",
+      "sha256": "e58ecf086de4927bed4dc02d170c9a5a30f0dcaffa89f00cb7c8afc50f4157ee",
+      "size": 2332
+    },
+    {
+      "path": "PHASE_P02_SEMANTIC_VOCABULARY_AND_REFINEMENT.md",
+      "sha256": "9ba722feaf1ef9d282fd81419ff126e549de5fdc527c9d8fa4f649b7b809e2fb",
+      "size": 2184
+    },
+    {
+      "path": "PHASE_P03_GLOBAL_OPERATIONAL_SEMANTICS.md",
+      "sha256": "a087a9988926914ed809bf73efb59500b86122d51025de7284c3266f6df8cd50",
+      "size": 2020
+    },
+    {
+      "path": "PHASE_P04_OPERATION_OBLIGATIONS.md",
+      "sha256": "28d868c738098600c2d2dc4d136adb577f09943ce77c365720c3860134742f01",
+      "size": 2109
+    },
+    {
+      "path": "PHASE_P05_EXECUTION_GUARANTEES_AND_BINDING.md",
+      "sha256": "b1d8c769802f76cc368952836dd3e244de758cbb9b9efff1efc8cae756cd1f8c",
+      "size": 2380
+    },
+    {
+      "path": "PHASE_P06_GENERATION_EXACT_ADMISSION_SENTRY.md",
+      "sha256": "ad38f8f0c2e301897a26d0d09ed2325496d66590a9f771fe63bf3ea207c5ae34",
+      "size": 2235
+    },
+    {
+      "path": "PHASE_P07_EFFECT_AND_PUBLICATION_ALGEBRA.md",
+      "sha256": "e243d89c541199fac1474c1589974deaa8c6e553b7d03b0222193353fec3ff53",
+      "size": 2190
+    },
+    {
+      "path": "PHASE_P08_VISIBILITY_MEMORY_SHARING_LOCALITY.md",
+      "sha256": "76cd293b9321f554f4528a1bbc30bc97b5bcf97fcaa6b9df9dadcdeb3b833696",
+      "size": 2018
+    },
+    {
+      "path": "PHASE_P09_RESOURCE_MEASUREMENT_RETIRE_CHARGING.md",
+      "sha256": "cc10fc91783200fd128a2f218dd1abaf3e83b69331a621a76eb80e49607a62f1",
+      "size": 2207
+    },
+    {
+      "path": "PHASE_P10_MULTI_RESOURCE_QOS_SCHEDULING.md",
+      "sha256": "c5acdd3ed0fe8b5f7baccc4880a854f7fea8d79a5145fa5c96d2215b3a96fa72",
+      "size": 2359
+    },
+    {
+      "path": "PHASE_P11_PREEMPTION_CANCELLATION_CONTAINMENT.md",
+      "sha256": "888be734aada4f35562bff32796a215409e049953dad293c3ede43943310a4d4",
+      "size": 2538
+    },
+    {
+      "path": "PHASE_P12_REPLAY_PROVIDER_REFINEMENT_ISOLATION.md",
+      "sha256": "303b180c1090de869980f07d9fa64b33bebbcc6b524f5e4bc122ef842f5587c2",
+      "size": 2350
+    },
+    {
+      "path": "PHASE_P13_LIVENESS_FAULT_QUARANTINE_RECOVERY.md",
+      "sha256": "404da1b5fc504be4444798793dfb0ef9abb379ff49803b8452e585c764fa3ae3",
+      "size": 2157
+    },
+    {
+      "path": "PHASE_P14_SCALABLE_AUTHORITY_OWNERS.md",
+      "sha256": "0491e10b4a82aeb29370a8c4a7762544cac2b8a98cc2bfcb9bf1ad88b830fdd6",
+      "size": 1924
+    },
+    {
+      "path": "PHASE_P15_MANAGED_ROOT_DURABLE_IFC.md",
+      "sha256": "8b44a3154a4002c572ce67e8f12291f684d2cbf5c71b51f0d882e52e30200657",
+      "size": 2256
+    },
+    {
+      "path": "PHASE_P16_SIPJOB_AND_DECLARATIVE_OPERATION_MODEL.md",
+      "sha256": "ccfc5ded0b2d40d3d6300e1bd9cb32b3952e3079770d1d56010a2a100a3d83c3",
+      "size": 2199
+    },
+    {
+      "path": "PHASE_P17_MATRIXMULTIPLY_HYBRIDCPU_VERTICAL.md",
+      "sha256": "2c0c6850e6a94ce9aea5a4d6e910636793d630a38c16895590a55a2a6295cbad",
+      "size": 3002
+    },
+    {
+      "path": "PHASE_P18_QUALIFICATION_PROMOTION_CUTOVER.md",
+      "sha256": "3ad3bbb3d3eb7b87cd2e9c092f0ac4038248579341b9ba77bdc1c2c913666d5b",
+      "size": 2150
+    },
+    {
+      "path": "TASK_INDEX.md",
+      "sha256": "7437e7e8477b76bbb2716786a83ca3b03c55794ed6178c65f6442c461e0b82d8",
+      "size": 9447
+    },
+    {
+      "path": "TASK_STATUS.json",
+      "sha256": "3ecf87a457d219fba273e4988a54ba8c8c0c0406dabeb60642de2c03d1690312",
+      "size": 25097
+    },
+    {
+      "path": "TRACEABILITY_MATRIX.md",
+      "sha256": "c0cf5ab37d9f8edb2ef649d2697a7bb6d517c1654c4dfd2943fca785598a3b92",
+      "size": 7734
+    },
+    {
+      "path": "TZ_P00_LIVE_BASELINE_SOURCE_FREEZE.md",
+      "sha256": "152f2dda20183812aa2dc29bd890b33e9db5a5f4ea3a45dd2fb79ee2a3791fd2",
+      "size": 10900
+    },
+    {
+      "path": "TZ_P01_OWNER_AND_MACHINE_RECONSTRUCTION.md",
+      "sha256": "53930326558ba71f34da8b0840b25b3c46b6ffe45180cf882998b4b42ff4bca9",
+      "size": 11112
+    },
+    {
+      "path": "TZ_P02_SEMANTIC_VOCABULARY_AND_REFINEMENT.md",
+      "sha256": "e42aa86cb4689884da0ac1270817a4eb446c845652e7e84162b1c1d90abe8dde",
+      "size": 10642
+    },
+    {
+      "path": "TZ_P03_GLOBAL_OPERATIONAL_SEMANTICS.md",
+      "sha256": "1dc552337f64a106dbde1f4f06d110025f5d3d1f0914123a77ef3ff25516a7db",
+      "size": 10338
+    },
+    {
+      "path": "TZ_P04_OPERATION_OBLIGATIONS.md",
+      "sha256": "415967a63b69b31b9cf8e85037f118ccc45deac93af5e91f185be84809f98e8f",
+      "size": 13939
+    },
+    {
+      "path": "TZ_P05_EXECUTION_GUARANTEES_AND_BINDING.md",
+      "sha256": "80afd713811a0cca707cc4375c75363346ac1b5b237b7ad36aeed9598219cf5a",
+      "size": 15533
+    },
+    {
+      "path": "TZ_P06_GENERATION_EXACT_ADMISSION_SENTRY.md",
+      "sha256": "8bfbd57c3daf350be6733d851bc860245659435464532d5ccf9ffb65f40517a2",
+      "size": 14603
+    },
+    {
+      "path": "TZ_P07_EFFECT_AND_PUBLICATION_ALGEBRA.md",
+      "sha256": "b0100a223709c84c3c0af6abab4b244f7c9da042587a233ef7c23acd4a797f2a",
+      "size": 14501
+    },
+    {
+      "path": "TZ_P08_VISIBILITY_MEMORY_SHARING_LOCALITY.md",
+      "sha256": "d6fcaf091a97204e520a55e5d9a7c7a2c1630e32ea5ecbd8c2838d4b7c7dbd0f",
+      "size": 13768
+    },
+    {
+      "path": "TZ_P09_RESOURCE_MEASUREMENT_RETIRE_CHARGING.md",
+      "sha256": "5ca80e43292591558fa3708d8fc7f12f0f629554e9981781b8529f858be88a36",
+      "size": 14952
+    },
+    {
+      "path": "TZ_P10_MULTI_RESOURCE_QOS_SCHEDULING.md",
+      "sha256": "5479c9f3ae1fd84daff5abe33a8a287ce055ac5760dcbb0c1d3a99f055b7e615",
+      "size": 15402
+    },
+    {
+      "path": "TZ_P11_PREEMPTION_CANCELLATION_CONTAINMENT.md",
+      "sha256": "6da9629fc4f6c0581e3aa7e20952928de6dd543e418b4f6a1c6f09e9e2c28c71",
+      "size": 15657
+    },
+    {
+      "path": "TZ_P12_REPLAY_PROVIDER_REFINEMENT_ISOLATION.md",
+      "sha256": "b4bc676614085b82c5f6fea4773487030b5e59c777874486665e62477265133e",
+      "size": 14717
+    },
+    {
+      "path": "TZ_P13_LIVENESS_FAULT_QUARANTINE_RECOVERY.md",
+      "sha256": "679f2fe040d5e5b34592ff4f9c0ed41e4093d16c4eade1662f3f72cc7026f77a",
+      "size": 14578
+    },
+    {
+      "path": "TZ_P14_SCALABLE_AUTHORITY_OWNERS.md",
+      "sha256": "0eef377931c0f5651aa054568cad595ff4ed71424478690014631390bb5699f3",
+      "size": 13168
+    },
+    {
+      "path": "TZ_P15_MANAGED_ROOT_DURABLE_IFC.md",
+      "sha256": "8a6eb2415f50333568b2fbb7c08aa5ea4690f8db8bac367be96c072318dee393",
+      "size": 14336
+    },
+    {
+      "path": "TZ_P16_SIPJOB_AND_DECLARATIVE_OPERATION_MODEL.md",
+      "sha256": "f8f5b6d28088b2ce36323137d7e7fa28445cad9c29adc71852b9ac161947542f",
+      "size": 14299
+    },
+    {
+      "path": "TZ_P17_MATRIXMULTIPLY_HYBRIDCPU_VERTICAL.md",
+      "sha256": "e9c2e53235635112e133513643530dbaa087e879a8b575c9f2d7bd4359cfb7bb",
+      "size": 17252
+    },
+    {
+      "path": "TZ_P18_QUALIFICATION_PROMOTION_CUTOVER.md",
+      "sha256": "e6dffb0d570cbf0dd2a25fac9baa25cda2b08325e80c3237050adf6f638071a6",
+      "size": 13989
+    },
+    {
+      "path": "P00_REAUDIT_20260922.md",
+      "sha256": "76d0e723b846b5404f923a7e938d25aaca19947c37de3a7ce6f8dcabc0b26b19",
+      "size": 5986
+    },
+    {
+      "path": "P00_REAUDIT_20260922_TUPLE.json",
+      "sha256": "f6d9422b6cde2c1a70b1b37aceee1f740cf91f0d57ce623d62865f187d41766d",
+      "size": 1902
+    },
+    {
+      "path": "P01_REAUDIT_20260922.md",
+      "sha256": "9f67bc9d3a37485fc4ec355c46822538fdd4c470dbe0b6e13666a11d994a6f11",
+      "size": 6385
+    },
+    {
+      "path": "P01_REAUDIT_20260922_TUPLE.json",
+      "sha256": "39268a6435343f87113497a4668da8cf538b360c4a13fb66eb94e40a73595e42",
+      "size": 2034
+    },
+    {
+      "path": "P02_REAUDIT_20260922.md",
+      "sha256": "6412089ebbb9c7da95d04639e03c097f002a8db06af108510f58a0126ae59b0e",
+      "size": 5629
+    },
+    {
+      "path": "P02_REAUDIT_20260922_TUPLE.json",
+      "sha256": "219abcb24a6932b3b69474a69dad5cd4b95cf78ad8588155f41b2bea18ab3666",
+      "size": 1363
+    },
+    {
+      "path": "P03_REAUDIT_20260922.md",
+      "sha256": "4eb330d3bb4f3f381d5cc4e0faf1a83d3bb8c9e515f1e1809b2bf8d5e03be8b9",
+      "size": 6980
+    },
+    {
+      "path": "P03_REAUDIT_20260922_TUPLE.json",
+      "sha256": "041e0acda94cd1b00b7d4e85ba078224f6a9b3a80ab5eb2ab1bbd92e41ff8b25",
+      "size": 1607
+    },
+    {
+      "path": "formal/SemanticAdmissionSentry.tla",
+      "sha256": "590bd641f23188e3853574ed792bedc7614789d705f89b4a58ab215bedabd4e3",
+      "size": 13063
+    },
+    {
+      "path": "formal/SemanticAdmissionSentry.cfg",
+      "sha256": "1e3c4e27036aefa18c7f209df777b63562b9f2ee154a323ded4eab1ed53968b1",
+      "size": 194
+    },
+    {
+      "path": "P04_REAUDIT_20260922.md",
+      "sha256": "36cecbb81287527c22a9555f8387df784a2b8460601d0e108ae5c6b1e9a8506c",
+      "size": 6856
+    },
+    {
+      "path": "P04_REAUDIT_20260922_TUPLE.json",
+      "sha256": "77e400489c87bec37f3fba79c6a79b7b52438f77e7f755e8cf9411a6e72f9cdf",
+      "size": 1822
+    },
+    {
+      "path": "P05_REAUDIT_20260922.md",
+      "sha256": "ed17e9bf097803fa8576cbe322a98a40441c1ebd642b9034e0787288fb6804b7",
+      "size": 7113
+    },
+    {
+      "path": "P05_REAUDIT_20260922_TUPLE.json",
+      "sha256": "3a1bebbfafea8832b359f9df03e9cdfb8992173e9146bcba9e4c90c728a53a89",
+      "size": 2025
+    },
+    {
+      "path": "P06_REAUDIT_20260922.md",
+      "sha256": "e33e76b859aaebb98e82c649171c2a931a9e0332342a80ea6cb664847e010a17",
+      "size": 6017
+    },
+    {
+      "path": "P06_REAUDIT_20260922_TUPLE.json",
+      "sha256": "e68738daf4afd2987b0afedb20d835e9183ae2ff0c405ca519f20c2e1e03ba3d",
+      "size": 1534
+    },
+    {
+      "path": "P07_REAUDIT_20260922.md",
+      "sha256": "6e61b3cf57f6dce7bc8222abaa737317ae22590effb9346e00d505662c1eeff2",
+      "size": 5587
+    },
+    {
+      "path": "P07_REAUDIT_20260922_TUPLE.json",
+      "sha256": "2cf478e157510fdeb2bdee083c7913ed958371d0a5d39e6d5b4c80acef563d1a",
+      "size": 1349
+    },
+    {
+      "path": "P08_REAUDIT_20260922.md",
+      "sha256": "6fe11f3551541f59e637cc071847f96446203225901728b6f8b15b19106b5b32",
+      "size": 4734
+    },
+    {
+      "path": "P08_REAUDIT_20260922_TUPLE.json",
+      "sha256": "9240e00230fea34736f5729a0756f83d23bb49bb0b560553ede66bf15420bbde",
+      "size": 1108
+    },
+    {
+      "path": "P09_REAUDIT_20260922.md",
+      "sha256": "97f8e0fc5202ad75e637ec7cc84c07bcba4c808b73f47f6190754e944fff47c8",
+      "size": 5872
+    },
+    {
+      "path": "P09_REAUDIT_20260922_TUPLE.json",
+      "sha256": "7ed53e31f85172a70f96a66509551efd4531b71d8725febadf1d2f8cb95647a3",
+      "size": 1427
+    },
+    {
+      "path": "P10_REAUDIT_20260922.md",
+      "sha256": "f7e91b3302e424dc13607ecd003fffc4f74e8abfc161aa151a09ffb298e4625e",
+      "size": 5554
+    },
+    {
+      "path": "P10_REAUDIT_20260922_TUPLE.json",
+      "sha256": "ca1beecc59420e41189b5ad6fbee3f73926561dec942c1de46b4da5dd0457b8f",
+      "size": 2167
+    },
+    {
+      "path": "P11_REAUDIT_20260922.md",
+      "sha256": "5386895a02e91ebd016792f6bcfc9ad1f85320c45cf145f4e48cb8c5fda15a9e",
+      "size": 5462
+    },
+    {
+      "path": "P11_REAUDIT_20260922_TUPLE.json",
+      "sha256": "189ceca18f050925e3726206e68bdc407720a9d7327aeb79adbf1724278b8579",
+      "size": 2158
+    },
+    {
+      "path": "P12_REAUDIT_20260922.md",
+      "sha256": "93f5b21304e85188b1c3a4428c7df6482b6e2ed0a412876ca37e55dc589cb345",
+      "size": 5820
+    },
+    {
+      "path": "P12_REAUDIT_20260922_TUPLE.json",
+      "sha256": "a251de3543a52878845f8cbcb10bf57db9b01adeadaf742147ff9d28bf92d794",
+      "size": 2064
+    },
+    {
+      "path": "P13_REAUDIT_20260923.md",
+      "sha256": "bab458d96319b8e2e9ac46915c2d9c7b3dd29def6b4c6384555238252e8cb0a3",
+      "size": 5183
+    },
+    {
+      "path": "P13_REAUDIT_20260923_TUPLE.json",
+      "sha256": "cfa2fa0545acb69f96cae69115d50238f918b888639b6681ff0c135ea7e73f11",
+      "size": 1874
+    },
+    {
+      "path": "P14_RESOURCE_BUDGET_MEASUREMENT_20260923.json",
+      "sha256": "f0bce6d230958ecc69f4d38dde81b84606481d9461c7740a7e4a3f832d776503",
+      "size": 1720
+    },
+    {
+      "path": "P14_REAUDIT_20260923.md",
+      "sha256": "3be32e1edf559a78644e1c1f07dfb50314fa8103cbdcc54b57cc48389f34e1cf",
+      "size": 4735
+    },
+    {
+      "path": "P14_REAUDIT_20260923_TUPLE.json",
+      "sha256": "d716c884b6be9765011a7d47e8d2c88aaa206064ca1aacaeba6e923425e44073",
+      "size": 1454
+    },
+    {
+      "path": "P15_REAUDIT_20260923.md",
+      "sha256": "a4e0ed1074a3c111ec17d2ce27c0591a5a52c8054f41540addb318d9dd22c9a2",
+      "size": 6082
+    },
+    {
+      "path": "P15_REAUDIT_20260923_TUPLE.json",
+      "sha256": "74c697b4b0d00018f2695762ea64d9311f15f684a734b9a4ae83e96a67ac8fb4",
+      "size": 1869
+    },
+    {
+      "path": "P16_REAUDIT_20260923.md",
+      "sha256": "ad039c6008b6c30a15ccb1f70d6ce209a503febfae900bd58cafc94aa56732ae",
+      "size": 5800
+    },
+    {
+      "path": "P16_REAUDIT_20260923_TUPLE.json",
+      "sha256": "681d18c384e38b7dd7d53c7906a08bb5e667457322d4db0c9a255b30fbfe555c",
+      "size": 1791
+    },
+    {
+      "path": "P17_REAUDIT_20260923.md",
+      "sha256": "5339b41ded77b78f6fa30f9087d6c06585af87649527df3ba0e7b4b89dbd0a45",
+      "size": 6272
+    },
+    {
+      "path": "P17_REAUDIT_20260923_TUPLE.json",
+      "sha256": "a20796fb55b20da9ebffa49decc176861441f008915df171f9e45aea55f10900",
+      "size": 1750
+    },
+    {
+      "path": "P18_REAUDIT_20260923.md",
+      "sha256": "5548f7bdfec72392bb4c206277e70ba128736a006c0829d55b2e3756a31a93d2",
+      "size": 8612
+    },
+    {
+      "path": "P18_REAUDIT_20260923_TUPLE.json",
+      "sha256": "791a7bbd10848be7b768af0595ea5f336545d2a6d7ecd054198f255f882bb949",
+      "size": 4853
+    }
+  ]
+}

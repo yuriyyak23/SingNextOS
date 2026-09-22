@@ -7,6 +7,21 @@ namespace SingPlus.Tests.Admission;
 
 public sealed class AdmissionVerifierTests
 {
+    [Fact]
+    public void AdmissionProofPolicyAndResultAreExplicitlyNonAuthoritative()
+    {
+        using var fixture = CompileFixture("public static class Fixture { public static int Root(int value) => System.Math.Abs(value); }", allowUnsafe: false);
+        var result = AdmissionVerifier.Verify(fixture.AssemblyPath, "Fixture::Root", "ManagedCap");
+
+        Assert.True(result.IsAdmitted);
+        Assert.False(result.AuthorizesExecution);
+        Assert.False(result.MaterializesCapability);
+        Assert.False(result.IsRuntimeAuthority);
+        Assert.False(result.Proof.AuthorizesExecution);
+        Assert.False(result.Proof.MaterializesCapability);
+        Assert.False(result.Proof.IsRuntimeAuthority);
+    }
+
     [Theory]
     [InlineData("public static int Root() => 1; public static object Root(int value) => new object();")]
     [InlineData("public static object Root(int value) => new object(); public static int Root() => 1;")]

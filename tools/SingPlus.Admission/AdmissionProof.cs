@@ -21,6 +21,9 @@ public sealed class SingPlusAdmissionProofV1
     public required string DependencyDigest { get; init; }
     public required string RulesetDigest { get; init; }
     public required string ProofDigest { get; init; }
+    public bool AuthorizesExecution => false;
+    public bool MaterializesCapability => false;
+    public bool IsRuntimeAuthority => false;
 
     public byte[] SerializeCanonical(IReadOnlyList<AdmissionViolation> violations)
     {
@@ -61,4 +64,7 @@ public sealed class SingPlusAdmissionProofV1
 public sealed record AdmissionVerificationResult(SingPlusAdmissionProofV1 Proof, IReadOnlyList<AdmissionViolation> Violations)
 {
     public bool IsAdmitted => Violations.Count == 0;
+    public bool AuthorizesExecution => false;
+    public bool MaterializesCapability => false;
+    public bool IsRuntimeAuthority => false;
 }

@@ -233,11 +233,77 @@ public sealed class ExternalOperationLifecycleTests
         var unavailableOnly = scenario.Kernel.ReleaseExternalOperation(scenario.Owner, preparation.Operation, new(false, true));
         Assert.False(unavailableOnly.IsSuccess);
         Assert.Equal(KernelError.InvalidTransition, unavailableOnly.Error);
-        var released = scenario.Kernel.ReleaseExternalOperation(scenario.Owner, preparation.Operation, new(false, true, ProviderEffectContained: true));
+        var untrustedContainment = scenario.Kernel.ReleaseExternalOperation(scenario.Owner,
+            preparation.Operation, new(false, true, ProviderEffectContained: true));
+        Assert.False(untrustedContainment.IsSuccess);
+        Assert.Equal(KernelError.InvalidTransition, untrustedContainment.Error);
+        var released = scenario.Kernel.ReleaseExternalOperation(scenario.Owner, preparation.Operation, new(true, true));
         Assert.True(released.IsSuccess, released.Message);
-        Assert.True(scenario.Kernel.ReleaseExternalOperation(scenario.Owner, preparation.Operation, new(false, true, ProviderEffectContained: true)).IsSuccess);
+        Assert.True(scenario.Kernel.ReleaseExternalOperation(scenario.Owner, preparation.Operation, new(true, true)).IsSuccess);
         Assert.DoesNotContain(released.Value!.Transitions, transition => transition.Event == "Published");
         Assert.True(scenario.Kernel.Regions.Validate(scenario.Output.Handle, new(new DomainId(10), scenario.Owner.Generation)).IsSuccess);
+    }
+
+    [Fact]
+    public void CallerCancellationFlagCannotUpgradeStoredAdmissionSupport()
+    {
+        var beforeDispatchOnly = CreateScenario();
+        var first = Prepare(beforeDispatchOnly, ExternalPublicationPolicy.Staged);
+        Assert.True(beforeDispatchOnly.Kernel.AdmitExternalOperation(
+            beforeDispatchOnly.Owner, first.Operation, Dependencies,
+            cancellationSupport: ExternalCancellationSupport.BeforeSubmissionOnly).IsSuccess);
+        _ = beforeDispatchOnly.Kernel.RecordExternalOperationSubmission(
+            beforeDispatchOnly.Owner, first.Operation, Dependencies).Value!;
+
+        var firstCancellation = beforeDispatchOnly.Kernel.CancelExternalOperation(
+            beforeDispatchOnly.Owner, first.Operation, providerCancellationSupported: true).Value!;
+        Assert.Equal("DrainRequired", firstCancellation.Transitions[^1].Event);
+
+        var cooperative = CreateScenario();
+        var second = Prepare(cooperative, ExternalPublicationPolicy.Staged);
+        Assert.True(cooperative.Kernel.AdmitExternalOperation(
+            cooperative.Owner, second.Operation, Dependencies,
+            cancellationSupport: ExternalCancellationSupport.ProviderCooperative).IsSuccess);
+        _ = cooperative.Kernel.RecordExternalOperationSubmission(
+            cooperative.Owner, second.Operation, Dependencies).Value!;
+
+        var secondCancellation = cooperative.Kernel.CancelExternalOperation(
+            cooperative.Owner, second.Operation, providerCancellationSupported: false).Value!;
+        Assert.Equal("ProviderCancellationRequested", secondCancellation.Transitions[^1].Event);
+    }
+
+    [Fact]
+    public async Task CancelAndRetireRaceLinearizesWithoutPublicationOrRelease()
+    {
+        var scenario = CreateScenario();
+        var prepared = Prepare(scenario, ExternalPublicationPolicy.Staged);
+        Assert.True(scenario.Kernel.AdmitExternalOperation(scenario.Owner, prepared.Operation, Dependencies,
+            cancellationSupport: ExternalCancellationSupport.ProviderCooperative).IsSuccess);
+        var binding = scenario.Kernel.RecordExternalOperationSubmission(
+            scenario.Owner, prepared.Operation, Dependencies).Value!;
+        using var start = new ManualResetEventSlim(false);
+        var cancel = Task.Run(() =>
+        {
+            start.Wait();
+            return scenario.Kernel.CancelExternalOperation(scenario.Owner, prepared.Operation, true);
+        });
+        var retire = Task.Run(() =>
+        {
+            start.Wait();
+            return scenario.Kernel.RecordExternalOperationCompletion(scenario.Owner,
+                new(binding, ExternalOperationCompletionDisposition.Cancelled));
+        });
+        start.Set();
+        var results = await Task.WhenAll(cancel, retire);
+
+        Assert.All(results, result => Assert.True(result.IsSuccess, result.Message));
+        var final = scenario.Kernel.QueryExternalOperation(scenario.Owner, prepared.Operation).Value!;
+        Assert.Equal(ExternalOperationState.DeviceComplete, final.State);
+        Assert.Contains(final.Disposition,
+            new[] { ExternalOperationDisposition.Cancelled, ExternalOperationDisposition.Discarded });
+        Assert.DoesNotContain(final.Transitions, transition => transition.Event is "Published" or "Released");
+        Assert.Equal(KernelError.InvalidTransition,
+            scenario.Kernel.ReleaseExternalOperation(scenario.Owner, prepared.Operation, new(false, false)).Error);
     }
 
     [Fact]

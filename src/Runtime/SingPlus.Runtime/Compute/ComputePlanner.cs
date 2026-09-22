@@ -221,8 +221,19 @@ public sealed class ComputePlanner(RegionAuthority regions)
             return KernelResult.Fail(KernelError.InvalidMessage, "Compute intent operation or publication preference is invalid.");
         if (intent.Input.Region.RegionId.Value == 0 || intent.Output.Region.RegionId.Value == 0 || intent.Input.Region == intent.Output.Region)
             return KernelResult.Fail(KernelError.InvalidMessage, "Compute intent requires distinct materialized input and output regions.");
-        if (intent.Input.Range.Length <= 0 || intent.Output.Range.Length <= 0 || intent.Input.Range.Length != intent.Output.Range.Length)
-            return KernelResult.Fail(KernelError.InvalidMessage, "Compute intent requires positive equal-length input and output ranges.");
+        if (intent.Operation == ComputeOperationKind.MatrixMultiply)
+        {
+            var matrix = ValidateMatrixMultiply(intent);
+            if (!matrix.IsSuccess) return matrix;
+        }
+        else
+        {
+            if (intent.RightInput is not null || intent.MatrixMultiplyShape is not null)
+                return KernelResult.Fail(KernelError.InvalidMessage,
+                    "Only MatrixMultiply may declare a right input or matrix shape.");
+            if (intent.Input.Range.Length <= 0 || intent.Output.Range.Length <= 0 || intent.Input.Range.Length != intent.Output.Range.Length)
+                return KernelResult.Fail(KernelError.InvalidMessage, "Compute intent requires positive equal-length input and output ranges.");
+        }
         if (intent.ResourceRequirement is { } resource)
         {
             ResourceEnvelopeV1 canonical;
@@ -233,6 +244,42 @@ public sealed class ComputePlanner(RegionAuthority regions)
                 return KernelResult.Fail(KernelError.InvalidMessage,
                     "P08 resource-aware compute supports only semantic ComputeTime/Nanoseconds.");
         }
+        if (intent.LocalityRequirement is { } locality &&
+            (locality.Version != ComputeLocalityRequirementV1.CurrentVersion ||
+             !Enum.IsDefined(locality.Strength) || !Enum.IsDefined(locality.RequiredClass)))
+            return KernelResult.Fail(KernelError.InvalidMessage, "Compute locality requirement is invalid or unsupported.");
+        return KernelResult.Ok();
+    }
+
+    private static KernelResult ValidateMatrixMultiply(ComputeIntent intent)
+    {
+        if (intent.RightInput is not { } right || intent.MatrixMultiplyShape is not { } shape)
+            return KernelResult.Fail(KernelError.InvalidMessage,
+                "MatrixMultiply requires exact A, B and C operands plus a versioned shape.");
+        if (shape.Version != MatrixMultiplyShapeV1.CurrentVersion || shape.Rows == 0 ||
+            shape.InnerDimension == 0 || shape.Columns == 0 || shape.ElementSizeBytes == 0)
+            return KernelResult.Fail(KernelError.InvalidMessage,
+                "MatrixMultiply shape version and dimensions must be known and non-zero.");
+        if (right.Region.RegionId.Value == 0 || right.Region == intent.Input.Region ||
+            right.Region == intent.Output.Region)
+            return KernelResult.Fail(KernelError.InvalidMessage,
+                "MatrixMultiply A, B and staged C require three distinct materialized Regions.");
+        try
+        {
+            var aBytes = checked(shape.Rows * shape.InnerDimension * shape.ElementSizeBytes);
+            var bBytes = checked(shape.InnerDimension * shape.Columns * shape.ElementSizeBytes);
+            var cBytes = checked(shape.Rows * shape.Columns * shape.ElementSizeBytes);
+            if (aBytes > long.MaxValue || bBytes > long.MaxValue || cBytes > long.MaxValue ||
+                intent.Input.Range.Length != (long)aBytes || right.Range.Length != (long)bBytes ||
+                intent.Output.Range.Length != (long)cBytes)
+                return KernelResult.Fail(KernelError.InvalidMessage,
+                    "MatrixMultiply operand ranges must exactly match the checked shape byte counts.");
+        }
+        catch (OverflowException)
+        {
+            return KernelResult.Fail(KernelError.InvalidMessage,
+                "MatrixMultiply shape byte arithmetic overflowed the canonical range.");
+        }
         return KernelResult.Ok();
     }
 
@@ -241,10 +288,41 @@ public sealed class ComputePlanner(RegionAuthority regions)
         !provider.Faulted &&
         provider.Generation != 0 &&
         !string.IsNullOrWhiteSpace(provider.ProviderId.Value) &&
-        provider.MaximumOperationBytes >= intent.Input.Range.Length &&
+        ProviderCapacitySatisfies(provider, intent) &&
+        ValidLocalityGuarantee(provider) && LocalityRequirementSatisfied(provider, intent) &&
         (provider.Capabilities & ComputeProviderCapabilities.AcceleratorExecution) != 0 &&
         (!intent.RequiresSecureEvidence || (provider.Capabilities & ComputeProviderCapabilities.SecureComputeEvidence) != 0) &&
         (!intent.RequiresVirtualizedDomain || (provider.Capabilities & ComputeProviderCapabilities.VirtualizedDomain) != 0);
+
+    private static bool ProviderCapacitySatisfies(ComputeProviderCandidate provider, ComputeIntent intent)
+    {
+        try
+        {
+            var bytes = checked(intent.Input.Range.Length + intent.Output.Range.Length +
+                (intent.RightInput?.Range.Length ?? 0));
+            return bytes > 0 && provider.MaximumOperationBytes >= bytes;
+        }
+        catch (OverflowException)
+        {
+            return false;
+        }
+    }
+
+    private static bool ValidLocalityGuarantee(ComputeProviderCandidate provider) =>
+        provider.LocalityGuarantee is not { } guarantee ||
+        guarantee.Version == ComputeLocalityGuaranteeV1.CurrentVersion &&
+        Enum.IsDefined(guarantee.Support) && Enum.IsDefined(guarantee.ProvidedClass) &&
+        guarantee.ProviderGeneration == provider.Generation && guarantee.ProviderGeneration != 0;
+
+    private static bool LocalityRequirementSatisfied(ComputeProviderCandidate provider, ComputeIntent intent)
+    {
+        if (intent.LocalityRequirement is not { } requirement ||
+            requirement.Strength == SemanticRequirementStrengthV1.Advisory)
+            return true;
+        return provider.LocalityGuarantee is { } guarantee &&
+               guarantee.Support == SemanticGuaranteeSupportV1.Supported &&
+               SemanticPartialOrdersV1.LocalityRefines(guarantee.ProvidedClass, requirement.RequiredClass);
+    }
 
     private static ComputePublicationPath? SelectPath(ComputeIntent intent, ComputeSelectionPolicy policy, ComputeProviderCandidate provider) =>
         intent.PublicationPreference switch
@@ -265,14 +343,19 @@ public sealed class ComputePlanner(RegionAuthority regions)
         _ => false
     };
 
-    private static OperationRegionUseRequest[] RequiredUses(ComputeIntent intent, ComputePublicationPath path) =>
-    [
-        new OperationRegionUseRequest(intent.Input.Region, RegionUseMode.ReadOnly, intent.Input.Range),
-        new OperationRegionUseRequest(
-            intent.Output.Region,
+    private static OperationRegionUseRequest[] RequiredUses(ComputeIntent intent, ComputePublicationPath path)
+    {
+        var uses = new List<OperationRegionUseRequest>
+        {
+            new(intent.Input.Region, RegionUseMode.ReadOnly, intent.Input.Range)
+        };
+        if (intent.RightInput is { } right)
+            uses.Add(new(right.Region, RegionUseMode.ReadOnly, right.Range));
+        uses.Add(new(intent.Output.Region,
             path == ComputePublicationPath.Staged ? RegionUseMode.StagedOutput : RegionUseMode.DirectCoherentWrite,
-            intent.Output.Range)
-    ];
+            intent.Output.Range));
+        return uses.ToArray();
+    }
 
     private static ComputeDependencyGraph BuildGraph(ComputePublicationPath path)
     {

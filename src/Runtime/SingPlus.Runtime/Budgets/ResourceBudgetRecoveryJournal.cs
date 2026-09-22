@@ -276,7 +276,6 @@ internal sealed class ResourceBudgetRecoveryJournal
             (ResourceBudgetRecoveryTransition.Prepared, ResourceBudgetRecoveryTransition.PossibleSubmit) => true,
             (ResourceBudgetRecoveryTransition.Prepared, ResourceBudgetRecoveryTransition.CancelledPreSubmit) => true,
             (ResourceBudgetRecoveryTransition.PossibleSubmit, ResourceBudgetRecoveryTransition.Quarantined) => true,
-            (ResourceBudgetRecoveryTransition.PossibleSubmit, ResourceBudgetRecoveryTransition.CancelledPreSubmit) => true,
             (ResourceBudgetRecoveryTransition.PossibleSubmit, ResourceBudgetRecoveryTransition.SettledExact or
                 ResourceBudgetRecoveryTransition.SettledContained or
                 ResourceBudgetRecoveryTransition.SettledConservative) => true,

@@ -38,7 +38,9 @@ internal sealed class ResourceAdmissionCommit : IDisposable
     private int _disposed;
 
     internal ResourceAdmissionCommit(
-        RuntimeKernel kernel, ProcessHandle principal, ProcessHandle budgetOwner, CapabilityId resourceGrant,
+        RuntimeKernel kernel, ProcessHandle principal, ProcessHandle budgetOwner,
+        CapabilityId effectCapability, ResourceKind effectResourceKind, string effectResourceId,
+        ulong effectResourceGeneration, CapabilityId resourceGrant,
         ulong resourceGeneration, ResourceEnvelopeV1 envelope, ExternalOperationHandle operation,
         BudgetReservationHandle lease, ResourceUseAuthorityLease resourceAuthority,
         OperationAuthorityLease effectAuthority,
@@ -47,6 +49,10 @@ internal sealed class ResourceAdmissionCommit : IDisposable
         _kernel = kernel;
         Principal = principal;
         BudgetOwner = budgetOwner;
+        EffectCapability = effectCapability;
+        EffectResourceKind = effectResourceKind;
+        EffectResourceId = effectResourceId;
+        EffectResourceGeneration = effectResourceGeneration;
         ResourceGrant = resourceGrant;
         ResourceGeneration = resourceGeneration;
         Envelope = envelope;
@@ -59,6 +65,10 @@ internal sealed class ResourceAdmissionCommit : IDisposable
 
     internal ProcessHandle Principal { get; }
     internal ProcessHandle BudgetOwner { get; }
+    internal CapabilityId EffectCapability { get; }
+    internal ResourceKind EffectResourceKind { get; }
+    internal string EffectResourceId { get; }
+    internal ulong EffectResourceGeneration { get; }
     internal CapabilityId ResourceGrant { get; }
     internal ulong ResourceGeneration { get; }
     internal ResourceEnvelopeV1 Envelope { get; }
@@ -173,8 +183,9 @@ public sealed partial class RuntimeKernel
             var accepts = EnsureProcessAcceptsNewEffects(processRecord);
             if (!accepts.IsSuccess) return KernelResult<ResourceAdmissionCommit>.Fail(accepts.Error, accepts.Message!);
             var requested = envelope.Canonicalize();
-            if (requested.ResourceClass != ResourceClassV1.ComputeTime || requested.Unit != ResourceUnitV1.Nanoseconds)
-                return KernelResult<ResourceAdmissionCommit>.Fail(KernelError.InvalidMessage, "P04 supports only ComputeTime nanoseconds.");
+            var budgetAmounts = ResourceEnvelopeBudgetMapping.Map([requested]);
+            if (!budgetAmounts.IsSuccess)
+                return KernelResult<ResourceAdmissionCommit>.Fail(budgetAmounts.Error, budgetAmounts.Message!);
             var resource = CapabilityAuthority.ValidateResourceUse(resourceGrant, processRecord.DomainId,
                 principal.Generation, resourceGrantGeneration, requested);
             if (!resource.IsSuccess) return KernelResult<ResourceAdmissionCommit>.Fail(resource.Error, resource.Message!);
@@ -190,16 +201,14 @@ public sealed partial class RuntimeKernel
                 var snapshot = Budgets.Query(donatedLease);
                 if (!snapshot.IsSuccess || snapshot.Value!.Owner != exactBudgetOwner ||
                     snapshot.Value.State != BudgetReservationState.Reserved ||
-                    snapshot.Value.Amounts.Count != 1 ||
-                    snapshot.Value.Amounts[0] != new BudgetAmount(ServiceBudgetDimension.ComputeTimeNanoseconds, requested.Amount))
+                    !snapshot.Value.Amounts.SequenceEqual(budgetAmounts.Value!))
                     return KernelResult<ResourceAdmissionCommit>.Fail(KernelError.StaleGeneration,
                         "Donated budget lease is stale, non-exact, or belongs to another charging lineage.");
                 lease = donatedLease;
             }
             else
             {
-                var reserved = Budgets.Reserve(principal,
-                    [new(ServiceBudgetDimension.ComputeTimeNanoseconds, requested.Amount)],
+                var reserved = Budgets.Reserve(principal, budgetAmounts.Value!,
                     BudgetReservationLifetime.ExternalEffect, AdmissionQosHint.None);
                 if (!reserved.IsSuccess) return KernelResult<ResourceAdmissionCommit>.Fail(reserved.Error, reserved.Message!);
                 lease = reserved.Value!.Reservation;
@@ -245,7 +254,9 @@ public sealed partial class RuntimeKernel
                 return KernelResult<ResourceAdmissionCommit>.Fail(journalPrepared.Error, journalPrepared.Message!);
             ResourceAdmissionQualificationHook?.At(ResourceAdmissionQualificationPoint.AfterLocalCommit);
 
-            var commit = new ResourceAdmissionCommit(this, principal, exactBudgetOwner, resourceGrant, resourceGrantGeneration, requested,
+            var commit = new ResourceAdmissionCommit(this, principal, exactBudgetOwner,
+                effectCapability, effectResourceKind, effectResourceId, effectResourceGeneration,
+                resourceGrant, resourceGrantGeneration, requested,
                 operation, lease.Value, resourceAuthority, effectAuthority, correlation);
             resourceAuthority = null;
             effectAuthority = null;
@@ -279,10 +290,35 @@ public sealed partial class RuntimeKernel
     internal KernelResult<OperationBinding> SubmitResourceExternalAdmission(
         ResourceAdmissionCommit commit,
         OperationDependencySnapshot dependencies,
-        Func<KernelResult> providerSubmit)
+        Func<KernelResult> providerSubmit,
+        Func<KernelResult>? finalSentry = null)
     {
         ArgumentNullException.ThrowIfNull(commit);
         ArgumentNullException.ThrowIfNull(providerSubmit);
+        if (commit.SubmitStarted)
+            return KernelResult<OperationBinding>.Fail(KernelError.InvalidTransition, "Duplicate provider submission is denied.");
+        if (finalSentry is not null)
+        {
+            KernelResult final;
+            try
+            {
+                final = finalSentry();
+            }
+            catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+            {
+                final = KernelResult.Fail(KernelError.PlatformFaulted,
+                    $"Final semantic sentry failed closed: {exception.GetType().Name}.");
+            }
+            if (!final.IsSuccess)
+            {
+                // A concurrent caller may have won the irreversible submit transition while this
+                // caller was revalidating.  Never compensate or refund after any submit winner.
+                if (commit.SubmitStarted)
+                    return KernelResult<OperationBinding>.Fail(KernelError.InvalidTransition,
+                        "Provider submission was already won; no post-submit compensation is permitted.");
+                return FailBeforeSubmit(commit, final.Error, final.Message!);
+            }
+        }
         if (!commit.TryStartSubmit())
             return KernelResult<OperationBinding>.Fail(KernelError.InvalidTransition, "Duplicate provider submission is denied.");
 

@@ -13,6 +13,8 @@ public sealed partial class ExternalOperationAuthority
         public OperationBinding? Binding { get; set; }
         public ExternalEffectBoundaryState EffectBoundary { get; set; }
         public ExternalOperationResourceBinding? ResourceBinding { get; set; }
+        public ExternalPublicationDecisionV1? PublicationDecision { get; set; }
+        public bool PublicationInFlight { get; set; }
         public List<ExternalOperationTransition> Transitions { get; } = [];
         public ulong NextTransitionSequence { get; set; } = 1;
     }
@@ -212,9 +214,17 @@ public sealed partial class ExternalOperationAuthority
         ExternalOperationHandle operation,
         OperationDependencySnapshot currentDependencies,
         PublicationPlan plan,
-        Action publicationAction)
+        Action publicationAction) =>
+        Publish(operation, currentDependencies, plan, _ => publicationAction());
+
+    public KernelResult<ExternalOperationSnapshot> Publish(
+        ExternalOperationHandle operation,
+        OperationDependencySnapshot currentDependencies,
+        PublicationPlan plan,
+        Action<ExternalPublicationDecisionV1> publicationAction)
     {
         ArgumentNullException.ThrowIfNull(publicationAction);
+        ExternalPublicationDecisionV1 decision;
         lock (_gate)
         {
             var resolved = Resolve(operation);
@@ -224,6 +234,8 @@ public sealed partial class ExternalOperationAuthority
                 return InvalidTransition<ExternalOperationSnapshot>(record, "Publication requires a completed and Visible operation.");
             if (plan.Policy != record.Preparation.PublicationPolicy)
                 return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.InvalidTransition, "Publication plan does not match the admitted policy.");
+            if (record.PublicationInFlight)
+                return InvalidTransition<ExternalOperationSnapshot>(record, "An exact publication decision is already in flight.");
             if (record.Admission.Dependencies != currentDependencies)
             {
                 FailPublicationRevalidation(record);
@@ -236,19 +248,57 @@ public sealed partial class ExternalOperationAuthority
                 return KernelResult<ExternalOperationSnapshot>.Fail(uses.Error, uses.Message!);
             }
 
-            try
+            // Direct/coherent effects are already externally observable at their effect boundary.
+            // Published is bookkeeping for that contour; no fictitious withheld-action gate exists.
+            if (record.Preparation.PublicationPolicy == ExternalPublicationPolicy.DirectCoherent)
             {
-                publicationAction();
+                record.Disposition = ExternalOperationDisposition.Published;
+                Move(record, ExternalOperationState.Published, "DirectPublicationObserved");
+                return KernelResult<ExternalOperationSnapshot>.Ok(Snapshot(record));
             }
-            catch (Exception exception)
+
+            if (record.Binding is not { } binding || record.NextTransitionSequence == 0)
+                return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.CapacityExhausted,
+                    "Publication decision generation is unavailable.");
+            decision = new(ExternalPublicationDecisionV1.CurrentVersion, binding,
+                currentDependencies, plan.Policy, record.NextTransitionSequence);
+            record.PublicationDecision = decision;
+            record.PublicationInFlight = true;
+        }
+
+        try
+        {
+            publicationAction(decision);
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        {
+            lock (_gate)
             {
-                record.Disposition = record.Preparation.PublicationPolicy == ExternalPublicationPolicy.Staged
-                    ? ExternalOperationDisposition.Discarded
-                    : ExternalOperationDisposition.Faulted;
+                var resolved = Resolve(operation);
+                if (!resolved.IsSuccess)
+                    return KernelResult<ExternalOperationSnapshot>.Fail(resolved.Error, resolved.Message!);
+                var record = resolved.Value!;
+                if (!record.PublicationInFlight || record.PublicationDecision != decision)
+                    return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.StaleGeneration,
+                        "Publication decision changed while provider action was in flight.");
+                record.PublicationInFlight = false;
+                record.Disposition = ExternalOperationDisposition.Discarded;
                 AddTransition(record, record.State, "PublicationFailed");
                 return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.PlatformFaulted, $"Publication action failed closed: {exception.Message}");
             }
+        }
 
+        lock (_gate)
+        {
+            var resolved = Resolve(operation);
+            if (!resolved.IsSuccess)
+                return KernelResult<ExternalOperationSnapshot>.Fail(resolved.Error, resolved.Message!);
+            var record = resolved.Value!;
+            if (!record.PublicationInFlight || record.PublicationDecision != decision ||
+                record.State != ExternalOperationState.Visible || record.Disposition != ExternalOperationDisposition.Completed)
+                return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.StaleGeneration,
+                    "Publication state changed while the exact provider action was in flight.");
+            record.PublicationInFlight = false;
             record.Disposition = ExternalOperationDisposition.Published;
             if (record.EffectBoundary == ExternalEffectBoundaryState.StagedPending)
                 record.EffectBoundary = ExternalEffectBoundaryState.ExternallyVisible;
@@ -266,6 +316,9 @@ public sealed partial class ExternalOperationAuthority
             var resolved = Resolve(operation);
             if (!resolved.IsSuccess) return KernelResult<ExternalOperationSnapshot>.Fail(resolved.Error, resolved.Message!);
             var record = resolved.Value!;
+            if (record.PublicationInFlight)
+                return InvalidTransition<ExternalOperationSnapshot>(record,
+                    "Cancellation cannot cross an in-flight publication decision.");
             if (record.State == ExternalOperationState.Released)
                 return KernelResult<ExternalOperationSnapshot>.Ok(Snapshot(record));
             if (record.State == ExternalOperationState.Published)
@@ -282,7 +335,8 @@ public sealed partial class ExternalOperationAuthority
                     break;
                 case ExternalOperationState.Submitted:
                     record.Disposition = ExternalOperationDisposition.CancellationPending;
-                    AddTransition(record, record.State, providerCancellationSupported ? "ProviderCancellationRequested" : "DrainRequired");
+                    var cooperative = record.Admission?.CancellationSupport == ExternalCancellationSupport.ProviderCooperative;
+                    AddTransition(record, record.State, cooperative ? "ProviderCancellationRequested" : "DrainRequired");
                     break;
                 case ExternalOperationState.DeviceComplete:
                 case ExternalOperationState.Visible:
@@ -306,6 +360,9 @@ public sealed partial class ExternalOperationAuthority
             var resolved = Resolve(operation);
             if (!resolved.IsSuccess) return KernelResult<ExternalOperationSnapshot>.Fail(resolved.Error, resolved.Message!);
             var record = resolved.Value!;
+            if (record.PublicationInFlight)
+                return InvalidTransition<ExternalOperationSnapshot>(record,
+                    "Provider loss requires reconciliation after the in-flight publication decision returns.");
             if (record.State is not (ExternalOperationState.Submitted or ExternalOperationState.DeviceComplete or ExternalOperationState.Visible))
                 return InvalidTransition<ExternalOperationSnapshot>(record, "Provider loss is relevant only after submission and before publication.");
 
@@ -333,6 +390,9 @@ public sealed partial class ExternalOperationAuthority
             var resolved = Resolve(operation);
             if (!resolved.IsSuccess) return KernelResult<ExternalOperationSnapshot>.Fail(resolved.Error, resolved.Message!);
             var record = resolved.Value!;
+            if (record.PublicationInFlight)
+                return InvalidTransition<ExternalOperationSnapshot>(record,
+                    "Release cannot cross an in-flight publication decision.");
             if (record.State == ExternalOperationState.Released)
                 return KernelResult<ExternalOperationSnapshot>.Ok(Snapshot(record));
             if (!CanRelease(record, plan))
@@ -360,6 +420,17 @@ public sealed partial class ExternalOperationAuthority
             return resolved.IsSuccess
                 ? KernelResult<ExternalOperationSnapshot>.Ok(Snapshot(resolved.Value!))
                 : KernelResult<ExternalOperationSnapshot>.Fail(resolved.Error, resolved.Message!);
+        }
+    }
+
+    internal KernelResult<OperationPreparation> QueryPreparation(ExternalOperationHandle operation)
+    {
+        lock (_gate)
+        {
+            var resolved = Resolve(operation);
+            return resolved.IsSuccess
+                ? KernelResult<OperationPreparation>.Ok(resolved.Value!.Preparation)
+                : KernelResult<OperationPreparation>.Fail(resolved.Error, resolved.Message!);
         }
     }
 
@@ -472,16 +543,16 @@ public sealed partial class ExternalOperationAuthority
         if (record.State is ExternalOperationState.Prepared or ExternalOperationState.Admitted)
             return record.Disposition == ExternalOperationDisposition.Cancelled;
         if (record.State == ExternalOperationState.Published)
-            return record.Disposition == ExternalOperationDisposition.Published && (plan.ProviderResourcesClosed || plan.ProviderEffectContained);
+            return record.Disposition == ExternalOperationDisposition.Published && plan.ProviderResourcesClosed;
         if (record.State is ExternalOperationState.DeviceComplete or ExternalOperationState.Visible)
             return (record.Disposition is ExternalOperationDisposition.Cancelled ||
                     record.Preparation.PublicationPolicy == ExternalPublicationPolicy.Staged &&
                     record.Disposition is ExternalOperationDisposition.Discarded or ExternalOperationDisposition.Faulted or ExternalOperationDisposition.ProviderLost) &&
-                   (plan.ProviderResourcesClosed || plan.ProviderEffectContained);
+                   plan.ProviderResourcesClosed;
         if (record.State == ExternalOperationState.Submitted)
             return record.Preparation.PublicationPolicy == ExternalPublicationPolicy.Staged &&
                    record.Disposition == ExternalOperationDisposition.ProviderLost &&
-                   (plan.ProviderResourcesClosed || plan.ProviderEffectContained);
+                   plan.ProviderResourcesClosed;
         return false;
     }
 

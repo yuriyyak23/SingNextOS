@@ -20,8 +20,10 @@ internal sealed record ExternalOperationResourceBinding(
     ResourceEnvelopeV1 Envelope,
     string ProviderIdentity,
     ulong ProviderGeneration,
+    MeasurementContractIdentityV1 MeasurementContract,
     ExternalResourceBindingState State,
     ulong? TerminalReceiptSequence = null,
+    Guid? TerminalEvidenceId = null,
     ulong? SettledAmount = null);
 
 internal readonly record struct ExternalResourceUsageEvidence(
@@ -29,8 +31,11 @@ internal readonly record struct ExternalResourceUsageEvidence(
     OperationBinding OperationBinding,
     string ProviderIdentity,
     ulong ProviderGeneration,
+    MeasurementContractIdentityV1 MeasurementContract,
+    Guid EvidenceId,
     ResourceClassV1 ResourceClass,
     ResourceUnitV1 Unit,
+    ResourceUsageBreakdownV1 Usage,
     ulong ConsumedAmount,
     ulong ReceiptSequence)
 {
@@ -66,7 +71,10 @@ public sealed partial class ExternalOperationAuthority
             catch (Exception exception) when (exception is ArgumentException or NotSupportedException or OverflowException)
             { return KernelResult<ExternalOperationResourceBinding>.Fail(KernelError.InvalidMessage, exception.Message); }
             var binding = new ExternalOperationResourceBinding(operation, budgetOwner, lease, canonical,
-                providerIdentity, providerGeneration, ExternalResourceBindingState.Bound);
+                providerIdentity, providerGeneration,
+                new MeasurementContractIdentityV1(1, $"{providerIdentity}:measurement",
+                    "1", canonical.ResourceClass, canonical.Unit).Canonicalize(),
+                ExternalResourceBindingState.Bound);
             record.ResourceBinding = binding;
             AddTransition(record, record.State, "ResourceLeaseBound");
             return KernelResult<ExternalOperationResourceBinding>.Ok(binding);
@@ -100,7 +108,7 @@ public sealed partial class ExternalOperationAuthority
         {
             if (evidence.Version != ExternalResourceUsageEvidence.CurrentVersion ||
                 evidence.ReceiptSequence == 0 || string.IsNullOrWhiteSpace(evidence.ProviderIdentity) ||
-                evidence.ProviderGeneration == 0)
+                evidence.ProviderGeneration == 0 || evidence.EvidenceId == Guid.Empty)
                 return KernelResult<ExternalOperationResourceBinding>.Fail(KernelError.InvalidMessage,
                     "Usage evidence version or identity is invalid.");
             var resolved = Resolve(evidence.OperationBinding.Operation);
@@ -115,12 +123,29 @@ public sealed partial class ExternalOperationAuthority
                 binding.ProviderGeneration != evidence.ProviderGeneration)
                 return KernelResult<ExternalOperationResourceBinding>.Fail(KernelError.StaleGeneration,
                     "Usage evidence provider identity or generation is stale.");
+            MeasurementContractIdentityV1 measurement;
+            try { measurement = evidence.MeasurementContract.Canonicalize(); }
+            catch (Exception exception) when (exception is ArgumentException or NotSupportedException or OverflowException)
+            { return KernelResult<ExternalOperationResourceBinding>.Fail(KernelError.InvalidMessage, exception.Message); }
+            if (binding.MeasurementContract != measurement)
+                return KernelResult<ExternalOperationResourceBinding>.Fail(KernelError.StaleGeneration,
+                    "Usage evidence measurement contract identity is stale or belongs to another contour.");
+            ulong normalized;
+            try { normalized = ResourceChargeabilityMatrixV1.For(evidence.ResourceClass).Normalize(evidence.Usage); }
+            catch (Exception exception) when (exception is ArgumentException or NotSupportedException or OverflowException)
+            { return KernelResult<ExternalOperationResourceBinding>.Fail(KernelError.InvalidMessage, exception.Message); }
             if (binding.Envelope.ResourceClass != evidence.ResourceClass ||
                 binding.Envelope.Unit != evidence.Unit || evidence.ConsumedAmount > binding.Envelope.Amount)
                 return KernelResult<ExternalOperationResourceBinding>.Fail(KernelError.InvalidMessage,
                     "Usage evidence changes the resource dimension or exceeds the bound envelope.");
+            if (measurement.ResourceClass != evidence.ResourceClass || measurement.Unit != evidence.Unit ||
+                normalized != evidence.ConsumedAmount)
+                return KernelResult<ExternalOperationResourceBinding>.Fail(KernelError.InvalidMessage,
+                    "Usage evidence does not match the bound chargeability policy normalization.");
             if (binding.TerminalReceiptSequence == evidence.ReceiptSequence)
-                return binding.State == ExternalResourceBindingState.Settled && binding.SettledAmount == evidence.ConsumedAmount
+                return binding.State == ExternalResourceBindingState.Settled &&
+                       binding.TerminalEvidenceId == evidence.EvidenceId &&
+                       binding.SettledAmount == evidence.ConsumedAmount
                     ? KernelResult<ExternalOperationResourceBinding>.Ok(binding)
                     : KernelResult<ExternalOperationResourceBinding>.Fail(KernelError.InvalidTransition,
                         "Duplicate evidence conflicts with the terminal settlement.");
@@ -132,6 +157,7 @@ public sealed partial class ExternalOperationAuthority
             {
                 State = ExternalResourceBindingState.Settling,
                 TerminalReceiptSequence = evidence.ReceiptSequence,
+                TerminalEvidenceId = evidence.EvidenceId,
                 SettledAmount = evidence.ConsumedAmount
             };
             record.ResourceBinding = binding;

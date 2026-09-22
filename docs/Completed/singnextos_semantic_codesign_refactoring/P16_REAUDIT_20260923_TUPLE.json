@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "phase": "P16",
+  "recorded_at_local_date": "2026-09-23",
+  "singnextos": {
+    "head": "a0f70bc2bd031bd2b1138b2a01984309814bba5c",
+    "tree": "c9e667fda0605d993c01060b7d7dc04b73cfac80",
+    "start_user_owned_dirty_changes": []
+  },
+  "artifacts": [
+    { "path": "src/Runtime/SingPlus.Runtime/SipJobs/SipJobBarrierPlanner.cs", "bytes": 2178, "sha256": "09c1f3c4adb51e45215e28be2c22d8d9f100531b5f16651710240290d5cc3d4d" },
+    { "path": "src/Runtime/SingPlus.Runtime/SipJobs/SipJobSegmentAdmission.cs", "bytes": 8124, "sha256": "b89d857852fb3bf1c25802ed0a15191ffdabd2beaf8925d4ec3e1e9a5234a20e" },
+    { "path": "src/Runtime/SingPlus.Runtime/SipJobs/SipJobStageExecutionEligibility.cs", "bytes": 2575, "sha256": "2b8ea0d9816c491f96bd227d4d4305542cb9c9c383d23e83fd51d82d7926cc9b" },
+    { "path": "tests/SingPlus.Tests/SipJobs/SipJobSemanticTraceVocabulary.cs", "bytes": 5448, "sha256": "abd55cba51ad4d9f440f2c3e9d6534105ac35f8f3fee769e0d9859274bc0541d" },
+    { "path": "tests/SingPlus.Tests/SipJobs/Phase140ArchitecturalFreezeTests.cs", "bytes": 1919, "sha256": "4be40d092d5f6654e7ae3ffd2bc567e09ead74764bc05f804e620bcccf944878" },
+    { "path": "tests/SingPlus.Tests/SipJobs/Phase16SemanticTraceEquivalenceTests.cs", "bytes": 4561, "sha256": "25b574d16a89e368f95ee81447236eccf8719e1ab27a6b3df5f31c8c8dd61d8b" }
+  ],
+  "tests": {
+    "focused_sipjobs": { "passed": 153, "failed": 0, "skipped": 0 },
+    "full_non_gui": { "passed": 1876, "failed": 0, "skipped": 2 }
+  },
+  "claims": {
+    "trace_schema_and_comparator": "ModelOnly StaticAdmission",
+    "ordinary_fused_runtime_equivalence": "FutureGated",
+    "generator": "Deferred"
+  },
+  "gates": { "all_vnext_and_sipjob": "OFF" },
+  "hybridcpu_scope": "CONTRACTS_EXTERNAL_TOOL_ONLY",
+  "isa_impact": "NONE"
+}
