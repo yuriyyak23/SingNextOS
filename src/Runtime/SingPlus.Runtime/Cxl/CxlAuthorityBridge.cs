@@ -52,6 +52,13 @@ public sealed class CxlAuthorityBridge : ICxlTeardownParticipant
         return FromProvider(_io.ResolveDevice(expected.EndpointId, expected.DeviceGeneration));
     }
 
+    /// <summary>
+    /// Revalidates boot-admission evidence against the current provider generation. This
+    /// creates no fabric binding, backing lease, RegionUse, OwnedRegion, or capability.
+    /// </summary>
+    public KernelResult<CxlEndpointSnapshot> RevalidateFreshBootEndpoint(CxlEndpointSnapshot expected) =>
+        ValidateEndpoint(expected, CxlEndpointFeatures.Io | CxlEndpointFeatures.Memory);
+
     public KernelResult ValidateDeviceAuthority(
         PlatformDomainIdentity subject,
         PlatformDeviceLease deviceLease,

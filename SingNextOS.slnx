@@ -28,6 +28,7 @@
     <Project Path="src/Platform/SingPlus.Platform.Abstractions/SingPlus.Platform.Abstractions.csproj" />
     <Project Path="src/Platform/SingPlus.Platform.Host/SingPlus.Platform.Host.csproj" />
     <Project Path="src/Platform/SingPlus.Platform.HybridCpu/SingPlus.Platform.HybridCpu.csproj" />
+    <Project Path="src/Platform/SingPlus.Platform.HybridCpu.Boot/SingPlus.Platform.HybridCpu.Boot.csproj" />
   </Folder>
   <Folder Name="/src/Drivers/">
     <Project Path="src/Drivers/SingPlus.Drivers/SingPlus.Drivers.csproj" />
@@ -36,6 +37,8 @@
     <Project Path="src/Kernel/SingPlus.Kernel/SingPlus.Kernel.csproj" />
   </Folder>
   <Folder Name="/src/Kernel/Boot/">
+    <Project Path="src/Kernel/Boot/SingNext.Boot.Capsule/SingNext.Boot.Capsule.csproj" />
+    <Project Path="src/Kernel/Boot/SingNext.Boot.Core/SingNext.Boot.Core.csproj" />
     <Project Path="src/Kernel/Boot/SingPlus.Boot/SingPlus.Boot.csproj" />
   </Folder>
   <Folder Name="/src/Kernel/Hal.Host/" Id="9f89a4ac-d3ea-0297-734d-b818aef93f72">

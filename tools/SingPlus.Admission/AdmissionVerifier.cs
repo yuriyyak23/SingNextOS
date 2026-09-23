@@ -8,7 +8,7 @@ namespace SingPlus.Admission;
 
 public static class AdmissionVerifier
 {
-    private const string Ruleset = "SingPlusAdmissionRulesV13|Profiles:KernelNoHeapV10,ManagedCapV1|ManagedCap:full-local-closure-module-scan,positive-exact-framework-member-surface,unknown-member-deny,ambient-reference-static-recursive-value-closure-deny,native-inventory-deny|AssemblyIdentity:unique|ParentType:named-generic,nested,unsupported-reject|Root:unique-name|LocalCall:exact-metadata-signature-or-reject|KernelNoHeap:newobj,newarr,box,ldind,stind,ldobj,stobj,cpblk,initblk,localloc,calli,interop(PinvokeImpl,InternalCall,Unmanaged,NonCil,DllImport,LibraryImport,UnmanagedCallersOnly),explicit-layout-field,framework-memory-boundary|ConcreteReachableBody:required,AbstractRoot:deny|RuntimeAsyncV2:lowering-unavailable|ForbiddenApi:System.Console,System.Environment,System.GC,System.Activator,System.Threading.ThreadPool,System.Threading.Tasks.Task,System.Diagnostics.Process,System.IO.*,System.Net.*,System.Reflection.*,System.Linq.Expressions.*|ForbiddenAssemblies:System.Console,System.IO.*,System.Net.*,System.Reflection.Emit*,Microsoft.CSharp|UnknownDependency:deny|LocalSingPlusDependency:required,identity-match,raw-sha256,transitive";
+    private const string Ruleset = "SingPlusAdmissionRulesV14|Profiles:KernelNoHeapV10,ManagedCapV1,BootCapsuleV1|BootCapsule:reachable-noheap,exact-local-dependency-allowlist,native-inventory-deny|ManagedCap:full-local-closure-module-scan,positive-exact-framework-member-surface,unknown-member-deny,ambient-reference-static-recursive-value-closure-deny,native-inventory-deny|AssemblyIdentity:unique|ParentType:named-generic,nested,unsupported-reject|Root:unique-name|LocalCall:exact-metadata-signature-or-reject|KernelNoHeap:newobj,newarr,box,ldind,stind,ldobj,stobj,cpblk,initblk,localloc,calli,interop(PinvokeImpl,InternalCall,Unmanaged,NonCil,DllImport,LibraryImport,UnmanagedCallersOnly),explicit-layout-field,framework-memory-boundary|ConcreteReachableBody:required,AbstractRoot:deny|RuntimeAsyncV2:lowering-unavailable|ForbiddenApi:System.Console,System.Environment,System.GC,System.Activator,System.Threading.ThreadPool,System.Threading.Tasks.Task,System.Diagnostics.Process,System.IO.*,System.Net.*,System.Reflection.*,System.Linq.Expressions.*|ForbiddenAssemblies:System.Console,System.IO.*,System.Net.*,System.Reflection.Emit*,Microsoft.CSharp|UnknownDependency:deny|LocalSingPlusDependency:required,identity-match,raw-sha256,transitive";
 
     public static ManagedCapPolicyDescriptor GetManagedCapPolicyDescriptor()
     {
@@ -82,7 +82,7 @@ public static class AdmissionVerifier
             {
                 var model = new AssemblyModel(Path.GetFullPath(path));
                 if (!string.Equals(model.Path, rootPath, StringComparison.OrdinalIgnoreCase) &&
-                    !model.Name.StartsWith("SingPlus.", StringComparison.Ordinal))
+                    !IsLocalAdmissionAssemblyName(model.Name))
                 {
                     model.Dispose();
                     continue;
@@ -120,14 +120,12 @@ public static class AdmissionVerifier
                 var content = hasLocal ? local!.ContentDigest : "external";
                 dependencies.Add(identity + "|" + content);
                 if (IsForbiddenAssembly(name)) violations.Add(new AdmissionViolation(model.Name, "forbidden-dependency", name));
-                else if (!IsKnownDependency(name)) violations.Add(new AdmissionViolation(model.Name, "unknown-dependency-category", name));
+                else if (!policy.IsDependencyAllowed(name)) violations.Add(new AdmissionViolation(model.Name, "unknown-dependency-category", name));
                 else if (policy.PositiveFrameworkSurface && !hasLocal && !policy.IsFrameworkAssemblyVersionAllowed(name, reference.Version))
                     violations.Add(new AdmissionViolation(model.Name, "unclassified-framework-version", name + "|" + reference.Version));
-                else if (policy.RequireLocalSingPlusDependencies &&
-                         name.StartsWith("SingPlus.", StringComparison.Ordinal) && !hasLocal)
+                else if (policy.RequiresLocalDependency(name) && !hasLocal)
                     violations.Add(new AdmissionViolation(model.Name, "missing-local-dependency", name));
-                else if (policy.RequireLocalSingPlusDependencies &&
-                         name.StartsWith("SingPlus.", StringComparison.Ordinal) && hasLocal && local!.Version != reference.Version)
+                else if (policy.RequiresLocalDependency(name) && hasLocal && local!.Version != reference.Version)
                     violations.Add(new AdmissionViolation(model.Name, "local-dependency-identity-mismatch", identity));
                 if (hasLocal) pending.Enqueue(local!);
             }
@@ -312,6 +310,11 @@ public static class AdmissionVerifier
         name == "mscorlib" || name == "netstandard" || name.StartsWith("System.", StringComparison.Ordinal) ||
         name.StartsWith("Microsoft.", StringComparison.Ordinal) || name.StartsWith("SingPlus.", StringComparison.Ordinal);
 
+    private static bool IsLocalAdmissionAssemblyName(string name) =>
+        name.StartsWith("SingPlus.", StringComparison.Ordinal) ||
+        name.StartsWith("SingNext.Boot.", StringComparison.Ordinal) ||
+        name == "HybridCpu.Boot.Contracts";
+
     private static bool IsForbiddenApi(string displayName)
     {
         var separator = displayName.IndexOf("::", StringComparison.Ordinal);
@@ -375,8 +378,24 @@ public static class AdmissionVerifier
         {
             "KernelNoHeap" => new(profile, "KernelNoHeapV10|net11", true, false, true, true, false, true, false),
             "ManagedCap" => new(profile, "ManagedCapV1|net11|framework-surface-v1", true, true, true, false, true, true, true),
+            "BootCapsule" => new(profile, "BootCapsuleV1|net11|reachable-noheap|exact-dependencies", true, false, true, true, false, true, true),
             _ => new(profile, "UnknownProfile|deny", false, false, true, true, true, true, true)
         };
+
+        public bool IsDependencyAllowed(string name)
+        {
+            if (Name != "BootCapsule") return IsKnownDependency(name);
+            return name is "mscorlib" or "netstandard" or "System.Private.CoreLib" or "System.Runtime" or
+                "SingNext.Boot.Core" or "SingPlus.Platform.HybridCpu.Boot" or "HybridCpu.Boot.Contracts" or "SingNext.Boot.Capsule";
+        }
+
+        public bool RequiresLocalDependency(string name)
+        {
+            if (!RequireLocalSingPlusDependencies) return false;
+            if (Name == "BootCapsule")
+                return name is "SingNext.Boot.Core" or "SingPlus.Platform.HybridCpu.Boot" or "HybridCpu.Boot.Contracts" or "SingNext.Boot.Capsule";
+            return name.StartsWith("SingPlus.", StringComparison.Ordinal);
+        }
 
         public bool IsFrameworkMemberAllowed(string? assemblyName, string displayName, string signature)
         {
@@ -456,6 +475,8 @@ public static class AdmissionVerifier
             var split = identity.Split(new[] { "::" }, 2, StringSplitOptions.None);
             if (split.Length != 2) throw new ArgumentException("Method must use Type::Method format.", nameof(identity));
             MethodDefinitionHandle? match = null;
+            MethodDefinitionHandle? uniqueNameMatch = null;
+            var nameMatchCount = 0;
             foreach (var typeHandle in Reader.TypeDefinitions)
             {
                 var type = Reader.GetTypeDefinition(typeHandle);
@@ -463,14 +484,21 @@ public static class AdmissionVerifier
                 foreach (var methodHandle in type.GetMethods())
                 {
                     var method = Reader.GetMethodDefinition(methodHandle);
-                    if (!string.Equals(Reader.GetString(method.Name), split[1], StringComparison.Ordinal) ||
-                        !string.Equals(SignatureHex(method.Signature), signature, StringComparison.Ordinal)) continue;
+                    if (!string.Equals(Reader.GetString(method.Name), split[1], StringComparison.Ordinal)) continue;
+                    nameMatchCount++;
+                    uniqueNameMatch = methodHandle;
+                    if (!string.Equals(SignatureHex(method.Signature), signature, StringComparison.Ordinal)) continue;
                     if (match is not null)
                         throw new InvalidOperationException($"Admission method identity '{identity}|{signature}' is ambiguous.");
                     match = methodHandle;
                 }
             }
-            return match;
+            if (match is not null) return match;
+            // TypeDefOrRef indices are local to a metadata image, so otherwise-identical
+            // Span/ref-struct signatures can have different raw blobs across assemblies.
+            // A unique same-named target still selects exactly one body; overloads remain
+            // fail-closed and require exact signature-qualified resolution.
+            return nameMatchCount == 1 ? uniqueNameMatch : null;
         }
 
         public string GetMethodDisplayName(MethodDefinitionHandle handle)

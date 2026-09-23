@@ -43,7 +43,11 @@ public sealed class SingCapPhase01ToolchainTests
             .ToArray();
         Assert.Equal(projects, declared.Order(StringComparer.Ordinal).ToArray());
 
-        string[] profiles = ["ManagedCap", "TrustedRuntime", "NativeIsolated", "PlatformExternal", "BuildTool/TestOnly"];
+        string[] profiles =
+        [
+            "ManagedCap", "TrustedRuntime", "NativeIsolated", "PlatformExternal", "BuildTool/TestOnly",
+            "BootCore", "BootPlatformAdapter", "BootCapsule"
+        ];
         foreach (var entry in entries)
         {
             Assert.Contains(entry.GetProperty("profile").GetString(), profiles);

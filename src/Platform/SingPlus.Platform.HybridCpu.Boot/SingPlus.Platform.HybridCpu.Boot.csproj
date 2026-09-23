@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>SingPlus.Platform.HybridCpu.Boot</AssemblyName>
+    <RootNamespace>SingPlus.Platform.HybridCpu.Boot</RootNamespace>
+    <SingCapSecurityProfile>BootPlatformAdapter</SingCapSecurityProfile>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../Kernel/Boot/SingNext.Boot.Core/SingNext.Boot.Core.csproj" />
+    <ProjectReference Include="../../../tools/HybridCpu_ExecutableAdapter/Boot.Contracts/HybridCpu.Boot.Contracts.csproj" />
+  </ItemGroup>
+</Project>

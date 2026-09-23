@@ -83,10 +83,13 @@ public sealed class HybridBootInfoImporter(
             security.Value, hasAperture, info.Records.ToArray());
 
         // Endpoint candidates come only from a current OS discovery pass, never from BootInfo.
+        var sawFreshCandidate = false;
+        var sawProviderRefusal = false;
         foreach (var endpointId in freshDiscovery.EnumerateCurrentEndpoints().Distinct().OrderBy(static x => x.Value, StringComparer.Ordinal))
         {
+            sawFreshCandidate = true;
             var current = provider.QueryEndpoint(endpointId);
-            if (!current.IsSuccess) continue;
+            if (!current.IsSuccess) { sawProviderRefusal = true; continue; }
             var endpoint = current.Value!;
             if (!endpoint.Available || endpoint.DeviceGeneration.Value == 0 ||
                 (endpoint.Features & (CxlEndpointFeatures.Io | CxlEndpointFeatures.Memory)) != (CxlEndpointFeatures.Io | CxlEndpointFeatures.Memory))
@@ -99,6 +102,8 @@ public sealed class HybridBootInfoImporter(
 
         if (hasAperture)
             _ = apertureRetirement.ReleaseInvalidateOrQuarantine(info.ResetSequence);
+        if (sawFreshCandidate && sawProviderRefusal)
+            return HybridBootTakeoverResult.Fail(HybridBootImportFailure.ProviderRefused, "The current provider refused a freshly enumerated endpoint.");
         return HybridBootTakeoverResult.Fail(HybridBootImportFailure.NoFreshEndpoint, "Fresh CXL discovery found no admissible endpoint.");
     }
 }

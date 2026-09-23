@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>SingNext.Boot.Core</AssemblyName>
+    <RootNamespace>SingNext.Boot.Core</RootNamespace>
+    <SingCapSecurityProfile>BootCore</SingCapSecurityProfile>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../../../tools/HybridCpu_ExecutableAdapter/Boot.Contracts/HybridCpu.Boot.Contracts.csproj" />
+  </ItemGroup>
+</Project>

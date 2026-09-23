@@ -51,7 +51,7 @@ public sealed class HybridBootInfoImporterTests
             .ImportAndDiscover(Wire(true, 7));
 
         Assert.False(result.IsSuccess);
-        Assert.Equal(HybridBootImportFailure.NoFreshEndpoint, result.Failure);
+        Assert.Equal(HybridBootImportFailure.ProviderRefused, result.Failure);
         Assert.Equal(1, retirement.Calls);
     }
 

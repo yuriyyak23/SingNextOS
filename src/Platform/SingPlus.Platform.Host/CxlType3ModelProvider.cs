@@ -3,7 +3,7 @@ using SingPlus.Contracts;
 namespace SingPlus.Platform.Host;
 
 /// <summary>Deterministic single-host Type-3 model. Hardware routing facts are intentionally private.</summary>
-public sealed class CxlType3ModelProvider : ICxlDiscoveryProvider, ICxlIoProvider, ICxlFabricProvider, ICxlMemoryProvider, ICxlFabricManagementProvider
+public sealed class CxlType3ModelProvider : ICxlDiscoveryProvider, ICxlEndpointEnumerationProvider, ICxlIoProvider, ICxlFabricProvider, ICxlMemoryProvider, ICxlFabricManagementProvider
 {
     private sealed class EndpointRecord(
         CxlEndpointId id, PlatformDeviceIdentity device, long capacity, CxlMemoryPersistence persistence,
@@ -82,6 +82,14 @@ public sealed class CxlType3ModelProvider : ICxlDiscoveryProvider, ICxlIoProvide
             return _endpoints.TryGetValue(endpointId, out var e)
                 ? PlatformAuthorityResult<CxlEndpointSnapshot>.Ok(new(e.Id, new(e.DeviceGeneration), CxlEndpointFeatures.Io | CxlEndpointFeatures.Memory, e.Available))
                 : Missing<CxlEndpointSnapshot>();
+    }
+
+    public PlatformAuthorityResult<IReadOnlyList<CxlEndpointId>> EnumerateCurrentEndpoints()
+    {
+        lock (_gate)
+            return PlatformAuthorityResult<IReadOnlyList<CxlEndpointId>>.Ok(
+                _endpoints.Values.Where(static endpoint => endpoint.Available).Select(static endpoint => endpoint.Id)
+                    .OrderBy(static id => id.Value, StringComparer.Ordinal).ToArray());
     }
 
     public PlatformAuthorityResult<PlatformDeviceIdentity> ResolveDevice(CxlEndpointId endpointId, CxlDeviceGeneration expectedGeneration)

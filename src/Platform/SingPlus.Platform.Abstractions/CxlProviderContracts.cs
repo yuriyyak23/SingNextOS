@@ -85,6 +85,29 @@ public interface ICxlDiscoveryProvider
     PlatformAuthorityResult<CxlEndpointSnapshot> QueryEndpoint(CxlEndpointId endpointId);
 }
 
+/// <summary>Enumerates the provider's current endpoint identities; boot evidence is never an input.</summary>
+public interface ICxlEndpointEnumerationProvider
+{
+    PlatformAuthorityResult<IReadOnlyList<CxlEndpointId>> EnumerateCurrentEndpoints();
+}
+
+public enum FirmwareBootApertureRetirementStatus
+{
+    Released = 0,
+    ProvenPreviouslyRetired,
+    Unsupported,
+    Ambiguous,
+}
+
+public readonly record struct FirmwareBootApertureRetirementResult(
+    FirmwareBootApertureRetirementStatus Status, ulong ResetSequence, string? Detail);
+
+/// <summary>Platform owner for the firmware-created aperture. It grants no memory authority.</summary>
+public interface IFirmwareBootApertureOwner
+{
+    FirmwareBootApertureRetirementResult RetireFirmwareBootAperture(ulong resetSequence);
+}
+
 /// <summary>Projects CXL.io discovery into the ordinary semantic device identity.</summary>
 public interface ICxlIoProvider
 {

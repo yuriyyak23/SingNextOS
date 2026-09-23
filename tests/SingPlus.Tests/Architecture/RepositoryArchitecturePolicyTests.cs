@@ -20,6 +20,9 @@ public sealed class RepositoryArchitecturePolicyTests
         NativeSdk,
         Compatibility,
         BootContracts,
+        BootCore,
+        BootPlatformAdapter,
+        BootCapsule,
         NeutralContracts,
         NeutralAuthority,
         NeutralModel,
@@ -96,6 +99,13 @@ public sealed class RepositoryArchitecturePolicyTests
     [InlineData(Layer.ExecutableAdapter, Layer.NeutralModel)]
     [InlineData(Layer.ExecutableAdapter, Layer.Compatibility)]
     [InlineData(Layer.ExecutableAdapter, Layer.ProviderAdapter)]
+    [InlineData(Layer.BootCore, Layer.PrivilegedMechanism)]
+    [InlineData(Layer.BootCore, Layer.ExecutableAdapter)]
+    [InlineData(Layer.BootPlatformAdapter, Layer.BootCapsule)]
+    [InlineData(Layer.BootCapsule, Layer.PrivilegedMechanism)]
+    [InlineData(Layer.BootCapsule, Layer.ProviderAdapter)]
+    [InlineData(Layer.BootCapsule, Layer.ExecutableAdapter)]
+    [InlineData(Layer.BootCapsule, Layer.NeutralModel)]
     public void ProjectPolicyFixtureRejectsForbiddenEdges(Layer source, Layer target) =>
         Assert.False(IsProjectReferenceAllowed(source, target));
 
@@ -132,6 +142,47 @@ public sealed class RepositoryArchitecturePolicyTests
             Assert.False(IsForbiddenPublicAssembly(exposed.Assembly.GetName().Name), $"{type.FullName} exposes {exposed.FullName}.");
     }
 
+    [Fact]
+    public void DirectBootRootsHaveNoForbiddenTransitiveAssemblyClosure()
+    {
+        var forbidden = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "SingPlus.Runtime",
+            "SingPlus.Kernel.Hal.Host",
+            "HybridCpu_ExecutableAdapter",
+            "HybridCPU_NeutralRuntime.Model",
+        };
+        foreach (var root in new[]
+                 {
+                     typeof(SingNext.Boot.Core.BootCoreAssembly).Assembly,
+                     typeof(SingNext.Boot.Capsule.BootCapsuleAssembly).Assembly,
+                 })
+        {
+            var pending = new Queue<AssemblyName>(root.GetReferencedAssemblies());
+            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            while (pending.TryDequeue(out var reference))
+            {
+                if (reference.Name is null || !visited.Add(reference.Name)) continue;
+                Assert.DoesNotContain(reference.Name, forbidden);
+                var localPath = Path.Combine(Path.GetDirectoryName(root.Location)!, reference.Name + ".dll");
+                if (!File.Exists(localPath)) continue;
+                foreach (var child in Assembly.LoadFrom(localPath).GetReferencedAssemblies()) pending.Enqueue(child);
+            }
+        }
+    }
+
+    [Fact]
+    public void ManagedGcHostDebugBootCannotBeClassifiedAsCapsule()
+    {
+        var project = Path.Combine(Root, "src", "Kernel", "Boot", "SingPlus.Boot", "SingPlus.Boot.csproj");
+        Assert.Equal(Layer.PrivilegedMechanism, Classify(project));
+        var references = XDocument.Load(project).Descendants("ProjectReference")
+            .Select(static value => ((string?)value.Attribute("Include"))?.Replace('\\', '/'))
+            .ToArray();
+        Assert.Contains(references, static value => value?.Contains("SingPlus.Runtime", StringComparison.Ordinal) == true);
+        Assert.Contains(references, static value => value?.Contains("SingPlus.Kernel.Hal.Host", StringComparison.Ordinal) == true);
+    }
+
     private static IEnumerable<string> EnumerateProjects() =>
         Directory.EnumerateFiles(Root, "*.csproj", SearchOption.AllDirectories)
             .Where(static path => !IsBuildOutputPath(path));
@@ -145,6 +196,9 @@ public sealed class RepositoryArchitecturePolicyTests
     private static bool IsProjectReferenceAllowed(Layer source, Layer target) => source switch
     {
         Layer.Contracts or Layer.BootContracts or Layer.NeutralContracts => false,
+        Layer.BootCore => target is Layer.BootContracts,
+        Layer.BootPlatformAdapter => target is Layer.BootCore or Layer.BootContracts,
+        Layer.BootCapsule => target is Layer.BootCore or Layer.BootPlatformAdapter or Layer.BootContracts,
         Layer.Sip => target is Layer.Contracts or Layer.NativeSdk or Layer.Tooling,
         Layer.PlatformAbstractions => target is Layer.Contracts,
         Layer.DriversServices => target is Layer.Contracts,
@@ -162,6 +216,7 @@ public sealed class RepositoryArchitecturePolicyTests
     private static bool IsPackageReferenceAllowed(Layer source, PackageClass packageClass) => source switch
     {
         Layer.PrivilegedMechanism => packageClass == PackageClass.ExternalSemanticContract,
+        Layer.BootCore or Layer.BootPlatformAdapter or Layer.BootCapsule => false,
         Layer.ExecutableAdapter => packageClass is PackageClass.ExternalSemanticContract or PackageClass.ExternalRuntimeImplementation,
         Layer.Tooling => packageClass is PackageClass.TestTooling or PackageClass.CompilerTooling,
         _ => false,
@@ -201,6 +256,9 @@ public sealed class RepositoryArchitecturePolicyTests
     {
         var relative = Path.GetRelativePath(Root, path).Replace('\\', '/');
         if (relative.StartsWith("tests/", StringComparison.OrdinalIgnoreCase) || relative.EndsWith(".Tests.csproj", StringComparison.OrdinalIgnoreCase) || relative.StartsWith("tools/SingPlus.", StringComparison.OrdinalIgnoreCase) || relative.StartsWith("sdk/SingPlus.Analyzers", StringComparison.OrdinalIgnoreCase) || relative.StartsWith("sdk/SingPlus.Generators", StringComparison.OrdinalIgnoreCase)) return Layer.Tooling;
+        if (relative == "src/Kernel/Boot/SingNext.Boot.Core/SingNext.Boot.Core.csproj") return Layer.BootCore;
+        if (relative == "src/Platform/SingPlus.Platform.HybridCpu.Boot/SingPlus.Platform.HybridCpu.Boot.csproj") return Layer.BootPlatformAdapter;
+        if (relative == "src/Kernel/Boot/SingNext.Boot.Capsule/SingNext.Boot.Capsule.csproj") return Layer.BootCapsule;
         if (relative == "contracts/SingPlus.Contracts/SingPlus.Contracts.csproj") return Layer.Contracts;
         if (relative == "src/Sip/SingPlus.Sip/SingPlus.Sip.csproj") return Layer.Sip;
         if (relative == "src/Platform/SingPlus.Platform.Abstractions/SingPlus.Platform.Abstractions.csproj") return Layer.PlatformAbstractions;

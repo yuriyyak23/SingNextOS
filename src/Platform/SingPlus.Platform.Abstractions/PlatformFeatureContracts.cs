@@ -45,7 +45,20 @@ public enum PlatformFeatureAvailability
 }
 
 public enum PlatformExternalGateState { ExternalBlocked = 0, Unavailable, SatisfiedForExplicitProfile }
-public enum PlatformExternalRequirement { ExtHcpu001 = 1, ExtHcpu002, ExtHcpu003, ExtHcpu004, ExtHcpu005, ExtHcpu006 }
+public enum PlatformExternalRequirement
+{
+    ExtHcpu001 = 1,
+    ExtHcpu002,
+    ExtHcpu003,
+    ExtHcpu004,
+    ExtHcpu005,
+    ExtHcpu006,
+    ExtHcpu007,
+    ExtHcpu008,
+    ExtHcpu009,
+    ExtHcpu010,
+    ExtHcpu011,
+}
 public readonly record struct PlatformExternalGate(PlatformExternalRequirement Requirement, PlatformExternalGateState State, string Scope);
 public readonly record struct PlatformExternalFeatureGate(
     PlatformExternalRequirement Requirement,
@@ -62,7 +75,12 @@ public static class PlatformExternalGateTable
         new PlatformExternalGate(PlatformExternalRequirement.ExtHcpu003, PlatformExternalGateState.ExternalBlocked, "HybridCPU scheduler-policy admission"),
         new PlatformExternalGate(PlatformExternalRequirement.ExtHcpu004, PlatformExternalGateState.ExternalBlocked, "Executable external mapping/custody/coherence"),
         new PlatformExternalGate(PlatformExternalRequirement.ExtHcpu005, PlatformExternalGateState.ExternalBlocked, "HybridCPU executable DSC1 Copy"),
-        new PlatformExternalGate(PlatformExternalRequirement.ExtHcpu006, PlatformExternalGateState.SatisfiedForExplicitProfile, "Pinned V3 executable-child profile only; evidence, SecureCompute and nested domains unavailable")
+        new PlatformExternalGate(PlatformExternalRequirement.ExtHcpu006, PlatformExternalGateState.SatisfiedForExplicitProfile, "Pinned V3 executable-child profile only; evidence, SecureCompute and nested domains unavailable"),
+        new PlatformExternalGate(PlatformExternalRequirement.ExtHcpu007, PlatformExternalGateState.Unavailable, "Direct SingNext capsule entry ABI"),
+        new PlatformExternalGate(PlatformExternalRequirement.ExtHcpu008, PlatformExternalGateState.Unavailable, "Direct SingNext capsule bootstrap memory profile"),
+        new PlatformExternalGate(PlatformExternalRequirement.ExtHcpu009, PlatformExternalGateState.Unavailable, "Architectural reset-to-ROM authenticated capsule transfer"),
+        new PlatformExternalGate(PlatformExternalRequirement.ExtHcpu010, PlatformExternalGateState.Unavailable, "ISE PCI/CXL Type-3/HDM end-to-end behavior"),
+        new PlatformExternalGate(PlatformExternalRequirement.ExtHcpu011, PlatformExternalGateState.ExternalBlocked, "Power-loss-safe monotonic protected boot state")
     });
 
     public static IReadOnlyList<PlatformExternalFeatureGate> FeatureGates { get; } = Array.AsReadOnly(new[]
