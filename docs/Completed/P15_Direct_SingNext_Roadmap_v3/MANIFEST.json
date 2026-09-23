@@ -2,10 +2,10 @@
   "schema": "P15DirectSingNextRoadmapManifestV3",
   "roadmapVersion": "3.0",
   "generatedDate": "2026-09-23",
-  "status": "ImplementationPlanNotEvidence",
+  "status": "ImplementationPlanWithSeparateEvidenceNotReadiness",
   "authoritativeRepository": "yuriyyak23/SingNextOS",
   "authoritativeBranch": "master",
-  "observedSingNextOsMasterSha": "ebf16c0823c2c0c8a617778945c99ba34f3ca727",
+  "observedSingNextOsMasterSha": "1e767da4e649832fe018f4bc365da9be824d1951",
   "externalDependency": {
     "repository": "yuriyyak23/HybridCPU-v2",
     "observedMasterSha": "794c4a53494f503855ac8cf209efab23fde083b2",
@@ -55,9 +55,9 @@
     "MANIFEST.json"
   ],
   "checksums": {
-    "00-README.md": "sha256:73398d9aa03b40890c9ec3c61a3563b0d7ce67310b2f74f1155c0fa37c0e993c",
+    "00-README.md": "sha256:d0c1fb82e588a4ce62c8f62c9ef04c3f8315e8452b90f2f9b19b7b28fa87ec16",
     "01-DECISION-AND-SCOPE.md": "sha256:bf101e6be92e315b7089e9c736285a444ada7348f78666119b0ff464289c05b5",
-    "02-CURRENT-STATE-BASELINE.md": "sha256:b77f9e92a7e616b61c669958a53cee273725a5fc8eb76d8106aa20ef8be68303",
+    "02-CURRENT-STATE-BASELINE.md": "sha256:f9b05e5edec8aa65292d06131549afdae541cf9a7a66d772ed798c6c7df923f3",
     "03-TARGET-PROJECT-TREE-AND-DAG.md": "sha256:2172aa46feca899926936c1c39db0874b68c4874fe438c611aeb272aac564c90",
     "04-API-CONTRACTS.md": "sha256:e2e8e9d13deb454ecb9357cda4b6eba551b423ffd5763701e8384c42b49ebf48",
     "05-MIGRATION-MAP.md": "sha256:4997f0163dfc7950be03c809962bc804abd340e976616d60b2386e52df5265a0",
@@ -73,7 +73,7 @@
     "15-CI-REPOSITORY-INTEGRATION.md": "sha256:a0b392803418c5b43cb2f858521c024e6c6f3f0c9f633e20949f32fa42740bd1",
     "16-EXTERNAL-HYBRIDCPU-FEATURE-GATES.md": "sha256:cfe8f84ce42bb50a12da8654e3954b49ef4ad6fdadf924b95d3efd324aa3f876",
     "17-RISKS-NON-GOALS-AND-FAIL-CLOSED.md": "sha256:cbb9c0c737804f3ed424f664249ef60ef881dd2ae6d63002f77eccf37751dee0",
-    "18-IMPLEMENTATION-CHECKLIST.md": "sha256:aeb23662d2b3ab8612756e78b4f764c99c4880199e545da496d298f0c299b311",
+    "18-IMPLEMENTATION-CHECKLIST.md": "sha256:56e0db9aa2a0677d691e9c286f722719bf580c881f2b03c5315a7ec131c7228e",
     "19-TRACEABILITY-MATRIX.md": "sha256:58dd574f1ab345c532a43a3097674d480afe3f4b58baa811f405b6966160c062",
     "20-FINDINGS-RESOLUTION-MAP.md": "sha256:79aa3ad76d869b23787d4007036fc6083a21de477e8e4f05a525ac8f3970ffa0",
     "21-V3-DELTA.md": "sha256:e5915c85e89f4930be460a9fd146e32369bd480f94d4feea9350ae159d052d3e"

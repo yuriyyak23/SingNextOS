@@ -1,28 +1,28 @@
 # Current-State Baseline and P15-00 Revalidation
 
-Observed SingNextOS master for this roadmap update: `ebf16c0823c2c0c8a617778945c99ba34f3ca727`.
+Observed SingNextOS master before the follow-up audit changes: `1e767da4e649832fe018f4bc365da9be824d1951`.
 
 ## Code-grounded matrix
 
 | Area | Current source evidence | Status | P15 action |
 |---|---|---|---|
 | Boot.Contracts | `tools/HybridCpu_ExecutableAdapter/Boot.Contracts/HybridCpu.Boot.Contracts.csproj`; `HybridBootInfoCodec.cs`, `BootPolicyCodec.cs` | `ContractOnly` / executable contract dependency | Reuse in place; freeze surface; do not duplicate |
-| Boot.Core candidate logic | `tools/HybridCpu_ExecutableAdapter/Boot/*Model.cs` | `ModelOnly` | Rewrite deterministic semantics behind Core ports; retain oracles |
-| Boot Capsule | no dedicated Direct-SingNext capsule project found; existing `src/Kernel/Boot/SingPlus.Boot` is host-debug `ManagedGc` | `Absent` for target capsule | Create new project; do not repurpose host-debug boot |
+| Boot.Core candidate logic | `src/Kernel/Boot/SingNext.Boot.Core`; retained `tools/HybridCpu_ExecutableAdapter/Boot/*Model.cs` oracle | `ModelValidated`; local production semantics tested | Keep oracle until broader differential proof and qualification exist |
+| Boot Capsule | `src/Kernel/Boot/SingNext.Boot.Capsule`; existing `src/Kernel/Boot/SingPlus.Boot` remains host-debug `ManagedGc` | project present; real root not admitted; entry returns `Unsupported` | Do not report success until entry/bootstrap/admission gates are satisfied |
 | HybridPlatformDescriptor | no verified authoritative production equivalent established | `Absent/Unverified` | Add only if P15-00 confirms no equivalent |
 | HybridBootInfo codec | `tools/.../Boot.Contracts/HybridBootInfoCodec.cs` | `ContractOnly` | Reuse wire format; do not assume allocation profile is capsule-safe |
 | HybridBootInfo importer | `src/Runtime/SingPlus.Runtime/Boot/HybridBootInfoImporter.cs` | `RuntimeImplemented`, locally `AdapterQualified` by existing evidence | Reuse; wire into real handoff |
-| Fresh discovery interface | same production file | `RuntimeImplemented` interface | Provide concrete production implementation; only tests currently implement it |
-| Aperture retirement interface | same production file | `RuntimeImplemented` interface | Provide concrete production implementation; only tests currently implement it |
+| Fresh discovery interface | interface in importer; `ProviderFreshCxlBootDiscovery` in `HybridBootProductionAdapters.cs` | local adapter implemented | Physical platform enumeration/composition remains external-gated |
+| Aperture retirement interface | interface in importer; `PlatformFirmwareApertureRetirement` in `HybridBootProductionAdapters.cs` | local adapter implemented | Exact-owner physical retirement proof remains external-gated |
 | Runtime CXL authority | `CxlAuthorityBridge.cs`, `CxlType3MemoryAuthority.cs` | `RuntimeImplemented` | Remains sole CXL authority path |
 | Region ownership | `Regions/RegionAuthority.cs` | `RuntimeImplemented` | Remains sole ownership authority |
 | Runtime reset epochs | `RuntimeKernel.PlatformBackendReset.cs::ObservePlatformBackendReset()` | `RuntimeImplemented` | Reuse for runtime backend lifecycle only |
 | Kernel entry | `src/Kernel/SingPlus.Kernel/Boot/KernelEntryPoint.cs` | `ProductionPath` for current host/kernel path | Extend via narrow entry adapter; preserve admission root semantics |
 | Existing SingPlus.Boot | `src/Kernel/Boot/SingPlus.Boot/*.cs`, references Runtime + Host HAL, `ManagedGc` | `ProductionPath` host-debug only | Keep separate from capsule |
-| PCI/CXL boot transport | adapter models and runtime providers exist; no SingNext-owned pre-kernel hardware project | `ModelOnly`/partial runtime | Create boot-specific platform adapter |
-| Temporary HDM | `TemporaryApertureModel.cs` | `ModelOnly` | Rewrite state machine + hardware executor |
-| Protected state | `TrustAndProtectedStateModel.cs` | `ModelOnly` | Core policy + protected-store port; hardware gated |
-| A/B and recovery | `AbRecoveryModel.cs`, `Stage0RecoveryModel.cs`, `Stage1LoadModel.cs` | `ModelOnly` | Differential rewrite |
+| PCI/CXL boot transport | `src/Platform/SingPlus.Platform.HybridCpu.Boot` plus retained models | local deterministic adapter semantics only | Real PCI/CXL transport remains `ExternalBlocked` |
+| Temporary HDM | production state machine plus retained `TemporaryApertureModel.cs` | local deterministic semantics | Physical decoder/coherence proof remains external-gated |
+| Protected state | Core durable protocol port plus retained model | protocol locally tested | Power-loss-safe store implementation remains `ExternalBlocked` |
+| A/B and recovery | Core state/recovery policies plus retained models | local deterministic semantics | Retain oracles; no ISE/hardware promotion |
 | Static admission | `SingPlus.Admission`, `KernelNoHeap`, `ManagedCap` | `Runtime/ToolingImplemented` | Extend existing verifier/profile mechanism; no second analyzer |
 | Architecture policy | `RepositoryArchitecturePolicyTests` includes `BootContracts` layer | `Runtime/TestImplemented` | Reuse existing `BootContracts`; add only missing new production layers |
 | External gate table | `PlatformFeatureContracts.cs::PlatformExternalGateTable` | `RuntimeImplemented` | Map P15 gates to existing requirements when possible |

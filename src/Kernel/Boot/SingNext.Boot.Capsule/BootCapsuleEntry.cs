@@ -7,7 +7,7 @@ public static class BootCapsuleEntry
 {
     // This root intentionally stays allocation-free. Full composition is added only through
     // admitted value-type/Span paths; unavailable platform services return a terminal code.
-    public static int Run() => 0;
+    public static int Run() => (int)BootFailure.Unsupported;
 
     public static int Prepare(
         ReadOnlySpan<byte> authenticatedImage,

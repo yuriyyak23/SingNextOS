@@ -1,22 +1,24 @@
 # Implementation Checklist
 
+Checked items below mean repository implementation or local deterministic evidence only. They do not imply `IseValidated`, `HardwareValidated`, an admitted capsule root, or a requalified HybridCPU revision.
+
 ## P15-00 baseline
 
-- [ ] Record current SingNextOS master SHA.
-- [ ] Record observed HybridCPU master separately from qualified HybridCPU SHA.
-- [ ] Confirm compiler contract version without treating version equality as qualification.
+- [x] Record current SingNextOS master SHA.
+- [x] Record observed HybridCPU master separately from qualified HybridCPU SHA.
+- [x] Confirm compiler contract version without treating version equality as qualification.
 - [ ] Inventory every `tools/HybridCpu_ExecutableAdapter/Boot/*` file.
 - [ ] Freeze existing Boot.Contracts paths/types/public surface.
 - [ ] Locate existing `HybridBootInfoImporter`, `IFreshCxlBootDiscovery`, `IFirmwareApertureRetirement`.
 - [ ] Confirm whether production implementations of the latter two exist; do not count test fakes.
 - [ ] Locate `CxlAuthorityBridge`, `CxlType3MemoryAuthority`, `RegionAuthority`, `ObservePlatformBackendReset`.
 - [ ] Record existing `SingPlus.Boot` as host-debug/ManagedGc and keep it separate.
-- [ ] Emit `DirectSingNextBootBaselineV2.json`.
+- [x] Emit and machine-validate `DirectSingNextBootBaselineV2.json`.
 
 ## Project graph
 
 - [ ] Reuse current Boot.Contracts before considering path move.
-- [ ] Add Core/PlatformAdapter/Capsule projects to `SingNextOS.slnx`.
+- [x] Add Core/PlatformAdapter/Capsule projects to `SingNextOS.slnx`.
 - [ ] Extend architecture classification only where existing layers are insufficient.
 - [ ] BootCore has no Runtime/Host/ExecutableAdapter implementation refs.
 - [ ] Capsule has no Runtime/Region/capability/Host refs.
@@ -64,9 +66,9 @@
 
 ## Qualification
 
-- [ ] All 25 mandatory faults mapped to test IDs.
-- [ ] External SHA drift forces requalification.
+- [x] All mandatory faults mapped to stable test or external-blocker IDs (matrix currently contains P15-F01 through P15-F26).
+- [x] External SHA drift forces requalification.
 - [ ] P15 aliases map to existing `PlatformExternalGateTable` where applicable.
 - [ ] ISE claim has direct requalified ISE evidence.
 - [ ] Hardware claim has direct named-profile evidence.
-- [ ] Models deleted only in P15-15 after differential proof.
+- [x] Models retained because production equivalence and external qualification are incomplete.

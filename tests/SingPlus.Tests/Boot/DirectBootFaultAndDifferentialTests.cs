@@ -59,11 +59,13 @@ public sealed class DirectBootFaultAndDifferentialTests
     public void P15_F22_F23_ConfirmedAndLocalRecoveryFailuresEndInBoundedFallbackOrHalt()
     {
         Assert.Equal(BootRecoveryRoute.Replica, BootRecoveryPolicy.Select(default, 0,
-            new(true, false, 5), new(true, true, 5), new(true, true, 0), 5));
+            new(true, false, 5), new(true, true, 5), new(true, true, 0), 5, 0));
         Assert.Equal(BootRecoveryRoute.SignedLocalRecovery, BootRecoveryPolicy.Select(default, 0,
-            new(true, false, 5), new(true, false, 5), new(true, true, 0), 5));
+            new(true, false, 5), new(true, false, 5), new(true, true, 2), 5, 2));
         Assert.Equal(BootRecoveryRoute.Halt, BootRecoveryPolicy.Select(default, 0,
-            new(true, false, 5), new(true, false, 5), new(true, false, 0), 5));
+            new(true, false, 5), new(true, false, 5), new(true, false, 0), 5, 0));
+        Assert.Equal(BootRecoveryRoute.Halt, BootRecoveryPolicy.Select(default, 0,
+            new(true, false, 5), new(true, false, 5), new(true, true, 1), 5, 2));
     }
 
     [Fact]

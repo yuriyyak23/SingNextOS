@@ -38,9 +38,14 @@ public interface IBootTemporaryMapping
 
 public interface IBootProtectedState
 {
-    BootResult<ProtectedBootEnvelope> Read(BootStateDomain domain, BootResetSnapshot reset);
+    /// <summary>Returns only an authenticated committed record or a failure.</summary>
+    BootResult<ProtectedBootEnvelope> ReadAuthenticated(BootStateDomain domain, BootResetSnapshot reset);
     BootFailure WriteCandidate(ProtectedBootEnvelope candidate, BootResetSnapshot reset);
-    BootFailure FlushAndCommit(BootStateDomain domain, ulong durableSequence, BootResetSnapshot reset);
+    BootFailure FlushCandidate(BootStateDomain domain, ulong durableSequence, BootResetSnapshot reset);
+    /// <summary>Returns only an authenticated durable, uncommitted candidate or a failure.</summary>
+    BootResult<ProtectedBootEnvelope> ReadCandidateAuthenticated(BootStateDomain domain, ulong durableSequence, BootResetSnapshot reset);
+    /// <summary>Atomically publishes the commit marker for the already verified durable candidate.</summary>
+    BootFailure PublishCommitMarker(BootStateDomain domain, ulong durableSequence, BootResetSnapshot reset);
 }
 
 public interface IBootRecoverySource

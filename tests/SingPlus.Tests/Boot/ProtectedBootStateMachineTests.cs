@@ -73,6 +73,80 @@ public sealed class ProtectedBootStateMachineTests
         Assert.True(recovered.Value.TrialAttempted);
     }
 
+    [Theory]
+    [InlineData(0, BootFailure.Timeout)]
+    [InlineData(1, BootFailure.Timeout)]
+    [InlineData(2, BootFailure.ReadbackMismatch)]
+    [InlineData(3, BootFailure.Timeout)]
+    [InlineData(4, BootFailure.SecurityPolicyDenied)]
+    public void P15_04_DurableProtocolFailsAtEveryCrashBoundary(int failStage, BootFailure expected)
+    {
+        var machine = new ProtectedBootStateMachine(BootStateDomain.Image);
+        var candidate = machine.BeginTrial(Initial(BootStateDomain.Image), BootSlot.B, 2, Guid.NewGuid(), 2).Value!;
+
+        var result = machine.Persist(new FakeProtectedStore(failStage), candidate, new(1, 1));
+
+        Assert.Equal(expected, result.Failure);
+    }
+
+    [Fact]
+    public void P15_04_DurableProtocolVerifiesCandidateBeforeAtomicCommitPublication()
+    {
+        var machine = new ProtectedBootStateMachine(BootStateDomain.Image);
+        var candidate = machine.BeginTrial(Initial(BootStateDomain.Image), BootSlot.B, 2, Guid.NewGuid(), 2).Value!;
+        var store = new FakeProtectedStore(-1);
+
+        var result = machine.Persist(store, candidate, new(1, 1));
+
+        Assert.True(result.IsSuccess);
+        Assert.True(result.Value.Committed);
+        Assert.Equal(["write", "flush", "verify", "commit", "read"], store.Operations);
+    }
+
     private static ProtectedBootEnvelope Initial(BootStateDomain domain) =>
         new(1, domain, BootSlot.A, 1, 1, null, null, 1, Guid.Empty, 0, false, 1, true, new byte[] { 1 });
+
+    private sealed class FakeProtectedStore(int failStage) : IBootProtectedState
+    {
+        private ProtectedBootEnvelope _candidate;
+        public List<string> Operations { get; } = [];
+
+        public BootFailure WriteCandidate(ProtectedBootEnvelope candidate, BootResetSnapshot reset)
+        {
+            Operations.Add("write");
+            if (failStage == 0) return BootFailure.Timeout;
+            _candidate = candidate;
+            return BootFailure.None;
+        }
+
+        public BootFailure FlushCandidate(BootStateDomain domain, ulong durableSequence, BootResetSnapshot reset)
+        {
+            Operations.Add("flush");
+            return failStage == 1 ? BootFailure.Timeout : BootFailure.None;
+        }
+
+        public BootResult<ProtectedBootEnvelope> ReadCandidateAuthenticated(BootStateDomain domain, ulong durableSequence, BootResetSnapshot reset)
+        {
+            Operations.Add("verify");
+            return failStage == 2
+                ? BootResult<ProtectedBootEnvelope>.Fail(BootFailure.SecurityPolicyDenied, "invalid MAC")
+                : BootResult<ProtectedBootEnvelope>.Success(_candidate);
+        }
+
+        public BootFailure PublishCommitMarker(BootStateDomain domain, ulong durableSequence, BootResetSnapshot reset)
+        {
+            Operations.Add("commit");
+            if (failStage == 3) return BootFailure.Timeout;
+            _candidate = _candidate with { Committed = true };
+            return BootFailure.None;
+        }
+
+        public BootResult<ProtectedBootEnvelope> ReadAuthenticated(BootStateDomain domain, BootResetSnapshot reset)
+        {
+            Operations.Add("read");
+            return failStage == 4
+                ? BootResult<ProtectedBootEnvelope>.Fail(BootFailure.SecurityPolicyDenied, "invalid MAC")
+                : BootResult<ProtectedBootEnvelope>.Success(_candidate);
+        }
+    }
 }

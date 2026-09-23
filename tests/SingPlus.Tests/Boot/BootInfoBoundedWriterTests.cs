@@ -8,6 +8,13 @@ namespace SingPlus.Tests.Boot;
 public sealed class BootInfoBoundedWriterTests
 {
     [Fact]
+    public void P15_09_UnwiredCapsuleEntryCannotReportSuccess()
+    {
+        Assert.Equal((int)BootFailure.Unsupported, BootCapsuleEntry.Run());
+        Assert.NotEqual(0, BootCapsuleEntry.Run());
+    }
+
+    [Fact]
     public void P15_09_BoundedWriterMatchesExistingCodecGoldenVectorsByteForByte()
     {
         foreach (var info in GoldenVectors())

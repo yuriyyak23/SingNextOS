@@ -1,11 +1,43 @@
+using System.Buffers.Binary;
 using System.Security.Cryptography;
 using YAKSys_Hybrid_CPU.Boot.Contracts;
 
 namespace SingNext.Boot.Core;
 
-public interface IBootSignatureVerifier
+public enum BootTrustRole : byte
 {
-    bool Verify(BootSignatureAlgorithm algorithm, ReadOnlySpan<byte> keyId, ReadOnlySpan<byte> signedBytes, ReadOnlySpan<byte> signature);
+    Production = 1,
+    Development = 2,
+    Recovery = 3,
+}
+
+public readonly record struct BootTrustContext(
+    Guid ActiveKeySetId,
+    ulong ActiveTrustEpoch,
+    BootTrustRole RequiredRole,
+    bool ProductionLocked,
+    bool HardwareDevelopmentEnabled);
+
+public readonly record struct BootTrustVerificationRequest(
+    Guid PolicyKeySetId,
+    ulong TrustEpoch,
+    BootTrustRole RequiredRole,
+    bool ProductionLocked,
+    bool HardwareDevelopmentEnabled,
+    BootSignatureAlgorithm Algorithm);
+
+/// <summary>
+/// Authoritative boot trust-policy port. Implementations must resolve exactly one key in the
+/// requested key set and epoch, reject revoked/duplicate keys, enforce key role and production
+/// lock, and only then verify the signature over the supplied canonical signed bytes.
+/// </summary>
+public interface IBootTrustPolicyVerifier
+{
+    bool VerifyAuthorized(
+        BootTrustVerificationRequest request,
+        ReadOnlySpan<byte> keyId,
+        ReadOnlySpan<byte> signedBytes,
+        ReadOnlySpan<byte> signature);
 }
 
 public static class BootManifestVerifier
@@ -18,11 +50,17 @@ public static class BootManifestVerifier
         uint firmwareAbi,
         Guid expectedPlatformFamily,
         ulong imageRollbackFloor,
-        IBootSignatureVerifier verifier)
+        HybridBootPolicyV1 policy,
+        BootTrustContext trust,
+        IBootTrustPolicyVerifier verifier)
     {
         ArgumentNullException.ThrowIfNull(verifier);
         if (envelope.Length > BootAbiV1.MaxManifestBytes)
             return BootResult<SingNextBootManifestV1>.Fail(BootFailure.LimitExceeded, "Manifest exceeds the v1 bound.");
+        if (envelope.Length < BootManifestCodec.HeaderSize)
+            return BootResult<SingNextBootManifestV1>.Fail(BootFailure.Malformed, "Manifest header is truncated.");
+        var totalLength = BinaryPrimitives.ReadUInt32LittleEndian(envelope[12..]);
+        var signedLength = BinaryPrimitives.ReadUInt32LittleEndian(envelope[16..]);
         var parsed = BootManifestCodec.Parse(envelope, supportedFeatures);
         if (!parsed.IsSuccess)
             return BootResult<SingNextBootManifestV1>.Fail(BootFailure.Malformed, parsed.Detail ?? "Manifest parse failed.");
@@ -35,12 +73,21 @@ public static class BootManifestVerifier
             cpuAbi < manifest.RequiredCpuAbiMin || cpuAbi > manifest.RequiredCpuAbiMax ||
             firmwareAbi < manifest.RequiredFirmwareAbiMin || firmwareAbi > manifest.RequiredFirmwareAbiMax)
             return BootResult<SingNextBootManifestV1>.Fail(BootFailure.SecurityPolicyDenied, "Manifest identity or ABI constraints do not match this boot environment.");
+        if (totalLength != envelope.Length || signedLength != totalLength || manifest.SignatureBlockOffset != 0)
+            return BootResult<SingNextBootManifestV1>.Fail(BootFailure.SecurityPolicyDenied, "Manifest signed region is not the canonical detached-signature form.");
         if (manifest.HashAlgorithm != BootHashAlgorithm.Sha384)
             return BootResult<SingNextBootManifestV1>.Fail(BootFailure.SecurityPolicyDenied, "The production loader supports only SHA-384 component hashes.");
         if (manifest.ImageGeneration < imageRollbackFloor)
             return BootResult<SingNextBootManifestV1>.Fail(BootFailure.RollbackRejected, "Manifest image generation is below the protected floor.");
-        if (signature.IsEmpty || !verifier.Verify(manifest.SignatureAlgorithm, manifest.SigningKeyId.Span, envelope, signature))
-            return BootResult<SingNextBootManifestV1>.Fail(BootFailure.SecurityPolicyDenied, "Manifest signature is invalid.");
+        if (policy.PolicyGeneration == 0 || policy.PlatformId != expectedPlatformFamily || policy.KeySetId == Guid.Empty ||
+            trust.ActiveKeySetId != policy.KeySetId || trust.ActiveTrustEpoch == 0 || !Enum.IsDefined(trust.RequiredRole) ||
+            (trust.ProductionLocked && trust.RequiredRole != BootTrustRole.Production) ||
+            (trust.RequiredRole == BootTrustRole.Development && !trust.HardwareDevelopmentEnabled))
+            return BootResult<SingNextBootManifestV1>.Fail(BootFailure.SecurityPolicyDenied, "Boot policy key set, trust epoch, role, or hardware lock is not admissible.");
+        var request = new BootTrustVerificationRequest(policy.KeySetId, trust.ActiveTrustEpoch, trust.RequiredRole,
+            trust.ProductionLocked, trust.HardwareDevelopmentEnabled, manifest.SignatureAlgorithm);
+        if (signature.IsEmpty || !verifier.VerifyAuthorized(request, manifest.SigningKeyId.Span, envelope[..checked((int)signedLength)], signature))
+            return BootResult<SingNextBootManifestV1>.Fail(BootFailure.SecurityPolicyDenied, "Manifest key authorization or signature is invalid.");
         return BootResult<SingNextBootManifestV1>.Success(manifest);
     }
 }

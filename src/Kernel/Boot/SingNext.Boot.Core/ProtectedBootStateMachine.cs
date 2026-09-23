@@ -102,11 +102,19 @@ public sealed class ProtectedBootStateMachine
             return BootResult<ProtectedBootEnvelope>.Fail(BootFailure.Malformed, "Protected-state candidate is invalid.");
         var write = store.WriteCandidate(candidate with { Committed = false }, reset);
         if (write != BootFailure.None) return BootResult<ProtectedBootEnvelope>.Fail(write, "Candidate write failed.");
-        var commit = store.FlushAndCommit(Domain, candidate.DurableSequence, reset);
-        if (commit != BootFailure.None) return BootResult<ProtectedBootEnvelope>.Fail(commit, "Commit marker was not durably published.");
-        var readback = store.Read(Domain, reset);
+        var flush = store.FlushCandidate(Domain, candidate.DurableSequence, reset);
+        if (flush != BootFailure.None) return BootResult<ProtectedBootEnvelope>.Fail(flush, "Candidate was not durably flushed.");
+        var candidateReadback = store.ReadCandidateAuthenticated(Domain, candidate.DurableSequence, reset);
+        if (!candidateReadback.IsSuccess || candidateReadback.Value.Committed ||
+            !SemanticEquals(candidate with { Committed = false }, candidateReadback.Value))
+            return BootResult<ProtectedBootEnvelope>.Fail(BootFailure.ReadbackMismatch, "Durable authenticated candidate did not read back exactly.");
+        var commit = store.PublishCommitMarker(Domain, candidate.DurableSequence, reset);
+        if (commit != BootFailure.None) return BootResult<ProtectedBootEnvelope>.Fail(commit, "Commit marker was not atomically published.");
+        var readback = store.ReadAuthenticated(Domain, reset);
+        if (!readback.IsSuccess)
+            return BootResult<ProtectedBootEnvelope>.Fail(readback.Failure, "Committed state did not authenticate on readback.");
         var actual = readback.Value;
-        if (!readback.IsSuccess || !actual.Committed || !SemanticEquals(candidate with { Committed = true }, actual))
+        if (!actual.Committed || !SemanticEquals(candidate with { Committed = true }, actual))
             return BootResult<ProtectedBootEnvelope>.Fail(BootFailure.ReadbackMismatch, "Committed state did not read back exactly.");
         return BootResult<ProtectedBootEnvelope>.Success(actual);
     }

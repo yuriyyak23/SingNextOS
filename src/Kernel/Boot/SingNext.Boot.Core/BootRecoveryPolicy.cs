@@ -19,12 +19,13 @@ public static class BootRecoveryPolicy
         BootRecoveryCandidate confirmed,
         BootRecoveryCandidate replica,
         BootRecoveryCandidate localRecovery,
-        ulong rollbackFloor)
+        ulong rollbackFloor,
+        ulong localRecoveryRollbackFloor)
     {
         if (trialAttemptsRemaining != 0 && Eligible(trial, rollbackFloor)) return BootRecoveryRoute.Trial;
         if (Eligible(confirmed, rollbackFloor)) return BootRecoveryRoute.Confirmed;
         if (Eligible(replica, rollbackFloor)) return BootRecoveryRoute.Replica;
-        return localRecovery.Present && localRecovery.Authenticated
+        return Eligible(localRecovery, localRecoveryRollbackFloor)
             ? BootRecoveryRoute.SignedLocalRecovery
             : BootRecoveryRoute.Halt;
     }

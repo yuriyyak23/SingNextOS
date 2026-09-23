@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Security.Cryptography;
 using SingNext.Boot.Core;
 using YAKSys_Hybrid_CPU.Boot.Contracts;
@@ -71,26 +72,65 @@ public sealed class DirectBootCoreSemanticTests
     public void P15_03_ManifestRequiresSignatureAbiPlatformAndRollback()
     {
         var platform = Guid.NewGuid();
+        var keySet = Guid.NewGuid();
+        var policy = BootPolicy(platform, keySet);
+        var trust = new BootTrustContext(keySet, 7, BootTrustRole.Production, true, false);
         var manifest = new SingNextBootManifestV1(_volume, Guid.NewGuid(), _image, _domain, 5, platform,
             1, 2, 1, 2, 0, 1, 1, 0, 0, 0, 0,
             BootHashAlgorithm.Sha384, BootSignatureAlgorithm.Ed25519, 0, new byte[32], 0, []);
         var bytes = BootManifestCodec.Encode(manifest);
 
-        Assert.True(BootManifestVerifier.ParseAndVerify(bytes, [1], 0, 1, 1, platform, 5, new AcceptSignature()).IsSuccess);
-        Assert.Equal(BootFailure.RollbackRejected, BootManifestVerifier.ParseAndVerify(bytes, [1], 0, 1, 1, platform, 6, new AcceptSignature()).Failure);
-        Assert.Equal(BootFailure.SecurityPolicyDenied, BootManifestVerifier.ParseAndVerify(bytes, [1], 0, 1, 1, Guid.NewGuid(), 0, new AcceptSignature()).Failure);
-        Assert.Equal(BootFailure.SecurityPolicyDenied, BootManifestVerifier.ParseAndVerify(bytes, [1], 0, 1, 1, platform, 0, new RejectSignature()).Failure);
+        Assert.True(BootManifestVerifier.ParseAndVerify(bytes, [1], 0, 1, 1, platform, 5, policy, trust, new TrustVerifier(keySet, 7)).IsSuccess);
+        Assert.Equal(BootFailure.RollbackRejected, BootManifestVerifier.ParseAndVerify(bytes, [1], 0, 1, 1, platform, 6, policy, trust, new TrustVerifier(keySet, 7)).Failure);
+        var otherPlatform = Guid.NewGuid();
+        Assert.Equal(BootFailure.SecurityPolicyDenied, BootManifestVerifier.ParseAndVerify(bytes, [1], 0, 1, 1, otherPlatform, 0,
+            BootPolicy(otherPlatform, keySet), trust, new TrustVerifier(keySet, 7)).Failure);
+        Assert.Equal(BootFailure.SecurityPolicyDenied, BootManifestVerifier.ParseAndVerify(bytes, [1], 0, 1, 1, platform, 0,
+            policy, trust, new TrustVerifier(keySet, 7, reject: true)).Failure);
 
         var unsupportedHash = manifest with { HashAlgorithm = BootHashAlgorithm.Sha256 };
         Assert.Equal(BootFailure.SecurityPolicyDenied,
-            BootManifestVerifier.ParseAndVerify(BootManifestCodec.Encode(unsupportedHash), [1], 0, 1, 1, platform, 0, new AcceptSignature()).Failure);
+            BootManifestVerifier.ParseAndVerify(BootManifestCodec.Encode(unsupportedHash), [1], 0, 1, 1, platform, 0, policy, trust, new TrustVerifier(keySet, 7)).Failure);
         var invalidIndex = manifest with { KernelComponentIndex = 1 };
         Assert.Equal(BootFailure.SecurityPolicyDenied,
-            BootManifestVerifier.ParseAndVerify(BootManifestCodec.Encode(invalidIndex), [1], 0, 1, 1, platform, 0, new AcceptSignature()).Failure);
+            BootManifestVerifier.ParseAndVerify(BootManifestCodec.Encode(invalidIndex), [1], 0, 1, 1, platform, 0, policy, trust, new TrustVerifier(keySet, 7)).Failure);
 
         bytes[0] ^= 0xff;
         Assert.Equal(BootFailure.Malformed,
-            BootManifestVerifier.ParseAndVerify(bytes, [1], 0, 1, 1, platform, 0, new AcceptSignature()).Failure);
+            BootManifestVerifier.ParseAndVerify(bytes, [1], 0, 1, 1, platform, 0, policy, trust, new TrustVerifier(keySet, 7)).Failure);
+    }
+
+    [Fact]
+    public void P15_03_TrustPolicyAndCanonicalSignedRegionFailClosed()
+    {
+        var platform = Guid.NewGuid();
+        var keySet = Guid.NewGuid();
+        var policy = BootPolicy(platform, keySet);
+        var manifest = new SingNextBootManifestV1(_volume, Guid.NewGuid(), _image, _domain, 5, platform,
+            1, 2, 1, 2, 0, 1, 1, 0, 0, 0, 0,
+            BootHashAlgorithm.Sha384, BootSignatureAlgorithm.Ed25519, 0, new byte[32], 0, []);
+        var bytes = BootManifestCodec.Encode(manifest);
+        var production = new BootTrustContext(keySet, 7, BootTrustRole.Production, true, false);
+
+        Assert.Equal(BootFailure.SecurityPolicyDenied, Verify(bytes, policy, production with { ActiveKeySetId = Guid.NewGuid() }, new TrustVerifier(keySet, 7)).Failure);
+        Assert.Equal(BootFailure.SecurityPolicyDenied, Verify(bytes, policy, production with { ActiveTrustEpoch = 6 }, new TrustVerifier(keySet, 7)).Failure);
+        Assert.Equal(BootFailure.SecurityPolicyDenied, Verify(bytes, policy,
+            production with { RequiredRole = BootTrustRole.Development, HardwareDevelopmentEnabled = true }, new TrustVerifier(keySet, 7)).Failure);
+        Assert.Equal(BootFailure.SecurityPolicyDenied, Verify(bytes, policy,
+            production with { ProductionLocked = false, RequiredRole = BootTrustRole.Development }, new TrustVerifier(keySet, 7)).Failure);
+        Assert.Equal(BootFailure.SecurityPolicyDenied, BootManifestVerifier.ParseAndVerify(bytes, [], 0, 1, 1, platform, 0,
+            policy, production with { ProductionLocked = false, RequiredRole = BootTrustRole.Development, HardwareDevelopmentEnabled = true },
+            new TrustVerifier(keySet, 7)).Failure);
+
+        var truncatedSignedRegion = bytes.ToArray();
+        BinaryPrimitives.WriteUInt32LittleEndian(truncatedSignedRegion.AsSpan(16), (uint)bytes.Length - 1);
+        Assert.Equal(BootFailure.Malformed, Verify(truncatedSignedRegion, policy, production, new TrustVerifier(keySet, 7)).Failure);
+        var embeddedSignature = bytes.ToArray();
+        BinaryPrimitives.WriteUInt32LittleEndian(embeddedSignature.AsSpan(164), 8);
+        Assert.Equal(BootFailure.SecurityPolicyDenied, Verify(embeddedSignature, policy, production, new TrustVerifier(keySet, 7)).Failure);
+
+        BootResult<SingNextBootManifestV1> Verify(byte[] envelope, HybridBootPolicyV1 p, BootTrustContext context, IBootTrustPolicyVerifier verifier) =>
+            BootManifestVerifier.ParseAndVerify(envelope, [1], 0, 1, 1, platform, 0, p, context, verifier);
     }
 
     private BootSelectionPolicy Policy() => new(_volume, _domain, 3, null, 0, null, false, true);
@@ -99,13 +139,13 @@ public sealed class DirectBootCoreSemanticTests
         new(_volume, replica, _image, _domain, generation, new byte[] { 1, 2, 3 }, 3, true, true,
             new("observation", 0, 1, 2, 3, dsn, "route"));
 
-    private sealed class AcceptSignature : IBootSignatureVerifier
-    {
-        public bool Verify(BootSignatureAlgorithm algorithm, ReadOnlySpan<byte> keyId, ReadOnlySpan<byte> signedBytes, ReadOnlySpan<byte> signature) => true;
-    }
+    private static HybridBootPolicyV1 BootPolicy(Guid platform, Guid keySet) =>
+        new(1, platform, keySet, Guid.NewGuid(), 0, []);
 
-    private sealed class RejectSignature : IBootSignatureVerifier
+    private sealed class TrustVerifier(Guid keySet, ulong epoch, bool reject = false) : IBootTrustPolicyVerifier
     {
-        public bool Verify(BootSignatureAlgorithm algorithm, ReadOnlySpan<byte> keyId, ReadOnlySpan<byte> signedBytes, ReadOnlySpan<byte> signature) => false;
+        public bool VerifyAuthorized(BootTrustVerificationRequest request, ReadOnlySpan<byte> keyId,
+            ReadOnlySpan<byte> signedBytes, ReadOnlySpan<byte> signature) =>
+            !reject && request.PolicyKeySetId == keySet && request.TrustEpoch == epoch && !signature.IsEmpty;
     }
 }

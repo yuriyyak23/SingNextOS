@@ -7,6 +7,18 @@ namespace SingPlus.Tests.Runtime;
 public sealed class HybridBootProductionAdapterTests
 {
     [Fact]
+    public void P15_10_EntryAdapterRejectsNullPhysicalAddressBeforeReadingMemory()
+    {
+        var memory = new CountingPhysicalBootInfoReader();
+        var adapter = new HybridBootInfoEntryAdapter(memory, null!);
+
+        var result = adapter.Import(0, HybridBootInfoCodec.HeaderSize);
+
+        Assert.Equal(HybridBootImportFailure.InvalidBootInfo, result.Failure);
+        Assert.Equal(0, memory.Calls);
+    }
+
+    [Fact]
     public void P15_10_EntryAdapterValidatesRangeThenCopiesBeforeParsing()
     {
         var platform = new PlatformOwner();
@@ -24,6 +36,41 @@ public sealed class HybridBootProductionAdapterTests
         Assert.Equal([platform.Endpoint], discovery.EnumerateCurrentEndpoints());
         platform.Available = false;
         Assert.Empty(discovery.EnumerateCurrentEndpoints());
+    }
+
+    [Theory]
+    [InlineData(KernelBootMemoryKind.Mmio)]
+    [InlineData(KernelBootMemoryKind.FirmwareReserved)]
+    [InlineData(KernelBootMemoryKind.TemporaryCxlAperture)]
+    [InlineData(KernelBootMemoryKind.Reserved)]
+    public void P15_10_PhysicalBootInfoReaderRejectsEveryNonRamClass(KernelBootMemoryKind kind)
+    {
+        var destination = Enumerable.Repeat((byte)0xcc, 16).ToArray();
+        var reader = new KernelOwnedPhysicalBootInfoReader(new MemoryMap(kind), new PhysicalMemory(new byte[16]),
+            new CopyEpoch(1), 1);
+
+        Assert.False(reader.TryCopy(0x1000, destination));
+        Assert.All(destination, static value => Assert.Equal(0, value));
+    }
+
+    [Fact]
+    public void P15_10_PhysicalBootInfoReaderRejectsKernelOverlapAndResetDuringCopy()
+    {
+        var bytes = Enumerable.Range(0, 16).Select(static value => (byte)value).ToArray();
+        var destination = new byte[bytes.Length];
+        var overlap = new KernelOwnedPhysicalBootInfoReader(new MemoryMap(KernelBootMemoryKind.NormalRam, overlap: true),
+            new PhysicalMemory(bytes), new CopyEpoch(1), 1);
+        Assert.False(overlap.TryCopy(0x1000, destination));
+
+        var reset = new KernelOwnedPhysicalBootInfoReader(new MemoryMap(KernelBootMemoryKind.NormalRam),
+            new PhysicalMemory(bytes), new CopyEpoch(1, 2), 1);
+        Assert.False(reset.TryCopy(0x1000, destination));
+        Assert.All(destination, static value => Assert.Equal(0, value));
+
+        var stable = new KernelOwnedPhysicalBootInfoReader(new MemoryMap(KernelBootMemoryKind.NormalRam),
+            new PhysicalMemory(bytes), new CopyEpoch(1), 1);
+        Assert.True(stable.TryCopy(0x1000, destination));
+        Assert.Equal(bytes, destination);
     }
 
     [Theory]
@@ -57,6 +104,43 @@ public sealed class HybridBootProductionAdapterTests
             if (kernelOwnedDestination.Length != bytes.Length) return false;
             bytes.CopyTo(kernelOwnedDestination);
             return true;
+        }
+    }
+
+    private sealed class MemoryMap(KernelBootMemoryKind kind, bool overlap = false) : IKernelBootMemoryMap
+    {
+        public bool TryClassify(ulong physicalAddress, ulong byteLength, out KernelBootMemoryKind value)
+        {
+            value = kind;
+            return physicalAddress <= ulong.MaxValue - byteLength;
+        }
+        public bool OverlapsKernelImage(ulong physicalAddress, ulong byteLength) => overlap;
+    }
+
+    private sealed class PhysicalMemory(byte[] bytes) : IKernelPhysicalMemory
+    {
+        public bool TryCopyFromPhysical(ulong physicalAddress, Span<byte> destination)
+        {
+            if (destination.Length != bytes.Length) return false;
+            bytes.CopyTo(destination);
+            return true;
+        }
+    }
+
+    private sealed class CopyEpoch(params ulong[] values) : IKernelBootCopyEpoch
+    {
+        private int _index;
+        public ulong CurrentEpoch => values[Math.Min(_index++, values.Length - 1)];
+    }
+
+    private sealed class CountingPhysicalBootInfoReader : IKernelPhysicalBootInfoReader
+    {
+        public int Calls { get; private set; }
+
+        public bool TryCopy(ulong physicalAddress, Span<byte> kernelOwnedDestination)
+        {
+            Calls++;
+            return false;
         }
     }
 
