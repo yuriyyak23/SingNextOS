@@ -1,0 +1,22 @@
+# v6 Normative Invariants
+
+- **V6-001 One owner:** no phase creates a second authoritative store for an existing fact.
+- **V6-002 Evidence is non-authoritative:** compiler proofs, replay certificates, attestation, health, topology and telemetry never become capabilities.
+- **V6-003 Fresh generations:** every cross-layer binding names exact current generations/epochs; stale correlation fails closed.
+- **V6-004 No authority from addresses:** VA, PA, HPA, DPA, IOVA, BDF, PASID, decoder, port and route identities are not authority.
+- **V6-005 Memory separation:** ownership, coherence, ordering, atomicity, visibility, publication and durability are independent properties.
+- **V6-006 No hidden rollback:** CPU squash/replay, cancellation or provider reset does not imply rollback of externally visible effects.
+- **V6-007 Resource separation:** reservation, scheduling eligibility, enforced upper bound and guaranteed service are distinct claims.
+- **V6-008 Compiler proof boundary:** validated compiler facts may accelerate checks but may not replace runtime legality or live authority.
+- **V6-009 Topology privacy:** ordinary SIP/application contracts do not carry provider-private hardware topology.
+- **V6-010 Durable authority prohibition:** checkpoints/persistent media never restore ephemeral capabilities or provider leases.
+- **V6-011 Preemption is explicit:** cancellation does not imply preemption; preemption does not imply resumability; resumability requires a qualified state-capture contract.
+- **V6-012 Attestation is predicate evidence:** measurement may satisfy a trust obligation but never grants access itself.
+- **V6-013 Partial failure is explicit:** unavailable, degraded, contained, closed and quarantined are distinct states.
+- **V6-014 Multi-host narrowing:** delegated remote authority is always a monotonic subset of a single logical owner's authority.
+- **V6-015 Planner is policy-only:** locality, energy and performance scores cannot authorize an effect.
+- **V6-016 Provider callbacks outside authority locks:** no provider/user callback or blocking wait executes under an authority-owner lock.
+- **V6-017 Semantic trace preservation:** optimized/fused/provider-specific execution must preserve the authoritative trace modulo explicitly declared unobservable stuttering.
+- **V6-018 Unknown mandatory semantics deny:** unknown enum/value/schema/version cannot silently degrade a Mandatory obligation.
+- **V6-019 Exact artifact tuple:** claims bind source SHA, package digest, toolchain, contract schema, provider/runtime and relevant hardware/firmware profile.
+- **V6-020 ISA conservatism:** v6 does not require new ISA state/instructions unless a separate later ADR proves an unavoidable enforcement gap.
