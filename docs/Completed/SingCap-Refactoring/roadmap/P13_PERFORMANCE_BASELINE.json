@@ -1,0 +1,363 @@
+{
+  "schema": "SingCapPerformanceQualificationV1",
+  "capturedUtc": "2026-09-19T00:47:02.9939808+00:00",
+  "environment": {
+    "runtime": "11.0.0",
+    "os": "Microsoft Windows NT 10.0.26200.0",
+    "processorCount": 16,
+    "stopwatchFrequency": 10000000,
+    "configuration": "Release"
+  },
+  "methodology": {
+    "iterationsPerWorker": 5000,
+    "workers": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "latencyUnit": "nanoseconds",
+    "lockWaitMetric": "maxObservedOperationLatencyNs (closest available runtime measurement; lock acquisition is not separately instrumented)",
+    "providerLatencyIncluded": false,
+    "spanRule": "Capability/Region lookup occurs outside the element loop."
+  },
+  "measurements": [
+    {
+      "Operation": "capability-lookup",
+      "Contention": "shared",
+      "Workers": 1,
+      "Samples": 5000,
+      "ThroughputPerSecond": 1018164.0465911868,
+      "MedianNs": 400,
+      "P95Ns": 400,
+      "P99Ns": 2200,
+      "MaxObservedOperationLatencyNs": 1868500
+    },
+    {
+      "Operation": "capability-lookup",
+      "Contention": "unrelated",
+      "Workers": 1,
+      "Samples": 5000,
+      "ThroughputPerSecond": 797295.5734149764,
+      "MedianNs": 500,
+      "P95Ns": 600,
+      "P99Ns": 1100,
+      "MaxObservedOperationLatencyNs": 16800
+    },
+    {
+      "Operation": "region-validate",
+      "Contention": "shared",
+      "Workers": 1,
+      "Samples": 5000,
+      "ThroughputPerSecond": 1970132.7869498404,
+      "MedianNs": 200,
+      "P95Ns": 300,
+      "P99Ns": 800,
+      "MaxObservedOperationLatencyNs": 1028200
+    },
+    {
+      "Operation": "region-validate",
+      "Contention": "unrelated",
+      "Workers": 1,
+      "Samples": 5000,
+      "ThroughputPerSecond": 2554408.909778277,
+      "MedianNs": 300,
+      "P95Ns": 300,
+      "P99Ns": 2200,
+      "MaxObservedOperationLatencyNs": 16700
+    },
+    {
+      "Operation": "capability-lookup",
+      "Contention": "shared",
+      "Workers": 2,
+      "Samples": 10000,
+      "ThroughputPerSecond": 1312697.7250948423,
+      "MedianNs": 1300,
+      "P95Ns": 1700,
+      "P99Ns": 10300,
+      "MaxObservedOperationLatencyNs": 35800
+    },
+    {
+      "Operation": "capability-lookup",
+      "Contention": "unrelated",
+      "Workers": 2,
+      "Samples": 10000,
+      "ThroughputPerSecond": 1158681.4205434218,
+      "MedianNs": 1500,
+      "P95Ns": 1900,
+      "P99Ns": 11200,
+      "MaxObservedOperationLatencyNs": 23300
+    },
+    {
+      "Operation": "region-validate",
+      "Contention": "shared",
+      "Workers": 2,
+      "Samples": 10000,
+      "ThroughputPerSecond": 1864454.181038501,
+      "MedianNs": 800,
+      "P95Ns": 1100,
+      "P99Ns": 2100,
+      "MaxObservedOperationLatencyNs": 1015000
+    },
+    {
+      "Operation": "region-validate",
+      "Contention": "unrelated",
+      "Workers": 2,
+      "Samples": 10000,
+      "ThroughputPerSecond": 3644713.34329555,
+      "MedianNs": 500,
+      "P95Ns": 700,
+      "P99Ns": 1300,
+      "MaxObservedOperationLatencyNs": 10700
+    },
+    {
+      "Operation": "capability-lookup",
+      "Contention": "shared",
+      "Workers": 4,
+      "Samples": 20000,
+      "ThroughputPerSecond": 2031900.8432388501,
+      "MedianNs": 900,
+      "P95Ns": 3200,
+      "P99Ns": 12800,
+      "MaxObservedOperationLatencyNs": 678900
+    },
+    {
+      "Operation": "capability-lookup",
+      "Contention": "unrelated",
+      "Workers": 4,
+      "Samples": 20000,
+      "ThroughputPerSecond": 1932087.1371298847,
+      "MedianNs": 800,
+      "P95Ns": 3400,
+      "P99Ns": 15900,
+      "MaxObservedOperationLatencyNs": 692400
+    },
+    {
+      "Operation": "region-validate",
+      "Contention": "shared",
+      "Workers": 4,
+      "Samples": 20000,
+      "ThroughputPerSecond": 2923420.9872392677,
+      "MedianNs": 500,
+      "P95Ns": 1900,
+      "P99Ns": 10100,
+      "MaxObservedOperationLatencyNs": 1726200
+    },
+    {
+      "Operation": "region-validate",
+      "Contention": "unrelated",
+      "Workers": 4,
+      "Samples": 20000,
+      "ThroughputPerSecond": 5434191.935659167,
+      "MedianNs": 600,
+      "P95Ns": 1000,
+      "P99Ns": 1600,
+      "MaxObservedOperationLatencyNs": 45300
+    },
+    {
+      "Operation": "capability-lookup",
+      "Contention": "shared",
+      "Workers": 8,
+      "Samples": 40000,
+      "ThroughputPerSecond": 1958345.9809844606,
+      "MedianNs": 900,
+      "P95Ns": 3200,
+      "P99Ns": 13200,
+      "MaxObservedOperationLatencyNs": 2344000
+    },
+    {
+      "Operation": "capability-lookup",
+      "Contention": "unrelated",
+      "Workers": 8,
+      "Samples": 40000,
+      "ThroughputPerSecond": 2016271.3094674018,
+      "MedianNs": 900,
+      "P95Ns": 3300,
+      "P99Ns": 16100,
+      "MaxObservedOperationLatencyNs": 2275600
+    },
+    {
+      "Operation": "region-validate",
+      "Contention": "shared",
+      "Workers": 8,
+      "Samples": 40000,
+      "ThroughputPerSecond": 2682601.318498548,
+      "MedianNs": 600,
+      "P95Ns": 2800,
+      "P99Ns": 13200,
+      "MaxObservedOperationLatencyNs": 2596800
+    },
+    {
+      "Operation": "region-validate",
+      "Contention": "unrelated",
+      "Workers": 8,
+      "Samples": 40000,
+      "ThroughputPerSecond": 7152436.298614215,
+      "MedianNs": 800,
+      "P95Ns": 1400,
+      "P99Ns": 3500,
+      "MaxObservedOperationLatencyNs": 33700
+    },
+    {
+      "Operation": "capability-lookup",
+      "Contention": "shared",
+      "Workers": 16,
+      "Samples": 80000,
+      "ThroughputPerSecond": 1683402.4931190924,
+      "MedianNs": 1200,
+      "P95Ns": 4600,
+      "P99Ns": 16700,
+      "MaxObservedOperationLatencyNs": 6064500
+    },
+    {
+      "Operation": "capability-lookup",
+      "Contention": "unrelated",
+      "Workers": 16,
+      "Samples": 80000,
+      "ThroughputPerSecond": 1719102.886158858,
+      "MedianNs": 1100,
+      "P95Ns": 4000,
+      "P99Ns": 15900,
+      "MaxObservedOperationLatencyNs": 7239700
+    },
+    {
+      "Operation": "region-validate",
+      "Contention": "shared",
+      "Workers": 16,
+      "Samples": 80000,
+      "ThroughputPerSecond": 1862912.897178851,
+      "MedianNs": 1000,
+      "P95Ns": 3900,
+      "P99Ns": 13900,
+      "MaxObservedOperationLatencyNs": 10432900
+    },
+    {
+      "Operation": "region-validate",
+      "Contention": "unrelated",
+      "Workers": 16,
+      "Samples": 80000,
+      "ThroughputPerSecond": 5119049.9043377545,
+      "MedianNs": 2500,
+      "P95Ns": 4000,
+      "P99Ns": 4700,
+      "MaxObservedOperationLatencyNs": 5448900
+    },
+    {
+      "Operation": "capability-lookup",
+      "Contention": "shared",
+      "Workers": 32,
+      "Samples": 160000,
+      "ThroughputPerSecond": 4932927.60003823,
+      "MedianNs": 400,
+      "P95Ns": 3100,
+      "P99Ns": 9400,
+      "MaxObservedOperationLatencyNs": 18388800
+    },
+    {
+      "Operation": "capability-lookup",
+      "Contention": "unrelated",
+      "Workers": 32,
+      "Samples": 160000,
+      "ThroughputPerSecond": 5095330.448102467,
+      "MedianNs": 300,
+      "P95Ns": 2700,
+      "P99Ns": 8600,
+      "MaxObservedOperationLatencyNs": 16772100
+    },
+    {
+      "Operation": "region-validate",
+      "Contention": "shared",
+      "Workers": 32,
+      "Samples": 160000,
+      "ThroughputPerSecond": 1611726.925107079,
+      "MedianNs": 1000,
+      "P95Ns": 5700,
+      "P99Ns": 16100,
+      "MaxObservedOperationLatencyNs": 47836800
+    },
+    {
+      "Operation": "region-validate",
+      "Contention": "unrelated",
+      "Workers": 32,
+      "Samples": 160000,
+      "ThroughputPerSecond": 14171959.00760857,
+      "MedianNs": 700,
+      "P95Ns": 1100,
+      "P99Ns": 1900,
+      "MaxObservedOperationLatencyNs": 3961900
+    }
+  ],
+  "singleThreadMeasurements": [
+    {
+      "Operation": "single-sip-empty-call",
+      "Samples": 1000,
+      "ThroughputPerSecond": 72220.93829443032,
+      "MedianNs": 2500,
+      "P95Ns": 3000,
+      "P99Ns": 3300,
+      "MaxObservedOperationLatencyNs": 11276400
+    },
+    {
+      "Operation": "sip-with-4-exact-capabilities",
+      "Samples": 1000,
+      "ThroughputPerSecond": 216736.38353670432,
+      "MedianNs": 3800,
+      "P95Ns": 4500,
+      "P99Ns": 4700,
+      "MaxObservedOperationLatencyNs": 661300
+    },
+    {
+      "Operation": "seal-unseal-internal-resolution",
+      "Samples": 1000,
+      "ThroughputPerSecond": 196935.68080664854,
+      "MedianNs": 600,
+      "P95Ns": 600,
+      "P99Ns": 1000,
+      "MaxObservedOperationLatencyNs": 4468200
+    },
+    {
+      "Operation": "async-lease-revalidation",
+      "Samples": 1000,
+      "ThroughputPerSecond": 1695777.5139901645,
+      "MedianNs": 200,
+      "P95Ns": 200,
+      "P99Ns": 200,
+      "MaxObservedOperationLatencyNs": 374600
+    },
+    {
+      "Operation": "region-lexical-borrow-acquire-return",
+      "Samples": 1000,
+      "ThroughputPerSecond": 193203.11443420468,
+      "MedianNs": 1100,
+      "P95Ns": 1400,
+      "P99Ns": 1800,
+      "MaxObservedOperationLatencyNs": 3982500
+    },
+    {
+      "Operation": "move-64-byte-region",
+      "Samples": 1000,
+      "ThroughputPerSecond": 106140.21121902033,
+      "MedianNs": 3200,
+      "P95Ns": 3800,
+      "P99Ns": 4200,
+      "MaxObservedOperationLatencyNs": 5115300
+    },
+    {
+      "Operation": "external-operation-prepare-admit-publish-release",
+      "Samples": 1000,
+      "ThroughputPerSecond": 14354.472207588637,
+      "MedianNs": 40200,
+      "P95Ns": 60800,
+      "P99Ns": 79500,
+      "MaxObservedOperationLatencyNs": 24292200
+    }
+  ],
+  "spanAfterAcquisition": {
+    "elementsPerPass": 4096,
+    "passes": 10000,
+    "elapsedNanoseconds": 27147400,
+    "operationsPerSecond": 1508800106.0875075
+  }
+}

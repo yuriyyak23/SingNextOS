@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>YAKSys_Hybrid_CPU.ExecutableAdapter</RootNamespace>
+    <AssemblyName>HybridCpu_ExecutableAdapter</AssemblyName>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <RestoreLockedMode Condition="'$(CI)' == 'true'">true</RestoreLockedMode>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="HybridCPU.ExternalRuntime.Contracts" Version="[1.14.0]" />
+    <PackageReference Include="HybridCPU.ExternalRuntime" Version="[1.6.0]" />
+    <ProjectReference Include="../../contracts/SingPlus.Contracts/SingPlus.Contracts.csproj" />
+    <ProjectReference Include="../Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Contracts/HybridCPU_NeutralRuntime.Contracts.csproj" />
+    <ProjectReference Include="Boot.Contracts/HybridCpu.Boot.Contracts.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Remove="Boot.Contracts/**/*.cs" />
+  </ItemGroup>
+  <Target Name="RejectForbiddenAdapterProjectReferences" BeforeTargets="ResolveProjectReferences">
+    <Error
+      Condition="'%(ProjectReference.Filename)' == 'HybridCPU_NeutralRuntime.Model' Or '%(ProjectReference.Filename)' == 'HybridCPU_NeutralRuntime'"
+      Text="The executable adapter must not reference the ModelOnly facade or compatibility aggregator." />
+    <Error
+      Condition="$([System.String]::Copy('%(ProjectReference.FullPath)').Contains('HybridCPU v2'))"
+      Text="Direct sibling HybridCPU-v2 project references are forbidden; use a versioned external facade/package." />
+  </Target>
+</Project>

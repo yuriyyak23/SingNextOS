@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "phase": "P15",
+  "claim": "RuntimeEnforced",
+  "contour": "Windows-x64/.NET-11/JIT trace/telemetry non-interference; audit-only gate OFF",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "800027893dcf1ed23d8d7fe775841dd9d01a9fff",
+  "enabledFeatureGates": [],
+  "tests": [
+    { "lane": "trace-telemetry-authority-boundary", "passed": 19, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui-current-code", "passed": 1765, "failed": 0, "skipped": 2 }
+  ],
+  "defectsConfirmed": 0,
+  "evidence": { "path": "P15_REAUDIT_20260922.md", "sha256": "59cdca39ca4f24456b9ba91e25eda450bc5b2040dbc8cb104ddcbfae452c265b" },
+  "ordinaryFallback": "unchanged",
+  "futureGated": [{ "owner": "each authoritative transition plus trace subsystem", "missing": "enabled contour-specific post-linearization event and redaction/correlation proof", "requiredGateState": "OFF" }],
+  "exclusions": ["telemetry/replay is evidence only", "no provider/NativeAOT/temporal guarantee/hardware/ProductionQualified claim", "no ISA change"]
+}

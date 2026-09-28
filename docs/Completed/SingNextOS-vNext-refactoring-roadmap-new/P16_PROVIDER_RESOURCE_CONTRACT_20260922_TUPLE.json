@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "phase": "P16",
+  "phaseDisposition": "Open",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "executionHead": "cb6a94c314055e0712b8d9b8382ca1d146fe1c0e",
+  "claim": "StaticAdmission",
+  "productionQualified": false,
+  "p17MayStart": false,
+  "enabledFeatureGates": [],
+  "isaChangeCategory": [],
+  "artifacts": [
+    {
+      "path": "src/Platform/SingPlus.Platform.Abstractions/PlatformResourceContracts.cs",
+      "bytes": 9708,
+      "sha256": "de0cd36d1b536f7bbc35e73dc89843331e994d93efffc094594e60de58c54f29"
+    },
+    {
+      "path": "src/Platform/SingPlus.Platform.Abstractions/PlatformFeatureContracts.cs",
+      "bytes": 8407,
+      "sha256": "6a112e80c1116df495801ba44940cec92f1ebb06c37d6c9ebbc0e7d182ccc369"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Platform/VNextPhase16ProviderResourceContractTests.cs",
+      "bytes": 6988,
+      "sha256": "f02f0884b6bdfd5b884067a0fb4a6f785c6ad7aec0854215d57849f80ad0f8d3"
+    }
+  ],
+  "exclusions": [
+    "no executable provider or runtime adapter claim",
+    "external Contracts 1.14.0 and HybridCPU source are unchanged and not newly qualified",
+    "all gates remain OFF",
+    "no ProductionQualified, NativeAOT, hardware, QEMU, firmware or CXL boot claim"
+  ]
+}

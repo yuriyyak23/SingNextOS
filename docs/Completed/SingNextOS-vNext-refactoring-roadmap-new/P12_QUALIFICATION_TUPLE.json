@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "phase": "P12",
+  "claim": "RuntimeEnforced",
+  "contour": "resource consumption is forced through the ordinary SIP authority boundary; fused resource contour excluded",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "phaseEntryHead": "8c3f55e47555b2db99356b861ee404211d072edc",
+  "reviewedHead": "cf66d014fd0fc19cdcabca2ef1b5b974805ecda1",
+  "midPhaseHeadChange": true,
+  "enabledFeatureGates": [],
+  "tests": [
+    { "lane": "P12-barrier-and-ordinary-oracle", "passed": 43, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui", "passed": 1648, "failed": 9, "skipped": 2, "disposition": "same unrelated baseline failures" }
+  ],
+  "build": { "target": "SingNextOS.slnx", "warnings": 0, "errors": 0 },
+  "ordinaryFallback": "mandatory for resource-consuming SipJob edges",
+  "exclusions": [
+    "FG-VNX-SIPJOB-RESOURCE remains OFF",
+    "no fused resource execution or parallel lease split",
+    "no upper-bound, guarantee, hardware or production claim"
+  ]
+}

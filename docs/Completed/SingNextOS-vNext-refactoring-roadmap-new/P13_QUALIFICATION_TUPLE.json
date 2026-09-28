@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "phase": "P13",
+  "claim": "ModelOnly",
+  "contour": "typed non-compute dimension algebra and negative family qualification only",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "phaseEntryHead": "cf66d014fd0fc19cdcabca2ef1b5b974805ecda1",
+  "reviewedHead": "cf66d014fd0fc19cdcabca2ef1b5b974805ecda1",
+  "enabledFeatureGates": [],
+  "futureGatedFamilies": ["DmaThroughput", "NetworkThroughput", "FabricThroughput", "DeviceOccupancy"],
+  "tests": [
+    { "lane": "P01-P03-P13-dimension-boundary", "passed": 21, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui", "passed": 1652, "failed": 9, "skipped": 2, "disposition": "same unrelated baseline failures" }
+  ],
+  "build": { "target": "SingNextOS.slnx", "warnings": 0, "errors": 0 },
+  "ordinaryFallback": "ComputeTime only; unchanged",
+  "exclusions": [
+    "all non-compute family gates remain OFF",
+    "no semantic-to-budget mapping or provider adapter",
+    "no ExecutableAdapter, upper-bound, guarantee, hardware or production claim"
+  ]
+}

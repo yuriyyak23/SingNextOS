@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "phase": "P16",
+  "phaseDisposition": "ClosedExactHostContour",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "executionHead": "800027893dcf1ed23d8d7fe775841dd9d01a9fff",
+  "runtimeContour": "Windows-x64/.NET-11/JIT/host-provider/ComputeTimeNanoseconds",
+  "claim": "ExecutableAdapter",
+  "productionQualified": false,
+  "p17MayStart": true,
+  "enabledFeatureGates": [],
+  "isaChangeCategory": [],
+  "artifacts": [
+    { "path": "src/Platform/SingPlus.Platform.Abstractions/PlatformResourceContracts.cs", "bytes": 9708, "sha256": "de0cd36d1b536f7bbc35e73dc89843331e994d93efffc094594e60de58c54f29" },
+    { "path": "src/Platform/SingPlus.Platform.Host/HostPlatformAuthorityProvider.Resources.cs", "bytes": 8970, "sha256": "531303973679e466053ea3808a75b9a32585ecca518a70ba7b0ca4827477a6e8" },
+    { "path": "src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.Resources.cs", "bytes": 8088, "sha256": "aa249adcd150ece3775428f357601f75b83f73874e94e5a81e7bbf08ebef1c3e" },
+    { "path": "src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetRecoveryJournal.cs", "bytes": 21653, "sha256": "2255698e183271211e49da6d8e11f6b068932196915101ba467630b6f3f74414" },
+    { "path": "src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetAuthority.cs", "bytes": 30857, "sha256": "8b48d88befe9798a467b6c8abf1b3c4bb238ea55409162e00fa2bb593f1ffdc2" },
+    { "path": "src/Runtime/SingPlus.Runtime/RuntimeKernel.cs", "bytes": 17278, "sha256": "d942b731a1c8e34d031d0fd894625c0d7bb246fba73eaae95f6d543b2b57f077" },
+    { "path": "src/Runtime/SingPlus.Runtime/VNext/ResourceAdmissionProtocol.cs", "bytes": 23326, "sha256": "bb1e869f7b74882334482a0834e5f992930895a344ebf2c43ec71e307310758c" },
+    { "path": "src/Runtime/SingPlus.Runtime/VNext/ExternalOperationResourceBinding.cs", "bytes": 17264, "sha256": "db9101e470bda0e18c04fb237eb54f5d4053bcce31e270b8fcddf551efd3965b" },
+    { "path": "src/Runtime/SingPlus.Runtime/VNext/VNextFeatureGates.cs", "bytes": 9507, "sha256": "393bc923c145d4b5efe20ef846ce816162d02af37a5e4e8c27cf76bbb5fef2d3" },
+    { "path": "src/Runtime/SingPlus.Runtime/SipJobs/SipJobResourceTransportExecutor.cs", "bytes": 2483, "sha256": "dbe44494d3dca984a5c22420ee586a08d28a7b40eef95776cd9a77ac904f4195" },
+    { "path": "tools/SingPlus.SingCapQualification/VNextControlledTopologyQualification.cs", "bytes": 9930, "sha256": "fb4c245c89f72c7c0a2211f5ec2729d3772f83b0796ac5a6e919a7cb9e79a1f9" },
+    { "path": "tests/SingPlus.Tests/Platform/VNextPhase16ProviderResourceContractTests.cs", "bytes": 6988, "sha256": "f02f0884b6bdfd5b884067a0fb4a6f785c6ad7aec0854215d57849f80ad0f8d3" },
+    { "path": "tests/SingPlus.Tests/Platform/VNextPhase16HostResourceAdapterTests.cs", "bytes": 5057, "sha256": "3e19ffb8a26ead5a92904ed2be128f2b3c393a5df79a5ff04bb8f8d04e218c76" },
+    { "path": "tests/SingPlus.Tests/Runtime/VNextPhase16ResourceBudgetRecoveryJournalTests.cs", "bytes": 6441, "sha256": "120ba6e96ba9e1164d8a1fc1b9b875573ceded0c7a16dc751e0b27ef9e3343f7" },
+    { "path": "tests/SingPlus.Tests/Runtime/VNextPhase16DurableResourceAdmissionTests.cs", "bytes": 7854, "sha256": "b1da61c08bfbf8cdfdf8b9b9ae6c082ef89e604eaa49c2e726c54e225a975fd6" },
+    { "path": "tests/SingPlus.Tests/Runtime/VNextPhase16FeatureGateRollbackTests.cs", "bytes": 4494, "sha256": "a79c5f0ea9d30d8a77653f6862e29b3a52ccf4c324a8b86ca0260fd0462a6754" },
+    { "path": "tests/SingPlus.Tests/Runtime/VNextPhase16SipJobResourceDifferentialTests.cs", "bytes": 7955, "sha256": "4c583a56f241960870039f4e156556bca0a54aa4600b5edea0f6232b5083b85a" },
+    { "path": "tests/SingPlus.Tests/Architecture/VNextPhase16BlockerRemediationTests.cs", "bytes": 3897, "sha256": "46171a6b34c9d0ad7c26d3e27cb5cf209a68c7ac6a2dee3714acab56cc3db21e" },
+    { "path": "tests/SingPlus.Tests/Architecture/VNextPhase16ControlledTopologyQualificationTests.cs", "bytes": 2782, "sha256": "9e0c1db550f6e7277cfe65a7c5c6282e78d00961c913706e4b34268a5d26b3f5" },
+    { "path": "docs/SingNextOS-vNext-refactoring-roadmap-new/P16_CONTROLLED_TOPOLOGY_20260922.json", "bytes": 1458, "sha256": "06386ccbf37523dd1e78ae37aa316d961d8241552b72c1474f42c099cfa3ccba" }
+  ],
+  "futureGated": [
+    "wall-clock/CPU-time upper bound lacks preemptive or contained execution owner",
+    "minimum provider CPU capacity lacks scheduler/provider capacity owner",
+    "HybridCPU resource provider contract/source remains unavailable locally"
+  ],
+  "exclusions": [
+    "no EnforcedUpperBound, GuaranteedReservation or ProductionQualified claim",
+    "no HybridCPU, NativeAOT, real hardware, QEMU, firmware or CXL boot qualification",
+    "all gates remain default OFF"
+  ]
+}

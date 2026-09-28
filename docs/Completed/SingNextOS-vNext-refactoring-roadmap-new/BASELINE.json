@@ -1,0 +1,25 @@
+{
+  "research_date": "2026-09-20",
+  "SingNextOS": {
+    "branch": "master",
+    "sha": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+    "commit_time_utc": "2026-09-20T13:54:11Z"
+  },
+  "HybridCPU-v2": {
+    "branch": "master",
+    "sha": "794c4a53494f503855ac8cf209efab23fde083b2",
+    "commit_time_utc": "2026-09-18T21:05:22Z"
+  },
+  "superseded_roadmap_baseline": {
+    "SingNextOS": "386e247e37f4e252d1bf4fda80a57b49858fb788",
+    "HybridCPU-v2": "794c4a53494f503855ac8cf209efab23fde083b2"
+  },
+  "source_of_truth_order": [
+    "live code + executable tests",
+    "current normative specifications",
+    "current implementation evidence",
+    "roadmap/design",
+    "historical documents"
+  ],
+  "known_externalruntime_contract_contour": "HybridCPU.ExternalRuntime.Contracts/1.14.0 (must be re-pinned at P16)"
+}

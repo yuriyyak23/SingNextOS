@@ -1,0 +1,629 @@
+using SingPlus.Contracts;
+using SingPlus.Platform;
+
+namespace SingPlus.Runtime;
+
+public sealed record CxlType2Execution(
+    ComputePlan Plan,
+    ExternalOperationHandle Operation,
+    OperationBinding Binding,
+    CxlAcceleratorSubmission Submission,
+    OperationDependencySnapshot Dependencies,
+    CxlEndpointSnapshot Endpoint,
+    CxlFabricBinding Fabric,
+    PlatformDomainIdentity Subject,
+    PlatformDeviceLease DeviceLease,
+    CxlSecurityAuthority? SecurityAuthority = null,
+    CxlSecurityPolicy? SecurityPolicy = null);
+
+/// <summary>Composes Type-2 execution through the provider-neutral planner and lifecycle.</summary>
+public sealed class CxlType2AcceleratorService : ICxlTeardownParticipant, IComposedWorkTeardownParticipant
+{
+    private readonly RuntimeKernel kernel;
+    private readonly CxlAuthorityBridge authority;
+    private readonly ICxlType2AcceleratorProvider provider;
+    private readonly CxlFabricManagerAuthority fabricManager;
+    private readonly Dictionary<ExternalOperationId, (ProcessHandle Principal, CxlType2Execution Execution)> _live = [];
+    private readonly Dictionary<ExternalOperationId, ProcessHandle> _uncontained = [];
+    private readonly Dictionary<ExternalOperationId, VirtualComputeContext> _virtualContexts = [];
+
+    public CxlType2AcceleratorService(RuntimeKernel kernel, CxlAuthorityBridge authority,
+        ICxlType2AcceleratorProvider provider, CxlFabricManagerAuthority fabricManager)
+    {
+        this.kernel = kernel ?? throw new ArgumentNullException(nameof(kernel));
+        this.authority = authority ?? throw new ArgumentNullException(nameof(authority));
+        this.provider = provider ?? throw new ArgumentNullException(nameof(provider));
+        this.fabricManager = fabricManager ?? throw new ArgumentNullException(nameof(fabricManager));
+        kernel.RegisterCxlTeardownParticipant(this);
+        kernel.RegisterComposedWorkTeardownParticipant(this);
+    }
+    public KernelResult<CxlType2Execution> Submit(
+        ProcessHandle principal,
+        ComputePlan plan,
+        IReadOnlyList<ComputeProviderCandidate> currentCandidates,
+        PlatformDomainIdentity subject,
+        PlatformDeviceLease deviceLease,
+        CxlEndpointSnapshot endpoint,
+        CxlFabricBinding fabric,
+        ulong platformGeneration,
+        ExternalEffectPolicy? effectPolicy = null,
+        CxlSecurityAuthority? securityAuthority = null,
+        CxlSecurityPolicy? securityPolicy = null)
+    {
+        if (plan.Intent.RequiresVirtualizedDomain)
+            return KernelResult<CxlType2Execution>.Fail(KernelError.PlatformDenied,
+                "Virtualized Type-2 work requires an exact kernel-validated virtual compute context.");
+        return SubmitCore(principal, plan, currentCandidates, subject, deviceLease, endpoint, fabric,
+            platformGeneration, effectPolicy, securityAuthority, securityPolicy, null, null);
+    }
+
+    internal KernelResult<CxlType2Execution> SubmitProtected(
+        ProcessHandle principal,
+        ComputePlan plan,
+        IReadOnlyList<ComputeProviderCandidate> currentCandidates,
+        PlatformDomainIdentity subject,
+        PlatformDeviceLease deviceLease,
+        CxlEndpointSnapshot endpoint,
+        CxlFabricBinding fabric,
+        ulong platformGeneration,
+        Func<ExternalOperationHandle, IEnumerable<ProtectedAcceleratorLabelSidebandV1>> labelSideband,
+        ExternalEffectPolicy? effectPolicy = null,
+        CxlSecurityAuthority? securityAuthority = null,
+        CxlSecurityPolicy? securityPolicy = null)
+    {
+        ArgumentNullException.ThrowIfNull(labelSideband);
+        if (provider is not ICxlType2ProtectedAcceleratorProvider)
+            return KernelResult<CxlType2Execution>.Fail(KernelError.PlatformUnsupported,
+                "The Type-2 provider does not expose a protected label submission boundary.");
+        if (plan.Intent.RequiresVirtualizedDomain)
+            return KernelResult<CxlType2Execution>.Fail(KernelError.PlatformDenied,
+                "Virtualized protected Type-2 work requires an exact kernel-validated virtual compute context.");
+        if (plan.Intent.RightInput is not null)
+            return KernelResult<CxlType2Execution>.Fail(KernelError.PlatformUnsupported,
+                "Protected Type-2 sideband currently binds one input Region only.");
+        return SubmitCore(principal, plan, currentCandidates, subject, deviceLease, endpoint, fabric,
+            platformGeneration, effectPolicy, securityAuthority, securityPolicy, null, labelSideband);
+    }
+
+    private KernelResult<CxlType2Execution> SubmitCore(
+        ProcessHandle principal,
+        ComputePlan plan,
+        IReadOnlyList<ComputeProviderCandidate> currentCandidates,
+        PlatformDomainIdentity subject,
+        PlatformDeviceLease deviceLease,
+        CxlEndpointSnapshot endpoint,
+        CxlFabricBinding fabric,
+        ulong platformGeneration,
+        ExternalEffectPolicy? effectPolicy,
+        CxlSecurityAuthority? securityAuthority,
+        CxlSecurityPolicy? securityPolicy,
+        VirtualComputeContext? virtualContext,
+        Func<ExternalOperationHandle, IEnumerable<ProtectedAcceleratorLabelSidebandV1>>? labelSidebandFactory)
+    {
+        var planned = virtualContext is { } plannedContext
+            ? kernel.ValidateVirtualizedComputePlanBeforeSubmit(principal, plan, currentCandidates, plannedContext)
+            : kernel.ValidateComputePlanBeforeSubmit(principal, plan, currentCandidates);
+        if (!planned.IsSuccess) return KernelResult<CxlType2Execution>.Fail(planned.Error, planned.Message!);
+        if (virtualContext is { } exactContext)
+        {
+            var exact = kernel.RevalidateVirtualComputeContext(principal, exactContext, plan);
+            if (!exact.IsSuccess) return KernelResult<CxlType2Execution>.Fail(exact.Error, exact.Message!);
+        }
+        if (plan.PublicationPath == ComputePublicationPath.DirectCoherent)
+            return KernelResult<CxlType2Execution>.Fail(KernelError.PlatformUnsupported, "Direct coherent Type-2 output is future-gated until CPU alias exclusion and symmetric coherent binding release exist.");
+
+        var dependencies = new OperationDependencySnapshot(platformGeneration, endpoint.DeviceGeneration.Value, fabric.Generation.Value);
+        var policy = plan.PublicationPath == ComputePublicationPath.Staged ? ExternalPublicationPolicy.Staged : ExternalPublicationPolicy.DirectCoherent;
+        var prepared = kernel.PrepareExternalOperation(principal, plan.RequiredRegionUses,
+            ExternalVisibilityRequirement.PublicationFence, policy, effectPolicy);
+        if (!prepared.IsSuccess) return KernelResult<CxlType2Execution>.Fail(prepared.Error, prepared.Message!);
+        IReadOnlyList<ProtectedAcceleratorLabelSidebandV1>? protectedSideband = null;
+        if (labelSidebandFactory is not null)
+        {
+            ProtectedAcceleratorLabelResult verified;
+            try
+            {
+                verified = V6ProtectedAcceleratorLabelFlow.Verify(labelSidebandFactory(prepared.Value!.Operation));
+            }
+            catch (Exception exception)
+            {
+                AbortPreSubmit(principal, prepared.Value!.Operation);
+                return KernelResult<CxlType2Execution>.Fail(KernelError.PlatformDenied,
+                    $"Protected Type-2 label production failed closed: {exception.Message}");
+            }
+            if (!verified.IsSuccess || !LabelsMatchOperation(verified.Sideband, plan, prepared.Value!.Operation) ||
+                !LabelsMatchLiveRegions(principal, plan, verified.Sideband))
+            {
+                AbortPreSubmit(principal, prepared.Value!.Operation);
+                return KernelResult<CxlType2Execution>.Fail(
+                    verified.Error == ProtectedAcceleratorLabelError.OperationMismatch
+                        ? KernelError.StaleGeneration : KernelError.PlatformDenied,
+                    verified.Detail ?? "Protected Type-2 labels do not match the actual operation identity.");
+            }
+            protectedSideband = verified.Sideband;
+        }
+        var admitted = virtualContext is not null
+            ? kernel.AdmitExternalOperationForVirtualContext(principal, prepared.Value!.Operation, dependencies,
+                new ExternalServiceIdentity(plan.ProviderId.Value), ExternalCancellationSupport.BeforeSubmissionOnly)
+            : kernel.AdmitExternalOperation(principal, prepared.Value!.Operation, dependencies,
+                new ExternalServiceIdentity(plan.ProviderId.Value), ExternalCancellationSupport.BeforeSubmissionOnly);
+        if (!admitted.IsSuccess)
+        {
+            AbortPreSubmit(principal, prepared.Value.Operation);
+            return KernelResult<CxlType2Execution>.Fail(admitted.Error, admitted.Message!);
+        }
+        var device = authority.ValidateDeviceAuthority(subject, deviceLease, endpoint);
+        if (!device.IsSuccess)
+        {
+            AbortPreSubmit(principal, prepared.Value.Operation);
+            return KernelResult<CxlType2Execution>.Fail(device.Error, device.Message!);
+        }
+        if (virtualContext is { } currentContext)
+        {
+            var exact = kernel.RevalidateVirtualComputeContext(principal, currentContext, plan);
+            if (!exact.IsSuccess)
+            {
+                AbortPreSubmit(principal, prepared.Value.Operation);
+                return KernelResult<CxlType2Execution>.Fail(exact.Error, exact.Message!);
+            }
+        }
+        var fabricAdmission = fabricManager.ValidateAdmission(fabric);
+        if (!fabricAdmission.IsSuccess)
+        {
+            AbortPreSubmit(principal, prepared.Value.Operation);
+            return KernelResult<CxlType2Execution>.Fail(fabricAdmission.Error, fabricAdmission.Message!);
+        }
+        var preEffect = authority.RevalidateBeforeEffect(admitted.Value!.Principal, admitted.Value.RegionUses[0].Handle, endpoint, fabric);
+        if (!preEffect.IsSuccess)
+        {
+            AbortPreSubmit(principal, prepared.Value.Operation);
+            return KernelResult<CxlType2Execution>.Fail(preEffect.Error, preEffect.Message!);
+        }
+        if (plan.Intent.RequiresSecureEvidence)
+        {
+            if (securityAuthority is null || securityPolicy is null || !securityPolicy.RequiredForOperation)
+            {
+                AbortPreSubmit(principal, prepared.Value.Operation);
+                return KernelResult<CxlType2Execution>.Fail(KernelError.PlatformDenied, "Secure-required Type-2 admission requires a generation-bound security policy and authority.");
+            }
+            var readiness = securityAuthority.Evaluate(admitted.Value.Principal, admitted.Value.RegionUses[0].Handle,
+                subject, deviceLease, endpoint, fabric, securityPolicy);
+            if (!readiness.IsSuccess || !readiness.Value!.Ready)
+            {
+                AbortPreSubmit(principal, prepared.Value.Operation);
+                return KernelResult<CxlType2Execution>.Fail(readiness.Error, readiness.Message ?? "Secure-required Type-2 readiness failed.");
+            }
+        }
+        if (virtualContext is { } submissionContext)
+        {
+            var exact = kernel.RevalidateVirtualComputeContext(principal, submissionContext, plan);
+            if (!exact.IsSuccess)
+            {
+                AbortPreSubmit(principal, prepared.Value.Operation);
+                return KernelResult<CxlType2Execution>.Fail(exact.Error, exact.Message!);
+            }
+        }
+        var binding = kernel.RecordExternalOperationSubmission(principal, prepared.Value.Operation, dependencies);
+        if (!binding.IsSuccess)
+        {
+            AbortPreSubmit(principal, prepared.Value.Operation);
+            return KernelResult<CxlType2Execution>.Fail(binding.Error, binding.Message!);
+        }
+        if (virtualContext is { } pinnedContext)
+            kernel.PinVirtualComputeContext(principal, binding.Value.Operation, pinnedContext);
+        var providerEffectStarted = false;
+        var admittedEffect = fabricManager.ExecuteAdmission(fabric, () =>
+        {
+            providerEffectStarted = true;
+            return SubmitProviderEffect(principal, plan, admitted.Value, binding.Value!, dependencies, endpoint, fabric, subject,
+                deviceLease, securityAuthority, securityPolicy, virtualContext, protectedSideband);
+        });
+        if (!providerEffectStarted)
+            AbortNotAccepted(principal, binding.Value);
+        return admittedEffect;
+    }
+
+    internal KernelResult<CxlType2Execution> SubmitVirtualized(
+        ProcessHandle principal, ComputePlan plan, IReadOnlyList<ComputeProviderCandidate> currentCandidates,
+        VirtualComputeContext context, PlatformDomainIdentity subject, PlatformDeviceLease deviceLease,
+        CxlEndpointSnapshot endpoint, CxlFabricBinding fabric, ulong platformGeneration,
+        ExternalEffectPolicy? effectPolicy = null, CxlSecurityAuthority? securityAuthority = null,
+        CxlSecurityPolicy? securityPolicy = null)
+    {
+        if (!plan.Intent.RequiresVirtualizedDomain)
+            return KernelResult<CxlType2Execution>.Fail(KernelError.PlatformDenied, "Virtualized Type-2 submit requires a virtualized compute plan.");
+        return SubmitCore(principal, plan, currentCandidates, subject, deviceLease, endpoint, fabric, platformGeneration,
+            effectPolicy, securityAuthority, securityPolicy, context, null);
+    }
+
+    private KernelResult<CxlType2Execution> SubmitProviderEffect(
+        ProcessHandle principal, ComputePlan plan, OperationAdmissionSnapshot admission,
+        OperationBinding binding, OperationDependencySnapshot dependencies, CxlEndpointSnapshot endpoint,
+        CxlFabricBinding fabric, PlatformDomainIdentity subject, PlatformDeviceLease deviceLease,
+        CxlSecurityAuthority? securityAuthority, CxlSecurityPolicy? securityPolicy,
+        VirtualComputeContext? virtualContext,
+        IReadOnlyList<ProtectedAcceleratorLabelSidebandV1>? protectedSideband)
+    {
+        if (plan.Intent.RequiresSecureEvidence)
+        {
+            if (securityAuthority is null || securityPolicy is null)
+            {
+                AbortNotAccepted(principal, binding);
+                return KernelResult<CxlType2Execution>.Fail(KernelError.PlatformDenied,
+                    "Secure-required Type-2 provider submission lost its trust predicate.");
+            }
+            var trust = securityAuthority.Evaluate(admission.Principal,
+                admission.RegionUses[0].Handle, subject, deviceLease, endpoint, fabric, securityPolicy);
+            if (!trust.IsSuccess || !trust.Value!.Ready)
+            {
+                AbortNotAccepted(principal, binding);
+                return KernelResult<CxlType2Execution>.Fail(trust.Error,
+                    trust.Message ?? "Device trust evidence became invalid before provider submit.");
+            }
+        }
+        PlatformAuthorityResult<CxlAcceleratorSubmission> submitted;
+        try
+        {
+            var request = new CxlAcceleratorRequest(plan.Intent.Operation, plan.PublicationPath, binding,
+                admission.RegionUses, endpoint.EndpointId, endpoint.DeviceGeneration,
+                new(fabric.BindingId, fabric.Generation));
+            if (protectedSideband is not null)
+            {
+                var reverified = V6ProtectedAcceleratorLabelFlow.Verify(protectedSideband);
+                if (!reverified.IsSuccess || !LabelsMatchOperation(reverified.Sideband, plan, binding.Operation) ||
+                    !LabelsMatchLiveRegions(principal, plan, reverified.Sideband))
+                {
+                    AbortNotAccepted(principal, binding);
+                    return KernelResult<CxlType2Execution>.Fail(KernelError.StaleGeneration,
+                        reverified.Detail ?? "Protected Type-2 labels became stale before provider submit.");
+                }
+                if (provider is not ICxlType2ProtectedAcceleratorProvider protectedProvider)
+                {
+                    AbortNotAccepted(principal, binding);
+                    return KernelResult<CxlType2Execution>.Fail(KernelError.PlatformUnsupported,
+                        "The protected Type-2 provider boundary disappeared before submit.");
+                }
+                submitted = protectedProvider.SubmitProtected(
+                    new(request, plan.ProviderGeneration, reverified.Sideband));
+            }
+            else
+            {
+                submitted = provider.Submit(request);
+            }
+        }
+        catch (Exception exception)
+        {
+            _uncontained[binding.Operation.OperationId] = principal;
+            _ = fabricManager.TrackOperation(fabric, principal, binding.Operation,
+                () => KernelResult.Fail(KernelError.ExternalEffectUncontained,
+                    "Type-2 submission threw without a recovery token."));
+            return KernelResult<CxlType2Execution>.Fail(KernelError.ExternalEffectUncontained,
+                $"Type-2 submission threw after its effect boundary and remains quarantined: {exception.Message}");
+        }
+        if (!submitted.IsSuccess)
+        {
+            if (submitted.Status == PlatformAuthorityStatus.NotAccepted)
+                AbortNotAccepted(principal, binding);
+            else
+            {
+                _uncontained[binding.Operation.OperationId] = principal;
+                _ = fabricManager.TrackOperation(fabric, principal, binding.Operation,
+                    () => KernelResult.Fail(KernelError.ExternalEffectUncontained, "Submission acceptance remains ambiguous without a recovery token."));
+            }
+            return KernelResult<CxlType2Execution>.Fail(Map(submitted.Status), submitted.Message ?? "Type-2 submission failed.");
+        }
+        if (submitted.Value!.OperationBinding != binding || submitted.Value.EndpointId != endpoint.EndpointId ||
+            submitted.Value.DeviceGeneration != endpoint.DeviceGeneration ||
+            submitted.Value.FabricBinding != new CxlFabricBindingRef(fabric.BindingId, fabric.Generation))
+        {
+            var compensation = provider.Release(submitted.Value);
+            if (compensation.IsSuccess)
+                CloseSubmitted(principal, binding.Operation);
+            else
+            {
+                var recovery = new CxlType2Execution(plan, binding.Operation, binding, submitted.Value,
+                    dependencies, endpoint, fabric, subject, deviceLease, securityAuthority, securityPolicy);
+                _live[binding.Operation.OperationId] = (principal, recovery);
+                _ = fabricManager.TrackOperation(fabric, principal, binding.Operation,
+                    () => CloseProviderForFabricDrain(principal, recovery));
+            }
+            return KernelResult<CxlType2Execution>.Fail(KernelError.PlatformFaulted, "Type-2 provider returned a malformed submission identity.");
+        }
+        var execution = new CxlType2Execution(plan, binding.Operation, binding,
+            submitted.Value, dependencies, endpoint, fabric, subject, deviceLease,
+            securityAuthority, securityPolicy);
+        _live.Add(execution.Operation.OperationId, (principal, execution));
+        if (virtualContext is { } context) _virtualContexts.Add(execution.Operation.OperationId, context);
+        var tracked = fabricManager.TrackOperation(fabric, principal, execution.Operation,
+            () => CloseProviderForFabricDrain(principal, execution));
+        if (!tracked.IsSuccess)
+        {
+            var cancellation = provider.Cancel(execution.Submission);
+            if (cancellation.IsSuccess)
+            {
+                CloseSubmitted(principal, execution.Operation);
+                _live.Remove(execution.Operation.OperationId);
+                _virtualContexts.Remove(execution.Operation.OperationId);
+            }
+            return KernelResult<CxlType2Execution>.Fail(tracked.Error, tracked.Message!);
+        }
+        if (virtualContext is { } submittedContext)
+        {
+            var exact = kernel.RevalidateVirtualComputeContext(principal, submittedContext, plan);
+            if (!exact.IsSuccess)
+            {
+                var failed = FailBeforePublication(principal, execution, exact.Error, exact.Message!);
+                return KernelResult<CxlType2Execution>.Fail(failed.Error, failed.Message!);
+            }
+        }
+        return KernelResult<CxlType2Execution>.Ok(execution);
+    }
+
+    public KernelResult<ExternalOperationSnapshot> CompleteVisiblePublish(
+        ProcessHandle principal,
+        CxlType2Execution execution,
+        IReadOnlyList<ComputeProviderCandidate> currentCandidates,
+        Action publicationAction) => CompleteVisiblePublishCore(principal, execution, currentCandidates,
+            publicationAction, null);
+
+    internal KernelResult<ExternalOperationSnapshot> CompleteVisiblePublishWithGuestEvent(
+        ProcessHandle principal,
+        CxlType2Execution execution,
+        IReadOnlyList<ComputeProviderCandidate> currentCandidates,
+        Action publicationAction,
+        VirtualIoBinding virtualIo,
+        CapabilityId eventCapability,
+        KernelEventEndpoint endpoint) => CompleteVisiblePublishCore(principal, execution, currentCandidates,
+            publicationAction, () => kernel.PublishVirtualIoEvent(principal, virtualIo, execution.Operation,
+                eventCapability, endpoint));
+
+    private KernelResult<ExternalOperationSnapshot> CompleteVisiblePublishCore(
+        ProcessHandle principal,
+        CxlType2Execution execution,
+        IReadOnlyList<ComputeProviderCandidate> currentCandidates,
+        Action publicationAction,
+        Func<KernelResult>? publishGuestEvent)
+    {
+        if (!_live.TryGetValue(execution.Operation.OperationId, out var live) ||
+            live.Principal != principal || live.Execution != execution)
+            return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.StaleGeneration,
+                "Exact live Type-2 execution identity is required before completion or publication.");
+        if (_virtualContexts.TryGetValue(execution.Operation.OperationId, out var virtualContext))
+        {
+            var exact = kernel.RevalidateVirtualComputeContext(principal, virtualContext, execution.Plan);
+            if (!exact.IsSuccess)
+                return FailBeforePublication(principal, execution, exact.Error, exact.Message!);
+        }
+        var providerCandidate = currentCandidates.SingleOrDefault(candidate => candidate.ProviderId == execution.Plan.ProviderId);
+        if (providerCandidate is null || !providerCandidate.Available || providerCandidate.Faulted)
+            return FailBeforePublication(principal, execution, KernelError.PlatformUnavailable, "Type-2 provider disappeared before publication.");
+        if (providerCandidate.Generation != execution.Plan.ProviderGeneration)
+            return FailBeforePublication(principal, execution, KernelError.StaleGeneration, "Type-2 provider generation changed before publication.");
+        var device = authority.ValidateDeviceAuthority(execution.Subject, execution.DeviceLease, execution.Endpoint);
+        if (!device.IsSuccess) return FailBeforePublication(principal, execution, device.Error, device.Message!);
+        var operation = kernel.QueryExternalOperation(principal, execution.Operation);
+        if (!operation.IsSuccess || operation.Value!.Admission is null)
+            return KernelResult<ExternalOperationSnapshot>.Fail(operation.Error, operation.Message ?? "Operation admission is unavailable.");
+        var bindingValidation = authority.RevalidateBeforeEffect(operation.Value.Admission.Principal,
+            operation.Value.Admission.RegionUses[0].Handle, execution.Endpoint, execution.Fabric);
+        if (!bindingValidation.IsSuccess)
+            return FailBeforePublication(principal, execution, bindingValidation.Error, bindingValidation.Message!);
+        var securityBeforeCompletion = RevalidateSecurity(execution, operation.Value.Admission);
+        if (!securityBeforeCompletion.IsSuccess)
+            return FailBeforePublication(principal, execution, securityBeforeCompletion.Error,
+                securityBeforeCompletion.Message!);
+
+        var completion = provider.ObserveCompletion(execution.Submission);
+        if (!completion.IsSuccess || completion.Value!.Submission != execution.Submission)
+            return FailBeforePublication(principal, execution, Map(completion.Status), completion.Message ?? "Type-2 completion is stale.");
+        var completed = kernel.RecordExternalOperationCompletion(principal,
+            new(execution.Binding, completion.Value.Disposition));
+        if (!completed.IsSuccess) return completed;
+        if (completion.Value.Disposition != ExternalOperationCompletionDisposition.Completed)
+            return CloseAfterProviderRelease(principal, execution, KernelError.PlatformFaulted,
+                $"Type-2 provider completed with {completion.Value.Disposition}.");
+        // Device completion is not publication authority. Security/provider generations may
+        // change while completion is observed, so close that window before visibility.
+        var securityAfterCompletion = RevalidateSecurity(execution, operation.Value.Admission);
+        if (!securityAfterCompletion.IsSuccess)
+            return FailBeforePublication(principal, execution, securityAfterCompletion.Error,
+                securityAfterCompletion.Message!);
+        var visibility = provider.AcquireVisibility(execution.Submission, ExternalVisibilityRequirement.PublicationFence);
+        if (!visibility.IsSuccess || visibility.Value!.Submission != execution.Submission)
+            return FailBeforePublication(principal, execution, Map(visibility.Status), visibility.Message ?? "Type-2 visibility is stale.");
+        var visible = kernel.RecordExternalOperationVisibility(principal,
+            new(execution.Binding, visibility.Value.Requirement, visibility.Value.Satisfied));
+        if (!visible.IsSuccess)
+            return CloseAfterProviderRelease(principal, execution, visible.Error, visible.Message);
+        // AcquireVisibility is a provider callback. A reset there invalidates the
+        // earlier security query, even when the visibility receipt itself succeeded.
+        var securityBeforePublication = RevalidateSecurity(execution, operation.Value.Admission);
+        if (!securityBeforePublication.IsSuccess)
+            return FailBeforePublication(principal, execution, securityBeforePublication.Error,
+                securityBeforePublication.Message!);
+        var published = kernel.PublishExternalOperation(principal, execution.Operation, execution.Dependencies,
+            new(execution.Plan.PublicationPath == ComputePublicationPath.Staged ? ExternalPublicationPolicy.Staged : ExternalPublicationPolicy.DirectCoherent),
+            () =>
+            {
+                publicationAction();
+                // The action may already have published output. A trust reset during
+                // it must leave the owner's publication decision ambiguous.
+                var afterAction = RevalidateSecurity(execution, operation.Value.Admission);
+                if (!afterAction.IsSuccess)
+                    throw new InvalidOperationException(
+                        $"Type-2 trust changed during publication action: {afterAction.Error}: {afterAction.Message}");
+            });
+        if (!published.IsSuccess)
+            return CloseAfterProviderRelease(principal, execution, published.Error, published.Message);
+        if (publishGuestEvent is not null)
+        {
+            var delivered = publishGuestEvent();
+            if (!delivered.IsSuccess)
+                return CloseAfterProviderRelease(principal, execution, delivered.Error, delivered.Message);
+        }
+        var release = provider.Release(execution.Submission);
+        if (!release.IsSuccess) return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.PlatformFaulted, release.Message ?? "Type-2 release is ambiguous; operation remains quarantined.");
+        return CloseLocalAfterProviderClosure(principal, execution);
+    }
+
+    private static KernelResult RevalidateSecurity(CxlType2Execution execution,
+        OperationAdmissionSnapshot admission)
+    {
+        if (!execution.Plan.Intent.RequiresSecureEvidence) return KernelResult.Ok();
+        if (execution.SecurityAuthority is null || execution.SecurityPolicy is null)
+            return KernelResult.Fail(KernelError.PlatformDenied,
+                "Secure readiness receipt is missing before publication.");
+        var readiness = execution.SecurityAuthority.Evaluate(admission.Principal,
+            admission.RegionUses[0].Handle, execution.Subject, execution.DeviceLease,
+            execution.Endpoint, execution.Fabric, execution.SecurityPolicy);
+        if (!readiness.IsSuccess)
+            return KernelResult.Fail(readiness.Error,
+                readiness.Message ?? "Secure readiness became stale before publication.");
+        return readiness.Value!.Ready
+            ? KernelResult.Ok()
+            : KernelResult.Fail(KernelError.PlatformDenied,
+                "Required secure readiness was not proven before publication.");
+    }
+
+    private KernelResult<ExternalOperationSnapshot> FailBeforePublication(ProcessHandle principal, CxlType2Execution execution, KernelError error, string message)
+    {
+        var providerClosure = provider.Release(execution.Submission);
+        if (!providerClosure.IsSuccess)
+            return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.PlatformFaulted, $"{message} Provider release did not prove closure; operation remains quarantined.");
+        var closed = CloseLocalAfterProviderClosure(principal, execution);
+        if (!closed.IsSuccess)
+            return KernelResult<ExternalOperationSnapshot>.Fail(closed.Error, closed.Message!);
+        return KernelResult<ExternalOperationSnapshot>.Fail(error, message);
+    }
+
+    private KernelResult<ExternalOperationSnapshot> CloseAfterProviderRelease(
+        ProcessHandle principal, CxlType2Execution execution, KernelError originalError, string? originalMessage)
+    {
+        var providerClosure = provider.Release(execution.Submission);
+        if (!providerClosure.IsSuccess)
+            return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.PlatformFaulted,
+                $"{originalMessage ?? "Type-2 operation failed."} Provider release did not prove closure; operation remains quarantined.");
+        var closed = CloseLocalAfterProviderClosure(principal, execution);
+        return closed.IsSuccess
+            ? KernelResult<ExternalOperationSnapshot>.Fail(originalError, originalMessage ?? "Type-2 operation failed closed.")
+            : closed;
+    }
+
+    private KernelResult<ExternalOperationSnapshot> CloseLocalAfterProviderClosure(
+        ProcessHandle principal, CxlType2Execution execution)
+    {
+        var current = kernel.QueryExternalOperation(principal, execution.Operation);
+        if (!current.IsSuccess)
+            return current;
+        if (current.Value!.State == ExternalOperationState.Submitted)
+        {
+            var lost = kernel.RecordExternalOperationProviderLoss(principal, execution.Operation);
+            if (!lost.IsSuccess) return lost;
+        }
+        else if (current.Value.State is ExternalOperationState.DeviceComplete or ExternalOperationState.Visible &&
+                 current.Value.Disposition == ExternalOperationDisposition.Completed)
+        {
+            var cancelled = kernel.CancelExternalOperation(principal, execution.Operation, false);
+            if (!cancelled.IsSuccess) return cancelled;
+        }
+        var closed = kernel.ReleaseExternalOperation(principal, execution.Operation, new(true, false));
+        if (closed.IsSuccess)
+        {
+            _live.Remove(execution.Operation.OperationId);
+            _virtualContexts.Remove(execution.Operation.OperationId);
+            kernel.ReleaseVirtualComputeContext(execution.Operation);
+            _ = fabricManager.UntrackOperation(execution.Fabric, principal, execution.Operation);
+        }
+        return closed;
+    }
+
+    private void AbortPreSubmit(ProcessHandle principal, ExternalOperationHandle operation)
+    {
+        _ = kernel.CancelExternalOperation(principal, operation, false);
+        _ = kernel.ReleaseExternalOperation(principal, operation, new(true, false));
+    }
+
+    private void AbortNotAccepted(ProcessHandle principal, OperationBinding binding)
+    {
+        _ = kernel.RecordExternalOperationCompletion(principal, new(binding, ExternalOperationCompletionDisposition.Cancelled));
+        _ = kernel.ReleaseExternalOperation(principal, binding.Operation, new(true, false));
+        kernel.ReleaseVirtualComputeContext(binding.Operation);
+    }
+
+    private void CloseSubmitted(ProcessHandle principal, ExternalOperationHandle operation)
+    {
+        _ = kernel.RecordExternalOperationProviderLoss(principal, operation);
+        _ = kernel.ReleaseExternalOperation(principal, operation, new(true, false));
+        kernel.ReleaseVirtualComputeContext(operation);
+    }
+
+    private KernelResult CloseProviderForFabricDrain(ProcessHandle principal, CxlType2Execution execution)
+    {
+        var cancellation = provider.Cancel(execution.Submission);
+        if (!cancellation.IsSuccess)
+            return KernelResult.Fail(Map(cancellation.Status), cancellation.Message ?? "Fabric drain could not close Type-2 provider work.");
+        var closed = CloseLocalAfterProviderClosure(principal, execution);
+        return closed.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(closed.Error, closed.Message!);
+    }
+
+    KernelResult ICxlTeardownParticipant.CloseForProcess(ProcessHandle process, RegionOwner owner) =>
+        CloseForProcess(process);
+
+    KernelResult IComposedWorkTeardownParticipant.CloseComposedWorkForProcess(ProcessHandle process, RegionOwner owner) =>
+        CloseForProcess(process);
+
+    private KernelResult CloseForProcess(ProcessHandle process)
+    {
+        if (_uncontained.Values.Any(principal => principal == process))
+            return KernelResult.Fail(KernelError.PlatformFaulted, "Type-2 submission acceptance is ambiguous and has no recovery token; reclaim remains quarantined.");
+        foreach (var live in _live.Values.Where(item => item.Principal == process).ToArray())
+        {
+            var cancelled = provider.Cancel(live.Execution.Submission);
+            if (!cancelled.IsSuccess)
+                return KernelResult.Fail(Map(cancelled.Status), cancelled.Message ?? "Type-2 provider closure is ambiguous; reclaim is quarantined.");
+            var closed = CloseLocalAfterProviderClosure(process, live.Execution);
+            if (!closed.IsSuccess) return KernelResult.Fail(closed.Error, closed.Message!);
+        }
+        return KernelResult.Ok();
+    }
+
+    private static KernelError Map(PlatformAuthorityStatus status) => status switch
+    {
+        PlatformAuthorityStatus.NotAccepted => KernelError.PlatformUnavailable,
+        PlatformAuthorityStatus.Unavailable => KernelError.PlatformUnavailable,
+        PlatformAuthorityStatus.Unsupported => KernelError.PlatformUnsupported,
+        PlatformAuthorityStatus.Stale => KernelError.StaleGeneration,
+        PlatformAuthorityStatus.Revoked => KernelError.PlatformBindingRevoked,
+        PlatformAuthorityStatus.Denied => KernelError.PlatformDenied,
+        _ => KernelError.PlatformFaulted
+    };
+
+    private static bool LabelsMatchOperation(
+        IReadOnlyList<ProtectedAcceleratorLabelSidebandV1> sideband,
+        ComputePlan plan,
+        ExternalOperationHandle operation)
+    {
+        var operationId = $"external-operation:{operation.OperationId.Value}";
+        return sideband.Count >= 2 && sideband.All(value =>
+            string.Equals(value.OperationId, operationId, StringComparison.Ordinal) &&
+            value.ProviderGeneration == plan.ProviderGeneration &&
+            value.OperationGeneration == operation.Generation.Value &&
+            !value.AuthorizesAccess && !value.AuthorizesExecution);
+    }
+
+    private bool LabelsMatchLiveRegions(ProcessHandle principal, ComputePlan plan,
+        IReadOnlyList<ProtectedAcceleratorLabelSidebandV1> sideband)
+    {
+        if (sideband.Count < 2 || plan.Intent.RightInput is not null) return false;
+        var process = kernel.Processes.Resolve(principal);
+        if (!process.IsSuccess) return false;
+        var owner = new RegionOwner(process.Value!.DomainId, principal.Generation);
+        var input = kernel.Regions.QueryProtectedLabel(plan.Intent.Input.Region, owner);
+        var output = kernel.Regions.QueryProtectedLabel(plan.Intent.Output.Region, owner);
+        return input.IsSuccess && output.IsSuccess &&
+            sideband[0].Label == input.Value!.Label &&
+            sideband[0].LabelGeneration == input.Value.LabelGeneration &&
+            sideband[^1].Label == output.Value!.Label &&
+            sideband[^1].LabelGeneration == output.Value.LabelGeneration;
+    }
+}

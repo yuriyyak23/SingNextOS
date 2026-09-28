@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "phase": "P09",
+  "claim": "ExecutableAdapter",
+  "contour": "existing ordinary host-JIT provider-neutral staged ExternalOperation adapter; resource contour excluded",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "phaseEntryHead": "8c3f55e47555b2db99356b861ee404211d072edc",
+  "reviewedHead": "8c3f55e47555b2db99356b861ee404211d072edc",
+  "hybridCpuReferenceSha": {
+    "value": "794c4a53494f503855ac8cf209efab23fde083b2",
+    "locallyVerified": false
+  },
+  "contractsPackage": {
+    "id": "HybridCPU.ExternalRuntime.Contracts",
+    "version": "1.14.0",
+    "nupkgSha256": "b96e99bda066ee585b26a11cbfa7b68ce6bf44fc0006679483ccc1a4eeb678c2",
+    "assemblySha256": "bf490de31f8347fa6d145e43adbb12335d81442022a2dc5855d5c872dda9165b",
+    "sourceShaAvailable": false
+  },
+  "enabledFeatureGates": [],
+  "tests": [
+    { "lane": "exact-package-prerequisite", "passed": 5, "failed": 0, "skipped": 0 },
+    { "lane": "provider-lifecycle-P08-independent-gates", "passed": 15, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui", "passed": 1636, "failed": 9, "skipped": 2, "disposition": "same unrelated baseline failures" }
+  ],
+  "build": { "target": "SingNextOS.slnx", "warnings": 0, "errors": 0 },
+  "ordinaryFallback": "unchanged",
+  "exclusions": [
+    "FG-VNX-HCPU-RESOURCE-CONTRACT remains OFF",
+    "FG-VNX-HCPU-USAGE-EVIDENCE remains OFF",
+    "no HybridCPU source SHA verification",
+    "no ISA, NativeAOT, hardware, guarantee, upper-bound or production claim"
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "phase": "P10",
+  "claim": "RuntimeEnforced",
+  "contour": "internal host-JIT policy-only scheduler cache and live provider revalidation",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "phaseEntryHead": "8c3f55e47555b2db99356b861ee404211d072edc",
+  "reviewedHead": "8c3f55e47555b2db99356b861ee404211d072edc",
+  "enabledFeatureGates": [],
+  "authoritativeOwners": ["CapabilityAuthority", "ResourceBudgetAuthority", "RegionAuthority", "ExternalOperationAuthority"],
+  "schedulerAuthority": "none",
+  "tests": [
+    { "lane": "P10-focused", "passed": 5, "failed": 0, "skipped": 0 },
+    { "lane": "P03-P04-P08-P10-regression", "passed": 23, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui", "passed": 1641, "failed": 9, "skipped": 2, "disposition": "same unrelated baseline failures" }
+  ],
+  "build": { "target": "SingNextOS.slnx", "warnings": 0, "errors": 0 },
+  "ordinaryFallback": "unchanged",
+  "exclusions": [
+    "FG-VNX-RESOURCE-SCHEDULER remains OFF",
+    "no upper-bound or guaranteed-reservation claim",
+    "no HybridCPU, NativeAOT, hardware or production claim"
+  ]
+}

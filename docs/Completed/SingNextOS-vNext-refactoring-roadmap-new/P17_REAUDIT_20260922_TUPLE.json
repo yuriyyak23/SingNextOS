@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "phase": "P17",
+  "claim": "RuntimeEnforced",
+  "contour": "Windows-x64/.NET-11/JIT host-provider additive migration and cleanup-evidence registry",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "800027893dcf1ed23d8d7fe775841dd9d01a9fff",
+  "productionQualified": false,
+  "enabledFeatureGates": [],
+  "tests": [
+    { "lane": "phase-17-focused-current", "passed": 16, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui-final", "passed": 1767, "failed": 0, "skipped": 2 }
+  ],
+  "build": { "warnings": 0, "errors": 0 },
+  "defectsConfirmed": 2,
+  "defectDisposition": [
+    "generation exhaustion now fails before registration/release mutation",
+    "malformed cleanup-proof digests now return false without throwing"
+  ],
+  "evidence": {
+    "path": "P17_REAUDIT_20260922.md",
+    "bytes": 2321,
+    "sha256": "7b92890960fb825c4203c6d9f62c16f7816bc2f9ea2858f60a49d04e47f4abe7"
+  },
+  "removedCompatibilityPaths": [],
+  "ordinaryFallback": "preserved",
+  "futureGated": [
+    { "owner": "production deployment and compatibility consumers", "missing": "fresh production-shaped no-live-consumer inventory and proof", "requiredGateState": "OFF" },
+    { "owner": "HybridCPU/provider/runtime and enforcement owners", "missing": "local source, executable environments, NativeAOT, temporal and guarantee proof", "requiredGateState": "OFF" }
+  ],
+  "exclusions": [
+    "local empty-registry proof is not a production no-live-consumer claim",
+    "no ProductionQualified/GuaranteedReservation/EnforcedUpperBound claim",
+    "no HybridCPU/provider-wide/NativeAOT/hardware claim",
+    "no ISA or microarchitecture change"
+  ]
+}

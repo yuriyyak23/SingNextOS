@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "phase": "P08",
+  "claim": "RuntimeEnforced",
+  "contour": "internal Windows-x64/.NET-11/JIT staged ComputeTime/Nanoseconds plan admission; rollout-OFF",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "800027893dcf1ed23d8d7fe775841dd9d01a9fff",
+  "defaultFeatureGateState": "OFF",
+  "enabledFeatureGates": [],
+  "tests": [
+    { "lane": "P08-focused", "passed": 6, "failed": 0, "skipped": 0 },
+    { "lane": "planner-P04-P08-regression", "passed": 57, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui", "passed": 1765, "failed": 0, "skipped": 2 }
+  ],
+  "build": { "solutionWarnings": 0, "solutionErrors": 0 },
+  "remediation": "duplicate provider identities fail closed before admission instead of throwing",
+  "evidence": { "path": "P08_REAUDIT_20260922.md", "sha256": "e43e31a319b44517d82884aa134c669368eacaed98b936be7ac9a2d3656cfb1e" },
+  "ordinaryFallback": "unchanged resource-unaware ComputePlan path",
+  "futureGated": [
+    { "owner": "PlatformAuthorityBridge plus provider/runtime", "missing": "P09 locally verifiable provider mapping/source evidence", "requiredGateState": "OFF" }
+  ],
+  "exclusions": ["plan/candidate remains non-authoritative", "no provider/NativeAOT/upper-bound/guarantee/ProductionQualified claim", "no ISA or hardware change"]
+}

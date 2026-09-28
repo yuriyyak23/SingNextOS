@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "phase": "P01",
+  "claim": "ModelOnly",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "800027893dcf1ed23d8d7fe775841dd9d01a9fff",
+  "entryDirtyWorktree": "P00 re-audit outputs plus preserved pre-existing P16/P17 changes; exact original list is pinned by P00_REAUDIT_20260922_TUPLE.json",
+  "runtimeProfile": "Windows-x64/JIT/model-only",
+  "initialResourceClass": "ComputeTime",
+  "canonicalUnit": "Nanoseconds",
+  "defaultFeatureGateState": "OFF",
+  "enabledFeatureGates": [],
+  "tests": [
+    {
+      "lane": "P01-focused",
+      "command": "dotnet test tests/SingPlus.Tests/SingPlus.Tests.csproj --no-build --no-restore --filter FullyQualifiedName~VNextPhase01ResourceModelTests --verbosity minimal",
+      "passed": 11,
+      "failed": 0,
+      "skipped": 0
+    },
+    {
+      "lane": "full-non-gui-current-tree",
+      "command": "dotnet test SingNextOS.slnx --no-build --no-restore --filter FullyQualifiedName!~SingPlus.Tests.Gui --verbosity minimal",
+      "passed": 1761,
+      "failed": 0,
+      "skipped": 2
+    }
+  ],
+  "builds": [
+    { "target": "contracts/SingPlus.Contracts/SingPlus.Contracts.csproj", "warnings": 0, "errors": 0 },
+    { "target": "SingNextOS.slnx", "warnings": 0, "errors": 0 }
+  ],
+  "evidence": {
+    "path": "P01_REAUDIT_20260922.md",
+    "sha256": "061da867004da4101cbea3fd74eae95ab8e37522bbbb9e58ce5f16b18846df55"
+  },
+  "externalPrerequisites": {
+    "contractsPackage": "HybridCPU.ExternalRuntime.Contracts/1.14.0",
+    "packageQualification": "inventory-only",
+    "hybridCpuReferenceShaLocallyVerified": false
+  },
+  "exclusions": [
+    "no live CapabilityAuthority resource grant",
+    "no lease/reservation/settlement state machine claim from P01",
+    "no provider, NativeAOT, temporal upper-bound or guarantee qualification",
+    "no ISA, hardware or ProductionQualified claim"
+  ]
+}

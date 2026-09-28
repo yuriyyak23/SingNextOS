@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "phase": "P03",
+  "recorded_at_local_date": "2026-09-22",
+  "singnextos": {
+    "head": "a0f70bc2bd031bd2b1138b2a01984309814bba5c",
+    "tree": "c9e667fda0605d993c01060b7d7dc04b73cfac80",
+    "start_user_owned_dirty_changes": []
+  },
+  "implementation": [
+    "docs/singnextos_semantic_codesign_refactoring/formal/SemanticAdmissionSentry.tla",
+    "docs/singnextos_semantic_codesign_refactoring/formal/SemanticAdmissionSentry.cfg",
+    "tests/SingPlus.Tests/Architecture/SemanticAdmissionFormalModelTests.cs"
+  ],
+  "formal": {
+    "qualification": "ModelOnly",
+    "tlc_executed": false,
+    "reason": "No local tla2tools/TLC or Apalache executable artifact was found; network use is prohibited."
+  },
+  "runtime_contour": {
+    "name": "existing ResourceAdmissionProtocol commit/compensation boundary",
+    "qualification": "RuntimeEnforced",
+    "semantic_four_gate_sentry": "FutureGated"
+  },
+  "tests": {
+    "focused": { "passed": 19, "failed": 0, "skipped": 0 },
+    "full_non_gui": {
+      "passed": 1790,
+      "failed": 0,
+      "skipped": 2,
+      "projects": {
+        "SingPlus.Tests": { "passed": 1582, "skipped": 2 },
+        "SingPlus.Platform.HybridCpu.Tests": { "passed": 60, "skipped": 0 },
+        "HybridCpu_ExecutableAdapter.Tests": { "passed": 90, "skipped": 0 },
+        "HybridCPU_NeutralRuntime.Tests": { "passed": 58, "skipped": 0 }
+      }
+    }
+  },
+  "solution_build": { "exit_code": 0, "warnings": 0, "errors": 0 },
+  "gates": { "semantic_codesign": "OFF" },
+  "hybridcpu_scope": "local external-tool/package/adapter only",
+  "isa_impact": "NONE"
+}

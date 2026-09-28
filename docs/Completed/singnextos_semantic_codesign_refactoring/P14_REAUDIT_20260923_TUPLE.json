@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "phase": "P14",
+  "recorded_at_local_date": "2026-09-23",
+  "singnextos": {
+    "head": "a0f70bc2bd031bd2b1138b2a01984309814bba5c",
+    "tree": "c9e667fda0605d993c01060b7d7dc04b73cfac80",
+    "start_user_owned_dirty_changes": []
+  },
+  "artifacts": [
+    { "path": "tools/SingPlus.SingCapQualification/VNextResourcePerformanceQualification.cs", "bytes": 15560, "sha256": "b4b7956d3d2f0394ccee8c994881887c75768ec3679f444a0ece57e4e3ca8be7" },
+    { "path": "tests/SingPlus.Tests/Architecture/VNextPhase16ResourcePerformanceQualificationTests.cs", "bytes": 4624, "sha256": "4bcfc9edc699f9645d293e9c6eb06a100e02e629498882b8a699312af3ac0786" },
+    { "path": "docs/singnextos_semantic_codesign_refactoring/P14_RESOURCE_BUDGET_MEASUREMENT_20260923.json", "bytes": 1720, "sha256": "f0bce6d230958ecc69f4d38dde81b84606481d9461c7740a7e4a3f832d776503" }
+  ],
+  "benchmark": {
+    "rows": 20,
+    "attempts": 124000,
+    "unexpected_outcomes": 0,
+    "raw_json_utf8_sha256": "2294b0277e060bd20e409eba5e9733370005b71b9bbc5d5c9107b18c56d28aba"
+  },
+  "tests": { "focused_performance_qualification": { "passed": 5, "failed": 0, "skipped": 0 } },
+  "claims": {
+    "measurement": "ModelOnly AccountingOnly exact host/JIT observation",
+    "sharding": "Deferred",
+    "escrow": "Deferred",
+    "cross_shard_proof": "NotApplicableUntilImplementation"
+  },
+  "gates": { "all_vnext": "OFF" },
+  "hybridcpu_scope": "NONE",
+  "isa_impact": "NONE"
+}

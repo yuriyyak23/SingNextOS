@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "phase": "P08",
+  "recorded_at_local_date": "2026-09-22",
+  "singnextos": {
+    "head": "a0f70bc2bd031bd2b1138b2a01984309814bba5c",
+    "tree": "c9e667fda0605d993c01060b7d7dc04b73cfac80",
+    "start_user_owned_dirty_changes": []
+  },
+  "implementation": [
+    "contracts/SingPlus.Contracts/ExternalOperations.cs",
+    "contracts/SingPlus.Contracts/ComputePlanning.cs",
+    "src/Runtime/SingPlus.Runtime/Compute/ComputePlanner.cs",
+    "tests/SingPlus.Tests/Runtime/VisibilityRegionLocalityV1Tests.cs"
+  ],
+  "tests": {
+    "focused_visibility_region_locality": { "passed": 36, "failed": 0, "skipped": 0 },
+    "full_non_gui": { "passed": 1828, "failed": 0, "skipped": 2 }
+  },
+  "solution_build": { "exit_code": 0, "warnings": 0, "errors": 0 },
+  "claims": {
+    "visibility_locality_descriptors": "StaticAdmission",
+    "staged_region_lifecycle": "RuntimeEnforced host/JIT",
+    "direct_coherent": "Unsupported",
+    "shared_mutable": "FutureGated"
+  },
+  "gates": { "all_vnext": "OFF" },
+  "hybridcpu_scope": "local external-tool/package boundary only",
+  "isa_impact": "NONE"
+}

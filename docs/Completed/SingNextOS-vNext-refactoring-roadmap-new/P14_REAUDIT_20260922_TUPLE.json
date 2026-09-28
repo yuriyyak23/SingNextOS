@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "phase": "P14",
+  "claim": "RuntimeEnforced",
+  "contour": "ordinary fresh-generation checkpoint restore plus authenticated local host conservative recovery; external provider reconciliation excluded",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "800027893dcf1ed23d8d7fe775841dd9d01a9fff",
+  "enabledFeatureGates": [],
+  "tests": [
+    { "lane": "checkpoint-resource-provider-ABA-and-durable-host-recovery", "passed": 39, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui-current-code", "passed": 1765, "failed": 0, "skipped": 2 }
+  ],
+  "defectsConfirmed": 0,
+  "evidence": { "path": "P14_REAUDIT_20260922.md", "sha256": "ecd902a672cd461aa164c47df23bdbf3fab71633eae4fc85014b708a7862ee8f" },
+  "ordinaryFallback": "unchanged",
+  "futureGated": [{ "owner": "ResourceBudgetAuthority plus provider reconciliation adapter", "missing": "exact provider restart/generation recovery contract and locally verifiable provider source", "requiredGateState": "OFF" }],
+  "exclusions": ["no external provider reconciliation", "no automatic refund/reclaim", "no NativeAOT/hardware/ProductionQualified claim", "no ISA change"]
+}

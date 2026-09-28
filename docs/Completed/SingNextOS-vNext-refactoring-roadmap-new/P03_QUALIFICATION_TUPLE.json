@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "phase": "P03",
+  "claim": "RuntimeEnforced",
+  "contour": "internal ResourceBudgetAuthority host-JIT lease state machine",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "b86cc33c16a77760c6971cc1a656c34b6cf2a10d",
+  "resourceDimension": "ComputeTimeNanoseconds",
+  "enabledFeatureGates": [],
+  "tests": [
+    { "lane": "P03-focused", "passed": 6, "failed": 0, "skipped": 0 },
+    { "lane": "P03-budget-regression", "passed": 29, "failed": 0, "skipped": 0 },
+    { "lane": "DSC1-flake-rerun", "passed": 5, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui-final", "passed": 1591, "failed": 9, "skipped": 2, "disposition": "same pre-existing failures recorded by P00" }
+  ],
+  "build": { "target": "SingNextOS.slnx", "warnings": 0, "errors": 0 },
+  "exclusions": [
+    "no cross-owner admission",
+    "no public or SIP resource lease path",
+    "resource lease gate remains OFF",
+    "no provider, guarantee, hardware, or production qualification"
+  ]
+}

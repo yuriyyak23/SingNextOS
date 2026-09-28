@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "phase": "P12",
+  "claim": "RuntimeEnforced",
+  "contour": "ordinary resource boundary plus isolated Windows-x64/.NET-11/JIT host-test fused differential; default-OFF",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "800027893dcf1ed23d8d7fe775841dd9d01a9fff",
+  "defaultFeatureGateState": "OFF",
+  "enabledFeatureGates": [],
+  "tests": [
+    { "lane": "P12-ordinary-oracle-and-P16-fused-differential", "passed": 48, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui-current-code", "passed": 1765, "failed": 0, "skipped": 2 }
+  ],
+  "defectsConfirmed": 0,
+  "evidence": { "path": "P12_REAUDIT_20260922.md", "sha256": "d6ccd2ac80f4069c7b35de4c4683a870298488e5c9a0ab910b5b02e1b7b9f549" },
+  "ordinaryFallback": "mandatory and unchanged when the gate is off or stale before submit",
+  "futureGated": [{ "owner": "existing authority owners plus production migration qualification", "missing": "production-shaped fused async/provider/restart/NativeAOT evidence", "requiredGateState": "OFF" }],
+  "exclusions": ["no production fused execution", "no temporal guarantee/provider/hardware/ProductionQualified claim", "no ISA change"]
+}

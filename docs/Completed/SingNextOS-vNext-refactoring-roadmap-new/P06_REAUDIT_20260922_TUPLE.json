@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "phase": "P06",
+  "claim": "RuntimeEnforced",
+  "contour": "internal Windows-x64/.NET-11/JIT ComputeTime/Nanoseconds exact invocation donation; rollout-OFF",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "800027893dcf1ed23d8d7fe775841dd9d01a9fff",
+  "defaultFeatureGateState": "OFF",
+  "enabledFeatureGates": [],
+  "owners": {
+    "permission": "CapabilityAuthority",
+    "quantity": "ResourceBudgetAuthority",
+    "binding": "EndpointSessionInvocationRegistry"
+  },
+  "tests": [
+    { "lane": "P06-focused", "passed": 6, "failed": 0, "skipped": 0 },
+    { "lane": "P02-P06-and-invocation-regression", "passed": 46, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui", "passed": 1764, "failed": 0, "skipped": 2 }
+  ],
+  "build": { "runtimeWarnings": 0, "runtimeErrors": 0, "solutionWarnings": 0, "solutionErrors": 0 },
+  "remediation": "nested provenance now includes exact process/session/invocation identities and generations",
+  "evidence": { "path": "P06_REAUDIT_20260922.md", "sha256": "783b498d467365829aeafce4632fbcae21f24adef27777e80182b59abbfacf0a" },
+  "ordinaryFallback": "unchanged and default",
+  "futureGated": [
+    { "owner": "ExternalOperationAuthority plus provider/runtime", "missing": "P07 exact provider correlation and external reconciliation evidence", "requiredGateState": "OFF" },
+    { "owner": "production migration and qualification owners", "missing": "production consumer/provider/NativeAOT executable proof", "requiredGateState": "OFF" }
+  ],
+  "exclusions": ["no production donation", "no provider/NativeAOT/upper-bound/guarantee/ProductionQualified claim", "no ISA or hardware change"]
+}

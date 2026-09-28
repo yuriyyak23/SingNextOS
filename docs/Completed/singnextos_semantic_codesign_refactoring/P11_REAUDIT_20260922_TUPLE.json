@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "phase": "P11",
+  "recorded_at_local_date": "2026-09-22",
+  "singnextos": {
+    "head": "a0f70bc2bd031bd2b1138b2a01984309814bba5c",
+    "tree": "c9e667fda0605d993c01060b7d7dc04b73cfac80",
+    "start_user_owned_dirty_changes": []
+  },
+  "artifacts": [
+    { "path": "contracts/SingPlus.Contracts/ExternalOperations.cs", "bytes": 15122, "sha256": "c1baa0df3799d7e47352e7b94932862aec5342960a4a3877d5136f5555e9ec22" },
+    { "path": "src/Runtime/SingPlus.Runtime/ExternalOperations/ExternalOperationAuthority.cs", "bytes": 34211, "sha256": "dc9591abc4c7e16904f9ecf57273a44f8a6eb0d5476e15e7bf67a7047a26b5cd" },
+    { "path": "src/Runtime/SingPlus.Runtime/ExternalOperations/RuntimeKernel.ExternalOperations.cs", "bytes": 17909, "sha256": "2d5cf428eeaf592b76191dcdb4b378688ffa0537d408f4a8f38c5e8c9c8dab66" },
+    { "path": "src/Runtime/SingPlus.Runtime/ExternalOperations/HybridCpuExternalOperationProvider.cs", "bytes": 22789, "sha256": "510bd46edbcdfaf471574ead094cc943b23a0412bdb4673d381778060f819571" },
+    { "path": "tests/SingPlus.Tests/Contracts/CancellationContainmentSemanticsV1Tests.cs", "bytes": 2630, "sha256": "8328e33dfbca237664e33389e79369f9b55cde9378d0e0aef42746aa7fd2dca5" },
+    { "path": "tests/SingPlus.Tests/Runtime/ExternalOperationLifecycleTests.cs", "bytes": 29713, "sha256": "85e657570cfa67fc79510ae6b4107e56cbeefd5500eff995ac59202d70d662a6" },
+    { "path": "tests/SingPlus.Tests/Runtime/Phase10ProviderConformanceTests.cs", "bytes": 17470, "sha256": "5c965e8ec925c57a2f1d22a70d5321d46d0da8c948c6fe4a8bda682eaa880946" }
+  ],
+  "tests": {
+    "focused_cancellation_containment_lifecycle": { "passed": 43, "failed": 0, "skipped": 0 },
+    "full_non_gui": { "passed": 1848, "failed": 0, "skipped": 2 }
+  },
+  "solution_build": { "exit_code": 0, "warnings": 0, "errors": 0 },
+  "claims": {
+    "cancellation_mapping": "StaticAdmission",
+    "host_cancellation_lifecycle": "RuntimeEnforced host/JIT",
+    "bounded_preemption": "FutureGated",
+    "provider_containment": "Unsupported"
+  },
+  "gates": { "all_vnext": "OFF" },
+  "hybridcpu_scope": "local external-tool/package boundary only",
+  "isa_impact": "NONE"
+}
