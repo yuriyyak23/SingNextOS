@@ -117,6 +117,54 @@ public sealed class V6ManagedSafePointProviderTests
         Assert.Equal(8UL, provider.ProviderGeneration);
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void TerminalGenerationResetQuarantinesInFlightSafePoint(bool providerReset)
+    {
+        var provider = new V6ManagedSafePointProvider("managed-safe-point-model-v1", 1_000,
+            providerReset ? ulong.MaxValue : 7,
+            providerReset ? 11 : ulong.MaxValue, new TestTimeProvider());
+        var expectedProvider = provider.ProviderGeneration;
+        var expectedRuntime = provider.RuntimeGeneration;
+
+        var result = provider.RequestSafePoint(Correlation, 3, expectedProvider,
+            expectedRuntime, () =>
+            {
+                if (providerReset) provider.ResetProvider();
+                else provider.ResetRuntime();
+                return KernelResult.Ok();
+            });
+
+        Assert.Equal(KernelError.StaleGeneration, result.Error);
+        Assert.Null(result.Value);
+        Assert.Equal(KernelError.StaleGeneration,
+            provider.RequestSafePoint("managed-safe-point:new", 4, expectedProvider,
+                expectedRuntime, KernelResult.Ok).Error);
+        Assert.Equal(KernelError.StaleGeneration,
+            provider.ValidateLoweringSafePointMap([], "point", 1, new string('a', 64),
+                expectedProvider, expectedRuntime).Error);
+    }
+
+    [Fact]
+    public void ExhaustedRequestGenerationDeniesBeforeProviderHook()
+    {
+        var provider = Provider(new TestTimeProvider());
+        typeof(V6ManagedSafePointProvider).GetField("_nextRequestGeneration",
+            global::System.Reflection.BindingFlags.Instance |
+            global::System.Reflection.BindingFlags.NonPublic)!.SetValue(provider, ulong.MaxValue);
+        var callbacks = 0;
+
+        var result = provider.RequestSafePoint(Correlation, 3, 7, 11, () =>
+        {
+            callbacks++;
+            return KernelResult.Ok();
+        });
+
+        Assert.Equal(KernelError.CapacityExhausted, result.Error);
+        Assert.Equal(0, callbacks);
+    }
+
     [Fact]
     public async Task ConcurrentRequestForExactOperationHasOneInFlightWinner()
     {

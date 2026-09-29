@@ -1,7 +1,7 @@
 param(
     [ValidateSet('LocalAdapter','Ise','Hardware')]
     [string]$Lane = 'LocalAdapter',
-    [string]$HybridCpuRoot = 'C:\Users\Yuriy Kurnosov\Desktop\HybridCPU v2'
+    [string]$HybridCpuRoot = '\Desktop\HybridCPU v2'
 )
 
 $ErrorActionPreference = 'Stop'

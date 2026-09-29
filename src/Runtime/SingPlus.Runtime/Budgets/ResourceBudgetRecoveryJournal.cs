@@ -198,7 +198,7 @@ internal sealed class ResourceBudgetRecoveryJournal
         ValidatePayload(payload);
         lock (_gate)
         {
-            var current = ReplayCore(_store.ReadFrames());
+            var current = ObserveVerifiedHistory();
             var prior = current.Items.SingleOrDefault(item => item.LastPayload.Lease == payload.Lease);
             if (prior is null && payload.Transition != ResourceBudgetRecoveryTransition.Prepared)
                 throw new InvalidDataException("Recovery journal lease history must begin with Prepared.");
@@ -224,7 +224,22 @@ internal sealed class ResourceBudgetRecoveryJournal
 
     internal ResourceBudgetRecoverySnapshot Replay()
     {
-        lock (_gate) return ReplayCore(_store.ReadFrames());
+        lock (_gate) return ObserveVerifiedHistory();
+    }
+
+    private ResourceBudgetRecoverySnapshot ObserveVerifiedHistory()
+    {
+        var frames = _store.ReadFrames();
+        var current = ReplayCore(frames);
+        if (current.LastSequence < _lastSequence ||
+            current.LastSequence != 0 && current.JournalEpoch != _epoch)
+            throw new InvalidDataException("Recovery journal history regressed or changed epoch.");
+        if (current.LastSequence > _lastSequence)
+        {
+            _lastSequence = current.LastSequence;
+            _lastAuthenticator = DecodeFrame(frames[^1]).Authenticator;
+        }
+        return current;
     }
 
     private ResourceBudgetRecoverySnapshot ReplayCore(IReadOnlyList<byte[]> frames)

@@ -14,12 +14,8 @@ public sealed partial class RuntimeKernel
         lock (_platformMemoryUseGate)
         {
             reset = PlatformAuthority.ObserveBackendReset();
-            if (!reset.IsSuccess)
-            {
-                return KernelResult<PlatformBackendResetSnapshot>.Fail(
-                    reset.Error,
-                    reset.Message!);
-            }
+            if (!reset.IsSuccess && reset.Error != KernelError.CapacityExhausted)
+                return reset;
 
             _virtualDomains.QuarantineForPlatformBackendReset();
             QuarantineVirtualIoForBackendReset();

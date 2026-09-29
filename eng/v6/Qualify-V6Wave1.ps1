@@ -24,7 +24,7 @@ try {
     $passed = [int]$match.Groups[2].Value
     $skipped = [int]$match.Groups[3].Value
     $total = [int]$match.Groups[4].Value
-    if ($failed -ne 0 -or $passed -ne 48 -or $skipped -ne 0 -or $total -ne 48) {
+    if ($failed -ne 0 -or $passed -ne 52 -or $skipped -ne 0 -or $total -ne 52) {
         throw "Unexpected Wave 1 test counts: failed=$failed passed=$passed skipped=$skipped total=$total"
     }
 

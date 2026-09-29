@@ -117,6 +117,74 @@ public sealed class VNextPhase16ResourceBudgetRecoveryJournalTests
         }
     }
 
+    [Fact]
+    public void CompleteFrameThenAppendErrorAdvancesNextSequenceFromVerifiedReplay()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"singnext-p16-ambiguous-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        try
+        {
+            var path = Path.Combine(root, "budget.recovery");
+            var store = new CompleteFrameThenThrowStore(new FileResourceBudgetJournalStore(path));
+            var journal = new ResourceBudgetRecoveryJournal(store, Key, Guid.NewGuid());
+            journal.Append(Payload(ResourceBudgetRecoveryTransition.Prepared));
+            journal.Append(Payload(ResourceBudgetRecoveryTransition.PossibleSubmit));
+            store.ThrowAfterNextWrite = true;
+
+            Assert.Throws<IOException>(() => journal.Append(
+                Payload(ResourceBudgetRecoveryTransition.SettledExact, [Amount(4)])));
+            Assert.Equal(3UL, journal.Replay().LastSequence);
+            var nextLease = Payload(ResourceBudgetRecoveryTransition.Prepared) with
+            {
+                Lease = new BudgetReservationHandle(new BudgetReservationId(32),
+                    new BudgetGeneration(4))
+            };
+            var next = journal.Append(nextLease);
+
+            Assert.Equal(4UL, next.Sequence);
+            var replay = new ResourceBudgetRecoveryJournal(
+                new FileResourceBudgetJournalStore(path), Key).Replay();
+            Assert.Equal(4UL, replay.LastSequence);
+            Assert.Equal(2, replay.Items.Count);
+            Assert.Equal(ResourceBudgetRecoveryTransition.SettledExact,
+                replay.Items.Single(item => item.LastPayload.Lease.ReservationId.Value == 31)
+                    .LastPayload.Transition);
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void LiveReplayRejectsRegressedTailAndChangedEpoch(bool replaceEpoch)
+    {
+        var store = new MemoryStore();
+        var journal = new ResourceBudgetRecoveryJournal(store, Key, Guid.NewGuid());
+        journal.Append(Payload(ResourceBudgetRecoveryTransition.Prepared));
+        journal.Append(Payload(ResourceBudgetRecoveryTransition.PossibleSubmit));
+        Assert.Equal([Amount(1000)], journal.Replay().ConservativeRecoveryCharge);
+
+        store.Frames.Clear();
+        if (replaceEpoch)
+        {
+            var replacement = new ResourceBudgetRecoveryJournal(store, Key, Guid.NewGuid());
+            replacement.Append(Payload(ResourceBudgetRecoveryTransition.Prepared));
+            replacement.Append(Payload(ResourceBudgetRecoveryTransition.CancelledPreSubmit));
+            Assert.Empty(replacement.Replay().ConservativeRecoveryCharge);
+        }
+
+        Assert.Throws<InvalidDataException>(() => journal.Replay());
+        Assert.Throws<InvalidDataException>(() => journal.Append(Payload(
+            ResourceBudgetRecoveryTransition.Prepared) with
+        {
+            Lease = new BudgetReservationHandle(new BudgetReservationId(32),
+                new BudgetGeneration(4))
+        }));
+    }
+
     private static ResourceBudgetRecoveryPayload Payload(
         ResourceBudgetRecoveryTransition transition,
         IReadOnlyList<BudgetAmount>? charged = null) =>
@@ -133,5 +201,19 @@ public sealed class VNextPhase16ResourceBudgetRecoveryJournalTests
         internal List<byte[]> Frames { get; } = [];
         public IReadOnlyList<byte[]> ReadFrames() => Frames.Select(static frame => frame.ToArray()).ToArray();
         public void AppendFrame(ReadOnlySpan<byte> frame) => Frames.Add(frame.ToArray());
+    }
+
+    private sealed class CompleteFrameThenThrowStore(IResourceBudgetJournalStore inner)
+        : IResourceBudgetJournalStore
+    {
+        internal bool ThrowAfterNextWrite { get; set; }
+        public IReadOnlyList<byte[]> ReadFrames() => inner.ReadFrames();
+        public void AppendFrame(ReadOnlySpan<byte> frame)
+        {
+            inner.AppendFrame(frame);
+            if (!ThrowAfterNextWrite) return;
+            ThrowAfterNextWrite = false;
+            throw new IOException("Simulated lost append acknowledgement after full file frame.");
+        }
     }
 }

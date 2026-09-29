@@ -16,6 +16,7 @@ public sealed partial class ExternalOperationAuthority
         public ExternalPublicationDecisionV1? PublicationDecision { get; set; }
         public bool PublicationInFlight { get; set; }
         public bool PublicationEffectAmbiguous { get; set; }
+        public bool RegionInvalidationUnproven { get; set; }
         public List<ExternalOperationTransition> Transitions { get; } = [];
         public ulong NextTransitionSequence { get; set; } = 1;
     }
@@ -319,6 +320,19 @@ public sealed partial class ExternalOperationAuthority
                 record.State != ExternalOperationState.Visible || record.Disposition != ExternalOperationDisposition.Completed)
                 return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.StaleGeneration,
                     "Publication state changed while the exact provider action was in flight.");
+            var liveUses = ValidateUses(record);
+            if (!liveUses.IsSuccess)
+            {
+                // The callback may already have published externally. A concurrent
+                // Region damage or revoke cannot turn that effect into success.
+                record.PublicationInFlight = false;
+                record.PublicationEffectAmbiguous = true;
+                record.Disposition = ExternalOperationDisposition.Faulted;
+                record.EffectBoundary = ExternalEffectBoundaryState.PossiblyExternallyVisible;
+                AddTransition(record, record.State, "PublicationEffectAmbiguous");
+                return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.ExternalEffectUncontained,
+                    $"Region use changed during publication; exact effect closure is required: {liveUses.Message}");
+            }
             record.PublicationInFlight = false;
             record.Disposition = ExternalOperationDisposition.Published;
             if (record.EffectBoundary == ExternalEffectBoundaryState.StagedPending)
@@ -347,7 +361,9 @@ public sealed partial class ExternalOperationAuthority
                 return KernelResult<ExternalOperationSnapshot>.Ok(Snapshot(record));
             if (record.State == ExternalOperationState.Published)
                 return InvalidTransition<ExternalOperationSnapshot>(record, "Published results cannot be cancelled or unpublished.");
-            if (record.Disposition is ExternalOperationDisposition.Cancelled or ExternalOperationDisposition.Discarded or ExternalOperationDisposition.CancellationPending)
+            if (record.Disposition is ExternalOperationDisposition.Cancelled or ExternalOperationDisposition.Discarded or
+                ExternalOperationDisposition.CancellationPending or ExternalOperationDisposition.ProviderLost or
+                ExternalOperationDisposition.Faulted)
                 return KernelResult<ExternalOperationSnapshot>.Ok(Snapshot(record));
 
             switch (record.State)
@@ -393,14 +409,27 @@ public sealed partial class ExternalOperationAuthority
             if (record.Preparation.PublicationPolicy == ExternalPublicationPolicy.Staged)
             {
                 record.Disposition = ExternalOperationDisposition.ProviderLost;
+                KernelResult? invalidationFailure = null;
                 foreach (var use in record.Admission?.RegionUses ?? [])
-                    _ = _regions.InvalidateUse(use.Handle, record.Preparation.Principal);
+                {
+                    var invalidation = _regions.InvalidateUseAfterProviderLoss(use.Handle,
+                        record.Preparation.Principal, operation);
+                    if (!invalidation.IsSuccess)
+                        invalidationFailure ??= invalidation;
+                }
+                AddTransition(record, record.State, "ProviderLost");
+                if (invalidationFailure is { } failure)
+                {
+                    record.RegionInvalidationUnproven = true;
+                    return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.ExternalEffectUncontained,
+                        $"Provider loss is recorded, but exact Region use invalidation failed: {failure.Message}");
+                }
             }
             else
             {
                 record.Disposition = ExternalOperationDisposition.Faulted;
+                AddTransition(record, record.State, "ProviderLost");
             }
-            AddTransition(record, record.State, "ProviderLost");
             return KernelResult<ExternalOperationSnapshot>.Ok(Snapshot(record));
         }
     }
@@ -608,7 +637,7 @@ public sealed partial class ExternalOperationAuthority
 
     private static bool CanRelease(Record record, ReleasePlan plan)
     {
-        if (record.PublicationEffectAmbiguous) return false;
+        if (record.PublicationEffectAmbiguous || record.RegionInvalidationUnproven) return false;
         // Region reclaim for a resource-bound submitted effect must wait for the
         // separate budget owner to complete exact settlement. Provider closure
         // alone cannot turn a quarantined or in-flight charge into settlement.

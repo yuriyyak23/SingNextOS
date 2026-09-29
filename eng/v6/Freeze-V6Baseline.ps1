@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$RepositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path,
-    [string]$HybridRoot = 'C:\Users\Yuriy Kurnosov\Desktop\HybridCPU ISE',
+    [string]$HybridRoot = '\Desktop\HybridCPU ISE',
     [string]$OutputDirectory = (Join-Path $RepositoryRoot 'artifacts\v6\p00-baseline')
 )
 
@@ -47,6 +47,9 @@ try {
     $branch = (& git branch --show-current).Trim()
     $status = @(& git status --short)
     $dotnet = Invoke-Captured $RepositoryRoot 'dotnet' @('--info')
+    $architectureGuards = Invoke-Captured $RepositoryRoot 'dotnet' @(
+        'test', 'tests/SingPlus.Tests/SingPlus.Tests.csproj', '--no-restore',
+        '--filter', 'FullyQualifiedName~V6ArchitectureGuardTests', '--verbosity', 'quiet')
     $projects = @(Get-ChildItem -Path $RepositoryRoot -Filter '*.csproj' -File -Recurse |
         Where-Object { $_.FullName -notmatch '[\\/](?:bin|obj|\.vs|artifacts)[\\/]' } |
         ForEach-Object { [IO.Path]::GetRelativePath($RepositoryRoot, $_.FullName).Replace('\', '/') } |
@@ -105,21 +108,25 @@ try {
         }
         toolchain = [ordered]@{ dotnetInfoExitCode = $dotnet.exitCode; dotnetInfo = $dotnet.output }
         owners = $owners
-        featureGates = [ordered]@{ registry = 'src/Runtime/SingPlus.Runtime/V6/V6FeatureGates.cs'; state = 'OFF'; allV6DefaultOff = $true }
+        featureGates = [ordered]@{
+            registry = 'src/Runtime/SingPlus.Runtime/V6/V6FeatureGates.cs'
+            state = if ($architectureGuards.exitCode -eq 0) { 'OFF' } else { 'UNVERIFIED' }
+            allV6DefaultOff = ($architectureGuards.exitCode -eq 0)
+            guardCommand = 'dotnet test tests/SingPlus.Tests/SingPlus.Tests.csproj --no-restore --filter FullyQualifiedName~V6ArchitectureGuardTests --verbosity quiet'
+            guardExitCode = $architectureGuards.exitCode
+            guardOutput = $architectureGuards.output
+        }
         roadmapPackage = [ordered]@{ path = 'docs/SingNextOS-v6-roadmap-reworked-2026-09-23'; hashFailures = @($roadmapFailures); valid = ($roadmapFailures.Count -eq 0) }
         claims = [ordered]@{
             p00 = 'StaticAdmission'
-            c0 = 'StaticAdmission'
-            f0 = 'ModelOnly'
-            p01 = 'FutureGated'; p04 = 'FutureGated'; p05Runtime = 'FutureGated'; qv1 = 'FutureGated'
-            p03 = 'FutureGated'; p10 = 'FutureGated'; p08 = 'FutureGated'; p11 = 'FutureGated'
+            otherPhases = 'Not assessed by this identity freeze; use exact contour qualification artifacts.'
         }
-        externalBlockers = @(
-            'No physical IOMMU/DMA/ordering/persistence/RAS/attestation campaign input was supplied.',
-            'HybridCPU ISE has no Git metadata; identity is the recorded file inventory, not roadmap SHA 794c4a... .'
-        )
+        externalBlockers = @('No physical IOMMU/DMA/ordering/persistence/RAS/attestation campaign input was supplied.')
         skippedChecks = @('Java-dependent checks excluded by instruction; cross-language qualification is not claimed.')
         isaImpact = 'NONE'
+    }
+    if (-not $baseline.hybridCpu.gitMetadataAvailable) {
+        $baseline.externalBlockers += 'HybridCPU ISE Git metadata is unavailable; identity is the recorded file inventory.'
     }
 
     $jsonPath = Join-Path $OutputDirectory 'baseline.json'
@@ -132,8 +139,8 @@ try {
 - HybridCPU identity: reproducible file inventory; Git metadata available = ``$($baseline.hybridCpu.gitMetadataAvailable)``.
 - Projects: $($projects.Count); test/qualification projects: $($tests.Count).
 - Roadmap hash validation: ``$($baseline.roadmapPackage.valid)``; failures: ``$($roadmapFailures -join ', ')``.
-- All v6 feature gates: ``OFF``.
-- Maximum claims: P00/C0 ``StaticAdmission``; F0 ``ModelOnly``; dependent runtime/provider contours ``FutureGated``.
+- V6 gate guard: ``$($baseline.featureGates.state)``; test exit code: ``$($architectureGuards.exitCode)``.
+- P00 identity claim: ``StaticAdmission``. Other phase claims require their exact contour qualification artifacts.
 - ISA/opcode/architectural CPU semantics impact: ``NONE``.
 - Java-dependent checks skipped by instruction; cross-language qualification is not claimed.
 
@@ -145,6 +152,7 @@ This artifact records identity/evidence only. It grants no execution, effect, pu
     }
     Set-Content -LiteralPath (Join-Path $OutputDirectory 'SHA256SUMS.txt') -Value $sums -Encoding ascii
     if ($roadmapFailures.Count -gt 0) { exit 2 }
+    if ($architectureGuards.exitCode -ne 0) { exit 3 }
 } finally {
     Pop-Location
 }

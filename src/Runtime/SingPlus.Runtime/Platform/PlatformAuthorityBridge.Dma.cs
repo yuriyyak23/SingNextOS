@@ -132,26 +132,39 @@ public sealed partial class PlatformAuthorityBridge
                 KernelError.PlatformFaulted,
                 "The DMA provider returned an invalid zero runtime incarnation.");
         }
-        var providerResult = dmaProvider.BindDmaGrant(request);
+        var backendEpoch = BackendEpoch;
+        PlatformAuthorityResult<PlatformProviderDmaGrant> providerResult;
+        try { providerResult = dmaProvider.BindDmaGrant(request); }
+        catch (Exception exception)
+        {
+            PinUnclosedDmaAdmission(deviceLease, mapping, range, direction,
+                default, providerIncarnation);
+            return KernelResult<PlatformDmaGrant>.Fail(KernelError.PlatformFaulted,
+                $"The DMA provider threw during grant admission; the mapping and device remain pinned: {exception.Message}");
+        }
         if (!providerResult.IsSuccess)
         {
+            PinUnclosedDmaAdmission(deviceLease, mapping, range, direction,
+                default, providerIncarnation);
             return FromProviderFailure<PlatformDmaGrant>(
                 providerResult.Status,
                 providerResult.Message);
         }
 
         var providerGrant = providerResult.Value!;
-        if (CurrentProviderIncarnation() != providerIncarnation)
+        if (CurrentProviderIncarnation() != providerIncarnation || BackendEpoch != backendEpoch)
         {
-            _ = dmaProvider.RevokeDmaGrant(providerGrant);
+            RevokeRejectedDmaAdmissionOrPin(dmaProvider, deviceLease, mapping,
+                range, direction, providerGrant, providerIncarnation, backendEpoch);
             return KernelResult<PlatformDmaGrant>.Fail(
                 KernelError.StaleGeneration,
-                "The DMA provider incarnation changed while the grant was being admitted.");
+                "The DMA provider or local backend generation changed while the grant was being admitted.");
         }
         var providerValidation = PlatformDmaGrantContract.ValidateGrant(request, providerGrant);
         if (!providerValidation.IsSuccess)
         {
-            _ = dmaProvider.RevokeDmaGrant(providerGrant);
+            RevokeRejectedDmaAdmissionOrPin(dmaProvider, deviceLease, mapping,
+                range, direction, providerGrant, providerIncarnation, backendEpoch);
             return KernelResult<PlatformDmaGrant>.Fail(
                 KernelError.PlatformFaulted,
                 providerValidation.Message ?? "The provider returned malformed DMA grant authority.");
@@ -166,6 +179,37 @@ public sealed partial class PlatformAuthorityBridge
             direction);
         _dmaGrants.Add(grant.GrantId, new DmaGrantRecord(grant, providerGrant, providerIncarnation));
         return KernelResult<PlatformDmaGrant>.Ok(grant);
+    }
+
+    private void RevokeRejectedDmaAdmissionOrPin(
+        IPlatformDmaGrantProvider dmaProvider, PlatformDeviceLease deviceLease,
+        PlatformOwnedRegionSliceMapping mapping, PlatformDmaRange range,
+        PlatformDmaDirection direction, PlatformProviderDmaGrant providerGrant,
+        PlatformProviderIncarnation providerIncarnation, PlatformBackendEpoch backendEpoch)
+    {
+        try
+        {
+            var closure = dmaProvider.RevokeDmaGrant(providerGrant);
+            if ((closure.IsSuccess || closure.Status == PlatformAuthorityStatus.Revoked) &&
+                CurrentProviderIncarnation() == providerIncarnation && BackendEpoch == backendEpoch)
+                return;
+        }
+        catch (Exception) { /* An exception cannot establish closure. */ }
+        PinUnclosedDmaAdmission(deviceLease, mapping, range, direction,
+            providerGrant, providerIncarnation);
+    }
+
+    private void PinUnclosedDmaAdmission(
+        PlatformDeviceLease deviceLease, PlatformOwnedRegionSliceMapping mapping,
+        PlatformDmaRange range, PlatformDmaDirection direction,
+        PlatformProviderDmaGrant providerGrant, PlatformProviderIncarnation providerIncarnation)
+    {
+        // The provider may have materialized authority even without a usable
+        // admission receipt. Keep the existing bridge owner dependencies live.
+        var grant = new PlatformDmaGrant(new PlatformDmaGrantId(_nextDmaGrantId++),
+            new PlatformDmaGrantGeneration(1), deviceLease, mapping, range, direction);
+        _dmaGrants.Add(grant.GrantId, new DmaGrantRecord(grant, providerGrant, providerIncarnation));
+        FaultPinDmaSubmissionLocked(grant.GrantId);
     }
 
     internal KernelResult RevokeDmaGrant(

@@ -20,6 +20,7 @@ $evidenceInputs = @(
     'src/Runtime/SingPlus.Runtime/Compute/ComputePlanner.cs',
     'src/Runtime/SingPlus.Runtime/VNext/SemanticAdmissionSentry.cs',
     'src/Runtime/SingPlus.Runtime/VNext/ExternalOperationResourceBinding.cs',
+    'src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetAuthority.cs',
     'src/Runtime/SingPlus.Runtime/V6/V6MemorySemanticBinding.cs',
     'src/Runtime/SingPlus.Runtime/V6/V6SharedOperationSessionProvider.cs',
     'src/Runtime/SingPlus.Runtime/V6/V6ExternalOperationTraceProjection.cs',
@@ -58,7 +59,7 @@ try {
     if (-not $match.Success) { throw 'The QV1 test runner summary could not be parsed.' }
     $failed = [int]$match.Groups[1].Value; $passed = [int]$match.Groups[2].Value
     $skipped = [int]$match.Groups[3].Value; $total = [int]$match.Groups[4].Value
-    if ($failed -ne 0 -or $passed -ne 120 -or $skipped -ne 0 -or $total -ne 120) {
+    if ($failed -ne 0 -or $passed -ne 131 -or $skipped -ne 0 -or $total -ne 131) {
         throw "Unexpected QV1 counts: failed=$failed passed=$passed skipped=$skipped total=$total"
     }
     $packageTestFilter = 'FullyQualifiedName~AdapterBoundaryTests.VersionedExternalRuntimePackageExposesAdapterSessionWithoutGrantingAuthority'
@@ -142,7 +143,8 @@ try {
                 'visibility after publication attempt', 'provider loss after possible write')
             race = @('concurrent submit has one irreversible winner', 'cancel versus completion linearizes',
                 'reentrant and concurrent owner release from trace callback preserve the final observed prefix',
-                'cancel between owner submit and provider callback cannot reauthorize execution')
+                'cancel between owner submit and provider callback cannot reauthorize execution',
+                'owner cancellation after binding attach but before packaged submit prevents managed execution')
             externalRuntimePackage = @('concurrent admission reserves correlation before provider callback', 'transport loss after possible admission retains correlation tombstone')
             differential = 'reference V1 and v6 staged traces have the same allowed owner-event projection'
         }
@@ -182,6 +184,7 @@ try {
             'The named QV1 tests use a managed runtime legality decision service; no independently executing HybridCPU legality service is wired to the selected session.',
             'An unresolved admission is quarantined only within the adapter session; cross-session reconciliation requires external owner evidence.',
             'Provider revalidation must read live provider-owned admission and generation; this managed test does not establish atomicity with a physical provider callback.',
+            'The shared provider rechecks SingNext owner state immediately before invoking the managed callback; that read is not an atomic physical execution fence against a later owner transition.',
             'No physical DMA/IOMMU, ordering, security, performance, or operational qualification exists.',
             'The qualified direct semantic trace stream is managed and owner-projected; no physical production provider stream exists.'
         )
@@ -198,6 +201,7 @@ try {
         'SemanticAdmissionSentryTests.SharedSessionCancellationAcknowledgesOnlyBeforeSubmit',
         'SemanticAdmissionSentryTests.SharedSessionPostSubmitCancelAndProviderLossDoNotProveClosure',
         'SemanticAdmissionSentryTests.SharedSessionCancelAfterOwnerSubmitCannotReauthorizeExecution',
+        'SemanticAdmissionSentryTests.SharedSessionRechecksOwnerAfterBindingAttachBeforeExecution',
         'SemanticAdmissionSentryTests.SharedSessionRejectsSemanticsOutsideExactStagedContour',
         'SemanticAdmissionSentryTests.BindingAwareCallbackIsNotInvokedWhenIndependentLegalityDenies',
         'SemanticAdmissionSentryTests.BindingAwareProviderFailureRetainsPossibleEffectAndBudgetQuarantine',
@@ -206,7 +210,16 @@ try {
         'V6MemoryRuntimeEnforcementTests.ConcurrentReleaseFromSettlementTraceDoesNotBlockOwnerOrLoseFinalEvent',
         'VNextPhase07ExternalOperationResourceBindingTests.PublishedOperationCannotReleaseRegionWhileResourceSettlementIsInFlight',
         'VNextPhase07ExternalOperationResourceBindingTests.ProviderLossWithQuarantinedResourceBindingCannotReleaseRegion',
+        'VNextPhase07ExternalOperationResourceBindingTests.FailedRegionInvalidationStillQuarantinesResourceBoundProviderLoss',
+        'VNextPhase07ExternalOperationResourceBindingTests.FailedBudgetQuarantineReportsUncontainedProviderLossAndKeepsResourcePinned',
+        'VNextPhase07ExternalOperationResourceBindingTests.ProviderLossDuringExactSettlementRetainsLossAndCompletesBudgetReceipt',
+        'VNextPhase07ExternalOperationResourceBindingTests.ProviderLossAfterBudgetSettlementAcceptsExactChargeBeforeBindingCompletion',
+        'VNextPhase07ExternalOperationResourceBindingTests.ProviderLossBindingReadRacesExactSettlementWithoutFalseQuarantineFailure',
+        'VNextPhase07ExternalOperationResourceBindingTests.PriorDifferentBudgetTerminalChargeCannotCompleteExactReceipt',
         'ExternalOperationLifecycleTests.MultiRegionReleaseFailureLeavesEveryUsePinned',
+        'ExternalOperationLifecycleTests.ProviderLossInvalidatesWritableUseAtTerminalMutationEpochWithoutReclaim',
+        'ExternalOperationLifecycleTests.ProviderLossWithBrokenRegionUseBindingReportsFailureAndRetainsOwnerPin',
+        'ExternalOperationLifecycleTests.LateCancellationCannotEraseProviderLossConsequence',
         'ExternalOperationLifecycleTests.FailedAdmissionCleanupRetainsAcquiredUseUnderOperationOwner',
         'ExternalOperationLifecycleTests.FailedAdmissionWithSuccessfulCleanupLeavesNoRegionUse')
     $artifact.changedFiles += @('src/Runtime/SingPlus.Runtime/VNext/ResourceAdmissionProtocol.cs',
@@ -230,6 +243,7 @@ try {
 - Single-owner seam: the binding-aware callback receives the exact SingNext operation after its one submit commit. The packaged session executes that binding once; denied legality invokes no callback and unknown execution outcome quarantines the possible effect. The V1 callback remains compatible.
 - Composition boundary: the old provider constructs a separate SingNext operation and cannot serve as this callback. The shared-operation provider never calls a second owner submit. Ambiguous publication blocks successful receipts and release. Qualified provider execution and an independently executing HybridCPU legality service remain missing.
 - Cancellation boundary: only owner-confirmed pre-submit cancel, release, and CancelledPreSubmit budget compensation receive a positive acknowledgement. Post-submit cancel and provider loss retain possible effect; a cancel between owner submit and callback prevents execution and leaves owner quarantine. Admission rejects cancellation semantics outside this exact staged contour.
+- Binding handoff: packaged submit rechecks the exact active SingNext owner binding after attach; cancellation before that read prevents managed execution. The read does not establish an atomic fence with physical execution.
 - Package tuple: `HybridCPU.ExternalRuntime.Contracts/1.14.0` plus local `HybridCPU.ExternalRuntime/1.6.0` exposes `ExternalOperationAdapterSession` (1/1 package-surface test). Package and assembly hashes are in the JSON artifact.
 - Provider generation: observed A-B-A reconfiguration during an in-flight ambiguous publication invalidates the old request and preserves the possible effect; the latest generation value alone is not treated as proof that no drift occurred.
 - The earlier ``executable-adapter-package-gap`` artifact records the historical 1.3.0 failure; package availability is now resolved, while executable QV1 integration remains partial.

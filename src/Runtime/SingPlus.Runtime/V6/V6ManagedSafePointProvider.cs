@@ -43,6 +43,8 @@ internal sealed class V6ManagedSafePointProvider
     private ulong _providerGeneration;
     private ulong _runtimeGeneration;
     private ulong _nextRequestGeneration;
+    private bool _providerGenerationExhausted;
+    private bool _runtimeGenerationExhausted;
 
     internal V6ManagedSafePointProvider(
         string providerIdentity,
@@ -96,7 +98,8 @@ internal sealed class V6ManagedSafePointProvider
 
         lock (_sync)
         {
-            if (expectedProviderGeneration == 0 || expectedRuntimeGeneration == 0 ||
+            if (_providerGenerationExhausted || _runtimeGenerationExhausted ||
+                expectedProviderGeneration == 0 || expectedRuntimeGeneration == 0 ||
                 expectedProviderGeneration != _providerGeneration ||
                 expectedRuntimeGeneration != _runtimeGeneration)
                 return KernelResult.Fail(KernelError.StaleGeneration,
@@ -129,14 +132,18 @@ internal sealed class V6ManagedSafePointProvider
         ulong requestGeneration;
         lock (_sync)
         {
-            if (expectedProviderGeneration != _providerGeneration ||
+            if (_providerGenerationExhausted || _runtimeGenerationExhausted ||
+                expectedProviderGeneration != _providerGeneration ||
                 expectedRuntimeGeneration != _runtimeGeneration)
                 return KernelResult<V6ManagedSafePointReceipt>.Fail(KernelError.StaleGeneration,
                     "Managed safe-point provider or runtime generation is stale.");
             if (_requests.ContainsKey(operationCorrelation))
                 return KernelResult<V6ManagedSafePointReceipt>.Fail(KernelError.InvalidTransition,
                     "The exact operation already has a safe-point attempt; ambiguous or terminal attempts cannot be retried under the same correlation.");
-            requestGeneration = checked(++_nextRequestGeneration);
+            if (_nextRequestGeneration == ulong.MaxValue)
+                return KernelResult<V6ManagedSafePointReceipt>.Fail(KernelError.CapacityExhausted,
+                    "Managed safe-point request generation space is exhausted.");
+            requestGeneration = ++_nextRequestGeneration;
             _requests[operationCorrelation] = new(requestGeneration, V6ManagedSafePointStatus.Draining);
         }
 
@@ -172,6 +179,7 @@ internal sealed class V6ManagedSafePointProvider
         {
             if (!_requests.TryGetValue(operationCorrelation, out var current) ||
                 current.Generation != requestGeneration || current.Status != V6ManagedSafePointStatus.Draining ||
+                _providerGenerationExhausted || _runtimeGenerationExhausted ||
                 expectedProviderGeneration != _providerGeneration ||
                 expectedRuntimeGeneration != _runtimeGeneration)
                 return KernelResult<V6ManagedSafePointReceipt>.Fail(KernelError.StaleGeneration,
@@ -208,8 +216,11 @@ internal sealed class V6ManagedSafePointProvider
     {
         lock (_sync)
         {
-            _providerGeneration = checked(_providerGeneration + 1);
             QuarantineDraining();
+            if (_providerGeneration == ulong.MaxValue)
+                _providerGenerationExhausted = true;
+            else if (!_providerGenerationExhausted)
+                _providerGeneration++;
         }
     }
 
@@ -217,8 +228,11 @@ internal sealed class V6ManagedSafePointProvider
     {
         lock (_sync)
         {
-            _runtimeGeneration = checked(_runtimeGeneration + 1);
             QuarantineDraining();
+            if (_runtimeGeneration == ulong.MaxValue)
+                _runtimeGenerationExhausted = true;
+            else if (!_runtimeGenerationExhausted)
+                _runtimeGeneration++;
         }
     }
 

@@ -128,6 +128,48 @@ public sealed class SemanticAdmissionSentryTests
     }
 
     [Fact]
+    public void SharedSessionRechecksOwnerAfterBindingAttachBeforeExecution()
+    {
+        var context = Create();
+        using var commit = context.Commit;
+        var calls = 0;
+        var provider = new V6SharedOperationSessionProvider(context.Kernel, commit,
+            new(new(Guid.NewGuid()), new(1)), context.ProviderGenerations, _ =>
+            { calls++; return KernelResult.Ok(); });
+        var session = new ExternalOperationAdapterSession(provider);
+        var semantic = new Hc.ExternalOperationSemanticRequest(
+            Hc.ExternalOperationContract.Version, new(Guid.NewGuid()),
+            Hc.ExternalEffectClass.NonIdempotent,
+            Hc.ExternalVisibilityRequirement.StagedOutput,
+            Hc.ExternalCancellationMode.ExactAcknowledgement,
+            Hc.ExternalReplayEffectClass.StagedReversibleUntilPublish);
+        Assert.Equal(ExternalOperationAdapterStatus.Accepted, session.Admit(semantic));
+
+        var result = context.Kernel.SubmitSemanticResourceExternalAdmissionWithBinding(
+            commit, context.Dependencies, context.Binding, context.Obligations, context.Guarantees,
+            context.Refinement, ProviderIdentity, context.ProviderGenerations,
+            new Provider(context.Binding), new Runtime(context.Binding), binding =>
+            {
+                Assert.True(provider.AttachCommittedBinding(binding).IsSuccess);
+                var cancelled = context.Kernel.CancelExternalOperation(context.Principal,
+                    context.Operation, providerCancellationSupported: false);
+                Assert.True(cancelled.IsSuccess);
+                Assert.Equal(ExternalOperationDisposition.CancellationPending,
+                    cancelled.Value!.Disposition);
+                Assert.NotEqual(ExternalOperationAdapterStatus.Accepted,
+                    session.Submit(semantic.Correlation));
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Owner changed after binding attach.");
+            });
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(0, calls);
+        Assert.Equal(ExternalOperationDisposition.ProviderLost,
+            context.Kernel.QueryExternalOperation(context.Principal, context.Operation).Value!.Disposition);
+        Assert.Equal(BudgetReservationState.Quarantined,
+            context.Kernel.Budgets.Query(context.Lease).Value!.State);
+    }
+
+    [Fact]
     public void SharedSessionObservesOnlyCommittedOwnerLifecycleStages()
     {
         var context = Create();

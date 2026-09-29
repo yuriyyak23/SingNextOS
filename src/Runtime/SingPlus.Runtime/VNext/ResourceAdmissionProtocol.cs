@@ -423,6 +423,23 @@ public sealed partial class RuntimeKernel
         if (_resourceBudgetRecoveryJournal is null) return KernelResult.Ok();
         try
         {
+            if (transition == ResourceBudgetRecoveryTransition.SettledExact)
+            {
+                var prior = _resourceBudgetRecoveryJournal.Replay().Items
+                    .SingleOrDefault(item => item.LastPayload.Lease == lease);
+                if (prior?.LastPayload.Transition == ResourceBudgetRecoveryTransition.SettledExact)
+                {
+                    var payload = prior.LastPayload;
+                    return payload.Owner == owner &&
+                           payload.ProviderCorrelation == correlation &&
+                           payload.ReservedAmounts.SequenceEqual(
+                               [new BudgetAmount(ServiceBudgetDimension.ComputeTimeNanoseconds, envelope.Amount)]) &&
+                           payload.ChargedAmounts.SequenceEqual(charged)
+                        ? KernelResult.Ok()
+                        : KernelResult.Fail(KernelError.Quarantined,
+                            "The durable terminal resource receipt conflicts with the exact budget settlement.");
+                }
+            }
             _resourceBudgetRecoveryJournal.Append(new ResourceBudgetRecoveryPayload(
                 lease, owner,
                 [new BudgetAmount(ServiceBudgetDimension.ComputeTimeNanoseconds, envelope.Amount)],

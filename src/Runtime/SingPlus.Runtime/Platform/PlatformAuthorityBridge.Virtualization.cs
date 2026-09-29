@@ -21,6 +21,9 @@ public sealed partial class PlatformAuthorityBridge
 
     internal KernelResult<VirtualDomainBinding> CreateVirtualDomain(PlatformDomainIdentity owner, PlatformVirtualDomainProfile profile)
     {
+        if (_backendEpochExhausted)
+            return KernelResult<VirtualDomainBinding>.Fail(KernelError.CapacityExhausted,
+                "Platform backend generation space is exhausted.");
         if (_provider is not IPlatformVirtualizationProvider provider || !_featureManifest.Supports(PlatformFeatureFamily.VirtualizationDomains, PlatformVirtualizationContract.ContractVersion, PlatformFeatureAvailability.ModelOnly))
             return KernelResult<VirtualDomainBinding>.Fail(KernelError.PlatformUnsupported, "Platform virtualization ModelOnly contract is unavailable.");
         var result = provider.CreateVirtualDomain(owner, profile);
@@ -56,6 +59,9 @@ public sealed partial class PlatformAuthorityBridge
 
     private KernelResult<VirtualDomainRecord> ResolveVirtualDomain(VirtualDomainBinding binding)
     {
+        if (_backendEpochExhausted)
+            return KernelResult<VirtualDomainRecord>.Fail(KernelError.CapacityExhausted,
+                "Platform backend generation space is exhausted.");
         if (!_virtualDomainBindings.TryGetValue(binding.BindingId, out var record))
             return KernelResult<VirtualDomainRecord>.Fail(KernelError.PlatformBindingNotFound, "Virtual-domain platform binding was not found.");
         if (record.Binding.Generation != binding.Generation)

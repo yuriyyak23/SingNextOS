@@ -109,17 +109,22 @@ internal sealed class V6ManagedTemporalCapacityProvider
     {
         lock (_sync)
         {
+            var resolved = Resolve(handle);
+            if (!resolved.IsSuccess) return resolved;
+            if (resolved.Value!.State == V6TemporalProviderReservationState.Released) return resolved;
+            if (resolved.Value.State is not (V6TemporalProviderReservationState.Reserved or V6TemporalProviderReservationState.InUse))
+                return KernelResult<V6TemporalProviderReservation>.Fail(KernelError.InvalidTransition,
+                    "Quarantined temporal capacity requires explicit reconciliation.");
             if (_resetBeforeNextRelease)
             {
                 _resetBeforeNextRelease = false;
                 var reset = ResetCore();
                 if (!reset.IsSuccess)
                     return KernelResult<V6TemporalProviderReservation>.Fail(reset.Error, reset.Message!);
+                resolved = Resolve(handle);
+                if (!resolved.IsSuccess) return resolved;
             }
-            var resolved = Resolve(handle);
-            if (!resolved.IsSuccess) return resolved;
             var record = _records[handle.Id];
-            if (record.Reservation.State == V6TemporalProviderReservationState.Released) return resolved;
             if (record.Reservation.State is not (V6TemporalProviderReservationState.Reserved or V6TemporalProviderReservationState.InUse))
                 return KernelResult<V6TemporalProviderReservation>.Fail(KernelError.InvalidTransition,
                     "Quarantined temporal capacity requires explicit reconciliation.");

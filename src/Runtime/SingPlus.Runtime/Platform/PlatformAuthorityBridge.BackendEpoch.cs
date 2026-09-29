@@ -24,6 +24,7 @@ internal readonly record struct PlatformBackendResetSnapshot(
 public sealed partial class PlatformAuthorityBridge
 {
     private ulong _backendEpoch = 1;
+    private bool _backendEpochExhausted;
 
     internal PlatformBackendEpoch BackendEpoch => new(_backendEpoch);
 
@@ -38,6 +39,12 @@ public sealed partial class PlatformAuthorityBridge
     /// </summary>
     internal KernelResult<PlatformBackendResetSnapshot> ObserveBackendReset()
     {
+        lock (_secureDomainLifecycleGate)
+            return ObserveBackendResetCore();
+    }
+
+    private KernelResult<PlatformBackendResetSnapshot> ObserveBackendResetCore()
+    {
         if (_provider is null)
         {
             return KernelResult<PlatformBackendResetSnapshot>.Fail(
@@ -45,20 +52,18 @@ public sealed partial class PlatformAuthorityBridge
                 "No platform backend is configured to invalidate.");
         }
 
-        if (_backendEpoch == ulong.MaxValue ||
+        var exhausted = _backendEpochExhausted || _backendEpoch == ulong.MaxValue ||
             _domains.Values.Any(record =>
                 record.AuthorityState != DomainAuthorityState.Closed &&
                 record.Binding.Generation.Value == ulong.MaxValue) ||
             _virtualDomainBindings.Values.Any(record =>
-                record.Binding.Generation.Value == ulong.MaxValue))
-        {
-            return KernelResult<PlatformBackendResetSnapshot>.Fail(
-                KernelError.CapacityExhausted,
-                "Platform reset generation space is exhausted; old authority cannot be made distinguishably stale.");
-        }
+                record.Binding.Generation.Value == ulong.MaxValue);
+        // A reset is already an observation of lost continuity. Even if no
+        // distinguishable next generation exists, quarantine the old authority.
+        _backendEpochExhausted |= exhausted;
 
         var previous = BackendEpoch;
-        _backendEpoch++;
+        if (!exhausted) _backendEpoch++;
         var current = BackendEpoch;
 
         var faultPinnedMappings = 0;
@@ -144,11 +149,15 @@ public sealed partial class PlatformAuthorityBridge
             var staleBinding = record.Binding with
             {
                 Generation = new PlatformDomainBindingGeneration(
-                    record.Binding.Generation.Value + 1),
+                    record.Binding.Generation.Value == ulong.MaxValue
+                        ? ulong.MaxValue : record.Binding.Generation.Value + 1),
             };
             _domains[bindingId] = new DomainRecord(staleBinding, record.ProviderLease)
             {
                 AuthorityState = DomainAuthorityState.Quarantined,
+                SecureCreateMayHaveEffect = record.SecureCreateMayHaveEffect,
+                PendingSecureCreates = record.PendingSecureCreates,
+                ParentRevokeMayHaveEffect = record.ParentRevokeMayHaveEffect,
                 ExecutionPolicy = record.ExecutionPolicy,
             };
         }
@@ -160,11 +169,16 @@ public sealed partial class PlatformAuthorityBridge
             var staleBinding = record.Binding with
             {
                 Generation = new VirtualDomainBindingGeneration(
-                    record.Binding.Generation.Value + 1),
+                    record.Binding.Generation.Value == ulong.MaxValue
+                        ? ulong.MaxValue : record.Binding.Generation.Value + 1),
             };
             _virtualDomainBindings[bindingId] = record with { Binding = staleBinding };
         }
 
+        if (exhausted)
+            return KernelResult<PlatformBackendResetSnapshot>.Fail(
+                KernelError.CapacityExhausted,
+                "Platform reset quarantined old authority, but generation space is exhausted.");
         return KernelResult<PlatformBackendResetSnapshot>.Ok(new(
             previous,
             current,

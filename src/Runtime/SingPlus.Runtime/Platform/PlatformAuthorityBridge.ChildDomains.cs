@@ -258,7 +258,21 @@ public sealed partial class PlatformAuthorityBridge
             return KernelResult.Fail(KernelError.PlatformBindingActive, "Child mappings and virtual-I/O bindings must close before child closure.");
         if (_provider is not IPlatformChildDomainProvider provider)
             return KernelResult.Fail(KernelError.PlatformUnsupported, "Child-domain provider is unavailable.");
-        var result = provider.CloseChildDomain(record.ProviderLease);
+        var backendEpoch = BackendEpoch;
+        PlatformAuthorityResult<PlatformChildDomainClosureReceipt> result;
+        try { result = provider.CloseChildDomain(record.ProviderLease); }
+        catch (Exception exception) when (exception is not StackOverflowException)
+        {
+            record.State = PlatformChildDomainState.Faulted;
+            return KernelResult.Fail(KernelError.PlatformFaulted,
+                $"Child closure may have taken effect without a receipt: {exception.Message}");
+        }
+        if (BackendEpoch != backendEpoch || record.State == PlatformChildDomainState.Faulted)
+        {
+            record.State = PlatformChildDomainState.Faulted;
+            return KernelResult.Fail(KernelError.PlatformFaulted,
+                "Backend reset during child closure leaves the child quarantined.");
+        }
         if (!result.IsSuccess)
         {
             record.State = PlatformChildDomainState.Faulted;

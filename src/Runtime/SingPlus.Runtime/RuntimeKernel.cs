@@ -30,6 +30,15 @@ public sealed partial class RuntimeKernel
         IPlatformAuthorityProvider? platformProvider,
         TimeProvider? timeProvider,
         RuntimeKernelRecoveryOptions? recoveryOptions)
+        : this(platformProvider, timeProvider, recoveryOptions, null)
+    {
+    }
+
+    internal RuntimeKernel(
+        IPlatformAuthorityProvider? platformProvider,
+        TimeProvider? timeProvider,
+        RuntimeKernelRecoveryOptions? recoveryOptions,
+        IResourceBudgetJournalStore? resourceBudgetJournalStore)
     {
         var selectedTimeProvider = timeProvider ?? TimeProvider.System;
         _operabilityTimeProvider = selectedTimeProvider;
@@ -51,7 +60,7 @@ public sealed partial class RuntimeKernel
             ArgumentException.ThrowIfNullOrWhiteSpace(recoveryOptions.ResourceBudgetJournalPath);
             ArgumentNullException.ThrowIfNull(recoveryOptions.AuthenticationKey);
             _resourceBudgetRecoveryJournal = new ResourceBudgetRecoveryJournal(
-                new FileResourceBudgetJournalStore(recoveryOptions.ResourceBudgetJournalPath),
+                resourceBudgetJournalStore ?? new FileResourceBudgetJournalStore(recoveryOptions.ResourceBudgetJournalPath),
                 recoveryOptions.AuthenticationKey);
             var recovery = _resourceBudgetRecoveryJournal.Replay();
             var staged = Budgets.StageConservativeRecoveryCharge(recovery.ConservativeRecoveryCharge);

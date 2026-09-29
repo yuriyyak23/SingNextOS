@@ -136,6 +136,8 @@ internal sealed class EndpointSessionInvocationRegistry
         {
             var resolved = ResolveForCaller(handle, caller);
             if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+            if (resolved.Value!.CancellationScope is { } existing && existing != scope)
+                return KernelResult.Fail(KernelError.StaleGeneration, "Invocation is already bound to another cancellation scope generation.");
             var temporal = _cancellationScopes.Observe(caller, scope);
             if (!temporal.IsSuccess) return KernelResult.Fail(temporal.Error, temporal.Message!);
             if (temporal.Value!.Disposition == CancellationDisposition.Stale)
@@ -145,8 +147,6 @@ internal sealed class EndpointSessionInvocationRegistry
                 scope,
                 $"ipc:{handle.Session.SessionId.Value}:{handle.Session.Generation.Value}:{handle.InvocationId.Value}:{handle.Generation.Value}");
             if (!binding.IsSuccess) return binding;
-            if (resolved.Value!.CancellationScope is { } existing && existing != scope)
-                return KernelResult.Fail(KernelError.StaleGeneration, "Invocation is already bound to another cancellation scope generation.");
             resolved.Value.CancellationScope = scope;
             return KernelResult.Ok();
         }

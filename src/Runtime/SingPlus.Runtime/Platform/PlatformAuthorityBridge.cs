@@ -54,6 +54,9 @@ public sealed partial class PlatformAuthorityBridge
         public PlatformDomainBinding Binding { get; } = binding;
         public PlatformProviderDomainLease ProviderLease { get; } = providerLease;
         public DomainAuthorityState AuthorityState { get; set; }
+        public bool SecureCreateMayHaveEffect { get; set; }
+        public int PendingSecureCreates { get; set; }
+        public bool ParentRevokeMayHaveEffect { get; set; }
         public PlatformExecutionPolicyRegistration? ExecutionPolicy { get; set; }
     }
 
@@ -85,6 +88,7 @@ public sealed partial class PlatformAuthorityBridge
     private readonly IPlatformAuthorityProvider? _provider;
     private PlatformFeatureManifest _featureManifest;
     private readonly Dictionary<PlatformDomainBindingId, DomainRecord> _domains = [];
+    private readonly object _secureDomainLifecycleGate = new();
     private readonly Dictionary<PlatformRegionMappingId, MappingRecord> _mappings = [];
     private readonly Dictionary<PlatformDomainIdentity, PlatformDomainBindingId> _activeSubjects = [];
     private ulong _nextDomainBindingId = 1;
@@ -120,6 +124,9 @@ public sealed partial class PlatformAuthorityBridge
 
     internal KernelResult<PlatformDomainBinding> BindDomain(PlatformDomainIdentity subject)
     {
+        if (_backendEpochExhausted)
+            return KernelResult<PlatformDomainBinding>.Fail(KernelError.CapacityExhausted,
+                "Platform backend generation space is exhausted.");
         if (_provider is null)
             return KernelResult<PlatformDomainBinding>.Fail(
                 KernelError.PlatformUnavailable,
@@ -202,43 +209,69 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDomainBinding binding,
         PlatformDomainIdentity expectedSubject)
     {
-        var validation = ValidateDomainIdentity(binding, expectedSubject);
-        if (!validation.IsSuccess) return validation;
-
-        if (HasActiveDsc1Operations(binding))
+        DomainRecord record;
+        PlatformBackendEpoch backendEpoch;
+        lock (_secureDomainLifecycleGate)
         {
-            return KernelResult.Fail(
-                KernelError.PlatformBindingActive,
-                "DSC1 operations must close and release local reservations before the platform domain binding.");
+            var validation = ValidateDomainIdentity(binding, expectedSubject);
+            if (!validation.IsSuccess) return validation;
+
+            if (HasActiveDsc1Operations(binding))
+                return KernelResult.Fail(KernelError.PlatformBindingActive,
+                    "DSC1 operations must close and release local reservations before the platform domain binding.");
+            if (_mappings.Values.Any(m =>
+                    !m.LocalReservationReleased && m.Mapping.DomainBinding.BindingId == binding.BindingId))
+                return KernelResult.Fail(KernelError.PlatformBindingActive,
+                    "Platform region mappings must reach verified closure and release their local reservation before the domain binding.");
+
+            record = _domains[binding.BindingId];
+            if (record.AuthorityState == DomainAuthorityState.Closed)
+            {
+                ReleaseActiveSubject(record);
+                return KernelResult.Ok();
+            }
+            if (record.PendingSecureCreates != 0 || record.SecureCreateMayHaveEffect ||
+                _secureDomains.Values.Any(secure => secure.Binding.Parent.BindingId == binding.BindingId))
+                return KernelResult.Fail(KernelError.PlatformBindingActive,
+                    "Secure-domain creation and child authority must have exact closure before the parent platform domain.");
+            if (record.ParentRevokeMayHaveEffect)
+                return KernelResult.Fail(KernelError.PlatformFaulted,
+                    "Parent-domain revoke may have taken effect without exact closure evidence.");
+
+            record.ParentRevokeMayHaveEffect = true;
+            backendEpoch = BackendEpoch;
         }
 
-        if (_mappings.Values.Any(m =>
-                !m.LocalReservationReleased &&
-                m.Mapping.DomainBinding.BindingId == binding.BindingId))
+        PlatformAuthorityResult providerResult;
+        try { providerResult = _provider!.RevokeDomain(record.ProviderLease); }
+        catch (Exception exception) when (exception is not StackOverflowException)
         {
-            return KernelResult.Fail(
-                KernelError.PlatformBindingActive,
-                "Platform region mappings must reach verified closure and release their local reservation before the domain binding.");
+            lock (_secureDomainLifecycleGate) QuarantineDomain(_domains[binding.BindingId]);
+            return KernelResult.Fail(KernelError.PlatformFaulted,
+                $"Parent-domain revoke may have taken effect without closure evidence: {exception.Message}");
         }
 
-        var record = _domains[binding.BindingId];
-        if (record.AuthorityState == DomainAuthorityState.Closed)
+        lock (_secureDomainLifecycleGate)
         {
-            ReleaseActiveSubject(record);
+            var current = _domains[binding.BindingId];
+            if (BackendEpoch != backendEpoch || current != record || current.Binding != binding)
+            {
+                QuarantineDomain(current);
+                return KernelResult.Fail(KernelError.PlatformFaulted,
+                    "Backend reset during parent-domain revoke leaves closure uncertain.");
+            }
+            if (!providerResult.IsSuccess)
+            {
+                QuarantineDomain(record);
+                // V1 permits an exact same-lease retry after an ordinary provider
+                // failure. The parent stays quarantined between attempts.
+                record.ParentRevokeMayHaveEffect = false;
+                return FromProviderFailure(providerResult.Status, providerResult.Message);
+            }
+
+            CloseDomain(record);
             return KernelResult.Ok();
         }
-
-        var providerResult = _provider!.RevokeDomain(record.ProviderLease);
-        if (!providerResult.IsSuccess)
-        {
-            if (RequiresDomainQuarantine(providerResult.Status))
-                QuarantineDomain(record);
-
-            return FromProviderFailure(providerResult.Status, providerResult.Message);
-        }
-
-        CloseDomain(record);
-        return KernelResult.Ok();
     }
 
     internal KernelResult ValidateDomain(

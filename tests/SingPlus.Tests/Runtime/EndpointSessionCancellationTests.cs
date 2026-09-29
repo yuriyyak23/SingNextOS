@@ -260,6 +260,30 @@ public sealed class EndpointSessionCancellationTests
             scenario.Kernel.TerminateProcess(scenario.Service).Error);
     }
 
+    [Fact]
+    public void ConflictingInvocationScopeBindDoesNotConsumeRejectedScope()
+    {
+        var scopes = new CancellationScopeAuthority(TimeProvider.System);
+        var registry = new EndpointSessionInvocationRegistry(scopes);
+        var caller = new ProcessHandle(new ProcessId(810), 1);
+        var service = new ProcessHandle(new ProcessId(811), 1);
+        var session = new EndpointSessionHandle(new EndpointSessionId(12), new EndpointSessionGeneration(1));
+        var first = registry.Register(session, caller, service, 1, 1);
+        var second = registry.Register(session, caller, service, 2, 1);
+        var boundScope = scopes.Create(caller, null, null).Value!.Scope;
+        var rejectedScope = scopes.Create(caller, null, null).Value!.Scope;
+        Assert.True(registry.BindCancellationScope(first, caller, boundScope).IsSuccess);
+        var before = scopes.Observe(caller, rejectedScope).Value!.Sequence;
+
+        Assert.Equal(KernelError.StaleGeneration,
+            registry.BindCancellationScope(first, caller, rejectedScope).Error);
+        Assert.Equal(before, scopes.Observe(caller, rejectedScope).Value!.Sequence);
+        Assert.True(registry.BindCancellationScope(second, caller, rejectedScope).IsSuccess);
+        Assert.Equal(KernelError.StaleGeneration,
+            registry.BindCancellationScope(first, caller, rejectedScope with
+            { Generation = new CancellationScopeGeneration(rejectedScope.Generation.Value + 1) }).Error);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

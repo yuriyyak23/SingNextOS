@@ -24,7 +24,8 @@ internal sealed record ExternalOperationResourceBinding(
     ExternalResourceBindingState State,
     ulong? TerminalReceiptSequence = null,
     Guid? TerminalEvidenceId = null,
-    ulong? SettledAmount = null);
+    ulong? SettledAmount = null,
+    bool SettlementInFlight = false);
 
 internal readonly record struct ExternalResourceUsageEvidence(
     uint Version,
@@ -143,12 +144,23 @@ public sealed partial class ExternalOperationAuthority
                 return KernelResult<ExternalOperationResourceBinding>.Fail(KernelError.InvalidMessage,
                     "Usage evidence does not match the bound chargeability policy normalization.");
             if (binding.TerminalReceiptSequence == evidence.ReceiptSequence)
-                return binding.State == ExternalResourceBindingState.Settled &&
-                       binding.TerminalEvidenceId == evidence.EvidenceId &&
-                       binding.SettledAmount == evidence.ConsumedAmount
-                    ? KernelResult<ExternalOperationResourceBinding>.Ok(binding)
-                    : KernelResult<ExternalOperationResourceBinding>.Fail(KernelError.InvalidTransition,
+            {
+                if (binding.TerminalEvidenceId != evidence.EvidenceId ||
+                    binding.SettledAmount != evidence.ConsumedAmount)
+                    return KernelResult<ExternalOperationResourceBinding>.Fail(KernelError.InvalidTransition,
                         "Duplicate evidence conflicts with the terminal settlement.");
+                if (binding.State == ExternalResourceBindingState.Settled)
+                    return KernelResult<ExternalOperationResourceBinding>.Ok(binding);
+                if (binding.State == ExternalResourceBindingState.Quarantined && !binding.SettlementInFlight)
+                {
+                    binding = binding with { State = ExternalResourceBindingState.Settling,
+                        SettlementInFlight = true };
+                    record.ResourceBinding = binding;
+                    return KernelResult<ExternalOperationResourceBinding>.Ok(binding);
+                }
+                return KernelResult<ExternalOperationResourceBinding>.Fail(KernelError.InvalidTransition,
+                    "The exact receipt is already being settled or cannot be retried.");
+            }
             if (binding.State is not (ExternalResourceBindingState.Consuming or ExternalResourceBindingState.Quarantined) ||
                 record.State is not (ExternalOperationState.DeviceComplete or ExternalOperationState.Visible or ExternalOperationState.Published))
                 return KernelResult<ExternalOperationResourceBinding>.Fail(KernelError.InvalidTransition,
@@ -158,7 +170,8 @@ public sealed partial class ExternalOperationAuthority
                 State = ExternalResourceBindingState.Settling,
                 TerminalReceiptSequence = evidence.ReceiptSequence,
                 TerminalEvidenceId = evidence.EvidenceId,
-                SettledAmount = evidence.ConsumedAmount
+                SettledAmount = evidence.ConsumedAmount,
+                SettlementInFlight = true
             };
             record.ResourceBinding = binding;
             return KernelResult<ExternalOperationResourceBinding>.Ok(binding);
@@ -175,10 +188,14 @@ public sealed partial class ExternalOperationAuthority
                 return KernelResult<ExternalOperationResourceBinding>.Fail(resolved.Error, resolved.Message!);
             var record = resolved.Value!;
             var binding = record.ResourceBinding;
-            if (binding is null || binding.Lease != lease || binding.State != ExternalResourceBindingState.Settling)
+            if (binding is null || binding.Lease != lease || !binding.SettlementInFlight ||
+                binding.State != ExternalResourceBindingState.Settling &&
+                !(binding.State == ExternalResourceBindingState.Quarantined &&
+                  binding.TerminalReceiptSequence is not null))
                 return KernelResult<ExternalOperationResourceBinding>.Fail(KernelError.StaleGeneration,
                     "Settlement completion does not match the reserved binding transition.");
-            binding = binding with { State = success ? ExternalResourceBindingState.Settled : ExternalResourceBindingState.Quarantined };
+            binding = binding with { State = success ? ExternalResourceBindingState.Settled : ExternalResourceBindingState.Quarantined,
+                SettlementInFlight = false };
             record.ResourceBinding = binding;
             AddTransition(record, record.State, success ? "ResourceSettled" : "ResourceSettlementQuarantined");
             return KernelResult<ExternalOperationResourceBinding>.Ok(binding);
@@ -252,6 +269,10 @@ public sealed partial class ExternalOperationAuthority
 
 public sealed partial class RuntimeKernel
 {
+    internal Action? ResourceSettlementAfterBeginQualificationHook { private get; set; }
+    internal Action? ResourceSettlementAfterBudgetQualificationHook { private get; set; }
+    internal Action? ResourceSettlementAfterJournalQualificationHook { private get; set; }
+
     internal KernelResult<BudgetReservationSnapshot> SettleResourceExternalOperation(
         ProcessHandle principal, ExternalResourceUsageEvidence evidence)
     {
@@ -266,6 +287,8 @@ public sealed partial class RuntimeKernel
         if (binding.State == ExternalResourceBindingState.Settled)
             return Budgets.Query(binding.Lease);
 
+        ResourceSettlementAfterBeginQualificationHook?.Invoke();
+
         var correlation = new PlatformResourceCorrelation(
             new PlatformResourceCorrelationId(binding.Operation.OperationId.Value),
             new PlatformResourceCorrelationGeneration(binding.Operation.Generation.Value));
@@ -273,15 +296,6 @@ public sealed partial class RuntimeKernel
         IReadOnlyList<BudgetAmount> recoveryCharge = evidence.ConsumedAmount == 0
             ? []
             : [new BudgetAmount(ServiceBudgetDimension.ComputeTimeNanoseconds, evidence.ConsumedAmount)];
-        var journal = AppendResourceRecovery(binding.Lease, binding.BudgetOwner, binding.Envelope,
-            correlation, recoveryTransition, recoveryCharge);
-        if (!journal.IsSuccess)
-        {
-            _ = ExternalOperations.CompleteResourceSettlement(binding.Operation, binding.Lease, success: false);
-            EmitExternalOperationTrace(binding.Operation);
-            return KernelResult<BudgetReservationSnapshot>.Fail(journal.Error, journal.Message!);
-        }
-
         var lease = Budgets.Query(binding.Lease);
         if (!lease.IsSuccess)
         {
@@ -301,11 +315,34 @@ public sealed partial class RuntimeKernel
         }
         var settled = Budgets.SettleLease(binding.BudgetOwner, binding.Lease,
             [new(ServiceBudgetDimension.ComputeTimeNanoseconds, evidence.ConsumedAmount)]);
+        if (settled.IsSuccess)
+            ResourceSettlementAfterBudgetQualificationHook?.Invoke();
+        if (!settled.IsSuccess)
+        {
+            _ = ExternalOperations.CompleteResourceSettlement(binding.Operation, binding.Lease, success: false);
+            EmitExternalOperationTrace(binding.Operation);
+            return KernelResult<BudgetReservationSnapshot>.Fail(settled.Error, settled.Message!);
+        }
+        if (!Budgets.IsExactSettledExternalLease(binding.BudgetOwner, binding.Lease,
+                evidence.ConsumedAmount))
+        {
+            _ = ExternalOperations.CompleteResourceSettlement(binding.Operation, binding.Lease, success: false);
+            EmitExternalOperationTrace(binding.Operation);
+            return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.ExternalEffectUncontained,
+                "Budget owner did not confirm the exact terminal resource charge.");
+        }
+        var journal = AppendResourceRecovery(binding.Lease, binding.BudgetOwner, binding.Envelope,
+            correlation, recoveryTransition, recoveryCharge);
+        if (!journal.IsSuccess)
+        {
+            _ = ExternalOperations.CompleteResourceSettlement(binding.Operation, binding.Lease, success: false);
+            EmitExternalOperationTrace(binding.Operation);
+            return KernelResult<BudgetReservationSnapshot>.Fail(journal.Error, journal.Message!);
+        }
+        ResourceSettlementAfterJournalQualificationHook?.Invoke();
         var completed = ExternalOperations.CompleteResourceSettlement(binding.Operation, binding.Lease, settled.IsSuccess);
         if (completed.IsSuccess)
             EmitExternalOperationTrace(binding.Operation);
-        if (!settled.IsSuccess)
-            return KernelResult<BudgetReservationSnapshot>.Fail(settled.Error, settled.Message!);
         return completed.IsSuccess
             ? settled
             : KernelResult<BudgetReservationSnapshot>.Fail(completed.Error, completed.Message!);

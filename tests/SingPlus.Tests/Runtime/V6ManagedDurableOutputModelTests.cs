@@ -70,6 +70,67 @@ public sealed class V6ManagedDurableOutputModelTests
     }
 
     [Fact]
+    public void PrecommitCrashRequiresFreshAdmissionForNewOperationCorrelation()
+    {
+        var model = new V6ManagedDurableOutputModel(Semantics);
+        Assert.False(Submit(model, Binding(), KernelResult.Ok,
+            V6DurabilityFaultPoint.TornData).IsSuccess);
+        Assert.Null(model.Recover().LastDurable);
+        var next = Binding() with { OperationCorrelation = "operation:43", OperationGeneration = 14 };
+        var calls = 0;
+
+        Assert.Equal(KernelError.StaleGeneration,
+            Submit(model, next, () => { calls++; return KernelResult.Ok(); }).Error);
+        Assert.Equal(0, calls);
+        Assert.True(Submit(model, next, () => { calls++; return KernelResult.Ok(); },
+            runtimeGeneration: 4, processGeneration: 6,
+            providerAdmissionGeneration: 8).IsSuccess);
+        Assert.Equal(1, calls);
+    }
+
+    [Fact]
+    public void PublishedReplayIsHistoricalButNewOperationNeedsFreshAdmissionAfterRecovery()
+    {
+        var model = new V6ManagedDurableOutputModel(Semantics);
+        var original = Submit(model, Binding(), KernelResult.Ok);
+        Assert.True(original.IsSuccess);
+        _ = model.Recover();
+        var next = Binding() with { OperationCorrelation = "operation:43", OperationGeneration = 14 };
+        var calls = 0;
+
+        Assert.Equal(original.Value, Submit(model, Binding(),
+            () => { calls++; return KernelResult.Ok(); }).Value);
+        Assert.Equal(KernelError.StaleGeneration,
+            Submit(model, next, () => { calls++; return KernelResult.Ok(); }).Error);
+        Assert.Equal(0, calls);
+        Assert.True(Submit(model, next, () => { calls++; return KernelResult.Ok(); },
+            runtimeGeneration: 4, processGeneration: 6,
+            providerAdmissionGeneration: 8).IsSuccess);
+        Assert.Equal(1, calls);
+    }
+
+    [Theory]
+    [InlineData(3UL, 6UL, 8UL)]
+    [InlineData(4UL, 5UL, 8UL)]
+    [InlineData(4UL, 6UL, 7UL)]
+    public void EveryRecoveryAdmissionDimensionMustAdvanceForNewOperation(
+        ulong runtime, ulong process, ulong provider)
+    {
+        var model = new V6ManagedDurableOutputModel(Semantics);
+        Assert.False(Submit(model, Binding(), KernelResult.Ok,
+            V6DurabilityFaultPoint.CrashAfterWrite).IsSuccess);
+        _ = model.Recover();
+        var next = Binding() with { OperationCorrelation = "operation:43", OperationGeneration = 14 };
+        var calls = 0;
+
+        Assert.Equal(KernelError.StaleGeneration,
+            Submit(model, next, () => { calls++; return KernelResult.Ok(); },
+                runtimeGeneration: runtime, processGeneration: process,
+                providerAdmissionGeneration: provider).Error);
+        Assert.Equal(0, calls);
+    }
+
+    [Fact]
     public void DuplicateReplayReturnsTheSameReceiptAndNeverPublishesTwice()
     {
         var model = new V6ManagedDurableOutputModel(Semantics);

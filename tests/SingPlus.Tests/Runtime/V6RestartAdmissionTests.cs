@@ -10,6 +10,60 @@ public sealed class V6RestartAdmissionTests
     private static readonly PreemptionGuaranteeV1 RestartOnly = new(1,
         PreemptionClassV1.RestartOnly, PreemptionEffectSemanticsV1.RequestOnly, 0, false);
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void ZeroGenerationCopiedBindingCannotSubmit(bool zeroProvider)
+    {
+        var scenario = CreateScenario();
+        var predecessor = CreateClosedPredecessor(scenario);
+        var replacement = PrepareAndAdmit(scenario);
+        var valid = scenario.Kernel.CreateV6RestartBinding(scenario.Owner, predecessor.Operation,
+            replacement.Operation, Dependencies, RestartOnly, 19, 23).Value!;
+        var binding = zeroProvider
+            ? valid with { ProviderGeneration = 0 }
+            : valid with { RuntimeGeneration = 0 };
+        var callbacks = 0;
+        var submitted = scenario.Kernel.SubmitV6Restart(scenario.Owner, binding,
+            () => { callbacks++; return KernelResult.Ok(); }, KernelResult.Ok, KernelResult.Ok,
+            () => binding.ProviderGeneration, () => binding.RuntimeGeneration,
+            () => { callbacks++; return KernelResult.Ok(); });
+        Assert.Equal(KernelError.InvalidMessage, submitted.Error);
+        Assert.Equal(0, callbacks);
+        Assert.Equal(ExternalOperationState.Admitted,
+            scenario.Kernel.QueryExternalOperation(scenario.Owner, replacement.Operation).Value!.State);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void TerminalDependencyGenerationCannotCreateOrSubmitRestart(bool providerTerminal)
+    {
+        var scenario = CreateScenario();
+        var predecessor = CreateClosedPredecessor(scenario);
+        var replacement = PrepareAndAdmit(scenario);
+        var providerGeneration = providerTerminal ? ulong.MaxValue : 19UL;
+        var runtimeGeneration = providerTerminal ? 23UL : ulong.MaxValue;
+        var rejected = scenario.Kernel.CreateV6RestartBinding(scenario.Owner, predecessor.Operation,
+            replacement.Operation, Dependencies, RestartOnly, providerGeneration, runtimeGeneration);
+        Assert.Equal(KernelError.CapacityExhausted, rejected.Error);
+
+        var valid = scenario.Kernel.CreateV6RestartBinding(scenario.Owner, predecessor.Operation,
+            replacement.Operation, Dependencies, RestartOnly, 19, 23).Value!;
+        var binding = providerTerminal
+            ? valid with { ProviderGeneration = ulong.MaxValue }
+            : valid with { RuntimeGeneration = ulong.MaxValue };
+        var callbacks = 0;
+        var submitted = scenario.Kernel.SubmitV6Restart(scenario.Owner, binding,
+            () => { callbacks++; return KernelResult.Ok(); }, KernelResult.Ok, KernelResult.Ok,
+            () => providerGeneration, () => runtimeGeneration,
+            () => { callbacks++; return KernelResult.Ok(); });
+        Assert.Equal(KernelError.CapacityExhausted, submitted.Error);
+        Assert.Equal(0, callbacks);
+        Assert.Equal(ExternalOperationState.Admitted,
+            scenario.Kernel.QueryExternalOperation(scenario.Owner, replacement.Operation).Value!.State);
+    }
+
     [Fact]
     public void ClosedProviderLostPredecessorCanRestartThroughAllFreshAdmissionSentries()
     {
@@ -30,7 +84,7 @@ public sealed class V6RestartAdmissionTests
             () => { providerSubmits++; return KernelResult.Ok(); });
 
         Assert.True(result.IsSuccess, result.Message);
-        Assert.Equal(["SingNext", "Provider", "Runtime"], sentries);
+        Assert.Equal(["SingNext", "Provider", "Runtime", "SingNext", "Provider"], sentries);
         Assert.Equal(1, providerSubmits);
         Assert.False(result.Value!.AuthorizesExecution);
         Assert.False(result.Value.ProvesPredecessorClosure);
@@ -58,6 +112,38 @@ public sealed class V6RestartAdmissionTests
         Assert.False(result.IsSuccess);
         Assert.Equal(KernelError.PlatformDenied, result.Error);
         Assert.Equal(0, providerSubmits);
+        Assert.Equal(ExternalOperationState.Admitted,
+            scenario.Kernel.QueryExternalOperation(scenario.Owner, replacement.Operation).Value!.State);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void LegalityRevokesEarlierAdmissionBeforeReplacementSubmit(bool providerRevoked)
+    {
+        var scenario = CreateScenario();
+        var predecessor = CreateClosedPredecessor(scenario);
+        var replacement = PrepareAndAdmit(scenario);
+        var binding = scenario.Kernel.CreateV6RestartBinding(scenario.Owner, predecessor.Operation,
+            replacement.Operation, Dependencies, RestartOnly, 19, 23).Value!;
+        var singNextAllowed = true;
+        var providerAllowed = true;
+        var callbacks = 0;
+
+        var result = scenario.Kernel.SubmitV6Restart(scenario.Owner, binding,
+            () => singNextAllowed ? KernelResult.Ok() : KernelResult.Fail(KernelError.CapabilityRevoked, "revoked"),
+            () => providerAllowed ? KernelResult.Ok() : KernelResult.Fail(KernelError.PlatformDenied, "revoked"),
+            () =>
+            {
+                if (providerRevoked) providerAllowed = false;
+                else singNextAllowed = false;
+                return KernelResult.Ok();
+            },
+            () => 19, () => 23,
+            () => { callbacks++; return KernelResult.Ok(); });
+
+        Assert.Equal(providerRevoked ? KernelError.PlatformDenied : KernelError.CapabilityRevoked, result.Error);
+        Assert.Equal(0, callbacks);
         Assert.Equal(ExternalOperationState.Admitted,
             scenario.Kernel.QueryExternalOperation(scenario.Owner, replacement.Operation).Value!.State);
     }
@@ -119,6 +205,44 @@ public sealed class V6RestartAdmissionTests
         var snapshot = scenario.Kernel.QueryExternalOperation(scenario.Owner, replacement.Operation).Value!;
         Assert.Equal(ExternalOperationDisposition.ProviderLost, snapshot.Disposition);
         Assert.DoesNotContain(snapshot.Transitions, transition => transition.Event == "Published");
+    }
+
+    [Theory]
+    [InlineData("provider")]
+    [InlineData("runtime")]
+    [InlineData("observation-throws")]
+    public void PostSubmitGenerationDriftOrObservationFailureCannotIssueRestartReceipt(string fault)
+    {
+        var scenario = CreateScenario();
+        var predecessor = CreateClosedPredecessor(scenario);
+        var replacement = PrepareAndAdmit(scenario);
+        var binding = scenario.Kernel.CreateV6RestartBinding(scenario.Owner, predecessor.Operation,
+            replacement.Operation, Dependencies, RestartOnly, 19, 23, scenario.RestartBudget).Value!;
+        ulong providerGeneration = 19;
+        ulong runtimeGeneration = 23;
+        var callbackEntered = false;
+
+        var result = scenario.Kernel.SubmitV6Restart(scenario.Owner, binding,
+            KernelResult.Ok, KernelResult.Ok, KernelResult.Ok,
+            () => callbackEntered && fault == "observation-throws"
+                ? throw new InvalidOperationException("generation source unavailable")
+                : providerGeneration,
+            () => runtimeGeneration,
+            () =>
+            {
+                callbackEntered = true;
+                if (fault == "provider") providerGeneration++;
+                if (fault == "runtime") runtimeGeneration++;
+                return KernelResult.Ok();
+            });
+
+        Assert.True(callbackEntered);
+        Assert.Equal(fault == "observation-throws" ? KernelError.PlatformUnavailable : KernelError.StaleGeneration,
+            result.Error);
+        Assert.Equal(ExternalOperationDisposition.ProviderLost,
+            scenario.Kernel.QueryExternalOperation(scenario.Owner, replacement.Operation).Value!.Disposition);
+        Assert.Equal(BudgetReservationState.Quarantined,
+            scenario.Kernel.Budgets.Query(scenario.RestartBudget).Value!.State);
     }
 
     [Fact]

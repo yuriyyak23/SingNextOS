@@ -14,12 +14,25 @@ function Get-Sha256([string]$Path) {
 $filter = 'FullyQualifiedName~FaultReconciliationPolicyV1Tests|FullyQualifiedName~RasFailureContractsV1Tests|FullyQualifiedName~V6RasFailureConsequenceTests|FullyQualifiedName~V6BoundedEvidenceReconcilerTests|FullyQualifiedName~Phase10ProviderConformanceTests|FullyQualifiedName~CxlType3MemoryProviderTests|FullyQualifiedName=SingPlus.Tests.Architecture.V6ArchitectureGuardTests.V6GateRegistryIsClosedCompleteAndDefaultOff|FullyQualifiedName=SingPlus.Tests.Runtime.ExternalOperationLifecycleTests.ProviderLossRequiresExplicitClosureOrContainmentBeforeLocalRelease|FullyQualifiedName=SingPlus.Tests.Runtime.V6MemoryRuntimeEnforcementTests.ProviderLossProjectsToQuarantineWithoutInventingRelease|FullyQualifiedName=SingPlus.Tests.Runtime.HybridCpuExternalOperationProviderTests.CancellationReceiptDistinguishesPreSubmitClosureFromPendingPostSubmitEffect|FullyQualifiedName=SingPlus.Tests.Runtime.HybridCpuExternalOperationProviderTests.ReconfigureAfterSubmitRejectsStaleClosureAndKeepsRegionPinned|FullyQualifiedName=SingPlus.Tests.Runtime.HybridCpuExternalOperationProviderTests.ReconfigureBeforeSubmitClosesLocalAdmissionWithoutInventingEffect|FullyQualifiedName=SingPlus.Tests.Runtime.HybridCpuExternalOperationProviderTests.ReconfigureAfterCompletionOrVisibilityProjectsProviderLossWithoutPublication|FullyQualifiedName=SingPlus.Tests.Runtime.HybridCpuExternalOperationProviderTests.ReconfigureAfterReleasePreservesPublishedTerminalDecision|FullyQualifiedName=SingPlus.Tests.Runtime.HybridCpuExternalOperationProviderTests.ReconfiguredOperationRequiresCurrentGenerationAndExplicitClosureForReconciliation|FullyQualifiedName=SingPlus.Tests.Runtime.HybridCpuExternalOperationProviderTests.ReconfigureGenerationAbaNeverReauthorizesOldRequest|FullyQualifiedName=SingPlus.Tests.Runtime.HybridCpuExternalOperationProviderTests.PublicationCallbackReentryIsFailClosedAndGenerationChangeWaitsForBoundaryExit'
 $filter += '|FullyQualifiedName~PlatformDmaSubmissionTests.TrustedBackendResetDuringSubmitPinsPossibleEffectWithoutProviderIncarnationDrift|FullyQualifiedName~PlatformDmaSubmissionTests.ProviderThrowDuringGrantRevokePinsMappingAfterPossibleClosure'
 $filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.EffectPublicationSemanticsV1Tests.ProviderLossDuringAmbiguousPublicationClosureCannotClearPossibleEffect'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.EffectPublicationSemanticsV1Tests.RegionDamageDuringPublicationCannotBecomePublishedEvidence'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.ExternalOperationLifecycleTests.ProviderLossInvalidatesWritableUseAtTerminalMutationEpochWithoutReclaim'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.ExternalOperationLifecycleTests.ProviderLossWithBrokenRegionUseBindingReportsFailureAndRetainsOwnerPin'
+$filter += '|FullyQualifiedName~ExternalOperationLifecycleTests.LateCancellationCannotEraseProviderLossConsequence'
 $filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.HybridCpuExternalOperationProviderTests.ReconfigureGenerationAbaInsideAmbiguousPublicationCannotReauthorizeOldRequest'
 $filter += '|FullyQualifiedName=SingPlus.Tests.Ownership.RegionUseTests.ExhaustedMutationEpochCannotReleaseOrInvalidateWritableUse'
 $filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.ExternalOperationLifecycleTests.MultiRegionReleaseFailureLeavesEveryUsePinned'
 $filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.ExternalOperationLifecycleTests.FailedAdmissionCleanupRetainsAcquiredUseUnderOperationOwner|FullyQualifiedName=SingPlus.Tests.Runtime.ExternalOperationLifecycleTests.FailedAdmissionWithSuccessfulCleanupLeavesNoRegionUse'
 $filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.PublishedOperationCannotReleaseRegionWhileResourceSettlementIsInFlight'
 $filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.ProviderLossWithQuarantinedResourceBindingCannotReleaseRegion'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.FailedRegionInvalidationStillQuarantinesResourceBoundProviderLoss'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.FailedBudgetQuarantineReportsUncontainedProviderLossAndKeepsResourcePinned'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.ProviderLossDuringExactSettlementRetainsLossAndCompletesBudgetReceipt'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.ProviderLossAfterBudgetSettlementAcceptsExactChargeBeforeBindingCompletion'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.ProviderLossBindingReadRacesExactSettlementWithoutFalseQuarantineFailure'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.PriorDifferentBudgetTerminalChargeCannotCompleteExactReceipt'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase16DurableResourceAdmissionTests.JournalFailureAfterBudgetSettlementAndProviderLossKeepsColdChargeConservative'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase16DurableResourceAdmissionTests.RetryAfterDurableTerminalRecordDoesNotAppendSecondReceipt'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase16DurableResourceAdmissionTests.LiveJournalRollbackCannotLowerObservedRecoveryCharge'
 $filter += '|FullyQualifiedName=SingPlus.Tests.Ownership.RegionUseTests.DomainReclaimPreflightsLaterInvalidatedUseBeforeReleasingEarlierRegion'
 $filter += '|FullyQualifiedName=SingPlus.Tests.Ownership.RegionUseTests.ConcurrentAllocationAndTeardownLeaveNoOwnedRegion'
 $filter += '|FullyQualifiedName=SingPlus.Tests.Ownership.RegionUseTests.ConcurrentTransferAndTargetTeardownLeaveNoRegionOwnedByExitedTarget'
@@ -56,6 +69,7 @@ $evidenceInputs = @(
     'src/Runtime/SingPlus.Runtime/Services/EndpointSessionRegistry.cs',
     'src/Runtime/SingPlus.Runtime/Services/EndpointSessionInvocationRegistry.cs',
     'src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetAuthority.cs',
+    'src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetRecoveryJournal.cs',
     'src/Runtime/SingPlus.Runtime/VNext/ResourceDonationProtocol.cs',
     'src/Runtime/SingPlus.Runtime/Services/RuntimeKernel.Services.cs',
     'src/Sip/SingPlus.Sip/Regions/OwnedBuffer.cs',
@@ -90,6 +104,7 @@ $evidenceInputs = @(
     'tests/SingPlus.Tests/Runtime/Phase10ProviderConformanceTests.cs',
     'tests/SingPlus.Tests/Runtime/ExternalOperationLifecycleTests.cs',
     'tests/SingPlus.Tests/Runtime/VNextPhase07ExternalOperationResourceBindingTests.cs',
+    'tests/SingPlus.Tests/Runtime/VNextPhase16DurableResourceAdmissionTests.cs',
     'tests/SingPlus.Tests/Runtime/EffectPublicationSemanticsV1Tests.cs',
     'tests/SingPlus.Tests/Runtime/HybridCpuExternalOperationProviderTests.cs',
     'tests/SingPlus.Tests/Runtime/V6MemoryRuntimeEnforcementTests.cs',
@@ -108,7 +123,7 @@ try {
     $passed = [int]$match.Groups[2].Value
     $skipped = [int]$match.Groups[3].Value
     $total = [int]$match.Groups[4].Value
-    if ($failed -ne 0 -or $passed -ne 119 -or $skipped -ne 0 -or $total -ne 119) {
+    if ($failed -ne 0 -or $passed -ne 133 -or $skipped -ne 0 -or $total -ne 133) {
         throw "Unexpected P10 counts: failed=$failed passed=$passed skipped=$skipped total=$total"
     }
 
@@ -189,6 +204,10 @@ try {
             'PlatformDmaSubmissionTests.TrustedBackendResetDuringSubmitPinsPossibleEffectWithoutProviderIncarnationDrift',
             'PlatformDmaSubmissionTests.ProviderThrowDuringGrantRevokePinsMappingAfterPossibleClosure',
             'EffectPublicationSemanticsV1Tests.ProviderLossDuringAmbiguousPublicationClosureCannotClearPossibleEffect',
+            'EffectPublicationSemanticsV1Tests.RegionDamageDuringPublicationCannotBecomePublishedEvidence',
+            'ExternalOperationLifecycleTests.ProviderLossInvalidatesWritableUseAtTerminalMutationEpochWithoutReclaim',
+            'ExternalOperationLifecycleTests.ProviderLossWithBrokenRegionUseBindingReportsFailureAndRetainsOwnerPin',
+            'ExternalOperationLifecycleTests.LateCancellationCannotEraseProviderLossConsequence',
             'HybridCpuExternalOperationProviderTests.ReconfigureGenerationAbaInsideAmbiguousPublicationCannotReauthorizeOldRequest',
             'RegionUseTests.ExhaustedMutationEpochCannotReleaseOrInvalidateWritableUse',
             'RegionUseTests.DomainReclaimPreflightsLaterInvalidatedUseBeforeReleasingEarlierRegion',
@@ -226,7 +245,16 @@ try {
             'ExternalOperationLifecycleTests.FailedAdmissionCleanupRetainsAcquiredUseUnderOperationOwner',
             'ExternalOperationLifecycleTests.FailedAdmissionWithSuccessfulCleanupLeavesNoRegionUse',
             'VNextPhase07ExternalOperationResourceBindingTests.PublishedOperationCannotReleaseRegionWhileResourceSettlementIsInFlight',
-            'VNextPhase07ExternalOperationResourceBindingTests.ProviderLossWithQuarantinedResourceBindingCannotReleaseRegion')
+            'VNextPhase07ExternalOperationResourceBindingTests.ProviderLossWithQuarantinedResourceBindingCannotReleaseRegion',
+            'VNextPhase07ExternalOperationResourceBindingTests.FailedRegionInvalidationStillQuarantinesResourceBoundProviderLoss',
+            'VNextPhase07ExternalOperationResourceBindingTests.FailedBudgetQuarantineReportsUncontainedProviderLossAndKeepsResourcePinned',
+            'VNextPhase07ExternalOperationResourceBindingTests.ProviderLossDuringExactSettlementRetainsLossAndCompletesBudgetReceipt',
+            'VNextPhase07ExternalOperationResourceBindingTests.ProviderLossAfterBudgetSettlementAcceptsExactChargeBeforeBindingCompletion',
+            'VNextPhase07ExternalOperationResourceBindingTests.ProviderLossBindingReadRacesExactSettlementWithoutFalseQuarantineFailure',
+            'VNextPhase07ExternalOperationResourceBindingTests.PriorDifferentBudgetTerminalChargeCannotCompleteExactReceipt',
+            'VNextPhase16DurableResourceAdmissionTests.JournalFailureAfterBudgetSettlementAndProviderLossKeepsColdChargeConservative',
+            'VNextPhase16DurableResourceAdmissionTests.RetryAfterDurableTerminalRecordDoesNotAppendSecondReceipt',
+            'VNextPhase16DurableResourceAdmissionTests.LiveJournalRollbackCannotLowerObservedRecoveryCharge')
         changedFiles = @('src/Runtime/SingPlus.Runtime/ExternalOperations/ExternalOperationAuthority.cs',
             'src/Runtime/SingPlus.Runtime/VNext/ExternalOperationResourceBinding.cs',
             'src/Runtime/SingPlus.Runtime/Regions/RegionAuthority.cs',
@@ -286,6 +314,9 @@ try {
                 'internal owner-authorized backing replacement contract after tracked closure; test caller only',
                 'per-failure-domain observation and generation high-watermark survives damage removal and reconfiguration')
             regionMutationBoundary = @('failed writable-use release or invalidation at mutation epoch exhaustion retains the active use pin')
+            providerLossTerminalEpoch = @('provider loss invalidates the exact operation-owned writable use at terminal mutation epoch without wrapping the epoch or releasing the owner pin')
+            providerLossInvalidationFailure = @('broken operation/use binding returns ExternalEffectUncontained after recording provider loss; release remains pinned')
+            providerLossCancellation = @('late cancellation preserves ProviderLost or Faulted consequence for staged and direct effects')
             multiRegionRelease = @('all Region uses are validated and writable mutation capacity is reserved under ordered Region owner locks before any use is released')
             domainReclaimPreflight = @('all existing Region records are locked in ID order; a later invalidated or operation-bound use, reservation, damage or exhausted mutation epoch blocks reclaim before an earlier Region changes')
             allocationTeardown = @('managed AllocateBuffer and AllocateRegion check process state, reserve budget, create and register the Region under the same kernel gate as process teardown; a concurrent allocation either precedes reclaim or is denied')
@@ -304,6 +335,7 @@ try {
             admissionCleanup = @('failed admission cleans acquired uses as one Region transition or retains every uncleared use in the cancelled operation record; submit remains denied')
             operationUseReleaseOwner = @('operation-bound Region uses are pinned at atomic acquisition; public release, a different operation generation and direct domain reclaim cannot free an active or quarantined use')
             externalOperation = @('provider loss after submit quarantines', 'pre-submit cancellation receipt follows owner release',
+                'Region damage during a staged publication callback invalidates the exact use and retains ambiguous publication instead of recording Published',
                 'post-submit cancellation receipt stays unconfirmed while effect remains possible',
                 'reconfigure automatically cancels and releases pre-submit admission',
                 'reconfigure automatically projects post-submit provider loss without release',
@@ -396,11 +428,15 @@ try {
 - CXL Type-3: exact live endpoint/fabric/memory generations are revalidated before and after the deterministic health callback, immediately before Region consequence; rebind during the callback leaves Region undamaged and marks placement for migration. Stale or malformed tuples do not reach RegionAuthority.
 - Reconfiguration: old requests remain stale across generation ABA; pre-submit admissions close locally and post-submit operations automatically project provider loss. Explicit current-generation reconciliation with a separate resource-closure assertion is required for release. A provider-signed closure source remains open.
 - Publication reconciliation: a provider-loss owner transition during the closure callback invalidates that callback result and retains the possible external effect.
+- Publication/damage race: staged publication rechecks exact Region uses after its callback; concurrent subrange damage leaves a possible publication effect pinned and never records Published from the stale use.
 - Settlement/release interlock: a published resource-bound operation retains Region uses before settlement, while settlement is in flight, and after a failed settlement transition.
 - Provider-loss pin: an invalidated RegionUse rejects new access but remains a reclaim pin while the bound budget is quarantined; the owner trace stays at Quarantined without a synthetic release.
 - Deferred provider reconfiguration: A-B-A drift during an in-flight ambiguous publication is retained; the old request becomes stale and provider loss keeps the Region pinned.
 - Region damage replay: provider and failure-domain generation high-watermarks remain in RegionAuthority after reconfiguration or replacement; an old generation with a larger observation sequence cannot create fresh damage.
 - Region use boundary: mutation epoch exhaustion rejects writable-use release or invalidation before changing the active use pin.
+- Provider-loss exception: the exact operation-owned writable use enters terminal local Invalidated state at an exhausted epoch; the epoch does not wrap, and release/reclaim remain pinned. Ordinary public invalidation still rejects epoch exhaustion.
+- Invalidation failure: a broken exact operation/use binding reports `ExternalEffectUncontained` while retaining the ProviderLost transition and denying release; this is fault-injection evidence, not a physical containment claim.
+- Late cancellation preserves the staged `ProviderLost` or direct-write `Faulted` consequence and cannot rewrite either as `CancellationPending`.
 - Multi-use release: exact Region uses release as one owner transition; exhaustion on a later writable Region retains every earlier use pin.
 - Admission cleanup: failed acquisition either releases its earlier Region use or records it on a cancelled, unsubmitted operation when local cleanup fails.
 - Not claimed: executable provider backing replacement, physical ECC/poison/CXL telemetry, hardware, or production qualification.

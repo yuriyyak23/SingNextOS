@@ -35,6 +35,17 @@ $runtimeFilter = 'FullyQualifiedName~PlatformDmaGrantTests|FullyQualifiedName~Pl
 $runtimeFilter += '|FullyQualifiedName~PlatformDeviceLeaseTests.MalformedProviderDeviceAuthorityFailsClosedAndIsRevoked|FullyQualifiedName~PlatformBorrowReadGrantTests.DeniedRevokedFaultedOrMalformedGrantAdmissionFailsClosed'
 $runtimeFilter += '|FullyQualifiedName~PlatformDeviceLeaseTests.MalformedDeviceCleanupFailureQuarantinesExistingDeviceOwner|FullyQualifiedName~PlatformBorrowReadGrantTests.MalformedBorrowMappingCleanupAmbiguityPinsBorrowLifetime'
 $runtimeFilter += '|FullyQualifiedName~PlatformBorrowReadGrantTeardownTests'
+$runtimeFilter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformBackendResetEpochTests.TerminalBackendEpochStillQuarantinesOldAuthorityAndDeniesNewBinding'
+$runtimeFilter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.BackendResetQuarantinedVirtualIoCannotInvokeLateProviderRevoke'
+$runtimeFilter += '|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.BackendResetInsideClosureCallbackCannotTurnLateReceiptIntoClosure'
+$runtimeFilter += '|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.ClosureCallbackExceptionPinsGuestOrVirtualIoWithoutRetry'
+$runtimeFilter += '|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.ChildCloseCallbackResetOrThrowCannotCloseOrRetry'
+$runtimeFilter += '|FullyQualifiedName~Phase7EvidenceSecureComputeTests.SecureRegionUnbindResetOrThrowKeepsMappingPinned|FullyQualifiedName~Phase7EvidenceSecureComputeTests.SecureDomainRevokeResetOrThrowKeepsDomainPinned'
+$runtimeFilter += '|FullyQualifiedName~Phase7EvidenceSecureComputeTests.SecureRegionBindResetOrThrowPinsMappingWithoutPublishedLease|FullyQualifiedName~Phase7EvidenceSecureComputeTests.FailedOrMalformedSecureRegionBindPinsMappingWithoutExactClosure'
+$runtimeFilter += '|FullyQualifiedName~Phase7EvidenceSecureComputeTests.AmbiguousSecureCreatePinsParentWithoutPublishedLease|FullyQualifiedName~Phase7EvidenceSecureComputeTests.MalformedSecureCreateCleanupFaultPinsParent|FullyQualifiedName~Phase7EvidenceSecureComputeTests.MalformedSecureCreateWithExactCleanupDoesNotPinParent|FullyQualifiedName~Phase7EvidenceSecureComputeTests.ParentDomainClosesOnlyAfterSecureChildExactClosure'
+$runtimeFilter += '|FullyQualifiedName~Phase7EvidenceSecureComputeTests.SecureCreateCallbackCannotRevokeParentBeforeLeasePublication'
+$runtimeFilter += '|FullyQualifiedName~Phase7EvidenceSecureComputeTests.ConcurrentParentRevokeCannotPassInFlightSecureCreate|FullyQualifiedName~Phase7EvidenceSecureComputeTests.ConcurrentSecureCreateCannotPassInFlightParentRevoke|FullyQualifiedName~Phase7EvidenceSecureComputeTests.ParentRevokeResetOrThrowRetainsPossibleEffectPin'
+$runtimeFilter += '|FullyQualifiedName~Phase7EvidenceSecureComputeTests.ResetBetweenBridgeAdmissionAndKernelPublicationCannotIssueSecureHandle|FullyQualifiedName~Phase7EvidenceSecureComputeTests.ProcessExitBeforeSecureHandlePublicationAttemptsExactChildClosure|FullyQualifiedName~Phase7EvidenceSecureComputeTests.FailedLocalPublicationCleanupRetainsUnpublishedSecureChildPin'
 $hybridFilter = 'FullyQualifiedName~HybridCpuDmaGrantTests|FullyQualifiedName~HybridCpuDmaVisibilityTests'
 $evidenceInputs = @(
     'contracts/SingPlus.Contracts/DmaExecutionBindingV1.cs',
@@ -51,6 +62,11 @@ $evidenceInputs = @(
     'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.Device.cs',
     'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.BorrowReadGrant.cs',
     'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.BackendEpoch.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.Virtualization.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.VirtualIo.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.GuestMemory.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.SecureCompute.cs',
+    'src/Runtime/SingPlus.Runtime/SecureCompute/RuntimeKernel.SecureCompute.cs',
     'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.DmaVisibility.cs',
     'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.DmaSubmission.cs',
     'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.DmaTrace.cs',
@@ -67,6 +83,9 @@ $evidenceInputs = @(
     'src/Runtime/SingPlus.Runtime/Platform/RuntimeKernel.PlatformDmaPostCompletion.cs',
     'src/Runtime/SingPlus.Runtime/Platform/RuntimeKernel.PlatformDmaPageFault.cs',
     'src/Runtime/SingPlus.Runtime/Platform/RuntimeKernel.PlatformBackendReset.cs',
+    'tests/SingPlus.Tests/Platform/PlatformBackendResetEpochTests.cs',
+    'tests/SingPlus.Tests/Platform/PlatformAuthorityBridgeChildDomainTests.cs',
+    'tests/SingPlus.Tests/Platform/Phase7EvidenceSecureComputeTests.cs',
     'src/Runtime/SingPlus.Runtime/V6/V6PlatformDmaSemanticSubmission.cs',
     'src/Runtime/SingPlus.Runtime/Regions/RegionAuthority.cs',
     'src/Runtime/SingPlus.Runtime/RuntimeKernel.ProcessTeardown.cs',
@@ -75,6 +94,7 @@ $evidenceInputs = @(
     'src/Runtime/SingPlus.Runtime/V6/V6FeatureGates.cs',
     'src/Platform/SingPlus.Platform.HybridCpu/HybridCpuPlatformAuthorityProvider.Dma.cs',
     'tests/SingPlus.Tests/Platform/PlatformDmaSubmissionTests.cs',
+    'tests/SingPlus.Tests/Platform/PlatformDmaGrantTests.cs',
     'tests/SingPlus.Tests/Platform/PlatformDeviceLeaseTests.cs',
     'tests/SingPlus.Tests/Platform/PlatformBorrowReadGrantTests.cs',
     'tests/SingPlus.Tests/Platform/PlatformBorrowReadGrantTeardownTests.cs',
@@ -94,7 +114,7 @@ $evidenceInputs = @(
 Push-Location $RepositoryRoot
 try {
     $runs = @(
-        Invoke-QualifiedTests 'tests\SingPlus.Tests\SingPlus.Tests.csproj' $runtimeFilter 170
+        Invoke-QualifiedTests 'tests\SingPlus.Tests\SingPlus.Tests.csproj' $runtimeFilter 204
         Invoke-QualifiedTests 'tests\SingPlus.Platform.HybridCpu.Tests\SingPlus.Platform.HybridCpu.Tests.csproj' $hybridFilter 6
     )
     New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
@@ -130,7 +150,12 @@ try {
             hybridCpuAdapter = 'in-tree NeutralDomainRuntimeFacade-backed admission and visibility adapter'
         }
         tests = $runs
-        totals = [ordered]@{ passed = 172; failed = 0; skipped = 0; total = 172 }
+        totals = [ordered]@{
+            passed = [int]$runs[0].passed + [int]$runs[1].passed
+            failed = [int]$runs[0].failed + [int]$runs[1].failed
+            skipped = [int]$runs[0].skipped + [int]$runs[1].skipped
+            total = [int]$runs[0].total + [int]$runs[1].total
+        }
         sliceStatus = 'managed-completion-page-fault-and-post-acquire-race-sentries-qualified; HybridCPU-bounded-submit-FutureGated'
         requirementClassification = [ordered]@{
             VerifiedExisting = @('RegionUse and mapping/device grant owners remain separate',
@@ -145,7 +170,7 @@ try {
             ExternalBlocked = @('physical IOMMU isolation campaign and physical faulting provider')
             FutureGated = @('HybridCPU bounded submit/completion', 'production DMA qualification')
         }
-        requirementIds = @('P04-COMPLETION-RESET-01', 'P04-POST-ACQUIRE-RESET-01',
+        requirementIds = @('P04-ADMISSION-CLEANUP-PIN-01', 'P04-COMPLETION-RESET-01', 'P04-POST-ACQUIRE-RESET-01',
             'P04-PAGE-FAULT-COMPLETION-RACE-01', 'P04-PAGE-FAULT-REVOKE-01',
             'P04-PAGE-FAULT-CAPABILITY-TEARDOWN-01',
             'P04-PAGE-FAULT-REGION-GENERATION-01',
@@ -169,7 +194,9 @@ try {
             'P07-DMA-MOVE-RESET-NO-SOURCE-RELEASE-01',
             'P07-DMA-PARTIAL-CLOSURE-NO-RESUBMIT-01',
             'P04-BORROW-EXIT-LOCAL-ACCESS-VS-GRANT-CLOSURE-01')
-        testIds = @('PlatformDmaCompletionTests.ProviderResetDuringCompletionObservationCannotBecomeReusableProof',
+        testIds = @('PlatformDmaGrantTests.FailedDmaAdmissionCannotDiscardPossibleProviderGrant',
+            'PlatformDmaGrantTests.RejectedProviderGrantNeedsConfirmedCleanupBeforeMappingClosure',
+            'PlatformDmaCompletionTests.ProviderResetDuringCompletionObservationCannotBecomeReusableProof',
             'PlatformBorrowReadGrantTeardownTests.BorrowerTeardownClosesGrantBeforeReturningCpuBorrow',
             'PlatformBorrowReadGrantTeardownTests.OwnerTeardownClosesGrantBeforeRevokingBorrowAndReclaimingRegion',
             'PlatformBorrowReadGrantTeardownTests.BorrowerTeardownRemainsDrainingUntilGrantClosureIsObserved',
@@ -299,6 +326,7 @@ try {
             fault = @('ambiguous provider acceptance pins mapping', 'provider incarnation drift during submit pins mapping', 'malformed completion pins authority',
                 'trusted backend reset during provider submit faults the result and pins the possible effect without inventing provider incarnation drift',
                 'ambiguous grant closure after post-completion visibility still pins the grant and blocks a second provider revoke',
+                'failed grant admission or unconfirmed cleanup of a rejected grant retains a bridge-owned pin on the device and mapping',
                 'atomic copy ambiguous, malformed, or reset response pins both mappings',
                 'page-fault range or direction widening denied before callback',
                 'page-fault provider reset or malformed evidence pins mapping',
@@ -325,7 +353,7 @@ try {
             constructDigestsMedianNanoseconds = [double]$performance.summary.constructDigestsMedianNanoseconds
             canonicalRoundTripMedianNanoseconds = [double]$performance.summary.canonicalRoundTripMedianNanoseconds
             supportsGatePromotion = $false
-            interpretation = 'DmaExecutionBindingV1 contract/sideband CPU overhead only; functional provider submit/complete/race and V1 ambiguous-cleanup coverage is in the 170 selected runtime tests.'
+            interpretation = 'DmaExecutionBindingV1 contract/sideband CPU overhead only; functional provider submit/complete/race and V1 ambiguous-cleanup coverage is in the 173 selected runtime tests.'
         }
         featureGate = [ordered]@{
             roadmapGate = 'V6-DMA-TRANSLATION-BINDING'
@@ -378,7 +406,8 @@ try {
     @"
 # P04 DMA composition evidence
 
-- Result: 176/176 selected tests passed across the managed runtime and HybridCPU adapter projects.
+- Result: 179/179 selected tests passed across the managed runtime and HybridCPU adapter projects.
+- Grant admission cleanup: a failed provider bind or unconfirmed revoke of a rejected grant retains a bridge-owned fault pin, blocking mapping and device closure. Confirmed cleanup of a malformed grant permits normal closure; this is deterministic managed provider evidence.
 - Bound submit failure: only explicit provider `NotAccepted` permits retry. Denied, unavailable, stale or faulted responses retain possible-effect quarantine and prevent grant revoke; this is managed adapter evidence only.
 - V1 malformed admission: ambiguous mapping, borrow mapping, or device cleanup retains the existing owner reservation and blocks reclaim while preserving the fail-closed V1 result.
 - V1 provider failure without lease: Faulted/Revoked mapping responses retain the Region or borrow reservation because the response alone cannot prove no external effect.

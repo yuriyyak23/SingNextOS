@@ -57,8 +57,22 @@ public sealed partial class PlatformAuthorityBridge
             return KernelResult.Fail(KernelError.PlatformFaulted, "Guest mapping is quarantined.");
         if (_provider is not IPlatformGuestMemoryProvider provider)
             return KernelResult.Fail(KernelError.PlatformUnsupported, "Guest-memory provider is unavailable.");
+        var backendEpoch = BackendEpoch;
         record.Closure = PlatformExternalClosureState.Draining;
-        var result = provider.UnmapGuestRegion(record.ProviderLease);
+        PlatformAuthorityResult<PlatformGuestRegionMappingClosureReceipt> result;
+        try { result = provider.UnmapGuestRegion(record.ProviderLease); }
+        catch (Exception exception) when (exception is not StackOverflowException)
+        {
+            record.Closure = PlatformExternalClosureState.Faulted;
+            return KernelResult.Fail(KernelError.PlatformFaulted,
+                $"Guest unmap may have taken effect without a closure receipt: {exception.Message}");
+        }
+        if (BackendEpoch != backendEpoch || record.Closure == PlatformExternalClosureState.Faulted)
+        {
+            record.Closure = PlatformExternalClosureState.Faulted;
+            return KernelResult.Fail(KernelError.PlatformFaulted,
+                "Backend reset during guest unmap leaves mapping closure uncertain.");
+        }
         if (!result.IsSuccess)
         {
             record.Closure = PlatformExternalClosureState.Faulted;

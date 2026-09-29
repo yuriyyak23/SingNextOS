@@ -99,6 +99,29 @@ public sealed class PlatformAuthorityBridgeChildDomainTests
         Assert.Equal(1, provider.CloseCalls);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ChildCloseCallbackResetOrThrowCannotCloseOrRetry(bool throws)
+    {
+        var provider = new ChildProvider();
+        var bridge = new PlatformAuthorityBridge(provider);
+        PlatformDomainIdentity owner = Subject(1, 10);
+        var parent = bridge.BindDomain(owner).Value!;
+        var child = bridge.CreateChildDomain(parent, owner, Intent()).Value!;
+        Assert.True(bridge.TransitionChildDomain(child, PlatformChildDomainTransition.BeginDrain).IsSuccess);
+        provider.BeforeChildClose = throws
+            ? () => throw new InvalidOperationException("after possible effect")
+            : () => Assert.True(bridge.ObserveBackendReset().IsSuccess);
+
+        var closed = bridge.CloseChildDomain(child);
+        var retry = bridge.CloseChildDomain(child);
+
+        Assert.Equal(KernelError.PlatformFaulted, closed.Error);
+        Assert.Equal(KernelError.PlatformFaulted, retry.Error);
+        Assert.Equal(1, provider.CloseCalls);
+    }
+
     [Fact]
     public void ChildClosureRequiresTerminalGuestAndIoReceipts()
     {
@@ -123,6 +146,90 @@ public sealed class PlatformAuthorityBridgeChildDomainTests
         Assert.True(bridge.RevokeChildVirtualIo(io).IsSuccess);
         Assert.True(bridge.UnmapChildGuestRegion(guest).IsSuccess);
         Assert.True(bridge.CloseChildDomain(child).IsSuccess);
+    }
+
+    [Fact]
+    public void BackendResetQuarantinedVirtualIoCannotInvokeLateProviderRevoke()
+    {
+        var provider = new ChildProvider();
+        var bridge = new PlatformAuthorityBridge(provider);
+        PlatformDomainIdentity owner = Subject(1, 10);
+        var parent = bridge.BindDomain(owner).Value!;
+        var child = bridge.CreateChildDomain(parent, owner, Intent()).Value!;
+        var device = bridge.BindDevice(parent, owner, new CapabilityId(9),
+            new("device:test"), PlatformDeviceRights.Read).Value!;
+        var io = bridge.BindChildVirtualIo(child, device,
+            new(PlatformDeviceRights.Read, 512)).Value!;
+
+        Assert.True(bridge.ObserveBackendReset().IsSuccess);
+        Assert.Equal(KernelError.PlatformFaulted, bridge.RevokeChildVirtualIo(io).Error);
+        Assert.Equal(0, provider.VirtualIoRevokeCalls);
+        Assert.Equal(KernelError.PlatformFaulted, bridge.RevokeChildVirtualIo(io).Error);
+        Assert.Equal(0, provider.VirtualIoRevokeCalls);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void BackendResetInsideClosureCallbackCannotTurnLateReceiptIntoClosure(bool virtualIo)
+    {
+        var provider = new ChildProvider();
+        var bridge = new PlatformAuthorityBridge(provider);
+        PlatformDomainIdentity owner = Subject(1, 10);
+        var parent = bridge.BindDomain(owner).Value!;
+        var child = bridge.CreateChildDomain(parent, owner, Intent()).Value!;
+        var region = new PlatformRegionIdentity(new(new RegionId(5), new RegionGeneration(1)),
+            new(new DomainId(1), owner.ProcessGeneration), 4096);
+        var parentMapping = bridge.MapOwnedRegion(parent, owner, new CapabilityId(8), region,
+            PlatformMemoryAccess.Read | PlatformMemoryAccess.Write).Value!;
+        var guest = bridge.MapChildGuestRegion(child, parentMapping,
+            new(0, 4096), PlatformGuestMemoryAccess.Read).Value!;
+        var device = bridge.BindDevice(parent, owner, new CapabilityId(9),
+            new("device:test"), PlatformDeviceRights.Read).Value!;
+        var io = bridge.BindChildVirtualIo(child, device,
+            new(PlatformDeviceRights.Read, 512)).Value!;
+        if (virtualIo) provider.BeforeVirtualIoRevoke = () => Assert.True(bridge.ObserveBackendReset().IsSuccess);
+        else provider.BeforeGuestUnmap = () => Assert.True(bridge.ObserveBackendReset().IsSuccess);
+
+        var close = virtualIo ? bridge.RevokeChildVirtualIo(io) : bridge.UnmapChildGuestRegion(guest);
+
+        Assert.Equal(KernelError.PlatformFaulted, close.Error);
+        Assert.Equal(KernelError.PlatformFaulted, bridge.RevokeChildVirtualIo(io).Error);
+        Assert.Equal(KernelError.PlatformFaulted, bridge.UnmapChildGuestRegion(guest).Error);
+        Assert.Equal(virtualIo ? 1 : 0, provider.VirtualIoRevokeCalls);
+        Assert.Equal(virtualIo ? 0 : 1, provider.GuestUnmapCalls);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void ClosureCallbackExceptionPinsGuestOrVirtualIoWithoutRetry(bool virtualIo)
+    {
+        var provider = new ChildProvider();
+        var bridge = new PlatformAuthorityBridge(provider);
+        PlatformDomainIdentity owner = Subject(1, 10);
+        var parent = bridge.BindDomain(owner).Value!;
+        var child = bridge.CreateChildDomain(parent, owner, Intent()).Value!;
+        var region = new PlatformRegionIdentity(new(new RegionId(5), new RegionGeneration(1)),
+            new(new DomainId(1), owner.ProcessGeneration), 4096);
+        var mapping = bridge.MapOwnedRegion(parent, owner, new CapabilityId(8), region,
+            PlatformMemoryAccess.Read | PlatformMemoryAccess.Write).Value!;
+        var guest = bridge.MapChildGuestRegion(child, mapping,
+            new(0, 4096), PlatformGuestMemoryAccess.Read).Value!;
+        var device = bridge.BindDevice(parent, owner, new CapabilityId(9),
+            new("device:test"), PlatformDeviceRights.Read).Value!;
+        var io = bridge.BindChildVirtualIo(child, device,
+            new(PlatformDeviceRights.Read, 512)).Value!;
+        if (virtualIo) provider.BeforeVirtualIoRevoke = () => throw new InvalidOperationException("after effect");
+        else provider.BeforeGuestUnmap = () => throw new InvalidOperationException("after effect");
+
+        var first = virtualIo ? bridge.RevokeChildVirtualIo(io) : bridge.UnmapChildGuestRegion(guest);
+        var retry = virtualIo ? bridge.RevokeChildVirtualIo(io) : bridge.UnmapChildGuestRegion(guest);
+
+        Assert.Equal(KernelError.PlatformFaulted, first.Error);
+        Assert.Equal(KernelError.PlatformFaulted, retry.Error);
+        Assert.Equal(virtualIo ? 1 : 0, provider.VirtualIoRevokeCalls);
+        Assert.Equal(virtualIo ? 0 : 1, provider.GuestUnmapCalls);
     }
 
     [Fact]
@@ -303,6 +410,10 @@ public sealed class PlatformAuthorityBridgeChildDomainTests
         public int CompletionCalls { get; private set; }
         public int RevokeDomainCalls { get; private set; }
         public int EventCalls { get; private set; }
+        public int VirtualIoRevokeCalls { get; private set; }
+        public Action? BeforeVirtualIoRevoke { get; set; }
+        public Action? BeforeGuestUnmap { get; set; }
+        public Action? BeforeChildClose { get; set; }
         public List<string> CallLog { get; } = [];
         public PlatformProviderChildDomainLease LastChildLease { get; private set; }
         public PlatformProviderDescriptor Descriptor { get; } = new(new("test.child"), 2,
@@ -363,6 +474,7 @@ public sealed class PlatformAuthorityBridgeChildDomainTests
         {
             CloseCalls++;
             CallLog.Add("child-close");
+            BeforeChildClose?.Invoke();
             return PlatformAuthorityResult<PlatformChildDomainClosureReceipt>.Ok(new(lease.LeaseId,
                 MalformedClose ? new(lease.Generation.Value + 1) : lease.Generation,
                 lease.ParentDomainLease.LeaseId, lease.ParentDomainLease.Generation,
@@ -375,6 +487,7 @@ public sealed class PlatformAuthorityBridgeChildDomainTests
         {
             GuestUnmapCalls++;
             CallLog.Add("guest-unmap");
+            BeforeGuestUnmap?.Invoke();
             return PlatformAuthorityResult<PlatformGuestRegionMappingClosureReceipt>.Ok(new(lease.LeaseId, lease.Generation,
                 lease.ChildLease.LeaseId, lease.ChildLease.Generation, lease.ChildLease.ParentDomainLease.LeaseId,
                 lease.ChildLease.ParentDomainLease.Generation, true));
@@ -392,10 +505,14 @@ public sealed class PlatformAuthorityBridgeChildDomainTests
         public PlatformAuthorityResult<PlatformProviderVirtualIoLease> BindVirtualIo(PlatformVirtualIoRequest request) =>
             PlatformAuthorityResult<PlatformProviderVirtualIoLease>.Ok(new(new(next++), new(41), request.ChildLease,
                 request.ParentDeviceLease, request.Profile));
-        public PlatformAuthorityResult<PlatformVirtualIoClosureReceipt> RevokeVirtualIo(PlatformProviderVirtualIoLease lease) =>
-            PlatformAuthorityResult<PlatformVirtualIoClosureReceipt>.Ok(new(lease.LeaseId, lease.Generation,
+        public PlatformAuthorityResult<PlatformVirtualIoClosureReceipt> RevokeVirtualIo(PlatformProviderVirtualIoLease lease)
+        {
+            VirtualIoRevokeCalls++;
+            BeforeVirtualIoRevoke?.Invoke();
+            return PlatformAuthorityResult<PlatformVirtualIoClosureReceipt>.Ok(new(lease.LeaseId, lease.Generation,
                 lease.ChildLease.LeaseId, lease.ChildLease.Generation, lease.ChildLease.ParentDomainLease.LeaseId,
                 lease.ChildLease.ParentDomainLease.Generation, true));
+        }
         public PlatformAuthorityResult<PlatformProviderDeviceLease> BindDevice(PlatformProviderDomainLease domainLease,
             PlatformDeviceIdentity device, PlatformDeviceRights rights) =>
             PlatformAuthorityResult<PlatformProviderDeviceLease>.Ok(new(new(next++), new(37), domainLease, device, rights));

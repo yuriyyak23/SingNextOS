@@ -61,7 +61,7 @@ try {
     $passed = [int]$match.Groups[2].Value + [int]$adapterMatch.Groups[2].Value
     $skipped = [int]$match.Groups[3].Value + [int]$adapterMatch.Groups[3].Value
     $total = [int]$match.Groups[4].Value + [int]$adapterMatch.Groups[4].Value
-    if ($failed -ne 0 -or $passed -ne 60 -or $skipped -ne 0 -or $total -ne 60) {
+    if ($failed -ne 0 -or $passed -ne 64 -or $skipped -ne 0 -or $total -ne 64) {
         throw "Unexpected P01 runtime test counts: failed=$failed passed=$passed skipped=$skipped total=$total"
     }
 
@@ -135,6 +135,9 @@ try {
             'MemorySemanticsV1Tests.PartialOrderIsReflexiveAntisymmetricForDistinctComparableValuesAndTransitive',
             'V6MemoryRuntimeEnforcementTests.ProjectionRejectsDiscontinuousOwnerStatesAndContradictorySnapshotState',
             'ExternalOperationLifecycleTests.MultiRegionReleaseFailureLeavesEveryUsePinned',
+            'ExternalOperationLifecycleTests.ProviderLossInvalidatesWritableUseAtTerminalMutationEpochWithoutReclaim',
+            'ExternalOperationLifecycleTests.ProviderLossWithBrokenRegionUseBindingReportsFailureAndRetainsOwnerPin',
+            'ExternalOperationLifecycleTests.LateCancellationCannotEraseProviderLossConsequence',
             'ExternalOperationLifecycleTests.FailedAdmissionCleanupRetainsAcquiredUseUnderOperationOwner',
             'ExternalOperationLifecycleTests.FailedAdmissionWithSuccessfulCleanupLeavesNoRegionUse')
         coverage = [ordered]@{

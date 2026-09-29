@@ -49,6 +49,12 @@ internal sealed class V6ManagedDurableOutputModel
     private bool _publishing;
     private (string Correlation, ulong Generation)? _publishingKey;
     private ulong _recoveryEpoch;
+    private ulong _lastRuntimeAdmissionGeneration;
+    private ulong _lastProcessAdmissionGeneration;
+    private ulong _lastProviderAdmissionGeneration;
+    private ulong _recoveryRuntimeFloor;
+    private ulong _recoveryProcessFloor;
+    private ulong _recoveryProviderFloor;
 
     internal V6ManagedDurableOutputModel(PersistenceSemanticsV1 semantics)
     {
@@ -104,6 +110,12 @@ internal sealed class V6ManagedDurableOutputModel
                      priorProviderAdmissionGeneration <= existing.ProviderAdmissionGeneration))
                     return KernelResult<ProviderPersistEvidenceV1>.Fail(KernelError.StaleGeneration,
                         "Crash recovery requires fresh runtime, process, and provider admission generations.");
+                if (!HasFreshRecoveryAdmission(priorRuntimeGeneration,
+                    priorProcessGeneration, priorProviderAdmissionGeneration))
+                    return KernelResult<ProviderPersistEvidenceV1>.Fail(KernelError.StaleGeneration,
+                        "Recovery requires fresh runtime, process, and provider admission generations.");
+                RememberAdmission(priorRuntimeGeneration, priorProcessGeneration,
+                    priorProviderAdmissionGeneration);
                 var current = ValidateCurrentPersistence(currentProviderGeneration,
                     currentMediaGeneration, currentDomain);
                 if (!current.IsSuccess)
@@ -118,6 +130,12 @@ internal sealed class V6ManagedDurableOutputModel
             }
             else
             {
+                if (!HasFreshRecoveryAdmission(priorRuntimeGeneration,
+                    priorProcessGeneration, priorProviderAdmissionGeneration))
+                    return KernelResult<ProviderPersistEvidenceV1>.Fail(KernelError.StaleGeneration,
+                        "Recovery requires fresh runtime, process, and provider admission generations.");
+                RememberAdmission(priorRuntimeGeneration, priorProcessGeneration,
+                    priorProviderAdmissionGeneration);
                 var write = Next();
                 _hasUncommitted = true;
                 if (fault is V6DurabilityFaultPoint.CrashAfterWrite or V6DurabilityFaultPoint.TornData)
@@ -202,6 +220,9 @@ internal sealed class V6ManagedDurableOutputModel
         lock (_sync)
         {
             _recoveryEpoch++;
+            _recoveryRuntimeFloor = Math.Max(_recoveryRuntimeFloor, _lastRuntimeAdmissionGeneration);
+            _recoveryProcessFloor = Math.Max(_recoveryProcessFloor, _lastProcessAdmissionGeneration);
+            _recoveryProviderFloor = Math.Max(_recoveryProviderFloor, _lastProviderAdmissionGeneration);
             if (_publishingKey is { } key)
                 _durable[key].PublicationAmbiguous = true;
             var torn = _hasUncommitted;
@@ -261,6 +282,18 @@ internal sealed class V6ManagedDurableOutputModel
     }
 
     private ulong Next() => ++_sequence;
+
+    private bool HasFreshRecoveryAdmission(ulong runtime, ulong process, ulong provider) =>
+        _recoveryEpoch == 0 ||
+        (runtime > _recoveryRuntimeFloor && process > _recoveryProcessFloor &&
+         provider > _recoveryProviderFloor);
+
+    private void RememberAdmission(ulong runtime, ulong process, ulong provider)
+    {
+        _lastRuntimeAdmissionGeneration = Math.Max(_lastRuntimeAdmissionGeneration, runtime);
+        _lastProcessAdmissionGeneration = Math.Max(_lastProcessAdmissionGeneration, process);
+        _lastProviderAdmissionGeneration = Math.Max(_lastProviderAdmissionGeneration, provider);
+    }
 
     private KernelResult ValidateCurrentPersistence(
         Func<ulong> currentProviderGeneration,

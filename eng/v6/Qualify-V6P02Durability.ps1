@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 function Get-Sha256([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
 
-$filter = 'FullyQualifiedName~PersistenceContractsV1Tests|FullyQualifiedName~V6ManagedDurableOutputModelTests|FullyQualifiedName~StagedDurableOutputFormalModelTests|FullyQualifiedName~Phase08OrdinaryCheckpointTests|FullyQualifiedName~ExternalOperationLifecycleTests|FullyQualifiedName~EffectPublicationSemanticsV1Tests|FullyQualifiedName=SingPlus.Tests.Runtime.CxlType2AcceleratorServiceTests.PublicationExceptionClosesProviderButQuarantinesPossiblePublicationAndRegionUses|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.PublicationFailureAfterSettlementDoesNotUndoChargeOrReleaseRegion|FullyQualifiedName=SingPlus.Tests.Architecture.V6ArchitectureGuardTests.V6GateRegistryIsClosedCompleteAndDefaultOff'
+$filter = 'FullyQualifiedName~PersistenceContractsV1Tests|FullyQualifiedName~V6ManagedDurableOutputModelTests|FullyQualifiedName~StagedDurableOutputFormalModelTests|FullyQualifiedName~Phase08OrdinaryCheckpointTests|FullyQualifiedName~ExternalOperationLifecycleTests|FullyQualifiedName~EffectPublicationSemanticsV1Tests|FullyQualifiedName~VNextPhase16DurableResourceAdmissionTests|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase16ResourceBudgetRecoveryJournalTests.CompleteFrameThenAppendErrorAdvancesNextSequenceFromVerifiedReplay|FullyQualifiedName~VNextPhase16ResourceBudgetRecoveryJournalTests.LiveReplayRejectsRegressedTailAndChangedEpoch|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase16ResourceBudgetRecoveryJournalTests.FileStoreRoundTripsFsyncedFramesAndRejectsTornTail|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.PriorDifferentBudgetTerminalChargeCannotCompleteExactReceipt|FullyQualifiedName=SingPlus.Tests.Runtime.CxlType2AcceleratorServiceTests.PublicationExceptionClosesProviderButQuarantinesPossiblePublicationAndRegionUses|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.PublicationFailureAfterSettlementDoesNotUndoChargeOrReleaseRegion|FullyQualifiedName=SingPlus.Tests.Architecture.V6ArchitectureGuardTests.V6GateRegistryIsClosedCompleteAndDefaultOff'
 $evidenceInputs = @(
     'contracts/SingPlus.Contracts/PersistenceContracts.cs',
     'contracts/SingPlus.Contracts/ExternalOperations.cs',
@@ -20,6 +20,10 @@ $evidenceInputs = @(
     'src/Runtime/SingPlus.Runtime/ExternalOperations/RuntimeKernel.ExternalOperations.cs',
     'src/Runtime/SingPlus.Runtime/Cxl/CxlType2AcceleratorService.cs',
     'src/Runtime/SingPlus.Runtime/VNext/ExternalOperationResourceBinding.cs',
+    'src/Runtime/SingPlus.Runtime/VNext/ResourceAdmissionProtocol.cs',
+    'src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetAuthority.cs',
+    'src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetRecoveryJournal.cs',
+    'src/Runtime/SingPlus.Runtime/RuntimeKernel.cs',
     'formal/v6/StagedDurableOutput.tla',
     'formal/v6/StagedDurableOutput.cfg',
     'tests/SingPlus.Tests/Contracts/PersistenceContractsV1Tests.cs',
@@ -30,6 +34,8 @@ $evidenceInputs = @(
     'tests/SingPlus.Tests/Runtime/EffectPublicationSemanticsV1Tests.cs',
     'tests/SingPlus.Tests/Runtime/CxlType2AcceleratorServiceTests.cs',
     'tests/SingPlus.Tests/Runtime/VNextPhase07ExternalOperationResourceBindingTests.cs',
+    'tests/SingPlus.Tests/Runtime/VNextPhase16DurableResourceAdmissionTests.cs',
+    'tests/SingPlus.Tests/Runtime/VNextPhase16ResourceBudgetRecoveryJournalTests.cs',
     'tests/SingPlus.Tests/Architecture/V6ArchitectureGuardTests.cs',
     'tools/SingPlus.SingCapQualification/SingPlus.SingCapQualification.csproj',
     'tools/SingPlus.SingCapQualification/Program.cs',
@@ -45,7 +51,7 @@ try {
     if (-not $match.Success) { throw 'The P02 test runner summary could not be parsed.' }
     $failed = [int]$match.Groups[1].Value; $passed = [int]$match.Groups[2].Value
     $skipped = [int]$match.Groups[3].Value; $total = [int]$match.Groups[4].Value
-    if ($failed -ne 0 -or $passed -ne 66 -or $skipped -ne 0 -or $total -ne 66) {
+    if ($failed -ne 0 -or $passed -ne 90 -or $skipped -ne 0 -or $total -ne 90) {
         throw "Unexpected P02 counts: failed=$failed passed=$passed skipped=$skipped total=$total"
     }
     New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
@@ -98,7 +104,14 @@ try {
             'P02-PUBLICATION-AMBIGUITY-01', 'P02-PUBLICATION-OWNER-01', 'P02-EXACT-REPLAY-01',
             'P02-CLOSURE-PROVIDER-LOSS-RACE-01',
             'P02-POST-PUBLICATION-TUPLE-REVALIDATION-01')
-        testIds = @('V6ManagedDurableOutputModelTests.RecoveryDuringPublicationQuarantinesPossibleEffectUntilExplicitClosure',
+        testIds = @('V6ManagedDurableOutputModelTests.PrecommitCrashRequiresFreshAdmissionForNewOperationCorrelation',
+            'V6ManagedDurableOutputModelTests.PublishedReplayIsHistoricalButNewOperationNeedsFreshAdmissionAfterRecovery',
+            'V6ManagedDurableOutputModelTests.EveryRecoveryAdmissionDimensionMustAdvanceForNewOperation',
+            'V6ManagedDurableOutputModelTests.RecoveryDuringPublicationQuarantinesPossibleEffectUntilExplicitClosure',
+            'EffectPublicationSemanticsV1Tests.RegionDamageDuringPublicationCannotBecomePublishedEvidence',
+            'ExternalOperationLifecycleTests.ProviderLossInvalidatesWritableUseAtTerminalMutationEpochWithoutReclaim',
+            'ExternalOperationLifecycleTests.ProviderLossWithBrokenRegionUseBindingReportsFailureAndRetainsOwnerPin',
+            'ExternalOperationLifecycleTests.LateCancellationCannotEraseProviderLossConsequence',
             'V6ManagedDurableOutputModelTests.PublicationFailureRequiresClosureBeforeFreshRetryWithoutRestaging',
             'V6ManagedDurableOutputModelTests.PublicationCallbackDriftRetainsPossibleEffectWithoutPublishedEvidence',
             'EffectPublicationSemanticsV1Tests.StagedProviderActionFailureRetainsPossibleEffectUntilExactClosure',
@@ -106,7 +119,16 @@ try {
             'EffectPublicationSemanticsV1Tests.AmbiguousPublicationClosureRunsOutsideOwnerLockAndHasOneWinner',
             'EffectPublicationSemanticsV1Tests.ProviderLossDuringAmbiguousPublicationClosureCannotClearPossibleEffect',
             'CxlType2AcceleratorServiceTests.PublicationExceptionClosesProviderButQuarantinesPossiblePublicationAndRegionUses',
-            'VNextPhase07ExternalOperationResourceBindingTests.PublicationFailureAfterSettlementDoesNotUndoChargeOrReleaseRegion')
+            'VNextPhase07ExternalOperationResourceBindingTests.PublicationFailureAfterSettlementDoesNotUndoChargeOrReleaseRegion',
+            'VNextPhase07ExternalOperationResourceBindingTests.PriorDifferentBudgetTerminalChargeCannotCompleteExactReceipt',
+            'VNextPhase16DurableResourceAdmissionTests.ExactRecoveryRecordFollowsBudgetOwnerCommit',
+            'VNextPhase16DurableResourceAdmissionTests.JournalFailureAfterBudgetSettlementAndProviderLossKeepsColdChargeConservative',
+            'VNextPhase16DurableResourceAdmissionTests.RetryAfterDurableTerminalRecordDoesNotAppendSecondReceipt',
+            'VNextPhase16DurableResourceAdmissionTests.CompleteFileFrameWithLostAppendAcknowledgementRetriesExactReceipt',
+            'VNextPhase16ResourceBudgetRecoveryJournalTests.CompleteFrameThenAppendErrorAdvancesNextSequenceFromVerifiedReplay',
+            'VNextPhase16ResourceBudgetRecoveryJournalTests.FileStoreRoundTripsFsyncedFramesAndRejectsTornTail',
+            'VNextPhase16ResourceBudgetRecoveryJournalTests.LiveReplayRejectsRegressedTailAndChangedEpoch',
+            'VNextPhase16DurableResourceAdmissionTests.LiveJournalRollbackCannotLowerObservedRecoveryCharge')
         commandsActuallyRun = @(
             "dotnet test tests\SingPlus.Tests\SingPlus.Tests.csproj --no-restore --filter $filter",
             "dotnet run --project tools\SingPlus.SingCapQualification\SingPlus.SingCapQualification.csproj -c Release --no-restore -- --v6-p02-durability-performance --output $performancePath"
@@ -144,6 +166,7 @@ try {
                 'after metadata persist', 'provider loss before durable', 'after durable before publication')
             freshness = @('provider generation', 'media generation', 'operation generation',
                 'recovery generation', 'fresh runtime/process/provider admission after each crash',
+                'new operation correlation after recovery must exceed the last attempted admission tuple, including precommit failure',
                 'unpublished retry revalidates provider/media/domain before publication')
             replay = @('same tuple idempotent', 'changed content or recovery generation rejected',
                 'last committed value survives torn successor and older publication')

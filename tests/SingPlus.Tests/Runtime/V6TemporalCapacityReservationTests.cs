@@ -6,6 +6,51 @@ namespace SingPlus.Tests.Runtime;
 public sealed class V6TemporalCapacityReservationTests
 {
     [Fact]
+    public void StaleReleaseCannotTriggerInjectedResetOfLiveReservation()
+    {
+        var provider = new V6ManagedTemporalCapacityProvider(50);
+        var reserved = provider.Reserve("operation:capacity:exact-release", Temporal(40).ComputeEnvelope).Value!;
+        Assert.True(provider.BeginUse(reserved.Handle).IsSuccess);
+        provider.InjectResetBeforeNextRelease();
+
+        Assert.Equal(KernelError.StaleGeneration,
+            provider.Release(reserved.Handle with { Generation = reserved.Handle.Generation + 1 }).Error);
+        Assert.Equal(1UL, provider.ProviderGeneration);
+        Assert.Equal(V6TemporalProviderReservationState.InUse,
+            provider.Query(reserved.Handle).Value!.State);
+        Assert.Equal(40UL, provider.ReservedNanoseconds);
+
+        Assert.Equal(KernelError.InvalidTransition, provider.Release(reserved.Handle).Error);
+        Assert.Equal(2UL, provider.ProviderGeneration);
+        Assert.Equal(V6TemporalProviderReservationState.Quarantined,
+            provider.Query(reserved.Handle).Value!.State);
+        Assert.Equal(40UL, provider.ReservedNanoseconds);
+    }
+
+    [Fact]
+    public void RepeatedOrQuarantinedReleaseCannotTriggerInjectedReset()
+    {
+        var provider = new V6ManagedTemporalCapacityProvider(50);
+        var released = provider.Reserve("operation:capacity:released", Temporal(10).ComputeEnvelope).Value!;
+        Assert.True(provider.Release(released.Handle).IsSuccess);
+        var live = provider.Reserve("operation:capacity:live", Temporal(40).ComputeEnvelope).Value!;
+        Assert.True(provider.BeginUse(live.Handle).IsSuccess);
+        provider.InjectResetBeforeNextRelease();
+
+        Assert.True(provider.Release(released.Handle).IsSuccess);
+        Assert.Equal(1UL, provider.ProviderGeneration);
+        Assert.Equal(V6TemporalProviderReservationState.InUse, provider.Query(live.Handle).Value!.State);
+        Assert.Equal(40UL, provider.ReservedNanoseconds);
+
+        Assert.Equal(KernelError.InvalidTransition, provider.Release(live.Handle).Error);
+        Assert.Equal(2UL, provider.ProviderGeneration);
+        Assert.Equal(V6TemporalProviderReservationState.Quarantined, provider.Query(live.Handle).Value!.State);
+        provider.InjectResetBeforeNextRelease();
+        Assert.Equal(KernelError.InvalidTransition, provider.Release(live.Handle).Error);
+        Assert.Equal(2UL, provider.ProviderGeneration);
+    }
+
+    [Fact]
     public void AdmissionBindsExistingBudgetAndNamedProviderWithoutDeadlinePromotion()
     {
         var context = Create(100, 100, 60);

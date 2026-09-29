@@ -334,6 +334,22 @@ public sealed class ResourceBudgetAuthority
         }
     }
 
+    internal bool IsExactSettledExternalLease(
+        ProcessHandle owner, BudgetReservationHandle reservation, ulong chargedAmount)
+    {
+        lock (_gate)
+        {
+            var resolved = ResolveReservation(owner, reservation);
+            if (!resolved.IsSuccess) return false;
+            var record = resolved.Value!;
+            return record.Lifetime == BudgetReservationLifetime.ExternalEffect &&
+                   record.State == BudgetReservationState.Released && record.SettlementTerminal &&
+                   record.ChargedAmounts.Length == 1 &&
+                   record.ChargedAmounts[0] == new BudgetAmount(
+                       ServiceBudgetDimension.ComputeTimeNanoseconds, chargedAmount);
+        }
+    }
+
     // Corrective accounting for a reported ComputeTime overrun. The budget owner alone
     // decides whether every ancestor can retain the extra charge; this is not a
     // reservation or evidence that the provider enforced an upper bound.

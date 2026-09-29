@@ -347,6 +347,121 @@ public sealed class ExternalOperationLifecycleTests
         Assert.True(scenario.Kernel.Regions.Validate(scenario.Output.Handle, new(new DomainId(10), scenario.Owner.Generation)).IsSuccess);
     }
 
+    [Theory]
+    [InlineData(ExternalPublicationPolicy.Staged, ExternalOperationDisposition.ProviderLost)]
+    [InlineData(ExternalPublicationPolicy.DirectCoherent, ExternalOperationDisposition.Faulted)]
+    public void LateCancellationCannotEraseProviderLossConsequence(
+        ExternalPublicationPolicy policy, ExternalOperationDisposition consequence)
+    {
+        var scenario = CreateScenario();
+        var preparation = Prepare(scenario, policy);
+        Assert.True(scenario.Kernel.AdmitExternalOperation(scenario.Owner,
+            preparation.Operation, Dependencies).IsSuccess);
+        _ = scenario.Kernel.RecordExternalOperationSubmission(scenario.Owner,
+            preparation.Operation, Dependencies).Value!;
+        Assert.True(scenario.Kernel.RecordExternalOperationProviderLoss(scenario.Owner,
+            preparation.Operation).IsSuccess);
+
+        var cancelled = scenario.Kernel.CancelExternalOperation(scenario.Owner,
+            preparation.Operation, providerCancellationSupported: true);
+
+        Assert.True(cancelled.IsSuccess, cancelled.Message);
+        Assert.Equal(consequence, cancelled.Value!.Disposition);
+        Assert.Equal(consequence,
+            scenario.Kernel.QueryExternalOperation(scenario.Owner,
+                preparation.Operation).Value!.Disposition);
+        Assert.Equal(KernelError.InvalidTransition,
+            scenario.Kernel.ReleaseExternalOperation(scenario.Owner,
+                preparation.Operation, new(false, true)).Error);
+    }
+
+    [Fact]
+    public void ProviderLossInvalidatesWritableUseAtTerminalMutationEpochWithoutReclaim()
+    {
+        var scenario = CreateScenario();
+        var preparation = Prepare(scenario, ExternalPublicationPolicy.Staged);
+        Assert.True(scenario.Kernel.AdmitExternalOperation(scenario.Owner,
+            preparation.Operation, Dependencies).IsSuccess);
+        _ = scenario.Kernel.RecordExternalOperationSubmission(scenario.Owner,
+            preparation.Operation, Dependencies).Value!;
+        var use = scenario.Kernel.QueryExternalOperation(scenario.Owner,
+            preparation.Operation).Value!.Admission!.RegionUses.Single(candidate =>
+            candidate.Region == scenario.Output.Handle);
+        var regions = typeof(RegionAuthority).GetField("_regions",
+            BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(scenario.Kernel.Regions)!;
+        var records = (global::System.Collections.IEnumerable)regions.GetType()
+            .GetProperty("Values")!.GetValue(regions)!;
+        var record = records.Cast<object>().Single(candidate =>
+            Equals(candidate.GetType().GetProperty("Id")!.GetValue(candidate),
+                scenario.Output.Handle.RegionId));
+        record.GetType().GetProperty("MutationEpoch")!.SetValue(record,
+            new MutationEpoch(ulong.MaxValue));
+        var principal = scenario.Kernel.QueryExternalOperation(scenario.Owner,
+            preparation.Operation).Value!.Admission!.Principal;
+        Assert.Equal(KernelError.CapacityExhausted,
+            scenario.Kernel.Regions.InvalidateUse(use.Handle, principal).Error);
+
+        var lost = scenario.Kernel.RecordExternalOperationProviderLoss(scenario.Owner,
+            preparation.Operation);
+
+        Assert.True(lost.IsSuccess, lost.Message);
+        Assert.Equal(ExternalOperationDisposition.ProviderLost, lost.Value!.Disposition);
+        Assert.Equal(RegionUseState.Invalidated,
+            scenario.Kernel.Regions.SnapshotUses().Single(candidate =>
+                candidate.Handle == use.Handle).State);
+        Assert.Equal(KernelError.StaleGeneration,
+            scenario.Kernel.ValidateRegionUse(scenario.Owner, use.Handle).Error);
+        Assert.Equal(ulong.MaxValue,
+            scenario.Kernel.Regions.Snapshot().Single(candidate =>
+                candidate.Handle == scenario.Output.Handle).MutationEpoch.Value);
+        Assert.Equal(KernelError.RegionUseConflict,
+            scenario.Kernel.AcquireRegionUse(scenario.Owner, scenario.Output.Handle,
+                RegionUseMode.ReadOnly, use.Range).Error);
+        Assert.Equal(KernelError.CapacityExhausted,
+            scenario.Kernel.ReleaseExternalOperation(scenario.Owner, preparation.Operation,
+                new(ProviderResourcesClosed: true, ProviderUnavailable: true)).Error);
+    }
+
+    [Fact]
+    public void ProviderLossWithBrokenRegionUseBindingReportsFailureAndRetainsOwnerPin()
+    {
+        var scenario = CreateScenario();
+        var preparation = Prepare(scenario, ExternalPublicationPolicy.Staged);
+        Assert.True(scenario.Kernel.AdmitExternalOperation(scenario.Owner,
+            preparation.Operation, Dependencies).IsSuccess);
+        _ = scenario.Kernel.RecordExternalOperationSubmission(scenario.Owner,
+            preparation.Operation, Dependencies).Value!;
+        var outputUse = scenario.Kernel.QueryExternalOperation(scenario.Owner,
+            preparation.Operation).Value!.Admission!.RegionUses.Single(candidate =>
+            candidate.Region == scenario.Output.Handle);
+        var regions = typeof(RegionAuthority).GetField("_regions",
+            BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(scenario.Kernel.Regions)!;
+        var records = (global::System.Collections.IEnumerable)regions.GetType()
+            .GetProperty("Values")!.GetValue(regions)!;
+        var record = records.Cast<object>().Single(candidate =>
+            Equals(candidate.GetType().GetProperty("Id")!.GetValue(candidate),
+                scenario.Output.Handle.RegionId));
+        var uses = record.GetType().GetProperty("Uses")!.GetValue(record)!;
+        var useRecords = (global::System.Collections.IEnumerable)uses.GetType()
+            .GetProperty("Values")!.GetValue(uses)!;
+        var storedUse = useRecords.Cast<object>().Single(candidate =>
+            Equals(candidate.GetType().GetProperty("Handle")!.GetValue(candidate),
+                outputUse.Handle));
+        storedUse.GetType().GetProperty("ReleaseOwnerOperation")!.SetValue(storedUse,
+            new ExternalOperationHandle(new ExternalOperationId(999), new OperationGeneration(1)));
+
+        var lost = scenario.Kernel.RecordExternalOperationProviderLoss(scenario.Owner,
+            preparation.Operation);
+
+        Assert.Equal(KernelError.ExternalEffectUncontained, lost.Error);
+        Assert.Equal(ExternalOperationDisposition.ProviderLost,
+            scenario.Kernel.QueryExternalOperation(scenario.Owner,
+                preparation.Operation).Value!.Disposition);
+        Assert.Equal(KernelError.InvalidTransition,
+            scenario.Kernel.ReleaseExternalOperation(scenario.Owner, preparation.Operation,
+                new(ProviderResourcesClosed: true, ProviderUnavailable: true)).Error);
+    }
+
     [Fact]
     public void CallerCancellationFlagCannotUpgradeStoredAdmissionSupport()
     {

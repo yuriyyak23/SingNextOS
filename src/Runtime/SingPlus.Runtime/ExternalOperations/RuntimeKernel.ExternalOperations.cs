@@ -248,6 +248,8 @@ public sealed partial class RuntimeKernel
         return CancellationScopes.RecordDisposition(principal, scope, disposition);
     }
 
+    internal Action? ResourceProviderLossAfterBindingReadQualificationHook { private get; set; }
+
     public KernelResult<ExternalOperationSnapshot> RecordExternalOperationProviderLoss(
         ProcessHandle principal,
         ExternalOperationHandle operation)
@@ -255,17 +257,44 @@ public sealed partial class RuntimeKernel
         var validation = ValidateExternalOperationPrincipal(principal, operation, requireNewEffect: false);
         if (!validation.IsSuccess) return KernelResult<ExternalOperationSnapshot>.Fail(validation.Error, validation.Message!);
         var lost = ExternalOperations.RecordProviderLoss(operation);
-        if (lost.IsSuccess && ExternalOperations.QueryResourceBinding(operation) is { IsSuccess: true, Value: { } resource })
+        var observed = lost.IsSuccess ? lost : ExternalOperations.Query(operation);
+        var lossRecorded = observed.IsSuccess &&
+            observed.Value!.Transitions.Count != 0 &&
+            observed.Value.Transitions[^1].Event == "ProviderLost";
+        KernelResult? resourceQuarantineFailure = null;
+        if (lossRecorded && ExternalOperations.QueryResourceBinding(operation) is { IsSuccess: true, Value: { } resource })
         {
-            _ = Budgets.QuarantineLease(resource.BudgetOwner, resource.Lease);
-            _ = ExternalOperations.MarkResourceQuarantined(operation);
+            if (resource.State != ExternalResourceBindingState.Settled)
+            {
+                ResourceProviderLossAfterBindingReadQualificationHook?.Invoke();
+                var budgetQuarantine = Budgets.QuarantineLease(resource.BudgetOwner, resource.Lease);
+                var bindingQuarantine = ExternalOperations.MarkResourceQuarantined(operation);
+                var current = ExternalOperations.QueryResourceBinding(operation);
+                var exactSettlementAlreadyCommitted = current.IsSuccess &&
+                    current.Value!.Operation == operation &&
+                    current.Value.TerminalReceiptSequence is not null &&
+                    current.Value.TerminalEvidenceId is not null &&
+                    current.Value.SettledAmount is { } amount &&
+                    (current.Value.State is ExternalResourceBindingState.Quarantined or
+                        ExternalResourceBindingState.Settled) &&
+                    Budgets.IsExactSettledExternalLease(current.Value.BudgetOwner, current.Value.Lease, amount) &&
+                    current.Value.BudgetOwner == resource.BudgetOwner &&
+                    current.Value.Lease == resource.Lease;
+                if (!budgetQuarantine.IsSuccess && !exactSettlementAlreadyCommitted)
+                    resourceQuarantineFailure = KernelResult.Fail(budgetQuarantine.Error, budgetQuarantine.Message!);
+                if (!bindingQuarantine.IsSuccess && !exactSettlementAlreadyCommitted)
+                    resourceQuarantineFailure ??= KernelResult.Fail(bindingQuarantine.Error, bindingQuarantine.Message!);
+            }
         }
-        if (lost.IsSuccess)
+        if (lossRecorded)
         {
             RecordTrace(principal, TraceEventKind.ExternalOperationFaulted, null, "external-operation",
                 operation.OperationId.Value.ToString(), "provider-lost", "effect-closure-ambiguous");
             EmitExternalOperationTrace(operation);
         }
+        if (resourceQuarantineFailure is { } failure && lost.IsSuccess)
+            return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.ExternalEffectUncontained,
+                $"Provider loss is recorded, but exact resource quarantine failed: {failure.Message}");
         return lost;
     }
 

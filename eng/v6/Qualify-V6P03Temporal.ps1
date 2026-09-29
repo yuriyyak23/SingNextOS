@@ -55,7 +55,7 @@ try {
     $passed = [int]$match.Groups[2].Value
     $skipped = [int]$match.Groups[3].Value
     $total = [int]$match.Groups[4].Value
-    if ($failed -ne 0 -or $passed -ne 81 -or $skipped -ne 0 -or $total -ne 81) {
+    if ($failed -ne 0 -or $passed -ne 83 -or $skipped -ne 0 -or $total -ne 83) {
         throw "Unexpected P03 counts: failed=$failed passed=$passed skipped=$skipped total=$total"
     }
     $boundRaceFilter = 'FullyQualifiedName~V6TemporalCapacityReservationTests.ConcurrentBoundSubmitHasOneOwnerTransitionAndOneProviderCallback'
@@ -129,7 +129,9 @@ try {
             'P03-OWNER-CORRECTIVE-CHARGE-01',
             'P03-DONATION-POSSIBLE-SUBMIT-NO-REFUND-01',
             'P03-GENERATED-DONATION-CLOSE-BEFORE-SUBMIT-01')
-        testIds = @('V6TemporalCapacityReservationTests.BudgetCancelledAfterAdmissionClosesUnusedProviderCapacityBeforeSubmit',
+        testIds = @('V6TemporalCapacityReservationTests.StaleReleaseCannotTriggerInjectedResetOfLiveReservation',
+            'V6TemporalCapacityReservationTests.RepeatedOrQuarantinedReleaseCannotTriggerInjectedReset',
+            'V6TemporalCapacityReservationTests.BudgetCancelledAfterAdmissionClosesUnusedProviderCapacityBeforeSubmit',
             'V6TemporalCapacityReservationTests.ResetRetainsAmbiguousCapacityAndCorrelationUntilReconciliation',
             'V6TemporalCapacityReservationTests.ResetBeforeSubmitAllowsExactCancellationOfStaleReservation',
             'V6TemporalCapacityReservationTests.ResetAfterSubmitQuarantinesBudgetBeforeSettlement',

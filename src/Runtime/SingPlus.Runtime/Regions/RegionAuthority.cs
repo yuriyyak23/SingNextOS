@@ -1023,6 +1023,30 @@ public sealed class RegionAuthority
         }
     }
 
+    internal KernelResult InvalidateUseAfterProviderLoss(
+        RegionUseHandle handle, RegionOwner principal, ExternalOperationHandle operation)
+    {
+        var lookup = FindUse(handle);
+        if (!lookup.IsSuccess) return KernelResult.Fail(lookup.Error, lookup.Message!);
+        var (region, use) = lookup.Value!;
+        lock (region.Gate)
+        {
+            if (use.Principal != principal || use.ReleaseOwnerOperation != operation)
+                return KernelResult.Fail(KernelError.StaleGeneration,
+                    "Provider-loss invalidation requires the exact operation-owned Region use.");
+            if (use.State != RegionUseState.Active) return KernelResult.Ok();
+            if (IsWriteMode(use.Mode) && region.MutationEpoch.Value != ulong.MaxValue)
+            {
+                var mutation = AdvanceMutation(region, invalidateActiveUses: false);
+                if (!mutation.IsSuccess) return mutation;
+            }
+            // At the terminal epoch no successor can be minted. Invalidate the
+            // local use without wrapping its generation; release remains pinned.
+            use.State = RegionUseState.Invalidated;
+            return KernelResult.Ok();
+        }
+    }
+
     public IReadOnlyList<RegionUseDescriptor> SnapshotUses() =>
         OrderedRecords().SelectMany(SnapshotUses).OrderBy(static use => use.Handle.UseId.Value).ToArray();
 

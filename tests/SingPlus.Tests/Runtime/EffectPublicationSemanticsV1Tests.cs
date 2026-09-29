@@ -79,6 +79,41 @@ public sealed class EffectPublicationSemanticsV1Tests
     }
 
     [Fact]
+    public void RegionDamageDuringPublicationCannotBecomePublishedEvidence()
+    {
+        var context = Ready(ExternalPublicationPolicy.Staged);
+        var admission = context.Kernel.QueryExternalOperation(context.Owner,
+            context.Operation).Value!.Admission!;
+        var output = admission.RegionUses.Last();
+        var calls = 0;
+
+        var published = context.Kernel.PublishExternalOperation(context.Owner,
+            context.Operation, Dependencies, new(ExternalPublicationPolicy.Staged), _ =>
+            {
+                calls++;
+                var damage = context.Kernel.Regions.QuarantineSubrange(output.Region,
+                    admission.Principal, new ProviderHealthEvidenceV1(1,
+                        new("test-provider", "bank-0", 1, 1), 1,
+                        ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission,
+                        output.Range));
+                Assert.True(damage.IsSuccess, damage.Message);
+            });
+
+        Assert.Equal(1, calls);
+        Assert.Equal(KernelError.ExternalEffectUncontained, published.Error);
+        var owner = context.Kernel.QueryExternalOperation(context.Owner, context.Operation).Value!;
+        Assert.Equal(ExternalOperationState.Visible, owner.State);
+        Assert.Equal(ExternalOperationDisposition.Faulted, owner.Disposition);
+        Assert.Equal(ExternalEffectBoundaryState.PossiblyExternallyVisible, owner.EffectBoundary);
+        Assert.Equal(KernelError.ExternalEffectUncontained,
+            context.Kernel.ReleaseExternalOperation(context.Owner, context.Operation,
+                new(ProviderResourcesClosed: true, ProviderUnavailable: false)).Error);
+        Assert.Equal(KernelError.InvalidTransition,
+            context.Kernel.PublishExternalOperation(context.Owner, context.Operation,
+                Dependencies, new(ExternalPublicationPolicy.Staged), _ => Assert.Fail()).Error);
+    }
+
+    [Fact]
     public void DirectCoherentContourNeverExecutesFictitiousWithheldPublicationAction()
     {
         var context = Ready(ExternalPublicationPolicy.DirectCoherent);

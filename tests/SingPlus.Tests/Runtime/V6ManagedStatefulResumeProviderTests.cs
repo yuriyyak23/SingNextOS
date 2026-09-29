@@ -119,6 +119,72 @@ public sealed class V6ManagedStatefulResumeProviderTests
         Assert.Equal(0UL, Used(budgets, account));
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void TerminalGenerationResetQuarantinesCaptureAndDeniesRestore(bool providerReset)
+    {
+        var provider = new V6ManagedStatefulResumeProvider("managed-stateful-model-v1",
+            providerReset ? ulong.MaxValue : 7,
+            providerReset ? 11 : ulong.MaxValue);
+        var capture = provider.Capture(Correlation, 3, D('b'), Payload).Value!;
+
+        if (providerReset) provider.ResetProvider();
+        else provider.ResetRuntime();
+
+        Assert.Equal(V6ManagedCapturedStateStatus.Quarantined,
+            provider.Query(capture.Handle).Value!.Status);
+        Assert.Equal(KernelError.StaleGeneration,
+            provider.AdmitRestore(capture.Handle, capture.Binding).Error);
+        Assert.Equal(KernelError.StaleGeneration,
+            provider.Restore(capture.Handle, capture.Binding).Error);
+        Assert.Equal(KernelError.StaleGeneration,
+            provider.Capture("managed-stateful:new", 4, D('c'), Payload).Error);
+        Assert.Equal((ulong)Payload.Length, provider.RetainedPayloadBytes);
+        Assert.True(provider.Discard(capture.Handle, capture.Binding).IsSuccess);
+        Assert.Equal(0UL, provider.RetainedPayloadBytes);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void TerminalResetCannotUseUnchangedGenerationToReleaseStorageEscrow(bool providerReset)
+    {
+        var (budgets, owner, account) = Budget(256);
+        var provider = new V6ManagedStatefulResumeProvider("managed-stateful-model-v1",
+            providerReset ? ulong.MaxValue : 7,
+            providerReset ? 11 : ulong.MaxValue);
+        var contour = new V6ManagedStatefulResumeContour(new(budgets), provider);
+        var suspended = contour.CaptureAndSuspend(owner, Correlation, 3, D('b'), Payload).Value!;
+
+        if (providerReset) provider.ResetProvider();
+        else provider.ResetRuntime();
+        var resumed = contour.Resume(owner, suspended.Handle, KernelResult.Ok, KernelResult.Ok);
+
+        Assert.Equal(KernelError.StaleGeneration, resumed.Error);
+        Assert.Equal(V6ManagedCapturedStateStatus.Quarantined,
+            provider.QueryByCorrelation(Correlation).Value!.Status);
+        Assert.Equal((ulong)Payload.Length, Used(budgets, account));
+        Assert.True(contour.Discard(owner, suspended.Handle).IsSuccess);
+        Assert.Equal(0UL, Used(budgets, account));
+    }
+
+    [Fact]
+    public void ExhaustedCaptureGenerationDeniesBeforeRetainingPayload()
+    {
+        var provider = Provider();
+        typeof(V6ManagedStatefulResumeProvider).GetField("_nextCaptureGeneration",
+            global::System.Reflection.BindingFlags.Instance |
+            global::System.Reflection.BindingFlags.NonPublic)!.SetValue(provider, ulong.MaxValue);
+
+        var capture = provider.Capture(Correlation, 3, D('b'), Payload);
+
+        Assert.Equal(KernelError.CapacityExhausted, capture.Error);
+        Assert.Equal(0UL, provider.RetainedPayloadBytes);
+        Assert.Equal(KernelError.StaleGeneration,
+            provider.QueryByCorrelation(Correlation).Error);
+    }
+
     [Fact]
     public void RestoreLossQuarantinesBothProviderStateAndStorageUntilReconciliation()
     {

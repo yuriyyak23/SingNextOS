@@ -19,6 +19,8 @@ $evidenceInputs = @(
     'src/Runtime/SingPlus.Runtime/Cxl/CxlSecurityAuthority.cs',
     'src/Runtime/SingPlus.Runtime/Cxl/CxlType2AcceleratorService.cs',
     'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.Device.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.SecureCompute.cs',
+    'src/Runtime/SingPlus.Runtime/SecureCompute/RuntimeKernel.SecureCompute.cs',
     'src/Runtime/SingPlus.Runtime/V6/V6FeatureGates.cs',
     'tests/SingPlus.Tests/Contracts/DeviceTrustContractsV1Tests.cs',
     'tests/SingPlus.Tests/Runtime/CxlSecurityAndMultiHostTests.cs',
@@ -41,7 +43,7 @@ try {
     if (-not $match.Success) { throw 'The P09 test runner summary could not be parsed.' }
     $failed = [int]$match.Groups[1].Value; $passed = [int]$match.Groups[2].Value
     $skipped = [int]$match.Groups[3].Value; $total = [int]$match.Groups[4].Value
-    if ($failed -ne 0 -or $passed -ne 150 -or $skipped -ne 0 -or $total -ne 150) {
+    if ($failed -ne 0 -or $passed -ne 172 -or $skipped -ne 0 -or $total -ne 172) {
         throw "Unexpected P09 counts: failed=$failed passed=$passed skipped=$skipped total=$total"
     }
     New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null

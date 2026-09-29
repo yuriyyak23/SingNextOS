@@ -11,6 +11,12 @@ function Get-Sha256([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm
 $filter = 'FullyQualifiedName~SemanticRefinementV1Tests|FullyQualifiedName~SemanticExtensionContractsV1Tests|FullyQualifiedName~MemorySemanticsV1Tests|FullyQualifiedName~TemporalSemanticsV1Tests|FullyQualifiedName~DmaExecutionBindingV1Tests|FullyQualifiedName~FailureDurabilitySemanticsV1Tests|FullyQualifiedName~SemanticTraceContractsV1Tests|FullyQualifiedName~SemanticAdmissionSentryTests|FullyQualifiedName~V6MemoryRuntimeEnforcementTests|FullyQualifiedName~Phase16SemanticTraceEquivalenceTests|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundSubmitEmitsNonAuthoritativeTraceAfterOwnerCommit|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundSubmitTraceSinkFailureCannotChangeCommittedEffect|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundDmaCompletionTrace|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundDmaResetTrace|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundDmaTraceSinkMayReenterAfterOwnerLock|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundDmaVisibilityTrace|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundDmaResetDuringAcquireTrace|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundDmaTraceRetainsOrderedEventsAcrossReentrantRemoval|FullyQualifiedName=SingPlus.Tests.Architecture.V6ArchitectureGuardTests.V6GateRegistryIsClosedCompleteAndDefaultOff|FullyQualifiedName=SingPlus.Tests.Architecture.RepositoryArchitecturePolicyTests.EveryProjectIsClassifiedAndEveryProjectReferenceIsAllowed|FullyQualifiedName=SingPlus.Tests.Architecture.RepositoryArchitecturePolicyTests.ExecutableAdapterMayConsumeOnlyExactlyPinnedExternalFacadePackages'
 $filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.PublishedOperationCannotReleaseRegionWhileResourceSettlementIsInFlight'
 $filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.ProviderLossWithQuarantinedResourceBindingCannotReleaseRegion'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.FailedRegionInvalidationStillQuarantinesResourceBoundProviderLoss'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.FailedBudgetQuarantineReportsUncontainedProviderLossAndKeepsResourcePinned'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.ProviderLossDuringExactSettlementRetainsLossAndCompletesBudgetReceipt'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.ProviderLossAfterBudgetSettlementAcceptsExactChargeBeforeBindingCompletion'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.ProviderLossBindingReadRacesExactSettlementWithoutFalseQuarantineFailure'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.PriorDifferentBudgetTerminalChargeCannotCompleteExactReceipt'
 $filter += '|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundDmaMalformedPageFaultTrace|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundDmaPageFaultResetTrace'
 $filter += '|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundDmaBackendResetTrace'
 $filter += '|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundDmaRepeatedBackendResetPreservesEveryEpochAfterQuarantine'
@@ -18,6 +24,7 @@ $filter += '|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundDmaProviderDri
 $filter += '|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundDmaBackendResetDoesNotInventUnobservedProviderGeneration'
 $filter += '|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundDmaBackendResetPreservesLastObservedProviderGeneration'
 $filter += '|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundDmaPageFaultBackendResetDoesNotObserveLaterProviderDrift'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformDmaSubmissionTests.V6BoundDmaGrantRevokeDoesNotInventTracePublicationOrRelease'
 $filter += '|FullyQualifiedName~PlatformDmaSubmissionTests.V6AmbiguousSubmitTraceRetainsPossibleEffectAndQuarantine|FullyQualifiedName~PlatformDmaSubmissionTests.V6DeniedSubmitQuarantinesPossibleEffectTrace|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundTransportUnavailableRetainsPossibleWriteAndBlocksRevoke'
 $filter += '|FullyQualifiedName~PlatformDmaSubmissionTests.V6AmbiguousSubmitTraceSinkReentersAfterOwnerLockAndCannotReleaseGrant|FullyQualifiedName~PlatformDmaSubmissionTests.V6AmbiguousSubmitTraceSinkFailureCannotReleaseGrant'
 $filter += '|FullyQualifiedName~PlatformDmaSubmissionTests.V6LostProviderIncarnationQuarantinesWithoutInventingGenerationDigest'
@@ -49,10 +56,12 @@ $evidenceInputs = @(
     'src/Runtime/SingPlus.Runtime/ExternalOperations/ExternalOperationAuthority.cs',
     'src/Runtime/SingPlus.Runtime/Regions/RegionAuthority.cs',
     'src/Runtime/SingPlus.Runtime/VNext/ExternalOperationResourceBinding.cs',
+    'src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetAuthority.cs',
     'src/Runtime/SingPlus.Runtime/V6/V6MemorySemanticBinding.cs',
     'src/Runtime/SingPlus.Runtime/V6/V6SharedOperationSessionProvider.cs',
     'src/Runtime/SingPlus.Runtime/V6/V6PlatformDmaSemanticSubmission.cs',
     'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.DmaTrace.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.Dma.cs',
     'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.DmaSubmission.cs',
     'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.DmaCompletion.cs',
     'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.DmaPostCompletion.cs',
@@ -101,7 +110,7 @@ try {
     $passed = ($matches | ForEach-Object { [int]$_.Groups[2].Value } | Measure-Object -Sum).Sum
     $skipped = ($matches | ForEach-Object { [int]$_.Groups[3].Value } | Measure-Object -Sum).Sum
     $total = ($matches | ForEach-Object { [int]$_.Groups[4].Value } | Measure-Object -Sum).Sum
-    if ($failed -ne 0 -or $passed -ne 170 -or $skipped -ne 0 -or $total -ne 170) {
+    if ($failed -ne 0 -or $passed -ne 178 -or $skipped -ne 0 -or $total -ne 178) {
         throw "Unexpected P05 counts: failed=$failed passed=$passed skipped=$skipped total=$total"
     }
     New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
@@ -296,6 +305,12 @@ try {
     $artifact.requirementIds += 'P05-PUBLISHED-SETTLEMENT-RELEASE-ORDER-01'
     $artifact.testIds += 'VNextPhase07ExternalOperationResourceBindingTests.PublishedOperationCannotReleaseRegionWhileResourceSettlementIsInFlight'
     $artifact.testIds += 'VNextPhase07ExternalOperationResourceBindingTests.ProviderLossWithQuarantinedResourceBindingCannotReleaseRegion'
+    $artifact.testIds += 'VNextPhase07ExternalOperationResourceBindingTests.FailedRegionInvalidationStillQuarantinesResourceBoundProviderLoss'
+    $artifact.testIds += 'VNextPhase07ExternalOperationResourceBindingTests.FailedBudgetQuarantineReportsUncontainedProviderLossAndKeepsResourcePinned'
+    $artifact.testIds += 'VNextPhase07ExternalOperationResourceBindingTests.ProviderLossDuringExactSettlementRetainsLossAndCompletesBudgetReceipt'
+    $artifact.testIds += 'VNextPhase07ExternalOperationResourceBindingTests.ProviderLossAfterBudgetSettlementAcceptsExactChargeBeforeBindingCompletion'
+    $artifact.testIds += 'VNextPhase07ExternalOperationResourceBindingTests.ProviderLossBindingReadRacesExactSettlementWithoutFalseQuarantineFailure'
+    $artifact.testIds += 'VNextPhase07ExternalOperationResourceBindingTests.PriorDifferentBudgetTerminalChargeCannotCompleteExactReceipt'
     $artifact.changedFiles += @('src/Runtime/SingPlus.Runtime/ExternalOperations/ExternalOperationAuthority.cs',
         'tests/SingPlus.Tests/Runtime/VNextPhase07ExternalOperationResourceBindingTests.cs')
     $artifact.coverage.trace += 'the published external-operation owner refuses Region release before exact resource settlement, during settlement, and after a failed settlement transition'
@@ -309,6 +324,7 @@ try {
     $artifact.coverage.trace += 'false or throwing direct sink delivery permanently stops that registration before a later semantic event can form an unobserved suffix; reentrant and concurrent owner release from a sink callback drain the final event without waiting on an observation lock'
     $artifact.requirementIds += 'P05-REFINEMENT-SINGLE-OWNER-SUBMIT-CALLBACK-01'
     $artifact.testIds += @('SemanticAdmissionSentryTests.BindingAwareSubmitPassesOnlyCommittedSingNextOperationToProviderCallback',
+        'SemanticAdmissionSentryTests.SharedSessionRechecksOwnerAfterBindingAttachBeforeExecution',
         'SemanticAdmissionSentryTests.BindingAwareCallbackIsNotInvokedWhenIndependentLegalityDenies',
         'SemanticAdmissionSentryTests.BindingAwareProviderFailureRetainsPossibleEffectAndBudgetQuarantine',
         'V6MemoryRuntimeEnforcementTests.StagedMemoryBindingAwareSubmitUsesOneCommittedOperation')
@@ -316,6 +332,7 @@ try {
         'src/Runtime/SingPlus.Runtime/VNext/SemanticAdmissionSentry.cs',
         'src/Runtime/SingPlus.Runtime/V6/V6MemorySemanticBinding.cs',
         'tests/SingPlus.Tests/Runtime/SemanticAdmissionSentryTests.cs')
+    $artifact.changedFiles += 'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.Dma.cs'
     $artifact.coverage.trace += 'the binding-aware internal submit callback receives the exact already-submitted SingNext operation only after independent gates and owner commit; provider failure retains possible effect and quarantine'
     $artifact.requirementIds += 'P05-RESOURCE-ASSURANCE-INCOMPARABILITY-01'
     $artifact.testIds += @('SemanticRefinementV1Tests.GuaranteedReservationDoesNotRefineEnforcedUpperBound',

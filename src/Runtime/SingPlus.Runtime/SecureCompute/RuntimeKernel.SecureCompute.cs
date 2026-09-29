@@ -18,6 +18,8 @@ public sealed partial class RuntimeKernel
     }
     private readonly Dictionary<SecureDomainId, SecureRecord> _secureDomainRecords = [];
     private ulong _nextSecureDomainId = 1;
+    // Deterministic fault-injection seam; it never supplies authority or closure evidence.
+    internal Action? BeforeSecureDomainLocalPublication { get; set; }
 
     public KernelResult<SecureDomainAuthoritySet> CreateSecureDomain(ProcessHandle owner, CapabilityId createCapability, PlatformDomainBinding parent, SecureDomainProfile profile)
     {
@@ -29,17 +31,68 @@ public sealed partial class RuntimeKernel
         if (!process.IsSuccess) return KernelResult<SecureDomainAuthoritySet>.Fail(process.Error, process.Message!);
         var created = PlatformAuthority.CreateSecureDomain(parent, PlatformIdentity(process.Value!), profile);
         if (!created.IsSuccess) return KernelResult<SecureDomainAuthoritySet>.Fail(created.Error, created.Message!);
-        var handle = new SecureDomainHandle(new(_nextSecureDomainId++), new(1));
-        var record = new SecureRecord(handle, owner, created.Value!);
-        _secureDomainRecords.Add(handle.DomainId, record);
-        var configure = MintCapability(process.Value!.DomainId, owner, ResourceKind.SecureCompute, SecureComputeResourceIds.Domain(handle.DomainId), CapabilityRights.Configure).Value!.CapabilityId;
-        var memory = MintCapability(process.Value.DomainId, owner, ResourceKind.SecureCompute, SecureComputeResourceIds.Memory(handle.DomainId), CapabilityRights.Map).Value!.CapabilityId;
-        var execute = MintCapability(process.Value.DomainId, owner, ResourceKind.SecureCompute, SecureComputeResourceIds.Domain(handle.DomainId), CapabilityRights.Execute).Value!.CapabilityId;
-        var evidence = MintCapability(process.Value.DomainId, owner, ResourceKind.Evidence, SecureComputeResourceIds.Evidence(handle.DomainId), CapabilityRights.Read).Value!.CapabilityId;
-        record.Capabilities.AddRange([configure, memory, execute, evidence]);
-        RecordTrace(owner, TraceEventKind.SecureDomainLifecycle, null, "secure-domain",
-            handle.DomainId.Value.ToString(), record.State.ToString(), "created");
-        return KernelResult<SecureDomainAuthoritySet>.Ok(new(handle, configure, memory, execute, evidence));
+        try { BeforeSecureDomainLocalPublication?.Invoke(); }
+        catch (Exception exception) when (exception is not StackOverflowException)
+        {
+            _ = PlatformAuthority.RevokeSecureDomain(created.Value!);
+            return KernelResult<SecureDomainAuthoritySet>.Fail(KernelError.PlatformFaulted,
+                $"Secure-domain local publication failed before a handle was issued: {exception.Message}");
+        }
+
+        KernelResult<SecureDomainAuthoritySet>? localFailure = null;
+        lock (_platformMemoryUseGate)
+        {
+            var current = Processes.Resolve(owner);
+            var publication = PlatformAuthority.ValidateSecureDomainPublication(created.Value!,
+                current.IsSuccess ? PlatformIdentity(current.Value!) : PlatformIdentity(process.Value!));
+            if (!publication.IsSuccess)
+                return KernelResult<SecureDomainAuthoritySet>.Fail(publication.Error, publication.Message!);
+            var effect = current.IsSuccess ? EnsureProcessAcceptsNewEffects(current.Value!) :
+                KernelResult.Fail(current.Error, current.Message!);
+            if (!effect.IsSuccess)
+                localFailure = KernelResult<SecureDomainAuthoritySet>.Fail(effect.Error, effect.Message!);
+            else
+            {
+                var handle = new SecureDomainHandle(new(_nextSecureDomainId++), new(1));
+                var mintedIds = new List<CapabilityId>(4);
+                var specifications = new (ResourceKind Kind, string Resource, CapabilityRights Rights)[]
+                {
+                    (ResourceKind.SecureCompute, SecureComputeResourceIds.Domain(handle.DomainId), CapabilityRights.Configure),
+                    (ResourceKind.SecureCompute, SecureComputeResourceIds.Memory(handle.DomainId), CapabilityRights.Map),
+                    (ResourceKind.SecureCompute, SecureComputeResourceIds.Domain(handle.DomainId), CapabilityRights.Execute),
+                    (ResourceKind.Evidence, SecureComputeResourceIds.Evidence(handle.DomainId), CapabilityRights.Read),
+                };
+                foreach (var specification in specifications)
+                {
+                    var minted = MintCapability(current.Value!.DomainId, owner, specification.Kind,
+                        specification.Resource, specification.Rights);
+                    if (!minted.IsSuccess)
+                    {
+                        localFailure = KernelResult<SecureDomainAuthoritySet>.Fail(minted.Error, minted.Message!);
+                        break;
+                    }
+                    mintedIds.Add(minted.Value!.CapabilityId);
+                }
+                if (localFailure is not null)
+                {
+                    foreach (var mintedId in mintedIds) _ = RevokeCapability(mintedId);
+                }
+                else
+                {
+                    var record = new SecureRecord(handle, owner, created.Value!);
+                    record.Capabilities.AddRange(mintedIds);
+                    _secureDomainRecords.Add(handle.DomainId, record);
+                    RecordTrace(owner, TraceEventKind.SecureDomainLifecycle, null, "secure-domain",
+                        handle.DomainId.Value.ToString(), record.State.ToString(), "created");
+                    return KernelResult<SecureDomainAuthoritySet>.Ok(new(handle,
+                        mintedIds[0], mintedIds[1], mintedIds[2], mintedIds[3]));
+                }
+            }
+        }
+
+        var cleanup = PlatformAuthority.RevokeSecureDomain(created.Value!);
+        return cleanup.IsSuccess ? localFailure!.Value : KernelResult<SecureDomainAuthoritySet>.Fail(KernelError.PlatformFaulted,
+            "Secure-domain local publication failed and exact provider closure is unavailable; parent remains pinned.");
     }
 
     public KernelResult BindSecureRegion(ProcessHandle owner, SecureDomainHandle domain, CapabilityId memoryCapability, PlatformRegionMapping mapping, PlatformSecureRegionClass regionClass)

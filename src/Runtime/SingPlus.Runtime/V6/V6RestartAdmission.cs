@@ -39,6 +39,9 @@ public sealed partial class RuntimeKernel
         if (providerGeneration == 0 || runtimeGeneration == 0)
             return KernelResult<V6RestartBindingV1>.Fail(KernelError.InvalidMessage,
                 "Restart dependency generations must be non-zero.");
+        if (providerGeneration == ulong.MaxValue || runtimeGeneration == ulong.MaxValue)
+            return KernelResult<V6RestartBindingV1>.Fail(KernelError.CapacityExhausted,
+                "Restart dependency generation is terminal.");
         var process = Processes.Resolve(principal);
         if (!process.IsSuccess) return KernelResult<V6RestartBindingV1>.Fail(process.Error, process.Message!);
         var prior = QueryExternalOperation(principal, predecessor);
@@ -83,7 +86,24 @@ public sealed partial class RuntimeKernel
         ArgumentNullException.ThrowIfNull(currentProviderGeneration);
         ArgumentNullException.ThrowIfNull(currentRuntimeGeneration);
         ArgumentNullException.ThrowIfNull(providerSubmit);
+        if (binding.ProviderGeneration == 0 || binding.RuntimeGeneration == 0)
+            return KernelResult<RestartAdmissionReceiptV1>.Fail(KernelError.InvalidMessage,
+                "Restart dependency generations must be non-zero.");
+        if (binding.ProviderGeneration == ulong.MaxValue || binding.RuntimeGeneration == ulong.MaxValue)
+            return KernelResult<RestartAdmissionReceiptV1>.Fail(KernelError.CapacityExhausted,
+                "Restart dependency generation is terminal.");
         foreach (var gate in new[] { singNextAdmission, providerAdmission, runtimeLegality })
+        {
+            KernelResult decision;
+            try { decision = gate(); }
+            catch (Exception exception) { return KernelResult<RestartAdmissionReceiptV1>.Fail(KernelError.PlatformDenied, exception.Message); }
+            if (!decision.IsSuccess)
+                return KernelResult<RestartAdmissionReceiptV1>.Fail(decision.Error, decision.Message!);
+        }
+        // Runtime legality can invalidate either earlier admission. Re-read both
+        // before the final owner and generation checks; the callbacks grant no
+        // permission on their own.
+        foreach (var gate in new[] { singNextAdmission, providerAdmission })
         {
             KernelResult decision;
             try { decision = gate(); }
@@ -138,6 +158,21 @@ public sealed partial class RuntimeKernel
         KernelResult providerResult;
         try { providerResult = providerSubmit(); }
         catch (Exception exception) { providerResult = KernelResult.Fail(KernelError.PlatformUnavailable, exception.Message); }
+        if (providerResult.IsSuccess)
+        {
+            try
+            {
+                if (currentProviderGeneration() != binding.ProviderGeneration ||
+                    currentRuntimeGeneration() != binding.RuntimeGeneration)
+                    providerResult = KernelResult.Fail(KernelError.StaleGeneration,
+                        "Provider or runtime generation changed during restart submit.");
+            }
+            catch (Exception exception)
+            {
+                providerResult = KernelResult.Fail(KernelError.PlatformUnavailable,
+                    $"Restart generation observation failed after possible effect: {exception.Message}");
+            }
+        }
         if (!providerResult.IsSuccess)
         {
             _ = RecordExternalOperationProviderLoss(principal, binding.Replacement);

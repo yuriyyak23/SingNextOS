@@ -71,6 +71,86 @@ public sealed class VNextPhase07ExternalOperationResourceBindingTests
     }
 
     [Fact]
+    public void FailedRegionInvalidationStillQuarantinesResourceBoundProviderLoss()
+    {
+        var setup = Create();
+        using var commit = Prepare(setup, setup.Operation).Value!;
+        Assert.True(setup.Kernel.SubmitResourceExternalAdmission(commit,
+            setup.Dependencies, KernelResult.Ok).IsSuccess);
+        var use = Assert.Single(setup.Kernel.QueryExternalOperation(setup.Process,
+            setup.Operation).Value!.Admission!.RegionUses);
+        var regions = typeof(RegionAuthority).GetField("_regions",
+            global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(setup.Kernel.Regions)!;
+        var records = (global::System.Collections.IEnumerable)regions.GetType()
+            .GetProperty("Values")!.GetValue(regions)!;
+        var region = records.Cast<object>().Single(candidate =>
+            Equals(candidate.GetType().GetProperty("Id")!.GetValue(candidate),
+                setup.Region.RegionId));
+        var uses = region.GetType().GetProperty("Uses")!.GetValue(region)!;
+        var storedUses = (global::System.Collections.IEnumerable)uses.GetType()
+            .GetProperty("Values")!.GetValue(uses)!;
+        var storedUse = storedUses.Cast<object>().Single(candidate =>
+            Equals(candidate.GetType().GetProperty("Handle")!.GetValue(candidate),
+                use.Handle));
+        storedUse.GetType().GetProperty("ReleaseOwnerOperation")!.SetValue(storedUse,
+            new ExternalOperationHandle(new ExternalOperationId(999), new OperationGeneration(1)));
+
+        var lost = setup.Kernel.RecordExternalOperationProviderLoss(setup.Process,
+            setup.Operation);
+
+        Assert.Equal(KernelError.ExternalEffectUncontained, lost.Error);
+        Assert.Equal(ExternalOperationDisposition.ProviderLost,
+            setup.Kernel.QueryExternalOperation(setup.Process, setup.Operation).Value!.Disposition);
+        Assert.Equal(ExternalResourceBindingState.Quarantined,
+            setup.Kernel.ExternalOperations.QueryResourceBinding(setup.Operation).Value!.State);
+        Assert.Equal(BudgetReservationState.Quarantined,
+            setup.Kernel.QueryBudget(commit.Lease).Value!.State);
+        Assert.Equal(10UL, Used(setup));
+        Assert.Equal(ExternalOperationDisposition.ProviderLost,
+            setup.Kernel.CancelExternalOperation(setup.Process, setup.Operation,
+                providerCancellationSupported: true).Value!.Disposition);
+        Assert.Equal(KernelError.InvalidTransition,
+            setup.Kernel.ReleaseExternalOperation(setup.Process, setup.Operation,
+                new(ProviderResourcesClosed: true, ProviderUnavailable: true)).Error);
+    }
+
+    [Fact]
+    public void FailedBudgetQuarantineReportsUncontainedProviderLossAndKeepsResourcePinned()
+    {
+        var setup = Create();
+        using var commit = Prepare(setup, setup.Operation).Value!;
+        Assert.True(setup.Kernel.SubmitResourceExternalAdmission(commit,
+            setup.Dependencies, KernelResult.Ok).IsSuccess);
+        var operations = typeof(ExternalOperationAuthority).GetField("_operations",
+            global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(setup.Kernel.ExternalOperations)!;
+        var record = operations.GetType().GetProperty("Item")!
+            .GetValue(operations, [setup.Operation.OperationId])!;
+        var bindingProperty = record.GetType().GetProperty("ResourceBinding")!;
+        var binding = (ExternalOperationResourceBinding)bindingProperty.GetValue(record)!;
+        bindingProperty.SetValue(record, binding with
+        {
+            Lease = new BudgetReservationHandle(commit.Lease.ReservationId,
+                new BudgetGeneration(commit.Lease.Generation.Value + 1))
+        });
+
+        var lost = setup.Kernel.RecordExternalOperationProviderLoss(setup.Process,
+            setup.Operation);
+
+        Assert.Equal(KernelError.ExternalEffectUncontained, lost.Error);
+        Assert.Equal(ExternalOperationDisposition.ProviderLost,
+            setup.Kernel.QueryExternalOperation(setup.Process, setup.Operation).Value!.Disposition);
+        Assert.Equal(ExternalResourceBindingState.Quarantined,
+            setup.Kernel.ExternalOperations.QueryResourceBinding(setup.Operation).Value!.State);
+        Assert.Equal(BudgetReservationState.Consuming, setup.Kernel.QueryBudget(commit.Lease).Value!.State);
+        Assert.Equal(10UL, Used(setup));
+        Assert.Equal(KernelError.InvalidTransition,
+            setup.Kernel.ReleaseExternalOperation(setup.Process, setup.Operation,
+                new(ProviderResourcesClosed: true, ProviderUnavailable: true)).Error);
+    }
+
+    [Fact]
     public void PublishedOperationCannotReleaseRegionWhileResourceSettlementIsInFlight()
     {
         var setup = Create();
@@ -208,6 +288,134 @@ public sealed class VNextPhase07ExternalOperationResourceBindingTests
     }
 
     [Fact]
+    public void ProviderLossDuringExactSettlementRetainsLossAndCompletesBudgetReceipt()
+    {
+        var setup = Create();
+        using var commit = Prepare(setup, setup.Operation).Value!;
+        var binding = setup.Kernel.SubmitResourceExternalAdmission(commit,
+            setup.Dependencies, KernelResult.Ok).Value!;
+        Assert.True(setup.Kernel.RecordExternalOperationCompletion(setup.Process,
+            new(binding, ExternalOperationCompletionDisposition.Completed)).IsSuccess);
+        setup.Kernel.ResourceSettlementAfterBeginQualificationHook = () =>
+        {
+            Assert.True(setup.Kernel.RecordExternalOperationProviderLoss(setup.Process,
+                setup.Operation).IsSuccess);
+            Assert.Equal(ExternalResourceBindingState.Quarantined,
+                setup.Kernel.ExternalOperations.QueryResourceBinding(setup.Operation).Value!.State);
+            Assert.Equal(BudgetReservationState.Quarantined,
+                setup.Kernel.QueryBudget(commit.Lease).Value!.State);
+            Assert.Equal(KernelError.InvalidTransition,
+                setup.Kernel.SettleResourceExternalOperation(setup.Process,
+                    Evidence(binding, consumed: 4, sequence: 1)).Error);
+        };
+
+        var settled = setup.Kernel.SettleResourceExternalOperation(setup.Process,
+            Evidence(binding, consumed: 4, sequence: 1));
+
+        Assert.True(settled.IsSuccess, settled.Message);
+        Assert.Equal(BudgetReservationState.Released, settled.Value!.State);
+        Assert.Equal(4UL, Used(setup));
+        Assert.Equal(ExternalResourceBindingState.Settled,
+            setup.Kernel.ExternalOperations.QueryResourceBinding(setup.Operation).Value!.State);
+        Assert.Equal(ExternalOperationDisposition.ProviderLost,
+            setup.Kernel.QueryExternalOperation(setup.Process, setup.Operation).Value!.Disposition);
+    }
+
+    [Fact]
+    public void ProviderLossAfterBudgetSettlementAcceptsExactChargeBeforeBindingCompletion()
+    {
+        var setup = Create();
+        using var commit = Prepare(setup, setup.Operation).Value!;
+        var binding = setup.Kernel.SubmitResourceExternalAdmission(commit,
+            setup.Dependencies, KernelResult.Ok).Value!;
+        Assert.True(setup.Kernel.RecordExternalOperationCompletion(setup.Process,
+            new(binding, ExternalOperationCompletionDisposition.Completed)).IsSuccess);
+        setup.Kernel.ResourceSettlementAfterBudgetQualificationHook = () =>
+        {
+            Assert.Equal(BudgetReservationState.Released,
+                setup.Kernel.QueryBudget(commit.Lease).Value!.State);
+            Assert.Equal(ExternalResourceBindingState.Settling,
+                setup.Kernel.ExternalOperations.QueryResourceBinding(setup.Operation).Value!.State);
+            Assert.True(setup.Kernel.Budgets.IsExactSettledExternalLease(
+                commit.BudgetOwner, commit.Lease, 4));
+            Assert.False(setup.Kernel.Budgets.IsExactSettledExternalLease(
+                commit.BudgetOwner, commit.Lease, 5));
+            Assert.False(setup.Kernel.Budgets.IsExactSettledExternalLease(
+                commit.BudgetOwner, new BudgetReservationHandle(commit.Lease.ReservationId,
+                    new BudgetGeneration(commit.Lease.Generation.Value + 1)), 4));
+            var lost = setup.Kernel.RecordExternalOperationProviderLoss(setup.Process,
+                setup.Operation);
+            Assert.True(lost.IsSuccess, lost.Message);
+            Assert.Equal(ExternalResourceBindingState.Quarantined,
+                setup.Kernel.ExternalOperations.QueryResourceBinding(setup.Operation).Value!.State);
+        };
+
+        var settled = setup.Kernel.SettleResourceExternalOperation(setup.Process,
+            Evidence(binding, consumed: 4, sequence: 1));
+
+        Assert.True(settled.IsSuccess, settled.Message);
+        Assert.Equal(4UL, Used(setup));
+        Assert.Equal(ExternalResourceBindingState.Settled,
+            setup.Kernel.ExternalOperations.QueryResourceBinding(setup.Operation).Value!.State);
+        Assert.Equal(ExternalOperationDisposition.ProviderLost,
+            setup.Kernel.QueryExternalOperation(setup.Process, setup.Operation).Value!.Disposition);
+    }
+
+    [Fact]
+    public void ProviderLossBindingReadRacesExactSettlementWithoutFalseQuarantineFailure()
+    {
+        var setup = Create();
+        using var commit = Prepare(setup, setup.Operation).Value!;
+        var binding = setup.Kernel.SubmitResourceExternalAdmission(commit,
+            setup.Dependencies, KernelResult.Ok).Value!;
+        Assert.True(setup.Kernel.RecordExternalOperationCompletion(setup.Process,
+            new(binding, ExternalOperationCompletionDisposition.Completed)).IsSuccess);
+        setup.Kernel.ResourceProviderLossAfterBindingReadQualificationHook = () =>
+        {
+            var settled = setup.Kernel.SettleResourceExternalOperation(setup.Process,
+                Evidence(binding, consumed: 4, sequence: 1));
+            Assert.True(settled.IsSuccess, settled.Message);
+        };
+
+        var lost = setup.Kernel.RecordExternalOperationProviderLoss(setup.Process,
+            setup.Operation);
+
+        Assert.True(lost.IsSuccess, lost.Message);
+        Assert.Equal(4UL, Used(setup));
+        Assert.Equal(BudgetReservationState.Released,
+            setup.Kernel.QueryBudget(commit.Lease).Value!.State);
+        Assert.Equal(ExternalResourceBindingState.Settled,
+            setup.Kernel.ExternalOperations.QueryResourceBinding(setup.Operation).Value!.State);
+        Assert.Equal(ExternalOperationDisposition.ProviderLost,
+            setup.Kernel.QueryExternalOperation(setup.Process, setup.Operation).Value!.Disposition);
+    }
+
+    [Fact]
+    public void PriorDifferentBudgetTerminalChargeCannotCompleteExactReceipt()
+    {
+        var setup = Create();
+        using var commit = Prepare(setup, setup.Operation).Value!;
+        var binding = setup.Kernel.SubmitResourceExternalAdmission(commit,
+            setup.Dependencies, KernelResult.Ok).Value!;
+        Assert.True(setup.Kernel.RecordExternalOperationCompletion(setup.Process,
+            new(binding, ExternalOperationCompletionDisposition.Completed)).IsSuccess);
+        setup.Kernel.ResourceSettlementAfterBeginQualificationHook = () =>
+            Assert.True(setup.Kernel.Budgets.SettleLease(commit.BudgetOwner, commit.Lease,
+                [new(ServiceBudgetDimension.ComputeTimeNanoseconds, 3)]).IsSuccess);
+
+        var result = setup.Kernel.SettleResourceExternalOperation(setup.Process,
+            Evidence(binding, consumed: 4, sequence: 1));
+
+        Assert.Equal(KernelError.ExternalEffectUncontained, result.Error);
+        Assert.Equal(3UL, Used(setup));
+        Assert.Equal(ExternalResourceBindingState.Quarantined,
+            setup.Kernel.ExternalOperations.QueryResourceBinding(setup.Operation).Value!.State);
+        Assert.Equal(KernelError.InvalidTransition,
+            setup.Kernel.ReleaseExternalOperation(setup.Process, setup.Operation,
+                new(ProviderResourcesClosed: true, ProviderUnavailable: true)).Error);
+    }
+
+    [Fact]
     public void ProviderLossAfterPossibleSubmitQuarantinesAndNeverRefunds()
     {
         var setup = Create();
@@ -222,6 +430,9 @@ public sealed class VNextPhase07ExternalOperationResourceBindingTests
             setup.Kernel.QueryBudget(commit.Lease).Value!.State);
         Assert.Equal(ExternalResourceBindingState.Quarantined,
             setup.Kernel.ExternalOperations.QueryResourceBinding(setup.Operation).Value!.State);
+        Assert.Equal(KernelError.StaleGeneration,
+            setup.Kernel.ExternalOperations.CompleteResourceSettlement(setup.Operation,
+                commit.Lease, success: true).Error);
     }
 
     [Fact]

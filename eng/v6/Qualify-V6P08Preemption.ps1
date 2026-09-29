@@ -63,7 +63,7 @@ try {
     $passed = [int]$match.Groups[2].Value
     $skipped = [int]$match.Groups[3].Value
     $total = [int]$match.Groups[4].Value
-    if ($failed -ne 0 -or $passed -ne 108 -or $skipped -ne 0 -or $total -ne 108) {
+    if ($failed -ne 0 -or $passed -ne 130 -or $skipped -ne 0 -or $total -ne 130) {
         throw "Unexpected P08 counts: failed=$failed passed=$passed skipped=$skipped total=$total"
     }
     $adapterOutput = & dotnet test 'tools\HybridCpu_ExecutableAdapter.Tests\HybridCpu_ExecutableAdapter.Tests.csproj' --no-restore --filter $adapterFilter 2>&1 | Out-String
@@ -138,9 +138,19 @@ try {
             'P08-RECOVERY-OWNER-BEFORE-PROVIDER-QUERY-01',
             'P08-RECOVERY-EXACT-BINDING-LOOKUP-01',
             'P08-RESUME-CANONICAL-DIGEST-01')
-        testIds = @('HybridCpuExternalOperationProviderTests.CancellationReceiptDistinguishesPreSubmitClosureFromPendingPostSubmitEffect',
+        testIds = @('V6RestartAdmissionTests.LegalityRevokesEarlierAdmissionBeforeReplacementSubmit[providerRevoked=False]',
+            'V6RestartAdmissionTests.LegalityRevokesEarlierAdmissionBeforeReplacementSubmit[providerRevoked=True]',
+            'V6RestartAdmissionTests.PostSubmitGenerationDriftOrObservationFailureCannotIssueRestartReceipt[provider]',
+            'V6RestartAdmissionTests.PostSubmitGenerationDriftOrObservationFailureCannotIssueRestartReceipt[runtime]',
+            'V6RestartAdmissionTests.PostSubmitGenerationDriftOrObservationFailureCannotIssueRestartReceipt[observation-throws]',
+            'HybridCpuExternalOperationProviderTests.CancellationReceiptDistinguishesPreSubmitClosureFromPendingPostSubmitEffect',
             'V6ManagedSafePointProviderTests.ClockFailureBeforeHookQuarantinesAttemptWithoutInvokingProvider',
             'V6ManagedSafePointProviderTests.ClockFailureAfterHookQuarantinesPossibleEffectWithoutReceipt',
+            'V6ManagedSafePointProviderTests.TerminalGenerationResetQuarantinesInFlightSafePoint',
+            'V6ManagedSafePointProviderTests.ExhaustedRequestGenerationDeniesBeforeProviderHook',
+            'V6ManagedStatefulResumeProviderTests.TerminalGenerationResetQuarantinesCaptureAndDeniesRestore',
+            'V6ManagedStatefulResumeProviderTests.ExhaustedCaptureGenerationDeniesBeforeRetainingPayload',
+            'V6ManagedStatefulResumeProviderTests.TerminalResetCannotUseUnchangedGenerationToReleaseStorageEscrow',
             'V6ManagedStatefulResumeProviderTests.ProviderDiscardFailureQuarantinesStorageUntilExactReconciliation',
             'V6ManagedStatefulResumeProviderTests.WrongOwnerCannotDiscardProviderPayloadBeforeEscrowAdmission',
             'V6StatefulResumeAccountingTests.ConcurrentDiscardRetainsEscrowUntilProviderClosureAndHasOneWinner',

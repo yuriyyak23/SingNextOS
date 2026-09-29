@@ -54,6 +54,8 @@ public sealed partial class RuntimeKernel
         ChannelEndpointHandle endpoint,
         ulong requestSequence)
     {
+        lock (_platformMemoryUseGate)
+        {
         var responderProcess = Processes.Resolve(responder);
         if (!responderProcess.IsSuccess)
             return KernelResult<ResponseEnvelope>.Fail(responderProcess.Error, responderProcess.Message!);
@@ -65,6 +67,7 @@ public sealed partial class RuntimeKernel
                 return KernelResult<ResponseEnvelope>.Fail(endpointValidation.Error, endpointValidation.Message!);
 
             return Responses.Cancel(responder, endpoint, requestSequence);
+        }
         }
     }
 

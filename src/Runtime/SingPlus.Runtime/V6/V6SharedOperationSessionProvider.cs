@@ -71,6 +71,11 @@ internal sealed class V6SharedOperationSessionProvider(
             if (request is null || presented != request || committedBinding is not { } exact ||
                 issued || cancellationRequested)
                 return Failure(Hc.ExternalOperationProviderPollStatus.Stale);
+            var owner = kernel.QueryExternalOperation(commit.Principal, commit.Operation);
+            if (!owner.IsSuccess || owner.Value!.State != ExternalOperationState.Submitted ||
+                owner.Value.Disposition != ExternalOperationDisposition.Active ||
+                owner.Value.Binding != exact)
+                return Failure(Hc.ExternalOperationProviderPollStatus.Stale);
             issued = true;
             binding = exact;
         }

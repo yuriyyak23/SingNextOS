@@ -9,6 +9,48 @@ public sealed class PlatformBackendResetEpochTests
 {
     [Fact]
     [Trait("Category", "Runtime")]
+    public void TerminalBackendEpochStillQuarantinesOldAuthorityAndDeniesNewBinding()
+    {
+        var provider = new HostPlatformAuthorityProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 1203, 12030);
+        var region = kernel.AllocateRegion(owner, 4096).Value!;
+        var capability = kernel.MintCapability(process.DomainId, owner,
+            ResourceKind.MemoryRegion,
+            CapabilityResourceIds.MemoryRegion(region.Handle.RegionId),
+            CapabilityRights.Map | CapabilityRights.Read).Value!.CapabilityId;
+        var binding = kernel.BindPlatformDomain(owner).Value!;
+        var mapping = kernel.MapPlatformOwnedRegion(owner, binding, capability,
+            region.Handle, PlatformMemoryAccess.Read).Value!;
+        var createCapability = kernel.MintCapability(process.DomainId, owner,
+            ResourceKind.Virtualization, VirtualizationResourceIds.Create,
+            CapabilityRights.Configure).Value!.CapabilityId;
+        var virtualDomain = kernel.CreateVirtualDomain(owner, createCapability,
+            new VirtualDomainProfile(2, 16 * 1024 * 1024)).Value!;
+        var field = typeof(PlatformAuthorityBridge).GetField("_backendEpoch",
+            global::System.Reflection.BindingFlags.Instance |
+            global::System.Reflection.BindingFlags.NonPublic)!;
+        field.SetValue(kernel.PlatformAuthority, ulong.MaxValue);
+
+        var reset = kernel.ObservePlatformBackendReset();
+
+        Assert.Equal(KernelError.CapacityExhausted, reset.Error);
+        Assert.Equal(ulong.MaxValue, kernel.PlatformAuthority.BackendEpoch.Value);
+        Assert.Equal(KernelError.StaleGeneration,
+            kernel.RevokePlatformDomain(owner, binding).Error);
+        Assert.Equal(KernelError.StaleGeneration,
+            kernel.RevokePlatformRegionMapping(owner, mapping).Error);
+        Assert.Equal(ReclaimExternalState.Quarantined,
+            kernel.QueryPlatformAuthorityDiagnostics(owner).Value!.DomainState);
+        Assert.Equal(VirtualDomainState.Quarantined,
+            kernel.QueryVirtualDomain(owner, virtualDomain.Domain).Value);
+        var (_, other) = TestFixtures.Create(kernel, 1204, 12040);
+        Assert.Equal(KernelError.CapacityExhausted,
+            kernel.BindPlatformDomain(other).Error);
+    }
+
+    [Fact]
+    [Trait("Category", "Runtime")]
     public void ResetMakesExistingDomainAndMappingStaleAndKeepsReservationPinned()
     {
         var provider = new HostPlatformAuthorityProvider();

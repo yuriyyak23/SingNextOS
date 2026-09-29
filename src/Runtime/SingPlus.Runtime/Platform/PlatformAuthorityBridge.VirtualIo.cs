@@ -54,10 +54,27 @@ public sealed partial class PlatformAuthorityBridge
             return KernelResult.Fail(KernelError.WrongPlatformDomain, "Virtual-I/O binding belongs to another child or device.");
         if (record.Closure == PlatformExternalClosureState.Closed)
             return KernelResult.Ok();
+        if (record.Closure == PlatformExternalClosureState.Faulted)
+            return KernelResult.Fail(KernelError.PlatformFaulted,
+                "Virtual-I/O binding is quarantined without exact provider closure.");
         if (_provider is not IPlatformVirtualIoProvider provider)
             return KernelResult.Fail(KernelError.PlatformUnsupported, "Bounded virtual-I/O provider is unavailable.");
+        var backendEpoch = BackendEpoch;
         record.Closure = PlatformExternalClosureState.Draining;
-        var result = provider.RevokeVirtualIo(record.ProviderLease);
+        PlatformAuthorityResult<PlatformVirtualIoClosureReceipt> result;
+        try { result = provider.RevokeVirtualIo(record.ProviderLease); }
+        catch (Exception exception) when (exception is not StackOverflowException)
+        {
+            record.Closure = PlatformExternalClosureState.Faulted;
+            return KernelResult.Fail(KernelError.PlatformFaulted,
+                $"Virtual-I/O revoke may have taken effect without a closure receipt: {exception.Message}");
+        }
+        if (BackendEpoch != backendEpoch || record.Closure == PlatformExternalClosureState.Faulted)
+        {
+            record.Closure = PlatformExternalClosureState.Faulted;
+            return KernelResult.Fail(KernelError.PlatformFaulted,
+                "Backend reset during virtual-I/O revoke leaves closure uncertain.");
+        }
         if (!result.IsSuccess)
         {
             record.Closure = PlatformExternalClosureState.Faulted;

@@ -1499,6 +1499,35 @@ public sealed class PlatformDmaSubmissionTests
     }
 
     [Fact]
+    public void V6BoundDmaGrantRevokeDoesNotInventTracePublicationOrRelease()
+    {
+        var scenario = CreateScenario(1560, 2110, PlatformDmaDirection.DeviceWritesMemory);
+        var prepared = scenario.Kernel.PreparePlatformDmaForDevice(
+            scenario.Subject, scenario.Grant).Value!;
+        var sink = new DmaTraceSink();
+        var submitted = scenario.Kernel.SubmitV6PlatformDma(
+            scenario.Subject, scenario.Grant, prepared, sink).Value!;
+        var completed = scenario.Kernel.ObservePlatformDmaCompletion(
+            scenario.Subject, submitted.Submission).Value!;
+        Assert.True(scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(
+            scenario.Subject, submitted.Submission, completed).IsSuccess);
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+
+        Assert.Equal([SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+            SemanticTraceEventKindV1.RetireOrComplete, SemanticTraceEventKindV1.Visible],
+            sink.Events.Select(static item => item.Kind));
+        Assert.True(SemanticTraceValidatorV1.Validate(sink.Events).IsValid);
+        var last = sink.Events[^1];
+        var fabricated = last with
+        {
+            Sequence = last.Sequence + 1,
+            Kind = SemanticTraceEventKindV1.Released,
+        };
+        Assert.Equal(SemanticTraceValidationStatusV1.InvalidLifecycleOrder,
+            SemanticTraceValidatorV1.Validate(sink.Events.Append(fabricated)).Status);
+    }
+
+    [Fact]
     public void V6BoundDmaResetDuringAcquireTraceQuarantinesWithoutVisibility()
     {
         var scenario = CreateScenario(1540, 1910, PlatformDmaDirection.DeviceWritesMemory);

@@ -47,6 +47,8 @@ internal sealed class V6ManagedStatefulResumeProvider(
     private ulong _runtimeGeneration = runtimeGeneration != 0 ? runtimeGeneration :
         throw new ArgumentOutOfRangeException(nameof(runtimeGeneration));
     private ulong _nextCaptureGeneration;
+    private bool _providerGenerationExhausted;
+    private bool _runtimeGenerationExhausted;
     private bool _failNextRestore;
     private bool _failNextDiscard;
     private int _correlationQueries;
@@ -85,6 +87,9 @@ internal sealed class V6ManagedStatefulResumeProvider(
             string capturedDigest = Convert.ToHexStringLower(SHA256.HashData(payload));
             lock (_sync)
             {
+                if (_providerGenerationExhausted || _runtimeGenerationExhausted)
+                    return KernelResult<V6ManagedCapturedStateReceipt>.Fail(KernelError.StaleGeneration,
+                        "Managed capture provider or runtime generation is exhausted.");
                 if (_records.Values.Any(record =>
                         record.Receipt.Binding.OperationCorrelation == operationCorrelation &&
                         record.Receipt.Status is V6ManagedCapturedStateStatus.Captured or
@@ -92,7 +97,10 @@ internal sealed class V6ManagedStatefulResumeProvider(
                             V6ManagedCapturedStateStatus.Quarantined))
                     return KernelResult<V6ManagedCapturedStateReceipt>.Fail(KernelError.DuplicateIdentity,
                         "The managed provider already holds live captured state for this operation correlation.");
-                var captureGeneration = checked(++_nextCaptureGeneration);
+                if (_nextCaptureGeneration == ulong.MaxValue)
+                    return KernelResult<V6ManagedCapturedStateReceipt>.Fail(KernelError.CapacityExhausted,
+                        "Managed capture generation space is exhausted.");
+                var captureGeneration = ++_nextCaptureGeneration;
                 var binding = new ResumeBindingV1(ResumeBindingV1.CurrentVersion, operationCorrelation,
                     capturedDigest, semanticBindingDigest, operationGeneration, captureGeneration,
                     _providerGeneration, _runtimeGeneration).Validate();
@@ -113,7 +121,8 @@ internal sealed class V6ManagedStatefulResumeProvider(
         {
             var record = Resolve(handle, binding);
             if (!record.IsSuccess) return KernelResult.Fail(record.Error, record.Message!);
-            return record.Value!.Receipt.Status == V6ManagedCapturedStateStatus.Captured &&
+            return !_providerGenerationExhausted && !_runtimeGenerationExhausted &&
+                   record.Value!.Receipt.Status == V6ManagedCapturedStateStatus.Captured &&
                    binding.ProviderGeneration == _providerGeneration && binding.RuntimeGeneration == _runtimeGeneration
                 ? KernelResult.Ok()
                 : KernelResult.Fail(KernelError.StaleGeneration,
@@ -129,7 +138,8 @@ internal sealed class V6ManagedStatefulResumeProvider(
             var resolved = Resolve(handle, binding);
             if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
             record = resolved.Value!;
-            if (record.Receipt.Status != V6ManagedCapturedStateStatus.Captured ||
+            if (_providerGenerationExhausted || _runtimeGenerationExhausted ||
+                record.Receipt.Status != V6ManagedCapturedStateStatus.Captured ||
                 binding.ProviderGeneration != _providerGeneration || binding.RuntimeGeneration != _runtimeGeneration)
                 return KernelResult.Fail(KernelError.StaleGeneration,
                     "Managed captured state changed before restore.");
@@ -228,8 +238,11 @@ internal sealed class V6ManagedStatefulResumeProvider(
     {
         lock (_sync)
         {
-            _providerGeneration = checked(_providerGeneration + 1);
             QuarantineLive();
+            if (_providerGeneration == ulong.MaxValue)
+                _providerGenerationExhausted = true;
+            else if (!_providerGenerationExhausted)
+                _providerGeneration++;
         }
     }
 
@@ -237,8 +250,11 @@ internal sealed class V6ManagedStatefulResumeProvider(
     {
         lock (_sync)
         {
-            _runtimeGeneration = checked(_runtimeGeneration + 1);
             QuarantineLive();
+            if (_runtimeGeneration == ulong.MaxValue)
+                _runtimeGenerationExhausted = true;
+            else if (!_runtimeGenerationExhausted)
+                _runtimeGeneration++;
         }
     }
 

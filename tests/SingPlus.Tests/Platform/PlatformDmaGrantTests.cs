@@ -248,6 +248,48 @@ public sealed class PlatformDmaGrantTests
         }
     }
 
+    [Fact]
+    public void FailedDmaAdmissionCannotDiscardPossibleProviderGrant()
+    {
+        var scenario = CreateScenario(1309, 1390,
+            PlatformDeviceRights.Read | PlatformDeviceRights.Configure,
+            PlatformMemoryAccess.Read);
+        scenario.Provider.DmaBindStatus = PlatformAuthorityStatus.Faulted;
+
+        var bind = scenario.Kernel.BindPlatformDma(scenario.Subject, scenario.Device,
+            scenario.Mapping, 0, 32, PlatformDmaDirection.DeviceReadsMemory);
+
+        Assert.False(bind.IsSuccess);
+        Assert.Equal(1, scenario.Provider.DmaBindCalls);
+        Assert.Equal(KernelError.PlatformFaulted,
+            scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).Error);
+        Assert.Equal(0, scenario.Provider.MappingRevokeCalls);
+        Assert.Equal(KernelError.PlatformFaulted,
+            scenario.Kernel.RevokePlatformDevice(scenario.Subject, scenario.Device).Error);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void RejectedProviderGrantNeedsConfirmedCleanupBeforeMappingClosure(bool cleanupFails)
+    {
+        var scenario = CreateScenario(cleanupFails ? 1310UL : 1311UL,
+            cleanupFails ? 1400UL : 1410UL,
+            PlatformDeviceRights.Read | PlatformDeviceRights.Configure,
+            PlatformMemoryAccess.Read);
+        scenario.Provider.ReturnMalformedGrant = true;
+        if (cleanupFails) scenario.Provider.DmaRevokeStatus = PlatformAuthorityStatus.Faulted;
+
+        var bind = scenario.Kernel.BindPlatformDma(scenario.Subject, scenario.Device,
+            scenario.Mapping, 0, 32, PlatformDmaDirection.DeviceReadsMemory);
+
+        Assert.Equal(KernelError.PlatformFaulted, bind.Error);
+        Assert.Equal(1, scenario.Provider.DmaRevokeCalls);
+        var revoke = scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping);
+        Assert.Equal(cleanupFails, !revoke.IsSuccess);
+        Assert.Equal(cleanupFails ? 0 : 1, scenario.Provider.MappingRevokeCalls);
+    }
+
     private static Scenario CreateScenario(
         ulong processId,
         ulong domainId,
@@ -350,6 +392,8 @@ public sealed class PlatformDmaGrantTests
         public int DmaRevokeCalls { get; private set; }
         public int MappingRevokeCalls { get; private set; }
         public PlatformAuthorityStatus? DmaRevokeStatus { get; set; }
+        public PlatformAuthorityStatus? DmaBindStatus { get; set; }
+        public bool ReturnMalformedGrant { get; set; }
         public List<string> Log { get; } = [];
 
         public PlatformProviderDescriptor Descriptor { get; } = new(
@@ -453,6 +497,9 @@ public sealed class PlatformDmaGrantTests
         {
             DmaBindCalls++;
             Log.Add("bind-dma");
+            if (DmaBindStatus is { } status)
+                return PlatformAuthorityResult<PlatformProviderDmaGrant>.Fail(status,
+                    "Injected ambiguous DMA grant admission failure.");
             var validation = PlatformDmaGrantContract.ValidateRequest(request);
             if (!validation.IsSuccess)
                 return PlatformAuthorityResult<PlatformProviderDmaGrant>.Fail(
@@ -474,7 +521,8 @@ public sealed class PlatformDmaGrantTests
                 request.Range,
                 request.Direction);
             _grants.Add(grant.GrantId, grant);
-            return PlatformAuthorityResult<PlatformProviderDmaGrant>.Ok(grant);
+            return PlatformAuthorityResult<PlatformProviderDmaGrant>.Ok(
+                ReturnMalformedGrant ? grant with { Generation = new(0) } : grant);
         }
 
         public PlatformAuthorityResult RevokeDmaGrant(PlatformProviderDmaGrant grant)
