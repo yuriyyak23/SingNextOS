@@ -5,7 +5,7 @@ namespace SingPlus.Runtime;
 public sealed partial class RuntimeKernel
 {
     private ResponseRegistry? _responseRegistry;
-    private ResponseRegistry Responses => _responseRegistry ??= new ResponseRegistry(Regions, Channels);
+    private ResponseRegistry Responses => _responseRegistry ??= new ResponseRegistry(Regions, Channels, TransferRegionForIpc);
 
     public KernelResult<ResponseEnvelope> PublishResponse(
         ProcessHandle responder,

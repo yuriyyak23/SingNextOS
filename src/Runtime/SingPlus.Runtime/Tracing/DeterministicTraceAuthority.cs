@@ -12,6 +12,7 @@ internal sealed class DeterministicTraceAuthority
         public Queue<SemanticTraceEvent> Events { get; } = new();
         public ulong NextSequence { get; set; } = 1;
         public ulong Dropped { get; set; }
+        public bool ObservationFailed { get; set; }
     }
 
     private sealed class SessionRecord(TraceSessionAdmission admission, ProducerRecord producer)
@@ -86,38 +87,69 @@ internal sealed class DeterministicTraceAuthority
         {
             if (session.Admission.State != TraceSessionState.Active)
                 return KernelResult.Fail(KernelError.TraceStopped, "Trace session is stopped.");
+            if (producer.NextSequence == 0)
+                return FailObservation(producer, KernelError.CapacityExhausted, "Trace producer sequence space is exhausted.");
             if (producer.Events.Count >= session.Admission.ProducerCapacity)
             {
                 if (session.Admission.OverflowPolicy == TraceOverflowPolicy.BackpressureTestMode)
                     return KernelResult.Fail(KernelError.TraceBackpressure, "The bounded trace producer is full.");
                 if (session.Admission.OverflowPolicy == TraceOverflowPolicy.StopSession)
                 {
+                    if (producer.Dropped == ulong.MaxValue)
+                        return FailObservation(producer, KernelError.CapacityExhausted, "Trace dropped-event counter is exhausted.");
                     producer.Dropped++;
                     session.Admission = session.Admission with { State = TraceSessionState.OverflowStopped };
                     return KernelResult.Fail(KernelError.TraceStopped, "Trace session stopped on overflow.");
                 }
-
+            }
+        }
+        long timestamp;
+        try { timestamp = _timeProvider.GetTimestamp(); }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        {
+            return FailObservation(producer, KernelError.PlatformFaulted, $"Trace clock failed: {exception.Message}");
+        }
+        // No configured clock callback runs under an authority/producer lock.
+        // Stop and publication arbitrate on this existing producer gate.
+        lock (producer.Gate)
+        {
+            if (session.Admission.State != TraceSessionState.Active)
+                return KernelResult.Fail(KernelError.TraceStopped, "Trace session stopped during clock observation.");
+            if (producer.NextSequence == 0)
+                return FailObservation(producer, KernelError.CapacityExhausted, "Trace producer sequence space is exhausted.");
+            if (producer.Events.Count >= session.Admission.ProducerCapacity)
+            {
+                if (session.Admission.OverflowPolicy == TraceOverflowPolicy.BackpressureTestMode)
+                    return KernelResult.Fail(KernelError.TraceBackpressure, "The bounded trace producer is full.");
+                if (producer.Dropped == ulong.MaxValue)
+                    return FailObservation(producer, KernelError.CapacityExhausted, "Trace dropped-event counter is exhausted.");
+                if (session.Admission.OverflowPolicy == TraceOverflowPolicy.StopSession)
+                {
+                    producer.Dropped++;
+                    session.Admission = session.Admission with { State = TraceSessionState.OverflowStopped };
+                    return KernelResult.Fail(KernelError.TraceStopped, "Trace session stopped on overflow.");
+                }
+                var marker = NewEvent(producer, timestamp, subject, TraceEventKind.BufferOverflow,
+                    correlation, parent, new("trace-buffer", session.Admission.Session.SessionId.Value.ToString(),
+                        "incomplete", "drop-with-marker"), incomplete: true);
                 producer.Dropped++;
                 producer.Events.Dequeue();
-                producer.Events.Enqueue(NewEvent(producer, subject, TraceEventKind.BufferOverflow,
-                    correlation, parent, new("trace-buffer", session.Admission.Session.SessionId.Value.ToString(),
-                        "incomplete", "drop-with-marker"), incomplete: true));
+                producer.Events.Enqueue(marker);
                 return KernelResult.Ok();
             }
-
-            producer.Events.Enqueue(NewEvent(producer, subject, kind, correlation, parent, data, incomplete: false));
+            producer.Events.Enqueue(NewEvent(producer, timestamp, subject, kind, correlation, parent, data, incomplete: false));
             return KernelResult.Ok();
         }
     }
 
-    private SemanticTraceEvent NewEvent(ProducerRecord producer, ProcessHandle subject, TraceEventKind kind,
-        CausalCorrelationId correlation, CausalCorrelationId? parent, TraceSemanticData data, bool incomplete)
+    private static KernelResult FailObservation(ProducerRecord producer, KernelError error, string message)
     {
-        if (producer.NextSequence == 0) throw new InvalidOperationException("Trace producer sequence space is exhausted.");
-        return new(producer.Handle, new(producer.NextSequence++), _timeProvider.GetTimestamp(), kind,
-            correlation, parent, subject, data, incomplete);
+        lock (producer.Gate) producer.ObservationFailed = true;
+        return KernelResult.Fail(error, message);
     }
-
+    private static SemanticTraceEvent NewEvent(ProducerRecord producer, long timestamp, ProcessHandle subject, TraceEventKind kind,
+        CausalCorrelationId correlation, CausalCorrelationId? parent, TraceSemanticData data, bool incomplete) =>
+        new(producer.Handle, new(producer.NextSequence++), timestamp, kind, correlation, parent, subject, data, incomplete);
     internal KernelResult<TraceSnapshot> Snapshot(TraceSessionHandle handle)
     {
         lock (_gate)
@@ -127,7 +159,7 @@ internal sealed class DeterministicTraceAuthority
             var record = resolved.Value!;
             lock (record.Producer.Gate)
                 return KernelResult<TraceSnapshot>.Ok(new(record.Admission, record.Producer.Events.ToArray(),
-                    record.Producer.Dropped, record.Producer.Dropped == 0));
+                    record.Producer.Dropped, record.Producer.Dropped == 0 && !record.Producer.ObservationFailed));
         }
     }
 
@@ -139,7 +171,8 @@ internal sealed class DeterministicTraceAuthority
             if (!resolved.IsSuccess) return KernelResult<TraceSessionAdmission>.Fail(resolved.Error, resolved.Message!);
             if (resolved.Value!.Admission.Owner != owner)
                 return KernelResult<TraceSessionAdmission>.Fail(KernelError.ProjectionDenied, "Trace session belongs to another process generation.");
-            resolved.Value.Admission = resolved.Value.Admission with { State = TraceSessionState.Stopped };
+            lock (resolved.Value.Producer.Gate)
+                resolved.Value.Admission = resolved.Value.Admission with { State = TraceSessionState.Stopped };
             PublishActiveLocked();
             return KernelResult<TraceSessionAdmission>.Ok(resolved.Value.Admission);
         }
@@ -150,10 +183,11 @@ internal sealed class DeterministicTraceAuthority
         lock (_gate)
         {
             var stopped = _sessions.Values
-                .Where(record => record.Admission.Owner == owner && record.Admission.State == TraceSessionState.Active)
+                .Where(record => record.Admission.Owner == owner)
                 .ToArray();
             foreach (var record in stopped)
-                record.Admission = record.Admission with { State = TraceSessionState.Stopped };
+                lock (record.Producer.Gate)
+                    record.Admission = record.Admission with { State = TraceSessionState.Stopped };
             if (stopped.Length != 0) PublishActiveLocked();
             return stopped.Select(static record => record.Admission.Session).ToArray();
         }

@@ -54,6 +54,8 @@ public sealed class RegionAuthority
         public bool PlatformMappingReserved { get; set; }
         public bool ExternalBorrowReadGrantReserved { get; set; }
         public RegionBackingLeaseDescriptor? BackingLease { get; set; }
+        public bool BackingClosureStarted { get; set; }
+        public int PendingBackingCreations { get; set; }
         public Dictionary<RegionUseId, RegionUseRecord> Uses { get; } = [];
         public Dictionary<ulong, RegionDamageDescriptorV1> Damage { get; } = [];
         public Dictionary<(string ProviderId, string FailureDomainId), DamageEvidenceHighWatermark> DamageEvidenceHighWatermarks { get; } = [];
@@ -76,6 +78,9 @@ public sealed class RegionAuthority
         FailureDomainScopeV1 scope,
         ulong observationSequence,
         DamageEvidenceHighWatermark highWatermark) =>
+        // This consumer retains a monotonic namespace sequence across generation
+        // changes. A provider sequence reset needs a separately admitted contour;
+        // generation advance alone cannot erase replay history or close damage.
         scope.ProviderGeneration < highWatermark.ProviderGeneration ||
         scope.FailureDomainGeneration < highWatermark.FailureDomainGeneration ||
         observationSequence <= highWatermark.ObservationSequence;
@@ -388,6 +393,10 @@ public sealed class RegionAuthority
     }
 
     public KernelResult<RegionBackingLeaseDescriptor> ValidateBacking(RegionBackingLeaseHandle handle, RegionOwner owner)
+        => ValidateBackingCore(handle, owner, allowClosure: false);
+
+    private KernelResult<RegionBackingLeaseDescriptor> ValidateBackingCore(
+        RegionBackingLeaseHandle handle, RegionOwner owner, bool allowClosure)
     {
         var record = _regions.Values.FirstOrDefault(item =>
         {
@@ -403,20 +412,87 @@ public sealed class RegionAuthority
             return KernelResult<RegionBackingLeaseDescriptor>.Fail(KernelError.StaleGeneration, "Region backing lease generation is stale.");
         if (lease.Owner != owner)
             return KernelResult<RegionBackingLeaseDescriptor>.Fail(KernelError.WrongRegionOwner, "Region backing lease owner does not match.");
+        if (record.BackingClosureStarted && !allowClosure)
+            return KernelResult<RegionBackingLeaseDescriptor>.Fail(KernelError.PlatformBindingDraining,
+                "Region backing closure forbids new backing effects.");
         return KernelResult<RegionBackingLeaseDescriptor>.Ok(lease);
+        }
+    }
+
+    // Local reservation admission only; this records no provider closure evidence.
+    internal KernelResult<RegionBackingLeaseDescriptor> BeginBackingCreation(
+        RegionBackingLeaseHandle handle, RegionOwner owner)
+    {
+        var validation = ValidateBacking(handle, owner);
+        if (!validation.IsSuccess) return validation;
+        var record = _regions[validation.Value!.Region.RegionId];
+        lock (record.Gate)
+        {
+            if (record.BackingLease != validation.Value || record.BackingClosureStarted)
+                return KernelResult<RegionBackingLeaseDescriptor>.Fail(KernelError.PlatformBindingDraining,
+                    "Backing changed or closure started before creation admission.");
+            if (record.PendingBackingCreations == int.MaxValue)
+                return KernelResult<RegionBackingLeaseDescriptor>.Fail(KernelError.CapacityExhausted,
+                    "Backing creation admission capacity is exhausted.");
+            record.PendingBackingCreations++;
+            return validation;
+        }
+    }
+
+    internal void EndBackingCreation(RegionBackingLeaseDescriptor admitted)
+    {
+        var record = _regions[admitted.Region.RegionId];
+        lock (record.Gate)
+        {
+            if (record.BackingLease != admitted || record.PendingBackingCreations <= 0)
+                throw new InvalidOperationException("Exact backing creation admission was not retained.");
+            record.PendingBackingCreations--;
+        }
+    }
+
+    internal bool HasPendingBackingCreations(RegionOwner owner)
+    {
+        foreach (var record in _regions.Values)
+            lock (record.Gate)
+                if (record.BackingLease?.Owner == owner && record.PendingBackingCreations != 0) return true;
+        return false;
+    }
+
+    internal KernelResult BeginBackingClosure(RegionBackingLeaseHandle handle, RegionOwner owner)
+    {
+        var validation = ValidateBackingCore(handle, owner, allowClosure: true);
+        if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
+        var record = _regions[validation.Value!.Region.RegionId];
+        lock (record.Gate)
+        {
+            if (record.BackingLease is not { } lease || lease.Handle != handle ||
+                lease.Owner != owner || lease.Region.Generation != record.Generation)
+                return KernelResult.Fail(KernelError.StaleGeneration, "Region backing changed before closure admission.");
+            if (record.PlatformMappingReserved || record.ExternalBorrowReadGrantReserved)
+                return KernelResult.Fail(KernelError.PlatformBindingActive,
+                    "Region mapping/grant reservation must close before backing closure admission.");
+            if (record.PendingBackingCreations != 0)
+                return KernelResult.Fail(KernelError.PlatformBindingDraining,
+                    "In-flight backing creation must publish its result before closure admission.");
+            record.BackingClosureStarted = true;
+            return KernelResult.Ok();
         }
     }
 
     public KernelResult ReleaseBacking(RegionBackingLeaseHandle handle, RegionOwner owner)
     {
-        var validation = ValidateBacking(handle, owner);
+        var validation = ValidateBackingCore(handle, owner, allowClosure: true);
         if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
         var record = _regions[validation.Value!.Region.RegionId];
         lock (record.Gate)
         {
             if (record.BackingLease?.Handle != handle)
                 return KernelResult.Fail(KernelError.StaleGeneration, "Region backing lease changed before release.");
+            if (record.PendingBackingCreations != 0)
+                return KernelResult.Fail(KernelError.PlatformBindingDraining,
+                    "Backing creation is still in flight.");
             record.BackingLease = null;
+            record.BackingClosureStarted = false;
         }
         return KernelResult.Ok();
     }
@@ -535,6 +611,9 @@ public sealed class RegionAuthority
         {
         var validation = ValidateBorrowLease(lease, owner, borrower);
         if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
+        if (record.BackingClosureStarted)
+            return KernelResult.Fail(KernelError.PlatformBindingDraining,
+                "Backing closure forbids a new external borrow read grant.");
         if (record.PlatformMappingReserved)
             return KernelResult.Fail(KernelError.PlatformBindingActive, "The borrowed region already has an owned-region platform mapping reservation.");
         if (record.ExternalBorrowReadGrantReserved)
@@ -610,6 +689,12 @@ public sealed class RegionAuthority
         {
         var validation = ValidateCore(record, handle, owner, RegionState.Owned);
         if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
+        if (record.BackingClosureStarted)
+            return KernelResult.Fail(KernelError.PlatformBindingDraining,
+                "Backing closure forbids a new platform mapping reservation.");
+        if (record.Damage.Count != 0)
+            return KernelResult.Fail(KernelError.Quarantined,
+                "Damaged Region cannot acquire a platform mapping before authoritative replacement.");
         if (record.PlatformMappingReserved) return KernelResult.Fail(KernelError.PlatformBindingActive, "The owned region already has an active platform mapping.");
         if (record.ExternalBorrowReadGrantReserved) return KernelResult.Fail(KernelError.PlatformBindingActive, "The region has an active external borrow read grant.");
         if (record.Uses.Values.Any(use => use.State == RegionUseState.Invalidated))
@@ -621,6 +706,23 @@ public sealed class RegionAuthority
             return KernelResult.Fail(KernelError.RegionUseConflict, "The whole region has an incompatible active use and cannot acquire a separate platform mapping reservation.");
         record.PlatformMappingReserved = true;
         return KernelResult.Ok();
+        }
+    }
+
+    internal KernelResult ValidatePlatformMappingRegionUsability(
+        RegionHandle handle, RegionOwner owner, ulong? expectedMutationEpoch = null)
+    {
+        if (!_regions.TryGetValue(handle.RegionId, out var record))
+            return KernelResult.Fail(KernelError.RegionNotFound, "Region was not found.");
+        lock (record.Gate)
+        {
+            var validation = ValidateCore(record, handle, owner, RegionState.Owned);
+            if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
+            if (record.Damage.Count != 0)
+                return KernelResult.Fail(KernelError.Quarantined, "Region has unresolved damage.");
+            return expectedMutationEpoch is { } expected && record.MutationEpoch.Value != expected
+                ? KernelResult.Fail(KernelError.StaleGeneration, "DMA Region mutation epoch changed before provider submission.")
+                : KernelResult.Ok();
         }
     }
 

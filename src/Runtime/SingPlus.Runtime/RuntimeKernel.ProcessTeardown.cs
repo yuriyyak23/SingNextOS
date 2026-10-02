@@ -36,8 +36,8 @@ public sealed partial class RuntimeKernel
     {
         public ProcessHandle Handle { get; } = handle;
         public ProcessState TargetTerminalState { get; } = targetTerminalState;
-        public PlatformRegionMapping[] Mappings { get; } = mappings;
-        public PlatformDomainBinding? DomainBinding { get; } = domainBinding;
+        public PlatformRegionMapping[] Mappings { get; set; } = mappings;
+        public PlatformDomainBinding? DomainBinding { get; set; } = domainBinding;
         public ProcessTeardownPhase Phase { get; set; } = ProcessTeardownPhase.LocalExitStarted;
         public bool ChannelsClosed { get; set; }
         public bool LocalAuthorizationRevoked { get; set; }
@@ -46,6 +46,7 @@ public sealed partial class RuntimeKernel
         public bool LocalReclaimCompleted { get; set; }
         public KernelError? BlockingError { get; set; }
         public bool ComposedAuthorityPrepared { get; set; }
+        public bool ComposedPreparationInFlight { get; set; }
 
         public ProcessTeardownSnapshot Snapshot => new(
             Handle,
@@ -61,13 +62,21 @@ public sealed partial class RuntimeKernel
 
     private readonly Dictionary<ProcessHandle, ProcessTeardownRecord> _processTeardowns = [];
     private readonly Dictionary<ProcessHandle, PlatformDomainBinding> _processPlatformBindings = [];
+    private readonly HashSet<ProcessHandle> _pendingPlatformDomainBinds = [];
     private readonly HashSet<ProcessHandle> _platformExecutionAttachments = [];
     private readonly Dictionary<ProcessHandle, List<PlatformRegionMapping>> _processPlatformMappings = [];
+    private readonly Dictionary<ProcessHandle, int> _pendingPlatformMappingAdmissions = [];
+    // Admission interlock only: entries carry no capability state or permission.
+    private readonly List<CapabilityId> _pendingPlatformMappingCapabilities = [];
 
     public KernelResult<ProcessTeardownSnapshot> ObserveProcessTeardown(ProcessHandle handle)
     {
-        lock (_platformMemoryUseGate)
-            return ObserveProcessTeardownLocked(handle);
+        try
+        {
+            lock (_platformMemoryUseGate)
+                return ObserveProcessTeardownLocked(handle);
+        }
+        finally { EmitProcessTeardownExternalOperationTraces(handle); }
     }
 
     private KernelResult<ProcessTeardownSnapshot> ObserveProcessTeardownLocked(
@@ -101,6 +110,12 @@ public sealed partial class RuntimeKernel
 
     public KernelResult<ProcessTeardownSnapshot> QueryProcessTeardown(ProcessHandle handle)
     {
+        lock (_platformMemoryUseGate)
+            return QueryProcessTeardownLocked(handle);
+    }
+
+    private KernelResult<ProcessTeardownSnapshot> QueryProcessTeardownLocked(ProcessHandle handle)
+    {
         if (_processTeardowns.TryGetValue(handle, out var record))
             return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
 
@@ -121,6 +136,14 @@ public sealed partial class RuntimeKernel
         ProcessHandle handle,
         ProcessState targetTerminalState)
     {
+        try { return BeginOrAdvanceProcessTeardownCore(handle, targetTerminalState); }
+        finally { EmitProcessTeardownExternalOperationTraces(handle); }
+    }
+
+    private KernelResult BeginOrAdvanceProcessTeardownCore(
+        ProcessHandle handle,
+        ProcessState targetTerminalState)
+    {
         ProcessTeardownRecord record;
         lock (_platformMemoryUseGate)
         {
@@ -137,21 +160,39 @@ public sealed partial class RuntimeKernel
             }
         }
 
-        if (!record.ComposedAuthorityPrepared)
+        bool prepare;
+        lock (_platformMemoryUseGate)
         {
-            var prepared = PrepareComposedAuthorityTeardown(handle);
-            lock (_platformMemoryUseGate)
+            if (_pendingPlatformMappingAdmissions.ContainsKey(handle) || record.ComposedPreparationInFlight)
+                return KernelResult.Fail(KernelError.PlatformBindingDraining,
+                    "Mapping admission or composed preparation must settle before teardown can advance.");
+            prepare = !record.ComposedAuthorityPrepared;
+            if (prepare) record.ComposedPreparationInFlight = true;
+        }
+
+        if (prepare)
+        {
+            var prepared = KernelResult.Fail(KernelError.PlatformFaulted,
+                "Composed teardown preparation did not return closure evidence.");
+            try
             {
-                if (!prepared.IsSuccess)
-                {
-                    record.Phase = ProcessTeardownPhase.PlatformFaulted;
-                    record.BlockingError = prepared.Error;
-                    return prepared;
-                }
-                record.ComposedAuthorityPrepared = true;
-                record.Phase = ProcessTeardownPhase.LocalExitStarted;
-                record.BlockingError = null;
+                prepared = PrepareComposedAuthorityTeardown(handle);
             }
+            catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+            {
+                // Possible effects remain owned by the existing participants.
+            }
+            finally
+            {
+                lock (_platformMemoryUseGate)
+                {
+                    record.ComposedAuthorityPrepared = prepared.IsSuccess;
+                    record.Phase = prepared.IsSuccess ? ProcessTeardownPhase.LocalExitStarted : ProcessTeardownPhase.PlatformFaulted;
+                    record.BlockingError = prepared.IsSuccess ? null : prepared.Error;
+                    record.ComposedPreparationInFlight = false;
+                }
+            }
+            if (!prepared.IsSuccess) return prepared;
         }
         lock (_platformMemoryUseGate)
             return BeginOrAdvanceProcessTeardownLocked(handle, targetTerminalState);
@@ -194,11 +235,12 @@ public sealed partial class RuntimeKernel
             foreach (var mapping in trackedMappings) mappings[mapping.MappingId] = mapping;
         foreach (var capabilityId in process.Capabilities.Items)
         {
-            foreach (var mapping in PlatformAuthority.BeginCapabilityRevocation(capabilityId))
+            foreach (var mapping in PlatformAuthority.BeginCapabilityRevocation(capabilityId, id => CapabilityAuthority.DependsOnCapability(id, capabilityId)))
                 mappings[mapping.MappingId] = mapping;
-            _ = PlatformAuthority.BeginIrqCapabilityRevocation(capabilityId);
-            _ = PlatformAuthority.BeginMmioCapabilityRevocation(capabilityId);
-            _ = PlatformAuthority.BeginDeviceCapabilityRevocation(capabilityId);
+            _ = PlatformAuthority.BeginIrqCapabilityRevocation(capabilityId, id => CapabilityAuthority.DependsOnCapability(id, capabilityId));
+            _ = PlatformAuthority.BeginMmioCapabilityRevocation(capabilityId, id => CapabilityAuthority.DependsOnCapability(id, capabilityId));
+            _ = PlatformAuthority.BeginDeviceCapabilityRevocation(capabilityId,
+                id => CapabilityAuthority.DependsOnCapability(id, capabilityId));
             _ = CapabilityAuthority.Revoke(capabilityId);
         }
         process.ClearCapabilities();
@@ -306,6 +348,20 @@ public sealed partial class RuntimeKernel
         SingProcess process,
         ProcessTeardownRecord record)
     {
+        if (!record.ComposedAuthorityPrepared || record.ComposedPreparationInFlight)
+        {
+            if (record.Phase != ProcessTeardownPhase.PlatformFaulted)
+                record.Phase = ProcessTeardownPhase.PlatformDraining;
+            return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
+        }
+
+        if (_pendingPlatformMappingAdmissions.TryGetValue(record.Handle, out var pendingAdmissions))
+        {
+            record.Phase = ProcessTeardownPhase.PlatformDraining;
+            record.PendingPlatformMappings = pendingAdmissions;
+            record.BlockingError = null;
+            return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
+        }
         var identity = PlatformIdentity(process);
         KernelError? firstBlockingError = null;
         var pendingMappings = 0;
@@ -471,6 +527,14 @@ public sealed partial class RuntimeKernel
             return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
         }
 
+        if (_pendingPlatformDomainBinds.Contains(record.Handle) ||
+            PlatformAuthority.HasUnresolvedDomainBindEffect(identity))
+        {
+            record.Phase = ProcessTeardownPhase.PlatformFaulted;
+            record.BlockingError = KernelError.PlatformFaulted;
+            return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
+        }
+
         if (!record.PlatformDomainClosed && record.DomainBinding is { } binding)
         {
             var revokeDomain = PlatformAuthority.RevokeDomain(binding, identity);
@@ -545,8 +609,8 @@ public sealed partial class RuntimeKernel
         {
             CapabilityAuthority.RevokeAllForDomain(process.DomainId);
             Regions.ReturnAllLoansForBorrowerDomain(process.DomainId);
-            Regions.ReclaimAllForDomain(process.DomainId);
-            ReleaseReclaimedRegionBudgetsForProcess(handle);
+            var reclaimed = Regions.ReclaimAllForDomain(process.DomainId);
+            ReleaseReclaimedRegionBudgetsForProcess(handle, reclaimed);
             lock (_requestResponseCorrelationGate)
                 Channels.CloseAllForDomain(process.DomainId);
         }
@@ -557,8 +621,16 @@ public sealed partial class RuntimeKernel
 
     private void TrackPlatformBinding(ProcessHandle process, PlatformDomainBinding binding, bool executionAttached = true)
     {
-        _processPlatformBindings[process] = binding;
-        if (executionAttached) _platformExecutionAttachments.Add(process);
+        lock (_platformMemoryUseGate)
+        {
+            _processPlatformBindings[process] = binding;
+            if (executionAttached) _platformExecutionAttachments.Add(process);
+            if (_processTeardowns.TryGetValue(process, out var teardown))
+            {
+                teardown.DomainBinding = binding;
+                teardown.PlatformDomainClosed = false;
+            }
+        }
     }
 
     private void UntrackPlatformBinding(ProcessHandle process, PlatformDomainBinding binding)
@@ -572,6 +644,8 @@ public sealed partial class RuntimeKernel
 
     private void TrackPlatformMapping(ProcessHandle process, PlatformRegionMapping mapping)
     {
+        lock (_platformMemoryUseGate)
+        {
         if (!_processPlatformMappings.TryGetValue(process, out var mappings))
         {
             mappings = [];
@@ -580,6 +654,41 @@ public sealed partial class RuntimeKernel
 
         if (!mappings.Any(existing => existing.MappingId == mapping.MappingId))
             mappings.Add(mapping);
+        if (_processTeardowns.TryGetValue(process, out var teardown) &&
+            !teardown.Mappings.Any(existing => existing.MappingId == mapping.MappingId))
+        {
+            teardown.Mappings = [.. teardown.Mappings, mapping];
+            teardown.PendingPlatformMappings++;
+        }
+        }
+    }
+
+    private KernelResult BeginPlatformMappingAdmission(
+        ProcessHandle handle, SingProcess process, CapabilityId capabilityId)
+    {
+        lock (_platformMemoryUseGate)
+        {
+            var effect = EnsureProcessAcceptsNewEffects(process);
+            if (!effect.IsSuccess) return effect;
+            _pendingPlatformMappingAdmissions.TryGetValue(handle, out var pending);
+            if (pending == int.MaxValue || _pendingPlatformMappingCapabilities.Count == int.MaxValue)
+                return KernelResult.Fail(KernelError.CapacityExhausted,
+                    "Platform mapping admission counter is exhausted.");
+            _pendingPlatformMappingAdmissions[handle] = pending + 1;
+            _pendingPlatformMappingCapabilities.Add(capabilityId);
+            return KernelResult.Ok();
+        }
+    }
+
+    private void EndPlatformMappingAdmission(ProcessHandle handle, CapabilityId capabilityId)
+    {
+        lock (_platformMemoryUseGate)
+        {
+            var pending = _pendingPlatformMappingAdmissions[handle];
+            if (pending == 1) _pendingPlatformMappingAdmissions.Remove(handle);
+            else _pendingPlatformMappingAdmissions[handle] = pending - 1;
+            _pendingPlatformMappingCapabilities.Remove(capabilityId);
+        }
     }
 
     private void UntrackPlatformMapping(PlatformRegionMapping mapping)

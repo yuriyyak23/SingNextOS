@@ -22,6 +22,30 @@ internal interface ISecureGuestBackingAuthority
 
 public sealed partial class RuntimeKernel
 {
+    internal KernelResult CommitCxlDeviceEffect(PlatformDeviceLease lease, RegionOwner owner, Func<KernelResult> commit)
+    {
+        var subject = lease.DomainBinding.Subject;
+        var source = PlatformAuthority.CxlDeviceSource(lease, subject);
+        if (!source.IsSuccess) return KernelResult.Fail(source.Error, source.Message!);
+        return CommitCxlBackingPublication(subject.Process, owner, () =>
+            CapabilityAuthority.CommitDeviceLeaseAdmission(source.Value, subject.DomainId, subject.Process.Generation,
+                ToDeviceCapabilityRights(lease.Rights), lease.Device.ResourceId,
+                () => PlatformAuthority.CommitCxlDeviceAdmission(lease, subject, commit)));
+    }
+
+    // Callback is local admission/publication only, never provider code.
+    internal KernelResult CommitCxlBackingPublication(ProcessHandle process, RegionOwner owner, Func<KernelResult> commit)
+    {
+        lock (_platformMemoryUseGate)
+        {
+            var resolved = Processes.Resolve(process);
+            if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+            if (owner != new RegionOwner(resolved.Value!.DomainId, process.Generation))
+                return KernelResult.Fail(KernelError.WrongRegionOwner, "CXL backing principal generation is not exact.");
+            var active = EnsureProcessAcceptsNewEffects(resolved.Value);
+            return active.IsSuccess ? commit() : active;
+        }
+    }
     private readonly List<ICxlTeardownParticipant> _cxlTeardownParticipants = [];
     private readonly List<IComposedWorkTeardownParticipant> _composedWorkTeardownParticipants = [];
     private readonly List<ISecureGuestBackingAuthority> _secureGuestBackingAuthorities = [];

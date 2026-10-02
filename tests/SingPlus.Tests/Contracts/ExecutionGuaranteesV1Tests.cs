@@ -7,6 +7,42 @@ namespace SingPlus.Tests.Contracts;
 
 public sealed class ExecutionGuaranteesV1Tests
 {
+    public static IEnumerable<object[]> InvalidProviderTokens()
+    {
+        for (var field = 0; field < 4; field++)
+            for (var fault = 0; fault < 3; fault++)
+                yield return [field, fault];
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidProviderTokens))]
+    public void GuaranteeTupleRejectsInvalidUnicodeAndControlsBeforeDigest(int field, int fault)
+    {
+        var token = fault switch { 0 => "provider\uD800", 1 => "provider\uDC00", _ => "provider\0tail" };
+        var original = HybridCpu114SemanticCompatibility.Map(Request()).Value!;
+        var changed = original with { Digest = default };
+        changed = field switch
+        {
+            0 => changed with { ProviderContract = changed.ProviderContract with { PackageId = token } },
+            1 => changed with { ProviderContract = changed.ProviderContract with { PackageVersion = token } },
+            2 => changed with { ProviderContract = changed.ProviderContract with { SchemaIdentity = token } },
+            _ => changed with { ProviderExecutionClass = token },
+        };
+        Assert.Throws<ArgumentException>(() => changed.Canonicalize());
+    }
+
+    [Fact]
+    public void ScalarUnicodeGuaranteeTupleRetainsExactV1DigestWithoutNormalization()
+    {
+        var original = HybridCpu114SemanticCompatibility.Map(Request()).Value!;
+        Assert.Equal(original.Digest, original.Canonicalize().Digest);
+        var scalar = (original with { Digest = default, ProviderExecutionClass = "provider:é🚀" }).Canonicalize();
+        Assert.Equal(scalar.Digest, scalar.Canonicalize().Digest);
+        var decomposed = (original with { Digest = default, ProviderExecutionClass = "provider:e\u0301🚀" }).Canonicalize();
+        Assert.NotEqual(scalar.Digest, decomposed.Digest);
+        Assert.True((original with { Digest = default, ProviderExecutionClass = "provider:\uFFFD" }).Canonicalize().Digest != default);
+    }
+
     [Fact]
     public void HybridCpu114MappingIsDimensionSpecificAndNeverExceedsStaticAdmission()
     {

@@ -5,6 +5,125 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class V6ManagedSafePointProviderTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void InvalidUnicodeCannotRegisterRequestOrAliasSafePointEvidence(bool lowSurrogate)
+    {
+        var invalid = "point:" + (lowSurrogate ? '\uDC00' : '\uD800');
+        Assert.ThrowsAny<ArgumentException>(() => new V6ManagedSafePointProvider(invalid, 1_000));
+        var provider = Provider(new());
+        var callbacks = 0;
+        var denied = provider.RequestSafePoint(invalid, 3, 7, 11, () =>
+        {
+            callbacks++;
+            return KernelResult.Ok();
+        });
+        Assert.Equal(KernelError.InvalidMessage, denied.Error);
+        Assert.Equal(0, callbacks);
+        Assert.Equal(KernelError.InvalidMessage,
+            provider.ValidateLoweringSafePointMap([], invalid, 1, new string('a', 64), 7, 11).Error);
+
+        var accepted = provider.RequestSafePoint("point:😀", 3, 7, 11, KernelResult.Ok);
+        Assert.True(accepted.IsSuccess, accepted.Message);
+        Assert.Equal(1UL, accepted.Value!.RequestGeneration);
+        Assert.False(accepted.Value.AuthorizesExecution);
+    }
+
+    [Theory]
+    [InlineData(1_000_000_000L, 99L, true, 99UL)]
+    [InlineData(1_000_000_000L, 100L, true, 100UL)]
+    [InlineData(1_000_000_000L, 101L, false, 0UL)]
+    [InlineData(1_000_000_000L, 199L, false, 0UL)]
+    [InlineData(3_000_000_000L, 300L, true, 100UL)]
+    [InlineData(3_000_000_000L, 301L, false, 0UL)]
+    [InlineData(3_000_000_000L, 1L, true, 1UL)]
+    public void ExactClockRatioCannotRoundOverBoundIntoContainment(long frequency, long ticks, bool accepted, ulong observed)
+    {
+        var clock = new RatioClock(frequency, 0, ticks);
+        var provider = new V6ManagedSafePointProvider("ratio-clock", 100, 7, 11, clock);
+        var result = provider.RequestSafePoint(Correlation, 3, 7, 11, KernelResult.Ok);
+        if (accepted)
+        {
+            Assert.True(result.IsSuccess, result.Message);
+            Assert.Equal(observed, result.Value!.ObservedLatencyNanoseconds);
+        }
+        else
+        {
+            Assert.Equal(KernelError.DeadlineExpired, result.Error);
+            Assert.Null(result.Value);
+        }
+    }
+
+    [Theory]
+    [InlineData(1L, false)]
+    [InlineData(1_000_000_000L, true)]
+    public void FullSignedTimestampRangeUsesCheckedWideArithmetic(long frequency, bool accepted)
+    {
+        var provider = new V6ManagedSafePointProvider("wide-clock", ulong.MaxValue, 7, 11,
+            new RatioClock(frequency, long.MinValue, long.MaxValue));
+        var result = provider.RequestSafePoint(Correlation, 3, 7, 11, KernelResult.Ok);
+        if (accepted)
+        {
+            Assert.True(result.IsSuccess, result.Message);
+            Assert.Equal(ulong.MaxValue, result.Value!.ObservedLatencyNanoseconds);
+        }
+        else Assert.Equal(KernelError.PlatformFaulted, result.Error);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void InvalidOrChangedClockFrequencyCannotProduceReceipt(bool changed)
+    {
+        var clock = new RatioClock(changed ? 1_000_000_000 : 0, 0, 100);
+        var provider = new V6ManagedSafePointProvider("frequency-clock", 100, 7, 11, clock);
+        var calls = 0;
+        var result = provider.RequestSafePoint(Correlation, 3, 7, 11, () =>
+        {
+            calls++;
+            clock.Frequency = 2_000_000_000;
+            return KernelResult.Ok();
+        });
+        Assert.Equal(KernelError.PlatformFaulted, result.Error);
+        Assert.Null(result.Value);
+        Assert.Equal(changed ? 1 : 0, calls);
+    }
+
+    private sealed class RatioClock(long frequency, long start, long end) : TimeProvider
+    {
+        private int _reads;
+        internal long Frequency { get; set; } = frequency;
+        public override long TimestampFrequency => Frequency;
+        public override long GetTimestamp() => ++_reads == 1 ? start : end;
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(-99)]
+    [InlineData(0)]
+    public void SubTickBackwardTimestampCannotBecomeContainmentReceipt(long delta)
+    {
+        var clock = new SubTickClock(delta);
+        var provider = new V6ManagedSafePointProvider("subtick-clock", 100, 7, 11, clock);
+        var result = provider.RequestSafePoint(Correlation, 3, 7, 11, KernelResult.Ok);
+        if (delta < 0)
+        {
+            Assert.Equal(KernelError.PlatformFaulted, result.Error);
+            Assert.Null(result.Value);
+            Assert.Equal(KernelError.InvalidTransition,
+                provider.RequestSafePoint(Correlation, 3, 7, 11, KernelResult.Ok).Error);
+        }
+        else Assert.True(result.IsSuccess, result.Message);
+    }
+
+    private sealed class SubTickClock(long delta) : TimeProvider
+    {
+        private int _reads;
+        public override long TimestampFrequency => 1_000_000_000;
+        public override long GetTimestamp() => ++_reads == 1 ? 1_000 : 1_000 + delta;
+    }
+
     [Fact]
     public void ExactManagedHookWithinBoundProducesValidNonAuthorityLifecycle()
     {

@@ -27,6 +27,19 @@ public readonly record struct FailureDomainScopeV1(
         if (string.IsNullOrWhiteSpace(ProviderId) || string.IsNullOrWhiteSpace(FailureDomainId) ||
             ProviderId.Length > 128 || FailureDomainId.Length > 128)
             throw new ArgumentException("Failure-domain identifiers must be non-empty and bounded.");
+        if (ProviderId != ProviderId.Trim() || FailureDomainId != FailureDomainId.Trim() ||
+            ProviderId.Any(char.IsControl) || FailureDomainId.Any(char.IsControl))
+            throw new ArgumentException("Failure-domain identifiers must be canonical tokens.");
+        try
+        {
+            var utf8 = new System.Text.UTF8Encoding(false, true);
+            _ = utf8.GetByteCount(ProviderId);
+            _ = utf8.GetByteCount(FailureDomainId);
+        }
+        catch (System.Text.EncoderFallbackException exception)
+        {
+            throw new ArgumentException("Failure-domain identifiers must contain valid Unicode scalar values.", exception);
+        }
         if (ProviderGeneration == 0 || FailureDomainGeneration == 0)
             throw new ArgumentException("Failure-domain generations must be non-zero.");
         return this;

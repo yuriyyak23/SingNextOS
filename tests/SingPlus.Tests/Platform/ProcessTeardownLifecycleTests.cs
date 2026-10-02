@@ -8,6 +8,103 @@ namespace SingPlus.Tests.Platform;
 public sealed class ProcessTeardownLifecycleTests
 {
     [Fact]
+    public void ObserveCannotReclaimWhileComposedPreparationCallbackIsInFlight()
+    {
+        var kernel = new RuntimeKernel(new HostPlatformAuthorityProvider());
+        var (_, owner) = TestFixtures.Create(kernel, 509, 590);
+        var calls = 0;
+        KernelResult<ProcessTeardownSnapshot> observation = default;
+        KernelResult overlapping = default;
+        var resolvedDuringCallback = false;
+        kernel.RegisterComposedWorkTeardownParticipant(new CallbackParticipant(() =>
+        {
+            calls++;
+            observation = kernel.ObserveProcessTeardown(owner);
+            resolvedDuringCallback = kernel.Processes.Resolve(owner).IsSuccess;
+            overlapping = kernel.TerminateProcess(owner);
+            return KernelResult.Ok();
+        }));
+        var terminated = kernel.TerminateProcess(owner);
+        Assert.True(observation!.IsSuccess, observation.Message);
+        Assert.False(observation.Value!.LocalReclaimCompleted);
+        Assert.True(resolvedDuringCallback);
+        Assert.Equal(KernelError.PlatformBindingDraining, overlapping!.Error);
+        Assert.Equal(1, calls);
+        Assert.True(terminated.IsSuccess, terminated.Message);
+        Assert.False(kernel.Processes.Resolve(owner).IsSuccess);
+    }
+    [Fact]
+    public void ThrownComposedPreparationDoesNotReclaimAndCanRetryExistingParticipant()
+    {
+        var kernel = new RuntimeKernel(new HostPlatformAuthorityProvider());
+        var (_, owner) = TestFixtures.Create(kernel, 510, 591);
+        var calls = 0;
+        kernel.RegisterComposedWorkTeardownParticipant(new CallbackParticipant(() =>
+        {
+            if (++calls == 1) throw new InvalidOperationException("Closure receipt unavailable.");
+            return KernelResult.Ok();
+        }));
+        Assert.Equal(KernelError.PlatformFaulted, kernel.TerminateProcess(owner).Error);
+        var observed = kernel.ObserveProcessTeardown(owner);
+        Assert.True(observed.IsSuccess);
+        Assert.Equal(ProcessTeardownPhase.PlatformFaulted, observed.Value!.Phase);
+        Assert.False(observed.Value.LocalReclaimCompleted);
+        Assert.True(kernel.Processes.Resolve(owner).IsSuccess);
+        Assert.Equal(1, calls);
+        Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.Equal(2, calls);
+        Assert.False(kernel.Processes.Resolve(owner).IsSuccess);
+    }
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ConcurrentPreparationFailureKeepsProcessUntilExactParticipantRetry(bool throws)
+    {
+        var kernel = new RuntimeKernel(new HostPlatformAuthorityProvider());
+        var (_, owner) = TestFixtures.Create(kernel, 511, 592);
+        using var resume = new ManualResetEventSlim();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        kernel.RegisterComposedWorkTeardownParticipant(new CallbackParticipant(() =>
+        {
+            if (Interlocked.Increment(ref calls) != 1) return KernelResult.Ok();
+            entered.SetResult();
+            if (!resume.Wait(TimeSpan.FromSeconds(10)))
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Test rendezvous expired.");
+            if (throws) throw new InvalidOperationException("Closure response lost.");
+            return KernelResult.Fail(KernelError.PlatformBindingDraining, "Existing owner still draining.");
+        }));
+        var preparing = Task.Run(() => kernel.TerminateProcess(owner));
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(KernelError.PlatformBindingDraining, kernel.TerminateProcess(owner).Error);
+            Assert.Equal(KernelError.InvalidTransition, kernel.FaultProcess(owner).Error);
+            var observed = kernel.ObserveProcessTeardown(owner);
+            Assert.True(observed.IsSuccess);
+            Assert.False(observed.Value!.LocalReclaimCompleted);
+            Assert.False(kernel.QueryProcessTeardown(owner).Value!.LocalReclaimCompleted);
+            Assert.True(kernel.Processes.Resolve(owner).IsSuccess);
+            Assert.Equal(1, Volatile.Read(ref calls));
+        }
+        finally
+        {
+            resume.Set();
+            await preparing.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        Assert.Equal(throws ? KernelError.PlatformFaulted : KernelError.PlatformBindingDraining,
+            (await preparing).Error);
+        Assert.False(kernel.ObserveProcessTeardown(owner).Value!.LocalReclaimCompleted);
+        Assert.Equal(1, calls);
+        Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.Equal(2, calls);
+        Assert.False(kernel.Processes.Resolve(owner).IsSuccess);
+    }
+    private sealed class CallbackParticipant(Func<KernelResult> close) : IComposedWorkTeardownParticipant
+    {
+        public KernelResult CloseComposedWorkForProcess(ProcessHandle process, RegionOwner owner) => close();
+    }
+    [Fact]
     [Trait("Category", "Runtime")]
     public async Task TerminationClosesWaitersAndKillsLocalAuthorityBeforeDeferredPlatformDrainCompletes()
     {

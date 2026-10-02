@@ -91,13 +91,49 @@ public sealed partial class PlatformAuthorityBridge
         if (providerIncarnation.Value == 0)
             return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(KernelError.PlatformFaulted,
                 "The exact mapping provider returned an invalid zero runtime incarnation.");
-        var providerResult = mappingProvider.MapOwnedRegionSlice(
-            domainRecord.ProviderLease,
-            slice);
+        lock (_secureDomainLifecycleGate)
+        {
+            var admission = ValidateDomain(binding, expectedSubject);
+            if (!admission.IsSuccess)
+                return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(admission.Error, admission.Message!);
+            domainRecord.PendingMappings++;
+        }
+        try
+        {
+        PlatformAuthorityResult<PlatformProviderOwnedRegionMapping> providerResult;
+        try { providerResult = mappingProvider.MapOwnedRegionSlice(domainRecord.ProviderLease, slice); }
+        catch (Exception exception) when (exception is not StackOverflowException)
+        {
+            lock (_secureDomainLifecycleGate)
+            {
+                // Keep an owner record for an effect whose receipt was lost. No provider
+                // lease or closure evidence is inferred from this local correlation.
+                var unresolved = new PlatformRegionMapping(
+                    new PlatformRegionMappingId(_nextMappingId++),
+                    new PlatformRegionMappingGeneration(1), binding, slice.Region.Handle, slice.Access);
+                _mappings.Add(unresolved.MappingId,
+                    new MappingRecord(unresolved, default, authorityCapabilityId,
+                        providerIncarnation, backendEpoch)
+                    {
+                        ClosureState = PlatformExternalClosureState.Faulted,
+                    });
+                _exactMappingSlices.Add(unresolved.MappingId, slice);
+                domainRecord.MappingMayHaveEffect = true;
+                QuarantineDomain(domainRecord);
+            }
+            retainReservation = true;
+            return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(KernelError.PlatformFaulted,
+                $"Exact mapping may have taken effect without a provider receipt: {exception.Message}");
+        }
         if (!providerResult.IsSuccess)
         {
-            if (RequiresDomainQuarantine(providerResult.Status))
+            var admissionLostContinuity = BackendEpoch != backendEpoch ||
+                !ReferenceEquals(_domains[binding.BindingId], domainRecord) ||
+                domainRecord.AuthorityState != DomainAuthorityState.Active;
+            if (RequiresDomainQuarantine(providerResult.Status) || admissionLostContinuity)
             {
+                lock (_secureDomainLifecycleGate)
+                {
                 var quarantinedMapping = new PlatformRegionMapping(
                     new PlatformRegionMappingId(_nextMappingId++),
                     new PlatformRegionMappingGeneration(1), binding,
@@ -111,7 +147,12 @@ public sealed partial class PlatformAuthorityBridge
                 _exactMappingSlices.Add(quarantinedMapping.MappingId, slice);
                 QuarantineDomain(domainRecord);
                 retainReservation = true;
+                }
             }
+
+            if (admissionLostContinuity)
+                return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(KernelError.PlatformFaulted,
+                    "Exact mapping admission crossed a backend generation or parent-domain transition; local reservation remains pinned.");
 
             return FromProviderFailure<PlatformOwnedRegionSliceMapping>(
                 providerResult.Status,
@@ -129,6 +170,8 @@ public sealed partial class PlatformAuthorityBridge
                 providerIncarnation, backendEpoch);
             if (!cleanupProven)
             {
+                lock (_secureDomainLifecycleGate)
+                {
                 var quarantinedMapping = new PlatformRegionMapping(
                     new PlatformRegionMappingId(_nextMappingId++),
                     new PlatformRegionMappingGeneration(1), binding,
@@ -142,32 +185,41 @@ public sealed partial class PlatformAuthorityBridge
                 _exactMappingSlices.Add(quarantinedMapping.MappingId, slice);
                 QuarantineDomain(domainRecord);
                 retainReservation = true;
+                }
             }
             return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(
                 KernelError.PlatformFaulted,
                 resultValidation.Message ?? "The provider returned malformed exact mapping evidence.");
         }
 
-        var mapping = new PlatformRegionMapping(
-            new PlatformRegionMappingId(_nextMappingId++),
-            new PlatformRegionMappingGeneration(1),
-            binding,
-            slice.Region.Handle,
-            slice.Access);
-
-        var mappingRecord = new MappingRecord(mapping, providerMapping.Lease,
-            authorityCapabilityId, providerIncarnation, backendEpoch);
-        if (!resultValidation.IsSuccess ||
-            CurrentProviderIncarnation() != providerIncarnation || BackendEpoch != backendEpoch)
-            mappingRecord.ClosureState = PlatformExternalClosureState.Faulted;
-        _mappings.Add(mapping.MappingId, mappingRecord);
-        _exactMappingSlices.Add(mapping.MappingId, slice);
+        PlatformRegionMapping mapping;
+        lock (_secureDomainLifecycleGate)
+        {
+            mapping = new PlatformRegionMapping(
+                new PlatformRegionMappingId(_nextMappingId++),
+                new PlatformRegionMappingGeneration(1), binding,
+                slice.Region.Handle, slice.Access);
+            var mappingRecord = new MappingRecord(mapping, providerMapping.Lease,
+                authorityCapabilityId, providerIncarnation, backendEpoch);
+            if (!resultValidation.IsSuccess ||
+                !ReferenceEquals(_domains[binding.BindingId], domainRecord) ||
+                CurrentProviderIncarnation() != providerIncarnation || BackendEpoch != backendEpoch ||
+                domainRecord.AuthorityState != DomainAuthorityState.Active)
+                mappingRecord.ClosureState = PlatformExternalClosureState.Faulted;
+            _mappings.Add(mapping.MappingId, mappingRecord);
+            _exactMappingSlices.Add(mapping.MappingId, slice);
+        }
 
         return KernelResult<PlatformOwnedRegionSliceMapping>.Ok(
             new PlatformOwnedRegionSliceMapping(
                 mapping,
                 slice.Offset,
                 slice.Length));
+        }
+        finally
+        {
+            lock (_secureDomainLifecycleGate) domainRecord.PendingMappings--;
+        }
     }
 
     internal KernelResult<PlatformRegionVisibilityEvidence> PrepareRegionMappingForConsumer(

@@ -13,6 +13,22 @@ public sealed class PlatformDmaDsc1MappingInterlockTests
     private const long DisjointDscOffset = 64;
 
     [Fact]
+    public void CapabilityRevokeDeniesMappingBeforeDsc1CancellationCallback()
+    {
+        var scenario = CreateScenario(2220, 2400);
+        Assert.True(SubmitDsc1(scenario, scenario.First, scenario.Second, DisjointDscOffset).IsSuccess);
+        scenario.Provider.BeforeDsc1Cancel = () =>
+        {
+            Assert.False(scenario.Kernel.CapabilityAuthority.Validate(scenario.First.Capability,
+                scenario.Binding.Subject.DomainId, scenario.Subject.Generation, CapabilityRights.Map).IsSuccess);
+            Assert.Equal(KernelError.PlatformBindingRevoked,
+                scenario.Kernel.PlatformAuthority.ValidateMapping(
+                    scenario.First.Mapping.Mapping, scenario.Binding.Subject).Error);
+        };
+        Assert.True(scenario.Kernel.RevokeCapability(scenario.First.Capability).IsSuccess);
+        Assert.Equal(1, scenario.Provider.Dsc1CancelCalls);
+    }
+    [Fact]
     public void ActiveDmaRejectsEitherDsc1RoleBeforeProviderAndPreservesIdentityErrors()
     {
         var scenario = CreateScenario(2201, 2210);
@@ -899,7 +915,7 @@ public sealed class PlatformDmaDsc1MappingInterlockTests
             96,
             PlatformMemoryAccess.Read | PlatformMemoryAccess.Write);
         Assert.True(mapping.IsSuccess, mapping.Message);
-        return new MappedBuffer(buffer, mapping.Value!);
+        return new MappedBuffer(buffer, mapping.Value!, capability);
     }
 
     private static CapabilityId Mint(
@@ -922,7 +938,8 @@ public sealed class PlatformDmaDsc1MappingInterlockTests
 
     private sealed record MappedBuffer(
         OwnedBuffer<byte> Buffer,
-        PlatformOwnedRegionSliceMapping Mapping);
+        PlatformOwnedRegionSliceMapping Mapping,
+        CapabilityId Capability);
 
     private sealed record Scenario(
         RuntimeKernel Kernel,
@@ -1000,6 +1017,7 @@ public sealed class PlatformDmaDsc1MappingInterlockTests
             PlatformProviderDmaCompletionState.Pending;
         public bool Dsc1SubmitDenied { get; set; }
         public bool Dsc1CancelPendingOnce { get; set; }
+        public Action? BeforeDsc1Cancel { get; set; }
         public bool Dsc1CompletionFaulted { get; set; }
         public ManualResetEventSlim? DmaSubmitEntered { get; set; }
         public ManualResetEventSlim? DmaSubmitRelease { get; set; }
@@ -1409,6 +1427,7 @@ public sealed class PlatformDmaDsc1MappingInterlockTests
             PlatformProviderDsc1Submission submission)
         {
             Dsc1CancelCalls++;
+            BeforeDsc1Cancel?.Invoke();
             if (Dsc1CancelPendingOnce &&
                 !_dsc1PendingCancellationCompletions.ContainsKey(
                     submission.Operation))

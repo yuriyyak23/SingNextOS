@@ -7,6 +7,12 @@ namespace SingPlus.Tests.Platform;
 
 public sealed class PlatformDeviceLeaseTests
 {
+    // Existing standalone bridge fixtures model trusted caller admission; no Kernel capability claim.
+    private static KernelResult<PlatformDeviceLease> BindDeviceForModel(
+        PlatformAuthorityBridge bridge, PlatformDomainBinding binding, PlatformDomainIdentity owner,
+        CapabilityId capability, PlatformDeviceIdentity device, PlatformDeviceRights rights) =>
+        bridge.BindDevice(binding, owner, capability, device, rights, static () => KernelResult.Ok(), static (_, commit) => commit());
+
     [Fact]
     public void ExactDeviceCapabilityMaterializesSeparateLeaseAndBlocksEarlyDomainClose()
     {
@@ -252,6 +258,163 @@ public sealed class PlatformDeviceLeaseTests
     }
 
     [Fact]
+    public void ProviderRevokedStatusCannotCloseExactDeviceLease()
+    {
+        var provider = new DeviceProvider { RevokeStatus = PlatformAuthorityStatus.Revoked };
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1130, 1230);
+        var binding = kernel.BindPlatformDomain(subject).Value!;
+        var capability = MintDeviceCapability(kernel, subject, "device/revoked-status",
+            CapabilityRights.Configure);
+        var lease = kernel.BindPlatformDevice(subject, binding, capability,
+            PlatformDeviceRights.Configure).Value!;
+
+        Assert.Equal(KernelError.PlatformFaulted, kernel.RevokePlatformDevice(subject, lease).Error);
+        provider.RevokeStatus = null;
+        Assert.Equal(KernelError.PlatformFaulted, kernel.RevokePlatformDevice(subject, lease).Error);
+        Assert.Equal(1, provider.DeviceRevokeCalls);
+        Assert.False(kernel.RevokePlatformDomain(subject, binding).IsSuccess);
+        Assert.Equal(0, provider.DomainRevokeCalls);
+    }
+
+    [Fact]
+    public void DeviceBindReceiptLossQuarantinesParentDomain()
+    {
+        var provider = new DeviceProvider { ThrowOnBindAfterMaterialize = true };
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1131, 1231);
+        var binding = kernel.BindPlatformDomain(subject).Value!;
+        var capability = MintDeviceCapability(kernel, subject, "device/lost-receipt",
+            CapabilityRights.Configure);
+
+        var result = kernel.BindPlatformDevice(subject, binding, capability,
+            PlatformDeviceRights.Configure);
+
+        Assert.Equal(KernelError.PlatformFaulted, result.Error);
+        Assert.Equal(1, provider.DeviceBindCalls);
+        Assert.Equal(0, provider.DeviceRevokeCalls);
+        Assert.Equal(KernelError.PlatformBindingActive, kernel.RevokePlatformDomain(subject, binding).Error);
+        Assert.Equal(0, provider.DomainRevokeCalls);
+        Assert.Equal(KernelError.PlatformFaulted,
+            kernel.BindPlatformDevice(subject, binding, capability,
+                PlatformDeviceRights.Configure).Error);
+        Assert.Equal(1, provider.DeviceBindCalls);
+    }
+
+    [Fact]
+    public void BackendResetPreservesUnknownDeviceBindPin()
+    {
+        var provider = new DeviceProvider { ThrowOnBindAfterMaterialize = true };
+        var bridge = new PlatformAuthorityBridge(provider);
+        var owner = new PlatformDomainIdentity(new DomainId(1233),
+            new ProcessHandle(new ProcessId(1133), 1));
+        var parent = bridge.BindDomain(owner).Value!;
+        Assert.Equal(KernelError.PlatformFaulted,
+            BindDeviceForModel(bridge, parent, owner, new CapabilityId(1), new("device/reset-pin"),
+                PlatformDeviceRights.Configure).Error);
+
+        Assert.True(bridge.ObserveBackendReset().IsSuccess);
+        Assert.True(bridge.TryGetQuarantinedDomainBinding(owner, out var current));
+        Assert.Equal(KernelError.StaleGeneration, bridge.RevokeDomain(parent, owner).Error);
+        Assert.Equal(KernelError.PlatformBindingActive, bridge.RevokeDomain(current, owner).Error);
+        Assert.Equal(0, provider.DomainRevokeCalls);
+    }
+
+    [Fact]
+    public void DeviceBindCallbackBlocksParentRevokeBeforeLeasePublication()
+    {
+        var provider = new DeviceProvider();
+        var bridge = new PlatformAuthorityBridge(provider);
+        var owner = new PlatformDomainIdentity(new DomainId(1234),
+            new ProcessHandle(new ProcessId(1134), 1));
+        var parent = bridge.BindDomain(owner).Value!;
+        provider.AfterBindMaterialize = () =>
+        {
+            Assert.Equal(KernelError.PlatformBindingActive, bridge.RevokeDomain(parent, owner).Error);
+            Assert.Equal(0, provider.DomainRevokeCalls);
+        };
+
+        var lease = BindDeviceForModel(bridge, parent, owner, new CapabilityId(1),
+            new("device/pending-bind"), PlatformDeviceRights.Configure).Value!;
+        Assert.Equal(KernelError.PlatformBindingActive, bridge.RevokeDomain(parent, owner).Error);
+        Assert.True(bridge.RevokeDevice(lease, owner).IsSuccess);
+        Assert.True(bridge.RevokeDomain(parent, owner).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ResetInsideDeviceBindCallbackPinsNewParentGeneration(bool terminalEpoch)
+    {
+        var provider = new DeviceProvider();
+        var bridge = new PlatformAuthorityBridge(provider);
+        var owner = new PlatformDomainIdentity(new DomainId(1235),
+            new ProcessHandle(new ProcessId(1135), 1));
+        var parent = bridge.BindDomain(owner).Value!;
+        if (terminalEpoch)
+            typeof(PlatformAuthorityBridge).GetField("_backendEpoch",
+                BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(bridge, ulong.MaxValue);
+        provider.AfterBindMaterialize = () =>
+        {
+            var reset = bridge.ObserveBackendReset();
+            Assert.Equal(terminalEpoch ? KernelError.CapacityExhausted : KernelError.None, reset.Error);
+        };
+
+        Assert.Equal(KernelError.PlatformFaulted,
+            BindDeviceForModel(bridge, parent, owner, new CapabilityId(1),
+                new("device/reset-during-bind"), PlatformDeviceRights.Configure).Error);
+        Assert.True(bridge.TryGetQuarantinedDomainBinding(owner, out var current));
+        Assert.NotEqual(parent.Generation, current.Generation);
+        Assert.Equal(KernelError.StaleGeneration, bridge.RevokeDomain(parent, owner).Error);
+        Assert.Equal(KernelError.PlatformBindingActive, bridge.RevokeDomain(current, owner).Error);
+        Assert.Equal(0, provider.DomainRevokeCalls);
+    }
+
+    [Fact]
+    public void ParentRevokeCallbackRejectsDeviceBindBeforeProvider()
+    {
+        var provider = new DeviceProvider();
+        var bridge = new PlatformAuthorityBridge(provider);
+        var owner = new PlatformDomainIdentity(new DomainId(1236),
+            new ProcessHandle(new ProcessId(1136), 1));
+        var parent = bridge.BindDomain(owner).Value!;
+        provider.BeforeDomainRevoke = () =>
+        {
+            Assert.Equal(KernelError.PlatformBindingActive,
+                BindDeviceForModel(bridge, parent, owner, new CapabilityId(1),
+                    new("device/revoke-in-flight"), PlatformDeviceRights.Configure).Error);
+            Assert.Equal(0, provider.DeviceBindCalls);
+        };
+
+        Assert.True(bridge.RevokeDomain(parent, owner).IsSuccess);
+        Assert.Equal(1, provider.DomainRevokeCalls);
+    }
+
+    [Theory]
+    [InlineData(PlatformAuthorityStatus.Faulted)]
+    [InlineData(PlatformAuthorityStatus.Denied)]
+    public void DeviceBindNonAcceptanceWithoutExactNoEffectPinsParentDomain(
+        PlatformAuthorityStatus status)
+    {
+        var provider = new DeviceProvider { BindStatusAfterMaterialize = status };
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1132, 1232);
+        var binding = kernel.BindPlatformDomain(subject).Value!;
+        var capability = MintDeviceCapability(kernel, subject, "device/ambiguous-status",
+            CapabilityRights.Configure);
+
+        Assert.False(kernel.BindPlatformDevice(subject, binding, capability,
+            PlatformDeviceRights.Configure).IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingActive,
+            kernel.RevokePlatformDomain(subject, binding).Error);
+        Assert.Equal(0, provider.DomainRevokeCalls);
+        Assert.Equal(KernelError.PlatformFaulted,
+            kernel.BindPlatformDevice(subject, binding, capability,
+                PlatformDeviceRights.Configure).Error);
+        Assert.Equal(1, provider.DeviceBindCalls);
+    }
+
+    [Fact]
     public void DeviceLeaseSurfaceKeepsProviderAndHardwareAuthorityPrivate()
     {
         var surface = new[]
@@ -334,6 +497,10 @@ public sealed class PlatformDeviceLeaseTests
         public DeviceBindFault BindFault { get; set; }
         public PlatformAuthorityStatus? RevokeStatus { get; set; }
         public bool ThrowOnRevoke { get; set; }
+        public bool ThrowOnBindAfterMaterialize { get; set; }
+        public PlatformAuthorityStatus? BindStatusAfterMaterialize { get; set; }
+        public Action? AfterBindMaterialize { get; set; }
+        public Action? BeforeDomainRevoke { get; set; }
         public int DeviceBindCalls { get; private set; }
         public int DeviceRevokeCalls { get; private set; }
         public int DomainRevokeCalls { get; private set; }
@@ -372,6 +539,7 @@ public sealed class PlatformDeviceLeaseTests
         {
             DomainRevokeCalls++;
             Log.Add("revoke-domain");
+            BeforeDomainRevoke?.Invoke();
             _domains.Remove(lease.LeaseId);
             return PlatformAuthorityResult.Ok();
         }
@@ -417,6 +585,12 @@ public sealed class PlatformDeviceLeaseTests
                 returnedRights);
             if (lease.LeaseId.Value != 0)
                 _devices[lease.LeaseId] = lease;
+            AfterBindMaterialize?.Invoke();
+            if (ThrowOnBindAfterMaterialize)
+                throw new InvalidOperationException("Injected device binding receipt loss.");
+            if (BindStatusAfterMaterialize is { } status)
+                return PlatformAuthorityResult<PlatformProviderDeviceLease>.Fail(status,
+                    "Injected ambiguous device binding response.");
             return PlatformAuthorityResult<PlatformProviderDeviceLease>.Ok(lease);
         }
 

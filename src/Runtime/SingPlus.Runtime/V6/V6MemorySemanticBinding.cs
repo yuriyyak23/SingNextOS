@@ -90,6 +90,19 @@ public sealed partial class RuntimeKernel
             return KernelResult.Fail(KernelError.StaleGeneration, "v6 memory binding identity is stale.");
         var live = RevalidateOperationObligationsV1(obligations);
         if (!live.IsSuccess) return live;
+        return RevalidateMemorySidecar(binding, baseBinding, obligations, guarantees, currentProviderGeneration);
+    }
+
+    private KernelResult RevalidateMemorySidecar(
+        V6MemorySemanticBindingV1 binding,
+        SemanticExecutionBindingV1 baseBinding,
+        OperationObligationsV1 obligations,
+        ExecutionGuaranteesV1 guarantees,
+        ulong currentProviderGeneration)
+    {
+        if (binding.Version != V6MemorySemanticBindingV1.CurrentVersion ||
+            binding.BaseBindingDigest != baseBinding.Digest || currentProviderGeneration == 0)
+            return KernelResult.Fail(KernelError.StaleGeneration, "v6 memory binding identity is stale.");
         var rebuilt = CreateV6MemorySemanticBinding(baseBinding, obligations, guarantees,
             binding.Requirements, binding.Guarantees, currentProviderGeneration);
         if (!rebuilt.IsSuccess)
@@ -142,13 +155,28 @@ public sealed partial class RuntimeKernel
         ISemanticTraceSinkV1? traceSink = null)
     {
         ArgumentNullException.ThrowIfNull(currentProviderGeneration);
-        if (traceSink is not null)
-            RegisterExternalOperationTrace(commit.Operation,
-                memoryBinding.ExtensionBinding.Digest.Value, traceSink);
+        ArgumentNullException.ThrowIfNull(providerSubmit);
         var submitted = SubmitSemanticResourceExternalAdmissionWithBinding(commit, dependencies, baseBinding, obligations, guarantees,
             refinement, currentProviderIdentity, currentProviderGenerations, providerAdmission, runtimeLegality,
-            providerSubmit, () => RevalidateV6MemorySemanticBinding(memoryBinding, baseBinding, obligations,
-                guarantees, currentProviderGeneration()));
+            operationBinding =>
+            {
+                var fresh = RevalidateMemorySidecar(memoryBinding, baseBinding, obligations,
+                    guarantees, currentProviderGeneration());
+                if (!fresh.IsSuccess) return fresh;
+                var owners = RevalidateResourceDispatch(commit, operationBinding);
+                return owners.IsSuccess ? providerSubmit(operationBinding) : owners;
+            }, () =>
+            {
+                var revalidated = RevalidateV6MemorySemanticBinding(memoryBinding, baseBinding, obligations,
+                    guarantees, currentProviderGeneration());
+                return revalidated;
+            }, () =>
+            {
+                if (traceSink is not null)
+                    RegisterExternalOperationTrace(commit.Operation, memoryBinding.ExtensionBinding.Digest.Value, traceSink);
+            }, () => ObserveFailedPreSubmitTrace(commit, baseBinding, obligations,
+                memoryBinding.ExtensionBinding, traceSink, generation =>
+                    RevalidateMemorySidecar(memoryBinding, baseBinding, obligations, guarantees, generation)));
         if (traceSink is not null)
         {
             EmitExternalOperationTrace(commit.Operation);
@@ -171,6 +199,13 @@ public sealed partial class RuntimeKernel
             requiredClause.Requirement != SemanticExtensionRequirement.Mandatory)
             return KernelResult<(MemorySemanticsV1, MemorySemanticsV1)>.Fail(KernelError.PlatformDenied,
                 "The safe v6 memory contour requires one mandatory memory clause and one guarantee.");
+
+        if (requiredClause.SchemaId != "singnext.memory-semantics/1" ||
+            providedClause.SchemaId != "singnext.memory-semantics/1" ||
+            requiredClause.SchemaVersion != MemorySemanticsV1.CurrentVersion ||
+            providedClause.SchemaVersion != MemorySemanticsV1.CurrentVersion)
+            return KernelResult<(MemorySemanticsV1, MemorySemanticsV1)>.Fail(KernelError.PlatformDenied,
+                "The memory contour does not support this exact extension schema tuple.");
 
         MemorySemanticsV1 required;
         MemorySemanticsV1 provided;

@@ -8,17 +8,17 @@ namespace SingPlus.Platform.HybridCpu.Tests;
 public sealed class Phase504ExecutableAdapterTests
 {
     [Fact]
-    public void ExplicitAdapterCompositionPublishesExecutableChildAndIoButNotNestedOrTrap()
+    public void ExplicitAdapterCompositionKeepsUnboundVirtualIoAndAggregateDomainUnavailable()
     {
         var provider = new HybridCpuPlatformAuthorityProvider(
             new NeutralDomainRuntimeFacade(), new HybridCpuExecutableChildAdapter());
         PlatformFeatureManifest features = provider.QueryFeatures();
 
-        Assert.Equal(PlatformFeatureAvailability.Executable,
+        Assert.Equal(PlatformFeatureAvailability.Unavailable,
             features.Resolve(PlatformFeatureFamily.VirtualizationDomains).Availability);
         Assert.Equal(PlatformFeatureAvailability.Executable,
             features.Resolve(PlatformFeatureFamily.ChildExecutableArtifact).Availability);
-        Assert.Equal(PlatformFeatureAvailability.Executable,
+        Assert.Equal(PlatformFeatureAvailability.Unavailable,
             features.Resolve(PlatformFeatureFamily.BoundedVirtualIo).Availability);
         Assert.Equal(PlatformFeatureAvailability.Unavailable,
             features.Resolve(PlatformFeatureFamily.NestedDomains).Availability);
@@ -34,6 +34,7 @@ public sealed class Phase504ExecutableAdapterTests
             features.Resolve(PlatformFeatureFamily.VmxCompatibility).Availability);
         Assert.Equal(HybridCpuChildDomainAdapterReadiness.Ready,
             provider.QueryChildDomainAdapterStatus().Readiness);
+        Assert.False(provider.QueryChildDomainAdapterStatus().HasVirtualIo);
     }
 
     [Fact]

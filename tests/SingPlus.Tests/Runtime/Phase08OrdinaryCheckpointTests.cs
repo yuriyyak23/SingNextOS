@@ -9,6 +9,30 @@ public sealed class Phase08OrdinaryCheckpointTests
 {
     private static readonly byte[] Image = [0x08, 0x88];
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CheckpointStorageCannotBeRefundedByObservedHandleBeforeActualDelete(bool retireSource)
+    {
+        var kernel = new RuntimeKernel();
+        var admin = Admin(kernel, 898, 8908);
+        var component = kernel.AdmitComponent(Plan("checkpoint-release-provenance", 808, 8008, 1)).Value!;
+        var checkpoint = kernel.CreateOrdinaryCheckpoint(admin.Process, admin.Capability, component.Identity, new byte[8]);
+        Assert.True(checkpoint.IsSuccess, checkpoint.Message);
+        var reservation = Assert.Single(kernel.Budgets.InspectionSnapshot(), r =>
+            r.Owner == component.Process && r.Lifetime == BudgetReservationLifetime.CheckpointImage).Reservation;
+        Assert.Equal(KernelError.InvalidTransition, kernel.ReleaseBudget(component.Process, reservation).Error);
+        Assert.Equal(8UL, Usage(kernel.QueryBudget(component.ProcessBudget).Value!, ServiceBudgetDimension.CheckpointStorageBytes).Used);
+        if (retireSource) Assert.True(kernel.TerminateProcess(component.Process).IsSuccess);
+        Assert.Equal(8UL, Usage(kernel.QueryBudget(kernel.Budgets.SystemBudget).Value!, ServiceBudgetDimension.CheckpointStorageBytes).Used);
+        var stale = reservation with { Generation = new(reservation.Generation.Value + 1) };
+        Assert.Equal(BudgetReservationState.Stale, kernel.ReleaseBudget(component.Process, stale).Value!.State);
+        Assert.Equal(KernelError.WrongRegionOwner, kernel.ReleaseBudget(component.Process with { Generation = 2 }, reservation).Error);
+        Assert.True(kernel.DeleteOrdinaryCheckpoint(admin.Process, admin.Capability, checkpoint.Value!.Handle).IsSuccess);
+        Assert.Equal(0UL, Usage(kernel.QueryBudget(kernel.Budgets.SystemBudget).Value!, ServiceBudgetDimension.CheckpointStorageBytes).Used);
+        Assert.True(kernel.DeleteOrdinaryCheckpoint(admin.Process, admin.Capability, checkpoint.Value!.Handle).IsSuccess);
+    }
+
     [Fact]
     public void PlannedCheckpointReplacementRestoresLogicalMemoryWithFreshAuthority()
     {

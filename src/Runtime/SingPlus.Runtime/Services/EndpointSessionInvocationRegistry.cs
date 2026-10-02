@@ -31,6 +31,7 @@ internal sealed class EndpointSessionInvocationRegistry
         public bool CancellationAccepted { get; set; }
         public bool AcceptedResponseCancelled { get; set; }
         public bool FailedSettlementMayHaveEffect { get; set; }
+        public bool DonationReturnInProgress { get; set; }
         public ResponsePublicationStatus? SettlementInProgress { get; set; }
         public ResponsePublicationStatus? TerminalStatus { get; set; }
         public ResourceDonationBinding? ResourceDonation { get; set; }
@@ -38,12 +39,17 @@ internal sealed class EndpointSessionInvocationRegistry
 
     private readonly Dictionary<(EndpointSessionId Session, EndpointSessionGeneration SessionGeneration, EndpointSessionInvocationId Invocation), Record> _records = [];
     private readonly object _gate = new();
+    private readonly object _settlementAdmissionGate;
     private readonly CancellationScopeAuthority _cancellationScopes;
 
     internal Action? SettlementReservedHook { get; set; }
 
-    internal EndpointSessionInvocationRegistry(CancellationScopeAuthority cancellationScopes) =>
+    internal EndpointSessionInvocationRegistry(CancellationScopeAuthority cancellationScopes,
+        object? settlementAdmissionGate = null)
+    {
         _cancellationScopes = cancellationScopes;
+        _settlementAdmissionGate = settlementAdmissionGate ?? _gate;
+    }
 
     internal EndpointSessionInvocationHandle Register(
         EndpointSessionHandle session,
@@ -214,6 +220,9 @@ internal sealed class EndpointSessionInvocationRegistry
                 return KernelResult.Fail(KernelError.ResponseNotPending, "Endpoint session invocation is already terminal.");
             if (!record.Delivered)
                 return KernelResult.Fail(KernelError.ResponseNotDelivered, "Endpoint session invocation has not been delivered to the service.");
+            if (record.FailedSettlementMayHaveEffect || record.SettlementInProgress is not null)
+                return KernelResult.Fail(KernelError.InvalidTransition,
+                    "Invocation settlement may have an effect; new service acceptance requires exact closure.");
             if (record.ServiceAccepted)
                 return KernelResult.Fail(KernelError.InvalidTransition, "Endpoint session invocation was already accepted by the service.");
             if (record.CancellationRequested)
@@ -348,13 +357,14 @@ internal sealed class EndpointSessionInvocationRegistry
         ResponsePublicationStatus status,
         bool? requireCancellationAccepted)
     {
+        lock (_settlementAdmissionGate)
         lock (_gate)
         {
             var resolved = ResolveForService(handle, service);
             if (!resolved.IsSuccess)
                 return KernelResult<Record>.Fail(resolved.Error, resolved.Message!);
             var record = resolved.Value!;
-            if (record.TerminalStatus is not null || record.SettlementInProgress is not null)
+            if (record.TerminalStatus is not null || record.SettlementInProgress is not null || record.DonationReturnInProgress)
                 return KernelResult<Record>.Fail(KernelError.ResponseNotPending, "Endpoint session invocation is already terminal or settlement is in progress.");
             if (!record.Delivered)
                 return KernelResult<Record>.Fail(KernelError.ResponseNotDelivered, "Endpoint session invocation has not been delivered to the service.");
@@ -446,21 +456,43 @@ internal sealed class EndpointSessionInvocationRegistry
             var record = resolved.Value!;
             if (record.Caller != binding.Caller || record.Service != binding.Service)
                 return KernelResult<ResourceDonationBinding>.Fail(KernelError.WrongSessionOwner, "Donation provenance does not match the exact invocation peers.");
-            if (record.TerminalStatus is not null || record.ResourceDonation is not null)
+            if (record.TerminalStatus is not null || record.ResourceDonation is not null ||
+                record.SettlementInProgress is not null || record.FailedSettlementMayHaveEffect)
                 return KernelResult<ResourceDonationBinding>.Fail(KernelError.InvalidTransition, "Invocation is terminal or already has a resource donation.");
             record.ResourceDonation = binding;
             return KernelResult<ResourceDonationBinding>.Ok(binding);
         }
     }
 
+    internal KernelResult ValidateResourceDonationBindingAdmission(
+        EndpointSessionInvocationHandle invocation, ProcessHandle caller, ProcessHandle service)
+    {
+        lock (_gate)
+        {
+            var resolved = ResolveForCaller(invocation, caller);
+            if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+            var record = resolved.Value!;
+            if (record.Service != service)
+                return KernelResult.Fail(KernelError.WrongSessionOwner, "Donation service generation does not match.");
+            if (record.TerminalStatus is not null || record.ResourceDonation is not null ||
+                record.SettlementInProgress is not null || record.FailedSettlementMayHaveEffect)
+                return KernelResult.Fail(KernelError.InvalidTransition, "Invocation cannot admit a new donation binding.");
+            return KernelResult.Ok();
+        }
+    }
+
     internal KernelResult<ResourceDonationBinding> ResolveResourceDonation(
-        EndpointSessionInvocationHandle invocation, ProcessHandle service)
+        EndpointSessionInvocationHandle invocation, ProcessHandle service, bool requireAdmission = false)
     {
         lock (_gate)
         {
             var resolved = ResolveForService(invocation, service);
             if (!resolved.IsSuccess) return KernelResult<ResourceDonationBinding>.Fail(resolved.Error, resolved.Message!);
             var donation = resolved.Value!.ResourceDonation;
+            if (requireAdmission && (resolved.Value.DonationReturnInProgress || resolved.Value.TerminalStatus is not null || resolved.Value.SettlementInProgress is not null ||
+                resolved.Value.FailedSettlementMayHaveEffect))
+                return KernelResult<ResourceDonationBinding>.Fail(KernelError.InvalidTransition,
+                    "Invocation settlement prevents new donation consumption.");
             return donation is not null && donation.State is ResourceDonationState.Bound or ResourceDonationState.Active
                 ? KernelResult<ResourceDonationBinding>.Ok(donation)
                 : KernelResult<ResourceDonationBinding>.Fail(KernelError.InvalidTransition, "Invocation has no live resource donation.");
@@ -468,12 +500,16 @@ internal sealed class EndpointSessionInvocationRegistry
     }
 
     internal KernelResult<ResourceDonationBinding> InspectResourceDonation(
-        EndpointSessionInvocationHandle invocation, ProcessHandle service)
+        EndpointSessionInvocationHandle invocation, ProcessHandle service, bool requirePreSubmitClosure = false)
     {
         lock (_gate)
         {
             var resolved = ResolveForService(invocation, service);
             if (!resolved.IsSuccess) return KernelResult<ResourceDonationBinding>.Fail(resolved.Error, resolved.Message!);
+            if (requirePreSubmitClosure && (resolved.Value!.SettlementInProgress is not null ||
+                resolved.Value.FailedSettlementMayHaveEffect))
+                return KernelResult<ResourceDonationBinding>.Fail(KernelError.InvalidTransition,
+                    "Ambiguous invocation settlement cannot prove pre-submit donation closure.");
             return resolved.Value!.ResourceDonation is { } donation
                 ? KernelResult<ResourceDonationBinding>.Ok(donation)
                 : KernelResult<ResourceDonationBinding>.Fail(KernelError.InvalidTransition, "Invocation has no resource donation.");
@@ -491,9 +527,60 @@ internal sealed class EndpointSessionInvocationRegistry
             if (donation is null || donation.State != ResourceDonationState.Bound)
                 return KernelResult<ResourceDonationBinding>.Fail(KernelError.InvalidTransition,
                     "Only a bound resource donation can cross the possible-submit boundary.");
+            if (resolved.Value.DonationReturnInProgress || resolved.Value.TerminalStatus is not null || resolved.Value.SettlementInProgress is not null ||
+                resolved.Value.FailedSettlementMayHaveEffect)
+                return KernelResult<ResourceDonationBinding>.Fail(KernelError.InvalidTransition,
+                    "Invocation settlement prevents new donation activation.");
             var active = donation with { State = ResourceDonationState.Active };
             resolved.Value.ResourceDonation = active;
             return KernelResult<ResourceDonationBinding>.Ok(active);
+        }
+    }
+
+    internal KernelResult<ResourceDonationBinding> ReturnResourceDonationPreSubmit(
+        EndpointSessionInvocationHandle invocation, ProcessHandle service,
+        Func<ResourceDonationBinding, KernelResult> cancelBudget)
+    {
+        ArgumentNullException.ThrowIfNull(cancelBudget);
+        Record record;
+        ResourceDonationBinding donation;
+        lock (_gate)
+        {
+            var resolved = ResolveForService(invocation, service);
+            if (!resolved.IsSuccess) return KernelResult<ResourceDonationBinding>.Fail(resolved.Error, resolved.Message!);
+            record = resolved.Value!;
+            if (record.DonationReturnInProgress || record.SettlementInProgress is not null ||
+                record.FailedSettlementMayHaveEffect || record.ResourceDonation is not
+                { State: ResourceDonationState.Bound or ResourceDonationState.Returned } current)
+                return KernelResult<ResourceDonationBinding>.Fail(KernelError.InvalidTransition,
+                    "Donation lacks exact pre-submit return admission.");
+            donation = current;
+            record.DonationReturnInProgress = true;
+        }
+        try
+        {
+            var cancelled = cancelBudget(donation);
+            lock (_gate)
+            {
+                if (!cancelled.IsSuccess)
+                    return KernelResult<ResourceDonationBinding>.Fail(cancelled.Error, cancelled.Message!);
+                if (record.ResourceDonation != donation)
+                    return KernelResult<ResourceDonationBinding>.Fail(KernelError.InvalidTransition,
+                        "Session loss changed donation closure during budget cancellation.");
+                var returned = donation with { State = ResourceDonationState.Returned };
+                record.ResourceDonation = returned;
+                return KernelResult<ResourceDonationBinding>.Ok(returned);
+            }
+        }
+        catch
+        {
+            lock (_gate)
+                record.ResourceDonation = donation with { State = ResourceDonationState.Quarantined };
+            throw;
+        }
+        finally
+        {
+            lock (_gate) record.DonationReturnInProgress = false;
         }
     }
 
@@ -507,6 +594,13 @@ internal sealed class EndpointSessionInvocationRegistry
             var donation = resolved.Value!.ResourceDonation;
             if (donation is null)
                 return KernelResult<ResourceDonationBinding>.Fail(KernelError.InvalidTransition, "Invocation has no resource donation.");
+            if (resolved.Value.DonationReturnInProgress)
+                return KernelResult<ResourceDonationBinding>.Fail(KernelError.InvalidTransition,
+                    "Donation return already has an owner winner.");
+            if (terminal == ResourceDonationState.Returned &&
+                (resolved.Value.SettlementInProgress is not null || resolved.Value.FailedSettlementMayHaveEffect))
+                return KernelResult<ResourceDonationBinding>.Fail(KernelError.InvalidTransition,
+                    "Ambiguous invocation settlement cannot prove pre-submit donation closure.");
             if (donation.State is ResourceDonationState.Returned or ResourceDonationState.Quarantined or ResourceDonationState.Closed)
                 return donation.State == terminal
                     ? KernelResult<ResourceDonationBinding>.Ok(donation)
@@ -546,6 +640,7 @@ internal sealed class EndpointSessionInvocationRegistry
     }
 
     private static bool HasUnclosedPossibleEffect(Record record) =>
+        record.DonationReturnInProgress ||
         record.SettlementInProgress is not null ||
         record.ServiceAccepted && record.TerminalStatus is null ||
         record.AcceptedResponseCancelled ||

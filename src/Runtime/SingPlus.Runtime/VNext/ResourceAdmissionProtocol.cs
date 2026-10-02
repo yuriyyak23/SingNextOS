@@ -78,14 +78,18 @@ internal sealed class ResourceAdmissionCommit : IDisposable
     internal OperationAuthorityLease EffectAuthority { get; }
     internal PlatformResourceCorrelation ProviderCorrelation { get; }
     internal bool TryStartSubmit() => Interlocked.CompareExchange(ref _submitStarted, 1, 0) == 0;
-    internal bool SubmitStarted => Volatile.Read(ref _submitStarted) != 0;
+    internal bool TryCloseBeforeSubmit() => Interlocked.CompareExchange(ref _submitStarted, -1, 0) == 0;
+    internal bool SubmitStarted => Volatile.Read(ref _submitStarted) > 0;
 
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        // Disposal and submit contend on the same admission state: -1 closes
+        // an unused commit without inventing a submitted external effect.
+        var unused = TryCloseBeforeSubmit();
         EffectAuthority.Dispose();
         ResourceAuthority.Dispose();
-        if (!SubmitStarted)
+        if (unused)
             _kernel.CompensateResourceAdmissionBeforeSubmit(this);
     }
 }
@@ -226,7 +230,18 @@ public sealed partial class RuntimeKernel
             ResourceAdmissionQualificationHook?.At(ResourceAdmissionQualificationPoint.AfterFinalRevalidation);
 
             var acquiredResource = CapabilityAuthority.AcquireResourceUseAuthority(resourceGrant,
-                process.Value.DomainId, principal.Generation, resourceGrantGeneration, requested);
+                process.Value.DomainId, principal.Generation, resourceGrantGeneration, requested,
+                revalidateConsumer: () =>
+                {
+                    var current = Processes.Resolve(principal);
+                    if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
+                    var accepts = EnsureProcessAcceptsNewEffects(current.Value!);
+                    if (!accepts.IsSuccess) return accepts;
+                    var prepared = ExternalOperations.Query(operation);
+                    return prepared.IsSuccess && prepared.Value!.State == ExternalOperationState.Prepared
+                        ? KernelResult.Ok()
+                        : KernelResult.Fail(KernelError.StaleGeneration, "External operation changed during resource clock collection.");
+                });
             if (!acquiredResource.IsSuccess)
                 return KernelResult<ResourceAdmissionCommit>.Fail(acquiredResource.Error, acquiredResource.Message!);
             resourceAuthority = acquiredResource.Value!;
@@ -235,6 +250,10 @@ public sealed partial class RuntimeKernel
                 effectResourceGeneration, CapabilityOperation.Execute);
             if (!acquired.IsSuccess) return KernelResult<ResourceAdmissionCommit>.Fail(acquired.Error, acquired.Message!);
             effectAuthority = acquired.Value!;
+            var liveRecords = RevalidateAdmissionCapabilityRecords(principal, effectCapability,
+                effectResourceGeneration, resourceGrant, resourceGrantGeneration);
+            if (!liveRecords.IsSuccess)
+                return KernelResult<ResourceAdmissionCommit>.Fail(liveRecords.Error, liveRecords.Message!);
             var bound = Budgets.BindLease(exactBudgetOwner, lease.Value);
             if (!bound.IsSuccess) return KernelResult<ResourceAdmissionCommit>.Fail(bound.Error, bound.Message!);
             var admitted = ExternalOperations.Admit(operation, dependencies);
@@ -272,17 +291,13 @@ public sealed partial class RuntimeKernel
         {
             effectAuthority?.Dispose();
             resourceAuthority?.Dispose();
-            if (externalCommitted)
+            if (externalCommitted && lease is { } cancelled)
             {
-                _ = ExternalOperations.Cancel(operation, providerCancellationSupported: false);
-                _ = ExternalOperations.MarkResourceCancelledPreSubmit(operation);
-                if (lease is { } cancelled)
-                    _ = AppendResourceRecovery(cancelled, exactBudgetOwner, envelope,
-                        new PlatformResourceCorrelation(new PlatformResourceCorrelationId(operation.OperationId.Value),
-                            new PlatformResourceCorrelationGeneration(operation.Generation.Value)),
-                        ResourceBudgetRecoveryTransition.CancelledPreSubmit, []);
+                _ = CompensateResourceAdmissionBeforeSubmit(operation, exactBudgetOwner, cancelled, envelope,
+                    new PlatformResourceCorrelation(new PlatformResourceCorrelationId(operation.OperationId.Value),
+                        new PlatformResourceCorrelationGeneration(operation.Generation.Value)));
             }
-            if (lease is { } reservation)
+            else if (lease is { } reservation)
                 _ = Budgets.CancelLeasePreSubmit(exactBudgetOwner, reservation);
         }
     }
@@ -306,7 +321,9 @@ public sealed partial class RuntimeKernel
         ResourceAdmissionCommit commit,
         OperationDependencySnapshot dependencies,
         Func<OperationBinding, KernelResult> providerSubmit,
-        Func<KernelResult>? finalSentry = null)
+        Func<KernelResult>? finalSentry = null,
+        Action? submissionObservation = null,
+        Action? preSubmitFailureObservation = null)
     {
         ArgumentNullException.ThrowIfNull(commit);
         ArgumentNullException.ThrowIfNull(providerSubmit);
@@ -331,20 +348,25 @@ public sealed partial class RuntimeKernel
                 if (commit.SubmitStarted)
                     return KernelResult<OperationBinding>.Fail(KernelError.InvalidTransition,
                         "Provider submission was already won; no post-submit compensation is permitted.");
-                return FailBeforeSubmit(commit, final.Error, final.Message!);
+                return FailBeforeSubmit(commit, final.Error, final.Message!, observation: preSubmitFailureObservation);
             }
         }
         if (!commit.TryStartSubmit())
             return KernelResult<OperationBinding>.Fail(KernelError.InvalidTransition, "Duplicate provider submission is denied.");
 
         var process = Processes.Resolve(commit.Principal);
-        if (!process.IsSuccess) return FailBeforeSubmit(commit, process.Error, process.Message!);
+        if (!process.IsSuccess) return FailBeforeSubmit(commit, process.Error, process.Message!, ownsSubmit: true, observation: preSubmitFailureObservation);
         var durableSubmit = AppendResourceRecovery(commit.Lease, commit.BudgetOwner, commit.Envelope,
             commit.ProviderCorrelation, ResourceBudgetRecoveryTransition.PossibleSubmit, []);
         if (!durableSubmit.IsSuccess)
-            return FailBeforeSubmit(commit, durableSubmit.Error, durableSubmit.Message!);
+            return FailBeforeSubmit(commit, durableSubmit.Error, durableSubmit.Message!, ownsSubmit: true, observation: preSubmitFailureObservation);
         var submitted = ExternalOperations.RecordSubmission(commit.Operation, dependencies);
-        if (!submitted.IsSuccess) return FailBeforeSubmit(commit, submitted.Error, submitted.Message!);
+        if (!submitted.IsSuccess) return FailBeforeSubmit(commit, submitted.Error, submitted.Message!, ownsSubmit: true, observation: preSubmitFailureObservation);
+        try { submissionObservation?.Invoke(); }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        {
+            // Observation cannot veto or compensate an authoritative submission.
+        }
         var consuming = Budgets.BeginConsumption(commit.BudgetOwner, commit.Lease);
         if (!consuming.IsSuccess)
         {
@@ -369,7 +391,8 @@ public sealed partial class RuntimeKernel
         try
         {
             ResourceAdmissionQualificationHook?.At(ResourceAdmissionQualificationPoint.BeforeProviderCallback);
-            var provider = providerSubmit(submitted.Value!);
+            var authorization = RevalidateResourceDispatch(commit, submitted.Value!);
+            var provider = !authorization.IsSuccess ? authorization : providerSubmit(submitted.Value!);
             ResourceAdmissionQualificationHook?.At(ResourceAdmissionQualificationPoint.AfterProviderCallback);
             if (provider.IsSuccess) return submitted;
             _ = ExternalOperations.RecordProviderLoss(commit.Operation);
@@ -395,21 +418,74 @@ public sealed partial class RuntimeKernel
         }
     }
 
-    internal void CompensateResourceAdmissionBeforeSubmit(ResourceAdmissionCommit commit)
+    internal KernelResult CompensateResourceAdmissionBeforeSubmit(ResourceAdmissionCommit commit)
+        => CompensateResourceAdmissionBeforeSubmit(commit.Operation, commit.BudgetOwner, commit.Lease,
+            commit.Envelope, commit.ProviderCorrelation);
+
+    private KernelResult RevalidateResourceDispatch(ResourceAdmissionCommit commit, OperationBinding binding)
     {
-        _ = ExternalOperations.Cancel(commit.Operation, providerCancellationSupported: false);
-        _ = Budgets.CancelLeasePreSubmit(commit.BudgetOwner, commit.Lease);
-        _ = ExternalOperations.MarkResourceCancelledPreSubmit(commit.Operation);
-        _ = AppendResourceRecovery(commit.Lease, commit.BudgetOwner, commit.Envelope,
-            commit.ProviderCorrelation, ResourceBudgetRecoveryTransition.CancelledPreSubmit, []);
+        var authorization = RevalidateResourceAdmissionCommit(commit, afterSubmit: true);
+        if (!authorization.IsSuccess) return authorization;
+        var liveOwner = ExternalOperations.Query(commit.Operation);
+        var liveBudget = Budgets.Query(commit.Lease);
+        var liveResource = ExternalOperations.QueryResourceBinding(commit.Operation);
+        return liveOwner.IsSuccess && liveOwner.Value!.State == ExternalOperationState.Submitted &&
+            liveOwner.Value.Disposition == ExternalOperationDisposition.Active && liveOwner.Value.Binding == binding &&
+            liveBudget.IsSuccess && liveBudget.Value!.Owner == commit.BudgetOwner &&
+            liveBudget.Value.State == BudgetReservationState.Consuming &&
+            liveResource.IsSuccess && liveResource.Value!.Lease == commit.Lease &&
+            liveResource.Value.State == ExternalResourceBindingState.Consuming
+                ? KernelResult.Ok()
+                : KernelResult.Fail(KernelError.StaleGeneration,
+                    "Exact resource owners changed before provider callback; reservations remain pinned.");
     }
 
-    private KernelResult<OperationBinding> FailBeforeSubmit(ResourceAdmissionCommit commit, KernelError error, string message)
+    private KernelResult CompensateResourceAdmissionBeforeSubmit(ExternalOperationHandle operation,
+        ProcessHandle budgetOwner, BudgetReservationHandle lease, ResourceEnvelopeV1 envelope,
+        PlatformResourceCorrelation correlation)
     {
-        CompensateResourceAdmissionBeforeSubmit(commit);
+        var cancelled = ExternalOperations.Cancel(operation, providerCancellationSupported: false);
+        if (!cancelled.IsSuccess ||
+            (cancelled.Value!.State is not (ExternalOperationState.Prepared or ExternalOperationState.Admitted) &&
+             !(cancelled.Value.State == ExternalOperationState.Released && cancelled.Value.Binding is null)) ||
+            cancelled.Value.Disposition != ExternalOperationDisposition.Cancelled)
+            return QuarantineCompensation();
+        var budget = Budgets.CancelLeasePreSubmit(budgetOwner, lease);
+        if (!budget.IsSuccess) return QuarantineCompensation();
+        var binding = ExternalOperations.MarkResourceCancelledPreSubmit(operation);
+        if (!binding.IsSuccess) return QuarantineCompensation();
+        return AppendResourceRecovery(lease, budgetOwner, envelope,
+            correlation, ResourceBudgetRecoveryTransition.CancelledPreSubmit, []);
+
+        KernelResult QuarantineCompensation()
+        {
+            _ = Budgets.QuarantineLease(budgetOwner, lease);
+            _ = ExternalOperations.MarkResourceQuarantined(operation);
+            _ = AppendResourceRecovery(lease, budgetOwner, envelope,
+                correlation, ResourceBudgetRecoveryTransition.Quarantined, []);
+            return KernelResult.Fail(KernelError.Quarantined,
+                "Pre-submit compensation was not confirmed by the authoritative owners.");
+        }
+    }
+
+    private KernelResult<OperationBinding> FailBeforeSubmit(ResourceAdmissionCommit commit, KernelError error, string message,
+        bool ownsSubmit = false, Action? observation = null)
+    {
+        if (!ownsSubmit && !commit.TryCloseBeforeSubmit())
+            return KernelResult<OperationBinding>.Fail(KernelError.InvalidTransition,
+                "Admission was already closed or submit was won; no losing compensation is permitted.");
+        var compensation = CompensateResourceAdmissionBeforeSubmit(commit);
         commit.EffectAuthority.Dispose();
         commit.ResourceAuthority.Dispose();
-        return KernelResult<OperationBinding>.Fail(error, message);
+        try { observation?.Invoke(); }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        {
+            // Only the submit/close winner observes committed compensation; observation
+            // cannot change its result or steal another caller's submission trace.
+        }
+        return compensation.IsSuccess
+            ? KernelResult<OperationBinding>.Fail(error, message)
+            : KernelResult<OperationBinding>.Fail(compensation.Error, compensation.Message!);
     }
 
     private KernelResult AppendResourceRecovery(
@@ -423,11 +499,11 @@ public sealed partial class RuntimeKernel
         if (_resourceBudgetRecoveryJournal is null) return KernelResult.Ok();
         try
         {
-            if (transition == ResourceBudgetRecoveryTransition.SettledExact)
+            if (transition is ResourceBudgetRecoveryTransition.SettledExact or ResourceBudgetRecoveryTransition.CancelledPreSubmit)
             {
                 var prior = _resourceBudgetRecoveryJournal.Replay().Items
                     .SingleOrDefault(item => item.LastPayload.Lease == lease);
-                if (prior?.LastPayload.Transition == ResourceBudgetRecoveryTransition.SettledExact)
+                if (prior?.LastPayload.Transition == transition)
                 {
                     var payload = prior.LastPayload;
                     return payload.Owner == owner &&
@@ -437,7 +513,7 @@ public sealed partial class RuntimeKernel
                            payload.ChargedAmounts.SequenceEqual(charged)
                         ? KernelResult.Ok()
                         : KernelResult.Fail(KernelError.Quarantined,
-                            "The durable terminal resource receipt conflicts with the exact budget settlement.");
+                            "The durable terminal resource receipt conflicts with the exact owner transition.");
                 }
             }
             _resourceBudgetRecoveryJournal.Append(new ResourceBudgetRecoveryPayload(

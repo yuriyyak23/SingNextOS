@@ -1,3 +1,5 @@
+using System.Collections;
+using System.Reflection;
 using System.Security.Cryptography;
 using SingPlus.Contracts;
 using SingPlus.Runtime;
@@ -7,6 +9,65 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class Phase02ServiceSupervisorTests
 {
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public async Task RegistrationWaitingOnSupervisorGateCannotPublishAfterSourceRevocation(int fault)
+    {
+        var s = CreateSupervisor();
+        var definition = Definition("revoked-registration", 220, 2020, Contract("RevokedRegistration"));
+        var gate = typeof(CapabilityAwareServiceSupervisor).GetField("_gate", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(s.Supervisor)!;
+        var completion = new TaskCompletionSource<KernelResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var worker = new Thread(() =>
+        {
+            try { completion.TrySetResult(s.Supervisor.Register(definition)); }
+            catch (Exception exception) { completion.TrySetException(exception); }
+        }) { IsBackground = true };
+        lock (gate)
+        {
+            worker.Start();
+            // All prerequisite owner gates are free. The worker waits on this held supervisor gate
+            // after initial control validation, before local registry publication.
+            Assert.True(SpinWait.SpinUntil(() => (worker.ThreadState & ThreadState.WaitSleepJoin) != 0,
+                TimeSpan.FromSeconds(10)));
+            Assert.False(completion.Task.IsCompleted);
+            if (fault == 0) Assert.True(s.Kernel.CapabilityAuthority.Revoke(s.ControlCapability).IsSuccess);
+            else if (fault == 1) s.Kernel.CapabilityAuthority.RevokeAllForDomain(s.IssuerDomain);
+            else Assert.True(s.Kernel.TerminateProcess(s.Principal).IsSuccess);
+        }
+        var refused = await completion.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.False(refused.IsSuccess);
+        Assert.Equal(KernelError.SupervisorDenied, refused.Error);
+        var records = (IDictionary)typeof(CapabilityAwareServiceSupervisor).GetField("_records", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(s.Supervisor)!;
+        Assert.Empty(records);
+        Assert.Equal(KernelError.ProcessNotFound, s.Kernel.Processes.Resolve(new(new(220), 1)).Error);
+    }
+
+    [Fact]
+    public void RegistrationOwnerCommitRejectsStaleAndWrongSourceWithoutCallback()
+    {
+        var s = CreateSupervisor();
+        var called = false;
+        KernelResult Publish() { called = true; return KernelResult.Ok(); }
+        Assert.False(s.Kernel.CapabilityAuthority.CommitSupervisorRegistration(s.ControlCapability,
+            s.IssuerDomain, s.Principal.Generation + 1, Publish).IsSuccess);
+        Assert.False(s.Kernel.CapabilityAuthority.CommitSupervisorRegistration(s.ControlCapability,
+            new(9999), s.Principal.Generation, Publish).IsSuccess);
+        foreach (var wrong in new[]
+        {
+            s.Kernel.MintCapability(s.IssuerDomain, s.Principal, ResourceKind.KernelService,
+                CapabilityResourceIds.ServiceSupervisor, CapabilityRights.Read).Value!.CapabilityId,
+            s.Kernel.MintCapability(s.IssuerDomain, s.Principal, ResourceKind.KernelService,
+                "other-supervisor", CapabilityRights.Configure | CapabilityRights.Execute).Value!.CapabilityId,
+        })
+            Assert.False(s.Kernel.CapabilityAuthority.CommitSupervisorRegistration(wrong,
+                s.IssuerDomain, s.Principal.Generation, Publish).IsSuccess);
+        Assert.False(called);
+        var definition = Definition("valid-registration", 221, 2021, Contract("ValidRegistration"));
+        Assert.True(s.Supervisor.Register(definition).IsSuccess);
+        Assert.Equal(KernelError.DuplicateIdentity, s.Supervisor.Register(definition).Error);
+        Assert.Equal(ServiceLifecycleState.Declared, s.Supervisor.Query(definition.Identity).Value!.State);
+    }
+
     [Fact]
     public void HardDependenciesStartFirstAndBindExactGeneration()
     {

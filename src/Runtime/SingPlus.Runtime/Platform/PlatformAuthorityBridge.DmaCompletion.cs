@@ -28,9 +28,12 @@ public sealed partial class PlatformAuthorityBridge
     {
         DmaSubmissionRecord record;
         IPlatformDmaCompletionProvider completionProvider;
+        PlatformBackendEpoch backendEpoch;
+        PlatformProviderIncarnation incarnation;
+        PlatformProviderIncarnation expectedIncarnation;
         lock (_dmaCompletionGate)
         {
-            var validation = ValidateDmaSubmissionIdentity(submission, expectedSubject);
+            var validation = ValidateDmaSubmissionIdentityLocked(submission, expectedSubject, observeProvider: false);
             if (!validation.IsSuccess)
             {
                 return KernelResult<PlatformDmaCompletionEvidence>.Fail(
@@ -44,13 +47,6 @@ public sealed partial class PlatformAuthorityBridge
                 return KernelResult<PlatformDmaCompletionEvidence>.Fail(
                     KernelError.PlatformDenied,
                     "Completion for this exact DMA operation has already been proven and cannot be replayed.");
-            }
-
-            if (HasFaultPinnedDmaSubmission(submission.GrantId))
-            {
-                return KernelResult<PlatformDmaCompletionEvidence>.Fail(
-                    KernelError.PlatformFaulted,
-                    "DMA completion state is fault-pinned and cannot produce reusable completion evidence.");
             }
 
             if (record.CompletionObservationInFlight)
@@ -85,11 +81,35 @@ public sealed partial class PlatformAuthorityBridge
             }
 
             record.CompletionObservationInFlight = true;
+            backendEpoch = BackendEpoch;
+            expectedIncarnation = _dmaGrants[submission.GrantId].ProviderIncarnation;
             completionProvider = exactCompletionProvider;
         }
 
         try
         {
+            lock (_dmaCompletionGate)
+            {
+                try { incarnation = CurrentProviderIncarnation(); }
+                catch (Exception exception)
+                {
+                    FaultPinDmaSubmissionLocked(submission.GrantId);
+                    return KernelResult<PlatformDmaCompletionEvidence>.Fail(KernelError.PlatformFaulted,
+                        $"DMA completion generation read failed; the effect remains pinned: {exception.Message}");
+                }
+                var exact = ValidateDmaSubmissionIdentityLocked(submission, expectedSubject, observeProvider: false);
+                if (!exact.IsSuccess || BackendEpoch != backendEpoch ||
+                    _dmaSubmissionFaultPins.Contains(submission.GrantId) || record.CompletionProven ||
+                    record.PageFaultsInFlight.Count != 0 || incarnation.Value == 0 ||
+                    incarnation != expectedIncarnation)
+                {
+                    // Actual generation observations remain trace evidence even for a pinned effect.
+                    FaultPinDmaSubmissionLocked(submission.GrantId,
+                        incarnation != expectedIncarnation ? incarnation : null);
+                    return KernelResult<PlatformDmaCompletionEvidence>.Fail(KernelError.PlatformFaulted,
+                        "DMA authority changed during completion admission; the effect remains pinned.");
+                }
+            }
             PlatformAuthorityResult<PlatformProviderDmaCompletionEvidence> providerResult;
             try
             {
@@ -107,10 +127,24 @@ public sealed partial class PlatformAuthorityBridge
 
             lock (_dmaCompletionGate)
             {
-                var stillExact = ValidateDmaSubmissionIdentityLocked(submission, expectedSubject);
-                if (!stillExact.IsSuccess)
+                if (_dmaSubmissionFaultPins.Contains(submission.GrantId))
+                    return KernelResult<PlatformDmaCompletionEvidence>.Fail(KernelError.PlatformFaulted,
+                        "DMA completion authority became fault-pinned during observation.");
+                PlatformProviderIncarnation observedIncarnation;
+                try { observedIncarnation = CurrentProviderIncarnation(); }
+                catch (Exception exception)
                 {
                     FaultPinDmaSubmissionLocked(submission.GrantId);
+                    return KernelResult<PlatformDmaCompletionEvidence>.Fail(KernelError.PlatformFaulted,
+                        $"DMA completion post-response generation read failed; the effect remains pinned: {exception.Message}");
+                }
+                var stillExact = ValidateDmaSubmissionIdentityLocked(submission, expectedSubject, observeProvider: false);
+                if (!stillExact.IsSuccess || BackendEpoch != backendEpoch ||
+                    _dmaSubmissionFaultPins.Contains(submission.GrantId) || observedIncarnation != incarnation ||
+                    record.CompletionProven || record.PageFaultsInFlight.Count != 0)
+                {
+                    FaultPinDmaSubmissionLocked(submission.GrantId,
+                        observedIncarnation != incarnation ? observedIncarnation : null);
                     return KernelResult<PlatformDmaCompletionEvidence>.Fail(KernelError.PlatformFaulted,
                         "DMA owner or provider incarnation changed during completion observation; the exact mapping remains pinned.");
                 }
@@ -219,7 +253,8 @@ public sealed partial class PlatformAuthorityBridge
 
     private KernelResult ValidateDmaSubmissionIdentityLocked(
         PlatformDmaSubmission submission,
-        PlatformDomainIdentity expectedSubject)
+        PlatformDomainIdentity expectedSubject,
+        bool observeProvider = true)
     {
         if (!_activeDmaSubmissions.TryGetValue(submission.GrantId, out var record))
         {
@@ -237,15 +272,6 @@ public sealed partial class PlatformAuthorityBridge
 
         var grantIdentity = ValidateDmaGrantIdentity(grantRecord.Grant, expectedSubject);
         if (!grantIdentity.IsSuccess) return grantIdentity;
-
-        var currentIncarnation = CurrentProviderIncarnation();
-        if (currentIncarnation.Value == 0 ||
-            currentIncarnation != grantRecord.ProviderIncarnation)
-        {
-            FaultPinDmaSubmissionLocked(submission.GrantId, currentIncarnation);
-            return KernelResult.Fail(KernelError.PlatformFaulted,
-                "The DMA provider incarnation changed while a possible submission remained pending.");
-        }
 
         if (record.Submission.OperationId != submission.OperationId)
         {
@@ -284,6 +310,39 @@ public sealed partial class PlatformAuthorityBridge
                 "The local DMA completion request is malformed.");
         }
 
+        if (observeProvider)
+        {
+            var backendEpoch = BackendEpoch;
+            PlatformProviderIncarnation currentIncarnation;
+            try { currentIncarnation = CurrentProviderIncarnation(); }
+            catch (Exception exception)
+            {
+                FaultPinDmaSubmissionLocked(submission.GrantId);
+                return KernelResult.Fail(KernelError.PlatformFaulted,
+                    $"DMA identity generation read failed; possible effect remains pinned: {exception.Message}");
+            }
+            if (currentIncarnation.Value == 0 || currentIncarnation != grantRecord.ProviderIncarnation)
+            {
+                FaultPinDmaSubmissionLocked(submission.GrantId, currentIncarnation);
+                return KernelResult.Fail(KernelError.PlatformFaulted,
+                    "The DMA provider incarnation changed while a possible submission remained pending.");
+            }
+            if (BackendEpoch != backendEpoch || _dmaSubmissionFaultPins.Contains(submission.GrantId))
+            {
+                FaultPinDmaSubmissionLocked(submission.GrantId);
+                return KernelResult.Fail(KernelError.PlatformFaulted,
+                    "DMA identity continuity was lost during generation observation.");
+            }
+            var fresh = ValidateDmaSubmissionIdentityLocked(submission, expectedSubject, observeProvider: false);
+            if (!fresh.IsSuccess) return fresh;
+            if (!ReferenceEquals(_activeDmaSubmissions[submission.GrantId], record) ||
+                !ReferenceEquals(_dmaGrants[submission.GrantId], grantRecord))
+            {
+                FaultPinDmaSubmissionLocked(submission.GrantId);
+                return KernelResult.Fail(KernelError.PlatformFaulted,
+                    "The exact DMA lifetime changed during generation observation.");
+            }
+        }
         return KernelResult.Ok();
     }
 }

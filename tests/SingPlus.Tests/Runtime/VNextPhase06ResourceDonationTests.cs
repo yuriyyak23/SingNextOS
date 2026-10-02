@@ -17,7 +17,78 @@ internal interface IVNextP06DonatedResourceService
 public sealed class VNextPhase06ResourceDonationTests
 {
     [Fact]
-    public void GeneratedSentryConsumesExactInvocationDonationWithoutSecondCharge()
+    public void RevokedDonationCannotBeginConsumptionAndBudgetRemainsReserved()
+    {
+        var setup = Create();
+        var invocation = Begin(setup.Kernel, setup.Caller, setup.Service, setup.Session);
+        var donation = setup.Kernel.BindResourceDonation(setup.Caller, setup.Service,
+            invocation.Context.Invocation, setup.SourceGrant, 1, Requirement(10), Envelope(10), AdmissionQosHint.None).Value!;
+        Assert.True(setup.Kernel.CapabilityAuthority.Revoke(donation.DerivedGrant).IsSuccess);
+        Assert.Equal(KernelError.CapabilityRevoked, setup.Kernel.MarkResourceDonationPossibleSubmit(
+            setup.Service, invocation.Context.Invocation).Error);
+        Assert.Equal(BudgetReservationState.Reserved, setup.Kernel.QueryBudget(donation.Lease).Value!.State);
+    }
+
+    [Fact]
+    public async Task ConcurrentInitialDonationBindingHasOneReservationAndOneDerivedRecord()
+    {
+        var setup = Create();
+        var invocation = Begin(setup.Kernel, setup.Caller, setup.Service, setup.Session);
+        var records = setup.Kernel.CapabilityAuthority.InspectionSnapshot().Length;
+        var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task<KernelResult<ResourceDonationBinding>> Bind() => Task.Run(async () =>
+        {
+            await start.Task;
+            return setup.Kernel.BindResourceDonation(setup.Caller, setup.Service,
+                invocation.Context.Invocation, setup.SourceGrant, 1, Requirement(10), Envelope(10), AdmissionQosHint.None);
+        });
+        var first = Bind();
+        var second = Bind();
+        start.SetResult();
+        var results = await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Single(results, result => result.IsSuccess);
+        Assert.Equal(KernelError.InvalidTransition, Assert.Single(results, result => !result.IsSuccess).Error);
+        Assert.Equal(records + 1, setup.Kernel.CapabilityAuthority.InspectionSnapshot().Length);
+        Assert.Equal(10UL, Used(setup));
+    }
+
+    [Fact]
+    public async Task ConcurrentDuplicateNestedDonationHasOneSplitAndPreservesHeldCapacity()
+    {
+        for (var iteration = 0; iteration < 16; iteration++)
+        {
+            var setup = Create(includeDownstream: true);
+            var parentInvocation = Begin(setup.Kernel, setup.Caller, setup.Service, setup.Session);
+            var parent = setup.Kernel.BindResourceDonation(setup.Caller, setup.Service,
+                parentInvocation.Context.Invocation, setup.SourceGrant, 1, Requirement(100), Envelope(100),
+                AdmissionQosHint.LatencySensitive).Value!;
+            var childInvocation = Begin(setup.Kernel, setup.Service, setup.Downstream, setup.DownstreamSession);
+            var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Task<KernelResult<ResourceDonationBinding>> Split() => Task.Run(async () =>
+            {
+                await start.Task;
+                return setup.Kernel.DeriveNestedResourceDonation(setup.Service, setup.Downstream,
+                    parentInvocation.Context.Invocation, childInvocation.Context.Invocation, Envelope(30),
+                    ResourceAssuranceV1.AccountingOnly, AdmissionQosHint.ThroughputOriented);
+            });
+            var first = Split();
+            var second = Split();
+            start.SetResult();
+            var results = await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Single(results.Where(result => result.IsSuccess));
+            Assert.Equal(KernelError.InvalidTransition, Assert.Single(results.Where(result => !result.IsSuccess)).Error);
+            Assert.Equal(100UL, Used(setup));
+            Assert.Equal(70UL, Assert.Single(setup.Kernel.QueryBudget(parent.Lease).Value!.Amounts).Amount);
+        }
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    public void GeneratedSentryConsumesExactInvocationDonationWithoutSecondCharge(int revokePoint)
     {
         var setup = Create();
         var invocation = Begin(setup.Kernel, setup.Caller, setup.Service, setup.Session);
@@ -37,10 +108,39 @@ public sealed class VNextPhase06ResourceDonationTests
             invocation.Context.Invocation, requirement => setup.Kernel.EnterDonatedSipResourceAdmission(
                 setup.Service, invocation.Context.Invocation, binding, requirement));
         var target = new DonatedTarget();
+        if (revokePoint != 0)
+            setup.Kernel.ResourceAdmissionQualificationHook = new Hook(point =>
+            {
+                if (point == (revokePoint is 1 or 4 ? ResourceAdmissionQualificationPoint.AfterLocalCommit : ResourceAdmissionQualificationPoint.BeforeProviderCallback))
+                {
+                    if (revokePoint >= 3)
+                        Assert.True(setup.Kernel.CancelExternalOperation(setup.Service, operation,
+                            providerCancellationSupported: false).IsSuccess);
+                    else Assert.True(setup.Kernel.CapabilityAuthority.Revoke(donation.DerivedGrant).IsSuccess);
+                }
+            });
 
         var result = IVNextP06DonatedResourceServiceGeneratedOperationSentries.InvokeRuntime_Run(
             target, in context);
 
+        if (revokePoint != 0)
+        {
+            Assert.False(result.IsSuccess);
+            Assert.Equal((int)(revokePoint >= 3 ? KernelError.StaleGeneration : KernelError.CapabilityRevoked), result.ErrorCode);
+            Assert.Equal(0, target.ProviderCalls);
+            Assert.Equal(revokePoint is 1 or 4 ? BudgetReservationState.CancelledPreSubmit : BudgetReservationState.Quarantined,
+                setup.Kernel.QueryBudget(donation.Lease).Value!.State);
+            if (revokePoint == 3)
+            {
+                Assert.NotNull(setup.Kernel.QueryExternalOperation(setup.Service, operation).Value!.Binding);
+                Assert.Equal(ExternalResourceBindingState.Quarantined,
+                    setup.Kernel.ExternalOperations.QueryResourceBinding(operation).Value!.State);
+                Assert.Equal(10UL, Used(setup));
+            }
+            if (revokePoint == 4)
+                Assert.Null(setup.Kernel.QueryExternalOperation(setup.Service, operation).Value!.Binding);
+            return;
+        }
         Assert.True(result.IsSuccess, result.Message);
         Assert.Equal(1, target.ProviderCalls);
         Assert.Equal(10UL, Used(setup));
@@ -156,7 +256,7 @@ public sealed class VNextPhase06ResourceDonationTests
         Assert.Equal(KernelError.InvalidTransition,
             setup.Kernel.CloseResourceDonation(setup.Service, invocation.Context.Invocation,
                 submitMayHaveOccurred: false).Error);
-        Assert.Equal(KernelError.ExternalEffectUncontained,
+        Assert.Equal(KernelError.PlatformBindingDraining,
             setup.Kernel.TerminateProcess(setup.Service).Error);
     }
 
@@ -209,6 +309,13 @@ public sealed class VNextPhase06ResourceDonationTests
         Assert.Equal(100UL, Used(setup));
         Assert.Equal(70UL, Assert.Single(setup.Kernel.QueryBudget(parent.Lease).Value!.Amounts).Amount);
         Assert.Equal(30UL, Assert.Single(setup.Kernel.QueryBudget(child.Value.Lease).Value!.Amounts).Amount);
+        var beforeDuplicate = Used(setup);
+        Assert.Equal(KernelError.InvalidTransition,
+            setup.Kernel.DeriveNestedResourceDonation(setup.Service, setup.Downstream,
+                parentInvocation.Context.Invocation, childInvocation.Context.Invocation, Envelope(10),
+                ResourceAssuranceV1.AccountingOnly, AdmissionQosHint.ThroughputOriented).Error);
+        Assert.Equal(beforeDuplicate, Used(setup));
+        Assert.Equal(70UL, Assert.Single(setup.Kernel.QueryBudget(parent.Lease).Value!.Amounts).Amount);
         Assert.True(setup.Kernel.CapabilityAuthority.ValidateResourceUse(child.Value.DerivedGrant,
             setup.DownstreamDomain, setup.Downstream.Generation, 1, Envelope(30)).IsSuccess);
         Assert.Equal(KernelError.DelegationDenied,
@@ -353,10 +460,12 @@ public sealed class VNextPhase06ResourceDonationTests
     {
         var setup = Create();
         var invocation = Begin(setup.Kernel, setup.Caller, setup.Service, setup.Session);
+        var capabilityRecords = setup.Kernel.CapabilityAuthority.InspectionSnapshot().Length;
         Assert.Equal(KernelError.StaleGeneration,
             setup.Kernel.BindResourceDonation(setup.Caller, setup.Service,
                 invocation.Context.Invocation with { Generation = new(2) }, setup.SourceGrant, 1,
                 Requirement(10), Envelope(10), AdmissionQosHint.None).Error);
+        Assert.Equal(capabilityRecords, setup.Kernel.CapabilityAuthority.InspectionSnapshot().Length);
         Assert.Equal(KernelError.InsufficientRights,
             setup.Kernel.BindResourceDonation(setup.Caller, setup.Service, invocation.Context.Invocation,
                 setup.SourceGrant, 1, Requirement(101), Envelope(101), AdmissionQosHint.None).Error);

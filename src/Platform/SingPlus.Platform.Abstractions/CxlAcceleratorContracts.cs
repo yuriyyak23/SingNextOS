@@ -54,7 +54,9 @@ public interface ICxlType2AcceleratorProvider
     PlatformAuthorityResult<CxlAcceleratorVisibility> AcquireVisibility(
         CxlAcceleratorSubmission submission,
         ExternalVisibilityRequirement requirement);
+    /// <summary>Requests cancellation; success alone does not prove closure or permit reclaim.</summary>
     PlatformAuthorityResult Cancel(CxlAcceleratorSubmission submission);
+    /// <summary>Success confirms closure of the exact submitted provider operation, independently of cancellation.</summary>
     PlatformAuthorityResult Release(CxlAcceleratorSubmission submission);
 }
 

@@ -48,26 +48,38 @@ public sealed partial class RuntimeKernel
             return KernelResult<PlatformDomainBinding>.Fail(resolved.Error, resolved.Message!);
 
         var process = resolved.Value!;
-        var effect = EnsureProcessAcceptsNewEffects(process);
-        if (!effect.IsSuccess)
-            return KernelResult<PlatformDomainBinding>.Fail(effect.Error, effect.Message!);
-
-        if (!CanChangePlatformExecutionAttachment(process.State))
+        lock (_platformMemoryUseGate)
         {
-            return KernelResult<PlatformDomainBinding>.Fail(
-                KernelError.InvalidTransition,
-                $"A platform execution domain cannot be attached while the process is {process.State}; bind before execution starts.");
+            var effect = EnsureProcessAcceptsNewEffects(process);
+            if (!effect.IsSuccess)
+                return KernelResult<PlatformDomainBinding>.Fail(effect.Error, effect.Message!);
+            if (!CanChangePlatformExecutionAttachment(process.State))
+                return KernelResult<PlatformDomainBinding>.Fail(
+                    KernelError.InvalidTransition,
+                    $"A platform execution domain cannot be attached while the process is {process.State}; bind before execution starts.");
+            if (!_pendingPlatformDomainBinds.Add(subject))
+                return KernelResult<PlatformDomainBinding>.Fail(
+                    KernelError.PlatformBindingActive,
+                    "A root domain bind is already in flight for this process generation.");
         }
 
         var identity = PlatformIdentity(process);
-        var binding = PlatformAuthority.BindDomain(identity);
-        if (binding.IsSuccess)
-            TrackPlatformBinding(subject, binding.Value!, executionAttached);
-        else if (PlatformAuthority.TryGetQuarantinedDomainBinding(
-                     identity,
-                     out var quarantinedBinding))
-            TrackPlatformBinding(subject, quarantinedBinding, executionAttached);
-        return binding;
+        try
+        {
+            var binding = PlatformAuthority.BindDomain(identity);
+            if (binding.IsSuccess)
+                TrackPlatformBinding(subject, binding.Value!, executionAttached);
+            else if (PlatformAuthority.TryGetQuarantinedDomainBinding(
+                         identity,
+                         out var quarantinedBinding))
+                TrackPlatformBinding(subject, quarantinedBinding, executionAttached);
+            return binding;
+        }
+        finally
+        {
+            lock (_platformMemoryUseGate)
+                _pendingPlatformDomainBinds.Remove(subject);
+        }
     }
 
     public KernelResult RevokePlatformDomain(
@@ -134,9 +146,11 @@ public sealed partial class RuntimeKernel
             return KernelResult<PlatformRegionMapping>.Fail(resolved.Error, resolved.Message!);
 
         var process = resolved.Value!;
-        var effect = EnsureProcessAcceptsNewEffects(process);
+        var effect = BeginPlatformMappingAdmission(owner, process, capabilityId);
         if (!effect.IsSuccess)
             return KernelResult<PlatformRegionMapping>.Fail(effect.Error, effect.Message!);
+        try
+        {
 
         var identity = PlatformIdentity(process);
 
@@ -216,10 +230,20 @@ public sealed partial class RuntimeKernel
             return mapping;
         }
 
+        lock (_platformMemoryUseGate)
+        {
         TrackPlatformMapping(owner, mapping.Value!);
+        if (!Regions.ValidatePlatformMappingRegionUsability(region, ownerIdentity).IsSuccess)
+            _ = PlatformAuthority.RevokeExactMappingLocalAuthorization(mapping.Value!, identity);
         if (budget.Value is { } budgetReservation)
             _mappingBudgetReservations.Add(mapping.Value.MappingId, (owner, budgetReservation));
+        // Preserve the receipt for closure without restoring revoked permission.
+        if (!CapabilityAuthority.Validate(capabilityId, process.DomainId, owner.Generation, requiredRights).IsSuccess)
+            _ = PlatformAuthority.BeginCapabilityRevocation(capabilityId, id => CapabilityAuthority.DependsOnCapability(id, capabilityId));
         return mapping;
+        }
+        }
+        finally { EndPlatformMappingAdmission(owner, capabilityId); }
     }
 
     public KernelResult<PlatformOwnedRegionSliceMapping> MapPlatformOwnedRegionSlice(
@@ -247,13 +271,15 @@ public sealed partial class RuntimeKernel
         }
 
         var process = resolved.Value!;
-        var effect = EnsureProcessAcceptsNewEffects(process);
+        var effect = BeginPlatformMappingAdmission(owner, process, capabilityId);
         if (!effect.IsSuccess)
         {
             return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(
                 effect.Error,
                 effect.Message!);
         }
+        try
+        {
 
         var identity = PlatformIdentity(process);
         var bindingValidation = PlatformAuthority.ValidateDomain(binding, identity);
@@ -350,10 +376,20 @@ public sealed partial class RuntimeKernel
             return mapping;
         }
 
+        lock (_platformMemoryUseGate)
+        {
         TrackPlatformMapping(owner, mapping.Value!.Mapping);
+        if (!Regions.ValidatePlatformMappingRegionUsability(region, ownerIdentity).IsSuccess)
+            _ = PlatformAuthority.RevokeExactMappingLocalAuthorization(mapping.Value.Mapping, identity);
         if (budget.Value is { } budgetReservation)
             _mappingBudgetReservations.Add(mapping.Value.Mapping.MappingId, (owner, budgetReservation));
+        // Preserve the receipt for closure without restoring revoked permission.
+        if (!CapabilityAuthority.Validate(capabilityId, process.DomainId, owner.Generation, requiredRights).IsSuccess)
+            _ = PlatformAuthority.BeginCapabilityRevocation(capabilityId, id => CapabilityAuthority.DependsOnCapability(id, capabilityId));
         return mapping;
+        }
+        }
+        finally { EndPlatformMappingAdmission(owner, capabilityId); }
     }
 
     public KernelResult<PlatformRegionVisibilityEvidence> PreparePlatformRegionMappingForConsumer(
@@ -380,6 +416,13 @@ public sealed partial class RuntimeKernel
         }
 
         var identity = PlatformIdentity(process);
+        var exactMapping = PlatformAuthority.ValidateExactMapping(mapping, identity);
+        if (!exactMapping.IsSuccess)
+            return KernelResult<PlatformRegionVisibilityEvidence>.Fail(exactMapping.Error, exactMapping.Message!);
+        var usability = Regions.ValidatePlatformMappingRegionUsability(mapping.Mapping.Region,
+            new RegionOwner(process.DomainId, owner.Generation));
+        if (!usability.IsSuccess)
+            return KernelResult<PlatformRegionVisibilityEvidence>.Fail(usability.Error, usability.Message!);
         return PlatformAuthority.PrepareRegionMappingForConsumer(
             mapping,
             identity,
@@ -455,7 +498,13 @@ public sealed partial class RuntimeKernel
 
     internal KernelResult CascadePlatformCapabilityRevocation(CapabilityId capabilityId)
     {
-        var mappings = PlatformAuthority.BeginCapabilityRevocation(capabilityId);
+        IReadOnlyList<PlatformRegionMapping> mappings;
+        bool pending;
+        lock (_platformMemoryUseGate)
+        {
+            mappings = PlatformAuthority.BeginCapabilityRevocation(capabilityId, id => CapabilityAuthority.DependsOnCapability(id, capabilityId));
+            pending = _pendingPlatformMappingCapabilities.Any(id => CapabilityAuthority.DependsOnCapability(id, capabilityId));
+        }
         KernelResult? firstFailure = null;
 
         foreach (var mapping in mappings)
@@ -487,7 +536,9 @@ public sealed partial class RuntimeKernel
                 firstFailure ??= finalize;
         }
 
-        return firstFailure ?? KernelResult.Ok();
+        return firstFailure ?? (pending
+            ? KernelResult.Fail(KernelError.PlatformBindingDraining, "An admitted mapping must settle before capability closure.")
+            : KernelResult.Ok());
     }
 
     private KernelResult FinalizePlatformRegionMappingClosure(

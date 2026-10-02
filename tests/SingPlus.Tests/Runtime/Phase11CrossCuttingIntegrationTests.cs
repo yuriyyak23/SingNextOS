@@ -247,6 +247,11 @@ public sealed class Phase11CrossCuttingIntegrationTests(ITestOutputHelper output
         var supervisorIdleTicks = timer.ElapsedTicks;
 
         var receiver = TestFixtures.Create(harness.Kernel, 1197, 11997).Handle;
+        var configure = harness.Kernel.MintCapability(new(11190), harness.Principal, ResourceKind.KernelService,
+            CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        var receiverBudget = harness.Kernel.AdmitProcessBudget(harness.Principal, configure, receiver, "diagnostic-move-receiver",
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, (ulong)iterations * 64)]);
+        Assert.True(receiverBudget.IsSuccess, receiverBudget.Message);
         var copyChannel = CopyChannel(harness.Kernel, started.Process, receiver, iterations);
         var payload = new IpcCopyPayload([1, 2, 3, 4], 64);
         timer.Restart();

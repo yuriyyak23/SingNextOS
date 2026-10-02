@@ -1,3 +1,5 @@
+using System.Text;
+
 namespace SingPlus.Contracts;
 
 public enum PreemptionClassV1 : byte
@@ -67,9 +69,13 @@ public readonly record struct ResumeBindingV1(
     {
         if (Version != CurrentVersion)
             throw new NotSupportedException("Resume binding version is unsupported.");
-        if (string.IsNullOrWhiteSpace(OperationCorrelation) || OperationCorrelation != OperationCorrelation.Trim() ||
-            OperationCorrelation.Any(char.IsControl) || OperationCorrelation.Length > 256)
+        if (OperationCorrelation is null || OperationCorrelation.Length > 256 ||
+            string.IsNullOrWhiteSpace(OperationCorrelation) || OperationCorrelation != OperationCorrelation.Trim() ||
+            OperationCorrelation.Any(char.IsControl))
             throw new ArgumentException("Resume operation correlation is not canonical.");
+        try { _ = new UTF8Encoding(false, true).GetByteCount(OperationCorrelation); }
+        catch (EncoderFallbackException exception)
+        { throw new ArgumentException("Resume operation correlation must contain valid Unicode scalar values.", nameof(OperationCorrelation), exception); }
         ValidateDigest(CapturedStateDigest);
         ValidateDigest(SemanticBindingDigest);
         if (OperationGeneration == 0 || CaptureGeneration == 0 || ProviderGeneration == 0 || RuntimeGeneration == 0)

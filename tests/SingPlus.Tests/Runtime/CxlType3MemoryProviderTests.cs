@@ -9,6 +9,588 @@ namespace SingPlus.Tests.Runtime;
 public sealed class CxlType3MemoryProviderTests
 {
     [Fact]
+    public void CxlLiveReceiptsHoldExactDeviceUntilAllPlacementsClose()
+    {
+        var s = CreateScenario();
+        var other = s.Kernel.AllocateBuffer<byte>(s.Handle, 64).Value!;
+        var first = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease, s.Endpoint, CxlMemoryPersistence.Volatile).Value!;
+        var second = s.Memory.Place(s.Owner, other.Handle, s.Subject, s.Lease, s.Endpoint, CxlMemoryPersistence.Volatile).Value!;
+        Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.RevokePlatformDevice(s.Handle, s.Lease).Error);
+        Assert.Equal(0, s.Platform.DeviceRevokeCalls);
+        Assert.True(s.Memory.Close(first.PlacementId).IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.RevokePlatformDevice(s.Handle, s.Lease).Error);
+        Assert.Equal(0, s.Platform.DeviceRevokeCalls);
+        Assert.True(s.Memory.Close(second.PlacementId).IsSuccess);
+        Assert.True(s.Kernel.RevokePlatformDevice(s.Handle, s.Lease).IsSuccess);
+        Assert.Equal(1, s.Platform.DeviceRevokeCalls);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void CxlCreationCallbackCannotCloseParentBeforeLateReceipt(bool memoryStage, bool capabilityRevoke)
+    {
+        CallbackMemoryProvider? memory = null;
+        CallbackFabricProvider? fabric = null;
+        var s = CreateScenario(memoryFactory: model => memory = new(model), fabricFactory: model => fabric = new(model));
+        var capability = DeviceCapability(s);
+        var closure = KernelResult.Ok();
+        Action callback = () => closure = capabilityRevoke ? s.Kernel.RevokeCapability(capability)
+            : s.Kernel.RevokePlatformDevice(s.Handle, s.Lease);
+        if (memoryStage) memory!.BindHook = callback;
+        else fabric!.BindHook = callback;
+        var result = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease, s.Endpoint, CxlMemoryPersistence.Volatile);
+        Assert.Equal(KernelError.PlatformBindingActive, closure.Error);
+        Assert.Equal(0, s.Platform.DeviceRevokeCalls);
+        Assert.Equal(!capabilityRevoke, result.IsSuccess);
+        if (capabilityRevoke) Assert.Equal(KernelError.ExternalEffectUncontained, result.Error);
+        Assert.False(s.Kernel.Regions.HasPendingBackingCreations(s.Owner));
+        var exited = s.Kernel.TerminateProcess(s.Handle);
+        Assert.True(exited.IsSuccess, $"{exited.Error}: {exited.Message}; {s.Kernel.QueryProcessTeardown(s.Handle).Value}");
+        Assert.Equal(KernelError.InvalidRegionState, s.Kernel.Regions.Validate(s.Buffer.Handle, s.Owner).Error);
+        Assert.Equal(1, s.Platform.DeviceRevokeCalls);
+    }
+
+    [Fact]
+    public async Task CxlPendingReceiptBlocksConcurrentParentDeviceClosure()
+    {
+        CallbackMemoryProvider? memory = null;
+        var s = CreateScenario(memoryFactory: model => memory = new(model));
+        using var entered = new ManualResetEventSlim();
+        using var resume = new ManualResetEventSlim();
+        memory!.BindHook = () => { entered.Set(); if (!resume.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException(); };
+        var pending = Task.Run(() => s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease, s.Endpoint, CxlMemoryPersistence.Volatile));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+            Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.RevokePlatformDevice(s.Handle, s.Lease).Error);
+            Assert.Equal(0, s.Platform.DeviceRevokeCalls);
+        }
+        finally { resume.Set(); }
+        var result = await pending;
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.True(s.Memory.Close(result.Value!.PlacementId).IsSuccess);
+        Assert.True(s.Kernel.RevokePlatformDevice(s.Handle, s.Lease).IsSuccess);
+    }
+
+    [Fact]
+    public void CxlFreshDeviceCapabilityAdmissionRejectsDirectOwnerRevocation()
+    {
+        CallbackFabricProvider? fabric = null;
+        var s = CreateScenario(fabricFactory: model => fabric = new(model));
+        Assert.True(s.Kernel.CapabilityAuthority.Revoke(DeviceCapability(s)).IsSuccess);
+        var result = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease, s.Endpoint, CxlMemoryPersistence.Volatile);
+        Assert.Equal(KernelError.CapabilityRevoked, result.Error);
+        Assert.Equal(0, fabric!.BindCalls);
+        Assert.False(s.Kernel.Regions.HasPendingBackingCreations(s.Owner));
+        Assert.True(s.Kernel.RevokePlatformDevice(s.Handle, s.Lease).IsSuccess);
+    }
+
+    [Fact]
+    public void CxlRevokedSourceForbidsNewMemoryEffectButAllowsExactClosureRetry()
+    {
+        CallbackMemoryProvider? memory = null;
+        var s = CreateScenario(memoryFactory: model => memory = new(model));
+        var placed = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease, s.Endpoint, CxlMemoryPersistence.Volatile).Value!;
+        var binding = s.Model.QueryMemory(placed.MemoryBindingId).Value!;
+        Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.RevokeCapability(DeviceCapability(s)).Error);
+        Assert.Equal(KernelError.CapabilityRevoked, s.Bridge.BindMemory(s.Owner, binding.BackingLease, binding.FabricBinding).Error);
+        Assert.Equal(1, memory!.BindCalls);
+        Assert.Equal(0, s.Platform.DeviceRevokeCalls);
+        Assert.True(s.Memory.Close(placed.PlacementId).IsSuccess);
+        Assert.True(s.Kernel.RevokeCapability(DeviceCapability(s)).IsSuccess);
+        Assert.Equal(1, s.Platform.DeviceRevokeCalls);
+    }
+
+    [Fact]
+    public void CxlPendingChildBlocksFabricReleaseUntilReceiptTracking()
+    {
+        CallbackMemoryProvider? memory = null;
+        var s = CreateScenario(memoryFactory: model => memory = new(model));
+        var release = KernelResult.Ok();
+        memory!.BindHook = () =>
+        {
+            var backing = s.Kernel.Regions.InspectionSnapshot().Single(item => item.Region.Handle == s.Buffer.Handle).BackingLease!;
+            var binding = s.Model.QueryMemory(new(1)).Value!;
+            Assert.Equal(backing.Handle, binding.BackingLease);
+            release = s.Bridge.ReleaseFabric(binding.FabricBinding);
+        };
+        var placed = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease, s.Endpoint, CxlMemoryPersistence.Volatile);
+        Assert.Equal(KernelError.PlatformBindingActive, release.Error);
+        Assert.True(placed.IsSuccess, placed.Message);
+        Assert.True(s.Memory.Close(placed.Value!.PlacementId).IsSuccess);
+        Assert.True(s.Kernel.RevokePlatformDevice(s.Handle, s.Lease).IsSuccess);
+    }
+
+    private static CapabilityId DeviceCapability(Scenario s) => s.Kernel.CapabilityAuthority.InspectionSnapshot()
+        .Single(item => item.Descriptor.ResourceKind == ResourceKind.Device && item.Descriptor.ResourceId == s.Lease.Device.ResourceId)
+        .Descriptor.CapabilityId;
+
+    [Fact]
+    public void CxlMalformedChildReceiptCannotUnpinOriginalDeviceOrFabric()
+    {
+        CallbackMemoryProvider? memory = null;
+        var s = CreateScenario(memoryFactory: model => memory = new(model));
+        memory!.RewriteReceipt = binding => binding with { FabricBinding = binding.FabricBinding with { BindingId = new(binding.FabricBinding.BindingId.Value + 100) } };
+        var placed = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease, s.Endpoint, CxlMemoryPersistence.Volatile);
+        Assert.Equal(KernelError.ExternalEffectUncontained, placed.Error);
+        var actual = s.Model.QueryMemory(new(1)).Value!;
+        Assert.Equal(KernelError.ExternalEffectUncontained, s.Bridge.ReleaseFabric(actual.FabricBinding).Error);
+        Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.RevokePlatformDevice(s.Handle, s.Lease).Error);
+        Assert.Equal(0, s.Platform.DeviceRevokeCalls);
+        Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.Regions.ReserveBacking(s.Buffer.Handle, s.Owner).Error);
+        Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CxlResetBeforeOrDuringClosureCannotReleaseParentReservation(bool duringClosure)
+    {
+        CallbackMemoryProvider? memory = null;
+        var s = CreateScenario(memoryFactory: model => memory = new(model));
+        var placed = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease, s.Endpoint, CxlMemoryPersistence.Volatile).Value!;
+        if (duringClosure) memory!.AfterReleaseHook = () => Assert.True(s.Model.Rebind(s.Endpoint.EndpointId).IsSuccess);
+        else Assert.True(s.Model.Rebind(s.Endpoint.EndpointId).IsSuccess);
+        var close = s.Memory.Close(placed.PlacementId);
+        Assert.Equal(duringClosure ? KernelError.ExternalEffectUncontained : KernelError.StaleGeneration, close.Error);
+        Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.RevokePlatformDevice(s.Handle, s.Lease).Error);
+        Assert.Equal(0, s.Platform.DeviceRevokeCalls);
+        Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.Regions.ReserveBacking(s.Buffer.Handle, s.Owner).Error);
+        Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CxlStaleParentGenerationOrSubjectHasNoEffectOrRetainedReservation(bool wrongSubject)
+    {
+        CallbackFabricProvider? fabric = null;
+        var s = CreateScenario(fabricFactory: model => fabric = new(model));
+        var lease = wrongSubject ? s.Lease with
+        {
+            DomainBinding = s.Lease.DomainBinding with { Subject = s.Subject with { Process = s.Handle with { Generation = s.Handle.Generation + 1 } } }
+        } : s.Lease with { Generation = new(s.Lease.Generation.Value + 1) };
+        var result = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, lease, s.Endpoint, CxlMemoryPersistence.Volatile);
+        Assert.Equal(wrongSubject ? KernelError.WrongPlatformDomain : KernelError.StaleGeneration, result.Error);
+        Assert.Equal(0, fabric!.BindCalls);
+        Assert.False(s.Kernel.Regions.HasPendingBackingCreations(s.Owner));
+        var retry = s.Kernel.Regions.ReserveBacking(s.Buffer.Handle, s.Owner);
+        Assert.True(retry.IsSuccess);
+        Assert.True(s.Kernel.Regions.ReleaseBacking(retry.Value!.Handle, s.Owner).IsSuccess);
+        Assert.True(s.Kernel.RevokePlatformDevice(s.Handle, s.Lease).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void NotAcceptedBackingCreationRequiresExactFreshTuple(bool memoryStage, bool reset)
+    {
+        CallbackMemoryProvider? memory = null;
+        CallbackFabricProvider? fabric = null;
+        var s = CreateScenario(memoryFactory: model => memory = new(model),
+            fabricFactory: model => fabric = new(model));
+        Action reject = () =>
+        {
+            if (reset) Assert.True(s.Model.Rebind(s.Endpoint.EndpointId).IsSuccess);
+        };
+        if (memoryStage) memory!.RejectBind = reject;
+        else fabric!.RejectBind = reject;
+        var result = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease,
+            s.Endpoint, CxlMemoryPersistence.Volatile);
+        Assert.Equal(reset ? KernelError.ExternalEffectUncontained : KernelError.PlatformUnavailable, result.Error);
+        Assert.False(s.Kernel.Regions.HasPendingBackingCreations(s.Owner));
+        if (reset)
+        {
+            Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.Regions.ReserveBacking(s.Buffer.Handle, s.Owner).Error);
+            Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+            Assert.False(s.Kernel.QueryProcessTeardown(s.Handle).Value.LocalReclaimCompleted);
+        }
+        else
+        {
+            var retry = s.Kernel.Regions.ReserveBacking(s.Buffer.Handle, s.Owner);
+            Assert.True(retry.IsSuccess);
+            Assert.True(s.Kernel.Regions.ReleaseBacking(retry.Value!.Handle, s.Owner).IsSuccess);
+            Assert.True(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        }
+    }
+
+    [Fact]
+    public void NotAcceptedMemoryCreationWithFailedTupleObservationRetainsBacking()
+    {
+        CallbackMemoryProvider? memory = null;
+        CallbackFabricProvider? fabric = null;
+        var s = CreateScenario(memoryFactory: model => memory = new(model),
+            fabricFactory: model => fabric = new(model));
+        memory!.RejectBind = () => fabric!.QueryHook = () => throw new InvalidOperationException("tuple observation lost");
+        var result = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease,
+            s.Endpoint, CxlMemoryPersistence.Volatile);
+        Assert.Equal(KernelError.ExternalEffectUncontained, result.Error);
+        Assert.False(s.Kernel.Regions.HasPendingBackingCreations(s.Owner));
+        fabric!.QueryHook = null;
+        Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.Regions.ReserveBacking(s.Buffer.Handle, s.Owner).Error);
+        Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.False(s.Kernel.QueryProcessTeardown(s.Handle).Value.LocalReclaimCompleted);
+    }
+
+    [Fact]
+    public async Task PendingMemoryCreationBlocksConcurrentProcessReclaimUntilReceiptTracking()
+    {
+        CallbackMemoryProvider? memory = null;
+        var s = CreateScenario(memoryFactory: model => memory = new(model));
+        using var entered = new ManualResetEventSlim();
+        using var resume = new ManualResetEventSlim();
+        memory!.BindHook = () =>
+        {
+            entered.Set();
+            if (!resume.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException();
+        };
+        var creation = Task.Run(() => s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease,
+            s.Endpoint, CxlMemoryPersistence.Volatile));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+            Assert.True(s.Kernel.Regions.HasPendingBackingCreations(s.Owner));
+            Assert.Equal(KernelError.PlatformBindingDraining, s.Kernel.TerminateProcess(s.Handle).Error);
+            Assert.False(s.Kernel.QueryProcessTeardown(s.Handle).Value.LocalReclaimCompleted);
+        }
+        finally { resume.Set(); }
+        Assert.Equal(KernelError.ExternalEffectUncontained, (await creation).Error);
+        Assert.False(s.Kernel.Regions.HasPendingBackingCreations(s.Owner));
+        Assert.True(s.Kernel.ObserveProcessTeardown(s.Handle).Value.LocalReclaimCompleted);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ResetDuringBackingCreationBalancesAdmissionWithoutInventingClosure(bool memoryStage)
+    {
+        CallbackMemoryProvider? memory = null;
+        CallbackFabricProvider? fabric = null;
+        var s = CreateScenario(memoryFactory: model => memory = new(model),
+            fabricFactory: model => fabric = new(model));
+        var reset = false;
+        Action callback = () => reset = s.Model.Rebind(s.Endpoint.EndpointId).IsSuccess;
+        if (memoryStage) memory!.BindHook = callback;
+        else fabric!.BindHook = callback;
+        var result = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease,
+            s.Endpoint, CxlMemoryPersistence.Volatile);
+        Assert.True(reset);
+        Assert.Equal(KernelError.ExternalEffectUncontained, result.Error);
+        Assert.False(s.Kernel.Regions.HasPendingBackingCreations(s.Owner));
+        Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.Regions.ReserveBacking(s.Buffer.Handle, s.Owner).Error);
+        Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.False(s.Kernel.QueryProcessTeardown(s.Handle).Value.LocalReclaimCompleted);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ProcessExitInsideBackingCreationRetainsLateReceiptForActualTeardown(bool memoryStage)
+    {
+        CallbackMemoryProvider? memory = null;
+        CallbackFabricProvider? fabric = null;
+        var s = CreateScenario(memoryFactory: model => memory = new(model),
+            fabricFactory: model => fabric = new(model));
+        var exit = KernelResult.Ok();
+        Action callback = () => exit = s.Kernel.TerminateProcess(s.Handle);
+        if (memoryStage) memory!.BindHook = callback;
+        else fabric!.BindHook = callback;
+        var placed = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease,
+            s.Endpoint, CxlMemoryPersistence.Volatile);
+        Assert.Equal(KernelError.PlatformBindingDraining, exit.Error);
+        Assert.Equal(KernelError.ExternalEffectUncontained, placed.Error);
+        Assert.False(s.Kernel.Regions.HasPendingBackingCreations(s.Owner));
+        Assert.False(s.Kernel.QueryProcessTeardown(s.Handle).Value.LocalReclaimCompleted);
+        var retried = s.Kernel.ObserveProcessTeardown(s.Handle);
+        Assert.True(retried.IsSuccess);
+        Assert.True(retried.Value.LocalReclaimCompleted);
+    }
+
+    [Fact]
+    public void ClosureAdmissionInsideMemoryCreationCannotLosePendingReceipt()
+    {
+        CallbackMemoryProvider? memory = null;
+        var s = CreateScenario(memoryFactory: model => memory = new(model));
+        var closure = KernelResult.Ok();
+        memory!.BindHook = () =>
+        {
+            var lease = s.Kernel.Regions.InspectionSnapshot().Single(item => item.Region.Handle == s.Buffer.Handle).BackingLease!;
+            closure = s.Kernel.Regions.BeginBackingClosure(lease.Handle, s.Owner);
+        };
+        var placed = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease,
+            s.Endpoint, CxlMemoryPersistence.Volatile);
+        Assert.True(placed.IsSuccess, placed.Message);
+        Assert.Equal(KernelError.PlatformBindingDraining, closure.Error);
+        Assert.False(s.Kernel.Regions.HasPendingBackingCreations(s.Owner));
+        Assert.True(s.Memory.Close(placed.Value!.PlacementId).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task BackingClosureBlocksNewMappingAndBackingEffectsUntilExactRelease(bool fails)
+    {
+        CallbackMemoryProvider? memory = null;
+        var s = CreateScenario(memoryFactory: model => memory = new(model));
+        var placement = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease,
+            s.Endpoint, CxlMemoryPersistence.Volatile).Value!;
+        var binding = s.Model.QueryMemory(placement.MemoryBindingId).Value!;
+        using var entered = new ManualResetEventSlim();
+        using var resume = new ManualResetEventSlim();
+        memory!.ReleaseHook = () =>
+        {
+            entered.Set();
+            if (!resume.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException();
+        };
+        s.Model.MemoryReleaseFails = fails;
+        var close = Task.Run(() => s.Memory.Close(placement.PlacementId));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+            Assert.Equal(KernelError.PlatformBindingDraining,
+                s.Kernel.MapPlatformOwnedRegion(s.Handle, s.Domain, s.RegionCapability, s.Buffer.Handle,
+                    PlatformMemoryAccess.Read | PlatformMemoryAccess.Write).Error);
+            Assert.False(s.Kernel.Regions.HasPlatformMappingReservation(s.Buffer.Handle, s.Owner));
+            Assert.Equal(KernelError.PlatformBindingDraining,
+                s.Bridge.BindMemory(s.Owner, binding.BackingLease, binding.FabricBinding).Error);
+        }
+        finally { resume.Set(); }
+        Assert.Equal(!fails, (await close).IsSuccess);
+        memory.ReleaseHook = null;
+        if (fails)
+        {
+            Assert.Equal(KernelError.PlatformBindingDraining,
+                s.Kernel.MapPlatformOwnedRegion(s.Handle, s.Domain, s.RegionCapability, s.Buffer.Handle,
+                    PlatformMemoryAccess.Read).Error);
+            s.Model.MemoryReleaseFails = false;
+            Assert.True(s.Memory.Close(placement.PlacementId).IsSuccess);
+        }
+        var mapping = s.Kernel.MapPlatformOwnedRegion(s.Handle, s.Domain, s.RegionCapability,
+            s.Buffer.Handle, PlatformMemoryAccess.Read);
+        Assert.True(mapping.IsSuccess, mapping.Message);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void WrongOwnerOrStaleBackingClosureAdmissionCannotPartiallyDenyMapping(bool stale)
+    {
+        var s = CreateScenario();
+        var placement = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease,
+            s.Endpoint, CxlMemoryPersistence.Volatile).Value!;
+        var binding = s.Model.QueryMemory(placement.MemoryBindingId).Value!;
+        var handle = stale ? binding.BackingLease with { Generation = binding.BackingLease.Generation + 1 } : binding.BackingLease;
+        var owner = stale ? s.Owner : new RegionOwner(new(9999), s.Handle.Generation);
+        Assert.False(s.Kernel.Regions.BeginBackingClosure(handle, owner).IsSuccess);
+        Assert.True(s.Kernel.Regions.ValidateBacking(binding.BackingLease, s.Owner).IsSuccess);
+        Assert.True(s.Kernel.Regions.ReservePlatformMapping(s.Buffer.Handle, s.Owner).IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingActive, s.Memory.Close(placement.PlacementId).Error);
+        Assert.True(s.Kernel.Regions.ReleasePlatformMappingReservation(s.Buffer.Handle, s.Owner).IsSuccess);
+        Assert.True(s.Memory.Close(placement.PlacementId).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void MemoryClosureSurvivesFabricFailureForDirectAndTeardownRetry(bool throws, bool teardown)
+    {
+        CallbackMemoryProvider? memory = null;
+        CallbackFabricProvider? fabric = null;
+        var s = CreateScenario(memoryFactory: model => memory = new(model),
+            fabricFactory: model => fabric = new(model));
+        var placement = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease,
+            s.Endpoint, CxlMemoryPersistence.Volatile).Value!;
+        if (throws) fabric!.UnbindHook = () => throw new InvalidOperationException("fabric closure failure");
+        else s.Model.FabricUnbindFails = true;
+        Assert.False(teardown ? s.Kernel.TerminateProcess(s.Handle).IsSuccess : s.Memory.Close(placement.PlacementId).IsSuccess);
+        Assert.Equal(CxlMemoryPlacementState.Quarantined, s.Memory.Query(placement.PlacementId).Value!.State);
+        Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.Regions.ReserveBacking(s.Buffer.Handle, s.Owner).Error);
+        Assert.Equal(1, memory!.ReleaseCalls);
+        Assert.Equal(1, fabric!.UnbindCalls);
+        fabric.UnbindHook = null;
+        s.Model.FabricUnbindFails = false;
+        if (teardown)
+        {
+            Assert.False(s.Kernel.QueryProcessTeardown(s.Handle).Value.LocalReclaimCompleted);
+            var retried = s.Kernel.ObserveProcessTeardown(s.Handle);
+            Assert.True(retried.IsSuccess);
+            Assert.True(retried.Value.LocalReclaimCompleted);
+        }
+        else Assert.True(s.Memory.Close(placement.PlacementId).IsSuccess);
+        Assert.Equal(1, memory.ReleaseCalls);
+        Assert.Equal(2, fabric.UnbindCalls);
+        Assert.Equal(CxlMemoryPlacementState.Released, s.Memory.Query(placement.PlacementId).Value!.State);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void LostSuccessfulClosureReplyNeverBecomesClosureFromNotFound(bool memoryReply)
+    {
+        CallbackMemoryProvider? memory = null;
+        CallbackFabricProvider? fabric = null;
+        var s = CreateScenario(memoryFactory: model => memory = new(model),
+            fabricFactory: model => fabric = new(model));
+        var placement = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease,
+            s.Endpoint, CxlMemoryPersistence.Volatile).Value!;
+        Action lost = () => throw new InvalidOperationException("successful provider closure reply lost");
+        if (memoryReply) memory!.AfterReleaseHook = lost;
+        else fabric!.AfterUnbindHook = lost;
+        Assert.False(s.Memory.Close(placement.PlacementId).IsSuccess);
+        memory!.AfterReleaseHook = null;
+        fabric!.AfterUnbindHook = null;
+        Assert.False(s.Memory.Close(placement.PlacementId).IsSuccess);
+        Assert.Equal(CxlMemoryPlacementState.Quarantined, s.Memory.Query(placement.PlacementId).Value!.State);
+        Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.Regions.ReserveBacking(s.Buffer.Handle, s.Owner).Error);
+        Assert.Equal(1, memory.ReleaseCalls);
+        Assert.Equal(memoryReply ? 0 : 1, fabric.UnbindCalls);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void FailedClosureBalancesInterlockAndRetainsBackingUntilRealRetry(bool throws)
+    {
+        CallbackMemoryProvider? memory = null;
+        var s = CreateScenario(memoryFactory: model => memory = new(model));
+        var placement = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease,
+            s.Endpoint, CxlMemoryPersistence.Volatile).Value!;
+        if (throws) memory!.ReleaseHook = () => throw new InvalidOperationException("closure exception");
+        else s.Model.MemoryReleaseFails = true;
+        Assert.False(s.Memory.Close(placement.PlacementId).IsSuccess);
+        Assert.Equal(CxlMemoryPlacementState.Quarantined, s.Memory.Query(placement.PlacementId).Value!.State);
+        Assert.Equal(KernelError.PlatformBindingActive,
+            s.Kernel.Regions.ReserveBacking(s.Buffer.Handle, s.Owner).Error);
+        memory!.ReleaseHook = null;
+        s.Model.MemoryReleaseFails = false;
+        Assert.True(s.Memory.Close(placement.PlacementId).IsSuccess);
+        Assert.Equal(2, memory.ReleaseCalls);
+        Assert.Equal(CxlMemoryPlacementState.Released, s.Memory.Query(placement.PlacementId).Value!.State);
+        var replacement = s.Kernel.Regions.ReserveBacking(s.Buffer.Handle, s.Owner);
+        Assert.True(replacement.IsSuccess);
+        Assert.True(s.Kernel.Regions.ReleaseBacking(replacement.Value!.Handle, s.Owner).IsSuccess);
+    }
+
+    [Fact]
+    public async Task ConcurrentHealthClosePreservesReleasedWithoutLateDamage()
+    {
+        var s = CreateScenario();
+        var placement = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease,
+            s.Endpoint, CxlMemoryPersistence.Volatile).Value!;
+        Assert.True(s.Model.InjectHealthFault(placement.MemoryBindingId,
+            ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(8, 8)).IsSuccess);
+        using var entered = new ManualResetEventSlim();
+        using var resume = new ManualResetEventSlim();
+        var health = Task.Run(() => s.Memory.ObserveAndQuarantine(placement.PlacementId, s.Owner,
+            new CallbackHealthProvider(s.Model, () =>
+            {
+                entered.Set();
+                if (!resume.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException();
+            })));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+            Assert.True(s.Memory.Close(placement.PlacementId).IsSuccess);
+            Assert.Equal(CxlMemoryPlacementState.Released, s.Memory.Refresh(placement.PlacementId).Value!.State);
+        }
+        finally { resume.Set(); }
+        Assert.Equal(KernelError.StaleGeneration, (await health).Error);
+        Assert.Empty(s.Kernel.Regions.SnapshotDamage());
+        Assert.Equal(CxlMemoryPlacementState.Released, s.Memory.Query(placement.PlacementId).Value!.State);
+    }
+
+    [Fact]
+    public async Task OverlappingHealthObservationsCommitOnePlacementConsequence()
+    {
+        var s = CreateScenario();
+        var placement = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease,
+            s.Endpoint, CxlMemoryPersistence.Volatile).Value!;
+        Assert.True(s.Model.InjectHealthFault(placement.MemoryBindingId,
+            ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(8, 8)).IsSuccess);
+        using var entered = new CountdownEvent(2);
+        using var resume = new ManualResetEventSlim();
+        var provider = new CallbackHealthProvider(s.Model, () =>
+        {
+            entered.Signal();
+            if (!resume.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException();
+        });
+        var tasks = Enumerable.Range(0, 2).Select(_ => Task.Run(() =>
+            s.Memory.ObserveAndQuarantine(placement.PlacementId, s.Owner, provider))).ToArray();
+        try { Assert.True(entered.Wait(TimeSpan.FromSeconds(5))); }
+        finally { resume.Set(); }
+        var results = await Task.WhenAll(tasks);
+        Assert.Single(results, item => item.IsSuccess);
+        Assert.Single(results, item => item.Error == KernelError.StaleGeneration);
+        Assert.Single(s.Kernel.Regions.SnapshotDamage());
+        Assert.Equal(CxlMemoryPlacementState.Quarantined, s.Memory.Query(placement.PlacementId).Value!.State);
+    }
+
+    [Fact]
+    public async Task PendingCloseRejectsOverlapOutsidePlacementLock()
+    {
+        CallbackMemoryProvider? memory = null;
+        var s = CreateScenario(memoryFactory: model => memory = new(model));
+        var placement = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease,
+            s.Endpoint, CxlMemoryPersistence.Volatile).Value!;
+        using var entered = new ManualResetEventSlim();
+        using var resume = new ManualResetEventSlim();
+        memory!.ReleaseHook = () =>
+        {
+            entered.Set();
+            if (!resume.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException();
+        };
+        var close = Task.Run(() => s.Memory.Close(placement.PlacementId));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+            Assert.Equal(KernelError.PlatformBindingDraining, s.Memory.Close(placement.PlacementId).Error);
+            Assert.Equal(CxlMemoryPlacementState.Draining, s.Memory.Refresh(placement.PlacementId).Value!.State);
+            Assert.Equal(KernelError.InvalidTransition,
+                s.Memory.ObserveAndQuarantine(placement.PlacementId, s.Owner, s.Model).Error);
+        }
+        finally { resume.Set(); }
+        Assert.True((await close).IsSuccess);
+        Assert.Equal(1, memory.ReleaseCalls);
+        Assert.Equal(CxlMemoryPlacementState.Released, s.Memory.Query(placement.PlacementId).Value!.State);
+    }
+
+    [Fact]
+    public void ClosingPlacementDuringHealthCallbackCannotResurrectReleasedPlacement()
+    {
+        var s = CreateScenario();
+        var placement = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease,
+            s.Endpoint, CxlMemoryPersistence.Volatile).Value!;
+        Assert.True(s.Model.InjectHealthFault(placement.MemoryBindingId,
+            ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(8, 8)).IsSuccess);
+        var closed = false;
+        var result = s.Memory.ObserveAndQuarantine(placement.PlacementId, s.Owner,
+            new CallbackHealthProvider(s.Model, () => closed = s.Memory.Close(placement.PlacementId).IsSuccess));
+        Assert.True(closed);
+        Assert.Equal(KernelError.StaleGeneration, result.Error);
+        Assert.Equal(CxlMemoryPlacementState.Released, s.Memory.Query(placement.PlacementId).Value!.State);
+        Assert.Empty(s.Kernel.Regions.SnapshotDamage());
+        Assert.True(s.Memory.Close(placement.PlacementId).IsSuccess);
+    }
+
+    private sealed class CallbackHealthProvider(ICxlType3HealthEvidenceProvider provider, Action callback)
+        : ICxlType3HealthEvidenceProvider
+    {
+        public PlatformAuthorityResult<CxlType3HealthObservation> QueryHealth(CxlType3HealthObservationRequest request)
+        {
+            var observation = provider.QueryHealth(request);
+            callback();
+            return observation;
+        }
+    }
+
+    [Fact]
     public void ModelHealthEvidenceQuarantinesOnlyTheExactCxlBackedSubrange()
     {
         var s = CreateScenario();
@@ -160,7 +742,11 @@ public sealed class CxlType3MemoryProviderTests
         Assert.False(refresh.IsSuccess);
         Assert.Equal(CxlMemoryPlacementState.MigrationRequired, s.Memory.Query(placed.PlacementId).Value!.State);
         Assert.True(s.Kernel.Regions.Validate(s.Buffer.Handle, s.Owner).IsSuccess);
-        Assert.True(s.Memory.Close(placed.PlacementId).IsSuccess);
+        Assert.Equal(KernelError.PlatformUnavailable, s.Memory.Close(placed.PlacementId).Error);
+        Assert.Equal(CxlMemoryPlacementState.Quarantined, s.Memory.Query(placed.PlacementId).Value!.State);
+        Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.RevokePlatformDevice(s.Handle, s.Lease).Error);
+        Assert.Equal(0, s.Platform.DeviceRevokeCalls);
+        Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.Regions.ReserveBacking(s.Buffer.Handle, s.Owner).Error);
     }
 
     [Fact]
@@ -176,6 +762,10 @@ public sealed class CxlType3MemoryProviderTests
         Assert.False(s.Memory.Refresh(first.PlacementId).IsSuccess);
         Assert.True(s.Memory.Refresh(second.PlacementId).IsSuccess);
         Assert.Equal(CxlMemoryPlacementState.Active, s.Memory.Query(second.PlacementId).Value!.State);
+        Assert.True(s.Memory.Close(second.PlacementId).IsSuccess);
+        Assert.True(s.Kernel.RevokePlatformDevice(s.Handle, s.Lease2!.Value).IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.RevokePlatformDevice(s.Handle, s.Lease).Error);
+        Assert.Equal(CxlMemoryPlacementState.Released, s.Memory.Query(second.PlacementId).Value!.State);
     }
 
     [Fact]
@@ -281,12 +871,11 @@ public sealed class CxlType3MemoryProviderTests
 
         var control = s.Kernel.AllocateBuffer<byte>(s.Handle, 8).Value!;
         var controlUse = s.Kernel.AcquireRegionUse(s.Handle, control.Handle, RegionUseMode.DevicePrivate, new(0, 8)).Value!;
-        var fabric = new CxlAuthorityBridge(s.Kernel, s.Model, s.Model, s.Model, s.Model,
-            new UnsupportedCoherent(), new EvidenceOnly()).BindFabric(s.Owner, controlUse.Handle, s.Subject, s.Lease,
-            new(s.Endpoint.EndpointId, s.Endpoint.DeviceGeneration, 8, CxlMemoryPersistence.Volatile, CxlMemorySharing.Exclusive)).Value!;
-        var accelerator = new CxlType2ModelAccelerator();
         var bridge = new CxlAuthorityBridge(s.Kernel, s.Model, s.Model, s.Model, s.Model,
             new UnsupportedCoherent(), new EvidenceOnly());
+        var fabric = bridge.BindFabric(s.Owner, controlUse.Handle, s.Subject, s.Lease,
+            new(s.Endpoint.EndpointId, s.Endpoint.DeviceGeneration, 8, CxlMemoryPersistence.Volatile, CxlMemorySharing.Exclusive)).Value!;
+        var accelerator = new CxlType2ModelAccelerator();
         var manager = new CxlFabricManagerAuthority(s.Kernel, s.Model);
         Assert.True(manager.Register(fabric).IsSuccess);
         var service = new CxlType2AcceleratorService(s.Kernel, bridge, accelerator, manager);
@@ -360,7 +949,10 @@ public sealed class CxlType3MemoryProviderTests
             s.Endpoint, CxlMemoryPersistence.Volatile);
 
         Assert.False(placement.IsSuccess);
+        Assert.False(s.Kernel.Regions.HasPendingBackingCreations(s.Owner));
         Assert.Equal(KernelError.ExternalEffectUncontained, placement.Error);
+        Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.RevokePlatformDevice(s.Handle, s.Lease).Error);
+        Assert.Equal(0, s.Platform.DeviceRevokeCalls);
         Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
         Assert.Equal(ProcessTeardownPhase.PlatformFaulted, s.Kernel.QueryProcessTeardown(s.Handle).Value!.Phase);
         Assert.True(s.Kernel.Regions.Validate(s.Buffer.Handle, s.Owner).IsSuccess);
@@ -369,7 +961,9 @@ public sealed class CxlType3MemoryProviderTests
     private static CxlMemoryPlacementIntent Intent(CxlMemoryPlacementPreference preference) =>
         new(64, CxlMemoryPersistence.Volatile, CxlMemorySharing.Exclusive, preference, 10, 0);
 
-    private static Scenario CreateScenario(bool twoEndpoints = false)
+    private static Scenario CreateScenario(bool twoEndpoints = false,
+        Func<CxlType3ModelProvider, ICxlMemoryProvider>? memoryFactory = null,
+        Func<CxlType3ModelProvider, ICxlFabricProvider>? fabricFactory = null)
     {
         var platform = new AuthorityProvider();
         var kernel = new RuntimeKernel(platform);
@@ -394,7 +988,7 @@ public sealed class CxlType3MemoryProviderTests
             lease2 = Lease("device:type3-1");
             Assert.True(model.RegisterEndpoint(new("type3-1"), lease2.Value.Device, 1024, latencyClass: 3, bandwidthClass: 4).IsSuccess);
         }
-        var bridge = new CxlAuthorityBridge(kernel, model, model, model, model,
+        var bridge = new CxlAuthorityBridge(kernel, model, model, fabricFactory?.Invoke(model) ?? model, memoryFactory?.Invoke(model) ?? model,
             new UnsupportedCoherent(), new EvidenceOnly());
         var memory = new CxlType3MemoryAuthority(kernel, bridge);
         var buffer = kernel.AllocateBuffer<byte>(handle, 64).Value!;
@@ -402,13 +996,84 @@ public sealed class CxlType3MemoryProviderTests
             CapabilityResourceIds.MemoryRegion(buffer.Handle.RegionId),
             CapabilityRights.Read | CapabilityRights.Write | CapabilityRights.Map).Value!.CapabilityId;
         return new(kernel, handle, owner, subject, domain, buffer, regionCapability, lease, lease2, model,
-            model.QueryEndpoint(new("type3-0")).Value!, memory);
+            model.QueryEndpoint(new("type3-0")).Value!, memory, bridge, platform);
     }
 
     private sealed record Scenario(RuntimeKernel Kernel, ProcessHandle Handle, RegionOwner Owner,
         PlatformDomainIdentity Subject, PlatformDomainBinding Domain, OwnedBuffer<byte> Buffer, CapabilityId RegionCapability, PlatformDeviceLease Lease,
         PlatformDeviceLease? Lease2, CxlType3ModelProvider Model, CxlEndpointSnapshot Endpoint,
-        CxlType3MemoryAuthority Memory);
+        CxlType3MemoryAuthority Memory, CxlAuthorityBridge Bridge, AuthorityProvider Platform);
+
+    private sealed class CallbackMemoryProvider(CxlType3ModelProvider model) : ICxlMemoryProvider
+    {
+        internal Func<CxlMemoryBinding, CxlMemoryBinding>? RewriteReceipt { get; set; }
+        internal int BindCalls { get; private set; }
+        internal Action? RejectBind { get; set; }
+        internal Action? BindHook { get; set; }
+        internal Action? ReleaseHook { get; set; }
+        internal Action? AfterReleaseHook { get; set; }
+        internal int ReleaseCalls { get; private set; }
+        public PlatformAuthorityResult<CxlMemoryCapacitySnapshot> QueryCapacity(CxlEndpointId endpoint) => model.QueryCapacity(endpoint);
+        public PlatformAuthorityResult<CxlMemoryBinding> BindMemory(CxlFabricBinding fabric, RegionBackingLeaseDescriptor backing)
+        {
+            BindCalls++;
+            if (RejectBind is { } reject)
+            {
+                reject();
+                return PlatformAuthorityResult<CxlMemoryBinding>.Fail(PlatformAuthorityStatus.NotAccepted, "zero-effect rejection");
+            }
+            var result = model.BindMemory(fabric, backing);
+            BindHook?.Invoke();
+            if (result.IsSuccess && RewriteReceipt is { } rewrite)
+                return PlatformAuthorityResult<CxlMemoryBinding>.Ok(rewrite(result.Value!));
+            return result;
+        }
+        public PlatformAuthorityResult<CxlMemoryBinding> QueryMemory(CxlMemoryBindingId binding) => model.QueryMemory(binding);
+        public PlatformAuthorityResult ReleaseMemory(CxlMemoryBinding binding)
+        {
+            ReleaseCalls++;
+            ReleaseHook?.Invoke();
+            var result = model.ReleaseMemory(binding);
+            if (result.IsSuccess) AfterReleaseHook?.Invoke();
+            return result;
+        }
+    }
+
+    private sealed class CallbackFabricProvider(CxlType3ModelProvider model) : ICxlFabricProvider
+    {
+        internal int BindCalls { get; private set; }
+        internal Action? RejectBind { get; set; }
+        internal Action? QueryHook { get; set; }
+        internal Action? BindHook { get; set; }
+        internal Action? UnbindHook { get; set; }
+        internal Action? AfterUnbindHook { get; set; }
+        internal int UnbindCalls { get; private set; }
+        public PlatformAuthorityResult<CxlFabricBinding> Bind(CxlFabricBindingRequest request)
+        {
+            BindCalls++;
+            if (RejectBind is { } reject)
+            {
+                reject();
+                return PlatformAuthorityResult<CxlFabricBinding>.Fail(PlatformAuthorityStatus.NotAccepted, "zero-effect rejection");
+            }
+            var result = model.Bind(request);
+            BindHook?.Invoke();
+            return result;
+        }
+        public PlatformAuthorityResult<CxlFabricBinding> Query(CxlFabricBindingId binding)
+        {
+            QueryHook?.Invoke();
+            return model.Query(binding);
+        }
+        public PlatformAuthorityResult Unbind(CxlFabricBinding binding)
+        {
+            UnbindCalls++;
+            UnbindHook?.Invoke();
+            var result = model.Unbind(binding);
+            if (result.IsSuccess) AfterUnbindHook?.Invoke();
+            return result;
+        }
+    }
 
     private sealed class UnsupportedCoherent : ICxlCoherentAccessProvider
     {
@@ -450,6 +1115,7 @@ public sealed class CxlType3MemoryProviderTests
 
     private sealed class AuthorityProvider : IPlatformAuthorityProvider, IPlatformDeviceLeaseProvider, IPlatformFeatureProvider
     {
+        internal int DeviceRevokeCalls { get; private set; }
         private ulong _nextDevice = 1;
         public PlatformProviderDescriptor Descriptor { get; } = new(new("type3-test"), 1,
             PlatformAuthorityFeatures.NeutralDomainBinding | PlatformAuthorityFeatures.DirectOwnedRegionMapping);
@@ -464,7 +1130,11 @@ public sealed class CxlType3MemoryProviderTests
         public PlatformAuthorityResult RevokeDomain(PlatformProviderDomainLease lease) => PlatformAuthorityResult.Ok();
         public PlatformAuthorityResult<PlatformProviderDeviceLease> BindDevice(PlatformProviderDomainLease d, PlatformDeviceIdentity device, PlatformDeviceRights rights) =>
             PlatformAuthorityResult<PlatformProviderDeviceLease>.Ok(new(new(_nextDevice++), new(1), d, device, rights));
-        public PlatformAuthorityResult RevokeDevice(PlatformProviderDeviceLease lease) => PlatformAuthorityResult.Ok();
+        public PlatformAuthorityResult RevokeDevice(PlatformProviderDeviceLease lease)
+        {
+            DeviceRevokeCalls++;
+            return PlatformAuthorityResult.Ok();
+        }
         public PlatformAuthorityResult<PlatformProviderRegionMappingLease> MapOwnedRegion(PlatformProviderDomainLease d, PlatformRegionIdentity r, PlatformMemoryAccess a) =>
             PlatformAuthorityResult<PlatformProviderRegionMappingLease>.Ok(new(new(1), new(1), d, r, a));
         public PlatformAuthorityResult RevokeRegionMapping(PlatformProviderRegionMappingLease m, PlatformRegionRevocationPolicy p) => PlatformAuthorityResult.Ok();

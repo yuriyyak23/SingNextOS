@@ -148,7 +148,14 @@ internal sealed class V6ManagedSafePointProvider
         }
 
         long started;
-        try { started = _timeProvider.GetTimestamp(); }
+        long timestampFrequency;
+        try
+        {
+            timestampFrequency = _timeProvider.TimestampFrequency;
+            if (timestampFrequency <= 0)
+                throw new InvalidOperationException("Managed safe-point timestamp frequency must be positive.");
+            started = _timeProvider.GetTimestamp();
+        }
         catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
         {
             Quarantine(operationCorrelation, requestGeneration);
@@ -163,10 +170,16 @@ internal sealed class V6ManagedSafePointProvider
         try
         {
             var completed = _timeProvider.GetTimestamp();
-            var elapsed = _timeProvider.GetElapsedTime(started, completed);
-            if (elapsed < TimeSpan.Zero)
-                throw new InvalidOperationException("Managed safe-point clock moved backwards.");
-            elapsedNanoseconds = checked((ulong)elapsed.Ticks * 100UL);
+            if (completed < started)
+                throw new InvalidOperationException("Managed safe-point timestamp moved backwards before duration conversion.");
+            if (_timeProvider.TimestampFrequency != timestampFrequency)
+                throw new InvalidOperationException("Managed safe-point timestamp frequency changed during the hook.");
+            // Preserve the exact clock ratio until the last integer conversion.
+            // Rounding up cannot admit a fractional-nanosecond overrun as in-bound.
+            var timestampDelta = (UInt128)((Int128)completed - started);
+            var numerator = timestampDelta * 1_000_000_000UL;
+            var denominator = (UInt128)timestampFrequency;
+            elapsedNanoseconds = checked((ulong)((numerator + denominator - 1) / denominator));
         }
         catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
         {
@@ -262,7 +275,7 @@ internal sealed class V6ManagedSafePointProvider
     private static string ValidateToken(string? value)
     {
         if (string.IsNullOrWhiteSpace(value) || value != value.Trim() || value.Any(char.IsControl) ||
-            Encoding.UTF8.GetByteCount(value) > 256)
+            new UTF8Encoding(false, true).GetByteCount(value) > 256)
             throw new ArgumentException("Managed provider identity or operation correlation is not canonical.");
         return value;
     }

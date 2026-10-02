@@ -34,6 +34,7 @@ internal sealed class V6ManagedTemporalCapacityProvider
     private readonly ulong _capacityNanoseconds;
     private ulong _reservedNanoseconds;
     private ulong _providerGeneration = 1;
+    private bool _providerGenerationExhausted;
     private ulong _nextReservationGeneration = 1;
     private bool _resetBeforeNextRelease;
 
@@ -61,6 +62,9 @@ internal sealed class V6ManagedTemporalCapacityProvider
                 "Managed temporal capacity supports only canonical ComputeTime/Nanoseconds reservations.");
         lock (_sync)
         {
+            if (_providerGenerationExhausted)
+                return KernelResult<V6TemporalProviderReservation>.Fail(KernelError.CapacityExhausted,
+                    "Temporal provider generation is exhausted; fresh admission is unavailable.");
             if (_records.Values.Any(record => record.Reservation.OperationCorrelation == operationCorrelation &&
                 record.Reservation.State is V6TemporalProviderReservationState.Reserved or
                     V6TemporalProviderReservationState.InUse or V6TemporalProviderReservationState.Quarantined))
@@ -105,13 +109,16 @@ internal sealed class V6ManagedTemporalCapacityProvider
         }
     }
 
-    internal KernelResult<V6TemporalProviderReservation> Release(V6TemporalProviderReservationHandle handle)
+    internal KernelResult<V6TemporalProviderReservation> Release(V6TemporalProviderReservationHandle handle, bool unusedOnly = false)
     {
         lock (_sync)
         {
             var resolved = Resolve(handle);
             if (!resolved.IsSuccess) return resolved;
             if (resolved.Value!.State == V6TemporalProviderReservationState.Released) return resolved;
+            if (unusedOnly && resolved.Value.State != V6TemporalProviderReservationState.Reserved)
+                return KernelResult<V6TemporalProviderReservation>.Fail(KernelError.InvalidTransition,
+                    "Unused compensation cannot release capacity that may have begun use.");
             if (resolved.Value.State is not (V6TemporalProviderReservationState.Reserved or V6TemporalProviderReservationState.InUse))
                 return KernelResult<V6TemporalProviderReservation>.Fail(KernelError.InvalidTransition,
                     "Quarantined temporal capacity requires explicit reconciliation.");
@@ -141,6 +148,9 @@ internal sealed class V6ManagedTemporalCapacityProvider
             var resolved = Resolve(handle);
             if (!resolved.IsSuccess) return resolved;
             var record = _records[handle.Id];
+            // Retry can reuse exact owner-recorded closure without releasing twice.
+            // Resolve still rejects a missing record or stale handle generation.
+            if (record.Reservation.State == V6TemporalProviderReservationState.Released) return resolved;
             if (record.Reservation.State != V6TemporalProviderReservationState.Quarantined)
                 return KernelResult<V6TemporalProviderReservation>.Fail(KernelError.InvalidTransition,
                     "Only quarantined temporal capacity requires reconciliation.");
@@ -165,7 +175,16 @@ internal sealed class V6ManagedTemporalCapacityProvider
     private KernelResult ResetCore()
     {
         if (_providerGeneration == ulong.MaxValue)
+        {
+            // A reset attempt cannot leave the terminal generation usable. Retain
+            // every live reservation until explicit model/provider reconciliation.
+            _providerGenerationExhausted = true;
+            foreach (var record in _records.Values)
+                if (record.Reservation.State != V6TemporalProviderReservationState.Released)
+                    record.Reservation = record.Reservation with
+                    { State = V6TemporalProviderReservationState.Quarantined };
             return KernelResult.Fail(KernelError.CapacityExhausted, "Temporal provider generation is exhausted.");
+        }
         _providerGeneration++;
         ulong retained = 0;
         foreach (var (id, record) in _records.ToArray())
@@ -211,8 +230,14 @@ internal sealed class V6ManagedTemporalCapacityProvider
             : KernelResult<V6TemporalProviderReservation>.Fail(KernelError.StaleGeneration,
                 "Temporal provider reservation is missing or stale.");
 
-    private static bool Canonical(string? value) =>
-        !string.IsNullOrWhiteSpace(value) && value == value.Trim() && value.Length <= 256 && !value.Any(char.IsControl);
+    private static bool Canonical(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value) || value != value.Trim() || value.Length > 256 || value.Any(char.IsControl))
+            return false;
+        try { _ = new System.Text.UTF8Encoding(false, true).GetByteCount(value); }
+        catch (System.Text.EncoderFallbackException) { return false; }
+        return true;
+    }
 }
 
 internal enum V6TemporalCapacityOperationState { Admitted = 1, SubmitInFlight, Submitted, Settled, Cancelled, Quarantined }
@@ -239,6 +264,7 @@ internal sealed class V6TemporalCapacityCoordinator
     private readonly RuntimeKernel? effectKernel;
     private readonly object _sync = new();
     private readonly Dictionary<Guid, V6TemporalCapacityBinding> _bindings = [];
+    private readonly HashSet<Guid> _cancellingBindings = [];
 
     internal V6TemporalCapacityCoordinator(ResourceBudgetAuthority budgets,
         V6ManagedTemporalCapacityProvider provider)
@@ -263,16 +289,38 @@ internal sealed class V6TemporalCapacityCoordinator
         var current = effectKernel.QueryExternalOperation(owner, operation);
         if (!current.IsSuccess)
             return KernelResult<V6TemporalCapacityBinding>.Fail(current.Error, current.Message!);
-        if (current.Value!.State is not (ExternalOperationState.Prepared or ExternalOperationState.Admitted))
+        if (current.Value!.State is not (ExternalOperationState.Prepared or ExternalOperationState.Admitted) ||
+            current.Value.Disposition != ExternalOperationDisposition.Active)
             return KernelResult<V6TemporalCapacityBinding>.Fail(KernelError.InvalidTransition,
-                "Temporal capacity can bind only a pre-submit external operation.");
+                "Temporal capacity can bind only an active pre-submit external operation.");
         var correlation = $"external:{operation.OperationId.Value}:{operation.Generation.Value}";
-        var admitted = Admit(owner, budget, correlation, temporal);
+        var admitted = AdmitCore(owner, budget, correlation, temporal, commitReceipt: false);
         if (!admitted.IsSuccess) return admitted;
         lock (_sync)
         {
             var bound = admitted.Value! with { ExternalOperation = operation };
             _bindings[bound.Id] = bound;
+            // The initial owner query predates capacity admission. Re-read every
+            // mutable owner immediately before returning the composition receipt.
+            // This is an admission observation, not an atomic execution fence;
+            // SubmitBoundExternalOperation still performs its own owner commit.
+            current = effectKernel.QueryExternalOperation(owner, operation);
+            var capacity = provider.Query(bound.ProviderReservation.Handle);
+            var budgetState = budgets.Query(budget);
+            var ownerReady = current.IsSuccess &&
+                current.Value!.State is ExternalOperationState.Prepared or ExternalOperationState.Admitted &&
+                current.Value.Disposition == ExternalOperationDisposition.Active;
+            var resourcesReady = capacity.IsSuccess && capacity.Value! == bound.ProviderReservation &&
+                capacity.Value.State == V6TemporalProviderReservationState.Reserved &&
+                capacity.Value.ProviderGeneration == provider.ProviderGeneration &&
+                budgetState.IsSuccess && budgetState.Value!.Owner == owner &&
+                budgetState.Value.State == BudgetReservationState.Bound;
+            if (!ownerReady || !resourcesReady)
+                return RejectUnpublishedAdmission(bound, !current.IsSuccess ? current.Error :
+                    !ownerReady ? KernelError.InvalidTransition : KernelError.StaleGeneration);
+            var committed = budgets.CommitTemporalComposition(owner, budget, bound.Id);
+            if (!committed.IsSuccess)
+                return RejectUnpublishedAdmission(bound, committed.Error);
             return KernelResult<V6TemporalCapacityBinding>.Ok(bound);
         }
     }
@@ -281,7 +329,11 @@ internal sealed class V6TemporalCapacityCoordinator
         ProcessHandle owner,
         BudgetReservationHandle budget,
         string operationCorrelation,
-        TemporalSemanticsV1 temporal)
+        TemporalSemanticsV1 temporal) => AdmitCore(owner, budget, operationCorrelation, temporal, commitReceipt: true);
+
+    private KernelResult<V6TemporalCapacityBinding> AdmitCore(
+        ProcessHandle owner, BudgetReservationHandle budget, string operationCorrelation,
+        TemporalSemanticsV1 temporal, bool commitReceipt)
     {
         TemporalSemanticsV1 exact;
         try { exact = temporal.Validate(); }
@@ -291,25 +343,74 @@ internal sealed class V6TemporalCapacityCoordinator
             exact.DeadlineSemantics != TemporalDeadlineSemanticsV1.None)
             return KernelResult<V6TemporalCapacityBinding>.Fail(KernelError.PlatformUnsupported,
                 "Managed protected capacity is a reservation only and cannot claim a completion deadline.");
-        var snapshot = budgets.Query(budget);
-        if (!snapshot.IsSuccess || snapshot.Value!.Owner != owner ||
-            snapshot.Value.State != BudgetReservationState.Bound ||
-            snapshot.Value.Lifetime != BudgetReservationLifetime.ExternalEffect ||
-            snapshot.Value.Amounts.SingleOrDefault(static amount => amount.Dimension == ServiceBudgetDimension.ComputeTimeNanoseconds).Amount < exact.ComputeEnvelope.Amount)
-            return KernelResult<V6TemporalCapacityBinding>.Fail(KernelError.PlatformDenied,
-                "Temporal capacity requires the exact bound compute-time budget envelope.");
-        var reserved = provider.Reserve(operationCorrelation, exact.ComputeEnvelope);
-        if (!reserved.IsSuccess)
-            return KernelResult<V6TemporalCapacityBinding>.Fail(reserved.Error, reserved.Message!);
-        var binding = new V6TemporalCapacityBinding(Guid.NewGuid(), owner, budget, exact,
-            reserved.Value!, V6TemporalCapacityOperationState.Admitted);
-        try { lock (_sync) _bindings.Add(binding.Id, binding); }
-        catch (Exception exception) when (exception is ArgumentException or OutOfMemoryException)
+        lock (_sync)
         {
-            _ = provider.Release(reserved.Value!.Handle);
-            return KernelResult<V6TemporalCapacityBinding>.Fail(KernelError.CapacityExhausted, exception.Message);
+            // The budget owner arbitrates composition uniqueness across instances;
+            // this dictionary only retains the committed composition relationship.
+            // No provider callback runs here.
+            var snapshot = budgets.Query(budget);
+            if (!snapshot.IsSuccess || snapshot.Value!.Owner != owner ||
+                snapshot.Value.State != BudgetReservationState.Bound ||
+                snapshot.Value.Lifetime != BudgetReservationLifetime.ExternalEffect ||
+                snapshot.Value.Amounts.SingleOrDefault(static amount => amount.Dimension == ServiceBudgetDimension.ComputeTimeNanoseconds).Amount < exact.ComputeEnvelope.Amount)
+                return KernelResult<V6TemporalCapacityBinding>.Fail(KernelError.PlatformDenied,
+                    "Temporal capacity requires the exact bound compute-time budget envelope.");
+            var composition = Guid.NewGuid();
+            var claimed = budgets.ClaimTemporalComposition(owner, budget, composition);
+            if (!claimed.IsSuccess)
+                return KernelResult<V6TemporalCapacityBinding>.Fail(claimed.Error, claimed.Message!);
+            var reserved = provider.Reserve(operationCorrelation, exact.ComputeEnvelope);
+            if (!reserved.IsSuccess)
+            {
+                budgets.AbandonTemporalComposition(owner, budget, composition);
+                return KernelResult<V6TemporalCapacityBinding>.Fail(reserved.Error, reserved.Message!);
+            }
+            var binding = new V6TemporalCapacityBinding(composition, owner, budget, exact,
+                reserved.Value!, V6TemporalCapacityOperationState.Admitted);
+            try { _bindings.Add(binding.Id, binding); }
+            catch (Exception exception) when (exception is ArgumentException or OutOfMemoryException)
+            {
+                var released = provider.Release(reserved.Value!.Handle, unusedOnly: true);
+                if (released.IsSuccess)
+                    budgets.AbandonTemporalComposition(owner, budget, composition);
+                return KernelResult<V6TemporalCapacityBinding>.Fail(KernelError.CapacityExhausted, exception.Message);
+            }
+            if (commitReceipt)
+            {
+                var committed = budgets.CommitTemporalComposition(owner, budget, composition);
+                if (!committed.IsSuccess)
+                    return RejectUnpublishedAdmission(binding, committed.Error);
+            }
+            return KernelResult<V6TemporalCapacityBinding>.Ok(binding);
         }
-        return KernelResult<V6TemporalCapacityBinding>.Ok(binding);
+    }
+
+    // Caller holds coordinator _sync; this compensates only unpublished model capacity.
+    private KernelResult<V6TemporalCapacityBinding> RejectUnpublishedAdmission(
+        V6TemporalCapacityBinding binding, KernelError error)
+    {
+        var capacity = provider.Query(binding.ProviderReservation.Handle);
+        var unused = capacity.IsSuccess && capacity.Value!.State == V6TemporalProviderReservationState.Reserved;
+        var released = unused ? provider.Release(binding.ProviderReservation.Handle, unusedOnly: true) : default;
+        var modelResetDroppedUnused = unused && released.Error == KernelError.StaleGeneration &&
+            provider.ProviderGeneration != binding.ProviderReservation.ProviderGeneration &&
+            !provider.Query(binding.ProviderReservation.Handle).IsSuccess;
+        if (released.IsSuccess || modelResetDroppedUnused)
+        {
+            _bindings.Remove(binding.Id);
+            budgets.AbandonTemporalComposition(binding.Owner, binding.Budget, binding.Id);
+            return KernelResult<V6TemporalCapacityBinding>.Fail(error,
+                "Temporal composition dependencies changed before receipt publication.");
+        }
+        _ = budgets.QuarantineLease(binding.Owner, binding.Budget);
+        var quarantine = provider.Quarantine(binding.ProviderReservation.Handle);
+        _bindings[binding.Id] = binding with
+        {
+            ProviderReservation = quarantine.IsSuccess ? quarantine.Value! : binding.ProviderReservation,
+            State = V6TemporalCapacityOperationState.Quarantined,
+        };
+        return KernelResult<V6TemporalCapacityBinding>.Fail(KernelError.ExternalEffectUncontained,
+            "Unpublished temporal composition could not close its exact provider reservation.");
     }
 
     internal KernelResult<V6TemporalCapacityBinding> Submit(
@@ -360,7 +461,7 @@ internal sealed class V6TemporalCapacityCoordinator
         lock (_sync)
         {
             if (!_bindings.TryGetValue(supplied.Id, out binding!) || binding != supplied ||
-                binding.State != V6TemporalCapacityOperationState.Admitted)
+                binding.State != V6TemporalCapacityOperationState.Admitted || _cancellingBindings.Contains(supplied.Id))
                 return KernelResult<V6TemporalCapacityBinding>.Fail(KernelError.StaleGeneration,
                     "Temporal capacity binding is stale or already consumed.");
             if (binding.ExternalOperation is { } operation)
@@ -376,6 +477,19 @@ internal sealed class V6TemporalCapacityCoordinator
                 !capacity.IsSuccess || capacity.Value! != binding.ProviderReservation ||
                 capacity.Value!.ProviderGeneration != provider.ProviderGeneration)
             {
+                if (capacity.IsSuccess && capacity.Value!.State is V6TemporalProviderReservationState.InUse or
+                    V6TemporalProviderReservationState.Quarantined)
+                {
+                    _ = budgets.QuarantineLease(binding.Owner, binding.Budget);
+                    var quarantined = provider.Quarantine(binding.ProviderReservation.Handle);
+                    _bindings[binding.Id] = binding with
+                    {
+                        ProviderReservation = quarantined.IsSuccess ? quarantined.Value! : binding.ProviderReservation,
+                        State = V6TemporalCapacityOperationState.Quarantined,
+                    };
+                    return KernelResult<V6TemporalCapacityBinding>.Fail(KernelError.StaleGeneration,
+                        "Provider use changed before submit; budget cancellation cannot establish closure.");
+                }
                 // The budget owner may have cancelled the still-bound lease after admission.
                 // No submit can have begun while this binding remains Admitted, so close only
                 // an exact, still-reserved provider record instead of leaking model capacity.
@@ -385,7 +499,7 @@ internal sealed class V6TemporalCapacityCoordinator
                     capacity.Value!.State == V6TemporalProviderReservationState.Reserved &&
                     capacity.Value!.ProviderGeneration == provider.ProviderGeneration)
                 {
-                    var released = provider.Release(binding.ProviderReservation.Handle);
+                    var released = provider.Release(binding.ProviderReservation.Handle, unusedOnly: true);
                     if (released.IsSuccess)
                     {
                         binding = binding with
@@ -397,19 +511,19 @@ internal sealed class V6TemporalCapacityCoordinator
                     }
                 }
                 if (budget.IsSuccess && budget.Value!.State == BudgetReservationState.Bound)
-                    _ = budgets.CancelLeasePreSubmit(binding.Owner, binding.Budget);
+                    _ = budgets.CancelLeasePreSubmit(binding.Owner, binding.Budget, binding.Id);
                 return KernelResult<V6TemporalCapacityBinding>.Fail(KernelError.StaleGeneration,
                     "Temporal budget or provider reservation changed before submit.");
             }
             // Begin both reservations before the owner submit. Cancellation cannot
             // remove the budget while the owner records a possible effect.
-            var consuming = budgets.BeginConsumption(binding.Owner, binding.Budget);
+            var consuming = budgets.BeginConsumption(binding.Owner, binding.Budget, binding.Id);
             var inUse = consuming.IsSuccess ? provider.BeginUse(binding.ProviderReservation.Handle) : default;
             if (!consuming.IsSuccess)
             {
                 // No owner submit or provider callback has run. Close a still-reserved
                 // provider record; a concurrent provider reset already drops it.
-                var released = provider.Release(binding.ProviderReservation.Handle);
+                var released = provider.Release(binding.ProviderReservation.Handle, unusedOnly: true);
                 var closed = released.IsSuccess
                     ? released.Value!
                     : released.Error == KernelError.StaleGeneration &&
@@ -425,6 +539,7 @@ internal sealed class V6TemporalCapacityCoordinator
                     };
                     return KernelResult<V6TemporalCapacityBinding>.Fail(consuming.Error, consuming.Message!);
                 }
+                _ = budgets.QuarantineLease(binding.Owner, binding.Budget);
                 var quarantined = provider.Quarantine(binding.ProviderReservation.Handle);
                 _bindings[binding.Id] = binding with
                 {
@@ -463,11 +578,20 @@ internal sealed class V6TemporalCapacityCoordinator
             }
             if (!ownerSubmit.IsSuccess)
             {
-                var owner = effectKernel!.QueryExternalOperation(binding.Owner, operation);
+                KernelResult<ExternalOperationSnapshot> owner;
+                try { owner = effectKernel!.CancelExternalOperation(binding.Owner, operation, false); }
+                catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+                {
+                    owner = KernelResult<ExternalOperationSnapshot>.Fail(KernelError.PlatformFaulted,
+                        $"External owner cancellation failed: {exception.GetType().Name}.");
+                }
                 lock (_sync)
                 {
                     var current = _bindings[binding.Id];
-                    if (!owner.IsSuccess || owner.Value!.Transitions.Any(transition =>
+                    if (!owner.IsSuccess || owner.Value!.Disposition != ExternalOperationDisposition.Cancelled ||
+                        (owner.Value.State is not (ExternalOperationState.Prepared or ExternalOperationState.Admitted) &&
+                         !(owner.Value.State == ExternalOperationState.Released && owner.Value.Binding is null)) ||
+                        owner.Value.Transitions.Any(transition =>
                             transition.Event == "Submitted"))
                     {
                         _ = budgets.QuarantineLease(current.Owner, current.Budget);
@@ -480,11 +604,13 @@ internal sealed class V6TemporalCapacityCoordinator
                         return KernelResult<V6TemporalCapacityBinding>.Fail(KernelError.ExternalEffectUncontained,
                             "External owner may have submitted despite an unsuccessful submit response.");
                     }
-                    // The owner has no Submitted transition and the provider callback
-                    // was never invoked. Close the two in-use reservations exactly.
-                    var settled = budgets.SettleLease(current.Owner, current.Budget, []);
-                    var released = settled.IsSuccess
-                        ? provider.Release(current.ProviderReservation.Handle)
+                    // Owner-confirmed pre-submit cancellation makes absence of Submitted
+                    // stable against competing admission. Our provider callback never ran.
+                    // Even definite owner denial cannot refund before the exact
+                    // provider record closes: reset may retain it in quarantine.
+                    var released = provider.Release(current.ProviderReservation.Handle);
+                    var settled = released.IsSuccess
+                        ? budgets.SettleLease(current.Owner, current.Budget, [], current.Id)
                         : default;
                     if (!settled.IsSuccess || !released.IsSuccess)
                     {
@@ -549,7 +675,10 @@ internal sealed class V6TemporalCapacityCoordinator
             var currentCapacity = provider.Query(binding.ProviderReservation.Handle);
             var providerStable = provider.ProviderGeneration == binding.ProviderReservation.ProviderGeneration &&
                 currentCapacity.IsSuccess && currentCapacity.Value!.State == V6TemporalProviderReservationState.InUse;
-            if (!submitted.IsSuccess || !providerStable)
+            var currentBudget = budgets.Query(binding.Budget);
+            var budgetStable = currentBudget.IsSuccess && currentBudget.Value!.Owner == binding.Owner &&
+                currentBudget.Value.State == BudgetReservationState.Consuming;
+            if (!submitted.IsSuccess || !providerStable || !budgetStable)
             {
                 _ = budgets.QuarantineLease(binding.Owner, binding.Budget);
                 var quarantined = provider.Quarantine(binding.ProviderReservation.Handle);
@@ -561,7 +690,7 @@ internal sealed class V6TemporalCapacityCoordinator
                 _bindings[binding.Id] = binding;
                 return KernelResult<V6TemporalCapacityBinding>.Fail(
                     submitted.IsSuccess ? KernelError.StaleGeneration : submitted.Error,
-                    submitted.IsSuccess ? "Temporal provider generation changed during submit." : submitted.Message!);
+                    submitted.IsSuccess ? "Temporal provider or budget reservation changed during submit." : submitted.Message!);
             }
             binding = binding with { State = V6TemporalCapacityOperationState.Submitted };
             _bindings[binding.Id] = binding;
@@ -622,7 +751,7 @@ internal sealed class V6TemporalCapacityCoordinator
             }
             IReadOnlyList<BudgetAmount> actual = actualComputeNanoseconds == 0
                 ? [] : [new(ServiceBudgetDimension.ComputeTimeNanoseconds, actualComputeNanoseconds)];
-            var settled = budgets.SettleLease(binding.Owner, binding.Budget, actual);
+            var settled = budgets.SettleLease(binding.Owner, binding.Budget, actual, binding.Id);
             if (!settled.IsSuccess)
             {
                 _ = budgets.QuarantineLease(binding.Owner, binding.Budget);
@@ -662,27 +791,88 @@ internal sealed class V6TemporalCapacityCoordinator
     {
         lock (_sync)
         {
-            if (!_bindings.TryGetValue(supplied.Id, out var binding) || binding != supplied ||
-                binding.State != V6TemporalCapacityOperationState.Admitted)
+            if (!_bindings.TryGetValue(supplied.Id, out var observed) || observed != supplied ||
+                observed.State != V6TemporalCapacityOperationState.Admitted || !_cancellingBindings.Add(supplied.Id))
                 return KernelResult<V6TemporalCapacityBinding>.Fail(KernelError.InvalidTransition,
-                    "Only exact pre-submit temporal capacity can be cancelled.");
-            var cancelled = budgets.CancelLeasePreSubmit(binding.Owner, binding.Budget);
-            if (!cancelled.IsSuccess)
-                return KernelResult<V6TemporalCapacityBinding>.Fail(cancelled.Error, cancelled.Message!);
-            var released = provider.Release(binding.ProviderReservation.Handle);
-            var providerReservation = released.IsSuccess
-                ? released.Value!
-                : released.Error == KernelError.StaleGeneration &&
-                  provider.ProviderGeneration != binding.ProviderReservation.ProviderGeneration
-                    ? binding.ProviderReservation with { State = V6TemporalProviderReservationState.Released }
-                    : null;
-            if (providerReservation is null)
-                return KernelResult<V6TemporalCapacityBinding>.Fail(KernelError.PlatformFaulted,
-                    "Budget cancellation succeeded but managed provider capacity could not close.");
-            binding = binding with { ProviderReservation = providerReservation, State = V6TemporalCapacityOperationState.Cancelled };
-            _bindings[binding.Id] = binding;
-            return KernelResult<V6TemporalCapacityBinding>.Ok(binding);
+                    "Only exact idle pre-submit temporal capacity can begin cancellation.");
         }
+        try
+        {
+            var ownerClosed = true;
+            if (supplied.ExternalOperation is { } operation)
+            {
+                ownerClosed = false;
+                try
+                {
+                    var cancelledOwner = effectKernel!.CancelExternalOperation(supplied.Owner, operation, false);
+                    ownerClosed = cancelledOwner.IsSuccess &&
+                        cancelledOwner.Value!.Disposition == ExternalOperationDisposition.Cancelled &&
+                        (cancelledOwner.Value.State is ExternalOperationState.Prepared or ExternalOperationState.Admitted ||
+                         cancelledOwner.Value.State == ExternalOperationState.Released && cancelledOwner.Value.Binding is null) &&
+                        !cancelledOwner.Value.Transitions.Any(transition => transition.Event == "Submitted");
+                }
+                catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+                {
+                    // Failed owner response cannot establish pre-submit closure.
+                }
+            }
+            lock (_sync)
+            {
+                if (!_bindings.TryGetValue(supplied.Id, out var binding) || binding != supplied ||
+                    binding.State != V6TemporalCapacityOperationState.Admitted)
+                    return KernelResult<V6TemporalCapacityBinding>.Fail(KernelError.InvalidTransition,
+                        "Only exact pre-submit temporal capacity can be cancelled.");
+                if (!ownerClosed)
+                {
+                    _ = budgets.QuarantineLease(binding.Owner, binding.Budget);
+                    var quarantine = provider.Quarantine(binding.ProviderReservation.Handle);
+                    _bindings[binding.Id] = binding with
+                    {
+                        ProviderReservation = quarantine.IsSuccess ? quarantine.Value! : binding.ProviderReservation,
+                        State = V6TemporalCapacityOperationState.Quarantined,
+                    };
+                    return KernelResult<V6TemporalCapacityBinding>.Fail(KernelError.ExternalEffectUncontained,
+                        "Bound external owner did not confirm stable pre-submit cancellation.");
+                }
+                var budget = budgets.Query(binding.Budget);
+                if (!budget.IsSuccess || budget.Value!.Owner != binding.Owner)
+                    return KernelResult<V6TemporalCapacityBinding>.Fail(KernelError.StaleGeneration,
+                        "Temporal cancellation budget owner changed.");
+                if (budget.Value.State is not (BudgetReservationState.Reserved or BudgetReservationState.Bound or
+                    BudgetReservationState.CancelledPreSubmit))
+                    return KernelResult<V6TemporalCapacityBinding>.Fail(KernelError.InvalidTransition,
+                        "Temporal cancellation budget is no longer pre-submit.");
+                // Close the exact unused provider record atomically before refund.
+                // A coordinator admission receipt cannot substitute for current provider state.
+                var released = provider.Release(binding.ProviderReservation.Handle, unusedOnly: true);
+                var providerReservation = released.IsSuccess
+                    ? released.Value!
+                    : released.Error == KernelError.StaleGeneration &&
+                      provider.ProviderGeneration != binding.ProviderReservation.ProviderGeneration &&
+                      provider.Query(binding.ProviderReservation.Handle).Error == KernelError.StaleGeneration
+                        ? binding.ProviderReservation with { State = V6TemporalProviderReservationState.Released }
+                        : null;
+                if (providerReservation is null)
+                {
+                    _ = budgets.QuarantineLease(binding.Owner, binding.Budget);
+                    var quarantine = provider.Quarantine(binding.ProviderReservation.Handle);
+                    _bindings[binding.Id] = binding with
+                    {
+                        ProviderReservation = quarantine.IsSuccess ? quarantine.Value! : binding.ProviderReservation,
+                        State = V6TemporalCapacityOperationState.Quarantined,
+                    };
+                    return KernelResult<V6TemporalCapacityBinding>.Fail(KernelError.ExternalEffectUncontained,
+                        "Exact unused provider closure failed; budget refund remains forbidden.");
+                }
+                binding = binding with { ProviderReservation = providerReservation, State = V6TemporalCapacityOperationState.Cancelled };
+                _bindings[binding.Id] = binding;
+                var cancelled = budgets.CancelLeasePreSubmit(binding.Owner, binding.Budget, binding.Id);
+                if (!cancelled.IsSuccess)
+                    return KernelResult<V6TemporalCapacityBinding>.Fail(cancelled.Error, cancelled.Message!);
+                return KernelResult<V6TemporalCapacityBinding>.Ok(binding);
+            }
+        }
+        finally { lock (_sync) _cancellingBindings.Remove(supplied.Id); }
     }
 
     internal KernelResult<V6TemporalCapacityBinding> ReconcileQuarantined(
@@ -787,13 +977,13 @@ internal sealed class V6TemporalCapacityCoordinator
             {
                 KernelResult<BudgetReservationSnapshot> settled;
                 if (binding.ReportedOverrunNanoseconds is { } reported)
-                    settled = budgets.SettleReportedComputeOverrun(binding.Owner, binding.Budget, reported);
+                    settled = budgets.SettleReportedComputeOverrun(binding.Owner, binding.Budget, reported, binding.Id);
                 else
                 {
-                    var reconciled = budgets.ReconcileLease(binding.Owner, binding.Budget);
+                    var reconciled = budgets.ReconcileLease(binding.Owner, binding.Budget, binding.Id);
                     if (!reconciled.IsSuccess)
                         return KernelResult<V6TemporalCapacityBinding>.Fail(reconciled.Error, reconciled.Message!);
-                    settled = budgets.SettleLease(binding.Owner, binding.Budget, []);
+                    settled = budgets.SettleLease(binding.Owner, binding.Budget, [], binding.Id);
                 }
                 if (!settled.IsSuccess)
                     return KernelResult<V6TemporalCapacityBinding>.Fail(settled.Error, settled.Message!);

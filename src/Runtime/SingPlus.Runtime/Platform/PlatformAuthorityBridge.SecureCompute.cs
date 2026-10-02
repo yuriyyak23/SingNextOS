@@ -13,6 +13,9 @@ public sealed partial class PlatformAuthorityBridge
         public Dictionary<PlatformRegionMappingId, PlatformProviderSecureRegionBinding> Regions { get; } = [];
         public HashSet<PlatformRegionMappingId> QuarantinedRegions { get; } = [];
         public bool TerminalQuarantined { get; set; }
+        public bool TransitionInFlight { get; set; }
+        public bool RevokeInFlight { get; set; }
+        public HashSet<PlatformRegionMappingId> RegionMutationsInFlight { get; } = [];
         public bool Quarantined => TerminalQuarantined || QuarantinedRegions.Count != 0;
     }
     private readonly Dictionary<SecureDomainBindingId, SecureDomainRecord> _secureDomains = [];
@@ -125,7 +128,7 @@ public sealed partial class PlatformAuthorityBridge
         }
     }
 
-    internal KernelResult ValidateSecureDomainPublication(SecureDomainBinding binding, PlatformDomainIdentity subject)
+    internal KernelResult ValidateSecureDomainLocalCommit(SecureDomainBinding binding, PlatformDomainIdentity subject)
     {
         lock (_secureDomainLifecycleGate)
         {
@@ -136,141 +139,276 @@ public sealed partial class PlatformAuthorityBridge
             {
                 secure.Value!.TerminalQuarantined = true;
                 return KernelResult.Fail(KernelError.PlatformFaulted,
-                    "Secure-domain authority changed before local handle publication and remains pinned.");
+                    "Secure-domain authority changed before local commit and remains pinned.");
             }
             return KernelResult.Ok();
         }
     }
 
+    internal void QuarantineSecureDomainLocalTransition(SecureDomainBinding binding)
+    {
+        lock (_secureDomainLifecycleGate)
+        {
+            if (_secureDomains.TryGetValue(binding.BindingId, out var record) && record.Binding == binding)
+                record.TerminalQuarantined = true;
+        }
+    }
+
     internal KernelResult BindSecureRegion(SecureDomainBinding binding, PlatformRegionMapping mapping, PlatformSecureRegionClass regionClass)
     {
-        var secure = ResolveSecure(binding);
-        if (!secure.IsSuccess) return KernelResult.Fail(secure.Error, secure.Message!);
         if (!Enum.IsDefined(regionClass)) return KernelResult.Fail(KernelError.PlatformDenied, "Secure region class is invalid.");
-        if (secure.Value!.Quarantined) return KernelResult.Fail(KernelError.PlatformFaulted, "Secure domain is quarantined.");
-        if (secure.Value.Regions.ContainsKey(mapping.MappingId)) return KernelResult.Fail(KernelError.PlatformDenied, "Mapping is already bound to this secure domain.");
-        if (!_mappings.TryGetValue(mapping.MappingId, out var mapped) || mapped.Mapping != mapping || mapped.LocalAuthorizationRevoked)
-            return KernelResult.Fail(KernelError.StaleGeneration, "Secure region mapping is absent, stale, or revoked.");
-        if (mapping.DomainBinding != binding.Parent)
-            return KernelResult.Fail(KernelError.WrongPlatformDomain, "Secure region belongs to another parent domain.");
-        var backendEpoch = BackendEpoch;
-        PlatformAuthorityResult<PlatformProviderSecureRegionBinding> result;
-        try { result = ((IPlatformSecureComputeProvider)_provider!).BindSecureRegion(secure.Value.ProviderLease, mapped.ProviderLease, regionClass); }
-        catch (Exception exception) when (exception is not StackOverflowException)
+        SecureDomainRecord record;
+        PlatformProviderRegionMappingLease mappingLease;
+        PlatformBackendEpoch backendEpoch;
+        lock (_secureDomainLifecycleGate)
         {
-            secure.Value.TerminalQuarantined = true;
-            secure.Value.QuarantinedRegions.Add(mapping.MappingId);
-            return KernelResult.Fail(KernelError.PlatformFaulted,
-                $"Secure-region bind may have taken effect without a lease: {exception.Message}");
+            var secure = ResolveSecure(binding);
+            if (!secure.IsSuccess) return KernelResult.Fail(secure.Error, secure.Message!);
+            record = secure.Value!;
+            if (record.Quarantined) return KernelResult.Fail(KernelError.PlatformFaulted, "Secure domain is quarantined.");
+            if (record.TransitionInFlight || record.RevokeInFlight || record.RegionMutationsInFlight.Contains(mapping.MappingId))
+                return KernelResult.Fail(KernelError.PlatformBindingActive, "Secure-domain transition, revoke, or exact mapping mutation is in flight.");
+            if (record.Regions.ContainsKey(mapping.MappingId)) return KernelResult.Fail(KernelError.PlatformDenied, "Mapping is already bound to this secure domain.");
+            if (!_mappings.TryGetValue(mapping.MappingId, out var mapped) || mapped.Mapping != mapping ||
+                mapped.LocalAuthorizationRevoked || mapped.ClosureState != PlatformExternalClosureState.Active)
+                return KernelResult.Fail(KernelError.StaleGeneration, "Secure region mapping is absent, stale, or closing.");
+            if (mapping.DomainBinding != binding.Parent)
+                return KernelResult.Fail(KernelError.WrongPlatformDomain, "Secure region belongs to another parent domain.");
+            mappingLease = mapped.ProviderLease;
+            backendEpoch = BackendEpoch;
+            record.RegionMutationsInFlight.Add(mapping.MappingId);
         }
-        if (BackendEpoch != backendEpoch || secure.Value.TerminalQuarantined)
+        try
         {
-            secure.Value.TerminalQuarantined = true;
-            secure.Value.QuarantinedRegions.Add(mapping.MappingId);
-            return KernelResult.Fail(KernelError.PlatformFaulted,
-                "Backend reset during secure-region bind leaves the mapping pinned.");
-        }
-        if (!result.IsSuccess)
-        {
-            secure.Value.TerminalQuarantined = true;
-            secure.Value.QuarantinedRegions.Add(mapping.MappingId);
-            return FromProviderFailure(result.Status, result.Message);
-        }
-        var providerBinding = result.Value;
-        if (providerBinding.BindingId.Value == 0 || providerBinding.Generation.Value == 0 || providerBinding.Domain != secure.Value.ProviderLease ||
-            providerBinding.Mapping != mapped.ProviderLease || providerBinding.RegionClass != regionClass)
-        {
-            var exactlyClosed = false;
-            try
-            {
-                var cleanup = ((IPlatformSecureComputeProvider)_provider!).UnbindSecureRegion(providerBinding);
-                exactlyClosed = cleanup.IsSuccess && cleanup.Value.Binding == providerBinding && cleanup.Value.Closed &&
-                    BackendEpoch == backendEpoch && !secure.Value.TerminalQuarantined;
-            }
+            PlatformAuthorityResult<PlatformProviderSecureRegionBinding> result;
+            try { result = ((IPlatformSecureComputeProvider)_provider!).BindSecureRegion(record.ProviderLease, mappingLease, regionClass); }
             catch (Exception exception) when (exception is not StackOverflowException)
             {
-                // The malformed provider binding may still exist after cleanup fault.
+                lock (_secureDomainLifecycleGate)
+                {
+                    record.TerminalQuarantined = true;
+                    record.QuarantinedRegions.Add(mapping.MappingId);
+                }
+                return KernelResult.Fail(KernelError.PlatformFaulted,
+                    $"Secure-region bind may have taken effect without a lease: {exception.Message}");
             }
-            if (!exactlyClosed)
+            lock (_secureDomainLifecycleGate)
             {
-                secure.Value.TerminalQuarantined = true;
-                secure.Value.QuarantinedRegions.Add(mapping.MappingId);
+                if (BackendEpoch != backendEpoch || record.TerminalQuarantined)
+                {
+                    record.TerminalQuarantined = true;
+                    record.QuarantinedRegions.Add(mapping.MappingId);
+                    return KernelResult.Fail(KernelError.PlatformFaulted,
+                        "Backend reset during secure-region bind leaves the mapping pinned.");
+                }
+                if (!result.IsSuccess)
+                {
+                    record.TerminalQuarantined = true;
+                    record.QuarantinedRegions.Add(mapping.MappingId);
+                    return FromProviderFailure(result.Status, result.Message);
+                }
             }
-            return KernelResult.Fail(exactlyClosed ? KernelError.PlatformBindingRevoked : KernelError.PlatformFaulted, exactlyClosed
-                ? "Provider secure-region binding was malformed and exactly compensated."
-                : "Provider secure-region binding was malformed; exact compensation failed and the secure domain is quarantined.");
+            var providerBinding = result.Value;
+            if (providerBinding.BindingId.Value == 0 || providerBinding.Generation.Value == 0 || providerBinding.Domain != record.ProviderLease ||
+                providerBinding.Mapping != mappingLease || providerBinding.RegionClass != regionClass)
+            {
+                var cleanupClosed = false;
+                try
+                {
+                    var cleanup = ((IPlatformSecureComputeProvider)_provider!).UnbindSecureRegion(providerBinding);
+                    cleanupClosed = cleanup.IsSuccess && cleanup.Value.Binding == providerBinding && cleanup.Value.Closed;
+                }
+                catch (Exception exception) when (exception is not StackOverflowException)
+                {
+                    // The malformed provider binding may still exist after cleanup fault.
+                }
+                lock (_secureDomainLifecycleGate)
+                {
+                    var exactlyClosed = cleanupClosed && BackendEpoch == backendEpoch && !record.TerminalQuarantined;
+                    if (!exactlyClosed)
+                    {
+                        record.TerminalQuarantined = true;
+                        record.QuarantinedRegions.Add(mapping.MappingId);
+                    }
+                    return KernelResult.Fail(exactlyClosed ? KernelError.PlatformBindingRevoked : KernelError.PlatformFaulted, exactlyClosed
+                        ? "Provider secure-region binding was malformed and exactly compensated."
+                        : "Provider secure-region binding was malformed; exact compensation failed and the secure domain is quarantined.");
+                }
+            }
+            lock (_secureDomainLifecycleGate)
+            {
+                if (BackendEpoch != backendEpoch || record.TerminalQuarantined)
+                {
+                    record.TerminalQuarantined = true;
+                    record.QuarantinedRegions.Add(mapping.MappingId);
+                    return KernelResult.Fail(KernelError.PlatformFaulted,
+                        "Secure-region bind lost backend continuity before binding publication.");
+                }
+                record.Regions.Add(mapping.MappingId, providerBinding);
+                return KernelResult.Ok();
+            }
         }
-        secure.Value.Regions.Add(mapping.MappingId, providerBinding);
-        return KernelResult.Ok();
+        finally
+        {
+            lock (_secureDomainLifecycleGate) record.RegionMutationsInFlight.Remove(mapping.MappingId);
+        }
     }
 
     internal KernelResult UnbindSecureRegion(SecureDomainBinding binding, PlatformRegionMapping mapping)
     {
-        var secure = ResolveSecure(binding);
-        if (!secure.IsSuccess) return KernelResult.Fail(secure.Error, secure.Message!);
-        if (!secure.Value!.Regions.TryGetValue(mapping.MappingId, out var providerBinding))
-            return KernelResult.Fail(KernelError.PlatformBindingNotFound, "Secure-region binding was not found.");
-        if (secure.Value.TerminalQuarantined)
-            return KernelResult.Fail(KernelError.PlatformFaulted, "Secure domain is quarantined.");
-        var backendEpoch = BackendEpoch;
-        PlatformAuthorityResult<PlatformSecureRegionClosureReceipt> result;
-        try { result = ((IPlatformSecureComputeProvider)_provider!).UnbindSecureRegion(providerBinding); }
-        catch (Exception exception) when (exception is not StackOverflowException)
+        SecureDomainRecord record;
+        PlatformProviderSecureRegionBinding providerBinding;
+        PlatformBackendEpoch backendEpoch;
+        lock (_secureDomainLifecycleGate)
         {
-            secure.Value.TerminalQuarantined = true;
-            secure.Value.QuarantinedRegions.Add(mapping.MappingId);
-            return KernelResult.Fail(KernelError.PlatformFaulted,
-                $"Secure-region unbind may have taken effect without closure evidence: {exception.Message}");
+            var secure = ResolveSecure(binding);
+            if (!secure.IsSuccess) return KernelResult.Fail(secure.Error, secure.Message!);
+            record = secure.Value!;
+            if (!record.Regions.TryGetValue(mapping.MappingId, out providerBinding))
+                return KernelResult.Fail(KernelError.PlatformBindingNotFound, "Secure-region binding was not found.");
+            if (!_mappings.TryGetValue(mapping.MappingId, out var mapped) || mapped.Mapping != mapping)
+                return KernelResult.Fail(KernelError.StaleGeneration, "Exact secure-region mapping is absent or stale.");
+            if (record.TerminalQuarantined)
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Secure domain is quarantined.");
+            if (record.TransitionInFlight || record.RevokeInFlight || record.RegionMutationsInFlight.Contains(mapping.MappingId))
+                return KernelResult.Fail(KernelError.PlatformBindingActive, "Secure-domain transition, revoke, or exact mapping mutation is in flight.");
+            backendEpoch = BackendEpoch;
+            record.RegionMutationsInFlight.Add(mapping.MappingId);
         }
-        if (BackendEpoch != backendEpoch || secure.Value.TerminalQuarantined)
+        try
         {
-            secure.Value.TerminalQuarantined = true;
-            secure.Value.QuarantinedRegions.Add(mapping.MappingId);
-            return KernelResult.Fail(KernelError.PlatformFaulted,
-                "Backend reset during secure-region unbind leaves closure uncertain.");
+            PlatformAuthorityResult<PlatformSecureRegionClosureReceipt> result;
+            try { result = ((IPlatformSecureComputeProvider)_provider!).UnbindSecureRegion(providerBinding); }
+            catch (Exception exception) when (exception is not StackOverflowException)
+            {
+                lock (_secureDomainLifecycleGate)
+                {
+                    record.TerminalQuarantined = true;
+                    record.QuarantinedRegions.Add(mapping.MappingId);
+                }
+                return KernelResult.Fail(KernelError.PlatformFaulted,
+                    $"Secure-region unbind may have taken effect without closure evidence: {exception.Message}");
+            }
+            lock (_secureDomainLifecycleGate)
+            {
+                if (BackendEpoch != backendEpoch || record.TerminalQuarantined)
+                {
+                    record.TerminalQuarantined = true;
+                    record.QuarantinedRegions.Add(mapping.MappingId);
+                    return KernelResult.Fail(KernelError.PlatformFaulted,
+                        "Backend reset during secure-region unbind leaves closure uncertain.");
+                }
+                if (!result.IsSuccess)
+                {
+                    record.QuarantinedRegions.Add(mapping.MappingId);
+                    return FromProviderFailure(result.Status, result.Message);
+                }
+                if (result.Value.Binding != providerBinding || !result.Value.Closed)
+                {
+                    record.QuarantinedRegions.Add(mapping.MappingId);
+                    return KernelResult.Fail(KernelError.PlatformFaulted, "Provider secure-region closure receipt is malformed.");
+                }
+                record.Regions.Remove(mapping.MappingId);
+                record.QuarantinedRegions.Remove(mapping.MappingId);
+                return KernelResult.Ok();
+            }
         }
-        if (!result.IsSuccess) { secure.Value.QuarantinedRegions.Add(mapping.MappingId); return FromProviderFailure(result.Status, result.Message); }
-        if (result.Value.Binding != providerBinding || !result.Value.Closed)
-        { secure.Value.QuarantinedRegions.Add(mapping.MappingId); return KernelResult.Fail(KernelError.PlatformFaulted, "Provider secure-region closure receipt is malformed."); }
-        secure.Value.Regions.Remove(mapping.MappingId);
-        secure.Value.QuarantinedRegions.Remove(mapping.MappingId);
-        return KernelResult.Ok();
+        finally
+        {
+            lock (_secureDomainLifecycleGate) record.RegionMutationsInFlight.Remove(mapping.MappingId);
+        }
     }
 
-    private bool HasActiveSecureRegion(PlatformRegionMappingId mappingId) =>
-        _secureDomains.Values.Any(record => record.Regions.ContainsKey(mappingId) ||
-            record.QuarantinedRegions.Contains(mappingId));
+    private bool HasActiveSecureRegion(PlatformRegionMappingId mappingId)
+    {
+        lock (_secureDomainLifecycleGate)
+            return _secureDomains.Values.Any(record => record.Regions.ContainsKey(mappingId) ||
+                record.QuarantinedRegions.Contains(mappingId) || record.RegionMutationsInFlight.Contains(mappingId));
+    }
 
     internal KernelResult TransitionSecureDomain(SecureDomainBinding binding, PlatformSecureDomainTransition transition)
     {
-        var secure = ResolveSecure(binding);
-        if (!secure.IsSuccess) return KernelResult.Fail(secure.Error, secure.Message!);
-        if (secure.Value!.Quarantined) return KernelResult.Fail(KernelError.PlatformFaulted, "Secure domain is quarantined.");
-        if (!Enum.IsDefined(transition)) return KernelResult.Fail(KernelError.PlatformDenied, "Secure-domain transition is invalid.");
-        var result = ((IPlatformSecureComputeProvider)_provider!).TransitionSecureDomain(secure.Value!.ProviderLease, transition);
-        if (!result.IsSuccess) { secure.Value.TerminalQuarantined = true; return FromProviderFailure(result.Status, result.Message); }
-        if (result.Value.Domain != secure.Value.ProviderLease || result.Value.Transition != transition || !result.Value.Accepted)
-        { secure.Value.TerminalQuarantined = true; return KernelResult.Fail(KernelError.PlatformFaulted, "Provider secure-domain transition receipt is malformed."); }
-        return KernelResult.Ok();
+        SecureDomainRecord record;
+        PlatformBackendEpoch backendEpoch;
+        lock (_secureDomainLifecycleGate)
+        {
+            var secure = ResolveSecure(binding);
+            if (!secure.IsSuccess) return KernelResult.Fail(secure.Error, secure.Message!);
+            if (secure.Value!.Quarantined) return KernelResult.Fail(KernelError.PlatformFaulted, "Secure domain is quarantined.");
+            if (!Enum.IsDefined(transition)) return KernelResult.Fail(KernelError.PlatformDenied, "Secure-domain transition is invalid.");
+            if (secure.Value.TransitionInFlight)
+                return KernelResult.Fail(KernelError.PlatformBindingActive, "Secure-domain transition is already in flight.");
+            if (secure.Value.RevokeInFlight)
+                return KernelResult.Fail(KernelError.PlatformBindingActive, "Secure-domain revoke is already in flight.");
+            if (secure.Value.RegionMutationsInFlight.Count != 0)
+                return KernelResult.Fail(KernelError.PlatformBindingActive, "Secure-region mutation must settle before domain transition.");
+            record = secure.Value;
+            backendEpoch = BackendEpoch;
+            record.TransitionInFlight = true;
+        }
+
+        PlatformAuthorityResult<PlatformSecureDomainTransitionReceipt> result;
+        try { result = ((IPlatformSecureComputeProvider)_provider!).TransitionSecureDomain(record.ProviderLease, transition); }
+        catch (Exception exception) when (exception is not StackOverflowException)
+        {
+            lock (_secureDomainLifecycleGate)
+            {
+                record.TerminalQuarantined = true;
+                record.TransitionInFlight = false;
+            }
+            return KernelResult.Fail(KernelError.PlatformFaulted,
+                $"Secure-domain transition may have taken effect without a receipt: {exception.Message}");
+        }
+        lock (_secureDomainLifecycleGate)
+        {
+            record.TransitionInFlight = false;
+            if (BackendEpoch != backendEpoch || record.TerminalQuarantined)
+            {
+                record.TerminalQuarantined = true;
+                return KernelResult.Fail(KernelError.PlatformFaulted,
+                    "Backend reset during secure-domain transition leaves the effect uncertain.");
+            }
+            if (!result.IsSuccess) { record.TerminalQuarantined = true; return FromProviderFailure(result.Status, result.Message); }
+            if (result.Value.Domain != record.ProviderLease || result.Value.Transition != transition || !result.Value.Accepted)
+            { record.TerminalQuarantined = true; return KernelResult.Fail(KernelError.PlatformFaulted, "Provider secure-domain transition receipt is malformed."); }
+            return KernelResult.Ok();
+        }
     }
 
     internal KernelResult RevokeSecureDomain(SecureDomainBinding binding)
     {
-        var secure = ResolveSecure(binding);
-        if (!secure.IsSuccess) return KernelResult.Fail(secure.Error, secure.Message!);
-        if (secure.Value!.Regions.Count != 0) return KernelResult.Fail(KernelError.PlatformBindingActive, "Secure regions must close before secure-domain authority.");
-        if (secure.Value.Quarantined) return KernelResult.Fail(KernelError.PlatformFaulted, "Secure domain is quarantined.");
-        var backendEpoch = BackendEpoch;
+        KernelResult<SecureDomainRecord> secure;
+        PlatformBackendEpoch backendEpoch;
+        lock (_secureDomainLifecycleGate)
+        {
+            secure = ResolveSecure(binding);
+            if (!secure.IsSuccess) return KernelResult.Fail(secure.Error, secure.Message!);
+            if (secure.Value!.Regions.Count != 0) return KernelResult.Fail(KernelError.PlatformBindingActive, "Secure regions must close before secure-domain authority.");
+            if (secure.Value.Quarantined) return KernelResult.Fail(KernelError.PlatformFaulted, "Secure domain is quarantined.");
+            if (secure.Value.TransitionInFlight)
+                return KernelResult.Fail(KernelError.PlatformBindingActive, "Secure-domain transition must settle before revoke.");
+            if (secure.Value.RevokeInFlight)
+                return KernelResult.Fail(KernelError.PlatformBindingActive, "Secure-domain revoke is already in flight.");
+            if (secure.Value.RegionMutationsInFlight.Count != 0)
+                return KernelResult.Fail(KernelError.PlatformBindingActive, "Secure-region mutation must settle before domain revoke.");
+            secure.Value.RevokeInFlight = true;
+            backendEpoch = BackendEpoch;
+        }
         PlatformAuthorityResult<PlatformSecureDomainClosureReceipt> result;
         try { result = ((IPlatformSecureComputeProvider)_provider!).RevokeSecureDomain(secure.Value.ProviderLease); }
         catch (Exception exception) when (exception is not StackOverflowException)
         {
-            secure.Value.TerminalQuarantined = true;
+            lock (_secureDomainLifecycleGate)
+            {
+                secure.Value.TerminalQuarantined = true;
+                secure.Value.RevokeInFlight = false;
+            }
             return KernelResult.Fail(KernelError.PlatformFaulted,
                 $"Secure-domain revoke may have taken effect without closure evidence: {exception.Message}");
         }
         lock (_secureDomainLifecycleGate)
         {
+            secure.Value.RevokeInFlight = false;
             if (BackendEpoch != backendEpoch || secure.Value.Quarantined)
             {
                 secure.Value.TerminalQuarantined = true;

@@ -6,6 +6,7 @@ namespace SingPlus.Platform.Host;
 public sealed class CxlType2ModelAccelerator : ICxlType2ProtectedAcceleratorProvider
 {
     private readonly Dictionary<CxlAcceleratorSubmissionId, CxlAcceleratorSubmission> _live = [];
+    private readonly HashSet<CxlAcceleratorSubmissionId> _cancelled = [];
     private ulong _nextId = 1;
     public int SubmitCount { get; private set; }
     public bool DeviceAvailable { get; set; } = true;
@@ -69,19 +70,21 @@ public sealed class CxlType2ModelAccelerator : ICxlType2ProtectedAcceleratorProv
     public PlatformAuthorityResult<CxlAcceleratorCompletion> ObserveCompletion(CxlAcceleratorSubmission submission) =>
         IsExact(submission)
             ? PlatformAuthorityResult<CxlAcceleratorCompletion>.Ok(new(submission,
+                _cancelled.Contains(submission.SubmissionId) ? ExternalOperationCompletionDisposition.Cancelled :
                 DeviceAvailable ? ExternalOperationCompletionDisposition.Completed : ExternalOperationCompletionDisposition.Faulted))
             : Fail<CxlAcceleratorCompletion>(PlatformAuthorityStatus.Stale, "Type-2 submission identity is stale.");
 
     public PlatformAuthorityResult<CxlAcceleratorVisibility> AcquireVisibility(CxlAcceleratorSubmission submission, ExternalVisibilityRequirement requirement) =>
         IsExact(submission)
-            ? PlatformAuthorityResult<CxlAcceleratorVisibility>.Ok(new(submission, requirement, DeviceAvailable && VisibilitySatisfied))
+            ? PlatformAuthorityResult<CxlAcceleratorVisibility>.Ok(new(submission, requirement,
+                DeviceAvailable && VisibilitySatisfied && !_cancelled.Contains(submission.SubmissionId)))
             : Fail<CxlAcceleratorVisibility>(PlatformAuthorityStatus.Stale, "Type-2 submission identity is stale.");
 
     public PlatformAuthorityResult Cancel(CxlAcceleratorSubmission submission)
     {
         if (!IsExact(submission)) return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Stale, "Submission is stale.");
         if (CancellationFails) return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Model cancellation closure is ambiguous.");
-        _live.Remove(submission.SubmissionId);
+        _cancelled.Add(submission.SubmissionId);
         return PlatformAuthorityResult.Ok();
     }
     public PlatformAuthorityResult Release(CxlAcceleratorSubmission submission)
@@ -89,6 +92,7 @@ public sealed class CxlType2ModelAccelerator : ICxlType2ProtectedAcceleratorProv
         if (!IsExact(submission)) return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Stale, "Submission is stale.");
         if (ReleaseFails) return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Model release closure is ambiguous.");
         _live.Remove(submission.SubmissionId);
+        _cancelled.Remove(submission.SubmissionId);
         return PlatformAuthorityResult.Ok();
     }
     private bool IsExact(CxlAcceleratorSubmission submission) => _live.TryGetValue(submission.SubmissionId, out var current) && current == submission;

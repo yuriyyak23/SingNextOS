@@ -47,11 +47,16 @@ OperationObligationsV1
 ExecutionGuaranteesV1
 SemanticExecutionBindingV1
 HybridCPU.ExternalRuntime.Contracts 1.14.0
-HybridCPU.ExternalRuntime 1.3.0
+HybridCPU.ExternalRuntime 1.6.0
 HybridCPU compiler/runtime contract v6
 ```
 
 ### Additive v6 sidecars
+
+The current package vocabulary above follows the executable adapter project and its
+lock file. It is dependency identity, not executable coverage or permission. Exact
+package/assembly hashes, consumers and contour qualification remain required; historical
+baseline package tuples are not current qualification identities. All new v6 gates remain OFF.
 
 ```text
 OperationSemanticExtensionsV1
@@ -109,3 +114,11 @@ HybridCPU machine replay and SingNext semantic/external replay are different fac
 ## 9. Contract claim ceiling
 
 Adding a contract type is `ModelOnly`/`StaticAdmission` evidence at most. `ExecutableAdapter` requires a concrete executing adapter and negative/fault tests.
+
+### C0/P04 unknown cancellation admission — 2026-10-02
+
+Unknown ExternalCancellationSupport is rejected by the existing ExternalOperationAuthority before acquiring Region uses or storing admission. Both kernel entry points (public admission and virtual/exact-mapping admission) use the same owner-hosted pure structural validator before binding cancellation consumers, recording cancellation outcome or reserving an attached budget. This is mandatory contract validation, not a second authority or cancellation ledger. Principal/operation authorization and exact generation resolution remain independent; the validator cannot grant permission. Three unknown enum boundaries, both kernel routes, active/requested scopes, direct owner/exact-mapping owner calls, unchanged owner history/Region uses/scope sequence/budget usage and subsequent supported admission are tested. BeforeSubmissionOnly and ProviderCooperative remain compatible; no silent fallback or stronger assurance is invented. Named managed admission guard RuntimeEnforced; physical closure FutureGated; gates OFF, public V1 APIs/enums/packages/schema unchanged, Java excluded, ISA/opcode/CPU NONE. Evidence: artifacts/v6/iteration-20261002-c0-cancellation-admission.
+
+### C0 channel identity/sequence exhaustion — 2026-10-02
+
+Existing ChannelRegistry refuses exhausted identity allocation (0 or terminal ulong.MaxValue sentinel) before inserting a record; its sole kernel caller propagates existing CapacityExhausted without process/response attachment. Internal Create now returns KernelResult; public V1 APIs/enums/packages/schema are unchanged. Queued send and copied/borrow/move inline admission refuse sequence ulong.MaxValue before any Region loan/transfer, payload mutation, queue enqueue or protocol transition. A final sequence ulong.MaxValue can commit once from MaxValue-1; it cannot wrap. Caller authorization, protocol/payload/capability checks remain independent. Existing kernel gates serialize real admission contours; standalone owner-global concurrency is not newly qualified. All seven queued/inline shapes, pair Borrow+Consume, ordinary/max boundaries, direct owner creation, sampled competing final identity and provisional IPC budget refund are tested. Initial new fixture failures (wrong ownership namespace/undersized IPC budget) are retained and corrected against actual contracts. Named managed guard RuntimeEnforced; physical FutureGated; gates OFF; Java excluded; ISA/opcode/CPU NONE. Evidence: artifacts/v6/iteration-20261002-c0-channel-counter-exhaustion.

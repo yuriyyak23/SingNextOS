@@ -40,7 +40,14 @@ public readonly record struct TemporalSemanticsV1(
             envelope.ResourceClass != ResourceClassV1.ComputeTime ||
             envelope.Unit != ResourceUnitV1.Nanoseconds || envelope.WindowNanoseconds != 0)
             throw new ArgumentException("Temporal v1 supports only canonical ComputeTime/Nanoseconds envelopes.");
-        if (Encoding.UTF8.GetByteCount(envelope.SemanticScope) > MaxSemanticScopeBytes)
+        int scopeBytes;
+        try { scopeBytes = new UTF8Encoding(false, true).GetByteCount(envelope.SemanticScope); }
+        catch (EncoderFallbackException exception)
+        {
+            throw new ArgumentException("Temporal semantic scope must contain valid Unicode scalar values.",
+                nameof(ComputeEnvelope), exception);
+        }
+        if (scopeBytes > MaxSemanticScopeBytes)
             throw new ArgumentException("Temporal semantic scope exceeds its canonical bound.");
         if (DeadlineSemantics == TemporalDeadlineSemanticsV1.None && DeadlineTimestamp != 0)
             throw new ArgumentException("A contour without a deadline cannot carry a deadline timestamp.");
@@ -55,7 +62,7 @@ public readonly record struct TemporalSemanticsV1(
     public byte[] SerializeCanonical()
     {
         var exact = Validate();
-        var scope = Encoding.UTF8.GetBytes(exact.ComputeEnvelope.SemanticScope);
+        var scope = new UTF8Encoding(false, true).GetBytes(exact.ComputeEnvelope.SemanticScope);
         var bytes = new byte[34 + scope.Length];
         BinaryPrimitives.WriteUInt16BigEndian(bytes, exact.Version);
         bytes[2] = (byte)exact.ComputeEnvelope.Family;

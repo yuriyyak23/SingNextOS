@@ -7,6 +7,126 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class CxlFabricManagerAuthorityTests
 {
+    [Fact]
+    public async Task ConcurrentRegisterHasOneOwnerAndDoesNotHoldGateDuringQuery()
+    {
+        var s = CreateScenario();
+        var hook = new CompletionHook(s.Model);
+        var manager = new CxlFabricManagerAuthority(s.Kernel, hook);
+        using var entered = new CountdownEvent(2);
+        using var resume = new ManualResetEventSlim();
+        hook.AfterQuery = () =>
+        {
+            entered.Signal();
+            if (!resume.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException();
+        };
+        var first = Task.Run(() => manager.Register(s.Binding));
+        var second = Task.Run(() => manager.Register(s.Binding));
+        try { Assert.True(entered.Wait(TimeSpan.FromSeconds(5))); }
+        finally { resume.Set(); }
+        var results = await Task.WhenAll(first, second);
+        Assert.Single(results, result => result.IsSuccess);
+        Assert.Single(results, result => !result.IsSuccess && result.Error == KernelError.PlatformDenied);
+        hook.AfterQuery = null;
+        Assert.True(manager.ValidateAdmission(s.Binding).IsSuccess);
+        Assert.True(manager.BeginReconfiguration(s.Binding).IsSuccess);
+    }
+
+    [Fact]
+    public void ReentrantRegisterKeepsFirstRecordAndRejectsOuterCommit()
+    {
+        var s = CreateScenario();
+        var hook = new CompletionHook(s.Model);
+        var manager = new CxlFabricManagerAuthority(s.Kernel, hook);
+        hook.AfterQuery = () =>
+        {
+            hook.AfterQuery = null;
+            Assert.True(manager.Register(s.Binding).IsSuccess);
+            Assert.True(manager.BeginReconfiguration(s.Binding).IsSuccess);
+        };
+        Assert.Equal(KernelError.PlatformDenied, manager.Register(s.Binding).Error);
+        Assert.Equal(KernelError.PlatformBindingDraining, manager.ValidateAdmission(s.Binding).Error);
+        Assert.True(manager.CompleteReconfiguration(s.Binding.BindingId).IsSuccess);
+    }
+
+    [Fact]
+    public async Task CompletionCallbackDoesNotHoldManagerGateAndCannotOverlap()
+    {
+        CompletionHook? hook = null;
+        var s = CreateScenario(providerFactory: model => hook = new(model));
+        Assert.True(s.Manager.BeginReconfiguration(s.Binding).IsSuccess);
+        using var entered = new ManualResetEventSlim();
+        using var resume = new ManualResetEventSlim();
+        hook!.BeforeComplete = () =>
+        {
+            Assert.Equal(KernelError.PlatformBindingDraining, s.Manager.CompleteReconfiguration(s.Binding.BindingId).Error);
+            entered.Set();
+            if (!resume.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException();
+        };
+        var completion = Task.Run(() => s.Manager.CompleteReconfiguration(s.Binding.BindingId));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+            var admission = await Task.Run(() => s.Manager.ValidateAdmission(s.Binding)).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(KernelError.PlatformBindingDraining, admission.Error);
+            var overlap = await Task.Run(() => s.Manager.CompleteReconfiguration(s.Binding.BindingId)).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(KernelError.PlatformBindingDraining, overlap.Error);
+            Assert.Equal(1, hook.Calls);
+        }
+        finally { resume.Set(); }
+        var completed = await completion;
+        Assert.True(completed.IsSuccess, completed.Message);
+        Assert.Equal(KernelError.InvalidTransition, s.Manager.CompleteReconfiguration(s.Binding.BindingId).Error);
+        Assert.True(s.Manager.ValidateAdmission(completed.Value!.Binding).IsSuccess);
+    }
+
+    [Fact]
+    public void CompletionReceiptCannotSubstituteAnotherEndpoint()
+    {
+        CompletionHook? hook = null;
+        var s = CreateScenario(providerFactory: model => hook = new(model));
+        Assert.True(s.Manager.BeginReconfiguration(s.Binding).IsSuccess);
+        hook!.ReplaceEndpoint = true;
+        var completed = s.Manager.CompleteReconfiguration(s.Binding.BindingId);
+        Assert.Equal(KernelError.PlatformFaulted, completed.Error);
+        Assert.Equal(KernelError.PlatformBindingDraining, s.Manager.ValidateAdmission(s.Binding).Error);
+        Assert.Equal(KernelError.InvalidTransition, s.Manager.CompleteReconfiguration(s.Binding.BindingId).Error);
+        Assert.Equal(1, hook.Calls);
+    }
+
+    [Fact]
+    public void ResetAfterCompletionReceiptCannotReopenAdmission()
+    {
+        CompletionHook? hook = null;
+        var s = CreateScenario(providerFactory: model => hook = new(model));
+        Assert.True(s.Manager.BeginReconfiguration(s.Binding).IsSuccess);
+        hook!.AfterComplete = () => Assert.True(s.Model.Rebind(s.Endpoint.EndpointId).IsSuccess);
+        Assert.Equal(KernelError.ExternalEffectUncontained, s.Manager.CompleteReconfiguration(s.Binding.BindingId).Error);
+        var rebound = s.Model.Query(s.Binding.BindingId).Value!;
+        Assert.NotEqual(s.Binding, rebound);
+        Assert.Equal(KernelError.PlatformBindingDraining, s.Manager.ValidateAdmission(rebound).Error);
+        Assert.Equal(KernelError.InvalidTransition, s.Manager.CompleteReconfiguration(s.Binding.BindingId).Error);
+    }
+
+    [Fact]
+    public void LostPrincipalQueryDoesNotProveTrackedOperationDrain()
+    {
+        var s = CreateScenario();
+        var operation = PrepareOperation(s);
+        Assert.True(s.Manager.TrackOperation(s.Binding, s.Handle, operation.Operation).IsSuccess);
+        Assert.True(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        var missing = s.Kernel.QueryExternalOperation(s.Handle, operation.Operation);
+        Assert.False(missing.IsSuccess);
+
+        var drained = s.Manager.BeginReconfiguration(s.Binding);
+
+        Assert.False(drained.IsSuccess);
+        Assert.Equal(missing.Error, drained.Error);
+        Assert.Equal(s.Binding, s.Model.Query(s.Binding.BindingId).Value);
+        Assert.Equal(CxlFabricResourceState.Bound, s.Model.QueryResource(s.Binding.BindingId).Value!.State);
+        Assert.Equal(KernelError.PlatformBindingDraining, s.Manager.ValidateAdmission(s.Binding).Error);
+    }
+
     [Theory]
     [InlineData(0)]
     [InlineData(1)]
@@ -186,7 +306,7 @@ public sealed class CxlFabricManagerAuthorityTests
              new(s.OperationOutput.Handle, RegionUseMode.StagedOutput, new(0, 8))],
             ExternalVisibilityRequirement.PublicationFence, ExternalPublicationPolicy.Staged).Value!;
 
-    private static Scenario CreateScenario(bool twoBindings = false)
+    private static Scenario CreateScenario(bool twoBindings = false, Func<CxlType3ModelProvider, ICxlFabricManagementProvider>? providerFactory = null)
     {
         var model = new CxlType3ModelProvider();
         Assert.True(model.RegisterEndpoint(new("fm-0"), new("device:fm-0"), 1024).IsSuccess);
@@ -203,11 +323,40 @@ public sealed class CxlFabricManagerAuthorityTests
         var kernel = new RuntimeKernel();
         var (_, handle) = TestFixtures.Create(kernel, 991, 992);
         var process = kernel.Processes.Resolve(handle).Value!;
-        var manager = new CxlFabricManagerAuthority(kernel, model);
+        var manager = new CxlFabricManagerAuthority(kernel, providerFactory?.Invoke(model) ?? model);
         Assert.True(manager.Register(binding).IsSuccess);
         if (other is not null) Assert.True(manager.Register(other).IsSuccess);
         return new(kernel, handle, new(process.DomainId, handle.Generation), model, manager, endpoint, binding, other,
             kernel.AllocateBuffer<byte>(handle, 8).Value!, kernel.AllocateBuffer<byte>(handle, 8).Value!);
+    }
+
+    private sealed class CompletionHook(ICxlFabricManagementProvider inner) : ICxlFabricManagementProvider
+    {
+        public Action? BeforeComplete { get; set; }
+        public Action? AfterComplete { get; set; }
+        public Action? AfterQuery { get; set; }
+        public bool ReplaceEndpoint { get; set; }
+        public int Calls { get; private set; }
+        public PlatformAuthorityResult<CxlFabricBinding> CompleteReconfiguration(CxlFabricReconfigurationTicket ticket)
+        {
+            Calls++;
+            BeforeComplete?.Invoke();
+            var result = inner.CompleteReconfiguration(ticket);
+            AfterComplete?.Invoke();
+            return ReplaceEndpoint && result.IsSuccess
+                ? PlatformAuthorityResult<CxlFabricBinding>.Ok(result.Value! with { EndpointId = new("substituted") }) : result;
+        }
+        public PlatformAuthorityResult<CxlFabricResourceSnapshot> QueryResource(CxlFabricBindingId id)
+        {
+            var result = inner.QueryResource(id);
+            AfterQuery?.Invoke();
+            return result;
+        }
+        public PlatformAuthorityResult<CxlFabricReconfigurationTicket> BeginReconfiguration(CxlFabricBinding binding) => inner.BeginReconfiguration(binding);
+        public PlatformAuthorityResult<CxlFabricPoolSnapshot> QueryPool(CxlFabricPoolId id) => inner.QueryPool(id);
+        public PlatformAuthorityResult<CxlPoolAssignment> AssignPoolCapacity(CxlFabricPoolId pool, CxlEndpointId endpoint, long bytes) => inner.AssignPoolCapacity(pool, endpoint, bytes);
+        public PlatformAuthorityResult ReleasePoolCapacity(CxlPoolAssignment assignment) => inner.ReleasePoolCapacity(assignment);
+        public PlatformAuthorityResult<CxlPeerAccessEvidence> QueryPeerAccess(CxlPeerAccessRequest request) => inner.QueryPeerAccess(request);
     }
 
     private sealed record Scenario(RuntimeKernel Kernel, ProcessHandle Handle, RegionOwner Owner,

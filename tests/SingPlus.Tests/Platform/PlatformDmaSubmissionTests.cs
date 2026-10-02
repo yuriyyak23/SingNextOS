@@ -8,6 +8,1237 @@ namespace SingPlus.Tests.Platform;
 
 public sealed class PlatformDmaSubmissionTests
 {
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    [InlineData(5)]
+    [InlineData(6)]
+    [InlineData(7)]
+    [InlineData(8)]
+    [InlineData(9)]
+    [InlineData(10)]
+    public void DeviceAdmissionGenerationGetterPreservesParentAndCapability(int fault)
+    {
+        var scenario = CreateScenario(1618, 2680, PlatformDmaDirection.DeviceWritesMemory);
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        Assert.True(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+        Assert.True(scenario.Kernel.RevokePlatformDevice(scenario.Subject, scenario.Device).IsSuccess);
+        var capability = scenario.DeviceCapability;
+        var revoked = capability;
+        if (fault is 8 or 10)
+        {
+            revoked = Mint(scenario.Kernel, scenario.Subject, ResourceKind.Device, scenario.Device.Device.ResourceId,
+                CapabilityRights.Write | CapabilityRights.Configure | CapabilityRights.Delegate);
+            capability = scenario.Kernel.DelegateCapability(scenario.Subject, scenario.Subject, revoked,
+                CapabilityRights.Write | CapabilityRights.Configure).Value!.CapabilityId;
+        }
+        var before = scenario.Provider.DeviceBindCalls;
+        var domains = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge)
+            .GetField("_domains", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(scenario.Kernel.PlatformAuthority)!;
+        var domainRecord = domains[scenario.Device.DomainBinding.BindingId]!;
+        KernelError? nested = null;
+        Action getter = () =>
+        {
+            scenario.Provider.DeviceBindEffect = null;
+            if (fault == 1) nested = scenario.Kernel.RevokePlatformDomain(scenario.Subject, scenario.Device.DomainBinding).Error;
+            if (fault == 2) throw new InvalidOperationException("Injected pre-device generation read loss.");
+            if (fault == 3) Assert.True(scenario.Kernel.ObservePlatformBackendReset().IsSuccess);
+            if (fault == 9) scenario.Provider.ThrowDuringDeviceRevoke = true;
+            if (fault is 4 or 5 or 8 or 9) nested = scenario.Kernel.RevokeCapability(revoked).Error;
+            if (fault == 6) nested = scenario.Kernel.BindPlatformDevice(scenario.Subject, scenario.Device.DomainBinding,
+                capability, scenario.Device.Rights).Error;
+            if (fault == 7) Assert.True(scenario.Kernel.CapabilityAuthority.Revoke(capability).IsSuccess);
+        };
+        if (fault is 4 or 8 or 9) scenario.Provider.DeviceBindEffect = () => scenario.Provider.OnIncarnationRead = getter;
+        else scenario.Provider.OnIncarnationRead = getter;
+        var result = scenario.Kernel.BindPlatformDevice(scenario.Subject, scenario.Device.DomainBinding,
+            capability, scenario.Device.Rights);
+        Assert.Equal(fault is 2 or 3 or 5 or 7 ? 0 : 1, scenario.Provider.DeviceBindCalls - before);
+        if (fault is 0 or 1 or 6 or 10)
+        {
+            Assert.True(result.IsSuccess, result.Message);
+            if (fault == 1) Assert.Equal(KernelError.PlatformBindingActive, nested);
+            if (fault == 6) Assert.Equal(KernelError.PlatformBindingDraining, nested);
+            if (fault == 10)
+            {
+                Assert.True(scenario.Kernel.RevokeCapability(revoked).IsSuccess);
+                Assert.Equal(KernelError.CapabilityRevoked, scenario.Kernel.PlatformAuthority.ValidateDeviceLease(
+                    result.Value!, scenario.Device.DomainBinding.Subject).Error);
+            }
+            else Assert.True(scenario.Kernel.RevokePlatformDevice(scenario.Subject, result.Value!).IsSuccess);
+        }
+        else
+        {
+            Assert.Equal(fault is 2 or 3 ? KernelError.PlatformFaulted : KernelError.CapabilityRevoked, result.Error);
+            if (fault is 4 or 5 or 8 or 9) Assert.Equal(KernelError.PlatformBindingDraining, nested);
+            if (fault is 4 or 5 or 7 or 8) Assert.True(scenario.Kernel.RevokeCapability(revoked).IsSuccess);
+            if (fault is 2 or 3) Assert.False(scenario.Kernel.RevokePlatformDomain(scenario.Subject, scenario.Device.DomainBinding).IsSuccess);
+            if (fault == 9)
+            {
+                Assert.False(scenario.Kernel.RevokeCapability(revoked).IsSuccess);
+                Assert.False(scenario.Kernel.RevokePlatformDomain(scenario.Subject, scenario.Device.DomainBinding).IsSuccess);
+            }
+        }
+        var pending = (HashSet<CapabilityId>)typeof(RuntimeKernel).GetField("_pendingPlatformDeviceCapabilities",
+            BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(scenario.Kernel)!;
+        Assert.Empty(pending);
+        Assert.Equal(0, (int)domainRecord.GetType().GetProperty("PendingDeviceBinds")!.GetValue(domainRecord)!);
+    }
+
+    [Fact]
+    public async Task DeviceAdmissionConcurrentRevokeCommitsBeforeProviderReturns()
+    {
+        var scenario = CreateScenario(1619, 2690, PlatformDmaDirection.DeviceWritesMemory);
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        Assert.True(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+        Assert.True(scenario.Kernel.RevokePlatformDevice(scenario.Subject, scenario.Device).IsSuccess);
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        scenario.Provider.DeviceBindEffect = () =>
+        {
+            entered.Set();
+            if (!release.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException("Test provider release missing.");
+        };
+        var admission = Task.Run(() => scenario.Kernel.BindPlatformDevice(scenario.Subject,
+            scenario.Device.DomainBinding, scenario.DeviceCapability, scenario.Device.Rights));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            var revoked = await Task.Run(() => scenario.Kernel.RevokeCapability(scenario.DeviceCapability))
+                .WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(KernelError.PlatformBindingDraining, revoked.Error);
+            var process = scenario.Kernel.Processes.Resolve(scenario.Subject).Value!;
+            Assert.Equal(KernelError.CapabilityRevoked, scenario.Kernel.CapabilityAuthority.Validate(
+                scenario.DeviceCapability, process.DomainId, scenario.Subject.Generation, CapabilityRights.Configure).Error);
+            Assert.Equal(KernelError.PlatformBindingActive, scenario.Kernel.RevokePlatformDomain(
+                scenario.Subject, scenario.Device.DomainBinding).Error);
+        }
+        finally { release.Set(); }
+        Assert.Equal(KernelError.CapabilityRevoked, (await admission.WaitAsync(TimeSpan.FromSeconds(10))).Error);
+        Assert.True(scenario.Kernel.RevokeCapability(scenario.DeviceCapability).IsSuccess);
+    }
+
+    [Fact]
+    public void DeviceAdmissionIdentityExhaustionRefusesBeforeProviderEffect()
+    {
+        var scenario = CreateScenario(1620, 2700, PlatformDmaDirection.DeviceWritesMemory);
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        Assert.True(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+        Assert.True(scenario.Kernel.RevokePlatformDevice(scenario.Subject, scenario.Device).IsSuccess);
+        typeof(PlatformAuthorityBridge).GetField("_nextDeviceLeaseId", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(scenario.Kernel.PlatformAuthority, ulong.MaxValue);
+        var before = scenario.Provider.DeviceBindCalls;
+        Assert.Equal(KernelError.CapacityExhausted, scenario.Kernel.BindPlatformDevice(scenario.Subject,
+            scenario.Device.DomainBinding, scenario.DeviceCapability, scenario.Device.Rights).Error);
+        Assert.Equal(before, scenario.Provider.DeviceBindCalls);
+        Assert.True(scenario.Kernel.RevokePlatformDomain(scenario.Subject, scenario.Device.DomainBinding).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    [InlineData(5)]
+    [InlineData(6)]
+    [InlineData(7)]
+    [InlineData(8)]
+    [InlineData(9)]
+    public void DmaGrantAdmissionGenerationGetterPreservesOwnerContinuity(int fault)
+    {
+        var scenario = CreateScenario(1616, 2660, PlatformDmaDirection.DeviceWritesMemory);
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        var before = scenario.Provider.GrantBindCalls;
+        KernelError? nested = null;
+        Action getter = () =>
+        {
+            scenario.Provider.GrantBindEffect = null;
+            if (fault is 1 or 9) nested = scenario.Kernel.BindPlatformDma(scenario.Subject,
+                scenario.Device, scenario.Mapping, 32, 64, PlatformDmaDirection.DeviceWritesMemory).Error;
+            if (fault is 2 or 6) nested = scenario.Kernel.RevokeCapability(scenario.DeviceCapability).Error;
+            if (fault is 3 or 7) Assert.True(scenario.Kernel.ObservePlatformBackendReset().IsSuccess);
+            if (fault is 4 or 5) throw new InvalidOperationException("Injected grant admission generation read loss.");
+            if (fault == 8)
+            {
+                var process = scenario.Kernel.Processes.Resolve(scenario.Subject).Value!;
+                Assert.True(scenario.Kernel.Regions.QuarantineSubrange(scenario.Mapping.Mapping.Region,
+                    new RegionOwner(process.DomainId, scenario.Subject.Generation),
+                    new(1, new("test-provider", "bank-0", 1, 1), 1,
+                        ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(40, 8))).IsSuccess);
+            }
+        };
+        if (fault is 5 or 6 or 7 or 9) scenario.Provider.GrantBindEffect = () => scenario.Provider.OnIncarnationRead = getter;
+        else scenario.Provider.OnIncarnationRead = getter;
+        var result = scenario.Kernel.BindPlatformDma(scenario.Subject, scenario.Device, scenario.Mapping,
+            32, 64, PlatformDmaDirection.DeviceWritesMemory);
+        Assert.Equal(fault is 2 or 3 or 4 or 8 ? 0 : 1, scenario.Provider.GrantBindCalls - before);
+        if (fault is 1 or 9) Assert.Equal(KernelError.PlatformBindingActive, nested);
+        if (fault is 2 or 6) Assert.Equal(KernelError.PlatformBindingDraining, nested);
+        if (fault is 0 or 1 or 9)
+        {
+            Assert.True(result.IsSuccess, result.Message);
+            Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, result.Value!).IsSuccess);
+        }
+        else
+        {
+            Assert.False(result.IsSuccess);
+            Assert.Equal(fault is 2 or 6 ? KernelError.CapabilityRevoked : fault == 8
+                ? KernelError.Quarantined : KernelError.PlatformFaulted, result.Error);
+            var process = scenario.Kernel.Processes.Resolve(scenario.Subject).Value!;
+            Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(scenario.Mapping.Mapping.Region,
+                new RegionOwner(process.DomainId, scenario.Subject.Generation)));
+            if (fault is 3 or 4 or 5 or 7)
+                Assert.False(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+            if (fault is 2 or 6) Assert.True(scenario.Kernel.RevokeCapability(scenario.DeviceCapability).IsSuccess);
+        }
+        var records = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge)
+            .GetField("_dmaGrants", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(scenario.Kernel.PlatformAuthority)!;
+        foreach (var record in records.Values)
+            Assert.False((bool)record.GetType().GetProperty("PreparationInFlight")!.GetValue(record)!);
+    }
+
+    [Fact]
+    public void DmaGrantAdmissionIdentityExhaustionRefusesBeforeProviderEffect()
+    {
+        var scenario = CreateScenario(1617, 2670, PlatformDmaDirection.DeviceWritesMemory);
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        var before = scenario.Provider.GrantBindCalls;
+        typeof(PlatformAuthorityBridge).GetField("_nextDmaGrantId", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(scenario.Kernel.PlatformAuthority, ulong.MaxValue);
+        var result = scenario.Kernel.BindPlatformDma(scenario.Subject, scenario.Device, scenario.Mapping,
+            32, 64, PlatformDmaDirection.DeviceWritesMemory);
+        Assert.Equal(KernelError.CapacityExhausted, result.Error);
+        Assert.Equal(before, scenario.Provider.GrantBindCalls);
+        Assert.True(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+    }
+
+    public static IEnumerable<object[]> IdentityGetterCases()
+    {
+        foreach (var bound in new[] { false, true })
+        foreach (var cached in new[] { false, true })
+        for (var fault = 0; fault < 5; fault++) yield return [bound, cached, fault];
+    }
+
+    [Theory]
+    [MemberData(nameof(IdentityGetterCases))]
+    public void DmaIdentityGenerationGetterRevalidatesCachedAndEventConsumers(bool bound, bool cached, int fault)
+    {
+        var scenario = CreateScenario(1615, 2650, PlatformDmaDirection.DeviceWritesMemory);
+        var prepared = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Value!;
+        var submission = bound
+            ? scenario.Kernel.SubmitV6PlatformDma(scenario.Subject, scenario.Grant, prepared, new DmaTraceSink()).Value!.Submission
+            : scenario.Kernel.SubmitPlatformDma(scenario.Subject, scenario.Grant, prepared).Value!;
+        var endpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        var completed = cached ? scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submission).Value! : default;
+        scenario.Provider.OnIncarnationRead = () =>
+        {
+            if (fault == 1) throw new InvalidOperationException("Injected identity generation read loss.");
+            if (fault == 2)
+            {
+                if (!cached) completed = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submission).Value!;
+                Assert.True(scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(scenario.Subject, submission, completed).IsSuccess);
+            }
+            if (fault == 3) Assert.True(scenario.Kernel.ObservePlatformBackendReset().IsSuccess);
+            if (fault == 4) scenario.Provider.AdvanceIncarnation();
+        };
+        var process = scenario.Kernel.Processes.Resolve(scenario.Subject).Value!;
+        var result = cached
+            ? scenario.Kernel.PlatformAuthority.GetProvenDmaCompletion(submission, new(process.DomainId, scenario.Subject))
+            : scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submission, endpoint);
+        if (fault == 0) Assert.True(result.IsSuccess, result.Message);
+        else
+        {
+            Assert.Equal(fault == 2 ? KernelError.PlatformBindingNotFound : KernelError.PlatformFaulted, result.Error);
+            Assert.Equal(KernelError.ResponseNotAvailable, scenario.Kernel.ConsumeKernelEvent(scenario.Subject, endpoint).Error);
+            Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(scenario.Mapping.Mapping.Region,
+                new RegionOwner(process.DomainId, scenario.Subject.Generation)));
+            if (fault != 2) Assert.False(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        }
+        Assert.Equal(cached || fault is 0 or 2 ? 1 : 0, scenario.Provider.CompletionCalls);
+    }
+
+    public static IEnumerable<object[]> PostCompletionGetterCases()
+    {
+        foreach (var bound in new[] { false, true })
+        foreach (var reads in new[] { false, true })
+        for (var fault = 0; fault < 8; fault++)
+            if (!reads || fault is 0 or 1 or 2 or 3 or 6)
+                yield return [bound, reads, fault];
+    }
+
+    [Theory]
+    [MemberData(nameof(PostCompletionGetterCases))]
+    public void PostCompletionGenerationGetterPreservesVisibilityLifetime(bool bound, bool reads, int fault)
+    {
+        var scenario = CreateScenario(1614, 2640, reads
+            ? PlatformDmaDirection.DeviceReadsMemory : PlatformDmaDirection.DeviceWritesMemory);
+        var prepared = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Value!;
+        var submission = bound
+            ? scenario.Kernel.SubmitV6PlatformDma(scenario.Subject, scenario.Grant, prepared, new DmaTraceSink()).Value!.Submission
+            : scenario.Kernel.SubmitPlatformDma(scenario.Subject, scenario.Grant, prepared).Value!;
+        var completed = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submission).Value!;
+        KernelError? nested = null;
+        Action getter = () =>
+        {
+            if (fault is 1 or 5) nested = scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(
+                scenario.Subject, submission, completed).Error;
+            if (fault is 2 or 4) throw new InvalidOperationException("Injected post-completion generation read loss.");
+            if (fault is 3 or 7) Assert.True(scenario.Kernel.ObservePlatformBackendReset().IsSuccess);
+            if (fault == 6) nested = scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).Error;
+        };
+        if (fault is 4 or 5 or 7) scenario.Provider.AcquireEffect = () => scenario.Provider.OnIncarnationRead = getter;
+        else scenario.Provider.OnIncarnationRead = getter;
+        var result = scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(scenario.Subject, submission, completed);
+        Assert.Equal(!reads && fault is not (2 or 3) ? 1 : 0, scenario.Provider.AcquireCalls);
+        var records = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge)
+            .GetField("_activeDmaSubmissions", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(scenario.Kernel.PlatformAuthority)!;
+        if (fault is 2 or 3 or 4 or 7)
+        {
+            Assert.Equal(KernelError.PlatformFaulted, result.Error);
+            Assert.True(records.Contains(scenario.Grant.GrantId));
+            Assert.False(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+            Assert.False(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+            Assert.Equal(0, scenario.Provider.DmaRevokeCalls);
+            var process = scenario.Kernel.Processes.Resolve(scenario.Subject).Value!;
+            Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(scenario.Mapping.Mapping.Region,
+                new RegionOwner(process.DomainId, scenario.Subject.Generation)));
+        }
+        else
+        {
+            Assert.True(result.IsSuccess, result.Message);
+            Assert.True(result.Value!.IsSatisfied);
+            Assert.False(records.Contains(scenario.Grant.GrantId));
+            if (fault is 1 or 5 or 6) Assert.Equal(KernelError.PlatformBindingDraining, nested);
+            Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+            Assert.True(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+        }
+        var grants = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge)
+            .GetField("_dmaGrants", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(scenario.Kernel.PlatformAuthority)!;
+        var grantRecord = grants[scenario.Grant.GrantId]!;
+        Assert.False((bool)grantRecord.GetType().GetProperty("AcquisitionInFlight")!.GetValue(grantRecord)!);
+    }
+
+    [Theory]
+    [InlineData(false, 0)]
+    [InlineData(true, 0)]
+    [InlineData(false, 1)]
+    [InlineData(true, 1)]
+    [InlineData(false, 2)]
+    [InlineData(true, 2)]
+    [InlineData(false, 3)]
+    [InlineData(true, 3)]
+    [InlineData(false, 4)]
+    [InlineData(true, 4)]
+    [InlineData(false, 5)]
+    [InlineData(true, 5)]
+    [InlineData(false, 6)]
+    [InlineData(true, 6)]
+    [InlineData(false, 7)]
+    [InlineData(true, 7)]
+    public void CompletionGenerationGetterPreservesObservationInterlock(bool bound, int fault)
+    {
+        var scenario = CreateScenario(1613, 2630, PlatformDmaDirection.DeviceWritesMemory);
+        var prepared = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Value!;
+        var submission = bound
+            ? scenario.Kernel.SubmitV6PlatformDma(scenario.Subject, scenario.Grant, prepared, new DmaTraceSink()).Value!.Submission
+            : scenario.Kernel.SubmitPlatformDma(scenario.Subject, scenario.Grant, prepared).Value!;
+        KernelError? nested = null;
+        Action getter = () =>
+        {
+            if (fault == 1) nested = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submission).Error;
+            if (fault is 2 or 4) throw new InvalidOperationException("Injected completion generation read loss.");
+            if (fault is 3 or 5) Assert.True(scenario.Kernel.ObservePlatformBackendReset().IsSuccess);
+            if (fault is 6 or 7) nested = scenario.Kernel.ResolvePlatformDmaPageFault(scenario.Subject,
+                submission, new(40, 8), PlatformMemoryAccess.Write, 1).Error;
+        };
+        if (fault is 4 or 5 or 7) scenario.Provider.CompletionEffect = () => scenario.Provider.OnIncarnationRead = getter;
+        else scenario.Provider.OnIncarnationRead = getter;
+        var result = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submission);
+        var records = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge)
+            .GetField("_activeDmaSubmissions", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(scenario.Kernel.PlatformAuthority)!;
+        var record = records[scenario.Grant.GrantId]!;
+        Assert.False((bool)record.GetType().GetProperty("CompletionObservationInFlight")!.GetValue(record)!);
+        Assert.Equal(fault is 2 or 3 ? 0 : 1, scenario.Provider.CompletionCalls);
+        Assert.Equal(0, scenario.Provider.PageFaultCalls);
+        if (fault is 2 or 3 or 4 or 5)
+        {
+            Assert.Equal(KernelError.PlatformFaulted, result.Error);
+            Assert.False((bool)record.GetType().GetProperty("CompletionProven")!.GetValue(record)!);
+            Assert.False(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+            Assert.False(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+            Assert.Equal(0, scenario.Provider.DmaRevokeCalls);
+            var process = scenario.Kernel.Processes.Resolve(scenario.Subject).Value!;
+            Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(scenario.Mapping.Mapping.Region,
+                new RegionOwner(process.DomainId, scenario.Subject.Generation)));
+        }
+        else
+        {
+            Assert.True(result.IsSuccess, result.Message);
+            if (fault is 1 or 6 or 7) Assert.Equal(KernelError.PlatformBindingDraining, nested);
+            Assert.True(scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(scenario.Subject, submission, result.Value!).IsSuccess);
+            Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+            Assert.True(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+        }
+    }
+
+    [Theory]
+    [InlineData(false, 0)]
+    [InlineData(true, 0)]
+    [InlineData(false, 1)]
+    [InlineData(true, 1)]
+    [InlineData(false, 2)]
+    [InlineData(true, 2)]
+    [InlineData(false, 3)]
+    [InlineData(true, 3)]
+    [InlineData(false, 4)]
+    [InlineData(true, 4)]
+    [InlineData(false, 5)]
+    [InlineData(true, 5)]
+    [InlineData(false, 6)]
+    [InlineData(true, 6)]
+    [InlineData(false, 7)]
+    [InlineData(true, 7)]
+    public void PageFaultGenerationGetterPreservesPendingResolutionAndRegionOwner(bool bound, int fault)
+    {
+        var scenario = CreateScenario(1612, 2620, PlatformDmaDirection.DeviceWritesMemory);
+        var prepared = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Value!;
+        var submission = bound
+            ? scenario.Kernel.SubmitV6PlatformDma(scenario.Subject, scenario.Grant, prepared, new DmaTraceSink()).Value!.Submission
+            : scenario.Kernel.SubmitPlatformDma(scenario.Subject, scenario.Grant, prepared).Value!;
+        var process = scenario.Kernel.Processes.Resolve(scenario.Subject).Value!;
+        var owner = new RegionOwner(process.DomainId, scenario.Subject.Generation);
+        KernelError? nested = null;
+        var called = false;
+        Action getter = () =>
+        {
+            called = true;
+            if (fault == 1) nested = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submission).Error;
+            if (fault is 2 or 4) throw new InvalidOperationException("Injected page-fault generation read loss.");
+            if (fault is 3 or 5) Assert.True(scenario.Kernel.ObservePlatformBackendReset().IsSuccess);
+            if (fault == 6) Assert.True(scenario.Kernel.Regions.QuarantineSubrange(
+                scenario.Mapping.Mapping.Region, owner, new(1, new("test-provider", "bank-0", 1, 1), 1,
+                    ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(40, 8))).IsSuccess);
+            if (fault == 7) nested = scenario.Kernel.ResolvePlatformDmaPageFault(scenario.Subject,
+                submission, new(40, 8), PlatformMemoryAccess.Write, 1).Error;
+        };
+        if (fault is 4 or 5) scenario.Provider.PageFaultEffect = () => scenario.Provider.OnIncarnationRead = getter;
+        else scenario.Provider.OnIncarnationRead = getter;
+        var result = scenario.Kernel.ResolvePlatformDmaPageFault(scenario.Subject, submission,
+            new(40, 8), PlatformMemoryAccess.Write, 1);
+        Assert.True(called);
+        var records = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge)
+            .GetField("_activeDmaSubmissions", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(scenario.Kernel.PlatformAuthority)!;
+        var record = records[scenario.Grant.GrantId]!;
+        Assert.Empty((HashSet<ulong>)record.GetType().GetProperty("PageFaultsInFlight")!.GetValue(record)!);
+        Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(scenario.Mapping.Mapping.Region, owner));
+        Assert.Equal(fault is 2 or 3 or 6 ? 0 : 1, scenario.Provider.PageFaultCalls);
+        if (fault is 2 or 3 or 4 or 5 or 6)
+        {
+            Assert.Equal(fault == 6 ? KernelError.Quarantined : KernelError.PlatformFaulted, result.Error);
+            Assert.Empty((HashSet<ulong>)record.GetType().GetProperty("ResolvedPageFaults")!.GetValue(record)!);
+        }
+        else
+        {
+            Assert.True(result.IsSuccess, result.Message);
+            if (fault == 1) Assert.Equal(KernelError.PlatformBindingDraining, nested);
+            if (fault == 7) Assert.Equal(KernelError.PlatformDenied, nested);
+            var completion = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submission).Value!;
+            Assert.True(scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(scenario.Subject, submission, completion).IsSuccess);
+            Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+            Assert.True(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+            Assert.False(scenario.Kernel.Regions.HasPlatformMappingReservation(scenario.Mapping.Mapping.Region, owner));
+        }
+    }
+
+    [Fact]
+    public void PageFaultCallbackDamageRetainsEffectUntilExactClosure()
+    {
+        var scenario = CreateScenario(1611, 2610, PlatformDmaDirection.DeviceWritesMemory);
+        var submission = PrepareAndSubmit(scenario);
+        var process = scenario.Kernel.Processes.Resolve(scenario.Subject).Value!;
+        var owner = new RegionOwner(process.DomainId, scenario.Subject.Generation);
+        var region = scenario.Mapping.Mapping.Region;
+        bool? damage = null;
+        scenario.Provider.PageFaultEffect = () => damage = scenario.Kernel.Regions.QuarantineSubrange(region, owner,
+            new(1, new("test-provider", "bank-0", 1, 1), 1,
+                ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(40, 8))).IsSuccess;
+        var result = scenario.Kernel.ResolvePlatformDmaPageFault(scenario.Subject, submission,
+            new(40, 8), PlatformMemoryAccess.Write, 1);
+        Assert.True(damage);
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.False(result.Value!.AuthorizesMapping);
+        Assert.False(result.Value.AuthorizesMemoryAccess);
+        Assert.Equal(KernelError.Quarantined, scenario.Kernel.ResolvePlatformDmaPageFault(
+            scenario.Subject, submission, new(48, 8), PlatformMemoryAccess.Write, 2).Error);
+        Assert.Equal(1, scenario.Provider.PageFaultCalls);
+        Assert.Equal(KernelError.PlatformBindingDraining,
+            scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).Error);
+        Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(region, owner));
+        var completed = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submission).Value!;
+        Assert.True(scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(
+            scenario.Subject, submission, completed).IsSuccess);
+        Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(region, owner));
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        Assert.True(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+        Assert.False(scenario.Kernel.Regions.HasPlatformMappingReservation(region, owner));
+        Assert.Single(scenario.Kernel.Regions.SnapshotDamage());
+    }
+
+    [Fact]
+    public void DamagedMappingDeniesPageFaultResolutionBeforeProvider()
+    {
+        var scenario = CreateScenario(1610, 2600, PlatformDmaDirection.DeviceWritesMemory);
+        var submission = PrepareAndSubmit(scenario);
+        var process = scenario.Kernel.Processes.Resolve(scenario.Subject).Value!;
+        var owner = new RegionOwner(process.DomainId, scenario.Subject.Generation);
+        var region = scenario.Mapping.Mapping.Region;
+        Assert.True(scenario.Kernel.Regions.QuarantineSubrange(region, owner,
+            new(1, new("test-provider", "bank-0", 1, 1), 1,
+                ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(40, 8))).IsSuccess);
+        Assert.Equal(KernelError.Quarantined, scenario.Kernel.ResolvePlatformDmaPageFault(
+            scenario.Subject, submission, new(40, 8), PlatformMemoryAccess.Write, 1).Error);
+        Assert.Equal(0, scenario.Provider.PageFaultCalls);
+        Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(region, owner));
+        var completion = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submission).Value!;
+        Assert.True(scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(
+            scenario.Subject, submission, completion).IsSuccess);
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        Assert.True(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+        Assert.Single(scenario.Kernel.Regions.SnapshotDamage());
+    }
+
+    [Fact]
+    public async Task ParallelDistinctPageFaultsCommitIndependentlyBeforeExactClosure()
+    {
+        var scenario = CreateScenario(1609, 2590, PlatformDmaDirection.DeviceWritesMemory);
+        var submission = PrepareAndSubmit(scenario);
+        using var entered = new CountdownEvent(2);
+        using var release = new ManualResetEventSlim();
+        scenario.Provider.PageFaultEffect = () =>
+        {
+            entered.Signal();
+            if (!release.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException("Test callback release missing.");
+        };
+        var first = Task.Run(() => scenario.Kernel.ResolvePlatformDmaPageFault(scenario.Subject, submission,
+            new(40, 8), PlatformMemoryAccess.Write, 1));
+        var second = Task.Run(() => scenario.Kernel.ResolvePlatformDmaPageFault(scenario.Subject, submission,
+            new(48, 8), PlatformMemoryAccess.Write, 2));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.Equal(KernelError.PlatformBindingDraining,
+                scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submission).Error);
+            Assert.Equal(KernelError.PlatformBindingDraining,
+                scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).Error);
+            Assert.Equal(0, scenario.Provider.DmaRevokeCalls);
+        }
+        finally { release.Set(); }
+        var results = await Task.WhenAll(first, second);
+        Assert.All(results, result => Assert.True(result.IsSuccess, result.Message));
+        var records = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge)
+            .GetField("_activeDmaSubmissions", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(scenario.Kernel.PlatformAuthority)!;
+        var record = records[scenario.Grant.GrantId]!;
+        Assert.Empty((HashSet<ulong>)record.GetType().GetProperty("PageFaultsInFlight")!.GetValue(record)!);
+        Assert.Equal(new ulong[] { 1, 2 }, ((HashSet<ulong>)record.GetType()
+            .GetProperty("ResolvedPageFaults")!.GetValue(record)!).Order());
+        var completed = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submission).Value!;
+        Assert.True(scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(
+            scenario.Subject, submission, completed).IsSuccess);
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        Assert.True(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+    }
+
+    [Fact]
+    public async Task ParallelPageFaultReceiptLossPreventsLateResolutionCommit()
+    {
+        var scenario = CreateScenario(1608, 2580, PlatformDmaDirection.DeviceWritesMemory);
+        var submission = PrepareAndSubmit(scenario);
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var callbacks = 0;
+        scenario.Provider.PageFaultEffect = () =>
+        {
+            if (Interlocked.Increment(ref callbacks) == 1)
+            {
+                entered.Set();
+                if (!release.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException("Test callback release missing.");
+            }
+            else throw new InvalidOperationException("Parallel sequence receipt lost.");
+        };
+        var first = Task.Run(() => scenario.Kernel.ResolvePlatformDmaPageFault(scenario.Subject, submission,
+            new(40, 8), PlatformMemoryAccess.Write, 1));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            var second = await Task.Run(() => scenario.Kernel.ResolvePlatformDmaPageFault(scenario.Subject, submission,
+                new(48, 8), PlatformMemoryAccess.Write, 2));
+            Assert.Equal(KernelError.PlatformFaulted, second.Error);
+        }
+        finally { release.Set(); }
+        Assert.Equal(KernelError.PlatformFaulted, (await first).Error);
+        Assert.Equal(2, callbacks);
+        Assert.Equal(2, scenario.Provider.PageFaultCalls);
+        // Inspect the existing owner only after both resolver tasks have completed.
+        var records = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge)
+            .GetField("_activeDmaSubmissions", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(scenario.Kernel.PlatformAuthority)!;
+        var record = records[scenario.Grant.GrantId]!;
+        Assert.Empty((HashSet<ulong>)record.GetType().GetProperty("PageFaultsInFlight")!.GetValue(record)!);
+        Assert.Empty((HashSet<ulong>)record.GetType().GetProperty("ResolvedPageFaults")!.GetValue(record)!);
+        Assert.False(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        Assert.Equal(0, scenario.Provider.DmaRevokeCalls);
+        var process = scenario.Kernel.Processes.Resolve(scenario.Subject).Value!;
+        Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(scenario.Mapping.Mapping.Region,
+            new RegionOwner(process.DomainId, scenario.Subject.Generation)));
+    }
+
+    [Fact]
+    public void PageFaultCallbackCannotPublishAfterOtherSequenceLosesReceipt()
+    {
+        var scenario = CreateScenario(1607, 2570, PlatformDmaDirection.DeviceWritesMemory);
+        var submission = PrepareAndSubmit(scenario);
+        KernelError? nestedError = null;
+        scenario.Provider.PageFaultEffect = () =>
+        {
+            scenario.Provider.PageFaultEffect = () => throw new InvalidOperationException("Other sequence receipt lost.");
+            nestedError = scenario.Kernel.ResolvePlatformDmaPageFault(scenario.Subject, submission,
+                new(48, 8), PlatformMemoryAccess.Write, 2).Error;
+            scenario.Provider.PageFaultEffect = null;
+        };
+        var result = scenario.Kernel.ResolvePlatformDmaPageFault(scenario.Subject, submission,
+            new(40, 8), PlatformMemoryAccess.Write, 1);
+        Assert.Equal(KernelError.PlatformFaulted, nestedError);
+        Assert.Equal(KernelError.PlatformFaulted, result.Error);
+        Assert.Equal(2, scenario.Provider.PageFaultCalls);
+        Assert.False(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        Assert.Equal(0, scenario.Provider.DmaRevokeCalls);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void PageFaultCallbackDuplicateAdmissionPreservesExactEffectLifecycle(int fault)
+    {
+        var scenario = CreateScenario(1606, 2560, PlatformDmaDirection.DeviceWritesMemory);
+        var submission = PrepareAndSubmit(scenario);
+        scenario.Provider.ResetDuringPageFault = fault == 2;
+        KernelError? nestedError = null;
+        scenario.Provider.PageFaultEffect = () =>
+        {
+            scenario.Provider.PageFaultEffect = null;
+            nestedError = scenario.Kernel.ResolvePlatformDmaPageFault(scenario.Subject, submission,
+                new(40, 8), PlatformMemoryAccess.Write, 1).Error;
+            if (fault == 1) throw new InvalidOperationException("Page fault receipt lost.");
+        };
+        var result = scenario.Kernel.ResolvePlatformDmaPageFault(scenario.Subject, submission,
+            new(40, 8), PlatformMemoryAccess.Write, 1);
+        Assert.Equal(KernelError.PlatformDenied, nestedError);
+        Assert.Equal(fault == 0, result.IsSuccess);
+        Assert.Equal(1, scenario.Provider.PageFaultCalls);
+        if (fault == 0)
+        {
+            Assert.False(result.Value!.AuthorizesMapping);
+            Assert.False(result.Value.AuthorizesMemoryAccess);
+            var completion = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submission).Value!;
+            Assert.True(scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(
+                scenario.Subject, submission, completion).IsSuccess);
+            Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        }
+        else
+        {
+            Assert.Equal(KernelError.PlatformFaulted, result.Error);
+            Assert.False(scenario.Kernel.ResolvePlatformDmaPageFault(scenario.Subject, submission,
+                new(40, 8), PlatformMemoryAccess.Write, 2).IsSuccess);
+            Assert.False(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+            Assert.Equal(1, scenario.Provider.PageFaultCalls);
+            Assert.Equal(0, scenario.Provider.DmaRevokeCalls);
+            var process = scenario.Kernel.Processes.Resolve(scenario.Subject).Value!;
+            Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(scenario.Mapping.Mapping.Region,
+                new RegionOwner(process.DomainId, scenario.Subject.Generation)));
+        }
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void PostCompletionAcquireCallbackCannotReenterFinalization(int fault)
+    {
+        var scenario = CreateScenario(1605, 2550, PlatformDmaDirection.DeviceWritesMemory);
+        var submission = PrepareAndSubmit(scenario);
+        var completed = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submission).Value!;
+        scenario.Provider.ResetDuringAcquire = fault == 2;
+        KernelError? nestedError = null;
+        scenario.Provider.AcquireEffect = () =>
+        {
+            scenario.Provider.AcquireEffect = null;
+            nestedError = scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(
+                scenario.Subject, submission, completed).Error;
+            if (fault == 1) throw new InvalidOperationException("Post-completion acquire receipt lost.");
+        };
+        var result = scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(scenario.Subject, submission, completed);
+        Assert.Equal(KernelError.PlatformBindingDraining, nestedError);
+        Assert.Equal(fault == 0, result.IsSuccess);
+        Assert.Equal(1, scenario.Provider.AcquireCalls);
+        if (fault == 0)
+        {
+            Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+            Assert.True(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+        }
+        else
+        {
+            Assert.Equal(KernelError.PlatformFaulted, result.Error);
+            Assert.Equal(KernelError.PlatformFaulted, scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(
+                scenario.Subject, submission, completed).Error);
+            Assert.NotEqual(KernelError.PlatformBindingDraining,
+                scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Error);
+            Assert.False(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+            Assert.Equal(1, scenario.Provider.AcquireCalls);
+            Assert.Equal(0, scenario.Provider.DmaRevokeCalls);
+            var process = scenario.Kernel.Processes.Resolve(scenario.Subject).Value!;
+            Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(scenario.Mapping.Mapping.Region,
+                new RegionOwner(process.DomainId, scenario.Subject.Generation)));
+        }
+    }
+
+    [Fact]
+    public void LegacyAcquireCallbackCannotReenterGrantAdmissionOrClosure()
+    {
+        var scenario = CreateScenario(1604, 2540, PlatformDmaDirection.DeviceWritesMemory);
+        var prepared = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Value!;
+        scenario.Provider.AcquireEffect = () =>
+        {
+            scenario.Provider.AcquireEffect = null;
+            Assert.Equal(KernelError.PlatformBindingDraining,
+                scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Error);
+            Assert.Equal(KernelError.PlatformBindingDraining,
+                scenario.Kernel.SubmitPlatformDma(scenario.Subject, scenario.Grant, prepared).Error);
+            Assert.Equal(KernelError.PlatformBindingDraining,
+                scenario.Kernel.AcquirePlatformDmaForCpu(scenario.Subject, scenario.Grant).Error);
+            Assert.Equal(KernelError.PlatformBindingDraining,
+                scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).Error);
+        };
+        Assert.True(scenario.Kernel.AcquirePlatformDmaForCpu(scenario.Subject, scenario.Grant).IsSuccess);
+        Assert.Equal(1, scenario.Provider.PrepareCalls);
+        Assert.Equal(1, scenario.Provider.AcquireCalls);
+        Assert.Equal(0, scenario.Provider.SubmitCalls);
+        Assert.Equal(0, scenario.Provider.DmaRevokeCalls);
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        Assert.True(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void LegacyAcquireReceiptLossCannotPublishVisibilityOrReleaseMapping(bool reset)
+    {
+        var scenario = CreateScenario(1603, 2530, PlatformDmaDirection.DeviceWritesMemory);
+        Assert.True(scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).IsSuccess);
+        scenario.Provider.ResetDuringAcquire = reset;
+        scenario.Provider.AcquireEffect = () =>
+        {
+            if (!reset) throw new InvalidOperationException("Acquire receipt lost.");
+        };
+        var result = scenario.Kernel.AcquirePlatformDmaForCpu(scenario.Subject, scenario.Grant);
+        Assert.Equal(KernelError.PlatformFaulted, result.Error);
+        Assert.False(scenario.Kernel.AcquirePlatformDmaForCpu(scenario.Subject, scenario.Grant).IsSuccess);
+        Assert.False(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        Assert.Equal(1, scenario.Provider.AcquireCalls);
+        Assert.Equal(0, scenario.Provider.DmaRevokeCalls);
+        var process = scenario.Kernel.Processes.Resolve(scenario.Subject).Value!;
+        Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(scenario.Mapping.Mapping.Region,
+            new RegionOwner(process.DomainId, scenario.Subject.Generation)));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void GrantRevokeCallbackCannotReenterAdmissionOrClosure(int fault)
+    {
+        var scenario = CreateScenario(1602, 2520, PlatformDmaDirection.DeviceReadsMemory);
+        var prepared = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Value!;
+        scenario.Provider.ThrowDuringRevoke = fault == 1;
+        scenario.Provider.ResetDuringRevoke = fault == 2;
+        scenario.Provider.RevokedDuringRevoke = fault == 3;
+        scenario.Provider.RevokeEffect = () =>
+        {
+            scenario.Provider.RevokeEffect = null;
+            Assert.Equal(KernelError.PlatformBindingDraining,
+                scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Error);
+            Assert.Equal(KernelError.PlatformBindingDraining,
+                scenario.Kernel.SubmitPlatformDma(scenario.Subject, scenario.Grant, prepared).Error);
+            Assert.Equal(KernelError.PlatformBindingDraining,
+                scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).Error);
+        };
+        var closed = scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant);
+        Assert.Equal(fault == 0, closed.IsSuccess);
+        Assert.Equal(1, scenario.Provider.PrepareCalls);
+        Assert.Equal(0, scenario.Provider.SubmitCalls);
+        Assert.Equal(1, scenario.Provider.DmaRevokeCalls);
+        if (fault == 0)
+            Assert.True(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+        else
+        {
+            Assert.Equal(KernelError.PlatformFaulted, closed.Error);
+            Assert.NotEqual(KernelError.PlatformBindingDraining,
+                scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Error);
+            Assert.False(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+            Assert.Equal(1, scenario.Provider.DmaRevokeCalls);
+            var process = scenario.Kernel.Processes.Resolve(scenario.Subject).Value!;
+            Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(scenario.Mapping.Mapping.Region,
+                new RegionOwner(process.DomainId, scenario.Subject.Generation)));
+        }
+    }
+
+    [Fact]
+    public void CopySubmitCallbackCannotReenterEitherGrantAdmissionOrClosure()
+    {
+        var scenario = CreateCopyScenario(1601, 2510);
+        var sourcePrepare = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Source).Value!;
+        var destinationPrepare = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Destination).Value!;
+        scenario.Provider.CopyEffect = () =>
+        {
+            scenario.Provider.CopyEffect = null;
+            foreach (var grant in new[] { scenario.Source, scenario.Destination })
+            {
+                Assert.Equal(KernelError.PlatformBindingDraining,
+                    scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, grant).Error);
+                Assert.Equal(KernelError.PlatformBindingDraining,
+                    scenario.Kernel.RevokePlatformDma(scenario.Subject, grant).Error);
+            }
+            Assert.Equal(KernelError.PlatformBindingDraining, scenario.Kernel.SubmitV6PlatformDmaCopy(
+                scenario.Subject, scenario.Source, sourcePrepare, scenario.Subject, scenario.Destination, destinationPrepare).Error);
+        };
+        var result = scenario.Kernel.SubmitV6PlatformDmaCopy(scenario.Subject, scenario.Source, sourcePrepare,
+            scenario.Subject, scenario.Destination, destinationPrepare);
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.Equal(1, scenario.Provider.CopySubmitCalls);
+        Assert.Equal(2, scenario.Provider.PrepareCalls);
+        Assert.Equal(0, scenario.Provider.DmaRevokeCalls);
+        Assert.True(scenario.Kernel.CompleteV6PlatformDmaCopy(scenario.Subject, scenario.Subject, result.Value!).IsSuccess);
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Source).IsSuccess);
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Destination).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SubmitCallbackCannotReenterGrantAdmissionOrClosure(bool sidecar)
+    {
+        var scenario = CreateScenario(1600, 2500, PlatformDmaDirection.DeviceReadsMemory);
+        var prepared = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Value!;
+        scenario.Provider.SubmitEffect = () =>
+        {
+            scenario.Provider.SubmitEffect = null;
+            Assert.Equal(KernelError.PlatformBindingDraining,
+                scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Error);
+            Assert.Equal(KernelError.PlatformBindingDraining,
+                scenario.Kernel.SubmitPlatformDma(scenario.Subject, scenario.Grant, prepared).Error);
+            Assert.Equal(KernelError.PlatformBindingDraining,
+                scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).Error);
+        };
+        var submission = sidecar
+            ? scenario.Kernel.SubmitV6PlatformDma(scenario.Subject, scenario.Grant, prepared, new DmaTraceSink()).Value!.Submission
+            : scenario.Kernel.SubmitPlatformDma(scenario.Subject, scenario.Grant, prepared).Value!;
+        Assert.Equal(1, scenario.Provider.PrepareCalls);
+        Assert.Equal(1, scenario.Provider.SubmitCalls);
+        Assert.Equal(0, scenario.Provider.DmaRevokeCalls);
+        var completed = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submission).Value!;
+        Assert.True(scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(scenario.Subject, submission, completed).IsSuccess);
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+    }
+
+    [Fact]
+    public void PrepareCallbackCannotReenterGrantAdmissionOrClosure()
+    {
+        var scenario = CreateScenario(1599, 2490, PlatformDmaDirection.DeviceReadsMemory);
+        var old = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Value!;
+        scenario.Provider.PrepareEffect = () =>
+        {
+            scenario.Provider.PrepareEffect = null;
+            Assert.Equal(KernelError.PlatformBindingDraining,
+                scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Error);
+            Assert.Equal(KernelError.PlatformBindingDraining,
+                scenario.Kernel.SubmitPlatformDma(scenario.Subject, scenario.Grant, old).Error);
+            Assert.Equal(KernelError.PlatformBindingDraining,
+                scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).Error);
+        };
+        var fresh = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant);
+        Assert.True(fresh.IsSuccess, fresh.Message);
+        Assert.Equal(2, scenario.Provider.PrepareCalls);
+        Assert.Equal(0, scenario.Provider.SubmitCalls);
+        Assert.Equal(0, scenario.Provider.DmaRevokeCalls);
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+    }
+
+    [Fact]
+    public void LostPrepareReceiptReturnsFaultAndRetainsGrantPin()
+    {
+        var scenario = CreateScenario(1598, 2480, PlatformDmaDirection.DeviceReadsMemory);
+        scenario.Provider.PrepareEffect = () => throw new InvalidOperationException("Lost prepare receipt.");
+        Assert.Equal(KernelError.PlatformFaulted,
+            scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Error);
+        Assert.Equal(KernelError.PlatformFaulted,
+            scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Error);
+        Assert.Equal(1, scenario.Provider.PrepareCalls);
+        Assert.False(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        Assert.Equal(0, scenario.Provider.DmaRevokeCalls);
+    }
+
+    [Fact]
+    public void BackendResetInsidePrepareCallbackCannotPublishLateCycle()
+    {
+        var scenario = CreateScenario(1597, 2470, PlatformDmaDirection.DeviceReadsMemory);
+        scenario.Provider.PrepareEffect = () => Assert.True(scenario.Kernel.ObservePlatformBackendReset().IsSuccess);
+        var prepared = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant);
+        Assert.Equal(KernelError.PlatformFaulted, prepared.Error);
+        Assert.Equal(1, scenario.Provider.PrepareCalls);
+        Assert.Equal(0, scenario.Provider.SubmitCalls);
+        Assert.False(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(PlatformDmaDirection.DeviceReadsMemory, false)]
+    [InlineData(PlatformDmaDirection.DeviceWritesMemory, false)]
+    [InlineData(PlatformDmaDirection.DeviceReadsMemory, true)]
+    [InlineData(PlatformDmaDirection.DeviceWritesMemory, true)]
+    public void PrepareCallbackDamageCannotAuthorizeSubmit(PlatformDmaDirection direction, bool sidecar)
+    {
+        var scenario = CreateScenario(1596, 2460, direction);
+        var process = scenario.Kernel.Processes.Resolve(scenario.Subject).Value!;
+        var owner = new RegionOwner(process.DomainId, scenario.Subject.Generation);
+        var region = scenario.Mapping.Mapping.Region;
+        scenario.Provider.PrepareEffect = () => Assert.True(scenario.Kernel.Regions.QuarantineSubrange(region, owner,
+            new(1, new("test-provider", "bank-0", 1, 1), 1,
+                ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(96, 8))).IsSuccess);
+        var prepared = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant);
+        Assert.True(prepared.IsSuccess, prepared.Message);
+        Assert.Equal(1, scenario.Provider.PrepareCalls);
+        var error = sidecar
+            ? scenario.Kernel.SubmitV6PlatformDma(scenario.Subject, scenario.Grant, prepared.Value!, new DmaTraceSink()).Error
+            : scenario.Kernel.SubmitPlatformDma(scenario.Subject, scenario.Grant, prepared.Value!).Error;
+        Assert.Equal(KernelError.Quarantined, error);
+        Assert.Equal(0, scenario.Provider.SubmitCalls);
+        Assert.Equal(0, scenario.Provider.BoundSubmitCalls);
+        Assert.False(scenario.Kernel.PlatformAuthority.HasPendingDmaSubmission(scenario.Grant.GrantId));
+        Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(region, owner));
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        Assert.Single(scenario.Kernel.Regions.SnapshotDamage());
+    }
+
+    [Theory]
+    [InlineData(PlatformDmaDirection.DeviceReadsMemory)]
+    [InlineData(PlatformDmaDirection.DeviceWritesMemory)]
+    public void ExistingGrantDamageDeniesPrepareBeforeProvider(PlatformDmaDirection direction)
+    {
+        var scenario = CreateScenario(1595, 2450, direction);
+        var process = scenario.Kernel.Processes.Resolve(scenario.Subject).Value!;
+        var owner = new RegionOwner(process.DomainId, scenario.Subject.Generation);
+        var region = scenario.Mapping.Mapping.Region;
+        Assert.True(scenario.Kernel.Regions.QuarantineSubrange(region, owner,
+            new(1, new("test-provider", "bank-0", 1, 1), 1,
+                ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(96, 8))).IsSuccess);
+        var prepared = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant);
+        Assert.Equal(KernelError.Quarantined, prepared.Error);
+        Assert.Equal(0, scenario.Provider.PrepareCalls);
+        Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(region, owner));
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        Assert.Single(scenario.Kernel.Regions.SnapshotDamage());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CopyCallbackDamageRetainsBothEffectsUntilExactClosure(bool damageDestination)
+    {
+        var scenario = CreateCopyScenario(1594, 2440);
+        var sourcePrepare = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Source).Value!;
+        var destinationPrepare = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Destination).Value!;
+        var process = scenario.Kernel.Processes.Resolve(scenario.Subject).Value!;
+        var owner = new RegionOwner(process.DomainId, scenario.Subject.Generation);
+        var region = (damageDestination ? scenario.Destination : scenario.Source).Mapping.Region;
+        scenario.Provider.CopyEffect = () => Assert.True(scenario.Kernel.Regions.QuarantineSubrange(region, owner,
+            new(1, new("test-provider", "bank-0", 1, 1), 1,
+                ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(0, 8))).IsSuccess);
+        var execution = scenario.Kernel.SubmitV6PlatformDmaCopy(scenario.Subject, scenario.Source, sourcePrepare,
+            scenario.Subject, scenario.Destination, destinationPrepare).Value!;
+        Assert.True(scenario.Kernel.PlatformAuthority.HasPendingDmaSubmission(scenario.Source.GrantId));
+        Assert.True(scenario.Kernel.PlatformAuthority.HasPendingDmaSubmission(scenario.Destination.GrantId));
+        Assert.Equal(KernelError.Quarantined, scenario.Kernel.SubmitV6PlatformDmaCopy(
+            scenario.Subject, scenario.Source, sourcePrepare, scenario.Subject, scenario.Destination, destinationPrepare).Error);
+        Assert.Equal(1, scenario.Provider.CopySubmitCalls);
+        Assert.Equal(KernelError.PlatformBindingDraining, scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Source).Error);
+        Assert.Equal(KernelError.PlatformBindingDraining, scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Destination).Error);
+        Assert.True(scenario.Kernel.CompleteV6PlatformDmaCopy(scenario.Subject, scenario.Subject, execution).IsSuccess);
+        Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(scenario.Source.Mapping.Region, owner));
+        Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(scenario.Destination.Mapping.Region, owner));
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Source).IsSuccess);
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Destination).IsSuccess);
+        Assert.True(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.SourceMapping).IsSuccess);
+        Assert.True(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.DestinationMapping).IsSuccess);
+        Assert.Single(scenario.Kernel.Regions.SnapshotDamage());
+    }
+
+    [Theory]
+    [InlineData(PlatformDmaDirection.DeviceReadsMemory, false)]
+    [InlineData(PlatformDmaDirection.DeviceWritesMemory, false)]
+    [InlineData(PlatformDmaDirection.DeviceReadsMemory, true)]
+    [InlineData(PlatformDmaDirection.DeviceWritesMemory, true)]
+    public void CallbackDamageRetainsAcceptedSubmissionUntilExactGrantClosure(PlatformDmaDirection direction, bool sidecar)
+    {
+        var scenario = CreateScenario(1593, 2430, direction);
+        var prepared = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Value!;
+        var process = scenario.Kernel.Processes.Resolve(scenario.Subject).Value!;
+        var owner = new RegionOwner(process.DomainId, scenario.Subject.Generation);
+        var region = scenario.Mapping.Mapping.Region;
+        scenario.Provider.SubmitEffect = () => Assert.True(scenario.Kernel.Regions.QuarantineSubrange(region, owner,
+            new(1, new("test-provider", "bank-0", 1, 1), 1,
+                ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(96, 8))).IsSuccess);
+
+        var submission = sidecar
+            ? scenario.Kernel.SubmitV6PlatformDma(scenario.Subject, scenario.Grant, prepared, new DmaTraceSink()).Value!.Submission
+            : scenario.Kernel.SubmitPlatformDma(scenario.Subject, scenario.Grant, prepared).Value!;
+        Assert.Equal(1, scenario.Provider.SubmitCalls);
+        Assert.True(scenario.Kernel.PlatformAuthority.HasPendingDmaSubmission(scenario.Grant.GrantId));
+        Assert.Equal(KernelError.Quarantined,
+            scenario.Kernel.SubmitPlatformDma(scenario.Subject, scenario.Grant, prepared).Error);
+        Assert.Equal(1, scenario.Provider.SubmitCalls);
+        Assert.Equal(KernelError.PlatformBindingDraining,
+            scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).Error);
+        Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(region, owner));
+        var completed = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submission).Value!;
+        Assert.True(scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(scenario.Subject, submission, completed).IsSuccess);
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        Assert.True(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+        Assert.Single(scenario.Kernel.Regions.SnapshotDamage());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DamagedCopyLegDeniesPairBeforeProvider(bool damageDestination)
+    {
+        var scenario = CreateCopyScenario(1592, 2420);
+        var sourcePrepare = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Source).Value!;
+        var destinationPrepare = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Destination).Value!;
+        var process = scenario.Kernel.Processes.Resolve(scenario.Subject).Value!;
+        var owner = new RegionOwner(process.DomainId, scenario.Subject.Generation);
+        var region = (damageDestination ? scenario.Destination : scenario.Source).Mapping.Region;
+        Assert.True(scenario.Kernel.Regions.QuarantineSubrange(region, owner,
+            new(1, new("test-provider", "bank-0", 1, 1), 1,
+                ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(0, 8))).IsSuccess);
+
+        var result = scenario.Kernel.SubmitV6PlatformDmaCopy(scenario.Subject, scenario.Source, sourcePrepare,
+            scenario.Subject, scenario.Destination, destinationPrepare);
+        Assert.Equal(KernelError.Quarantined, result.Error);
+        Assert.Equal(0, scenario.Provider.CopySubmitCalls);
+        Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(scenario.Source.Mapping.Region, owner));
+        Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(scenario.Destination.Mapping.Region, owner));
+        Assert.True(scenario.Kernel.PlatformAuthority.ValidateDmaGrant(scenario.Source, scenario.Source.Mapping.Mapping.DomainBinding.Subject).IsSuccess);
+        Assert.True(scenario.Kernel.PlatformAuthority.ValidateDmaGrant(scenario.Destination, scenario.Destination.Mapping.Mapping.DomainBinding.Subject).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(PlatformDmaDirection.DeviceReadsMemory, false)]
+    [InlineData(PlatformDmaDirection.DeviceWritesMemory, false)]
+    [InlineData(PlatformDmaDirection.DeviceReadsMemory, true)]
+    [InlineData(PlatformDmaDirection.DeviceWritesMemory, true)]
+    public void ExistingGrantDamageDeniesSubmitBeforeProvider(PlatformDmaDirection direction, bool sidecar)
+    {
+        var scenario = CreateScenario(1591, 2410, direction);
+        var prepared = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Value!;
+        var process = scenario.Kernel.Processes.Resolve(scenario.Subject).Value!;
+        var owner = new RegionOwner(process.DomainId, scenario.Subject.Generation);
+        var region = scenario.Mapping.Mapping.Region;
+        Assert.True(scenario.Kernel.Regions.QuarantineSubrange(region, owner,
+            new(1, new("test-provider", "bank-0", 1, 1), 1,
+                ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(96, 8))).IsSuccess);
+        var error = sidecar
+            ? scenario.Kernel.SubmitV6PlatformDma(scenario.Subject, scenario.Grant, prepared, new DmaTraceSink()).Error
+            : scenario.Kernel.SubmitPlatformDma(scenario.Subject, scenario.Grant, prepared).Error;
+        Assert.Equal(KernelError.Quarantined, error);
+        Assert.Equal(0, scenario.Provider.SubmitCalls);
+        Assert.Equal(0, scenario.Provider.BoundSubmitCalls);
+        Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(region, owner));
+    }
+
+    [Theory]
+    [InlineData(PlatformDmaDirection.DeviceReadsMemory)]
+    [InlineData(PlatformDmaDirection.DeviceWritesMemory)]
+    public void V6GrantClosureSidecarProjectsExactVisiblePrefixWithoutPublication(PlatformDmaDirection direction)
+    {
+        var scenario = CreateScenario(1590, 2400, direction);
+        var sink = new DmaTraceSink();
+        var prepared = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Value!;
+        var submitted = scenario.Kernel.SubmitV6PlatformDma(scenario.Subject,
+            scenario.Grant, prepared, sink).Value!;
+        Assert.False(scenario.Kernel.QueryV6PlatformDmaGrantClosure(scenario.Subject, scenario.Grant).IsSuccess);
+        var completed = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submitted.Submission).Value!;
+        Assert.True(scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(
+            scenario.Subject, submitted.Submission, completed).IsSuccess);
+        Assert.False(scenario.Kernel.QueryV6PlatformDmaGrantClosure(scenario.Subject, scenario.Grant).IsSuccess);
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        var observation = scenario.Kernel.QueryV6PlatformDmaGrantClosure(scenario.Subject, scenario.Grant).Value!;
+        var decoded = DmaGrantClosureObservationV1.ParseCanonical(observation.SerializeCanonical());
+        Assert.Equal(observation, decoded);
+        var identity = PlatformAuthorityBridge.DmaGrantIdentityDigest(scenario.Grant);
+        Assert.True(DmaGrantClosureProjectionV1.Validate(sink.Events, decoded,
+            identity, scenario.Provider.CurrentIncarnation.Value, scenario.Kernel.PlatformAuthority.BackendEpoch.Value));
+        Assert.False(observation.AuthorizesReclaim);
+        Assert.False(observation.AuthorizesEffect);
+        Assert.False(observation.ProvesPublication);
+        Assert.False(observation.ProvesSettlement);
+        Assert.Equal(PlatformExternalClosureState.Active,
+            scenario.Kernel.QueryPlatformRegionMappingLifecycle(scenario.Subject, scenario.Mapping.Mapping).Value!.PlatformClosure);
+        Assert.Equal(4, sink.Events.Count);
+        Assert.Equal(SemanticTraceEventKindV1.Visible, sink.Events[^1].Kind);
+        Assert.False(DmaGrantClosureProjectionV1.Validate(sink.Events, observation,
+            new string('f', 64), observation.ProviderGeneration, observation.BackendEpoch));
+        Assert.False(DmaGrantClosureProjectionV1.Validate(sink.Events, observation,
+            identity, observation.ProviderGeneration + 1, observation.BackendEpoch));
+        Assert.False(DmaGrantClosureProjectionV1.Validate(sink.Events, observation,
+            identity, observation.ProviderGeneration, observation.BackendEpoch + 1));
+        Assert.False(DmaGrantClosureProjectionV1.Validate(sink.Events.Take(3), observation,
+            identity, observation.ProviderGeneration, observation.BackendEpoch));
+        Assert.Equal(observation, scenario.Kernel.QueryV6PlatformDmaGrantClosure(scenario.Subject, scenario.Grant).Value!);
+        var stale = scenario.Grant with { Generation = new PlatformDmaGrantGeneration(scenario.Grant.Generation.Value + 1) };
+        Assert.Equal(KernelError.StaleGeneration, scenario.Kernel.QueryV6PlatformDmaGrantClosure(scenario.Subject, stale).Error);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void V6GrantClosureSidecarDoesNotExistAfterAmbiguousRevoke(int fault)
+    {
+        var scenario = CreateScenario(1591, 2410, PlatformDmaDirection.DeviceWritesMemory);
+        var sink = new DmaTraceSink();
+        var prepared = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Value!;
+        var submitted = scenario.Kernel.SubmitV6PlatformDma(scenario.Subject, scenario.Grant, prepared, sink).Value!;
+        var completed = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submitted.Submission).Value!;
+        Assert.True(scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(scenario.Subject, submitted.Submission, completed).IsSuccess);
+        scenario.Provider.ResetDuringRevoke = fault == 0;
+        scenario.Provider.ThrowDuringRevoke = fault == 1;
+        scenario.Provider.RevokedDuringRevoke = fault == 2;
+        if (fault == 3) scenario.Provider.RevokeEffect = () => scenario.Kernel.ObservePlatformBackendReset();
+        Assert.False(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        Assert.False(scenario.Kernel.QueryV6PlatformDmaGrantClosure(scenario.Subject, scenario.Grant).IsSuccess);
+        Assert.False(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void V6GrantClosureSidecarDoesNotReuseAnEarlierVisibleCycle(bool traceLastCycle)
+    {
+        var scenario = CreateScenario(1593, 2430, PlatformDmaDirection.DeviceWritesMemory);
+        var firstSink = new DmaTraceSink();
+        var lastSink = new DmaTraceSink();
+        for (var cycle = 0; cycle < 2; cycle++)
+        {
+            var prepared = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Value!;
+            var submitted = scenario.Kernel.SubmitV6PlatformDma(scenario.Subject, scenario.Grant,
+                prepared, cycle == 0 ? firstSink : traceLastCycle ? lastSink : null).Value!;
+            var completed = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submitted.Submission).Value!;
+            Assert.True(scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(scenario.Subject, submitted.Submission, completed).IsSuccess);
+        }
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        var result = scenario.Kernel.QueryV6PlatformDmaGrantClosure(scenario.Subject, scenario.Grant);
+        if (!traceLastCycle)
+        {
+            Assert.Equal(KernelError.PlatformUnsupported, result.Error);
+            return;
+        }
+        Assert.True(result.IsSuccess, result.Message);
+        var observation = result.Value!;
+        Assert.False(DmaGrantClosureProjectionV1.Validate(firstSink.Events, observation,
+            observation.GrantIdentityDigest, observation.ProviderGeneration, observation.BackendEpoch));
+        Assert.True(DmaGrantClosureProjectionV1.Validate(lastSink.Events, observation,
+            observation.GrantIdentityDigest, observation.ProviderGeneration, observation.BackendEpoch));
+    }
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void V6GrantClosureSidecarGenerationReadFailureKeepsGrantPinned(bool afterCallback)
+    {
+        var scenario = CreateScenario(1594, 2440, PlatformDmaDirection.DeviceWritesMemory);
+        var sink = new DmaTraceSink();
+        var prepared = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Value!;
+        var submitted = scenario.Kernel.SubmitV6PlatformDma(scenario.Subject, scenario.Grant, prepared, sink).Value!;
+        var completed = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submitted.Submission).Value!;
+        Assert.True(scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(scenario.Subject, submitted.Submission, completed).IsSuccess);
+        if (afterCallback) scenario.Provider.RevokeEffect = () => scenario.Provider.ThrowIncarnationRead = true;
+        else scenario.Provider.ThrowIncarnationRead = true;
+        var result = scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant);
+        Assert.Equal(KernelError.PlatformFaulted, result.Error);
+        Assert.Equal(afterCallback ? 1 : 0, scenario.Provider.DmaRevokeCalls);
+        scenario.Provider.ThrowIncarnationRead = false;
+        Assert.False(scenario.Kernel.QueryV6PlatformDmaGrantClosure(scenario.Subject, scenario.Grant).IsSuccess);
+        Assert.Equal(KernelError.PlatformFaulted, scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).Error);
+        Assert.False(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+    }
+    [Fact]
+    public void V6GrantClosureSidecarCannotRepairTraceSinkLoss()
+    {
+        var scenario = CreateScenario(1592, 2420, PlatformDmaDirection.DeviceWritesMemory);
+        var sink = new DmaTraceSink { ThrowOnRecord = true };
+        var prepared = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Value!;
+        var submitted = scenario.Kernel.SubmitV6PlatformDma(scenario.Subject, scenario.Grant, prepared, sink).Value!;
+        var completed = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submitted.Submission).Value!;
+        Assert.True(scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(scenario.Subject, submitted.Submission, completed).IsSuccess);
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        var observation = scenario.Kernel.QueryV6PlatformDmaGrantClosure(scenario.Subject, scenario.Grant).Value!;
+        Assert.False(DmaGrantClosureProjectionV1.Validate(sink.Events, observation,
+            observation.GrantIdentityDigest, observation.ProviderGeneration, observation.BackendEpoch));
+        Assert.Empty(sink.Events);
+    }
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void V6GrantClosureSidecarGenerationReadReentrancyCannotBypassClosureInterlock(int fault)
+    {
+        var scenario = CreateScenario(1595, 2450, PlatformDmaDirection.DeviceWritesMemory);
+        KernelResult? nested = null;
+        var called = false;
+        scenario.Provider.OnIncarnationRead = () =>
+        {
+            called = true;
+            if (fault == 1) nested = scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant);
+            if (fault == 2) Assert.True(scenario.Kernel.ObservePlatformBackendReset().IsSuccess);
+        };
+        var result = scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant);
+        Assert.True(called);
+        if (fault == 2)
+        {
+            Assert.Equal(KernelError.PlatformFaulted, result.Error);
+            Assert.Equal(0, scenario.Provider.DmaRevokeCalls);
+            Assert.Equal(KernelError.StaleGeneration, scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).Error);
+            Assert.False(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+        }
+        else
+        {
+            Assert.True(result.IsSuccess, result.Message);
+            if (fault == 1) Assert.Equal(KernelError.PlatformBindingDraining, nested!.Value.Error);
+            Assert.Equal(1, scenario.Provider.DmaRevokeCalls);
+            Assert.Equal(KernelError.PlatformBindingRevoked, scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).Error);
+        }
+    }
     [Fact]
     public void V6AtomicCopySubmitCreatesBothPendingLifetimesAtOneProviderBoundary()
     {
@@ -1928,6 +3159,23 @@ public sealed class PlatformDmaSubmissionTests
     }
 
     [Fact]
+    public void AlreadyRevokedStatusWithoutResetCannotProveExactGrantClosure()
+    {
+        var scenario = CreateScenario(1561, 2120, PlatformDmaDirection.DeviceReadsMemory);
+        CompleteDmaForGrantRevoke(scenario);
+        scenario.Provider.RevokedDuringRevoke = true;
+
+        Assert.Equal(KernelError.PlatformFaulted,
+            scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).Error);
+        Assert.Equal(1, scenario.Provider.DmaRevokeCalls);
+        Assert.Equal(KernelError.PlatformFaulted,
+            scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).Error);
+        Assert.Equal(1, scenario.Provider.DmaRevokeCalls);
+        Assert.False(scenario.Kernel.RevokePlatformRegionMapping(
+            scenario.Subject, scenario.Mapping).IsSuccess);
+    }
+
+    [Fact]
     public void ProviderThrowDuringGrantRevokePinsMappingAfterPossibleClosure()
     {
         var scenario = CreateScenario(1547, 1980, PlatformDmaDirection.DeviceReadsMemory);
@@ -2510,6 +3758,350 @@ public sealed class PlatformDmaSubmissionTests
         PlatformDmaGrant Destination,
         DataMotionPlanV1 Plan);
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    [InlineData(5)]
+    public void V6DmaPreparationGenerationGetterCannotLoseInterlockOrContinuity(int fault)
+    {
+        var scenario = CreateScenario(1596, 2460, PlatformDmaDirection.DeviceWritesMemory);
+        KernelResult? nested = null;
+        var called = false;
+        Action getter = () =>
+        {
+            called = true;
+            if (fault is 1 or 4) nested = scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant);
+            if (fault == 2) Assert.True(scenario.Kernel.ObservePlatformBackendReset().IsSuccess);
+            if (fault is 3 or 5) throw new InvalidOperationException("Injected preparation generation read loss.");
+        };
+        if (fault >= 4) scenario.Provider.PrepareEffect = () => scenario.Provider.OnIncarnationRead = getter;
+        else scenario.Provider.OnIncarnationRead = getter;
+        var result = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant);
+        Assert.True(called);
+        Assert.Equal(0, scenario.Provider.DmaRevokeCalls);
+        if (fault is 2 or 3 or 5)
+        {
+            Assert.Equal(KernelError.PlatformFaulted, result.Error);
+            Assert.Equal(fault == 5 ? 1 : 0, scenario.Provider.PrepareCalls);
+            Assert.False(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+            Assert.False(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+        }
+        else
+        {
+            Assert.True(result.IsSuccess, result.Message);
+            Assert.True(result.Value!.IsSatisfied);
+            if (fault is 1 or 4) Assert.Equal(KernelError.PlatformBindingDraining, nested!.Value.Error);
+            Assert.Equal(1, scenario.Provider.PrepareCalls);
+            Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        }
+    }
+
+    [Fact]
+    public void V6DmaPreparationGenerationGetterRevokeCannotAuthorizeProviderEffect()
+    {
+        var scenario = CreateScenario(1597, 2470, PlatformDmaDirection.DeviceWritesMemory);
+        var called = false;
+        scenario.Provider.OnIncarnationRead = () =>
+        {
+            called = true;
+            _ = scenario.Kernel.RevokeCapability(scenario.DeviceCapability);
+        };
+        var result = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant);
+        Assert.True(called);
+        Assert.False(result.IsSuccess);
+        Assert.Equal(0, scenario.Provider.PrepareCalls);
+        Assert.False(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    [InlineData(5)]
+    [InlineData(6)]
+    [InlineData(7)]
+    public void V6DmaAcquireGenerationGetterPreservesExactCycleAndAuthorization(int fault)
+    {
+        var scenario = CreateScenario(1598, 2480, PlatformDmaDirection.DeviceWritesMemory);
+        var prepared = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Value!;
+        KernelError? nestedError = null;
+        var called = false;
+        Action getter = () =>
+        {
+            called = true;
+            if (fault is 1 or 4) nestedError = scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).Error;
+            if (fault == 2) Assert.True(scenario.Kernel.ObservePlatformBackendReset().IsSuccess);
+            if (fault is 3 or 5) throw new InvalidOperationException("Injected acquire generation loss.");
+            if (fault == 6) _ = scenario.Kernel.RevokeCapability(scenario.DeviceCapability);
+            if (fault == 7) nestedError = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Error;
+        };
+        if (fault is 4 or 5) scenario.Provider.AcquireEffect = () => scenario.Provider.OnIncarnationRead = getter;
+        else scenario.Provider.OnIncarnationRead = getter;
+        var result = scenario.Kernel.AcquirePlatformDmaForCpu(scenario.Subject, scenario.Grant);
+        Assert.True(called);
+        if (fault is 2 or 3 or 5 or 6)
+        {
+            Assert.Equal(KernelError.PlatformFaulted, result.Error);
+            Assert.Equal(fault == 5 ? 1 : 0, scenario.Provider.AcquireCalls);
+            Assert.False(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+            Assert.False(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+        }
+        else
+        {
+            Assert.True(result.IsSuccess, result.Message);
+            Assert.True(result.Value!.IsSatisfied);
+            Assert.Equal(prepared.Cycle, result.Value.Cycle);
+            if (fault is 1 or 4 or 7) Assert.Equal(KernelError.PlatformBindingDraining, nestedError);
+            Assert.Equal(1, scenario.Provider.AcquireCalls);
+            Assert.Equal(1, scenario.Provider.PrepareCalls);
+            Assert.Equal(KernelError.PlatformDenied, scenario.Kernel.AcquirePlatformDmaForCpu(scenario.Subject, scenario.Grant).Error);
+            Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        }
+    }
+
+    public static IEnumerable<object[]> SubmitGetterFaults()
+    {
+        foreach (var bound in new[] { false, true })
+            for (var fault = 0; fault < 8; fault++) yield return [bound, fault];
+    }
+
+    [Theory]
+    [MemberData(nameof(SubmitGetterFaults))]
+    public void V6DmaSubmitGenerationGetterPreservesEffectAndAuthorization(bool bound, int fault)
+    {
+        var scenario = CreateScenario(1599, 2490, PlatformDmaDirection.DeviceWritesMemory);
+        var prepared = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Value!;
+        var sink = new DmaTraceSink();
+        KernelResult<PlatformDmaSubmission> Submit()
+        {
+            if (!bound) return scenario.Kernel.SubmitPlatformDma(scenario.Subject, scenario.Grant, prepared);
+            var execution = scenario.Kernel.SubmitV6PlatformDma(scenario.Subject, scenario.Grant, prepared, sink);
+            return execution.IsSuccess ? KernelResult<PlatformDmaSubmission>.Ok(execution.Value!.Submission)
+                : KernelResult<PlatformDmaSubmission>.Fail(execution.Error, execution.Message!);
+        }
+        KernelError? nestedError = null;
+        var called = false;
+        Action getter = () =>
+        {
+            called = true;
+            if (fault is 1 or 4) nestedError = scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).Error;
+            if (fault == 2) Assert.True(scenario.Kernel.ObservePlatformBackendReset().IsSuccess);
+            if (fault is 3 or 5) throw new InvalidOperationException("Injected submit generation read loss.");
+            if (fault == 6) _ = scenario.Kernel.RevokeCapability(scenario.DeviceCapability);
+            if (fault == 7) nestedError = Submit().Error;
+        };
+        if (fault is 4 or 5) scenario.Provider.SubmitEffect = () => scenario.Provider.OnIncarnationRead = getter;
+        else scenario.Provider.OnIncarnationRead = getter;
+        var result = Submit();
+        Assert.True(called);
+        if (fault is 2 or 3 or 5 or 6)
+        {
+            Assert.Equal(KernelError.PlatformFaulted, result.Error);
+            Assert.Equal(fault == 5 ? 1 : 0, scenario.Provider.SubmitCalls);
+            Assert.False(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+            Assert.False(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+            if (bound && fault == 5)
+                Assert.Equal(new[] { SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+                    SemanticTraceEventKindV1.Quarantined }, sink.Events.Select(e => e.Kind));
+            if (bound && fault != 5) Assert.Empty(sink.Events);
+        }
+        else
+        {
+            Assert.True(result.IsSuccess, result.Message);
+            if (fault is 1 or 4 or 7) Assert.Equal(KernelError.PlatformBindingDraining, nestedError);
+            Assert.Equal(1, scenario.Provider.SubmitCalls);
+            Assert.Equal(prepared.Cycle, result.Value!.PreparedCycle);
+            var completed = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, result.Value).Value!;
+            Assert.True(scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(scenario.Subject, result.Value, completed).IsSuccess);
+            Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        }
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void V6DmaSubmitRegionRevalidationRejectsGetterQuarantine(bool bound, bool quarantine)
+    {
+        var scenario = CreateScenario(1600, 2500, PlatformDmaDirection.DeviceWritesMemory);
+        var prepared = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Value!;
+        var owner = new RegionOwner(scenario.Grant.DeviceLease.DomainBinding.Subject.DomainId, scenario.Subject.Generation);
+        var before = scenario.Kernel.Regions.Validate(scenario.Mapping.Region, owner).Value!.MutationEpoch;
+        var called = false;
+        scenario.Provider.OnIncarnationRead = () =>
+        {
+            called = true;
+            if (!quarantine) return;
+            var evidence = new ProviderHealthEvidenceV1(1, new("dma-region-model", "bank-0", 1, 1),
+                1, ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(0, 8));
+            Assert.True(scenario.Kernel.Regions.QuarantineSubrange(scenario.Mapping.Region, owner, evidence).IsSuccess);
+        };
+        var sink = new DmaTraceSink();
+        KernelError error;
+        bool success;
+        if (bound)
+        {
+            var result = scenario.Kernel.SubmitV6PlatformDma(scenario.Subject, scenario.Grant, prepared, sink);
+            error = result.Error; success = result.IsSuccess;
+        }
+        else
+        {
+            var result = scenario.Kernel.SubmitPlatformDma(scenario.Subject, scenario.Grant, prepared);
+            error = result.Error; success = result.IsSuccess;
+        }
+        Assert.True(called);
+        Assert.Equal(!quarantine, success);
+        Assert.Equal(quarantine ? 0 : 1, scenario.Provider.SubmitCalls);
+        if (quarantine)
+        {
+            Assert.Equal(KernelError.Quarantined, error);
+            Assert.NotEqual(before, scenario.Kernel.Regions.Validate(scenario.Mapping.Region, owner).Value!.MutationEpoch);
+            Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(scenario.Mapping.Region, owner));
+            Assert.Single(scenario.Kernel.Regions.SnapshotDamage());
+            Assert.Empty(sink.Events);
+        }
+    }
+
+    [Fact]
+    public void V6DmaSubmitRegionRevalidationRejectsOwnerEpochAdvanceWithoutDamage()
+    {
+        var scenario = CreateScenario(1601, 2510, PlatformDmaDirection.DeviceWritesMemory);
+        var prepared = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Grant).Value!;
+        var owner = new RegionOwner(scenario.Grant.DeviceLease.DomainBinding.Subject.DomainId, scenario.Subject.Generation);
+        var before = scenario.Kernel.Regions.Validate(scenario.Mapping.Region, owner).Value!.MutationEpoch;
+        scenario.Provider.OnIncarnationRead = () =>
+        {
+            var operation = scenario.Kernel.ExternalOperations.Prepare(owner,
+                [new(scenario.Mapping.Region, RegionUseMode.ExclusiveWrite, new(0, 8))],
+                ExternalVisibilityRequirement.None, ExternalPublicationPolicy.Staged).Value!.Operation;
+            Assert.True(scenario.Kernel.ExternalOperations.AdmitForExactPlatformMappings(operation, new(1, 1)).IsSuccess);
+            Assert.True(scenario.Kernel.ExternalOperations.Cancel(operation, providerCancellationSupported: false).IsSuccess);
+            // Never submitted: the existing owner releases without a provider-closure claim.
+            Assert.True(scenario.Kernel.ExternalOperations.Release(operation, new(false, false)).IsSuccess);
+        };
+        var sink = new DmaTraceSink();
+        var result = scenario.Kernel.SubmitV6PlatformDma(scenario.Subject, scenario.Grant, prepared, sink);
+        Assert.Equal(KernelError.StaleGeneration, result.Error);
+        Assert.Equal(0, scenario.Provider.SubmitCalls);
+        Assert.NotEqual(before, scenario.Kernel.Regions.Validate(scenario.Mapping.Region, owner).Value!.MutationEpoch);
+        Assert.True(scenario.Kernel.Regions.ValidatePlatformMappingRegionUsability(scenario.Mapping.Region, owner).IsSuccess);
+        Assert.Empty(scenario.Kernel.Regions.SnapshotDamage());
+        Assert.Empty(sink.Events);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    [InlineData(5)]
+    [InlineData(6)]
+    [InlineData(7)]
+    [InlineData(8)]
+    [InlineData(9)]
+    [InlineData(10)]
+    [InlineData(11)]
+    [InlineData(12)]
+    public void V6DmaCopyGenerationGetterPreservesBothOwnersAndRegionTuples(int fault)
+    {
+        var scenario = CreateCrossOwnerCopyScenario(1602, 2520, 1603, 2530);
+        var source = scenario.Kernel.PreparePlatformDmaForDevice(scenario.SourceSubject, scenario.Source).Value!;
+        var destination = scenario.Kernel.PreparePlatformDmaForDevice(scenario.DestinationSubject, scenario.Destination).Value!;
+        KernelResult<V6PlatformDmaCopyExecution> Submit() => scenario.Kernel.SubmitV6PlatformDmaCopy(
+            scenario.SourceSubject, scenario.Source, source, scenario.DestinationSubject, scenario.Destination, destination);
+        KernelError? nestedError = null;
+        var called = false;
+        Action getter = () =>
+        {
+            called = true;
+            if (fault is 1 or 6) nestedError = scenario.Kernel.RevokePlatformDma(scenario.SourceSubject, scenario.Source).Error;
+            if (fault is 2 or 7) nestedError = scenario.Kernel.RevokePlatformDma(scenario.DestinationSubject, scenario.Destination).Error;
+            if (fault == 3) Assert.True(scenario.Kernel.ObservePlatformBackendReset().IsSuccess);
+            if (fault is 4 or 5) throw new InvalidOperationException("Injected copy generation loss.");
+            if (fault is >= 8 and <= 11)
+            {
+                var grant = fault is 9 or 11 ? scenario.Destination : scenario.Source;
+                var subject = fault is 9 or 11 ? scenario.DestinationSubject : scenario.SourceSubject;
+                var owner = new RegionOwner(grant.DeviceLease.DomainBinding.Subject.DomainId, subject.Generation);
+                if (fault is 8 or 9)
+                    Assert.True(scenario.Kernel.Regions.QuarantineSubrange(grant.Mapping.Region, owner,
+                        new(1, new("copy-region-model", "bank-0", 1, 1), 1,
+                            ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(0, 8))).IsSuccess);
+                else
+                {
+                    var operation = scenario.Kernel.ExternalOperations.Prepare(owner,
+                        [new(grant.Mapping.Region, RegionUseMode.ExclusiveWrite, new(0, 8))],
+                        ExternalVisibilityRequirement.None, ExternalPublicationPolicy.Staged).Value!.Operation;
+                    Assert.True(scenario.Kernel.ExternalOperations.AdmitForExactPlatformMappings(operation, new(1, 1)).IsSuccess);
+                    Assert.True(scenario.Kernel.ExternalOperations.Cancel(operation, false).IsSuccess);
+                    Assert.True(scenario.Kernel.ExternalOperations.Release(operation, new(false, false)).IsSuccess);
+                }
+            }
+            if (fault == 12) nestedError = Submit().Error;
+        };
+        if (fault is 5 or 6 or 7) scenario.Provider.CopyEffect = () => scenario.Provider.OnIncarnationRead = getter;
+        else scenario.Provider.OnIncarnationRead = getter;
+        var result = Submit();
+        Assert.True(called);
+        if (fault is 3 or 4 or 5 or 8 or 9 or 10 or 11)
+        {
+            Assert.Equal(fault is 8 or 9 ? KernelError.Quarantined : fault is 10 or 11 ? KernelError.StaleGeneration : KernelError.PlatformFaulted, result.Error);
+            Assert.Equal(fault == 5 ? 1 : 0, scenario.Provider.CopySubmitCalls);
+            if (fault is >= 8 and <= 11)
+            {
+                Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(scenario.SourceMapping.Region,
+                    new(scenario.Source.DeviceLease.DomainBinding.Subject.DomainId, scenario.SourceSubject.Generation)));
+                Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(scenario.DestinationMapping.Region,
+                    new(scenario.Destination.DeviceLease.DomainBinding.Subject.DomainId, scenario.DestinationSubject.Generation)));
+                Assert.Equal(0, scenario.Provider.DmaRevokeCalls);
+            }
+            else
+            {
+                Assert.False(scenario.Kernel.RevokePlatformRegionMapping(scenario.SourceSubject, scenario.SourceMapping).IsSuccess);
+                Assert.False(scenario.Kernel.RevokePlatformRegionMapping(scenario.DestinationSubject, scenario.DestinationMapping).IsSuccess);
+            }
+            if (fault == 5)
+            {
+                Assert.Equal(KernelError.PlatformFaulted, scenario.Kernel.RevokePlatformDma(scenario.SourceSubject, scenario.Source).Error);
+                Assert.Equal(KernelError.PlatformFaulted, scenario.Kernel.RevokePlatformDma(scenario.DestinationSubject, scenario.Destination).Error);
+            }
+        }
+        else
+        {
+            Assert.True(result.IsSuccess, result.Message);
+            if (fault != 0) Assert.Equal(KernelError.PlatformBindingDraining, nestedError);
+            Assert.Equal(1, scenario.Provider.CopySubmitCalls);
+            Assert.True(scenario.Kernel.CompleteV6PlatformDmaCopy(scenario.SourceSubject, scenario.DestinationSubject, result.Value!).IsSuccess);
+            Assert.True(scenario.Kernel.RevokePlatformDma(scenario.SourceSubject, scenario.Source).IsSuccess);
+            Assert.True(scenario.Kernel.RevokePlatformDma(scenario.DestinationSubject, scenario.Destination).IsSuccess);
+        }
+    }
+
+    [Fact]
+    public void V6DmaCopyGenerationGetterIdentityExhaustionIsRefusedBeforeEffect()
+    {
+        var scenario = CreateCopyScenario(1604, 2540);
+        var source = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Source).Value!;
+        var destination = scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Destination).Value!;
+        var field = typeof(PlatformAuthorityBridge).GetField("_nextDmaOperationId",
+            global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!;
+        scenario.Provider.OnIncarnationRead = () => field.SetValue(scenario.Kernel.PlatformAuthority, ulong.MaxValue);
+        var result = scenario.Kernel.SubmitV6PlatformDmaCopy(scenario.Subject, scenario.Source, source,
+            scenario.Subject, scenario.Destination, destination);
+        Assert.Equal(KernelError.CapacityExhausted, result.Error);
+        Assert.Equal(0, scenario.Provider.CopySubmitCalls);
+        Assert.Equal(ulong.MaxValue, field.GetValue(scenario.Kernel.PlatformAuthority));
+        Assert.True(scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Source).IsSuccess);
+        Assert.True(scenario.Kernel.PreparePlatformDmaForDevice(scenario.Subject, scenario.Destination).IsSuccess);
+    }
+
     private sealed class SubmissionProvider :
         IPlatformAuthorityProvider,
         IPlatformFeatureProvider,
@@ -2561,9 +4153,16 @@ public sealed class PlatformDmaSubmissionTests
         public bool KeepWriteCompletionPending { get; set; }
         public Action? CopyEffect { get; set; }
         public Action? SubmitEffect { get; set; }
+        public Action? PrepareEffect { get; set; }
         public bool ResetDuringPageFault { get; set; }
         public Action? PageFaultEffect { get; set; }
+        public Action? CompletionEffect { get; set; }
+        public Action? GrantBindEffect { get; set; }
+        public int GrantBindCalls { get; private set; }
+        public Action? DeviceBindEffect { get; set; }
+        public int DeviceBindCalls { get; private set; }
         public bool ResetDuringAcquire { get; set; }
+        public Action? AcquireEffect { get; set; }
         public bool ResetDuringRevoke { get; set; }
         public bool RevokedDuringRevoke { get; set; }
         public bool ThrowDuringRevoke { get; set; }
@@ -2588,7 +4187,20 @@ public sealed class PlatformDmaSubmissionTests
         public ManualResetEventSlim? CompletionEntered { get; set; }
         public ManualResetEventSlim? CompletionRelease { get; set; }
         public DmaExecutionBindingV1? LastBinding { get; private set; }
-        public PlatformProviderIncarnation CurrentIncarnation { get; private set; } = new(1);
+        private PlatformProviderIncarnation _currentIncarnation = new(1);
+        public bool ThrowIncarnationRead { get; set; }
+        public Action? OnIncarnationRead { get; set; }
+        public PlatformProviderIncarnation CurrentIncarnation
+        {
+            get
+            {
+                var callback = OnIncarnationRead;
+                OnIncarnationRead = null;
+                callback?.Invoke();
+                return ThrowIncarnationRead ? throw new InvalidOperationException("Injected incarnation read failure.") : _currentIncarnation;
+            }
+            private set => _currentIncarnation = value;
+        }
 
         public void AdvanceIncarnation() =>
             CurrentIncarnation = new PlatformProviderIncarnation(CurrentIncarnation.Value + 1);
@@ -2649,6 +4261,7 @@ public sealed class PlatformDmaSubmissionTests
             PlatformDeviceIdentity device,
             PlatformDeviceRights rights)
         {
+            DeviceBindCalls++;
             if (!_domains.TryGetValue(domainLease.LeaseId, out var domain) ||
                 domain != domainLease)
                 return PlatformAuthorityResult<PlatformProviderDeviceLease>.Fail(
@@ -2660,6 +4273,7 @@ public sealed class PlatformDmaSubmissionTests
                 device,
                 rights);
             _devices.Add(lease.LeaseId, lease);
+            DeviceBindEffect?.Invoke();
             if (ResetDuringDeviceAdmission) AdvanceIncarnation();
             return PlatformAuthorityResult<PlatformProviderDeviceLease>.Ok(lease);
         }
@@ -2789,6 +4403,7 @@ public sealed class PlatformDmaSubmissionTests
         public PlatformAuthorityResult<PlatformProviderDmaGrant> BindDmaGrant(
             PlatformDmaGrantRequest request)
         {
+            GrantBindCalls++;
             var validation = PlatformDmaGrantContract.ValidateRequest(request);
             if (!validation.IsSuccess)
             {
@@ -2814,6 +4429,7 @@ public sealed class PlatformDmaSubmissionTests
                 request.Range,
                 request.Direction);
             _grants.Add(grant.GrantId, grant);
+            GrantBindEffect?.Invoke();
             return PlatformAuthorityResult<PlatformProviderDmaGrant>.Ok(grant);
         }
 
@@ -2861,6 +4477,7 @@ public sealed class PlatformDmaSubmissionTests
             var cycle = new PlatformProviderDmaVisibilityCycle(_nextCycle++);
             _cycles[grant.GrantId] = cycle;
             _acquired.Remove(grant.GrantId);
+            PrepareEffect?.Invoke();
             return PlatformAuthorityResult<PlatformProviderDmaPrepareEvidence>.Ok(
                 new PlatformProviderDmaPrepareEvidence(
                     grant.GrantId,
@@ -2899,6 +4516,7 @@ public sealed class PlatformDmaSubmissionTests
             }
 
             _acquired.Add(grant.GrantId);
+            AcquireEffect?.Invoke();
             if (ResetDuringAcquire) AdvanceIncarnation();
             return PlatformAuthorityResult<PlatformProviderDmaAcquireEvidence>.Ok(
                 new PlatformProviderDmaAcquireEvidence(
@@ -3035,6 +4653,7 @@ public sealed class PlatformDmaSubmissionTests
                 : PlatformProviderDmaCompletionState.Completed;
             if (state == PlatformProviderDmaCompletionState.Completed)
                 _submissions.Remove(submission.GrantId);
+            CompletionEffect?.Invoke();
             return PlatformAuthorityResult<PlatformProviderDmaCompletionEvidence>.Ok(new(
                 submission.SubmissionId, submission.Generation, grant.GrantId, grant.Generation,
                 submission.PreparedCycle, submission.Range, submission.Direction, state));

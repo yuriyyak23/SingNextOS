@@ -5,6 +5,162 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class V6StatefulResumeAccountingTests
 {
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void CapturedStorageRequiresExistingResumeDiscardOrReconciliationConsumer(int path)
+    {
+        var (budgets, owner, account) = Create(64);
+        var accounting = new V6StatefulResumeAccounting(budgets);
+        var captured = accounting.AdmitCapturedState(owner, Binding(), 64, () => 7, () => 11).Value!;
+        Assert.Equal(KernelError.InvalidTransition, budgets.ReleaseExplicit(owner, captured.StorageReservation).Error);
+        Assert.Equal(64UL, Used(budgets.Query(account).Value!));
+        Assert.Equal(KernelError.BudgetExceeded, budgets.Reserve(owner, [Amount(1)], BudgetReservationLifetime.LocalResource, AdmissionQosHint.None).Error);
+        if (path == 0) Assert.True(accounting.Discard(owner, captured.Handle).IsSuccess);
+        else if (path == 1)
+            Assert.True(accounting.Resume(owner, captured.Handle, KernelResult.Ok, KernelResult.Ok, KernelResult.Ok,
+                () => 7, () => 11, KernelResult.Ok).IsSuccess);
+        else
+        {
+            Assert.False(accounting.DiscardWithProvider(owner, captured.Handle,
+                () => KernelResult.Fail(KernelError.PlatformUnavailable, "injected discard loss")).IsSuccess);
+            Assert.Equal(KernelError.InvalidTransition, budgets.ReleaseExplicit(owner, captured.StorageReservation).Error);
+            Assert.True(accounting.ReconcileQuarantinedDiscardWithProvider(owner, captured.Handle, KernelResult.Ok).IsSuccess);
+        }
+        Assert.Equal(0UL, Used(budgets.Query(account).Value!));
+        Assert.Equal(BudgetReservationState.Released, budgets.Query(captured.StorageReservation).Value!.State);
+        Assert.True(budgets.ReleaseExplicit(owner, captured.StorageReservation).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void BindFailureRemovesRecordOnlyAfterExactBudgetOwnerRelease(int mutation)
+    {
+        var (budgets, owner, account) = Create(256);
+        var accounting = new V6StatefulResumeAccounting(budgets);
+        accounting.BeforeNextStorageBindForTest(reservation =>
+        {
+            if (mutation == 0) Assert.True(budgets.QuarantineLease(owner, reservation).IsSuccess);
+            else if (mutation == 1)
+            {
+                Assert.True(budgets.BindLease(owner, reservation).IsSuccess);
+                Assert.True(budgets.BeginConsumption(owner, reservation).IsSuccess);
+            }
+            else Assert.True(budgets.Release(owner, reservation).IsSuccess);
+        });
+        Assert.False(accounting.AdmitCapturedState(owner, Binding(), 64, () => 7, () => 11).IsSuccess);
+        var recovery = accounting.FindRecoverySuspension(owner, Binding());
+        if (mutation != 2)
+        {
+            Assert.True(recovery.IsSuccess, recovery.Message);
+            Assert.Equal(BudgetReservationState.Quarantined, budgets.Query(recovery.Value!.StorageReservation).Value!.State);
+            Assert.Equal(64UL, Used(budgets.Query(account).Value!));
+            Assert.Equal(KernelError.DuplicateIdentity,
+                accounting.AdmitCapturedState(owner, Binding(), 32, () => 7, () => 11).Error);
+            Assert.True(accounting.ReconcileQuarantinedDiscardWithProvider(owner, recovery.Value.Handle,
+                KernelResult.Ok).IsSuccess);
+        }
+        else Assert.False(recovery.IsSuccess);
+        Assert.Equal(0UL, Used(budgets.Query(account).Value!));
+        Assert.True(accounting.AdmitCapturedState(owner, Binding(), 32, () => 7, () => 11).IsSuccess);
+    }
+
+    [Fact]
+    public void PostBindFaultHookExceptionRetainsExactRecoveryEscrow()
+    {
+        var (budgets, owner, account) = Create(256);
+        var accounting = new V6StatefulResumeAccounting(budgets);
+        accounting.AfterNextStorageBindForTest(() => throw new InvalidOperationException("injected boundary loss"));
+        Assert.Equal(KernelError.PlatformUnavailable,
+            accounting.AdmitCapturedState(owner, Binding(), 64, () => 7, () => 11).Error);
+        var recovery = accounting.FindRecoverySuspension(owner, Binding()).Value!;
+        Assert.Equal(V6StatefulSuspensionState.Quarantined, recovery.State);
+        Assert.Equal(64UL, Used(budgets.Query(account).Value!));
+        Assert.True(accounting.ReconcileQuarantinedDiscardWithProvider(owner, recovery.Handle,
+            KernelResult.Ok).IsSuccess);
+        Assert.True(accounting.AdmitCapturedState(owner, Binding(), 32, () => 7, () => 11).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void AdmissionGenerationLossRetainsEscrowUntilExactProviderDiscard(int fault)
+    {
+        var (budgets, owner, account) = Create(256);
+        var accounting = new V6StatefulResumeAccounting(budgets);
+        var providerReads = 0;
+        var runtimeReads = 0;
+        ulong ProviderGeneration()
+        {
+            if (++providerReads == 2 && fault == 2) throw new InvalidOperationException("provider loss");
+            return providerReads == 2 && fault == 0 ? 8UL : 7UL;
+        }
+        ulong RuntimeGeneration() => ++runtimeReads == 2 && fault == 1 ? 12UL : 11UL;
+        var denied = accounting.AdmitCapturedState(owner, Binding(), 64, ProviderGeneration, RuntimeGeneration);
+        Assert.Equal(fault == 2 ? KernelError.PlatformUnavailable : KernelError.StaleGeneration, denied.Error);
+        var recovery = accounting.FindRecoverySuspension(owner, Binding());
+        Assert.True(recovery.IsSuccess, recovery.Message);
+        Assert.Equal(V6StatefulSuspensionState.Quarantined, recovery.Value!.State);
+        Assert.Equal(BudgetReservationState.Quarantined,
+            budgets.Query(recovery.Value.StorageReservation).Value!.State);
+        Assert.Equal(64UL, Used(budgets.Query(account).Value!));
+        Assert.Equal(KernelError.DuplicateIdentity,
+            accounting.AdmitCapturedState(owner, Binding(), 32, () => 7, () => 11).Error);
+        var closures = 0;
+        Assert.True(accounting.ReconcileQuarantinedDiscardWithProvider(owner, recovery.Value.Handle,
+            () => { closures++; return KernelResult.Ok(); }).IsSuccess);
+        Assert.Equal(1, closures);
+        Assert.Equal(0UL, Used(budgets.Query(account).Value!));
+        Assert.True(accounting.AdmitCapturedState(owner, Binding(), 32, () => 7, () => 11).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void UnclosedCorrelationCannotAcquireSecondStorageEscrow(bool settlementPending)
+    {
+        var (budgets, owner, account) = Create(256);
+        var accounting = new V6StatefulResumeAccounting(budgets);
+        var admitted = accounting.AdmitCapturedState(owner, Binding(), 64, () => 7, () => 11).Value!;
+        Assert.False(accounting.DiscardWithProvider(owner, admitted.Handle,
+            () => KernelResult.Fail(KernelError.PlatformUnavailable, "lost closure")).IsSuccess);
+        if (settlementPending)
+        {
+            accounting.FailNextSettlementForTest();
+            Assert.False(accounting.ReconcileQuarantinedDiscardWithProvider(owner, admitted.Handle,
+                KernelResult.Ok).IsSuccess);
+        }
+        Assert.Equal(KernelError.DuplicateIdentity,
+            accounting.AdmitCapturedState(owner, Binding(), 32, () => 7, () => 11).Error);
+        Assert.Equal(64UL, Used(budgets.Query(account).Value!));
+        Assert.True(accounting.ReconcileQuarantinedDiscardWithProvider(owner, admitted.Handle,
+            KernelResult.Ok).IsSuccess);
+        Assert.True(accounting.AdmitCapturedState(owner, Binding(), 32, () => 7, () => 11).IsSuccess);
+        Assert.Equal(32UL, Used(budgets.Query(account).Value!));
+    }
+
+    [Fact]
+    public void DiscardCallbackCannotReadmitItsUnclosedCorrelation()
+    {
+        var (budgets, owner, account) = Create(256);
+        var accounting = new V6StatefulResumeAccounting(budgets);
+        var admitted = accounting.AdmitCapturedState(owner, Binding(), 64, () => 7, () => 11).Value!;
+        var discarded = accounting.DiscardWithProvider(owner, admitted.Handle, () =>
+        {
+            Assert.Equal(KernelError.DuplicateIdentity,
+                accounting.AdmitCapturedState(owner, Binding(), 32, () => 7, () => 11).Error);
+            Assert.Equal(64UL, Used(budgets.Query(account).Value!));
+            return KernelResult.Ok();
+        });
+        Assert.True(discarded.IsSuccess, discarded.Message);
+        Assert.Equal(0UL, Used(budgets.Query(account).Value!));
+        Assert.True(accounting.AdmitCapturedState(owner, Binding(), 32, () => 7, () => 11).IsSuccess);
+    }
+
     [Fact]
     public void CapturedStatePinsCheckpointStorageUntilExplicitDiscard()
     {
@@ -47,6 +203,41 @@ public sealed class V6StatefulResumeAccountingTests
         Assert.Equal(KernelError.InvalidTransition,
             accounting.Resume(owner, admitted.Handle, Gate, Gate, Gate,
                 () => 7, () => 11, Provider).Error);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void FinalResumeCallbacksCannotDonateQuarantinedStorageToRestore(int mutationPoint)
+    {
+        var (budgets, owner, account) = Create(256);
+        var accounting = new V6StatefulResumeAccounting(budgets);
+        var admitted = accounting.AdmitCapturedState(owner, Binding(), 48, () => 7, () => 11).Value!;
+        var gateCalls = new int[3];
+        var generationCalls = 0;
+        var restores = 0;
+        KernelResult Gate(int index)
+        {
+            if (++gateCalls[index] == 2 && mutationPoint == index)
+                Assert.True(budgets.QuarantineLease(owner, admitted.StorageReservation).IsSuccess);
+            return KernelResult.Ok();
+        }
+        ulong ProviderGeneration()
+        {
+            if (++generationCalls == 2 && mutationPoint == 3)
+                Assert.True(budgets.QuarantineLease(owner, admitted.StorageReservation).IsSuccess);
+            return 7;
+        }
+        var denied = accounting.Resume(owner, admitted.Handle,
+            () => Gate(0), () => Gate(1), () => Gate(2), ProviderGeneration, () => 11,
+            () => { restores++; return KernelResult.Ok(); });
+
+        Assert.Equal(KernelError.StaleGeneration, denied.Error);
+        Assert.Equal(0, restores);
+        Assert.Equal(BudgetReservationState.Quarantined, budgets.Query(admitted.StorageReservation).Value!.State);
+        Assert.Equal(48UL, Used(budgets.Query(account).Value!));
     }
 
     [Fact]
@@ -272,9 +463,11 @@ public sealed class V6StatefulResumeAccountingTests
         var (budgets, owner, account) = Create(256);
         var accounting = new V6StatefulResumeAccounting(budgets);
         using var barrier = new Barrier(2);
+        var generationReads = 0;
         ulong ProviderGeneration()
         {
-            Assert.True(barrier.SignalAndWait(TimeSpan.FromSeconds(5)));
+            if (Interlocked.Increment(ref generationReads) <= 2)
+                Assert.True(barrier.SignalAndWait(TimeSpan.FromSeconds(5)));
             return 7;
         }
         var first = Task.Run(() => accounting.AdmitCapturedState(

@@ -44,17 +44,19 @@ public sealed partial class RuntimeKernel
         _operabilityTimeProvider = selectedTimeProvider;
         Processes = new ProcessRegistry();
         Domains = new DomainRegistry();
-        CapabilityAuthority = new CapabilityAuthority();
+        CapabilityAuthority = new CapabilityAuthority(new AuthorityRealmId(Guid.NewGuid()),
+            CapabilityAuthorityLimits.Default, timeProvider: selectedTimeProvider);
         SealedObjects = new SealedObjectAuthority(CapabilityAuthority.RealmId);
         Regions = new RegionAuthority();
         ExternalOperations = new ExternalOperationAuthority(Regions);
         ComputePlanner = new ComputePlanner(Regions);
-        Channels = new ChannelRegistry(CapabilityAuthority, Regions);
+        Channels = new ChannelRegistry(CapabilityAuthority, Regions, TransferRegionForIpc);
         PlatformAuthority = new PlatformAuthorityBridge(platformProvider);
         Services = new ServiceRegistry();
         EndpointSessions = new EndpointSessionRegistry(selectedTimeProvider);
         CancellationScopes = new CancellationScopeAuthority(selectedTimeProvider);
         Budgets = new ResourceBudgetAuthority();
+        Channels.ChannelClosed += ReleaseClosedIpcBudgetsForChannel;
         if (recoveryOptions is not null)
         {
             ArgumentException.ThrowIfNullOrWhiteSpace(recoveryOptions.ResourceBudgetJournalPath);
@@ -277,6 +279,11 @@ public sealed partial class RuntimeKernel
         var result = CapabilityAuthority.Revoke(capabilityId);
         if (!result.IsSuccess) return result;
 
+        // Revoke local mapping permission before any cascade can enter a provider
+        // callback. Closure is still performed later and may remain draining/faulted.
+        _ = PlatformAuthority.BeginCapabilityRevocation(capabilityId, id => CapabilityAuthority.DependsOnCapability(id, capabilityId));
+        _ = PlatformAuthority.BeginIrqCapabilityRevocation(capabilityId, id => CapabilityAuthority.DependsOnCapability(id, capabilityId));
+        _ = PlatformAuthority.BeginMmioCapabilityRevocation(capabilityId, id => CapabilityAuthority.DependsOnCapability(id, capabilityId));
         foreach (var process in Processes.Snapshot())
             process.RemoveCapability(capabilityId);
         foreach (var subject in traceSubjects)

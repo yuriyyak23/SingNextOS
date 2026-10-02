@@ -5,6 +5,43 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class ResourceEnvelopeBudgetMappingTests
 {
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void MalformedScopeCannotCanonicalizeMapOrMintResourceAuthority(int fault)
+    {
+        var scope = fault switch { 0 => "scope\uD800", 1 => "scope\uDC00", 2 => "scope\ntail", _ => "scope\0tail" };
+        var envelope = Compute(10) with { SemanticScope = scope };
+        Assert.Throws<ArgumentException>(() => envelope.Canonicalize());
+        Assert.False(ResourceEnvelopeV1.IsSubset(envelope, envelope));
+        var mapped = ResourceEnvelopeBudgetMapping.Map([envelope]);
+        Assert.Equal(KernelError.InvalidMessage, mapped.Error);
+        Assert.Null(mapped.Value);
+        var authority = new RuntimeKernel().CapabilityAuthority;
+        var minted = authority.Mint(new(8400), new(8400), ResourceKind.Compute, "scope-grant",
+            CapabilityRights.Delegate, 1, 1, null, null, 100, 1,
+            resourceUse: new(1, envelope, 0, long.MaxValue, ResourceAssuranceV1.RuntimeEnforced, 1));
+        Assert.Equal(KernelError.DelegationDenied, minted.Error);
+        Assert.Empty(authority.InspectionSnapshot());
+        var fresh = authority.Mint(new(8400), new(8400), ResourceKind.Compute, "valid-grant",
+            CapabilityRights.Delegate, 1, 1, null, null, 100, 1,
+            resourceUse: new(1, Compute(10), 0, long.MaxValue, ResourceAssuranceV1.RuntimeEnforced, 1));
+        Assert.True(fresh.IsSuccess);
+        Assert.Equal(1UL, fresh.Value!.CapabilityId.Value);
+    }
+
+    [Fact]
+    public void ScalarScopeRemainsExactWithoutUnicodeNormalizationOrAuthority()
+    {
+        var scalar = (Compute(10) with { SemanticScope = "scope:é🚀\uFFFD" }).Canonicalize();
+        Assert.Equal(scalar, scalar.Canonicalize());
+        Assert.True(ResourceEnvelopeV1.IsSubset(scalar, scalar));
+        Assert.False(ResourceEnvelopeV1.IsSubset(scalar, scalar with { SemanticScope = "scope:e\u0301🚀\uFFFD" }));
+        Assert.True(ResourceEnvelopeBudgetMapping.Map([scalar]).IsSuccess);
+    }
+
     [Fact]
     public void ExactComputeTimeMappingIsCanonicalAndNonAuthoritative()
     {

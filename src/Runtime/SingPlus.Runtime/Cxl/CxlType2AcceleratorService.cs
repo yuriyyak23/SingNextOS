@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using SingPlus.Contracts;
 using SingPlus.Platform;
 
@@ -19,13 +20,25 @@ public sealed record CxlType2Execution(
 /// <summary>Composes Type-2 execution through the provider-neutral planner and lifecycle.</summary>
 public sealed class CxlType2AcceleratorService : ICxlTeardownParticipant, IComposedWorkTeardownParticipant
 {
+    private sealed class EffectRecord(ProcessHandle principal, OperationBinding binding, CxlAuthorityBridge.OperationPin pin)
+    {
+        public ProcessHandle Principal { get; } = principal;
+        public OperationBinding Binding { get; } = binding;
+        public CxlAuthorityBridge.OperationPin Pin { get; } = pin;
+        public bool CallbackInFlight { get; set; } = true;
+        public bool ClosureInFlight { get; set; }
+        public bool CancellationAcknowledged { get; set; }
+        public bool ProviderClosed { get; set; }
+    }
+    private readonly object _effectGate = new();
+    private readonly ConcurrentDictionary<ExternalOperationId, EffectRecord> _effects = new();
     private readonly RuntimeKernel kernel;
     private readonly CxlAuthorityBridge authority;
     private readonly ICxlType2AcceleratorProvider provider;
     private readonly CxlFabricManagerAuthority fabricManager;
-    private readonly Dictionary<ExternalOperationId, (ProcessHandle Principal, CxlType2Execution Execution)> _live = [];
-    private readonly Dictionary<ExternalOperationId, ProcessHandle> _uncontained = [];
-    private readonly Dictionary<ExternalOperationId, VirtualComputeContext> _virtualContexts = [];
+    private readonly ConcurrentDictionary<ExternalOperationId, (ProcessHandle Principal, CxlType2Execution Execution)> _live = new();
+    private readonly ConcurrentDictionary<ExternalOperationId, ProcessHandle> _uncontained = new();
+    private readonly ConcurrentDictionary<ExternalOperationId, VirtualComputeContext> _virtualContexts = new();
 
     public CxlType2AcceleratorService(RuntimeKernel kernel, CxlAuthorityBridge authority,
         ICxlType2AcceleratorProvider provider, CxlFabricManagerAuthority fabricManager)
@@ -261,6 +274,30 @@ public sealed class CxlType2AcceleratorService : ICxlTeardownParticipant, ICompo
                     trust.Message ?? "Device trust evidence became invalid before provider submit.");
             }
         }
+        var pinned = authority.BeginOperation(admission.Principal, fabric, deviceLease);
+        if (!pinned.IsSuccess)
+        {
+            AbortNotAccepted(principal, binding);
+            return KernelResult<CxlType2Execution>.Fail(pinned.Error, pinned.Message!);
+        }
+        var record = new EffectRecord(principal, binding, pinned.Value!);
+        if (!_effects.TryAdd(binding.Operation.OperationId, record))
+        {
+            _ = authority.EndOperation(pinned.Value!);
+            return KernelResult<CxlType2Execution>.Fail(KernelError.PlatformBindingActive, "Type-2 effect admission is already tracked.");
+        }
+        try { return SubmitPinnedEffect(principal, plan, admission, binding, dependencies, endpoint, fabric, subject,
+            deviceLease, securityAuthority, securityPolicy, virtualContext, protectedSideband); }
+        finally { lock (_effectGate) record.CallbackInFlight = false; }
+    }
+
+    private KernelResult<CxlType2Execution> SubmitPinnedEffect(
+        ProcessHandle principal, ComputePlan plan, OperationAdmissionSnapshot admission,
+        OperationBinding binding, OperationDependencySnapshot dependencies, CxlEndpointSnapshot endpoint,
+        CxlFabricBinding fabric, PlatformDomainIdentity subject, PlatformDeviceLease deviceLease,
+        CxlSecurityAuthority? securityAuthority, CxlSecurityPolicy? securityPolicy,
+        VirtualComputeContext? virtualContext, IReadOnlyList<ProtectedAcceleratorLabelSidebandV1>? protectedSideband)
+    {
         PlatformAuthorityResult<CxlAcceleratorSubmission> submitted;
         try
         {
@@ -283,11 +320,23 @@ public sealed class CxlType2AcceleratorService : ICxlTeardownParticipant, ICompo
                     return KernelResult<CxlType2Execution>.Fail(KernelError.PlatformUnsupported,
                         "The protected Type-2 provider boundary disappeared before submit.");
                 }
+                var permission = kernel.CommitCxlDeviceEffect(deviceLease, admission.Principal, KernelResult.Ok);
+                if (!permission.IsSuccess)
+                {
+                    AbortNotAccepted(principal, binding);
+                    return KernelResult<CxlType2Execution>.Fail(permission.Error, permission.Message!);
+                }
                 submitted = protectedProvider.SubmitProtected(
                     new(request, plan.ProviderGeneration, reverified.Sideband));
             }
             else
             {
+                var permission = kernel.CommitCxlDeviceEffect(deviceLease, admission.Principal, KernelResult.Ok);
+                if (!permission.IsSuccess)
+                {
+                    AbortNotAccepted(principal, binding);
+                    return KernelResult<CxlType2Execution>.Fail(permission.Error, permission.Message!);
+                }
                 submitted = provider.Submit(request);
             }
         }
@@ -303,7 +352,18 @@ public sealed class CxlType2AcceleratorService : ICxlTeardownParticipant, ICompo
         if (!submitted.IsSuccess)
         {
             if (submitted.Status == PlatformAuthorityStatus.NotAccepted)
-                AbortNotAccepted(principal, binding);
+            {
+                var source = authority.ValidateDeviceAuthority(subject, deviceLease, endpoint);
+                var currentFabric = authority.QueryFabric(fabric.BindingId);
+                if (source.IsSuccess && currentFabric.IsSuccess && currentFabric.Value == fabric)
+                    AbortNotAccepted(principal, binding);
+                else
+                {
+                    _uncontained[binding.Operation.OperationId] = principal;
+                    return KernelResult<CxlType2Execution>.Fail(KernelError.ExternalEffectUncontained,
+                        "Type-2 rejection lost its exact source tuple; parent remains pinned.");
+                }
+            }
             else
             {
                 _uncontained[binding.Operation.OperationId] = principal;
@@ -316,7 +376,7 @@ public sealed class CxlType2AcceleratorService : ICxlTeardownParticipant, ICompo
             submitted.Value.DeviceGeneration != endpoint.DeviceGeneration ||
             submitted.Value.FabricBinding != new CxlFabricBindingRef(fabric.BindingId, fabric.Generation))
         {
-            var compensation = provider.Release(submitted.Value);
+            var compensation = ConfirmProviderClosure(principal, binding.Operation, submitted.Value, false);
             if (compensation.IsSuccess)
                 CloseSubmitted(principal, binding.Operation);
             else
@@ -332,18 +392,21 @@ public sealed class CxlType2AcceleratorService : ICxlTeardownParticipant, ICompo
         var execution = new CxlType2Execution(plan, binding.Operation, binding,
             submitted.Value, dependencies, endpoint, fabric, subject, deviceLease,
             securityAuthority, securityPolicy);
-        _live.Add(execution.Operation.OperationId, (principal, execution));
-        if (virtualContext is { } context) _virtualContexts.Add(execution.Operation.OperationId, context);
+        _live.TryAdd(execution.Operation.OperationId, (principal, execution));
+        if (virtualContext is { } context) _virtualContexts.TryAdd(execution.Operation.OperationId, context);
         var tracked = fabricManager.TrackOperation(fabric, principal, execution.Operation,
             () => CloseProviderForFabricDrain(principal, execution));
         if (!tracked.IsSuccess)
         {
-            var cancellation = provider.Cancel(execution.Submission);
+            var cancellation = ConfirmProviderClosure(principal, execution.Operation, execution.Submission, true);
             if (cancellation.IsSuccess)
             {
-                CloseSubmitted(principal, execution.Operation);
-                _live.Remove(execution.Operation.OperationId);
-                _virtualContexts.Remove(execution.Operation.OperationId);
+                var settled = CloseSubmitted(principal, execution.Operation);
+                if (settled.IsSuccess)
+                {
+                    _live.TryRemove(execution.Operation.OperationId, out _);
+                    _virtualContexts.TryRemove(execution.Operation.OperationId, out _);
+                }
             }
             return KernelResult<CxlType2Execution>.Fail(tracked.Error, tracked.Message!);
         }
@@ -356,6 +419,10 @@ public sealed class CxlType2AcceleratorService : ICxlTeardownParticipant, ICompo
                 return KernelResult<CxlType2Execution>.Fail(failed.Error, failed.Message!);
             }
         }
+        var finalPermission = kernel.CommitCxlDeviceEffect(deviceLease, admission.Principal, KernelResult.Ok);
+        if (!finalPermission.IsSuccess)
+            return KernelResult<CxlType2Execution>.Fail(KernelError.ExternalEffectUncontained,
+                "Type-2 receipt arrived after local authorization changed; actual closure consumer retains it.");
         return KernelResult<CxlType2Execution>.Ok(execution);
     }
 
@@ -461,7 +528,7 @@ public sealed class CxlType2AcceleratorService : ICxlTeardownParticipant, ICompo
             if (!delivered.IsSuccess)
                 return CloseAfterProviderRelease(principal, execution, delivered.Error, delivered.Message);
         }
-        var release = provider.Release(execution.Submission);
+        var release = ConfirmProviderClosure(principal, execution.Operation, execution.Submission, false);
         if (!release.IsSuccess) return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.PlatformFaulted, release.Message ?? "Type-2 release is ambiguous; operation remains quarantined.");
         return CloseLocalAfterProviderClosure(principal, execution);
     }
@@ -487,7 +554,7 @@ public sealed class CxlType2AcceleratorService : ICxlTeardownParticipant, ICompo
 
     private KernelResult<ExternalOperationSnapshot> FailBeforePublication(ProcessHandle principal, CxlType2Execution execution, KernelError error, string message)
     {
-        var providerClosure = provider.Release(execution.Submission);
+        var providerClosure = ConfirmProviderClosure(principal, execution.Operation, execution.Submission, false);
         if (!providerClosure.IsSuccess)
             return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.PlatformFaulted, $"{message} Provider release did not prove closure; operation remains quarantined.");
         var closed = CloseLocalAfterProviderClosure(principal, execution);
@@ -499,7 +566,7 @@ public sealed class CxlType2AcceleratorService : ICxlTeardownParticipant, ICompo
     private KernelResult<ExternalOperationSnapshot> CloseAfterProviderRelease(
         ProcessHandle principal, CxlType2Execution execution, KernelError originalError, string? originalMessage)
     {
-        var providerClosure = provider.Release(execution.Submission);
+        var providerClosure = ConfirmProviderClosure(principal, execution.Operation, execution.Submission, false);
         if (!providerClosure.IsSuccess)
             return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.PlatformFaulted,
                 $"{originalMessage ?? "Type-2 operation failed."} Provider release did not prove closure; operation remains quarantined.");
@@ -529,8 +596,10 @@ public sealed class CxlType2AcceleratorService : ICxlTeardownParticipant, ICompo
         var closed = kernel.ReleaseExternalOperation(principal, execution.Operation, new(true, false));
         if (closed.IsSuccess)
         {
-            _live.Remove(execution.Operation.OperationId);
-            _virtualContexts.Remove(execution.Operation.OperationId);
+            var parent = ReleaseParentPin(principal, execution.Operation);
+            if (!parent.IsSuccess) return KernelResult<ExternalOperationSnapshot>.Fail(parent.Error, parent.Message!);
+            _live.TryRemove(execution.Operation.OperationId, out _);
+            _virtualContexts.TryRemove(execution.Operation.OperationId, out _);
             kernel.ReleaseVirtualComputeContext(execution.Operation);
             _ = fabricManager.UntrackOperation(execution.Fabric, principal, execution.Operation);
         }
@@ -545,23 +614,88 @@ public sealed class CxlType2AcceleratorService : ICxlTeardownParticipant, ICompo
 
     private void AbortNotAccepted(ProcessHandle principal, OperationBinding binding)
     {
+        lock (_effectGate)
+            if (_effects.TryGetValue(binding.Operation.OperationId, out var record)) record.ProviderClosed = true;
         _ = kernel.RecordExternalOperationCompletion(principal, new(binding, ExternalOperationCompletionDisposition.Cancelled));
-        _ = kernel.ReleaseExternalOperation(principal, binding.Operation, new(true, false));
+        var closed = kernel.ReleaseExternalOperation(principal, binding.Operation, new(true, false));
+        if (!closed.IsSuccess) return;
         kernel.ReleaseVirtualComputeContext(binding.Operation);
+        _ = ReleaseParentPin(principal, binding.Operation);
     }
 
-    private void CloseSubmitted(ProcessHandle principal, ExternalOperationHandle operation)
+    private KernelResult CloseSubmitted(ProcessHandle principal, ExternalOperationHandle operation)
     {
-        _ = kernel.RecordExternalOperationProviderLoss(principal, operation);
-        _ = kernel.ReleaseExternalOperation(principal, operation, new(true, false));
+        var current = kernel.QueryExternalOperation(principal, operation);
+        if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
+        if (current.Value!.State == ExternalOperationState.Submitted)
+        {
+            var lost = kernel.RecordExternalOperationProviderLoss(principal, operation);
+            if (!lost.IsSuccess) return KernelResult.Fail(lost.Error, lost.Message!);
+        }
+        var closed = kernel.ReleaseExternalOperation(principal, operation, new(true, false));
+        if (!closed.IsSuccess) return KernelResult.Fail(closed.Error, closed.Message!);
         kernel.ReleaseVirtualComputeContext(operation);
+        return ReleaseParentPin(principal, operation);
+    }
+
+    private KernelResult ReleaseParentPin(ProcessHandle principal, ExternalOperationHandle operation)
+    {
+        lock (_effectGate)
+        {
+            if (!_effects.TryGetValue(operation.OperationId, out var record)) return KernelResult.Ok();
+            if (record.Principal != principal || record.Binding.Operation != operation)
+                return KernelResult.Fail(KernelError.StaleGeneration, "Type-2 parent pin principal/operation is stale.");
+            var ended = authority.EndOperation(record.Pin);
+            if (ended.IsSuccess) _effects.TryRemove(operation.OperationId, out _);
+            return ended;
+        }
+    }
+
+    private KernelResult ConfirmProviderClosure(ProcessHandle principal, ExternalOperationHandle operation,
+        CxlAcceleratorSubmission submission, bool requestCancellation)
+    {
+        EffectRecord record;
+        lock (_effectGate)
+        {
+            if (!_effects.TryGetValue(operation.OperationId, out record!) || record.Principal != principal ||
+                record.Binding.Operation != operation || record.Binding != submission.OperationBinding ||
+                submission.EndpointId != record.Pin.Fabric.EndpointId || submission.DeviceGeneration != record.Pin.Fabric.DeviceGeneration ||
+                submission.FabricBinding != new CxlFabricBindingRef(record.Pin.Fabric.BindingId, record.Pin.Fabric.Generation))
+                return KernelResult.Fail(KernelError.StaleGeneration, "Type-2 closure requires the exact admitted submission tuple.");
+            if (record.ProviderClosed) return KernelResult.Ok();
+            if (record.ClosureInFlight)
+                return KernelResult.Fail(KernelError.PlatformBindingDraining, "Type-2 provider closure is already in flight.");
+            record.ClosureInFlight = true;
+        }
+        try
+        {
+            var source = authority.ValidateOperationClosureSource(record.Pin);
+            if (!source.IsSuccess) return source;
+            if (requestCancellation && !record.CancellationAcknowledged)
+            {
+                var cancelled = provider.Cancel(submission);
+                if (!cancelled.IsSuccess) return KernelResult.Fail(Map(cancelled.Status), cancelled.Message ?? "Cancellation request failed.");
+                lock (_effectGate) record.CancellationAcknowledged = true;
+            }
+            var released = provider.Release(submission);
+            if (!released.IsSuccess) return KernelResult.Fail(Map(released.Status), released.Message ?? "Provider release did not prove closure.");
+            var finalSource = authority.ValidateOperationClosureSource(record.Pin);
+            if (!finalSource.IsSuccess) return finalSource;
+            lock (_effectGate) record.ProviderClosed = true;
+            return KernelResult.Ok();
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        {
+            return KernelResult.Fail(KernelError.ExternalEffectUncontained, $"Type-2 closure response was lost; parent remains pinned: {exception.Message}");
+        }
+        finally { lock (_effectGate) record.ClosureInFlight = false; }
     }
 
     private KernelResult CloseProviderForFabricDrain(ProcessHandle principal, CxlType2Execution execution)
     {
-        var cancellation = provider.Cancel(execution.Submission);
+        var cancellation = ConfirmProviderClosure(principal, execution.Operation, execution.Submission, true);
         if (!cancellation.IsSuccess)
-            return KernelResult.Fail(Map(cancellation.Status), cancellation.Message ?? "Fabric drain could not close Type-2 provider work.");
+            return KernelResult.Fail(cancellation.Error, cancellation.Message ?? "Fabric drain could not close Type-2 provider work.");
         var closed = CloseLocalAfterProviderClosure(principal, execution);
         return closed.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(closed.Error, closed.Message!);
     }
@@ -574,15 +708,26 @@ public sealed class CxlType2AcceleratorService : ICxlTeardownParticipant, ICompo
 
     private KernelResult CloseForProcess(ProcessHandle process)
     {
+        lock (_effectGate)
+            if (_effects.Values.Any(record => record.Principal == process && (record.CallbackInFlight || record.ClosureInFlight)))
+                return KernelResult.Fail(KernelError.PlatformBindingDraining, "Type-2 callback/closure remains in flight.");
         if (_uncontained.Values.Any(principal => principal == process))
             return KernelResult.Fail(KernelError.PlatformFaulted, "Type-2 submission acceptance is ambiguous and has no recovery token; reclaim remains quarantined.");
         foreach (var live in _live.Values.Where(item => item.Principal == process).ToArray())
         {
-            var cancelled = provider.Cancel(live.Execution.Submission);
+            var cancelled = ConfirmProviderClosure(process, live.Execution.Operation, live.Execution.Submission, true);
             if (!cancelled.IsSuccess)
-                return KernelResult.Fail(Map(cancelled.Status), cancelled.Message ?? "Type-2 provider closure is ambiguous; reclaim is quarantined.");
+                return KernelResult.Fail(cancelled.Error, cancelled.Message ?? "Type-2 provider closure is ambiguous; reclaim is quarantined.");
             var closed = CloseLocalAfterProviderClosure(process, live.Execution);
             if (!closed.IsSuccess) return KernelResult.Fail(closed.Error, closed.Message!);
+        }
+        // Exact no-effect/closure receipts can outlive failed local settlement without a published execution.
+        foreach (var record in _effects.Values.Where(record => record.Principal == process).ToArray())
+        {
+            if (!record.ProviderClosed)
+                return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Type-2 effect has no exact closure receipt.");
+            var settled = CloseSubmitted(process, record.Binding.Operation);
+            if (!settled.IsSuccess) return settled;
         }
         return KernelResult.Ok();
     }

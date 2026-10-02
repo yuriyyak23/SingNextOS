@@ -17,22 +17,51 @@ public sealed partial class PlatformAuthorityBridge
         var requestValidation = PlatformVirtualEventContract.ValidateRequest(request, record.State);
         if (!requestValidation.IsSuccess)
             return FromProviderFailure<PlatformVirtualEventReceipt>(requestValidation.Status, requestValidation.Message);
-        var result = provider.InjectVirtualEvent(request);
-        if (!result.IsSuccess)
+        PlatformBackendEpoch backendEpoch;
+        lock (_secureDomainLifecycleGate)
         {
-            QuarantineChild(record, result.Status);
-            return FromProviderFailure<PlatformVirtualEventReceipt>(result.Status, result.Message);
+            if (record.TransitionInFlight || !PlatformVirtualEventContract.ValidateRequest(request, record.State).IsSuccess)
+                return KernelResult<PlatformVirtualEventReceipt>.Fail(KernelError.PlatformBindingActive,
+                    "Child lifecycle changed before virtual-event injection.");
+            record.PendingChildEffects++;
+            backendEpoch = BackendEpoch;
         }
-        var evidence = result.Value!;
-        var validation = PlatformVirtualEventContract.ValidateReceipt(request, evidence);
-        if (!validation.IsSuccess || evidence.Sequence <= record.LastEventSequence)
+        try
         {
-            record.State = PlatformChildDomainState.Faulted;
-            return KernelResult<PlatformVirtualEventReceipt>.Fail(KernelError.PlatformFaulted,
-                validation.IsSuccess ? "Virtual-event evidence sequence is stale or replayed." : validation.Message!);
+            PlatformAuthorityResult<PlatformVirtualEventReceipt> result;
+            try { result = provider.InjectVirtualEvent(request); }
+            catch (Exception exception) when (exception is not StackOverflowException)
+            {
+                lock (_secureDomainLifecycleGate) record.State = PlatformChildDomainState.Faulted;
+                return KernelResult<PlatformVirtualEventReceipt>.Fail(KernelError.PlatformFaulted,
+                    $"Virtual-event injection may have taken effect without a receipt: {exception.Message}");
+            }
+            lock (_secureDomainLifecycleGate)
+            {
+                if (BackendEpoch != backendEpoch || record.State == PlatformChildDomainState.Faulted)
+                {
+                    record.State = PlatformChildDomainState.Faulted;
+                    return KernelResult<PlatformVirtualEventReceipt>.Fail(KernelError.PlatformFaulted,
+                        "Backend or child changed during virtual-event injection.");
+                }
+                if (!result.IsSuccess)
+                {
+                    record.State = PlatformChildDomainState.Faulted;
+                    return FromProviderFailure<PlatformVirtualEventReceipt>(result.Status, result.Message);
+                }
+                var evidence = result.Value!;
+                var validation = PlatformVirtualEventContract.ValidateReceipt(request, evidence);
+                if (!validation.IsSuccess || evidence.Sequence <= record.LastEventSequence)
+                {
+                    record.State = PlatformChildDomainState.Faulted;
+                    return KernelResult<PlatformVirtualEventReceipt>.Fail(KernelError.PlatformFaulted,
+                        validation.IsSuccess ? "Virtual-event evidence sequence is stale or replayed." : validation.Message!);
+                }
+                record.LastEventSequence = evidence.Sequence;
+                return KernelResult<PlatformVirtualEventReceipt>.Ok(evidence);
+            }
         }
-        record.LastEventSequence = evidence.Sequence;
-        return KernelResult<PlatformVirtualEventReceipt>.Ok(evidence);
+        finally { lock (_secureDomainLifecycleGate) record.PendingChildEffects--; }
     }
 
     internal KernelResult<PlatformVirtualTrapEvidence> ObserveChildTrap(PlatformChildBinding child)
@@ -46,21 +75,51 @@ public sealed partial class PlatformAuthorityBridge
         var requestValidation = PlatformVirtualTrapContract.ValidateObservationRequest(record.ProviderLease, record.State);
         if (!requestValidation.IsSuccess)
             return FromProviderFailure<PlatformVirtualTrapEvidence>(requestValidation.Status, requestValidation.Message);
-        var result = provider.ObserveVirtualTrap(record.ProviderLease);
-        if (!result.IsSuccess)
+        PlatformBackendEpoch backendEpoch;
+        lock (_secureDomainLifecycleGate)
         {
-            QuarantineChild(record, result.Status);
-            return FromProviderFailure<PlatformVirtualTrapEvidence>(result.Status, result.Message);
+            if (record.TransitionInFlight ||
+                !PlatformVirtualTrapContract.ValidateObservationRequest(record.ProviderLease, record.State).IsSuccess)
+                return KernelResult<PlatformVirtualTrapEvidence>.Fail(KernelError.PlatformBindingActive,
+                    "Child lifecycle changed before trap observation.");
+            record.PendingChildEffects++;
+            backendEpoch = BackendEpoch;
         }
-        var evidence = result.Value!;
-        var validation = PlatformVirtualTrapContract.ValidateEvidence(record.ProviderLease, evidence);
-        if (!validation.IsSuccess || evidence.Sequence <= record.LastTrapSequence)
+        try
         {
-            record.State = PlatformChildDomainState.Faulted;
-            return KernelResult<PlatformVirtualTrapEvidence>.Fail(KernelError.PlatformFaulted,
-                validation.IsSuccess ? "Trap evidence sequence is stale or replayed." : validation.Message!);
+            PlatformAuthorityResult<PlatformVirtualTrapEvidence> result;
+            try { result = provider.ObserveVirtualTrap(record.ProviderLease); }
+            catch (Exception exception) when (exception is not StackOverflowException)
+            {
+                lock (_secureDomainLifecycleGate) record.State = PlatformChildDomainState.Faulted;
+                return KernelResult<PlatformVirtualTrapEvidence>.Fail(KernelError.PlatformFaulted,
+                    $"Trap observation lost its provider result: {exception.Message}");
+            }
+            lock (_secureDomainLifecycleGate)
+            {
+                if (BackendEpoch != backendEpoch || record.State == PlatformChildDomainState.Faulted)
+                {
+                    record.State = PlatformChildDomainState.Faulted;
+                    return KernelResult<PlatformVirtualTrapEvidence>.Fail(KernelError.PlatformFaulted,
+                        "Backend or child changed during trap observation.");
+                }
+                if (!result.IsSuccess)
+                {
+                    record.State = PlatformChildDomainState.Faulted;
+                    return FromProviderFailure<PlatformVirtualTrapEvidence>(result.Status, result.Message);
+                }
+                var evidence = result.Value!;
+                var validation = PlatformVirtualTrapContract.ValidateEvidence(record.ProviderLease, evidence);
+                if (!validation.IsSuccess || evidence.Sequence <= record.LastTrapSequence)
+                {
+                    record.State = PlatformChildDomainState.Faulted;
+                    return KernelResult<PlatformVirtualTrapEvidence>.Fail(KernelError.PlatformFaulted,
+                        validation.IsSuccess ? "Trap evidence sequence is stale or replayed." : validation.Message!);
+                }
+                record.LastTrapSequence = evidence.Sequence;
+                return KernelResult<PlatformVirtualTrapEvidence>.Ok(evidence);
+            }
         }
-        record.LastTrapSequence = evidence.Sequence;
-        return KernelResult<PlatformVirtualTrapEvidence>.Ok(evidence);
+        finally { lock (_secureDomainLifecycleGate) record.PendingChildEffects--; }
     }
 }

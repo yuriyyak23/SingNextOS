@@ -22,6 +22,8 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
         public CxlFabricBinding Binding { get; set; } = binding;
         public CxlFabricResourceState State { get; set; } = CxlFabricResourceState.Bound;
         public CxlFabricReconfigurationTicket? Ticket { get; set; }
+        public int PendingAdmissions { get; set; }
+        public bool CompletionInFlight { get; set; }
         public List<(ProcessHandle Principal, ExternalOperationHandle Operation, Func<KernelResult>? ProviderClosure)> Operations { get; } = [];
     }
 
@@ -43,18 +45,34 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
 
     public KernelResult<CxlFabricManagedBinding> Register(CxlFabricBinding binding)
     {
-        if (binding.BindingId.Value == 0 || binding.Generation.Value == 0 || _bindings.ContainsKey(binding.BindingId))
+        if (binding.BindingId.Value == 0 || binding.Generation.Value == 0)
             return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.PlatformDenied, "Fabric binding is invalid or already registered.");
+        lock (_gate)
+            if (_bindings.ContainsKey(binding.BindingId))
+                return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.PlatformDenied, "Fabric binding is already registered.");
         var provider = _provider.QueryResource(binding.BindingId);
         if (!provider.IsSuccess || provider.Value!.Binding != binding || provider.Value.State != CxlFabricResourceState.Bound)
             return KernelResult<CxlFabricManagedBinding>.Fail(Map(provider.Status), provider.Message ?? "Provider fabric binding is not current.");
-        var record = new BindingRecord(binding);
-        _bindings.Add(binding.BindingId, record);
-        return KernelResult<CxlFabricManagedBinding>.Ok(Snapshot(record));
+        lock (_gate)
+        {
+            if (_bindings.ContainsKey(binding.BindingId))
+                return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.PlatformDenied, "Fabric registration lost to an existing exact binding owner.");
+            var record = new BindingRecord(binding);
+            _bindings.Add(binding.BindingId, record);
+            return KernelResult<CxlFabricManagedBinding>.Ok(Snapshot(record));
+        }
     }
 
     public KernelResult ValidateAdmission(CxlFabricBinding binding)
     {
+        lock (_gate)
+        {
+            var local = ValidateAdmissionCore(binding);
+            if (!local.IsSuccess) return local;
+        }
+        var current = _provider.QueryResource(binding.BindingId);
+        if (!current.IsSuccess || current.Value!.Binding != binding || current.Value.State != CxlFabricResourceState.Bound)
+            return KernelResult.Fail(current.Status == PlatformAuthorityStatus.Stale ? KernelError.StaleGeneration : Map(current.Status), current.Message ?? "Fabric provider state changed.");
         lock (_gate) return ValidateAdmissionCore(binding);
     }
 
@@ -66,21 +84,20 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
             return KernelResult.Fail(KernelError.PlatformBindingDraining, "Fabric binding is draining or faulted; new admission is closed.");
         if (record.Binding != binding)
             return KernelResult.Fail(KernelError.StaleGeneration, "Fabric binding generation is stale.");
-        var current = _provider.QueryResource(binding.BindingId);
-        if (!current.IsSuccess || current.Value!.Binding != binding || current.Value.State != CxlFabricResourceState.Bound)
-            return KernelResult.Fail(current.Status == PlatformAuthorityStatus.Stale ? KernelError.StaleGeneration : Map(current.Status), current.Message ?? "Fabric provider state changed.");
         return KernelResult.Ok();
     }
 
     public KernelResult TrackOperation(CxlFabricBinding binding, ProcessHandle principal, ExternalOperationHandle operation,
         Func<KernelResult>? providerClosure = null)
     {
+        var fresh = ValidateAdmission(binding);
+        if (!fresh.IsSuccess) return fresh;
+        var snapshot = _kernel.QueryExternalOperation(principal, operation);
+        if (!snapshot.IsSuccess) return KernelResult.Fail(snapshot.Error, snapshot.Message!);
         lock (_gate)
         {
             var admission = ValidateAdmissionCore(binding);
             if (!admission.IsSuccess) return admission;
-            var snapshot = _kernel.QueryExternalOperation(principal, operation);
-            if (!snapshot.IsSuccess) return KernelResult.Fail(snapshot.Error, snapshot.Message!);
             if (snapshot.Value!.State is ExternalOperationState.Submitted or ExternalOperationState.DeviceComplete or ExternalOperationState.Visible or ExternalOperationState.Published &&
                 providerClosure is null)
                 return KernelResult.Fail(KernelError.ExternalEffectUncontained,
@@ -106,24 +123,41 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
     public KernelResult<T> ExecuteAdmission<T>(CxlFabricBinding binding, Func<KernelResult<T>> providerEffect)
     {
         ArgumentNullException.ThrowIfNull(providerEffect);
+        var fresh = ValidateAdmission(binding);
+        if (!fresh.IsSuccess) return KernelResult<T>.Fail(fresh.Error, fresh.Message!);
+        BindingRecord record;
         lock (_gate)
         {
             var admission = ValidateAdmissionCore(binding);
-            return admission.IsSuccess
-                ? providerEffect()
-                : KernelResult<T>.Fail(admission.Error, admission.Message!);
+            if (!admission.IsSuccess) return KernelResult<T>.Fail(admission.Error, admission.Message!);
+            record = _bindings[binding.BindingId];
+            if (record.PendingAdmissions == int.MaxValue)
+                return KernelResult<T>.Fail(KernelError.CapacityExhausted, "Fabric admission interlock is saturated.");
+            record.PendingAdmissions++;
         }
+        try { return providerEffect(); }
+        finally { lock (_gate) record.PendingAdmissions--; }
     }
 
     public KernelResult<CxlFabricManagedBinding> BeginReconfiguration(CxlFabricBinding binding)
     {
+        var fresh = ValidateAdmission(binding);
+        if (!fresh.IsSuccess) return KernelResult<CxlFabricManagedBinding>.Fail(fresh.Error, fresh.Message!);
+        BindingRecord record;
+        (ProcessHandle Principal, ExternalOperationHandle Operation, Func<KernelResult>? ProviderClosure)[] operations;
         lock (_gate)
         {
             var admission = ValidateAdmissionCore(binding);
             if (!admission.IsSuccess) return KernelResult<CxlFabricManagedBinding>.Fail(admission.Error, admission.Message!);
-            var record = _bindings[binding.BindingId];
+            record = _bindings[binding.BindingId];
+            if (record.PendingAdmissions != 0)
+                return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.PlatformBindingDraining, "Fabric creation callbacks must settle before reconfiguration.");
             record.State = CxlFabricResourceState.Draining; // closes admission before provider generation changes
-            foreach (var tracked in record.Operations.ToArray())
+            operations = record.Operations.ToArray();
+        }
+        try
+        {
+            foreach (var tracked in operations)
             {
                 var providerClosed = false;
                 if (tracked.ProviderClosure is not null)
@@ -131,7 +165,7 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
                     var closure = tracked.ProviderClosure();
                     if (!closure.IsSuccess)
                     {
-                        record.State = CxlFabricResourceState.Faulted;
+                        lock (_gate) record.State = CxlFabricResourceState.Faulted;
                         return KernelResult<CxlFabricManagedBinding>.Fail(closure.Error, closure.Message!);
                     }
                     providerClosed = true;
@@ -139,7 +173,7 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
                 var drained = DrainOperation(tracked.Principal, tracked.Operation, providerClosed);
                 if (!drained.IsSuccess)
                 {
-                    record.State = CxlFabricResourceState.Faulted;
+                    lock (_gate) record.State = CxlFabricResourceState.Faulted;
                     return KernelResult<CxlFabricManagedBinding>.Fail(drained.Error, drained.Message!);
                 }
             }
@@ -150,55 +184,91 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
             }
             catch (Exception exception)
             {
-                record.State = CxlFabricResourceState.Faulted;
+                lock (_gate) record.State = CxlFabricResourceState.Faulted;
                 return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.ExternalEffectUncontained,
                     $"Fabric reconfiguration threw after its effect boundary: {exception.Message}");
             }
             if (!begun.IsSuccess)
             {
-                record.State = begun.Status == PlatformAuthorityStatus.NotAccepted
-                    ? CxlFabricResourceState.Bound
-                    : CxlFabricResourceState.Faulted;
+                lock (_gate) record.State = begun.Status == PlatformAuthorityStatus.NotAccepted
+                    ? CxlFabricResourceState.Bound : CxlFabricResourceState.Faulted;
                 return KernelResult<CxlFabricManagedBinding>.Fail(Map(begun.Status), begun.Message ?? "Fabric reconfiguration failed to begin.");
             }
-            record.Ticket = begun.Value!;
-            return KernelResult<CxlFabricManagedBinding>.Ok(Snapshot(record));
+            lock (_gate)
+            {
+                record.Ticket = begun.Value!;
+                return KernelResult<CxlFabricManagedBinding>.Ok(Snapshot(record));
+            }
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        {
+            lock (_gate) record.State = CxlFabricResourceState.Faulted;
+            return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.ExternalEffectUncontained,
+                $"Fabric drain did not prove closure: {exception.Message}");
         }
     }
 
     public KernelResult<CxlFabricManagedBinding> CompleteReconfiguration(CxlFabricBindingId bindingId)
     {
+        BindingRecord record;
+        CxlFabricReconfigurationTicket ticket;
         lock (_gate)
         {
-            if (!_bindings.TryGetValue(bindingId, out var record) || record.State != CxlFabricResourceState.Draining || record.Ticket is null)
+            if (!_bindings.TryGetValue(bindingId, out record!) || record.State != CxlFabricResourceState.Draining || record.Ticket is null)
                 return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.InvalidTransition, "Fabric binding has no active reconfiguration.");
+            if (record.CompletionInFlight)
+                return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.PlatformBindingDraining, "Fabric completion callback is already in flight.");
+            ticket = record.Ticket;
+            record.CompletionInFlight = true;
+        }
+        try
+        {
             PlatformAuthorityResult<CxlFabricBinding> completed;
+            PlatformAuthorityResult<CxlFabricResourceSnapshot> observed = default;
             try
             {
-                completed = _provider.CompleteReconfiguration(record.Ticket);
+                completed = _provider.CompleteReconfiguration(ticket);
+                if (completed.IsSuccess) observed = _provider.QueryResource(bindingId);
             }
-            catch (Exception exception)
+            catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
             {
-                record.State = CxlFabricResourceState.Faulted;
+                lock (_gate) record.State = CxlFabricResourceState.Faulted;
                 return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.ExternalEffectUncontained,
                     $"Fabric reconfiguration completion threw after its effect boundary: {exception.Message}");
             }
-            if (!completed.IsSuccess)
+            lock (_gate)
             {
-                record.State = CxlFabricResourceState.Faulted;
-                return KernelResult<CxlFabricManagedBinding>.Fail(Map(completed.Status), completed.Message ?? "Fabric reconfiguration completion failed.");
+                if (!_bindings.TryGetValue(bindingId, out var current) || !ReferenceEquals(current, record) ||
+                    record.State != CxlFabricResourceState.Draining || record.Ticket != ticket || record.Binding != ticket.PreviousBinding)
+                {
+                    record.State = CxlFabricResourceState.Faulted;
+                    return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.ExternalEffectUncontained, "Fabric completion lost its exact admitted ticket/state.");
+                }
+                if (!completed.IsSuccess)
+                {
+                    record.State = CxlFabricResourceState.Faulted;
+                    return KernelResult<CxlFabricManagedBinding>.Fail(Map(completed.Status), completed.Message ?? "Fabric reconfiguration completion failed.");
+                }
+                if (completed.Value!.BindingId != bindingId || completed.Value.Generation != ticket.ReplacementGeneration ||
+                    completed.Value.EndpointId != ticket.PreviousBinding.EndpointId ||
+                    completed.Value.DeviceGeneration != ticket.PreviousBinding.DeviceGeneration)
+                {
+                    record.State = CxlFabricResourceState.Faulted;
+                    return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.PlatformFaulted, "Provider returned a malformed replacement binding.");
+                }
+                if (!observed.IsSuccess || observed.Value!.Binding != completed.Value || observed.Value.State != CxlFabricResourceState.Bound)
+                {
+                    record.State = CxlFabricResourceState.Faulted;
+                    return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.ExternalEffectUncontained, "Fabric completion receipt lost provider source continuity.");
+                }
+                record.Binding = completed.Value;
+                record.State = CxlFabricResourceState.Bound;
+                record.Ticket = null;
+                record.Operations.Clear();
+                return KernelResult<CxlFabricManagedBinding>.Ok(Snapshot(record));
             }
-            if (completed.Value!.BindingId != bindingId || completed.Value.Generation != record.Ticket.ReplacementGeneration)
-            {
-                record.State = CxlFabricResourceState.Faulted;
-                return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.PlatformFaulted, "Provider returned a malformed replacement binding.");
-            }
-            record.Binding = completed.Value;
-            record.State = CxlFabricResourceState.Bound;
-            record.Ticket = null;
-            record.Operations.Clear();
-            return KernelResult<CxlFabricManagedBinding>.Ok(Snapshot(record));
         }
+        finally { lock (_gate) record.CompletionInFlight = false; }
     }
 
     public KernelResult<CxlOwnedPoolAllocation> AssignPool(
@@ -275,12 +345,16 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
     private KernelResult DrainOperation(ProcessHandle principal, ExternalOperationHandle operation, bool providerClosed)
     {
         var snapshot = _kernel.QueryExternalOperation(principal, operation);
-        if (!snapshot.IsSuccess || snapshot.Value!.State == ExternalOperationState.Released) return KernelResult.Ok();
+        if (!snapshot.IsSuccess) return KernelResult.Fail(snapshot.Error, snapshot.Message!);
+        if (snapshot.Value!.State == ExternalOperationState.Released) return KernelResult.Ok();
         if (snapshot.Value.State is ExternalOperationState.Prepared or ExternalOperationState.Admitted)
         {
-            _ = _kernel.CancelExternalOperation(principal, operation, false);
-            _ = _kernel.ReleaseExternalOperation(principal, operation, new(true, false));
-            return KernelResult.Ok();
+            var cancelled = _kernel.CancelExternalOperation(principal, operation, false);
+            if (!cancelled.IsSuccess) return KernelResult.Fail(cancelled.Error, cancelled.Message!);
+            // The operation owner decides whether submission occurred; this snapshot is no closure proof.
+            var releasedPreSubmit = _kernel.ReleaseExternalOperation(principal, operation, new(false, false));
+            return releasedPreSubmit.IsSuccess ? KernelResult.Ok()
+                : KernelResult.Fail(releasedPreSubmit.Error, releasedPreSubmit.Message!);
         }
         if (!providerClosed)
             return KernelResult.Fail(KernelError.ExternalEffectUncontained,

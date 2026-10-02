@@ -59,9 +59,9 @@ public sealed partial class ExternalOperationAuthority
             if (!resolved.IsSuccess)
                 return KernelResult<ExternalOperationResourceBinding>.Fail(resolved.Error, resolved.Message!);
             var record = resolved.Value!;
-            if (record.State != ExternalOperationState.Admitted || record.ResourceBinding is not null)
+            if (record.State != ExternalOperationState.Admitted || record.Disposition != ExternalOperationDisposition.Active || record.ResourceBinding is not null)
                 return KernelResult<ExternalOperationResourceBinding>.Fail(KernelError.InvalidTransition,
-                    "An exact resource lease can bind once to an Admitted external operation.");
+                    "An exact resource lease can bind once to an Active Admitted external operation.");
             if (budgetOwner.ProcessId.Value == 0 || budgetOwner.Generation == 0 ||
                 lease.ReservationId.Value == 0 || lease.Generation.Value == 0 ||
                 string.IsNullOrWhiteSpace(providerIdentity) || providerGeneration == 0)
@@ -240,6 +240,10 @@ public sealed partial class ExternalOperationAuthority
             if (binding is null)
                 return KernelResult<ExternalOperationResourceBinding>.Fail(KernelError.InvalidTransition,
                     "External operation has no resource binding.");
+            if (record.Disposition != ExternalOperationDisposition.Cancelled || record.Binding is not null ||
+                record.State is not (ExternalOperationState.Prepared or ExternalOperationState.Admitted or ExternalOperationState.Released))
+                return KernelResult<ExternalOperationResourceBinding>.Fail(KernelError.InvalidTransition,
+                    "Resource pre-submit cancellation requires owner-confirmed cancellation without a submitted binding.");
             if (binding.State == ExternalResourceBindingState.CancelledPreSubmit)
                 return KernelResult<ExternalOperationResourceBinding>.Ok(binding);
             if (binding.State != ExternalResourceBindingState.Bound)

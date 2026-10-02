@@ -60,7 +60,10 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
         {
             Readiness = HybridCpuChildDomainAdapterReadiness.Ready,
             ExternalRequirement = string.Empty,
-            HasVirtualIo = _childRuntime is INeutralVirtualIoProvider,
+            HasVirtualIo = _childRuntime is INeutralVirtualIoProvider &&
+                _childRuntime is INeutralRuntimeFeatureProvider features &&
+                features.QueryNeutralFeatures().Resolve(NeutralRuntimeFeatureFamily.BoundedVirtualIo).Availability !=
+                    NeutralRuntimeFeatureAvailability.Unavailable,
         };
 
     public PlatformAuthorityResult<PlatformProviderChildDomainLease> CreateChildDomain(

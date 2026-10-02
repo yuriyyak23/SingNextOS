@@ -379,6 +379,84 @@ public interface IBadContract
         Assert.Contains(diagnostics, diagnostic => diagnostic.Id == expectedDiagnostic && diagnostic.Severity == DiagnosticSeverity.Error);
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [Trait("Category", "Generators")]
+    public void MalformedResourceScopeProducesDiagnosticWithoutPartialCodegen(int fault)
+    {
+        var literal = fault switch
+        {
+            0 => "host:\\ud800",
+            1 => "host:\\udc00",
+            2 => "host:\\ncompute",
+            _ => "host:\\0compute"
+        };
+        var source = $$"""
+using SingPlus.Contracts;
+using SingPlus.Sip.Sdk;
+[SipContract]
+public interface IBadScope
+{
+    [Message(1), RequiresResource(1, ResourceClassV1.ComputeTime, ResourceUnitV1.Nanoseconds, 10, "{{literal}}")]
+    void Run();
+}
+""";
+        var (driver, _, diagnostics) = Run(source);
+        Assert.Contains(diagnostics, d => d.Id == "SINGGEN012" && d.Severity == DiagnosticSeverity.Error);
+        Assert.Empty(driver.GetRunResult().Results.Single().GeneratedSources);
+    }
+
+    [Fact]
+    [Trait("Category", "Generators")]
+    public void ScalarResourceScopeRetainsValidGeneratedConsumer()
+    {
+        const string source = """
+using SingPlus.Contracts;
+using SingPlus.Sip.Sdk;
+[SipContract]
+public interface IScalarScope
+{
+    [Message(1), RequiresResource(1, ResourceClassV1.ComputeTime, ResourceUnitV1.Nanoseconds, 10, "host:é🚀\ufffd")]
+    void Run();
+}
+""";
+        var generated = RunValid(source);
+        Assert.Equal(5, generated.Count);
+        Assert.Contains(generated.Values, text => text.Contains("GeneratedSipResourceSentry.Enter", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData(0x2028)]
+    [InlineData(0x2029)]
+    [Trait("Category", "Generators")]
+    public void ScalarLineSeparatorScopeCompilesAndPreservesExactConstant(int scalar)
+    {
+        var scope = "host:" + (char)scalar + "compute";
+        var literal = "host:\\u" + scalar.ToString("x4", global::System.Globalization.CultureInfo.InvariantCulture) + "compute";
+        var source = $$"""
+using SingPlus.Contracts;
+using SingPlus.Sip.Sdk;
+[SipContract]
+public interface ISeparatorScope
+{
+    [Message(1), RequiresResource(1, ResourceClassV1.ComputeTime, ResourceUnitV1.Nanoseconds, 10, "{{literal}}")]
+    void Run();
+}
+""";
+        var (driver, compilation, diagnostics) = Run(source);
+        Assert.DoesNotContain(diagnostics, d => d.Severity == DiagnosticSeverity.Error);
+        Assert.DoesNotContain(compilation.GetDiagnostics(), d => d.Severity == DiagnosticSeverity.Error);
+        Assert.Equal(5, driver.GetRunResult().Results.Single().GeneratedSources.Length);
+        var constants = compilation.SyntaxTrees.Skip(1).SelectMany(tree =>
+            tree.GetRoot().DescendantNodes().OfType<Microsoft.CodeAnalysis.CSharp.Syntax.LiteralExpressionSyntax>()
+                .Select(node => compilation.GetSemanticModel(tree).GetConstantValue(node)))
+            .Where(value => value.HasValue).Select(value => value.Value);
+        Assert.Contains(scope, constants);
+    }
+
     private static Dictionary<string, string> RunValid(string source)
     {
         var (driver, outputCompilation, generatorDiagnostics) = Run(source);

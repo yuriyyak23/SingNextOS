@@ -53,14 +53,22 @@ public sealed partial class RuntimeKernel
             // SessionPin is reversible preparation. Revalidate it before the
             // consumptive capability commit so a losing close race cannot consume
             // quota/one-shot authority for a stage that will never execute.
-            var finalSession = EndpointSessions.RevalidatePin(sessionPin.Value!);
-            if (!finalSession.IsSuccess)
-                return KernelResult<EffectAdmissionLease>.Fail(finalSession.Error, finalSession.Message!);
-            EffectAdmissionQualificationHook?.At(EffectAdmissionQualificationPoint.AfterFinalSessionRevalidation);
-
+            var preparedSession = EndpointSessions.RevalidatePin(sessionPin.Value!);
+            if (!preparedSession.IsSuccess)
+                return KernelResult<EffectAdmissionLease>.Fail(preparedSession.Error, preparedSession.Message!);
             var acquired = CapabilityAuthority.AcquireOperationAuthority(capability,
                 process.Value!.DomainId, caller.Generation, resourceKind, resourceId, resourceGeneration,
-                operation, session, quotaAmount, oneShot);
+                operation, session, quotaAmount, oneShot, revalidateConsumer: () =>
+                {
+                    var current = Processes.Resolve(caller);
+                    if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
+                    var accepts = EnsureProcessAcceptsNewEffects(current.Value!);
+                    if (!accepts.IsSuccess) return accepts;
+                    var finalSession = EndpointSessions.RevalidatePin(sessionPin.Value!);
+                    if (!finalSession.IsSuccess) return KernelResult.Fail(finalSession.Error, finalSession.Message!);
+                    EffectAdmissionQualificationHook?.At(EffectAdmissionQualificationPoint.AfterFinalSessionRevalidation);
+                    return KernelResult.Ok();
+                });
             if (!acquired.IsSuccess)
                 return KernelResult<EffectAdmissionLease>.Fail(acquired.Error, acquired.Message!);
             capabilityLease = acquired.Value!;

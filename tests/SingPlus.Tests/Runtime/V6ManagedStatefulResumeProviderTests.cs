@@ -5,6 +5,104 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class V6ManagedStatefulResumeProviderTests
 {
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public void MalformedCorrelationCannotRetainCaptureOrStorage(int surrogate)
+    {
+        var correlation = new string(surrogate == 0 ? '\uD800' : '\uDC00', 1);
+        var (budgets, owner, account) = Budget(256);
+        var provider = Provider();
+        var contour = new V6ManagedStatefulResumeContour(new(budgets), provider);
+        Assert.Equal(KernelError.InvalidMessage,
+            contour.CaptureAndSuspend(owner, correlation, 3, D('b'), Payload).Error);
+        Assert.Equal(0UL, provider.RetainedPayloadBytes);
+        Assert.Equal(0UL, Used(budgets, account));
+    }
+
+    [Fact]
+    public void ValidSupplementaryCorrelationAtCharacterLimitCanCaptureAndDiscard()
+    {
+        var provider = Provider();
+        var correlation = string.Concat(Enumerable.Repeat("\U0001F680", 128));
+        var captured = provider.Capture(correlation, 3, D('b'), Payload);
+        Assert.True(captured.IsSuccess, captured.Message);
+        Assert.Equal(correlation, captured.Value!.Binding.OperationCorrelation);
+        Assert.True(provider.Discard(captured.Value.Handle, captured.Value.Binding).IsSuccess);
+        Assert.Equal(0UL, provider.RetainedPayloadBytes);
+    }
+
+    [Theory]
+    [InlineData(0, false)]
+    [InlineData(1, false)]
+    [InlineData(2, false)]
+    [InlineData(0, true)]
+    [InlineData(1, true)]
+    [InlineData(2, true)]
+    public void BindFailureCleanupUsesExactProviderClosureAndRetainsDiscardLoss(int mutation, bool discardLoss)
+    {
+        var (budgets, owner, account) = Budget(256);
+        var provider = Provider();
+        var accounting = new V6StatefulResumeAccounting(budgets);
+        var contour = new V6ManagedStatefulResumeContour(accounting, provider);
+        accounting.BeforeNextStorageBindForTest(reservation =>
+        {
+            if (mutation == 0) Assert.True(budgets.QuarantineLease(owner, reservation).IsSuccess);
+            else
+            {
+                Assert.True(budgets.BindLease(owner, reservation).IsSuccess);
+                Assert.True(budgets.BeginConsumption(owner, reservation).IsSuccess);
+                if (mutation == 2) throw new InvalidOperationException("loss after consumption");
+            }
+        });
+        if (discardLoss) provider.FailNextDiscardForTest();
+        Assert.Equal(KernelError.PlatformFaulted,
+            contour.CaptureAndSuspend(owner, Correlation, 3, D('b'), Payload).Error);
+        var captured = provider.QueryByCorrelation(Correlation).Value!;
+        Assert.Equal(discardLoss ? V6ManagedCapturedStateStatus.Quarantined : V6ManagedCapturedStateStatus.Discarded,
+            captured.Status);
+        Assert.Equal(discardLoss ? (ulong)Payload.Length : 0UL, Used(budgets, account));
+        Assert.Equal(discardLoss ? (ulong)Payload.Length : 0UL, provider.RetainedPayloadBytes);
+        if (discardLoss)
+        {
+            var recovery = accounting.FindRecoverySuspension(owner, captured.Binding).Value!;
+            Assert.Equal(BudgetReservationState.Quarantined, budgets.Query(recovery.StorageReservation).Value!.State);
+            var queries = provider.CorrelationQueries;
+            Assert.Equal(KernelError.StaleGeneration,
+                contour.ReconcileUnpublishedCapture(new(owner.ProcessId, owner.Generation + 1), Correlation).Error);
+            Assert.Equal(queries, provider.CorrelationQueries);
+            Assert.Equal((ulong)Payload.Length, Used(budgets, account));
+            Assert.True(contour.ReconcileUnpublishedCapture(owner, Correlation).IsSuccess);
+            Assert.Equal(0UL, Used(budgets, account));
+            Assert.Equal(0UL, provider.RetainedPayloadBytes);
+        }
+        Assert.True(contour.CaptureAndSuspend(owner, Correlation, 4, D('c'), new byte[] { 1 }).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void StorageRecordAllocationFailurePrecedesChargeAndUsesProviderCleanup(bool discardLoss)
+    {
+        var (budgets, owner, account) = Budget(256);
+        var provider = Provider();
+        var accounting = new V6StatefulResumeAccounting(budgets);
+        var contour = new V6ManagedStatefulResumeContour(accounting, provider);
+        var afterBind = 0;
+        accounting.AfterNextStorageBindForTest(() => afterBind++);
+        accounting.FailNextStorageRecordAllocationForTest();
+        if (discardLoss) provider.FailNextDiscardForTest();
+        var denied = contour.CaptureAndSuspend(owner, Correlation, 3, D('b'), Payload);
+        Assert.Equal(discardLoss ? KernelError.PlatformFaulted : KernelError.CapacityExhausted, denied.Error);
+        Assert.Equal(0, afterBind);
+        Assert.Equal(0UL, Used(budgets, account));
+        var captured = provider.QueryByCorrelation(Correlation).Value!;
+        Assert.Equal(discardLoss ? V6ManagedCapturedStateStatus.Quarantined : V6ManagedCapturedStateStatus.Discarded,
+            captured.Status);
+        if (discardLoss) Assert.True(provider.Discard(captured.Handle, captured.Binding).IsSuccess);
+        Assert.True(contour.CaptureAndSuspend(owner, Correlation, 4, D('c'), new byte[] { 1 }).IsSuccess);
+    }
+
     [Fact]
     public void CaptureRejectsNonCanonicalSemanticDigestBeforeRetainingState()
     {
@@ -282,6 +380,44 @@ public sealed class V6ManagedStatefulResumeProviderTests
 
         Assert.True(settled.IsSuccess, settled.Message);
         Assert.Equal(0UL, Used(budgets, account));
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void ResetAfterStorageBindUsesExactCleanupAndKeepsFailedDiscardPinned(bool runtimeReset, bool discardLoss)
+    {
+        var (budgets, owner, account) = Budget(256);
+        var provider = Provider();
+        var accounting = new V6StatefulResumeAccounting(budgets);
+        var contour = new V6ManagedStatefulResumeContour(accounting, provider);
+        accounting.AfterNextStorageBindForTest(() =>
+        {
+            Assert.Equal((ulong)Payload.Length, Used(budgets, account));
+            if (runtimeReset) provider.ResetRuntime(); else provider.ResetProvider();
+        });
+        if (discardLoss) provider.FailNextDiscardForTest();
+
+        var denied = contour.CaptureAndSuspend(owner, Correlation, 3, D('b'), Payload);
+
+        Assert.Equal(discardLoss ? KernelError.PlatformFaulted : KernelError.StaleGeneration, denied.Error);
+        var captured = provider.QueryByCorrelation(Correlation).Value!;
+        Assert.Equal(discardLoss ? V6ManagedCapturedStateStatus.Quarantined : V6ManagedCapturedStateStatus.Discarded,
+            captured.Status);
+        Assert.Equal(discardLoss ? (ulong)Payload.Length : 0UL, provider.RetainedPayloadBytes);
+        Assert.Equal(discardLoss ? (ulong)Payload.Length : 0UL, Used(budgets, account));
+        if (discardLoss)
+        {
+            var recovery = accounting.FindRecoverySuspension(owner, captured.Binding).Value!;
+            Assert.Equal(BudgetReservationState.Quarantined, budgets.Query(recovery.StorageReservation).Value!.State);
+            Assert.True(contour.ReconcileUnpublishedCapture(owner, Correlation).IsSuccess);
+            Assert.Equal(0UL, provider.RetainedPayloadBytes);
+            Assert.Equal(0UL, Used(budgets, account));
+        }
+        Assert.True(contour.CaptureAndSuspend(owner, Correlation, 4, D('c'), new byte[] { 1 }).IsSuccess);
+        Assert.Equal(1UL, Used(budgets, account));
     }
 
     [Fact]

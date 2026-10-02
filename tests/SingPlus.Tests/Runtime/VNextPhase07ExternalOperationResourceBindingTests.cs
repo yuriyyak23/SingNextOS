@@ -6,6 +6,98 @@ namespace SingPlus.Tests.Runtime;
 public sealed class VNextPhase07ExternalOperationResourceBindingTests
 {
     [Fact]
+    public void CancelledAdmittedOperationCannotBindNewResourceLease()
+    {
+        var s = Create();
+        Assert.True(s.Kernel.AdmitExternalOperation(s.Process, s.Operation, s.Dependencies).IsSuccess);
+        Assert.True(s.Kernel.CancelExternalOperation(s.Process, s.Operation, false).IsSuccess);
+        var lease = s.Kernel.Budgets.Reserve(s.Process,
+            [new(ServiceBudgetDimension.ComputeTimeNanoseconds, 10)],
+            BudgetReservationLifetime.ExternalEffect, AdmissionQosHint.None).Value!.Reservation;
+        Assert.True(s.Kernel.Budgets.BindLease(s.Process, lease).IsSuccess);
+        var before = s.Kernel.QueryExternalOperation(s.Process, s.Operation).Value!;
+        var bound = s.Kernel.ExternalOperations.BindResourceLease(s.Operation, s.Process, lease,
+            Envelope(10), "host:compute-v1", 1);
+        Assert.Equal(KernelError.InvalidTransition, bound.Error);
+        Assert.False(s.Kernel.ExternalOperations.QueryResourceBinding(s.Operation).IsSuccess);
+        Assert.Equal(before.Transitions, s.Kernel.QueryExternalOperation(s.Process, s.Operation).Value!.Transitions);
+        Assert.Equal(BudgetReservationState.Bound, s.Kernel.QueryBudget(lease).Value!.State);
+        Assert.True(s.Kernel.Budgets.CancelLeasePreSubmit(s.Process, lease).IsSuccess);
+    }
+
+    [Fact]
+    public void SubmittedOperationWithUnconsumedLeaseCannotClaimPreSubmitResourceCancellation()
+    {
+        var s = Create();
+        using var commit = Prepare(s, s.Operation).Value!;
+        Assert.True(s.Kernel.RecordExternalOperationSubmission(s.Process, s.Operation, s.Dependencies).IsSuccess);
+        var before = s.Kernel.QueryExternalOperation(s.Process, s.Operation).Value!;
+        Assert.Equal(ExternalResourceBindingState.Bound, s.Kernel.ExternalOperations.QueryResourceBinding(s.Operation).Value!.State);
+        Assert.Equal(KernelError.InvalidTransition, s.Kernel.ExternalOperations.MarkResourceCancelledPreSubmit(s.Operation).Error);
+        Assert.Equal(ExternalResourceBindingState.Bound, s.Kernel.ExternalOperations.QueryResourceBinding(s.Operation).Value!.State);
+        Assert.Equal(before.Transitions, s.Kernel.QueryExternalOperation(s.Process, s.Operation).Value!.Transitions);
+        Assert.Equal(BudgetReservationState.Bound, s.Kernel.QueryBudget(commit.Lease).Value!.State);
+    }
+
+    [Fact]
+    public async Task LosingFinalSentryCannotCompensateConcurrentSubmitWinner()
+    {
+        var setup = Create();
+        using var commit = Prepare(setup, setup.Operation).Value!;
+        var checking = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var finish = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var losing = Task.Run(() => setup.Kernel.SubmitResourceExternalAdmission(commit, setup.Dependencies,
+            KernelResult.Ok, () =>
+            {
+                checking.SetResult();
+                finish.Task.WaitAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
+                return KernelResult.Fail(KernelError.PlatformDenied, "losing sentry");
+            }));
+        await checking.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        try
+        {
+            Assert.True(setup.Kernel.SubmitResourceExternalAdmission(commit, setup.Dependencies, KernelResult.Ok).IsSuccess);
+            commit.Dispose();
+        }
+        finally { finish.TrySetResult(); }
+        Assert.Equal(KernelError.InvalidTransition, (await losing.WaitAsync(TimeSpan.FromSeconds(5))).Error);
+        Assert.True(commit.SubmitStarted);
+        Assert.Equal(BudgetReservationState.Consuming, setup.Kernel.QueryBudget(commit.Lease).Value!.State);
+        Assert.Equal(ExternalOperationState.Submitted, setup.Kernel.QueryExternalOperation(setup.Process, setup.Operation).Value!.State);
+    }
+
+    [Fact]
+    public void FailedFinalSentryClosesAdmissionBeforeLateSubmit()
+    {
+        var setup = Create();
+        using var commit = Prepare(setup, setup.Operation).Value!;
+        Assert.Equal(KernelError.PlatformDenied, setup.Kernel.SubmitResourceExternalAdmission(commit,
+            setup.Dependencies, KernelResult.Ok, () => KernelResult.Fail(KernelError.PlatformDenied, "sentry denial")).Error);
+        Assert.Equal(KernelError.InvalidTransition, setup.Kernel.SubmitResourceExternalAdmission(commit,
+            setup.Dependencies, KernelResult.Ok).Error);
+        Assert.False(commit.SubmitStarted);
+        Assert.Equal(BudgetReservationState.CancelledPreSubmit, setup.Kernel.QueryBudget(commit.Lease).Value!.State);
+    }
+
+    [Fact]
+    public void DisposedAdmissionCannotWinSubmitOrMutateSubmitState()
+    {
+        var setup = Create();
+        var commit = Prepare(setup, setup.Operation).Value!;
+        commit.Dispose();
+        var callbacks = 0;
+        var result = setup.Kernel.SubmitResourceExternalAdmission(commit, setup.Dependencies, () =>
+        {
+            callbacks++;
+            return KernelResult.Ok();
+        });
+        Assert.Equal(KernelError.InvalidTransition, result.Error);
+        Assert.False(commit.SubmitStarted);
+        Assert.Equal(0, callbacks);
+        Assert.Equal(BudgetReservationState.CancelledPreSubmit, setup.Kernel.QueryBudget(commit.Lease).Value!.State);
+    }
+
+    [Fact]
     public void ProviderLossWithQuarantinedResourceBindingCannotReleaseRegion()
     {
         var setup = Create();
@@ -39,7 +131,7 @@ public sealed class VNextPhase07ExternalOperationResourceBindingTests
         var trace = V6ExternalOperationTraceProjection.ProjectPublishedPrefix(owner,
             new string('a', 64));
         Assert.Equal([SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
-            SemanticTraceEventKindV1.Quarantined], trace.Select(item => item.Kind));
+            SemanticTraceEventKindV1.Quarantined, SemanticTraceEventKindV1.ResourceAccountingQuarantined], trace.Select(item => item.Kind));
         Assert.True(SemanticTraceValidatorV1.Validate(trace).IsValid);
         Assert.Equal(KernelError.RegionUseConflict,
             setup.Kernel.Regions.Release(setup.Region,

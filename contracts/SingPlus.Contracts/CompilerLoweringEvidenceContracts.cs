@@ -300,6 +300,11 @@ internal static class CompilerLoweringEvidenceValidationV1
         if (string.IsNullOrWhiteSpace(value) || value != value.Trim() || value.Length > 256 ||
             value.Any(character => char.IsControl(character) || character is '|' or ',' or '='))
             throw new ArgumentException("Lowering evidence token must be canonical and bounded.", parameter);
+        try { _ = new UTF8Encoding(false, true).GetByteCount(value); }
+        catch (EncoderFallbackException exception)
+        {
+            throw new ArgumentException("Lowering evidence token must contain valid Unicode.", parameter, exception);
+        }
     }
 
     internal static void Digest(string? value, string parameter)

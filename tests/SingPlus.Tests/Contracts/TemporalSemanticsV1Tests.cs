@@ -4,6 +4,31 @@ namespace SingPlus.Tests.Contracts;
 
 public sealed class TemporalSemanticsV1Tests
 {
+    [Theory]
+    [InlineData(0xd800)]
+    [InlineData(0xdc00)]
+    public void MalformedScopeCannotAliasCanonicalReplacementBytes(int codeUnit)
+    {
+        var valid = UpperBound(100);
+        var semantics = valid with
+        {
+            ComputeEnvelope = valid.ComputeEnvelope with { SemanticScope = new string((char)codeUnit, 1) },
+        };
+        Assert.Throws<ArgumentException>(() => semantics.Validate());
+        Assert.Throws<ArgumentException>(() => semantics.SerializeCanonical());
+    }
+
+    [Fact]
+    public void SupplementaryScopeRoundTripsAtExactUtf8Boundary()
+    {
+        var scope = string.Concat(Enumerable.Repeat("\U0001f680", 40));
+        var semantics = UpperBound(100, scope);
+        Assert.Equal(semantics, TemporalSemanticsV1.ParseCanonical(semantics.SerializeCanonical()));
+        Assert.Equal(UpperBound(100, "\ufffd"),
+            TemporalSemanticsV1.ParseCanonical(UpperBound(100, "\ufffd").SerializeCanonical()));
+        Assert.Throws<ArgumentException>(() => UpperBound(100, scope + "a").Validate());
+    }
+
     [Fact]
     public void EnforcedUpperBoundRoundTripsWithoutBecomingCapacityOrDeadlineAuthority()
     {

@@ -109,16 +109,10 @@ public sealed record ExecutionGuaranteesV1(
     public ExecutionGuaranteesV1 Canonicalize()
     {
         if (Version != CurrentVersion) throw new NotSupportedException("Unknown execution-guarantees version.");
-        if (string.IsNullOrWhiteSpace(ProviderContract.PackageId) ||
-            string.IsNullOrWhiteSpace(ProviderContract.PackageVersion) ||
-            string.IsNullOrWhiteSpace(ProviderContract.SchemaIdentity) ||
-            ProviderContract.PackageId != ProviderContract.PackageId.Trim() ||
-            ProviderContract.PackageVersion != ProviderContract.PackageVersion.Trim() ||
-            ProviderContract.SchemaIdentity != ProviderContract.SchemaIdentity.Trim())
-            throw new ArgumentException("Provider contract identity is non-canonical.");
-        if (string.IsNullOrWhiteSpace(ProviderExecutionClass) ||
-            ProviderExecutionClass != ProviderExecutionClass.Trim())
-            throw new ArgumentException("Provider execution class is non-canonical.");
+        ValidateCanonicalIdentifier(ProviderContract.PackageId);
+        ValidateCanonicalIdentifier(ProviderContract.PackageVersion);
+        ValidateCanonicalIdentifier(ProviderContract.SchemaIdentity);
+        ValidateCanonicalIdentifier(ProviderExecutionClass);
 
         Validate(ExecutionAdmission);
         Validate(Measurement);
@@ -174,10 +168,22 @@ public sealed record ExecutionGuaranteesV1(
             throw new ArgumentException("Every supported dimension requires an exact evidence/enforcement source.");
     }
 
+    private static void ValidateCanonicalIdentifier(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value) || value != value.Trim() || value.Any(char.IsControl))
+            throw new ArgumentException("Provider guarantee identifiers are non-canonical.");
+        try { _ = new UTF8Encoding(false, true).GetByteCount(value); }
+        catch (EncoderFallbackException exception)
+        {
+            throw new ArgumentException("Provider guarantee identifiers must contain valid Unicode scalar values.",
+                nameof(value), exception);
+        }
+    }
+
     private static string ComputeDigest(ExecutionGuaranteesV1 value)
     {
         using var stream = new MemoryStream();
-        using (var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true))
+        using (var writer = new BinaryWriter(stream, new UTF8Encoding(false, true), leaveOpen: true))
         {
             writer.Write(value.Version);
             writer.Write(value.ProviderContract.PackageId);

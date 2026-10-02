@@ -5,6 +5,133 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class EndpointSessionCancellationTests
 {
+    [Fact]
+    public async Task SettlementAdmissionWaitsForCorrelationGateAndCallbackReleasesIt()
+    {
+        var correlationGate = new object();
+        var registry = new EndpointSessionInvocationRegistry(new CancellationScopeAuthority(TimeProvider.System), correlationGate);
+        var caller = new ProcessHandle(new ProcessId(810), 1);
+        var service = new ProcessHandle(new ProcessId(811), 1);
+        var session = new EndpointSessionHandle(new EndpointSessionId(12), new EndpointSessionGeneration(1));
+        var invocation = registry.Register(session, caller, service, 1, 1);
+        Assert.True(registry.MarkDelivered(session, service, 1).IsSuccess);
+        using var attempted = new ManualResetEventSlim();
+        Task<KernelResult<ResponseEnvelope>> publication;
+        lock (correlationGate)
+        {
+            publication = Task.Run(() =>
+            {
+                attempted.Set();
+                return registry.Publish(invocation, service, () =>
+                {
+                    Assert.True(Task.Run(() =>
+                    {
+                        lock (correlationGate) return true;
+                    }).WaitAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult());
+                    return KernelResult<ResponseEnvelope>.Ok(new(1, 1, ResponsePublicationStatus.Published, null));
+                });
+            });
+            Assert.True(attempted.Wait(TimeSpan.FromSeconds(5)));
+            Assert.False(publication.Wait(TimeSpan.FromMilliseconds(100)));
+            Assert.Null(registry.SnapshotConsequence(invocation)!.Value.SettlementInProgress);
+        }
+        Assert.True((await publication.WaitAsync(TimeSpan.FromSeconds(5))).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void DonationReturnReservationExcludesSettlementAndPreservesFaultConsequence(int fault)
+    {
+        var registry = new EndpointSessionInvocationRegistry(new CancellationScopeAuthority(TimeProvider.System));
+        var caller = new ProcessHandle(new ProcessId(810), 1);
+        var service = new ProcessHandle(new ProcessId(811), 1);
+        var session = new EndpointSessionHandle(new EndpointSessionId(12), new EndpointSessionGeneration(1));
+        var invocation = registry.Register(session, caller, service, 1, 1);
+        Assert.True(registry.MarkDelivered(session, service, 1).IsSuccess);
+        var donation = new ResourceDonationBinding(invocation, caller, service, default, default,
+            caller, default, default, ResourceAssuranceV1.RuntimeEnforced, AdmissionQosHint.None, "owner-test");
+        Assert.True(registry.BindResourceDonation(donation).IsSuccess);
+        KernelResult CancelBudget(ResourceDonationBinding current)
+        {
+            Assert.Equal(donation, current);
+            Assert.True(Task.Run(() => registry.SnapshotConsequence(invocation)!.Value.UnclosedPossibleEffect)
+                .WaitAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult());
+            var callbacks = 0;
+            Assert.Equal(KernelError.ResponseNotPending, registry.Publish(invocation, service, () =>
+            {
+                callbacks++;
+                return KernelResult<ResponseEnvelope>.Ok(new(1, 1, ResponsePublicationStatus.Published, null));
+            }).Error);
+            Assert.Equal(0, callbacks);
+            Assert.Equal(KernelError.InvalidTransition, registry.ActivateResourceDonation(invocation, service).Error);
+            Assert.Equal(KernelError.InvalidTransition,
+                registry.ReturnResourceDonationPreSubmit(invocation, service, _ => KernelResult.Ok()).Error);
+            if (fault == 1) return KernelResult.Fail(KernelError.InvalidTransition, "budget denial");
+            if (fault == 2) throw new InvalidOperationException("budget callback loss");
+            if (fault == 3) registry.CloseSession(session);
+            return KernelResult.Ok();
+        }
+        if (fault == 2)
+            Assert.Throws<InvalidOperationException>(() => registry.ReturnResourceDonationPreSubmit(invocation, service, CancelBudget));
+        else
+            Assert.Equal(fault == 0 ? KernelError.None : KernelError.InvalidTransition,
+                registry.ReturnResourceDonationPreSubmit(invocation, service, CancelBudget).Error);
+        Assert.Equal(fault switch { 0 => ResourceDonationState.Returned, 1 => ResourceDonationState.Bound,
+            _ => ResourceDonationState.Quarantined }, registry.SnapshotConsequence(invocation)!.Value.DonationState);
+        if (fault == 1)
+            Assert.True(registry.ReturnResourceDonationPreSubmit(invocation, service, _ => KernelResult.Ok()).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void AmbiguousSettlementBlocksDonationBindingAndActivation(bool bindBeforeFailure)
+    {
+        var registry = new EndpointSessionInvocationRegistry(new CancellationScopeAuthority(TimeProvider.System));
+        var caller = new ProcessHandle(new ProcessId(810), 1);
+        var service = new ProcessHandle(new ProcessId(811), 1);
+        var session = new EndpointSessionHandle(new EndpointSessionId(12), new EndpointSessionGeneration(1));
+        var invocation = registry.Register(session, caller, service, 1, 1);
+        Assert.True(registry.MarkDelivered(session, service, 1).IsSuccess);
+        var donation = new ResourceDonationBinding(invocation, caller, service, default, default,
+            caller, default, default, ResourceAssuranceV1.RuntimeEnforced, AdmissionQosHint.None, "owner-test");
+        if (bindBeforeFailure) Assert.True(registry.BindResourceDonation(donation).IsSuccess);
+        registry.SettlementReservedHook = () =>
+        {
+            var denied = bindBeforeFailure
+                ? registry.ActivateResourceDonation(invocation, service)
+                : registry.BindResourceDonation(donation);
+            Assert.Equal(KernelError.InvalidTransition, denied.Error);
+            if (bindBeforeFailure)
+            {
+                var budgetCalls = 0;
+                Assert.Equal(KernelError.InvalidTransition,
+                    registry.ReturnResourceDonationPreSubmit(invocation, service, _ =>
+                    {
+                        budgetCalls++;
+                        return KernelResult.Ok();
+                    }).Error);
+                Assert.Equal(0, budgetCalls);
+            }
+        };
+        Assert.Equal(KernelError.ServiceUnavailable, registry.Publish(invocation, service,
+            () => KernelResult<ResponseEnvelope>.Fail(KernelError.ServiceUnavailable, "possible effect")).Error);
+        var result = bindBeforeFailure
+            ? registry.ActivateResourceDonation(invocation, service)
+            : registry.BindResourceDonation(donation);
+        Assert.Equal(KernelError.InvalidTransition, result.Error);
+        if (bindBeforeFailure)
+        {
+            Assert.Equal(KernelError.InvalidTransition,
+                registry.CloseResourceDonation(invocation, service, ResourceDonationState.Returned).Error);
+        }
+        Assert.Equal(bindBeforeFailure ? ResourceDonationState.Bound : (ResourceDonationState?)null,
+            registry.SnapshotConsequence(invocation)!.Value.DonationState);
+    }
+
     private static readonly TimeSpan CompletionTimeout = TimeSpan.FromSeconds(10);
 
     [Fact]
@@ -299,6 +426,12 @@ public sealed class EndpointSessionCancellationTests
         var scope = scopes.Create(caller, null, null).Value!.Scope;
         Assert.True(registry.BindCancellationScope(invocation, caller, scope).IsSuccess);
         var callbackEntered = false;
+        registry.SettlementReservedHook = () =>
+        {
+            Assert.Equal(KernelError.InvalidTransition,
+                registry.AcceptInvocation(invocation, service, allowInFlightCancellation: false).Error);
+            Assert.False(registry.SnapshotConsequence(invocation)!.Value.ServiceAccepted);
+        };
 
         if (throws)
         {
@@ -325,6 +458,9 @@ public sealed class EndpointSessionCancellationTests
         Assert.Null(failedSnapshot.SettlementInProgress);
         Assert.Null(failedSnapshot.TerminalStatus);
         Assert.True(failedSnapshot.UnclosedPossibleEffect);
+        Assert.Equal(KernelError.InvalidTransition,
+            registry.AcceptInvocation(invocation, service, allowInFlightCancellation: false).Error);
+        Assert.False(registry.SnapshotConsequence(invocation)!.Value.ServiceAccepted);
         Assert.Equal(CancellationDisposition.TooLateEffectMayExist,
             registry.RequestCancellation(invocation, caller, scope).Value!.Disposition);
 

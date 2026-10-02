@@ -121,13 +121,38 @@ public sealed partial class RuntimeKernel
         Hc.ExternalGenerationSet currentProviderGenerations,
         ISemanticProviderAdmissionService providerAdmission,
         IRuntimeLegalityService runtimeLegality,
-        Func<KernelResult> providerSubmit)
+        Func<KernelResult> providerSubmit,
+        ISemanticTraceSinkV1? traceSink = null)
     {
+        ArgumentNullException.ThrowIfNull(providerSubmit);
         ArgumentNullException.ThrowIfNull(currentProviderGeneration);
-        return SubmitSemanticResourceExternalAdmission(commit, dependencies, baseBinding, obligations, guarantees,
+        var submitted = SubmitSemanticResourceExternalAdmissionWithBinding(commit, dependencies, baseBinding, obligations, guarantees,
             refinement, currentProviderIdentity, currentProviderGenerations, providerAdmission, runtimeLegality,
-            providerSubmit, () => RevalidateV6TemporalSemanticBinding(temporalBinding, commit, baseBinding,
-                obligations, guarantees, currentProviderGeneration()));
+            operationBinding =>
+            {
+                var fresh = RevalidateV6TemporalSemanticBinding(temporalBinding, commit, baseBinding,
+                    obligations, guarantees, currentProviderGeneration());
+                if (!fresh.IsSuccess) return fresh;
+                var owners = RevalidateResourceDispatch(commit, operationBinding);
+                return owners.IsSuccess ? providerSubmit() : owners;
+            }, () => RevalidateV6TemporalSemanticBinding(temporalBinding, commit, baseBinding,
+                obligations, guarantees, currentProviderGeneration()), () =>
+                {
+                    if (traceSink is not null)
+                    {
+                        RegisterExternalOperationTrace(commit.Operation, temporalBinding.ExtensionBinding.Digest.Value, traceSink);
+                        EmitExternalOperationTrace(commit.Operation);
+                    }
+                }, () => ObserveFailedPreSubmitTrace(commit, baseBinding, obligations,
+                    temporalBinding.ExtensionBinding, traceSink, generation =>
+                        RevalidateV6TemporalSemanticBinding(temporalBinding, commit, baseBinding,
+                            obligations, guarantees, generation)));
+        if (traceSink is not null)
+        {
+            EmitExternalOperationTrace(commit.Operation);
+            if (!submitted.IsSuccess) DiscardExternalOperationTraceIfPreSubmit(commit.Operation);
+        }
+        return submitted;
     }
 
     private static KernelResult<(TemporalSemanticsV1 Required, TemporalSemanticsV1 Provided)>
@@ -145,6 +170,13 @@ public sealed partial class RuntimeKernel
             requiredClause.Requirement != SemanticExtensionRequirement.Mandatory)
             return KernelResult<(TemporalSemanticsV1, TemporalSemanticsV1)>.Fail(KernelError.PlatformDenied,
                 "The temporal upper-bound contour requires one mandatory clause and one guarantee.");
+
+        if (requiredClause.SchemaId != "singnext.temporal-semantics/1" ||
+            providedClause.SchemaId != "singnext.temporal-semantics/1" ||
+            requiredClause.SchemaVersion != TemporalSemanticsV1.CurrentVersion ||
+            providedClause.SchemaVersion != TemporalSemanticsV1.CurrentVersion)
+            return KernelResult<(TemporalSemanticsV1, TemporalSemanticsV1)>.Fail(KernelError.PlatformDenied,
+                "The temporal contour does not support this exact extension schema tuple.");
 
         TemporalSemanticsV1 required;
         TemporalSemanticsV1 provided;

@@ -289,8 +289,11 @@ internal sealed class V6ManagedStatefulResumeProvider(
 
     private static string ValidateToken(string? value)
     {
-        if (string.IsNullOrWhiteSpace(value) || value != value.Trim() || value.Any(char.IsControl) || value.Length > 256)
+        if (value is null || value.Length > 256 || string.IsNullOrWhiteSpace(value) || value != value.Trim() || value.Any(char.IsControl))
             throw new ArgumentException("Managed provider identity or operation correlation is not canonical.");
+        try { _ = new System.Text.UTF8Encoding(false, true).GetByteCount(value); }
+        catch (System.Text.EncoderFallbackException exception)
+        { throw new ArgumentException("Managed provider token must contain valid Unicode scalar values.", nameof(value), exception); }
         return value;
     }
 
@@ -335,7 +338,11 @@ internal sealed class V6ManagedStatefulResumeContour(
             receipt.CapturedStateBytes, () => provider.ProviderGeneration, () => provider.RuntimeGeneration);
         if (!admitted.IsSuccess)
         {
-            var discarded = provider.Discard(receipt.Handle, receipt.Binding);
+            var recovery = accounting.FindRecoverySuspension(owner, receipt.Binding);
+            var discarded = recovery.IsSuccess
+                ? ToCleanupResult(accounting.ReconcileQuarantinedDiscardWithProvider(owner,
+                    recovery.Value!.Handle, () => provider.Discard(receipt.Handle, receipt.Binding)))
+                : provider.Discard(receipt.Handle, receipt.Binding);
             return discarded.IsSuccess
                 ? admitted
                 : KernelResult<V6StatefulSuspensionReceipt>.Fail(KernelError.PlatformFaulted,
@@ -364,6 +371,9 @@ internal sealed class V6ManagedStatefulResumeContour(
         }
         return admitted;
     }
+
+    private static KernelResult ToCleanupResult(KernelResult<V6StatefulSuspensionReceipt> result) =>
+        result.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(result.Error, result.Message!);
 
     internal KernelResult<V6StatefulSuspensionReceipt> Resume(
         ProcessHandle owner,

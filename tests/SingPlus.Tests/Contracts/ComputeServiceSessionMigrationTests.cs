@@ -21,7 +21,8 @@ public sealed class ComputeServiceSessionMigrationTests
         var image = new byte[] { 0x43, 0x50, 0x55 };
         var serviceManifest = new ServiceManifestV1(
             new ComponentIdentity("compute-service"), new ComponentVersion("1"), Digest(image),
-            TestFixtures.Manifest(901, 9010, capabilities: [internalCompute]), [serviceRegistration], requiresPlatformDomain: true);
+            TestFixtures.Manifest(901, 9010, capabilities: [internalCompute]), [serviceRegistration], requiresPlatformDomain: true,
+            budgetRequests: [new(ServiceBudgetDimension.OwnedMemoryBytes, 64), new(ServiceBudgetDimension.ExternalOperations, 4), new(ServiceBudgetDimension.IpcMessages, 4), new(ServiceBudgetDimension.IpcBytes, 4096)]);
         var component = kernel.AdmitComponent(new ComponentAdmissionPlan(
             serviceManifest, image,
             [new ComponentCapabilityGrant(new DomainId(9000), internalCompute)],
@@ -29,6 +30,7 @@ public sealed class ComputeServiceSessionMigrationTests
         Assert.True(component.IsSuccess, component.Message);
 
         var caller = TestFixtures.Create(kernel, 902, 9020).Handle;
+        AdmitCallerBudget(kernel, caller, 9020);
         var callerCompute = kernel.MintCapability(new DomainId(9020), caller, ResourceKind.Compute, CapabilityResourceIds.Dsc1Copy, CapabilityRights.Execute).Value!.CapabilityId;
         var source = kernel.AllocateBuffer<byte>(caller, 32).Value!;
         var destination = kernel.AllocateBuffer<byte>(caller, 32).Value!;
@@ -140,10 +142,12 @@ public sealed class ComputeServiceSessionMigrationTests
         var registration = new ProvidedServiceManifestV1("compute", contract);
         var internalCompute = new CapabilityRequirementV1(ResourceKind.Compute, CapabilityResourceIds.Dsc1Copy, CapabilityRights.Execute);
         var image = new byte[] { 9, 2, 0 };
-        var manifest = new ServiceManifestV1(new ComponentIdentity("compute-session-test"), new ComponentVersion("1"), Digest(image), TestFixtures.Manifest(921, 9210, capabilities: [internalCompute]), [registration], requiresPlatformDomain: true);
+        var manifest = new ServiceManifestV1(new ComponentIdentity("compute-session-test"), new ComponentVersion("1"), Digest(image), TestFixtures.Manifest(921, 9210, capabilities: [internalCompute]), [registration], requiresPlatformDomain: true,
+            budgetRequests: [new(ServiceBudgetDimension.OwnedMemoryBytes, 64), new(ServiceBudgetDimension.ExternalOperations, 4), new(ServiceBudgetDimension.IpcMessages, 4), new(ServiceBudgetDimension.IpcBytes, 4096)]);
         var admitted = kernel.AdmitComponent(new ComponentAdmissionPlan(manifest, image, [new ComponentCapabilityGrant(new DomainId(9200), internalCompute)], [new ComponentProvidedServiceRegistration(registration, protocol, IComputeServiceResponseProtocol.Definition, [internalCompute])]));
         Assert.True(admitted.IsSuccess, admitted.Message);
         var caller = TestFixtures.Create(kernel, 922, 9220).Handle;
+        AdmitCallerBudget(kernel, caller, 9220);
         var callerCapability = kernel.MintCapability(new DomainId(9220), caller, ResourceKind.Compute, CapabilityResourceIds.Dsc1Copy, CapabilityRights.Execute).Value!.CapabilityId;
         var descriptor = kernel.ResolveByServiceName("compute").Value;
         var session = kernel.OpenSession(caller, descriptor, [callerCapability]).Value;
@@ -152,6 +156,15 @@ public sealed class ComputeServiceSessionMigrationTests
     }
 
     private sealed record ComponentScenario(RuntimeKernel Kernel, ProcessHandle Caller, ProcessHandle Service, ServiceEndpointDescriptor Descriptor, EndpointSessionHandle Session, CapabilityId CallerCapability, SingPlus.Sip.OwnedBuffer<byte> Source, SingPlus.Sip.OwnedBuffer<byte> Destination, RuntimeComputeServiceHost Host);
+
+    private static void AdmitCallerBudget(RuntimeKernel kernel, ProcessHandle caller, ulong domain)
+    {
+        var configure = kernel.MintCapability(new DomainId(domain), caller, ResourceKind.KernelService,
+            CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        var admitted = kernel.AdmitProcessBudget(caller, configure, caller, "compute-caller",
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 64), new(ServiceBudgetDimension.IpcMessages, 4), new(ServiceBudgetDimension.IpcBytes, 4096)]);
+        Assert.True(admitted.IsSuccess, admitted.Message);
+    }
 
     private static string Digest(ReadOnlySpan<byte> bytes) => Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
 }

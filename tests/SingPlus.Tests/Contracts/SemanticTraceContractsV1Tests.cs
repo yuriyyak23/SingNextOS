@@ -4,6 +4,551 @@ namespace SingPlus.Tests.Contracts;
 
 public sealed class SemanticTraceContractsV1Tests
 {
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    [InlineData(5)]
+    [InlineData(6)]
+    [InlineData(7)]
+    public void PreSubmitAccountingMarkerCannotBeSubstitutedAfterEffectBoundary(int phase)
+    {
+        var trace = Kinds(SemanticTraceEventKindV1.Submit).ToList();
+        if (phase > 0) trace.Add(Event(2, SemanticTraceEventKindV1.EffectPossible));
+        if (phase is >= 2 and <= 5) trace.Add(Event(3, SemanticTraceEventKindV1.RetireOrComplete));
+        if (phase is >= 3 and <= 5)
+        {
+            trace.Add(Event(4, SemanticTraceEventKindV1.Visible));
+            trace.Add(Event(5, SemanticTraceEventKindV1.Published));
+        }
+        if (phase is 4 or 5) trace.Add(Event(6, SemanticTraceEventKindV1.Settled));
+        if (phase == 5) trace.Add(Event(7, SemanticTraceEventKindV1.Released));
+        if (phase == 6) trace.Add(Event(3, SemanticTraceEventKindV1.GenerationChanged) with { GenerationVectorDigest = new string('c', 64) });
+        if (phase == 7) trace.Add(Event(3, SemanticTraceEventKindV1.Quarantined));
+        trace.Add(Event(trace.Count + 1, SemanticTraceEventKindV1.ResourceAccountingQuarantinedBeforeSubmit)
+            with { GenerationVectorDigest = new string(phase == 6 ? 'c' : 'a', 64) });
+        Assert.False(SemanticTraceValidatorV1.Validate(trace).IsValid);
+    }
+
+    [Fact]
+    public void PreSubmitAccountingSurvivesCancellationLocalReleaseAndCannotImplyNoResourceClosure()
+    {
+        var before = Kinds(SemanticTraceEventKindV1.ResourceAccountingQuarantinedBeforeSubmit,
+            SemanticTraceEventKindV1.CancelledBeforeSubmit, SemanticTraceEventKindV1.LocalAuthorityReleasedBeforeSubmit);
+        var late = Kinds(SemanticTraceEventKindV1.CancelledBeforeSubmit,
+            SemanticTraceEventKindV1.LocalAuthorityReleasedBeforeSubmit, SemanticTraceEventKindV1.ResourceAccountingQuarantinedBeforeSubmit);
+        Assert.True(SemanticTraceValidatorV1.Validate(before).IsValid);
+        Assert.True(SemanticTraceValidatorV1.Validate(late).IsValid);
+        Assert.True(SemanticTraceValidatorV1.Validate(Kinds(SemanticTraceEventKindV1.ResourceAccountingQuarantinedBeforeSubmit)).IsValid);
+        Assert.Equal(SemanticTraceComparisonStatusV1.EventMismatch,
+            SemanticTraceDifferentialV1.CompareAllowedProjection(before, late, new string('a', 64), new string('b', 64)).Status);
+        var submitted = Kinds(SemanticTraceEventKindV1.ResourceAccountingQuarantinedBeforeSubmit,
+            SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible, SemanticTraceEventKindV1.Quarantined);
+        Assert.True(SemanticTraceValidatorV1.Validate(submitted).IsValid);
+        Assert.False(SemanticTraceValidatorV1.Validate([.. submitted, Event(5,
+            SemanticTraceEventKindV1.LocalAuthorityReleasedWithoutResourceBinding)]).IsValid);
+        Assert.False(SemanticTraceValidatorV1.Validate([.. late, Event(4, SemanticTraceEventKindV1.Submit)]).IsValid);
+        Assert.Equal(16, (byte)SemanticTraceEventKindV1.ResourceAccountingQuarantinedBeforeSubmit);
+        Assert.All(late, item => Assert.False(item.AuthorizesEffect));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    [InlineData(5)]
+    [InlineData(6)]
+    [InlineData(7)]
+    [InlineData(8)]
+    public void NonResourceLocalReleaseCannotBypassActiveAccountingOrDriftFacts(int phase)
+    {
+        var kinds = phase switch
+        {
+            0 => Array.Empty<SemanticTraceEventKindV1>(),
+            1 => [SemanticTraceEventKindV1.Submit],
+            2 => [SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible],
+            3 => [SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible, SemanticTraceEventKindV1.RetireOrComplete],
+            4 => [SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible, SemanticTraceEventKindV1.RetireOrComplete, SemanticTraceEventKindV1.Visible],
+            5 => [SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible, SemanticTraceEventKindV1.RetireOrComplete, SemanticTraceEventKindV1.Visible, SemanticTraceEventKindV1.Published, SemanticTraceEventKindV1.Settled],
+            6 => [SemanticTraceEventKindV1.CancelledBeforeSubmit],
+            7 => [SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible, SemanticTraceEventKindV1.ResourceAccountingQuarantined, SemanticTraceEventKindV1.Quarantined],
+            _ => [SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible, SemanticTraceEventKindV1.GenerationChanged, SemanticTraceEventKindV1.Quarantined],
+        };
+        var trace = Kinds(kinds).ToList();
+        if (phase == 8)
+            for (var index = 2; index < trace.Count; index++)
+                trace[index] = trace[index] with { GenerationVectorDigest = new string('c', 64) };
+        trace.Add(Event(trace.Count + 1, SemanticTraceEventKindV1.LocalAuthorityReleasedWithoutResourceBinding)
+            with { GenerationVectorDigest = new string(phase == 8 ? 'c' : 'a', 64) });
+        Assert.Equal(SemanticTraceValidationStatusV1.InvalidLifecycleOrder, SemanticTraceValidatorV1.Validate(trace).Status);
+    }
+
+    [Fact]
+    public void NonResourceLocalReleaseIsTerminalObservationAndCannotReplaceGenericRelease()
+    {
+        foreach (var boundary in new[] { SemanticTraceEventKindV1.Quarantined, SemanticTraceEventKindV1.Published,
+                     SemanticTraceEventKindV1.EffectClosedWithoutPublication })
+        {
+            var prefix = boundary == SemanticTraceEventKindV1.Published
+                ? Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+                    SemanticTraceEventKindV1.RetireOrComplete, SemanticTraceEventKindV1.Visible, boundary).ToList()
+                : Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+                    SemanticTraceEventKindV1.Quarantined).ToList();
+            if (boundary == SemanticTraceEventKindV1.EffectClosedWithoutPublication)
+                prefix.Add(Event(prefix.Count + 1, boundary));
+            prefix.Add(Event(prefix.Count + 1, SemanticTraceEventKindV1.LocalAuthorityReleasedWithoutResourceBinding));
+            Assert.True(SemanticTraceValidatorV1.Validate(prefix).IsValid);
+            foreach (var kind in Enum.GetValues<SemanticTraceEventKindV1>())
+                Assert.Equal(SemanticTraceValidationStatusV1.EventAfterRelease,
+                    SemanticTraceValidatorV1.Validate([.. prefix, Event(prefix.Count + 1, kind)]).Status);
+            var generic = prefix.ToArray();
+            generic[^1] = generic[^1] with { Kind = SemanticTraceEventKindV1.Released };
+            Assert.Equal(SemanticTraceComparisonStatusV1.InvalidCandidate,
+                SemanticTraceDifferentialV1.CompareAllowedProjection(prefix, generic,
+                    new string('a', 64), new string('b', 64)).Status);
+        }
+        Assert.Equal(15, (byte)SemanticTraceEventKindV1.LocalAuthorityReleasedWithoutResourceBinding);
+    }
+
+    [Theory]
+    [InlineData(SemanticTraceEventKindV1.Submit)]
+    [InlineData(SemanticTraceEventKindV1.EffectPossible)]
+    [InlineData(SemanticTraceEventKindV1.RetireOrComplete)]
+    [InlineData(SemanticTraceEventKindV1.Visible)]
+    [InlineData(SemanticTraceEventKindV1.Published)]
+    [InlineData(SemanticTraceEventKindV1.Quarantined)]
+    [InlineData(SemanticTraceEventKindV1.GenerationChanged)]
+    [InlineData(SemanticTraceEventKindV1.Settled)]
+    [InlineData(SemanticTraceEventKindV1.Released)]
+    [InlineData(SemanticTraceEventKindV1.EffectClosedWithoutPublication)]
+    [InlineData(SemanticTraceEventKindV1.CancellationRequested)]
+    [InlineData(SemanticTraceEventKindV1.ResourceAccountingQuarantined)]
+    public void PreSubmitCancellationCannotAuthorizePostSubmitEvents(SemanticTraceEventKindV1 kind)
+    {
+        var prefix = Kinds(SemanticTraceEventKindV1.CancelledBeforeSubmit);
+        var suffix = Event(2, kind);
+        if (kind == SemanticTraceEventKindV1.GenerationChanged)
+            suffix = suffix with { GenerationVectorDigest = new string('c', 64) };
+        Assert.Equal(SemanticTraceValidationStatusV1.InvalidLifecycleOrder,
+            SemanticTraceValidatorV1.Validate([.. prefix, suffix]).Status);
+        Assert.False(SemanticTraceValidatorV1.Validate(Kinds(SemanticTraceEventKindV1.Submit,
+            SemanticTraceEventKindV1.EffectPossible, SemanticTraceEventKindV1.CancelledBeforeSubmit)).IsValid);
+    }
+
+    [Fact]
+    public void PreSubmitBranchRetainsCommittedCancellationAndRequiresExactLocalRelease()
+    {
+        var cancelled = Kinds(SemanticTraceEventKindV1.CancelledBeforeSubmit);
+        var repeated = Kinds(SemanticTraceEventKindV1.CancelledBeforeSubmit,
+            SemanticTraceEventKindV1.CancelledBeforeSubmit, SemanticTraceEventKindV1.LocalAuthorityReleasedBeforeSubmit);
+        Assert.True(SemanticTraceValidatorV1.Validate(cancelled).IsValid);
+        Assert.True(SemanticTraceValidatorV1.Validate(repeated).IsValid);
+        Assert.False(SemanticTraceValidatorV1.Validate(Kinds(SemanticTraceEventKindV1.LocalAuthorityReleasedBeforeSubmit)).IsValid);
+        Assert.Equal(SemanticTraceComparisonStatusV1.LengthMismatch,
+            SemanticTraceDifferentialV1.CompareAllowedProjection(cancelled, repeated,
+                new string('a', 64), new string('b', 64)).Status);
+        Assert.Equal(13, (byte)SemanticTraceEventKindV1.CancelledBeforeSubmit);
+        Assert.Equal(14, (byte)SemanticTraceEventKindV1.LocalAuthorityReleasedBeforeSubmit);
+        Assert.All(repeated, item => Assert.False(item.AuthorizesEffect));
+    }
+
+    [Fact]
+    public void PreSubmitReleasedBranchRejectsLateEventsAndChangedGeneration()
+    {
+        var released = Kinds(SemanticTraceEventKindV1.CancelledBeforeSubmit,
+            SemanticTraceEventKindV1.LocalAuthorityReleasedBeforeSubmit);
+        foreach (var kind in Enum.GetValues<SemanticTraceEventKindV1>().Where(kind =>
+                     kind != SemanticTraceEventKindV1.ResourceAccountingQuarantinedBeforeSubmit))
+            Assert.Equal(SemanticTraceValidationStatusV1.EventAfterRelease,
+                SemanticTraceValidatorV1.Validate([.. released, Event(3, kind)]).Status);
+        var stale = released.ToArray();
+        stale[1] = stale[1] with { GenerationVectorDigest = new string('c', 64) };
+        Assert.Equal(SemanticTraceValidationStatusV1.GenerationMismatch,
+            SemanticTraceValidatorV1.Validate(stale).Status);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    public void AccountingQuarantineCannotPrecedeEffectOrResurrectSettledAccounting(int phase)
+    {
+        var prefix = phase switch
+        {
+            0 => new List<SemanticTraceEventV1>(),
+            1 => Kinds(SemanticTraceEventKindV1.Submit).ToList(),
+            2 => Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+                SemanticTraceEventKindV1.RetireOrComplete, SemanticTraceEventKindV1.Visible,
+                SemanticTraceEventKindV1.Published, SemanticTraceEventKindV1.Settled).ToList(),
+            3 => Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+                SemanticTraceEventKindV1.RetireOrComplete, SemanticTraceEventKindV1.Settled).ToList(),
+            _ => Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+                SemanticTraceEventKindV1.RetireOrComplete, SemanticTraceEventKindV1.Visible,
+                SemanticTraceEventKindV1.Published, SemanticTraceEventKindV1.Settled,
+                SemanticTraceEventKindV1.Released).ToList(),
+        };
+        prefix.Add(Event(prefix.Count + 1, SemanticTraceEventKindV1.ResourceAccountingQuarantined));
+        Assert.False(SemanticTraceValidatorV1.Validate(prefix).IsValid);
+    }
+
+    [Fact]
+    public void AccountingObservationCannotClearProviderQuarantineOrGenerationDrift()
+    {
+        var quarantined = Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+            SemanticTraceEventKindV1.Quarantined, SemanticTraceEventKindV1.ResourceAccountingQuarantined,
+            SemanticTraceEventKindV1.RetireOrComplete, SemanticTraceEventKindV1.Settled);
+        Assert.True(SemanticTraceValidatorV1.Validate(quarantined).IsValid);
+        Assert.Equal(SemanticTraceValidationStatusV1.InvalidLifecycleOrder,
+            SemanticTraceValidatorV1.Validate([.. quarantined, Event(7, SemanticTraceEventKindV1.Released)]).Status);
+        Assert.Equal(SemanticTraceValidationStatusV1.InvalidLifecycleOrder,
+            SemanticTraceValidatorV1.Validate([.. quarantined, Event(7, SemanticTraceEventKindV1.Visible)]).Status);
+        var drift = Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible).ToList();
+        drift.Add(Event(3, SemanticTraceEventKindV1.GenerationChanged) with { GenerationVectorDigest = new string('c', 64) });
+        drift.Add(Event(4, SemanticTraceEventKindV1.ResourceAccountingQuarantined) with { GenerationVectorDigest = new string('c', 64) });
+        Assert.True(SemanticTraceValidatorV1.Validate(drift).IsValid);
+        drift.Add(Event(5, SemanticTraceEventKindV1.RetireOrComplete) with { GenerationVectorDigest = new string('c', 64) });
+        Assert.Equal(SemanticTraceValidationStatusV1.InvalidLifecycleOrder, SemanticTraceValidatorV1.Validate(drift).Status);
+    }
+
+    [Fact]
+    public void AccountingQuarantineAndProviderQuarantineAreDistinctMandatoryObservations()
+    {
+        var accounting = Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+            SemanticTraceEventKindV1.ResourceAccountingQuarantined);
+        var provider = Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+            SemanticTraceEventKindV1.Quarantined);
+        Assert.Equal(SemanticTraceComparisonStatusV1.EventMismatch,
+            SemanticTraceDifferentialV1.CompareAllowedProjection(accounting, provider,
+                new string('a', 64), new string('b', 64)).Status);
+        Assert.Equal(12, (byte)SemanticTraceEventKindV1.ResourceAccountingQuarantined);
+        Assert.Throws<NotSupportedException>(() => Event(1, (SemanticTraceEventKindV1)255).Validate());
+    }
+
+    [Theory]
+    [InlineData(SemanticTraceEventKindV1.Visible)]
+    [InlineData(SemanticTraceEventKindV1.Published)]
+    [InlineData(SemanticTraceEventKindV1.Released)]
+    [InlineData(SemanticTraceEventKindV1.RetireOrComplete)]
+    public void LateCompletionNeverClearsQuarantine(SemanticTraceEventKindV1 forbidden)
+    {
+        var trace = Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+            SemanticTraceEventKindV1.Quarantined, SemanticTraceEventKindV1.RetireOrComplete);
+        Assert.True(SemanticTraceValidatorV1.Validate(trace).IsValid);
+        Assert.Equal(SemanticTraceValidationStatusV1.InvalidLifecycleOrder,
+            SemanticTraceValidatorV1.Validate([.. trace, Event(5, forbidden)]).Status);
+    }
+
+    [Fact]
+    public void LateCompletionRequiresFreshGenerationAndIndependentClosure()
+    {
+        var trace = Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+            SemanticTraceEventKindV1.Quarantined, SemanticTraceEventKindV1.RetireOrComplete,
+            SemanticTraceEventKindV1.Settled);
+        Assert.True(SemanticTraceValidatorV1.Validate([.. trace,
+            Event(6, SemanticTraceEventKindV1.EffectClosedWithoutPublication),
+            Event(7, SemanticTraceEventKindV1.Released)]).IsValid);
+        var drift = Event(4, SemanticTraceEventKindV1.GenerationChanged) with { GenerationVectorDigest = new string('c', 64) };
+        Assert.Equal(SemanticTraceValidationStatusV1.InvalidLifecycleOrder,
+            SemanticTraceValidatorV1.Validate([.. trace.Take(3), drift,
+                Event(5, SemanticTraceEventKindV1.RetireOrComplete) with { GenerationVectorDigest = new string('c', 64) }]).Status);
+        Assert.Equal(SemanticTraceValidationStatusV1.InvalidLifecycleOrder,
+            SemanticTraceValidatorV1.Validate(Kinds(SemanticTraceEventKindV1.Submit,
+                SemanticTraceEventKindV1.EffectPossible, SemanticTraceEventKindV1.RetireOrComplete,
+                SemanticTraceEventKindV1.Quarantined, SemanticTraceEventKindV1.RetireOrComplete)).Status);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void EarlySettlementNeverSubstitutesPublicationOrFreshClosureAfterDrift(bool visible)
+    {
+        var trace = Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+            SemanticTraceEventKindV1.RetireOrComplete).ToList();
+        if (visible) trace.Add(Event(trace.Count + 1, SemanticTraceEventKindV1.Visible));
+        trace.Add(Event(trace.Count + 1, SemanticTraceEventKindV1.Settled));
+        Assert.True(SemanticTraceValidatorV1.Validate(trace).IsValid);
+        Assert.False(SemanticTraceValidatorV1.Validate(trace.Append(Event(trace.Count + 1, SemanticTraceEventKindV1.Released))).IsValid);
+        Assert.False(SemanticTraceValidatorV1.Validate(trace.Append(Event(trace.Count + 1, SemanticTraceEventKindV1.Settled))).IsValid);
+        Assert.False(SemanticTraceValidatorV1.Validate(trace.Append(Event(trace.Count + 1, SemanticTraceEventKindV1.EffectClosedWithoutPublication))).IsValid);
+        trace.Add(Event(trace.Count + 1, SemanticTraceEventKindV1.GenerationChanged) with { GenerationVectorDigest = new string('c', 64) });
+        Assert.True(SemanticTraceValidatorV1.Validate(trace).IsValid);
+        var next = Event(trace.Count + 1, SemanticTraceEventKindV1.Published) with { GenerationVectorDigest = new string('c', 64) };
+        Assert.False(SemanticTraceValidatorV1.Validate(trace.Append(next)).IsValid);
+        trace.Add(next with { Kind = SemanticTraceEventKindV1.Quarantined });
+        Assert.False(SemanticTraceValidatorV1.Validate(trace.Append(next with { Sequence = (ulong)trace.Count + 1, Kind = SemanticTraceEventKindV1.Settled })).IsValid);
+        trace.Add(next with { Sequence = (ulong)trace.Count + 1, Kind = SemanticTraceEventKindV1.EffectClosedWithoutPublication });
+        trace.Add(next with { Sequence = (ulong)trace.Count + 1, Kind = SemanticTraceEventKindV1.Released });
+        Assert.True(SemanticTraceValidatorV1.Validate(trace).IsValid);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DifferentialConsumerRejectsErasedSettlementHistoryBeforeComparison(bool generationDrift)
+    {
+        var reference = Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+            SemanticTraceEventKindV1.RetireOrComplete, SemanticTraceEventKindV1.Visible,
+            SemanticTraceEventKindV1.Published, SemanticTraceEventKindV1.Settled);
+        var candidate = reference.ToList();
+        if (generationDrift)
+            candidate.Add(Event(7, SemanticTraceEventKindV1.GenerationChanged) with
+                { GenerationVectorDigest = new string('c', 64) });
+        var digest = generationDrift ? new string('c', 64) : reference[0].GenerationVectorDigest;
+        candidate.Add(Event(candidate.Count + 1, SemanticTraceEventKindV1.Quarantined) with
+            { GenerationVectorDigest = digest });
+        candidate.Add(Event(candidate.Count + 1, SemanticTraceEventKindV1.Settled) with
+            { GenerationVectorDigest = digest });
+        var result = SemanticTraceDifferentialV1.CompareAllowedProjection(reference, candidate,
+            new string('a', 64), new string('b', 64));
+        Assert.Equal(SemanticTraceComparisonStatusV1.InvalidCandidate, result.Status);
+        Assert.False(result.IsEquivalent);
+        Assert.NotNull(result.Difference);
+        Assert.Equal(new string('a', 64), result.Difference.ReferenceSourceTupleDigest);
+        Assert.Equal(new string('b', 64), result.Difference.CandidateSourceTupleDigest);
+    }
+
+    [Theory]
+    [InlineData(SemanticTraceEventKindV1.Settled)]
+    [InlineData(SemanticTraceEventKindV1.EffectClosedWithoutPublication)]
+    public void GenerationChangeAfterUnsettledQuarantineRequiresFreshQuarantine(SemanticTraceEventKindV1 lateKind)
+    {
+        var trace = Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+            SemanticTraceEventKindV1.Quarantined).ToList();
+        trace.Add(Event(4, SemanticTraceEventKindV1.GenerationChanged) with
+            { GenerationVectorDigest = new string('c', 64) });
+        Assert.True(SemanticTraceValidatorV1.Validate(trace).IsValid);
+        var late = Event(5, lateKind) with { GenerationVectorDigest = new string('c', 64) };
+        Assert.False(SemanticTraceValidatorV1.Validate(trace.Append(late)).IsValid);
+        trace.Add(Event(5, SemanticTraceEventKindV1.Quarantined) with
+            { GenerationVectorDigest = new string('c', 64) });
+        trace.Add(late with { Sequence = 6 });
+        Assert.True(SemanticTraceValidatorV1.Validate(trace).IsValid);
+    }
+
+    [Fact]
+    public void DriftAfterSettledClosureRequiresFreshClosureWithoutSecondSettlement()
+    {
+        var trace = Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+            SemanticTraceEventKindV1.Quarantined, SemanticTraceEventKindV1.EffectClosedWithoutPublication,
+            SemanticTraceEventKindV1.Settled).ToList();
+        trace.Add(Event(6, SemanticTraceEventKindV1.GenerationChanged) with
+            { GenerationVectorDigest = new string('c', 64) });
+        var release = Event(7, SemanticTraceEventKindV1.Released) with
+            { GenerationVectorDigest = new string('c', 64) };
+        Assert.False(SemanticTraceValidatorV1.Validate(trace.Append(release)).IsValid);
+        trace.Add(Event(7, SemanticTraceEventKindV1.Quarantined) with
+            { GenerationVectorDigest = new string('c', 64) });
+        trace.Add(Event(8, SemanticTraceEventKindV1.EffectClosedWithoutPublication) with
+            { GenerationVectorDigest = new string('c', 64) });
+        trace.Add(release with { Sequence = 9 });
+        Assert.True(SemanticTraceValidatorV1.Validate(trace).IsValid);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void GenerationDriftCannotForgetSettlement(bool published)
+    {
+        var kinds = published
+            ? new[] { SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+                SemanticTraceEventKindV1.RetireOrComplete, SemanticTraceEventKindV1.Visible,
+                SemanticTraceEventKindV1.Published, SemanticTraceEventKindV1.Settled }
+            : new[] { SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+                SemanticTraceEventKindV1.Quarantined, SemanticTraceEventKindV1.Settled };
+        var trace = Kinds(kinds).ToList();
+        trace.Add(Event(trace.Count + 1, SemanticTraceEventKindV1.GenerationChanged) with
+            { GenerationVectorDigest = new string('c', 64) });
+        trace.Add(Event(trace.Count + 1, SemanticTraceEventKindV1.Quarantined) with
+            { GenerationVectorDigest = new string('c', 64) });
+        Assert.True(SemanticTraceValidatorV1.Validate(trace).IsValid);
+        trace.Add(Event(trace.Count + 1, SemanticTraceEventKindV1.Settled) with
+            { GenerationVectorDigest = new string('c', 64) });
+        Assert.False(SemanticTraceValidatorV1.Validate(trace).IsValid);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void NonpublicationQuarantineCannotForgetPriorSettlement(bool afterClosure)
+    {
+        var trace = Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+            SemanticTraceEventKindV1.Quarantined, SemanticTraceEventKindV1.Settled).ToList();
+        if (afterClosure) trace.Add(Event(5, SemanticTraceEventKindV1.EffectClosedWithoutPublication));
+        trace.Add(Event(trace.Count + 1, SemanticTraceEventKindV1.Quarantined));
+        Assert.True(SemanticTraceValidatorV1.Validate(trace).IsValid);
+        trace.Add(Event(trace.Count + 1, SemanticTraceEventKindV1.Settled));
+        Assert.False(SemanticTraceValidatorV1.Validate(trace).IsValid);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void RepeatedQuarantineCannotForgetPostPublicationSettlement(bool settleBeforeQuarantine)
+    {
+        var trace = Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+            SemanticTraceEventKindV1.RetireOrComplete, SemanticTraceEventKindV1.Visible,
+            SemanticTraceEventKindV1.Published,
+            settleBeforeQuarantine ? SemanticTraceEventKindV1.Settled : SemanticTraceEventKindV1.Quarantined,
+            settleBeforeQuarantine ? SemanticTraceEventKindV1.Quarantined : SemanticTraceEventKindV1.Settled,
+            SemanticTraceEventKindV1.Quarantined, SemanticTraceEventKindV1.Settled);
+        Assert.True(SemanticTraceValidatorV1.Validate(trace.Take(8)).IsValid);
+        Assert.False(SemanticTraceValidatorV1.Validate(trace).IsValid);
+    }
+
+    [Fact]
+    public void QuarantineAfterSettlementCannotErasePublicationHistory()
+    {
+        var trace = Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+            SemanticTraceEventKindV1.RetireOrComplete, SemanticTraceEventKindV1.Visible,
+            SemanticTraceEventKindV1.Published, SemanticTraceEventKindV1.Settled,
+            SemanticTraceEventKindV1.Quarantined, SemanticTraceEventKindV1.EffectClosedWithoutPublication,
+            SemanticTraceEventKindV1.Settled, SemanticTraceEventKindV1.Released);
+        Assert.True(SemanticTraceValidatorV1.Validate(trace.Take(7)).IsValid);
+        Assert.False(SemanticTraceValidatorV1.Validate(trace).IsValid);
+    }
+
+    [Theory]
+    [InlineData(SemanticTraceEventKindV1.Quarantined)]
+    [InlineData(SemanticTraceEventKindV1.GenerationChanged)]
+    public void ReleasedOperationCannotReopenItsLifecycle(SemanticTraceEventKindV1 lateKind)
+    {
+        var prefix = Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+            SemanticTraceEventKindV1.RetireOrComplete, SemanticTraceEventKindV1.Visible,
+            SemanticTraceEventKindV1.Published, SemanticTraceEventKindV1.Settled,
+            SemanticTraceEventKindV1.Released);
+        Assert.True(SemanticTraceValidatorV1.Validate(prefix).IsValid);
+        var late = Event(8, lateKind) with
+        {
+            GenerationVectorDigest = lateKind == SemanticTraceEventKindV1.GenerationChanged
+                ? new string('c', 64) : prefix[0].GenerationVectorDigest,
+        };
+        Assert.False(SemanticTraceValidatorV1.Validate(prefix.Append(late)).IsValid);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void PrivateProviderSourceMetadataMustValidateBeforeErasure(int fault)
+    {
+        var source = fault switch { 0 => " ", 1 => new string('\uD800', 1), _ => new string('a', 257) };
+        var trace = new[]
+        {
+            Provider(1, ProviderTraceDispositionV1.SecurityRelevant, SemanticTraceEventKindV1.Submit),
+            Provider(2, ProviderTraceDispositionV1.ProviderPrivate, default) with { ProviderIdentity = source },
+            Provider(3, ProviderTraceDispositionV1.SecurityRelevant, SemanticTraceEventKindV1.EffectPossible),
+        };
+        Assert.Throws<ArgumentException>(() => SemanticTraceProjectionV1.Project(trace));
+    }
+
+    [Fact]
+    public void ValidPrivateSourceIdentityIsObservationRatherThanAuthenticatedProviderBinding()
+    {
+        var projected = SemanticTraceProjectionV1.Project([
+            Provider(1, ProviderTraceDispositionV1.SecurityRelevant, SemanticTraceEventKindV1.Submit),
+            Provider(2, ProviderTraceDispositionV1.ProviderPrivate, default) with { ProviderIdentity = "other-provider" },
+            Provider(3, ProviderTraceDispositionV1.SecurityRelevant, SemanticTraceEventKindV1.EffectPossible),
+        ]);
+        Assert.Equal(2, projected.Count);
+        Assert.True(SemanticTraceValidatorV1.Validate(projected).IsValid);
+        Assert.All(projected, item => Assert.False(item.AuthorizesExecution));
+    }
+
+    [Fact]
+    public void InvalidEventDiagnosticIsFailureShapeWhileDifferentialBindsSourceTuple()
+    {
+        var first = Event(1, SemanticTraceEventKindV1.Submit) with { OperationCorrelation = " " };
+        var second = first with { OperationCorrelation = new string('\uD800', 1) };
+        var left = SemanticTraceValidatorV1.Validate([first]);
+        var right = SemanticTraceValidatorV1.Validate([second]);
+        Assert.Equal(SemanticTraceValidationStatusV1.InvalidEvent, left.Status);
+        Assert.Equal(left.Status, right.Status);
+        Assert.Equal(left.Counterexample!.CanonicalId, right.Counterexample!.CanonicalId);
+        Assert.False(left.Counterexample.AuthorizesExecution);
+        var reference = Kinds(SemanticTraceEventKindV1.Submit);
+        var a = SemanticTraceDifferentialV1.CompareAllowedProjection(reference, [first], new string('a', 64), new string('b', 64));
+        var b = SemanticTraceDifferentialV1.CompareAllowedProjection(reference, [second], new string('a', 64), new string('c', 64));
+        Assert.Equal(SemanticTraceComparisonStatusV1.InvalidCandidate, a.Status);
+        Assert.NotEqual(a.Difference!.CanonicalId, b.Difference!.CanonicalId);
+    }
+
+    [Fact]
+    public void CounterexampleIdentityIsStableAcrossCustomNumericCulture()
+    {
+        var original = global::System.Globalization.CultureInfo.CurrentCulture;
+        var reference = Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible);
+        var candidate = Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.Released);
+        try
+        {
+            global::System.Globalization.CultureInfo.CurrentCulture = global::System.Globalization.CultureInfo.InvariantCulture;
+            var validation = SemanticTraceValidatorV1.Validate(candidate).Counterexample!.CanonicalId;
+            var difference = SemanticTraceDifferentialV1.CompareAllowedProjection(reference, candidate,
+                new string('a', 64), new string('b', 64)).Difference!.CanonicalId;
+            var custom = (global::System.Globalization.CultureInfo)original.Clone();
+            custom.NumberFormat.NegativeSign = "negative";
+            custom.NumberFormat.PositiveSign = "positive";
+            custom.NumberFormat.NumberDecimalSeparator = ":";
+            custom.NumberFormat.NativeDigits = ["٠", "١", "٢", "٣", "٤", "٥", "٦", "٧", "٨", "٩"];
+            global::System.Globalization.CultureInfo.CurrentCulture = custom;
+            Assert.Equal(validation, SemanticTraceValidatorV1.Validate(candidate).Counterexample!.CanonicalId);
+            var compared = SemanticTraceDifferentialV1.CompareAllowedProjection(reference, candidate,
+                new string('a', 64), new string('b', 64));
+            Assert.Equal(difference, compared.Difference!.CanonicalId);
+            Assert.NotEqual(difference, SemanticTraceDifferentialV1.CompareAllowedProjection(reference, candidate,
+                new string('c', 64), new string('b', 64)).Difference!.CanonicalId);
+        }
+        finally { global::System.Globalization.CultureInfo.CurrentCulture = original; }
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void TraceTokenLengthRefusalPrecedesMalformedUnicodeScan(bool overlong, bool source)
+    {
+        var token = new string('a', overlong ? 256 : 255) + '\uD800';
+        var item = Event(1, SemanticTraceEventKindV1.Submit);
+        item = source ? item with { Source = token } : item with { OperationCorrelation = token };
+        var exception = Assert.Throws<ArgumentException>(() => item.Validate());
+        Assert.Equal(source ? nameof(item.Source) : nameof(item.OperationCorrelation), exception.ParamName);
+        if (overlong) Assert.Null(exception.InnerException);
+        else Assert.IsType<global::System.Text.EncoderFallbackException>(exception.InnerException);
+        Assert.Equal(SemanticTraceValidationStatusV1.InvalidEvent, SemanticTraceValidatorV1.Validate([item]).Status);
+    }
+
+    [Theory]
+    [InlineData(0xd800)]
+    [InlineData(0xdc00)]
+    public void MalformedUnicodeTraceIdentifiersFailClosed(int codeUnit)
+    {
+        var malformed = new string((char)codeUnit, 1);
+        var correlation = Event(1, SemanticTraceEventKindV1.Submit) with { OperationCorrelation = malformed };
+        var source = Event(1, SemanticTraceEventKindV1.Submit) with { Source = malformed };
+        Assert.Throws<ArgumentException>(() => correlation.Validate());
+        Assert.Throws<ArgumentException>(() => source.Validate());
+        Assert.Equal(SemanticTraceValidationStatusV1.InvalidEvent,
+            SemanticTraceValidatorV1.Validate([correlation]).Status);
+        Assert.Equal(SemanticTraceValidationStatusV1.InvalidEvent,
+            SemanticTraceValidatorV1.Validate([source]).Status);
+    }
+
+    [Fact]
+    public void TraceTokensPreserveValidSupplementaryUnicodeAtExactByteBoundary()
+    {
+        var token = string.Concat(Enumerable.Repeat("\U0001f680", 64));
+        var item = Event(1, SemanticTraceEventKindV1.Submit) with { OperationCorrelation = token, Source = "\ufffd" };
+        Assert.Equal(item, item.Validate());
+        Assert.True(SemanticTraceValidatorV1.Validate([item]).IsValid);
+        Assert.Throws<ArgumentException>(() => (item with { OperationCorrelation = token + "a" }).Validate());
+    }
+
     [Fact]
     public void CompleteStagedLifecycleIsValidAndEventsGrantNoAuthority()
     {
@@ -365,6 +910,49 @@ public sealed class SemanticTraceContractsV1Tests
         ]));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ProjectedPrivatePrefixCannotMakeGenerationReplayEquivalent(bool includePrefix)
+    {
+        var source = new List<ProviderTraceEventV1>();
+        if (includePrefix)
+            source.Add(Provider(1, ProviderTraceDispositionV1.ProviderPrivate, default));
+        source.Add(Provider(2, ProviderTraceDispositionV1.SecurityRelevant, SemanticTraceEventKindV1.Submit));
+        source.Add(Provider(3, ProviderTraceDispositionV1.SecurityRelevant, SemanticTraceEventKindV1.EffectPossible));
+        source.Add(Provider(4, ProviderTraceDispositionV1.SecurityRelevant, SemanticTraceEventKindV1.GenerationChanged)
+            with { GenerationVectorDigest = new string('c', 64) });
+        source.Add(Provider(5, ProviderTraceDispositionV1.ProviderPrivate, default)
+            with { GenerationVectorDigest = new string('c', 64) });
+        source.Add(Provider(6, ProviderTraceDispositionV1.SecurityRelevant, SemanticTraceEventKindV1.GenerationChanged));
+
+        var projected = SemanticTraceProjectionV1.Project(source);
+        Assert.Equal(4, projected.Count);
+        Assert.Equal(SemanticTraceValidationStatusV1.GenerationMismatch,
+            SemanticTraceValidatorV1.Validate(projected).Status);
+        Assert.Equal(SemanticTraceComparisonStatusV1.InvalidCandidate,
+            SemanticTraceDifferentialV1.CompareAllowedProjection(
+                Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible),
+                projected, new string('a', 64), new string('b', 64)).Status);
+    }
+
+    [Fact]
+    public void PrivatePrefixDriftMarkerCannotBecomeValidInitialSemanticEvent()
+    {
+        var projected = SemanticTraceProjectionV1.Project([
+            Provider(1, ProviderTraceDispositionV1.ProviderPrivate, default),
+            Provider(2, ProviderTraceDispositionV1.SecurityRelevant, SemanticTraceEventKindV1.GenerationChanged)
+                with { GenerationVectorDigest = new string('c', 64) },
+        ]);
+        Assert.Single(projected);
+        Assert.Equal(SemanticTraceValidationStatusV1.InvalidLifecycleOrder,
+            SemanticTraceValidatorV1.Validate(projected).Status);
+        Assert.Equal(SemanticTraceComparisonStatusV1.InvalidCandidate,
+            SemanticTraceDifferentialV1.CompareAllowedProjection(
+                Kinds(SemanticTraceEventKindV1.Submit), projected,
+                new string('a', 64), new string('b', 64)).Status);
+    }
+
     [Fact]
     public void TraceAndSourceTupleDigestsRejectNonCanonicalCase()
     {
@@ -510,6 +1098,37 @@ public sealed class SemanticTraceContractsV1Tests
 
         Assert.True(result.IsEquivalent);
         Assert.Null(result.Difference);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void GenerationTransitionCannotReuseAnObservedDigest(bool closeAndRelease)
+    {
+        var events = Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+            SemanticTraceEventKindV1.GenerationChanged, SemanticTraceEventKindV1.Quarantined,
+            SemanticTraceEventKindV1.GenerationChanged, SemanticTraceEventKindV1.Quarantined,
+            SemanticTraceEventKindV1.EffectClosedWithoutPublication, SemanticTraceEventKindV1.Settled,
+            SemanticTraceEventKindV1.Released).Select((item, index) => item with
+            { GenerationVectorDigest = new string(index is 2 or 3 ? 'b' : 'a', 64) }).ToArray();
+        if (!closeAndRelease) events = events[..5];
+        Assert.Equal(SemanticTraceValidationStatusV1.GenerationMismatch, SemanticTraceValidatorV1.Validate(events).Status);
+        var comparison = SemanticTraceDifferentialV1.CompareAllowedProjection(Kinds(
+            SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible), events,
+            new string('a', 64), new string('b', 64));
+        Assert.Equal(SemanticTraceComparisonStatusV1.InvalidCandidate, comparison.Status);
+    }
+
+    [Fact]
+    public void DistinctGenerationTransitionsRetainQuarantineAndExactClosureProjection()
+    {
+        var events = Kinds(SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+            SemanticTraceEventKindV1.GenerationChanged, SemanticTraceEventKindV1.Quarantined,
+            SemanticTraceEventKindV1.GenerationChanged, SemanticTraceEventKindV1.Quarantined,
+            SemanticTraceEventKindV1.EffectClosedWithoutPublication, SemanticTraceEventKindV1.Settled,
+            SemanticTraceEventKindV1.Released).Select((item, index) => item with
+            { GenerationVectorDigest = new string(index < 2 ? 'a' : index < 4 ? 'b' : 'c', 64) }).ToArray();
+        Assert.True(SemanticTraceValidatorV1.Validate(events).IsValid);
     }
 
     private static IReadOnlyList<SemanticTraceEventV1> Kinds(params SemanticTraceEventKindV1[] kinds) =>

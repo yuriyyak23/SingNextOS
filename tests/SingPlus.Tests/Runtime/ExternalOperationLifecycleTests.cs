@@ -9,6 +9,149 @@ public sealed class ExternalOperationLifecycleTests
 {
     private static readonly OperationDependencySnapshot Dependencies = new(7, 11);
 
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void DeniedAttachedBudgetReleaseRetainsExactAssociationForExistingRetry(bool teardown, bool virtualContext)
+    {
+        var s = CreateScenario();
+        var admin = TestFixtures.Create(s.Kernel, 3, 30).Handle;
+        var capability = s.Kernel.MintCapability(new(30), admin, ResourceKind.KernelService,
+            CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        var account = s.Kernel.AdmitProcessBudget(admin, capability, s.Owner, "release-retention",
+            [new(ServiceBudgetDimension.ExternalOperations, 1)]).Value!.ProcessBudget;
+        var prepared = Prepare(s, ExternalPublicationPolicy.Staged);
+        var admitted = virtualContext
+            ? s.Kernel.AdmitExternalOperationForVirtualContext(s.Owner, prepared.Operation, Dependencies)
+            : s.Kernel.AdmitExternalOperation(s.Owner, prepared.Operation, Dependencies);
+        Assert.True(admitted.IsSuccess, admitted.Message);
+        // Observation of the existing association, not an authority or closure receipt.
+        var associations = (Dictionary<ExternalOperationHandle, (ProcessHandle Owner, BudgetReservationHandle Reservation)>)
+            typeof(RuntimeKernel).GetField("_externalOperationBudgetReservations", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .GetValue(s.Kernel)!;
+        var charge = associations[prepared.Operation];
+        Assert.Equal(s.Owner, charge.Owner);
+        Assert.True(s.Kernel.Budgets.QuarantineLease(s.Owner, charge.Reservation).IsSuccess);
+        var stale = prepared.Operation with { Generation = new(prepared.Operation.Generation.Value + 1) };
+        Assert.False(s.Kernel.ReleaseExternalOperation(s.Owner, stale, new(false, false)).IsSuccess);
+        Assert.Equal(charge, associations[prepared.Operation]);
+        if (teardown) Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        else
+        {
+            Assert.True(s.Kernel.CancelExternalOperation(s.Owner, prepared.Operation, false).IsSuccess);
+            Assert.True(s.Kernel.ReleaseExternalOperation(s.Owner, prepared.Operation, new(false, false)).IsSuccess);
+            Assert.True(s.Kernel.ReleaseExternalOperation(s.Owner, prepared.Operation, new(false, false)).IsSuccess);
+        }
+        Assert.Equal(ExternalOperationState.Released, s.Kernel.ExternalOperations.Query(prepared.Operation).Value!.State);
+        Assert.Equal(charge, associations[prepared.Operation]);
+        Assert.Equal(BudgetReservationState.Quarantined, s.Kernel.QueryBudget(charge.Reservation).Value!.State);
+        Assert.Contains(s.Kernel.QueryBudget(account).Value!.Usage,
+            u => u.Dimension == ServiceBudgetDimension.ExternalOperations && u.Used == 1);
+        // No invented settlement or zero-charge reconciliation to make the retry pass.
+        Assert.False(s.Kernel.ReleaseBudget(s.Owner, charge.Reservation).IsSuccess);
+    }
+
+    [Fact]
+    public void SuccessfulAttachedBudgetReleaseRemovesAssociationAndDoesNotRefundTwice()
+    {
+        var s = CreateScenario();
+        var admin = TestFixtures.Create(s.Kernel, 3, 30).Handle;
+        var capability = s.Kernel.MintCapability(new(30), admin, ResourceKind.KernelService,
+            CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        var account = s.Kernel.AdmitProcessBudget(admin, capability, s.Owner, "release-success",
+            [new(ServiceBudgetDimension.ExternalOperations, 1)]).Value!.ProcessBudget;
+        var prepared = Prepare(s, ExternalPublicationPolicy.Staged);
+        Assert.True(s.Kernel.AdmitExternalOperation(s.Owner, prepared.Operation, Dependencies).IsSuccess);
+        Assert.True(s.Kernel.CancelExternalOperation(s.Owner, prepared.Operation, false).IsSuccess);
+        Assert.True(s.Kernel.ReleaseExternalOperation(s.Owner, prepared.Operation, new(false, false)).IsSuccess);
+        Assert.True(s.Kernel.ReleaseExternalOperation(s.Owner, prepared.Operation, new(false, false)).IsSuccess);
+        var associations = (Dictionary<ExternalOperationHandle, (ProcessHandle Owner, BudgetReservationHandle Reservation)>)
+            typeof(RuntimeKernel).GetField("_externalOperationBudgetReservations", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .GetValue(s.Kernel)!;
+        Assert.Empty(associations);
+        Assert.Contains(s.Kernel.QueryBudget(account).Value!.Usage,
+            u => u.Dimension == ServiceBudgetDimension.ExternalOperations && u.Used == 0);
+    }
+
+    [Theory]
+    [InlineData(-1, false, false)]
+    [InlineData(2, false, false)]
+    [InlineData(int.MaxValue, false, false)]
+    [InlineData(-1, true, false)]
+    [InlineData(2, true, false)]
+    [InlineData(int.MaxValue, true, false)]
+    [InlineData(-1, false, true)]
+    [InlineData(2, false, true)]
+    [InlineData(int.MaxValue, false, true)]
+    [InlineData(-1, true, true)]
+    [InlineData(2, true, true)]
+    [InlineData(int.MaxValue, true, true)]
+    public void UnknownCancellationSupportCannotMutateScopeBudgetOrRegionAdmission(
+        int unknown, bool virtualContext, bool requested)
+    {
+        var s = CreateScenario();
+        var prepared = Prepare(s, ExternalPublicationPolicy.Staged);
+        var admin = TestFixtures.Create(s.Kernel, 3, 30).Handle;
+        var capability = s.Kernel.MintCapability(new(30), admin, ResourceKind.KernelService,
+            CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        var account = s.Kernel.AdmitProcessBudget(admin, capability, s.Owner, "unknown-cancellation",
+            [new(ServiceBudgetDimension.ExternalOperations, 1)]).Value!.ProcessBudget;
+        var scope = s.Kernel.CreateCancellationScope(s.Owner).Value!.Scope;
+        if (requested) Assert.True(s.Kernel.RequestCancellation(s.Owner, scope).IsSuccess);
+        var beforeScope = s.Kernel.ObserveCancellation(s.Owner, scope).Value!;
+        var beforeBudget = s.Kernel.QueryBudget(account).Value!;
+        var result = virtualContext
+            ? s.Kernel.AdmitExternalOperationForVirtualContext(s.Owner, prepared.Operation, Dependencies,
+                cancellationSupport: (ExternalCancellationSupport)unknown, cancellationScope: scope)
+            : s.Kernel.AdmitExternalOperation(s.Owner, prepared.Operation, Dependencies,
+                cancellationSupport: (ExternalCancellationSupport)unknown, cancellationScope: scope);
+        Assert.Equal(KernelError.InvalidTransition, result.Error);
+        var after = s.Kernel.QueryExternalOperation(s.Owner, prepared.Operation).Value!;
+        Assert.Equal(ExternalOperationState.Prepared, after.State);
+        Assert.Equal(ExternalOperationDisposition.Active, after.Disposition);
+        Assert.Null(after.Admission);
+        Assert.Single(after.Transitions);
+        Assert.Empty(s.Kernel.Regions.SnapshotUses());
+        Assert.Equal(beforeScope, s.Kernel.ObserveCancellation(s.Owner, scope).Value!);
+        Assert.Equal(beforeBudget.Usage, s.Kernel.QueryBudget(account).Value!.Usage);
+        var known = virtualContext
+            ? s.Kernel.AdmitExternalOperationForVirtualContext(s.Owner, prepared.Operation, Dependencies,
+                cancellationSupport: ExternalCancellationSupport.ProviderCooperative, cancellationScope: scope)
+            : s.Kernel.AdmitExternalOperation(s.Owner, prepared.Operation, Dependencies,
+                cancellationSupport: ExternalCancellationSupport.ProviderCooperative, cancellationScope: scope);
+        if (requested) Assert.Equal(KernelError.DeadlineExpired, known.Error);
+        else
+        {
+            Assert.True(known.IsSuccess, known.Message);
+            Assert.Equal(ExternalCancellationSupport.ProviderCooperative, known.Value!.CancellationSupport);
+            Assert.Contains(s.Kernel.QueryBudget(account).Value!.Usage,
+                u => u.Dimension == ServiceBudgetDimension.ExternalOperations && u.Used == 1);
+        }
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(2)]
+    [InlineData(int.MaxValue)]
+    public void OwnerAdmissionRejectsUnknownCancellationSupportBeforeUseAcquisition(int unknown)
+    {
+        var s = CreateScenario();
+        var prepared = Prepare(s, ExternalPublicationPolicy.Staged);
+        Assert.Equal(KernelError.InvalidTransition, s.Kernel.ExternalOperations.Admit(
+            prepared.Operation, Dependencies, cancellationSupport: (ExternalCancellationSupport)unknown).Error);
+        Assert.Equal(KernelError.InvalidTransition, s.Kernel.ExternalOperations.AdmitForExactPlatformMappings(
+            prepared.Operation, Dependencies, cancellationSupport: (ExternalCancellationSupport)unknown).Error);
+        var after = s.Kernel.QueryExternalOperation(s.Owner, prepared.Operation).Value!;
+        Assert.Equal(ExternalOperationState.Prepared, after.State);
+        Assert.Null(after.Admission);
+        Assert.Single(after.Transitions);
+        Assert.Empty(s.Kernel.Regions.SnapshotUses());
+        Assert.True(s.Kernel.AdmitExternalOperation(s.Owner, prepared.Operation, Dependencies,
+            cancellationSupport: ExternalCancellationSupport.BeforeSubmissionOnly).IsSuccess);
+    }
+
     [Fact]
     public void MockNonCxlOperationTraversesAllSevenStatesWithoutConflation()
     {

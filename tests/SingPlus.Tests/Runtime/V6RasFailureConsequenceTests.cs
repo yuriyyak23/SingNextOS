@@ -6,6 +6,168 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class V6RasFailureConsequenceTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void GenerationAdvanceCannotResetObservationSequenceOrClearDamage(bool exhausted)
+    {
+        var context = Create();
+        var unaffected = context.Kernel.AcquireRegionUse(context.Process, context.Buffer.Handle,
+            RegionUseMode.ReadOnly, new(32, 8)).Value!;
+        var sequence = exhausted ? ulong.MaxValue : 10UL;
+        var original = Evidence(new(8, 8)) with { ObservationSequence = sequence };
+        var damage = context.Kernel.Regions.QuarantineSubrange(context.Buffer.Handle, context.Owner, original).Value!;
+        var next = original.Scope with { ProviderGeneration = 2, FailureDomainGeneration = 2 };
+        Assert.Equal(KernelError.StaleGeneration, context.Kernel.Regions.QuarantineSubrange(
+            context.Buffer.Handle, context.Owner, original with { Scope = next, ObservationSequence = 1 }).Error);
+        Assert.Equal(KernelError.StaleGeneration, context.Kernel.Regions.RecordFailureDomainReconfiguration(
+            damage.Handle, next, 1).Error);
+        var replacement = new RegionBackingReplacementEvidenceV1(1, damage.Handle, next, 1, 2,
+            damage.Range, new('a', 64), new('b', 64));
+        Assert.Equal(KernelError.StaleGeneration, context.Kernel.Regions.RecordAuthoritativeBackingReplacement(
+            context.Owner, replacement).Error);
+        Assert.Equal(damage, Assert.Single(context.Kernel.Regions.SnapshotDamage()));
+        Assert.True(context.Kernel.ValidateRegionUse(context.Process, unaffected.Handle).IsSuccess);
+        Assert.Equal(KernelError.Quarantined,
+            context.Kernel.Regions.ReservePlatformMapping(context.Buffer.Handle, context.Owner).Error);
+        if (!exhausted)
+        {
+            var rebound = context.Kernel.Regions.RecordFailureDomainReconfiguration(damage.Handle, next, sequence + 1);
+            Assert.True(rebound.IsSuccess, rebound.Message);
+            Assert.Equal(sequence + 1, rebound.Value!.EvidenceObservationSequence);
+            Assert.Equal(damage.Handle.Generation + 1, rebound.Value.Handle.Generation);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void FailureGenerationExhaustionCannotWrapOrPartiallyReconfigure(bool provider)
+    {
+        var context = Create();
+        var original = Evidence(new(8, 8));
+        var scope = provider ? original.Scope with { ProviderGeneration = ulong.MaxValue } :
+            original.Scope with { FailureDomainGeneration = ulong.MaxValue };
+        var damage = context.Kernel.Regions.QuarantineSubrange(context.Buffer.Handle,
+            context.Owner, original with { Scope = scope }).Value!;
+        var wrapped = provider ? scope with { ProviderGeneration = 0, FailureDomainGeneration = 2 } :
+            scope with { ProviderGeneration = 2, FailureDomainGeneration = 0 };
+        Assert.Equal(KernelError.InvalidMessage, context.Kernel.Regions.RecordFailureDomainReconfiguration(
+            damage.Handle, wrapped, 2).Error);
+        Assert.Equal(KernelError.StaleGeneration, context.Kernel.Regions.RecordFailureDomainReconfiguration(
+            damage.Handle, scope, 2).Error);
+        Assert.Equal(damage, Assert.Single(context.Kernel.Regions.SnapshotDamage()));
+        Assert.Equal(KernelError.Quarantined,
+            context.Kernel.Regions.ReservePlatformMapping(context.Buffer.Handle, context.Owner).Error);
+    }
+    [Fact]
+    public void CanonicalUnicodeFailureDomainRemainsAccepted()
+    {
+        var context = Create();
+        var original = Evidence(new(8, 8));
+        var evidence = original with { Scope = original.Scope with
+            { ProviderId = "провайдер-😀", FailureDomainId = "bank-零" } };
+        var result = context.Kernel.Regions.QuarantineSubrange(context.Buffer.Handle, context.Owner, evidence);
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.Equal(evidence.Scope, result.Value!.FailureDomain);
+        Assert.False(evidence.AuthorizesRegionMutation);
+        Assert.False(evidence.AuthorizesReclaim);
+    }
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    [InlineData(5)]
+    public void NoncanonicalFailureDomainCannotMutateRegionOrConsumeEvidenceSequence(int mutation)
+    {
+        var context = Create();
+        var use = context.Kernel.AcquireRegionUse(context.Process, context.Buffer.Handle,
+            RegionUseMode.ReadOnly, new(0, 64)).Value!;
+        var original = Evidence(new(8, 8));
+        var scope = mutation switch
+        {
+            0 => original.Scope with { ProviderId = original.Scope.ProviderId + " " },
+            1 => original.Scope with { FailureDomainId = " " + original.Scope.FailureDomainId },
+            2 => original.Scope with { ProviderId = original.Scope.ProviderId + (char)1 },
+            3 => original.Scope with { FailureDomainId = original.Scope.FailureDomainId + (char)1 },
+            4 => original.Scope with { ProviderId = original.Scope.ProviderId + (char)0xD800 },
+            _ => original.Scope with { FailureDomainId = original.Scope.FailureDomainId + (char)0xDC00 }
+        };
+        Assert.Equal(KernelError.InvalidMessage, context.Kernel.Regions.QuarantineSubrange(
+            context.Buffer.Handle, context.Owner, original with { Scope = scope, ObservationSequence = 100 }).Error);
+        Assert.Empty(context.Kernel.Regions.SnapshotDamage());
+        Assert.True(context.Kernel.ValidateRegionUse(context.Process, use.Handle).IsSuccess);
+        Assert.True(context.Kernel.Regions.QuarantineSubrange(context.Buffer.Handle,
+            context.Owner, original).IsSuccess);
+        Assert.Single(context.Kernel.Regions.SnapshotDamage());
+        Assert.Equal(KernelError.StaleGeneration, context.Kernel.ValidateRegionUse(context.Process, use.Handle).Error);
+    }
+    [Fact]
+    public void DamagedRegionCannotAcquirePlatformMappingBeforeAuthoritativeReplacement()
+    {
+        var context = Create();
+        var damage = context.Kernel.Regions.QuarantineSubrange(context.Buffer.Handle,
+            context.Owner, Evidence(new(8, 8))).Value!;
+        Assert.Equal(KernelError.Quarantined,
+            context.Kernel.Regions.ReservePlatformMapping(context.Buffer.Handle, context.Owner).Error);
+        Assert.False(context.Kernel.Regions.HasPlatformMappingReservation(context.Buffer.Handle, context.Owner));
+        Assert.True(context.Kernel.Regions.RecordAuthoritativeBackingReplacement(
+            context.Owner, Replacement(damage)).IsSuccess);
+        Assert.True(context.Kernel.Regions.ReservePlatformMapping(context.Buffer.Handle, context.Owner).IsSuccess);
+        Assert.True(context.Kernel.Regions.ReleasePlatformMappingReservation(context.Buffer.Handle, context.Owner).IsSuccess);
+    }
+
+    [Fact]
+    public void ReplacementWaitsForExactBackingLeaseClosureAndCanRetryUnchangedEvidence()
+    {
+        var context = Create();
+        var backing = context.Kernel.Regions.ReserveBacking(context.Buffer.Handle, context.Owner).Value!;
+        var damage = context.Kernel.Regions.QuarantineSubrange(context.Buffer.Handle,
+            context.Owner, Evidence(new(8, 8))).Value!;
+        var replacement = Replacement(damage);
+
+        Assert.Equal(KernelError.PlatformBindingActive,
+            context.Kernel.Regions.RecordAuthoritativeBackingReplacement(context.Owner, replacement).Error);
+        Assert.Equal(damage, Assert.Single(context.Kernel.Regions.SnapshotDamage()));
+        Assert.Equal(KernelError.StaleGeneration, context.Kernel.Regions.ReleaseBacking(
+            backing.Handle with { Generation = backing.Handle.Generation + 1 }, context.Owner).Error);
+        Assert.Equal(KernelError.PlatformBindingActive,
+            context.Kernel.Regions.RecordAuthoritativeBackingReplacement(context.Owner, replacement).Error);
+        Assert.Equal(damage, Assert.Single(context.Kernel.Regions.SnapshotDamage()));
+
+        Assert.True(context.Kernel.Regions.ReleaseBacking(backing.Handle, context.Owner).IsSuccess);
+        var cleared = context.Kernel.Regions.RecordAuthoritativeBackingReplacement(context.Owner, replacement);
+        Assert.True(cleared.IsSuccess, cleared.Message);
+        Assert.Empty(context.Kernel.Regions.SnapshotDamage());
+        Assert.False(cleared.Value!.GrantsRegionAuthority);
+        Assert.False(cleared.Value.AuthorizesReclaim);
+    }
+
+    [Theory]
+    [InlineData(64L, 1L)]
+    [InlineData(63L, 2L)]
+    public void OutOfBoundsDamageCannotMutateUsesOrEvidenceHighWatermark(long offset, long length)
+    {
+        var context = Create();
+        var use = context.Kernel.AcquireRegionUse(context.Process, context.Buffer.Handle,
+            RegionUseMode.ReadOnly, new(0, 64)).Value!;
+        var rejected = Evidence(new(offset, length)) with { ObservationSequence = 100 };
+
+        Assert.Equal(KernelError.InvalidRegionState, context.Kernel.Regions.QuarantineSubrange(
+            context.Buffer.Handle, context.Owner, rejected).Error);
+        Assert.Empty(context.Kernel.Regions.SnapshotDamage());
+        Assert.True(context.Kernel.ValidateRegionUse(context.Process, use.Handle).IsSuccess);
+
+        var accepted = context.Kernel.Regions.QuarantineSubrange(context.Buffer.Handle,
+            context.Owner, Evidence(new(63, 1)));
+        Assert.True(accepted.IsSuccess, accepted.Message);
+        Assert.Single(context.Kernel.Regions.SnapshotDamage());
+        Assert.Equal(KernelError.StaleGeneration,
+            context.Kernel.ValidateRegionUse(context.Process, use.Handle).Error);
+    }
+
     [Fact]
     public void RegionAuthorityQuarantinesOnlyTheDamagedSubrange()
     {

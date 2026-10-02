@@ -1,3 +1,5 @@
+using System.Collections;
+using System.Reflection;
 using System.Security.Cryptography;
 using SingPlus.Contracts;
 using SingPlus.Runtime;
@@ -7,6 +9,310 @@ namespace SingPlus.Tests.Runtime;
 public sealed class Phase09StructuredTelemetryTests
 {
     private static readonly byte[] Image = [0x09, 0x99];
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void ClockCancelOrTimeoutCannotCloseSubscriptionOrRefundCharge(bool timeout)
+    {
+        var clock = new CallbackClock();
+        var kernel = new RuntimeKernel(null, clock);
+        var component = kernel.AdmitComponent(Plan("clock-cancel", 932, 9032, 1)).Value!;
+        var subscription = kernel.StartTelemetrySubscription(component.Process, component.Process,
+            TelemetryProjectionClass.SelfOperational, 1, TelemetrySubscriptionOverflowPolicy.RejectSample).Value!;
+        clock.Next = () => { if (timeout) throw new TimeoutException(); throw new OperationCanceledException(); };
+        Assert.Equal(KernelError.PlatformFaulted, kernel.SampleTelemetrySubscription(component.Process, subscription.Subscription).Error);
+        Assert.Equal(0L, CaptureCounter(kernel));
+        Assert.Equal(1024UL, Usage(kernel.QueryBudget(component.ProcessBudget).Value!, ServiceBudgetDimension.TraceTelemetryBufferBytes).Used);
+        var batch = kernel.ReadTelemetrySubscription(component.Process, subscription.Subscription).Value!;
+        Assert.Equal(TelemetrySubscriptionState.Active, batch.Admission.State);
+        Assert.Empty(batch.Snapshots);
+        Assert.Equal(0UL, batch.DroppedSnapshots);
+        Assert.False(batch.Complete);
+        Assert.True(kernel.CloseTelemetrySubscription(component.Process, subscription.Subscription).IsSuccess);
+        Assert.Equal(0UL, Usage(kernel.QueryBudget(component.ProcessBudget).Value!, ServiceBudgetDimension.TraceTelemetryBufferBytes).Used);
+    }
+
+    [Fact]
+    public async Task LateBlockedClockFailureCannotReopenClosedSubscriptionOrPublishSample()
+    {
+        var clock = new CallbackClock();
+        var kernel = new RuntimeKernel(null, clock);
+        var component = kernel.AdmitComponent(Plan("clock-close-race", 933, 9033, 1)).Value!;
+        var subscription = kernel.StartTelemetrySubscription(component.Process, component.Process,
+            TelemetryProjectionClass.SelfOperational, 1, TelemetrySubscriptionOverflowPolicy.DropOldestWithMarker).Value!;
+        Assert.True(kernel.SampleTelemetrySubscription(component.Process, subscription.Subscription).IsSuccess);
+        using var entered = new ManualResetEventSlim(false);
+        using var release = new ManualResetEventSlim(false);
+        clock.Next = () => { entered.Set(); Assert.True(release.Wait(TimeSpan.FromSeconds(10))); throw new InvalidOperationException(); };
+        var sample = Task.Run(() => kernel.SampleTelemetrySubscription(component.Process, subscription.Subscription));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.True((await Task.Run(() => kernel.CloseTelemetrySubscription(component.Process, subscription.Subscription))
+                .WaitAsync(TimeSpan.FromSeconds(10))).IsSuccess);
+        }
+        finally { release.Set(); }
+        Assert.Equal(KernelError.PlatformFaulted, (await sample.WaitAsync(TimeSpan.FromSeconds(10))).Error);
+        Assert.Equal(1L, CaptureCounter(kernel));
+        var batch = kernel.ReadTelemetrySubscription(component.Process, subscription.Subscription).Value!;
+        Assert.Single(batch.Snapshots);
+        Assert.Equal(TelemetrySubscriptionState.Closed, batch.Admission.State);
+        Assert.Equal(0UL, batch.DroppedSnapshots);
+        Assert.False(batch.Complete);
+        Assert.Equal(0UL, Usage(kernel.QueryBudget(component.ProcessBudget).Value!, ServiceBudgetDimension.TraceTelemetryBufferBytes).Used);
+    }
+
+    [Theory]
+    [InlineData(TelemetrySubscriptionOverflowPolicy.DropOldestWithMarker)]
+    [InlineData(TelemetrySubscriptionOverflowPolicy.RejectSample)]
+    [InlineData(TelemetrySubscriptionOverflowPolicy.StopSubscription)]
+    public void ClockFailurePreservesBufferedStateAndChargeButMarksBatchIncomplete(TelemetrySubscriptionOverflowPolicy policy)
+    {
+        var clock = new CallbackClock();
+        var kernel = new RuntimeKernel(null, clock);
+        var component = kernel.AdmitComponent(Plan("clock-failed", 930, 9030, 1)).Value!;
+        var subscription = kernel.StartTelemetrySubscription(component.Process, component.Process,
+            TelemetryProjectionClass.SelfOperational, 1, policy).Value!;
+        Assert.True(kernel.SampleTelemetrySubscription(component.Process, subscription.Subscription).IsSuccess);
+        clock.Next = () => throw new InvalidOperationException("injected observation failure");
+        Assert.Equal(KernelError.PlatformFaulted, kernel.SampleTelemetrySubscription(component.Process, subscription.Subscription).Error);
+        Assert.Equal(1L, CaptureCounter(kernel));
+        Assert.Equal(1024UL, Usage(kernel.QueryBudget(component.ProcessBudget).Value!, ServiceBudgetDimension.TraceTelemetryBufferBytes).Used);
+        var batch = kernel.ReadTelemetrySubscription(component.Process, subscription.Subscription).Value!;
+        Assert.Single(batch.Snapshots);
+        Assert.Equal(0UL, batch.DroppedSnapshots);
+        Assert.False(batch.Complete);
+        Assert.Equal(TelemetrySubscriptionState.Active, batch.Admission.State);
+        Assert.True(kernel.SampleTelemetrySubscription(component.Process, subscription.Subscription).IsSuccess);
+        Assert.False(kernel.ReadTelemetrySubscription(component.Process, subscription.Subscription).Value!.Complete);
+        Assert.True(kernel.CloseTelemetrySubscription(component.Process, subscription.Subscription).IsSuccess);
+        Assert.Equal(0UL, Usage(kernel.QueryBudget(component.ProcessBudget).Value!, ServiceBudgetDimension.TraceTelemetryBufferBytes).Used);
+        var fresh = kernel.StartTelemetrySubscription(component.Process, component.Process,
+            TelemetryProjectionClass.SelfOperational, 1, policy).Value!;
+        Assert.True(kernel.SampleTelemetrySubscription(component.Process, fresh.Subscription).IsSuccess);
+        Assert.True(kernel.ReadTelemetrySubscription(component.Process, fresh.Subscription).Value!.Complete);
+        Assert.True(kernel.CloseTelemetrySubscription(component.Process, fresh.Subscription).IsSuccess);
+    }
+
+    [Fact]
+    public void FailedCaptureIdentityAllocationIsIncompleteWithoutSyntheticDrop()
+    {
+        var kernel = new RuntimeKernel();
+        var owner = kernel.AdmitComponent(Plan("capture-failed-observation", 931, 9031, 1)).Value!.Process;
+        var subscription = kernel.StartTelemetrySubscription(owner, owner, TelemetryProjectionClass.SelfOperational,
+            1, TelemetrySubscriptionOverflowPolicy.RejectSample).Value!;
+        typeof(RuntimeKernel).GetField("_telemetryCaptureSequence", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(kernel, long.MaxValue);
+        Assert.Equal(KernelError.CapacityExhausted, kernel.SampleTelemetrySubscription(owner, subscription.Subscription).Error);
+        var batch = kernel.ReadTelemetrySubscription(owner, subscription.Subscription).Value!;
+        Assert.Empty(batch.Snapshots);
+        Assert.Equal(0UL, batch.DroppedSnapshots);
+        Assert.False(batch.Complete);
+        Assert.Equal(long.MaxValue, CaptureCounter(kernel));
+        Assert.True(kernel.CloseTelemetrySubscription(owner, subscription.Subscription).IsSuccess);
+    }
+
+    [Fact]
+    public void DirectAndSupervisorClockFailureReturnFaultWithoutSnapshotOrCaptureId()
+    {
+        var clock = new CallbackClock();
+        var s = ControlledTelemetry(clock);
+        clock.Next = () => throw new InvalidOperationException("injected direct clock");
+        var direct = s.Kernel.ProjectTelemetry(s.Instance.Process, s.Instance.Process, TelemetryProjectionClass.ServiceAggregate);
+        Assert.Equal(KernelError.PlatformFaulted, direct.Error);
+        Assert.Null(direct.Value);
+        Assert.Equal(0L, CaptureCounter(s.Kernel));
+        clock.Next = () => throw new InvalidOperationException("injected supervisor clock");
+        var supervised = s.Supervisor.ProjectTelemetry(s.Instance);
+        Assert.Equal(KernelError.PlatformFaulted, supervised.Error);
+        Assert.Null(supervised.Value);
+        Assert.Equal(0L, CaptureCounter(s.Kernel));
+        Assert.True(s.Supervisor.ProjectTelemetry(s.Instance).IsSuccess);
+    }
+
+    private static long CaptureCounter(RuntimeKernel kernel) =>
+        (long)typeof(RuntimeKernel).GetField("_telemetryCaptureSequence", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel)!;
+
+    [Fact]
+    public async Task ConcurrentFinalDropIncrementCannotWrapOrMutateRefusedSample()
+    {
+        var kernel = new RuntimeKernel();
+        var owner = kernel.AdmitComponent(Plan("drop-final-race", 924, 9024, 1)).Value!.Process;
+        var subscription = kernel.StartTelemetrySubscription(owner, owner, TelemetryProjectionClass.SelfOperational,
+            1, TelemetrySubscriptionOverflowPolicy.DropOldestWithMarker).Value!;
+        Assert.True(kernel.SampleTelemetrySubscription(owner, subscription.Subscription).IsSuccess);
+        var record = SubscriptionRecord(kernel);
+        record.GetType().GetProperty("Dropped")!.SetValue(record, ulong.MaxValue - 1);
+        using var start = new ManualResetEventSlim(false);
+        var first = Task.Run(() => { start.Wait(); return kernel.SampleTelemetrySubscription(owner, subscription.Subscription); });
+        var second = Task.Run(() => { start.Wait(); return kernel.SampleTelemetrySubscription(owner, subscription.Subscription); });
+        start.Set();
+        var results = await Task.WhenAll(first, second);
+        Assert.Single(results, r => r.IsSuccess);
+        Assert.Equal(KernelError.CapacityExhausted, Assert.Single(results, r => !r.IsSuccess).Error);
+        var batch = kernel.ReadTelemetrySubscription(owner, subscription.Subscription).Value!;
+        Assert.InRange(Assert.Single(batch.Snapshots).CaptureSequence, 2UL, 3UL);
+        Assert.Equal(ulong.MaxValue, batch.DroppedSnapshots);
+        Assert.False(batch.Complete);
+        Assert.True(kernel.CloseTelemetrySubscription(owner, subscription.Subscription).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(TelemetrySubscriptionOverflowPolicy.DropOldestWithMarker)]
+    [InlineData(TelemetrySubscriptionOverflowPolicy.RejectSample)]
+    [InlineData(TelemetrySubscriptionOverflowPolicy.StopSubscription)]
+    public void ExhaustedDropCounterRefusesBeforeQueueOrStateMutation(TelemetrySubscriptionOverflowPolicy policy)
+    {
+        var kernel = new RuntimeKernel();
+        var owner = kernel.AdmitComponent(Plan("drop-exhausted", 920, 9020, 1)).Value!.Process;
+        var subscription = kernel.StartTelemetrySubscription(owner, owner, TelemetryProjectionClass.SelfOperational, 1, policy).Value!;
+        Assert.True(kernel.SampleTelemetrySubscription(owner, subscription.Subscription).IsSuccess);
+        var record = SubscriptionRecord(kernel);
+        record.GetType().GetProperty("Dropped")!.SetValue(record, ulong.MaxValue);
+        var refused = kernel.SampleTelemetrySubscription(owner, subscription.Subscription);
+        Assert.Equal(KernelError.CapacityExhausted, refused.Error);
+        Assert.Equal(TelemetrySubscriptionState.Active,
+            ((TelemetrySubscriptionAdmission)record.GetType().GetProperty("Admission")!.GetValue(record)!).State);
+        var batch = kernel.ReadTelemetrySubscription(owner, subscription.Subscription).Value!;
+        Assert.Equal(1UL, Assert.Single(batch.Snapshots).CaptureSequence);
+        Assert.Equal(ulong.MaxValue, batch.DroppedSnapshots);
+        Assert.False(batch.Complete);
+        Assert.True(kernel.CloseTelemetrySubscription(owner, subscription.Subscription).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(TelemetrySubscriptionOverflowPolicy.DropOldestWithMarker)]
+    [InlineData(TelemetrySubscriptionOverflowPolicy.RejectSample)]
+    [InlineData(TelemetrySubscriptionOverflowPolicy.StopSubscription)]
+    public void FinalDropIncrementPreservesV1OverflowPolicyAndIncompleteBatch(TelemetrySubscriptionOverflowPolicy policy)
+    {
+        var kernel = new RuntimeKernel();
+        var owner = kernel.AdmitComponent(Plan("drop-boundary", 921, 9021, 1)).Value!.Process;
+        var subscription = kernel.StartTelemetrySubscription(owner, owner, TelemetryProjectionClass.SelfOperational, 1, policy).Value!;
+        Assert.True(kernel.SampleTelemetrySubscription(owner, subscription.Subscription).IsSuccess);
+        var record = SubscriptionRecord(kernel);
+        record.GetType().GetProperty("Dropped")!.SetValue(record, ulong.MaxValue - 1);
+        var final = kernel.SampleTelemetrySubscription(owner, subscription.Subscription);
+        if (policy == TelemetrySubscriptionOverflowPolicy.DropOldestWithMarker) Assert.True(final.IsSuccess);
+        else Assert.Equal(policy == TelemetrySubscriptionOverflowPolicy.RejectSample ? KernelError.TelemetryBackpressure : KernelError.TelemetryStopped, final.Error);
+        Assert.Equal(policy == TelemetrySubscriptionOverflowPolicy.StopSubscription ? KernelError.TelemetryStopped : KernelError.CapacityExhausted,
+            kernel.SampleTelemetrySubscription(owner, subscription.Subscription).Error);
+        var batch = kernel.ReadTelemetrySubscription(owner, subscription.Subscription).Value!;
+        Assert.Equal(policy == TelemetrySubscriptionOverflowPolicy.DropOldestWithMarker ? 2UL : 1UL,
+            Assert.Single(batch.Snapshots).CaptureSequence);
+        Assert.Equal(ulong.MaxValue, batch.DroppedSnapshots);
+        Assert.False(batch.Complete);
+        Assert.True(kernel.CloseTelemetrySubscription(owner, subscription.Subscription).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(-1L)] [InlineData(long.MinValue)] [InlineData(long.MaxValue)]
+    public void InvalidOrExhaustedCaptureSequenceCannotMutateOrWrap(long counter)
+    {
+        var kernel = new RuntimeKernel();
+        var owner = kernel.AdmitComponent(Plan("capture-invalid", 922, 9022, 1)).Value!.Process;
+        var field = typeof(RuntimeKernel).GetField("_telemetryCaptureSequence", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        field.SetValue(kernel, counter);
+        Assert.Equal(KernelError.CapacityExhausted, kernel.ProjectTelemetry(owner, owner).Error);
+        Assert.Equal(counter, (long)field.GetValue(kernel)!);
+    }
+
+    [Fact]
+    public async Task ConcurrentFinalCaptureSequenceIsAllocatedExactlyOnce()
+    {
+        var kernel = new RuntimeKernel();
+        var owner = kernel.AdmitComponent(Plan("capture-final", 923, 9023, 1)).Value!.Process;
+        var field = typeof(RuntimeKernel).GetField("_telemetryCaptureSequence", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        field.SetValue(kernel, long.MaxValue - 1);
+        using var start = new ManualResetEventSlim(false);
+        var first = Task.Run(() => { start.Wait(); return kernel.ProjectTelemetry(owner, owner); });
+        var second = Task.Run(() => { start.Wait(); return kernel.ProjectTelemetry(owner, owner); });
+        start.Set();
+        var results = await Task.WhenAll(first, second);
+        Assert.Equal((ulong)long.MaxValue, Assert.Single(results, r => r.IsSuccess).Value!.CaptureSequence);
+        Assert.Equal(KernelError.CapacityExhausted, Assert.Single(results, r => !r.IsSuccess).Error);
+        Assert.Equal(long.MaxValue, (long)field.GetValue(kernel)!);
+        Assert.Equal(KernelError.CapacityExhausted, kernel.ProjectTelemetry(owner, owner).Error);
+    }
+
+    private static object SubscriptionRecord(RuntimeKernel kernel)
+    {
+        var records = (IDictionary)typeof(RuntimeKernel).GetField("_telemetrySubscriptions", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel)!;
+        return records.Values.Cast<object>().Single();
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)]
+    public void SupervisorProjectionRefusesRevokedControlOrExitedGeneration(int fault)
+    {
+        var clock = new CallbackClock();
+        var s = ControlledTelemetry(clock);
+        Assert.True(s.Supervisor.ProjectTelemetry(s.Instance).IsSuccess);
+        Action revoke = () => Assert.True(s.Kernel.CapabilityAuthority.Revoke(s.Control).IsSuccess);
+        if (fault == 0) revoke();
+        else clock.Next = fault == 1 ? revoke : () =>
+            Assert.True(s.Kernel.TerminateProcess(fault == 2 ? s.Principal : s.Instance.Process).IsSuccess);
+        var refused = s.Supervisor.ProjectTelemetry(s.Instance);
+        Assert.False(refused.IsSuccess);
+        Assert.Null(refused.Value);
+        if (fault != 3) Assert.Equal(KernelError.SupervisorDenied, refused.Error);
+        Assert.Null(clock.Next);
+    }
+
+    [Fact]
+    public async Task BlockedSupervisorSnapshotClockDoesNotPreventControlRevoke()
+    {
+        var clock = new CallbackClock();
+        var s = ControlledTelemetry(clock);
+        using var entered = new ManualResetEventSlim(false);
+        using var release = new ManualResetEventSlim(false);
+        clock.Next = () => { entered.Set(); Assert.True(release.Wait(TimeSpan.FromSeconds(10))); };
+        var projection = Task.Run(() => s.Supervisor.ProjectTelemetry(s.Instance));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.True((await Task.Run(() => s.Kernel.CapabilityAuthority.Revoke(s.Control))
+                .WaitAsync(TimeSpan.FromSeconds(10))).IsSuccess);
+        }
+        finally { release.Set(); }
+        var refused = await projection.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.False(refused.IsSuccess);
+        Assert.Equal(KernelError.SupervisorDenied, refused.Error);
+        Assert.Null(refused.Value);
+    }
+
+    private static (RuntimeKernel Kernel, ProcessHandle Principal, CapabilityId Control,
+        CapabilityAwareServiceSupervisor Supervisor, ServiceInstanceHandle Instance) ControlledTelemetry(CallbackClock clock)
+    {
+        var kernel = new RuntimeKernel(null, clock);
+        var principal = TestFixtures.Create(kernel, 910, 9010, identity: "telemetry-supervisor").Handle;
+        var control = kernel.MintCapability(new(9010), principal, ResourceKind.KernelService,
+            CapabilityResourceIds.ServiceSupervisor, CapabilityRights.Configure | CapabilityRights.Execute).Value!.CapabilityId;
+        var supervisor = kernel.CreateServiceSupervisor(principal, control).Value!;
+        var contract = new ServiceContractIdentity("ManagedTelemetry", "1", "managed-telemetry-digest");
+        var provided = new ProvidedServiceManifestV1("managed-telemetry", contract);
+        var manifest = new ServiceManifestV1(new("managed-telemetry"), new("1"), Digest(Image),
+            TestFixtures.Manifest(911, 9011, 1, "managed-telemetry-entry"), [provided],
+            telemetryPolicy: new(ServiceTelemetryVisibility.ServiceAggregate, 4096));
+        var definition = new ManagedServiceDefinition(new(manifest, Image,
+            providedServices: [new(provided, new(contract.Name, contract.Digest, "Idle", ["Done"],
+                [new(1, "Invoke")], [new(1, "Idle", "Done")]))]), "managed-telemetry");
+        Assert.True(supervisor.Register(definition).IsSuccess);
+        var started = supervisor.Start(definition.Identity);
+        Assert.True(started.IsSuccess, started.Message);
+        return (kernel, principal, control, supervisor, started.Value!.Snapshot.Instance!.Value);
+    }
+
+    private sealed class CallbackClock : TimeProvider
+    {
+        public Action? Next { get; set; }
+        public override long GetTimestamp()
+        {
+            var action = Next;
+            Next = null;
+            action?.Invoke();
+            return base.GetTimestamp();
+        }
+    }
 
     [Fact]
     public void SelfProjectionReflectsAuthoritativeBudgetMemoryDeadlineTraceAndCheckpointState()

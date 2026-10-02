@@ -28,7 +28,16 @@ public sealed class Phase9GuiOwnershipTests
         var present = compositor.PresentReadLeaseAsync(surface).AsTask();
         Assert.True(scenario.Host.ProcessNext().IsSuccess);
         Assert.True(SpinWait.SpinUntil(() => scenario.Kernel.Regions.Snapshot().Single(x => x.Handle.RegionId == pixels.Handle.RegionId).State == RegionState.Loaned, 1000));
-        Assert.True(scenario.Host.AcceptNext().IsSuccess);
+        // The borrow exists before the async continuation enqueues its request.
+        // Observe actual delivery, and preserve any non-empty-queue failure.
+        KernelResult acceptance = default;
+        Assert.True(SpinWait.SpinUntil(() =>
+        {
+            acceptance = scenario.Host.AcceptNext();
+            return acceptance.IsSuccess || acceptance.Error != KernelError.InvalidMessage ||
+                acceptance.Message != "Channel queue is empty.";
+        }, 1000), "The read-lease present request was not delivered within the test bound.");
+        Assert.True(acceptance.IsSuccess, acceptance.Message);
         Assert.Throws<InvalidOperationException>(() => surface.WritablePixels[0] = 9);
         Assert.True(scenario.Host.CompleteAccepted().IsSuccess);
         var fence = await present;
@@ -222,7 +231,15 @@ public sealed class Phase9GuiOwnershipTests
 
         var present = compositor.PresentReadLeaseAsync(surfaces[0]).AsTask();
         Assert.True(scenario.Host.ProcessNext().IsSuccess);
-        Assert.True(SpinWait.SpinUntil(() => scenario.Kernel.Regions.Snapshot().Single(x => x.Handle.RegionId == buffers[0].Handle.RegionId).State == RegionState.Loaned, 1000));
+        // PreparePresent completes before the async client continuation borrows pixels.
+        // Yield the test worker while waiting for that ownership handoff.
+        var waitStarted = global::System.Diagnostics.Stopwatch.GetTimestamp();
+        while (scenario.Kernel.Regions.Snapshot().Single(x => x.Handle.RegionId == buffers[0].Handle.RegionId).State != RegionState.Loaned &&
+               global::System.Diagnostics.Stopwatch.GetElapsedTime(waitStarted) < TimeSpan.FromSeconds(1) && !present.IsCompleted)
+            await Task.Delay(1);
+        var observed = scenario.Kernel.Regions.Snapshot().Single(x => x.Handle.RegionId == buffers[0].Handle.RegionId);
+        Assert.True(observed.State == RegionState.Loaned,
+            $"Read-lease handoff state={observed.State}; present={present.Status}; error={present.Exception}");
         Assert.True(scenario.Host.AcceptNext().IsSuccess);
         Assert.True(scenario.Host.CompleteAccepted().IsSuccess);
         var fence = await present;
@@ -258,6 +275,10 @@ public sealed class Phase9GuiOwnershipTests
     {
         var kernel = new RuntimeKernel();
         var caller = TestFixtures.Create(kernel, seed, seed * 10).Handle;
+        var configure = Mint(kernel, caller, ResourceKind.KernelService, CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure);
+        var budget = kernel.AdmitProcessBudget(caller, configure, caller, "surface-caller",
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 256), new(ServiceBudgetDimension.IpcMessages, 32), new(ServiceBudgetDimension.IpcBytes, 16384)]);
+        Assert.True(budget.IsSuccess, budget.Message);
         var admitted = Admit(kernel, seed + 1, seed * 10 + 1, $"compositor-{seed}", $"phase9-compositor-{seed}", ICompositorServiceProtocol.CreateDefinition(), ICompositorServiceResponseProtocol.Definition,
             new(ResourceKind.Compositor, CapabilityResourceIds.CompositorPresent, CapabilityRights.Read | CapabilityRights.Write));
         var capability = Mint(kernel, caller, ResourceKind.Compositor, CapabilityResourceIds.CompositorPresent, CapabilityRights.Read | CapabilityRights.Write);
@@ -274,7 +295,8 @@ public sealed class Phase9GuiOwnershipTests
         byte[] image = [(byte)(processId & 0xff), 0x50, 0x39];
         var contract = new ServiceContractIdentity(protocol.ContractName, "1", protocol.ContractDigest);
         var provided = new ProvidedServiceManifestV1(serviceName, contract);
-        var manifest = new ServiceManifestV1(new(componentName), new("1"), Convert.ToHexString(SHA256.HashData(image)).ToLowerInvariant(), TestFixtures.Manifest(processId, domainId, 1, componentName), [provided]);
+        var manifest = new ServiceManifestV1(new(componentName), new("1"), Convert.ToHexString(SHA256.HashData(image)).ToLowerInvariant(), TestFixtures.Manifest(processId, domainId, 1, componentName), [provided],
+            budgetRequests: [new(ServiceBudgetDimension.OwnedMemoryBytes, 256), new(ServiceBudgetDimension.IpcMessages, 32), new(ServiceBudgetDimension.IpcBytes, 16384)]);
         var result = kernel.AdmitComponent(new(manifest, image, providedServices: [new(provided, protocol, response, [requirement])]));
         Assert.True(result.IsSuccess, result.Message);
         return (result.Value!.Process, kernel.ResolveByServiceName(serviceName).Value);

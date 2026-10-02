@@ -22,6 +22,8 @@ internal sealed record V6StatefulSuspensionReceipt(
     ulong CapturedStateBytes,
     V6StatefulSuspensionState State)
 {
+    public BudgetReservationHandle StorageReservation { get; internal set; } = StorageReservation;
+    public V6StatefulSuspensionState State { get; internal set; } = State;
     internal bool AuthorizesResume => false;
     internal bool PreservesCapability => false;
 }
@@ -41,6 +43,26 @@ internal sealed class V6StatefulResumeAccounting(ResourceBudgetAuthority budgets
     private readonly Dictionary<Guid, Record> _records = [];
     private readonly HashSet<string> _pendingCorrelations = new(StringComparer.Ordinal);
     private bool _failNextSettlementForTest;
+    private Action? _afterStorageBindForTest;
+    private bool _failNextStorageRecordAllocationForTest;
+    private Action<BudgetReservationHandle>? _beforeStorageBindForTest;
+
+    internal void BeforeNextStorageBindForTest(Action<BudgetReservationHandle> callback)
+    {
+        ArgumentNullException.ThrowIfNull(callback);
+        lock (_sync) _beforeStorageBindForTest = callback;
+    }
+
+    internal void FailNextStorageRecordAllocationForTest()
+    {
+        lock (_sync) _failNextStorageRecordAllocationForTest = true;
+    }
+
+    internal void AfterNextStorageBindForTest(Action callback)
+    {
+        ArgumentNullException.ThrowIfNull(callback);
+        lock (_sync) _afterStorageBindForTest = callback;
+    }
 
     internal void FailNextSettlementForTest()
     {
@@ -126,48 +148,112 @@ internal sealed class V6StatefulResumeAccounting(ResourceBudgetAuthority budgets
             return KernelResult<V6StatefulSuspensionReceipt>.Fail(KernelError.StaleGeneration,
                 "Captured state generations changed before storage admission.");
 
-        lock (_sync)
+        var handle = new V6StatefulSuspensionHandle(Guid.NewGuid(), 1);
+        V6StatefulSuspensionReceipt receipt;
+        try
         {
+          lock (_sync)
+          {
             if (_pendingCorrelations.Contains(resumeBinding.OperationCorrelation) ||
                 _records.Values.Any(record => record.Receipt.ResumeBinding.OperationCorrelation == resumeBinding.OperationCorrelation &&
-                    record.Receipt.State is V6StatefulSuspensionState.Suspended or V6StatefulSuspensionState.ResumeInFlight))
+                    (record.Receipt.State is not (V6StatefulSuspensionState.Resumed or
+                        V6StatefulSuspensionState.Discarded or V6StatefulSuspensionState.SettlementPending) ||
+                     (record.Receipt.State == V6StatefulSuspensionState.SettlementPending &&
+                        record.Receipt.ResumeBinding == resumeBinding))))
                 return KernelResult<V6StatefulSuspensionReceipt>.Fail(KernelError.DuplicateIdentity,
                     "The captured operation correlation already has a live suspension escrow.");
             _pendingCorrelations.Add(resumeBinding.OperationCorrelation);
+            try
+            {
+                if (_failNextStorageRecordAllocationForTest)
+                {
+                    _failNextStorageRecordAllocationForTest = false;
+                    throw new OutOfMemoryException("Injected storage record allocation failure.");
+                }
+                receipt = new(handle, resumeBinding, default, capturedStateBytes, V6StatefulSuspensionState.Suspended);
+                _records.Add(handle.Id, new(receipt));
+            }
+            catch
+            {
+                _pendingCorrelations.Remove(resumeBinding.OperationCorrelation);
+                throw;
+            }
+          }
         }
+        catch (Exception exception) when (exception is ArgumentException or OutOfMemoryException)
+        { return KernelResult<V6StatefulSuspensionReceipt>.Fail(KernelError.CapacityExhausted, exception.Message); }
 
         var reserved = budgets.ReserveCheckpointStorage(owner, capturedStateBytes);
         if (!reserved.IsSuccess)
         {
+            lock (_sync) _records.Remove(handle.Id);
             RemovePending(resumeBinding.OperationCorrelation);
             return KernelResult<V6StatefulSuspensionReceipt>.Fail(reserved.Error, reserved.Message!);
         }
         var reservation = reserved.Value!.Reservation;
-        var bound = budgets.BindLease(owner, reservation);
+        receipt.StorageReservation = reservation;
+        Action<BudgetReservationHandle>? beforeStorageBind;
+        lock (_sync)
+        {
+            beforeStorageBind = _beforeStorageBindForTest;
+            _beforeStorageBindForTest = null;
+        }
+        KernelResult<BudgetReservationSnapshot> bound;
+        try
+        {
+            beforeStorageBind?.Invoke(reservation);
+            bound = budgets.BindLease(owner, reservation);
+        }
+        catch (Exception exception)
+        { bound = KernelResult<BudgetReservationSnapshot>.Fail(KernelError.PlatformUnavailable, exception.Message); }
         if (!bound.IsSuccess)
         {
-            _ = budgets.Release(owner, reservation);
+            var released = budgets.Release(owner, reservation);
+            if (!released.IsSuccess || released.Value!.Reservation != reservation || released.Value.Owner != owner ||
+                released.Value.State is not (BudgetReservationState.Released or BudgetReservationState.CancelledPreSubmit))
+            {
+                _ = budgets.QuarantineLease(owner, reservation);
+                lock (_sync)
+                {
+                    receipt.State = V6StatefulSuspensionState.Quarantined;
+                    _pendingCorrelations.Remove(resumeBinding.OperationCorrelation);
+                }
+                return KernelResult<V6StatefulSuspensionReceipt>.Fail(KernelError.PlatformFaulted,
+                    "Captured-state bind failed and exact budget cleanup was not confirmed; recovery escrow is retained.");
+            }
+            lock (_sync) _records.Remove(handle.Id);
             RemovePending(resumeBinding.OperationCorrelation);
             return KernelResult<V6StatefulSuspensionReceipt>.Fail(bound.Error, bound.Message!);
         }
-        var handle = new V6StatefulSuspensionHandle(Guid.NewGuid(), 1);
-        var receipt = new V6StatefulSuspensionReceipt(handle, resumeBinding, reservation,
-            capturedStateBytes, V6StatefulSuspensionState.Suspended);
-        try
+        Action? afterStorageBind;
+        lock (_sync)
         {
-            lock (_sync)
+            afterStorageBind = _afterStorageBindForTest;
+            _afterStorageBindForTest = null;
+        }
+        var generationsCurrent = GenerationsMatch(resumeBinding,
+            afterStorageBind is null ? currentProviderGeneration : () =>
             {
-                _records.Add(handle.Id, new(receipt));
-                _pendingCorrelations.Remove(resumeBinding.OperationCorrelation);
-            }
-        }
-        catch (Exception exception) when (exception is ArgumentException or OutOfMemoryException)
+                afterStorageBind();
+                return currentProviderGeneration();
+            }, currentRuntimeGeneration, out var generationError);
+        if (!generationsCurrent)
         {
-            _ = budgets.Release(owner, reservation);
-            RemovePending(resumeBinding.OperationCorrelation);
-            return KernelResult<V6StatefulSuspensionReceipt>.Fail(KernelError.CapacityExhausted, exception.Message);
+            // The payload was captured before this escrow admission. A generation
+            // loss cannot prove its closure or authorize releasing storage.
+            var quarantined = budgets.QuarantineLease(owner, reservation);
+            if (!quarantined.IsSuccess)
+                generationError = KernelResult.Fail(KernelError.PlatformFaulted,
+                    "Captured-state continuity was lost and storage quarantine was not confirmed.");
         }
-        return KernelResult<V6StatefulSuspensionReceipt>.Ok(receipt);
+        lock (_sync)
+        {
+            receipt.State = generationsCurrent ? V6StatefulSuspensionState.Suspended : V6StatefulSuspensionState.Quarantined;
+            _pendingCorrelations.Remove(resumeBinding.OperationCorrelation);
+        }
+        return generationsCurrent
+            ? KernelResult<V6StatefulSuspensionReceipt>.Ok(receipt)
+            : KernelResult<V6StatefulSuspensionReceipt>.Fail(generationError.Error, generationError.Message!);
     }
 
     internal KernelResult<V6StatefulSuspensionReceipt> Resume(
@@ -245,6 +331,18 @@ internal sealed class V6StatefulResumeAccounting(ResourceBudgetAuthority budgets
         {
             lock (_sync) record.Receipt = record.Receipt with { State = V6StatefulSuspensionState.Suspended };
             return KernelResult<V6StatefulSuspensionReceipt>.Fail(generationError.Error, generationError.Message!);
+        }
+
+        // Admission and generation callbacks run outside the escrow owner lock.
+        // Their success cannot preserve a reservation that the budget owner changed.
+        storage = budgets.Query(record.Receipt.StorageReservation);
+        if (!storage.IsSuccess || storage.Value!.Owner != owner || storage.Value.State != BudgetReservationState.Bound ||
+            storage.Value.Lifetime != BudgetReservationLifetime.CheckpointImage ||
+            storage.Value.Amounts.SingleOrDefault(static amount => amount.Dimension == ServiceBudgetDimension.CheckpointStorageBytes).Amount != record.Receipt.CapturedStateBytes)
+        {
+            lock (_sync) record.Receipt = record.Receipt with { State = V6StatefulSuspensionState.Suspended };
+            return KernelResult<V6StatefulSuspensionReceipt>.Fail(KernelError.StaleGeneration,
+                "Captured-state storage escrow changed during final resume admission.");
         }
 
         KernelResult resumed;

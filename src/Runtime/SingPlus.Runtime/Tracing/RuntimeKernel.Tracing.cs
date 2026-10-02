@@ -5,11 +5,19 @@ namespace SingPlus.Runtime;
 public sealed partial class RuntimeKernel
 {
     private readonly Dictionary<TraceSessionHandle, (ProcessHandle Owner, BudgetReservationHandle Reservation)> _traceBudgetReservations = [];
+    private readonly object _traceBudgetReservationsGate = new();
 
     public KernelResult<TraceSessionAdmission> StartTraceSession(
         ProcessHandle owner,
         int producerCapacity,
         TraceOverflowPolicy overflowPolicy = TraceOverflowPolicy.DropWithMarker)
+    {
+        lock (_platformMemoryUseGate)
+            return StartTraceSessionLocked(owner, producerCapacity, overflowPolicy);
+    }
+
+    private KernelResult<TraceSessionAdmission> StartTraceSessionLocked(
+        ProcessHandle owner, int producerCapacity, TraceOverflowPolicy overflowPolicy)
     {
         var process = Processes.Resolve(owner);
         if (!process.IsSuccess) return KernelResult<TraceSessionAdmission>.Fail(process.Error, process.Message!);
@@ -19,6 +27,15 @@ public sealed partial class RuntimeKernel
         var budget = ReserveAttachedBudget(owner, [new(ServiceBudgetDimension.TraceTelemetryBufferBytes, bytes)],
             BudgetReservationLifetime.TraceTelemetryBuffer);
         if (!budget.IsSuccess) return KernelResult<TraceSessionAdmission>.Fail(budget.Error, budget.Message!);
+        // Budget trace publication can invoke the configured clock and reenter
+        // lifecycle code. The admission lock does not preserve that permission.
+        var fresh = Processes.Resolve(owner);
+        var freshEffect = fresh.IsSuccess ? EnsureProcessAcceptsNewEffects(fresh.Value!) : KernelResult.Fail(fresh.Error, fresh.Message!);
+        if (!freshEffect.IsSuccess)
+        {
+            _ = ReleaseAttachedBudget(owner, budget.Value);
+            return KernelResult<TraceSessionAdmission>.Fail(freshEffect.Error, freshEffect.Message!);
+        }
         var started = Traces.Start(owner, producerCapacity, overflowPolicy, TraceVisibilityClass.Self);
         if (!started.IsSuccess)
         {
@@ -26,7 +43,8 @@ public sealed partial class RuntimeKernel
             return started;
         }
         if (budget.Value is { } reservation)
-            _traceBudgetReservations.Add(started.Value!.Session, (owner, reservation));
+            lock (_traceBudgetReservationsGate)
+                _traceBudgetReservations.Add(started.Value!.Session, (owner, reservation));
         return started;
     }
 
@@ -55,8 +73,7 @@ public sealed partial class RuntimeKernel
         var process = Processes.Resolve(owner);
         if (!process.IsSuccess) return KernelResult<TraceSessionAdmission>.Fail(process.Error, process.Message!);
         var stopped = Traces.Stop(owner, session);
-        if (stopped.IsSuccess && _traceBudgetReservations.Remove(session, out var charge))
-            _ = ReleaseAttachedBudget(charge.Owner, charge.Reservation);
+        if (stopped.IsSuccess) ReleaseTraceBudget(session);
         return stopped;
     }
 
@@ -75,11 +92,25 @@ public sealed partial class RuntimeKernel
 
     private void CloseTraceSessionsForProcess(ProcessHandle owner)
     {
-        foreach (var session in Traces.StopAllForProcess(owner))
-        {
-            if (_traceBudgetReservations.Remove(session, out var charge))
-                _ = ReleaseAttachedBudget(charge.Owner, charge.Reservation);
-        }
+        _ = Traces.StopAllForProcess(owner);
+        // Previously stopped sessions can still hold refused accounting. The
+        // actual teardown consumer routes those exact captured charges as well.
+        TraceSessionHandle[] sessions;
+        lock (_traceBudgetReservationsGate)
+            sessions = _traceBudgetReservations.Where(item => item.Value.Owner == owner)
+                .Select(item => item.Key).ToArray();
+        foreach (var session in sessions) ReleaseTraceBudget(session);
+    }
+
+    private void ReleaseTraceBudget(TraceSessionHandle session)
+    {
+        (ProcessHandle Owner, BudgetReservationHandle Reservation) charge;
+        lock (_traceBudgetReservationsGate)
+            if (!_traceBudgetReservations.TryGetValue(session, out charge)) return;
+        if (!ReleaseAttachedBudget(charge.Owner, charge.Reservation).IsSuccess) return;
+        lock (_traceBudgetReservationsGate)
+            if (_traceBudgetReservations.TryGetValue(session, out var current) && current == charge)
+                _traceBudgetReservations.Remove(session);
     }
 
     private void RecordTrace(

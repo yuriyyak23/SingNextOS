@@ -4,6 +4,24 @@ namespace SingPlus.Tests.Contracts;
 
 public sealed class PreemptionContractsV1Tests
 {
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public void ResumeBindingRejectsMalformedUnicodeCorrelation(int surrogate)
+    {
+        var correlation = new string(surrogate == 0 ? '\uD800' : '\uDC00', 1);
+        Assert.Throws<ArgumentException>(() =>
+            new ResumeBindingV1(1, correlation, Digest, Digest, 1, 2, 3, 4).Validate());
+    }
+
+    [Fact]
+    public void ResumeBindingPreservesValidSupplementaryUnicodeAtExistingCharacterLimit()
+    {
+        var correlation = string.Concat(Enumerable.Repeat("\U0001F680", 128));
+        Assert.Equal(256, correlation.Length);
+        Assert.Equal(correlation, new ResumeBindingV1(1, correlation, Digest, Digest, 1, 2, 3, 4).Validate().OperationCorrelation);
+    }
+
     private const string Digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     [Fact]

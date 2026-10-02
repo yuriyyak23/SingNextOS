@@ -8,6 +8,50 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class HybridCpuExternalOperationProviderTests
 {
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void NonResourceProviderReleaseProjectsOnlyActualLocalAuthorityFact(int phase)
+    {
+        var scenario = CreateScenario();
+        var request = Assert.IsType<Hc.ExternalOperationAdmissionReceipt>(scenario.Provider.Admit(Semantic()).Receipt).Request;
+        Assert.Equal(Hc.ExternalOperationStage.Submitted, scenario.Provider.Submit(request).Receipt!.Stage);
+        if (phase == 0)
+        {
+            Assert.True(scenario.Provider.RecordDeviceCompletion(request).IsSuccess);
+            var completed = Assert.Single(scenario.Kernel.ExternalOperations.InspectionSnapshot());
+            var invented = completed with { State = ExternalOperationState.Released,
+                Transitions = [.. completed.Transitions, new(completed.Transitions[^1].Sequence + 1,
+                    completed.State, ExternalOperationState.Released, "Released")] };
+            Assert.Throws<InvalidOperationException>(() => V6ExternalOperationTraceProjection.ProjectPublishedPrefix(invented, new string('a', 64)));
+            Assert.True(scenario.Provider.RecordVisibility(request).IsSuccess);
+            Assert.True(scenario.Provider.Publish(request, () => scenario.Input.Span.CopyTo(scenario.Output.Span)).IsSuccess);
+        }
+        else if (phase == 1 || phase == 3)
+            Assert.True(scenario.Provider.RecordDeviceCompletion(request, phase == 1
+                ? ExternalOperationCompletionDisposition.Faulted : ExternalOperationCompletionDisposition.Cancelled).IsSuccess);
+        else
+            Assert.True(scenario.Kernel.ExternalOperations.RecordProviderLoss(
+                Assert.Single(scenario.Kernel.ExternalOperations.InspectionSnapshot()).Operation).IsSuccess);
+        var before = Assert.Single(scenario.Kernel.ExternalOperations.InspectionSnapshot());
+        Assert.Equal(KernelError.InvalidTransition, scenario.Kernel.ExternalOperations.QueryResourceBinding(before.Operation).Error);
+        Assert.False(scenario.Provider.Release(request, providerResourcesClosed: false).IsSuccess);
+        Assert.Equal(before.Transitions, Assert.Single(scenario.Kernel.ExternalOperations.InspectionSnapshot()).Transitions);
+        Assert.True(scenario.Provider.Release(request, providerResourcesClosed: true).IsSuccess);
+        var released = Assert.Single(scenario.Kernel.ExternalOperations.InspectionSnapshot());
+        Assert.True(scenario.Provider.Release(request, providerResourcesClosed: true).IsSuccess);
+        Assert.Equal(released.Transitions, Assert.Single(scenario.Kernel.ExternalOperations.InspectionSnapshot()).Transitions);
+        var trace = V6ExternalOperationTraceProjection.ProjectPublishedPrefix(released, new string('a', 64));
+        Assert.True(SemanticTraceValidatorV1.Validate(trace).IsValid);
+        Assert.Equal(SemanticTraceEventKindV1.LocalAuthorityReleasedWithoutResourceBinding, trace[^1].Kind);
+        Assert.DoesNotContain(trace, item => item.Kind is SemanticTraceEventKindV1.Settled or
+            SemanticTraceEventKindV1.EffectClosedWithoutPublication or SemanticTraceEventKindV1.Released);
+        Assert.Equal(phase != 0, trace.Any(item => item.Kind == SemanticTraceEventKindV1.Quarantined));
+        Assert.False(trace[^1].AuthorizesEffect);
+    }
+
     [Fact]
     public void PackagedAdapterSessionDrivesExactSingNextProviderStages()
     {

@@ -33,6 +33,9 @@ public sealed partial class RuntimeKernel
     {
         var validation = ValidateExternalOperationPrincipal(principal, operation, requireNewEffect: true);
         if (!validation.IsSuccess) return KernelResult<OperationAdmissionSnapshot>.Fail(validation.Error, validation.Message!);
+        var cancellationValidation = ExternalOperationAuthority.ValidateCancellationSupport(cancellationSupport);
+        if (!cancellationValidation.IsSuccess)
+            return KernelResult<OperationAdmissionSnapshot>.Fail(cancellationValidation.Error, cancellationValidation.Message!);
         if (cancellationScope is { } scope)
         {
             var binding = CancellationScopes.BindConsumer(principal, scope,
@@ -59,7 +62,8 @@ public sealed partial class RuntimeKernel
             return admitted;
         }
         if (budget.Value is { } reservation)
-            _externalOperationBudgetReservations.Add(operation, (principal, reservation));
+            lock (_externalOperationBudgetReservationsGate)
+                _externalOperationBudgetReservations.Add(operation, (principal, reservation));
         RecordTrace(principal, TraceEventKind.ExternalOperationAdmitted, traceContext, "external-operation",
             $"{operation.OperationId.Value}:{operation.Generation.Value}", "admitted", "admitted");
         return admitted;
@@ -75,6 +79,9 @@ public sealed partial class RuntimeKernel
         var validation = ValidateExternalOperationPrincipal(principal, operation, requireNewEffect: true);
         if (!validation.IsSuccess)
             return KernelResult<OperationAdmissionSnapshot>.Fail(validation.Error, validation.Message!);
+        var cancellationValidation = ExternalOperationAuthority.ValidateCancellationSupport(cancellationSupport);
+        if (!cancellationValidation.IsSuccess)
+            return KernelResult<OperationAdmissionSnapshot>.Fail(cancellationValidation.Error, cancellationValidation.Message!);
         if (cancellationScope is { } scope)
         {
             var binding = CancellationScopes.BindConsumer(principal, scope,
@@ -102,7 +109,8 @@ public sealed partial class RuntimeKernel
             return admitted;
         }
         if (budget.Value is { } reservation)
-            _externalOperationBudgetReservations.Add(operation, (principal, reservation));
+            lock (_externalOperationBudgetReservationsGate)
+                _externalOperationBudgetReservations.Add(operation, (principal, reservation));
         return admitted;
     }
 
@@ -322,8 +330,8 @@ public sealed partial class RuntimeKernel
                 _ = CancellationScopes.RecordDisposition(principal, scope, outcome);
             }
         }
-        if (released.IsSuccess && _externalOperationBudgetReservations.Remove(operation, out var charge))
-            _ = ReleaseAttachedBudget(principal, charge.Reservation);
+        if (released.IsSuccess)
+            ReleaseExternalOperationBudget(principal, operation);
         if (released.IsSuccess)
         {
             RecordTrace(principal, TraceEventKind.ExternalOperationReleased, traceContext, "external-operation",

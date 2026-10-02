@@ -76,6 +76,13 @@ internal sealed class V6SharedOperationSessionProvider(
                 owner.Value.Disposition != ExternalOperationDisposition.Active ||
                 owner.Value.Binding != exact)
                 return Failure(Hc.ExternalOperationProviderPollStatus.Stale);
+            var budget = kernel.Budgets.Query(commit.Lease);
+            if (!budget.IsSuccess || budget.Value!.Owner != commit.BudgetOwner ||
+                budget.Value.State != BudgetReservationState.Consuming)
+                return Failure(Hc.ExternalOperationProviderPollStatus.Stale);
+            if (owner.Value.Admission is not { } admission ||
+                admission.RegionUses.Any(use => !kernel.Regions.ValidateUse(use.Handle, owner.Value.Principal).IsSuccess))
+                return Failure(Hc.ExternalOperationProviderPollStatus.Stale);
             issued = true;
             binding = exact;
         }
@@ -88,6 +95,15 @@ internal sealed class V6SharedOperationSessionProvider(
             {
                 lock (sync)
                 {
+                    var owner = kernel.QueryExternalOperation(commit.Principal, commit.Operation);
+                    var budget = kernel.Budgets.Query(commit.Lease);
+                    if (!owner.IsSuccess || owner.Value!.State != ExternalOperationState.Submitted ||
+                        owner.Value.Disposition != ExternalOperationDisposition.Active || owner.Value.Binding != binding ||
+                        cancellationRequested || !budget.IsSuccess || budget.Value!.Owner != commit.BudgetOwner ||
+                        budget.Value.State != BudgetReservationState.Consuming ||
+                        owner.Value.Admission is not { } admission ||
+                        admission.RegionUses.Any(use => !kernel.Regions.ValidateUse(use.Handle, owner.Value.Principal).IsSuccess))
+                        return Failure(Hc.ExternalOperationProviderPollStatus.Faulted);
                     executionAccepted = true;
                     delivered = Hc.ExternalOperationStage.Submitted;
                 }

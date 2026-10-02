@@ -1,3 +1,5 @@
+using System.Text;
+
 namespace SingPlus.Contracts;
 
 public enum SipResourceDonationPolicyV1
@@ -28,8 +30,15 @@ public readonly record struct SipResourceRequirementV1
             throw new ArgumentOutOfRangeException(nameof(maximumAmount), maximumAmount,
                 "SIP resource maximum must be finite and non-zero.");
         if (string.IsNullOrWhiteSpace(semanticScope) ||
-            !string.Equals(semanticScope, semanticScope.Trim(), StringComparison.Ordinal))
+            !string.Equals(semanticScope, semanticScope.Trim(), StringComparison.Ordinal) ||
+            semanticScope.Any(char.IsControl))
             throw new ArgumentException("SIP resource semantic scope must be non-empty and canonical.", nameof(semanticScope));
+        try { _ = new UTF8Encoding(false, true).GetByteCount(semanticScope); }
+        catch (EncoderFallbackException exception)
+        {
+            throw new ArgumentException("SIP resource semantic scope must contain only Unicode scalar values.",
+                nameof(semanticScope), exception);
+        }
         if (resourceClass != ResourceClassV1.ComputeTime || unit != ResourceUnitV1.Nanoseconds)
             throw new NotSupportedException("Only the P01 compute-time/nanoseconds resource family is supported.");
 

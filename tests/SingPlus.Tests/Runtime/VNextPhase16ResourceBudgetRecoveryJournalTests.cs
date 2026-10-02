@@ -185,6 +185,52 @@ public sealed class VNextPhase16ResourceBudgetRecoveryJournalTests
         }));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void LiveReplayRejectsAuthenticatedForkWithoutChangingObservedPrefix(bool longer)
+    {
+        var store = new MemoryStore();
+        var journal = new ResourceBudgetRecoveryJournal(store, Key, Guid.NewGuid());
+        journal.Append(Payload(ResourceBudgetRecoveryTransition.Prepared));
+        journal.Append(Payload(ResourceBudgetRecoveryTransition.PossibleSubmit));
+        var original = store.ReadFrames();
+        var branchStore = new MemoryStore();
+        branchStore.Frames.Add(original[0].ToArray());
+        var branch = new ResourceBudgetRecoveryJournal(branchStore, Key);
+        branch.Append(Payload(ResourceBudgetRecoveryTransition.CancelledPreSubmit));
+        if (longer) branch.Append(Payload(ResourceBudgetRecoveryTransition.Prepared) with
+        {
+            Lease = new BudgetReservationHandle(new BudgetReservationId(32), new BudgetGeneration(4))
+        });
+        store.Frames.Clear();
+        store.Frames.AddRange(branchStore.ReadFrames());
+        Assert.Throws<InvalidDataException>(() => journal.Replay());
+        var frameCount = store.Frames.Count;
+        Assert.Throws<InvalidDataException>(() => journal.Append(Payload(ResourceBudgetRecoveryTransition.Prepared) with
+        {
+            Lease = new BudgetReservationHandle(new BudgetReservationId(33), new BudgetGeneration(4))
+        }));
+        Assert.Equal(frameCount, store.Frames.Count);
+        store.Frames.Clear();
+        store.Frames.AddRange(original);
+        Assert.Equal(2UL, journal.Replay().LastSequence);
+        Assert.Equal([Amount(1000)], journal.Replay().ConservativeRecoveryCharge);
+    }
+
+    [Fact]
+    public void LiveReplayAcceptsAuthenticatedExtensionOfObservedPrefix()
+    {
+        var store = new MemoryStore();
+        var journal = new ResourceBudgetRecoveryJournal(store, Key, Guid.NewGuid());
+        journal.Append(Payload(ResourceBudgetRecoveryTransition.Prepared));
+        journal.Append(Payload(ResourceBudgetRecoveryTransition.PossibleSubmit));
+        var extension = new ResourceBudgetRecoveryJournal(store, Key);
+        extension.Append(Payload(ResourceBudgetRecoveryTransition.Quarantined));
+        Assert.Equal(3UL, journal.Replay().LastSequence);
+        Assert.Equal([Amount(1000)], journal.Replay().ConservativeRecoveryCharge);
+    }
+
     private static ResourceBudgetRecoveryPayload Payload(
         ResourceBudgetRecoveryTransition transition,
         IReadOnlyList<BudgetAmount>? charged = null) =>

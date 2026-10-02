@@ -9,6 +9,46 @@ namespace SingPlus.Tests.Runtime;
 public sealed class CxlAuthorityBridgeTests
 {
     [Fact]
+    public void DirectFabricReceiptRetainsParentUntilExactClosure()
+    {
+        var s = CreateScenario();
+        var fabric = s.Bridge.BindFabric(s.Owner, s.Use.Handle, s.Subject, s.Lease, Request(s.Cxl.Endpoint)).Value!;
+        Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.RevokePlatformDevice(s.Subject.Process, s.Lease).Error);
+        var capability = DeviceCapability(s);
+        Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.RevokeCapability(capability).Error);
+        Assert.True(s.Bridge.ReleaseFabric(fabric).IsSuccess);
+        Assert.True(s.Kernel.RevokeCapability(capability).IsSuccess);
+    }
+
+    [Fact]
+    public void EndpointQueryRevocationPreventsNewDirectFabricEffect()
+    {
+        var s = CreateScenario();
+        s.Cxl.EndpointQueryHook = () => Assert.True(s.Kernel.CapabilityAuthority.Revoke(DeviceCapability(s)).IsSuccess);
+        var result = s.Bridge.BindFabric(s.Owner, s.Use.Handle, s.Subject, s.Lease, Request(s.Cxl.Endpoint));
+        Assert.Equal(KernelError.CapabilityRevoked, result.Error);
+        Assert.Equal(0, s.Cxl.FabricBindCalls);
+        Assert.True(s.Kernel.RevokePlatformDevice(s.Subject.Process, s.Lease).IsSuccess);
+    }
+
+    [Fact]
+    public void CoherentAdmissionRejectsRevokedSourceBeforeProviderCallback()
+    {
+        var s = CreateScenario();
+        var fabric = s.Bridge.BindFabric(s.Owner, s.Use.Handle, s.Subject, s.Lease, Request(s.Cxl.Endpoint)).Value!;
+        Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.RevokeCapability(DeviceCapability(s)).Error);
+        var result = s.Bridge.BindCoherentAccess(s.Owner, s.Use.Handle, fabric);
+        Assert.Equal(KernelError.CapabilityRevoked, result.Error);
+        Assert.Equal(0, s.Cxl.CoherentBindCalls);
+        Assert.True(s.Bridge.ReleaseFabric(fabric).IsSuccess);
+        Assert.True(s.Kernel.RevokeCapability(DeviceCapability(s)).IsSuccess);
+    }
+
+    private static CapabilityId DeviceCapability(Scenario s) => s.Kernel.CapabilityAuthority.InspectionSnapshot()
+        .Single(item => item.Descriptor.ResourceKind == ResourceKind.Device && item.Descriptor.ResourceId == s.Lease.Device.ResourceId)
+        .Descriptor.CapabilityId;
+
+    [Fact]
     public void NarrowProviderRolesRemainIndependentAndPhysicalIdentityIsNotPublic()
     {
         var assembly = typeof(ICxlDiscoveryProvider).Assembly;
@@ -148,13 +188,18 @@ public sealed class CxlAuthorityBridgeTests
         public ulong CoherentGeneration { get; set; } = 1;
         public CxlEndpointFeatures Features { get; set; } = CxlEndpointFeatures.Io | CxlEndpointFeatures.Memory | CxlEndpointFeatures.CoherentAccess;
         public int FabricBindCalls { get; private set; }
+        internal Action? EndpointQueryHook { get; set; }
+        internal int CoherentBindCalls { get; private set; }
         public CxlEndpointSnapshot Endpoint => new(new("endpoint-0"), new(DeviceGeneration), Features, true);
         private CxlFabricBinding? _fabric;
         private CxlMemoryBinding? _memory;
         private CxlCoherentBinding? _coherent;
 
-        public PlatformAuthorityResult<CxlEndpointSnapshot> QueryEndpoint(CxlEndpointId endpointId) =>
-            endpointId == Endpoint.EndpointId ? PlatformAuthorityResult<CxlEndpointSnapshot>.Ok(Endpoint) : Fail<CxlEndpointSnapshot>();
+        public PlatformAuthorityResult<CxlEndpointSnapshot> QueryEndpoint(CxlEndpointId endpointId)
+        {
+            EndpointQueryHook?.Invoke();
+            return endpointId == Endpoint.EndpointId ? PlatformAuthorityResult<CxlEndpointSnapshot>.Ok(Endpoint) : Fail<CxlEndpointSnapshot>();
+        }
         public PlatformAuthorityResult<PlatformDeviceIdentity> ResolveDevice(CxlEndpointId endpointId, CxlDeviceGeneration expectedGeneration) =>
             expectedGeneration.Value == DeviceGeneration ? PlatformAuthorityResult<PlatformDeviceIdentity>.Ok(new("device:cxl-semantic-0")) : Stale<PlatformDeviceIdentity>();
         public PlatformAuthorityResult<CxlMemoryCapacitySnapshot> QueryCapacity(CxlEndpointId endpointId) =>
@@ -180,6 +225,7 @@ public sealed class CxlAuthorityBridgeTests
         public PlatformAuthorityResult<CxlCoherentBinding> BindCoherentAccess(CxlFabricBinding fabricBinding, RegionUseDescriptor regionUse)
         {
             _coherent = new(new(1), new(CoherentGeneration), fabricBinding, regionUse.Handle);
+            CoherentBindCalls++;
             return PlatformAuthorityResult<CxlCoherentBinding>.Ok(_coherent);
         }
         public PlatformAuthorityResult<CxlCoherentBinding> QueryCoherentAccess(CxlCoherentBindingId bindingId) => _coherent is null ? Fail<CxlCoherentBinding>() :

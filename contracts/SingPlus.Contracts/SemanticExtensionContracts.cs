@@ -104,10 +104,19 @@ public sealed record SemanticExtensionClauseV1
         return new(version, new(classId.Value), schemaId, schemaVersion, requirement, payload.ToArray());
     }
 
-    private static void ValidateToken(string? value, int maximumUtf8Bytes, string parameter)
+    internal static void ValidateToken(string? value, int maximumUtf8Bytes, string parameter)
     {
-        if (string.IsNullOrWhiteSpace(value) || value != value.Trim() || value.Any(char.IsControl) ||
-            Encoding.UTF8.GetByteCount(value) > maximumUtf8Bytes)
+        if (value is null || value.Length > maximumUtf8Bytes ||
+            string.IsNullOrWhiteSpace(value) || value != value.Trim() || value.Any(char.IsControl))
+            throw new ArgumentException("Semantic extension identifiers must be bounded canonical UTF-8 tokens.", parameter);
+        int byteCount;
+        try { byteCount = new UTF8Encoding(false, true).GetByteCount(value); }
+        catch (EncoderFallbackException exception)
+        {
+            throw new ArgumentException("Semantic extension identifiers must contain valid Unicode scalar values.",
+                parameter, exception);
+        }
+        if (byteCount > maximumUtf8Bytes)
             throw new ArgumentException("Semantic extension identifiers must be bounded canonical UTF-8 tokens.", parameter);
     }
 }
@@ -169,10 +178,28 @@ public static class SemanticExtensionRefinementV1
         ArgumentNullException.ThrowIfNull(refines);
         ArgumentNullException.ThrowIfNull(permitsOptionalAbsence);
 
+        // Snapshot only relevant class decisions before semantic callbacks. This
+        // preserves the input set's Contains semantics without enumerating it.
+        var supported = requirements.Clauses.Concat(guarantees.Clauses)
+            .Select(clause => clause.ClassId).Distinct().Where(supportedClasses.Contains).ToHashSet();
         var provided = guarantees.Clauses.ToDictionary(clause => clause.ClassId);
+        foreach (var offered in guarantees.Clauses)
+            if (offered.Requirement == SemanticExtensionRequirement.Mandatory &&
+                !supported.Contains(offered.ClassId))
+                return new(SemanticExtensionMatchStatus.UnknownMandatory, offered.ClassId);
+        // Unsupported mandatory requirements deny before invoking any semantic
+        // callback, including optional-absence callbacks for earlier clauses.
+        foreach (var required in requirements.Clauses)
+            if (required.Requirement == SemanticExtensionRequirement.Mandatory &&
+                !supported.Contains(required.ClassId))
+                return new(SemanticExtensionMatchStatus.UnknownMandatory, required.ClassId);
+        foreach (var required in requirements.Clauses)
+            if (required.Requirement == SemanticExtensionRequirement.Mandatory &&
+                !provided.ContainsKey(required.ClassId))
+                return new(SemanticExtensionMatchStatus.MissingMandatory, required.ClassId);
         foreach (var required in requirements.Clauses)
         {
-            if (!supportedClasses.Contains(required.ClassId))
+            if (!supported.Contains(required.ClassId))
             {
                 if (required.Requirement == SemanticExtensionRequirement.Mandatory)
                     return new(SemanticExtensionMatchStatus.UnknownMandatory, required.ClassId);
@@ -205,6 +232,7 @@ public sealed record SemanticBindingExtensionSetV1
 {
     public const ushort CurrentVersion = 1;
     public const int MaxGenerationSnapshots = 32;
+    public const int MaxGenerationOwnerUtf8Bytes = 96;
 
     private SemanticBindingExtensionSetV1(
         string obligationsV1Digest,
@@ -244,11 +272,14 @@ public sealed record SemanticBindingExtensionSetV1
         ArgumentNullException.ThrowIfNull(generations);
         ValidateSha256(obligationsV1Digest, nameof(obligationsV1Digest));
         ValidateSha256(guaranteesV1Digest, nameof(guaranteesV1Digest));
-        var exact = generations.OrderBy(item => item.Owner, StringComparer.Ordinal).ToArray();
-        if (exact.Length > MaxGenerationSnapshots || exact.Any(item => item.Generation == 0 ||
-                string.IsNullOrWhiteSpace(item.Owner) || item.Owner != item.Owner.Trim() || item.Owner.Any(char.IsControl)) ||
-            exact.Select(item => item.Owner).Distinct(StringComparer.Ordinal).Count() != exact.Length)
+        var exact = generations.Take(MaxGenerationSnapshots + 1).ToArray();
+        if (exact.Length > MaxGenerationSnapshots || exact.Any(item => item.Generation == 0))
             throw new ArgumentException("Generation snapshot is invalid, duplicated, or exceeds its bound.", nameof(generations));
+        foreach (var generation in exact)
+            SemanticExtensionClauseV1.ValidateToken(generation.Owner, MaxGenerationOwnerUtf8Bytes, nameof(generations));
+        if (exact.Select(item => item.Owner).Distinct(StringComparer.Ordinal).Count() != exact.Length)
+            throw new ArgumentException("Duplicate generation snapshot owner.", nameof(generations));
+        Array.Sort(exact, (left, right) => StringComparer.Ordinal.Compare(left.Owner, right.Owner));
 
         var payload = new List<byte>();
         CanonicalEncoding.WriteUInt16(payload, CurrentVersion);
@@ -269,7 +300,8 @@ public sealed record SemanticBindingExtensionSetV1
 
     private static void ValidateSha256(string? value, string parameter)
     {
-        if (value is null || value.Length != 64 || value.Any(character => !Uri.IsHexDigit(character)))
+        if (value is null || value.Length != 64 ||
+            value.Any(character => character is not (>= '0' and <= '9' or >= 'a' and <= 'f')))
             throw new ArgumentException("A canonical SHA-256 hex digest is required.", parameter);
     }
 }
@@ -297,7 +329,7 @@ internal sealed class SemanticExtensionSetV1
     internal static SemanticExtensionSetV1 Create(IEnumerable<SemanticExtensionClauseV1> clauses)
     {
         ArgumentNullException.ThrowIfNull(clauses);
-        var exact = clauses.ToArray();
+        var exact = clauses.Take(MaxClauses + 1).ToArray();
         if (exact.Length > MaxClauses)
             throw new ArgumentOutOfRangeException(nameof(clauses), $"At most {MaxClauses} clauses are permitted.");
         if (exact.Any(clause => clause is null))
@@ -372,7 +404,8 @@ internal static class CanonicalEncoding
         target.AddRange(bytes);
     }
 
-    internal static void WriteString(List<byte> target, string value) => WriteBytes(target, Encoding.UTF8.GetBytes(value));
+    internal static void WriteString(List<byte> target, string value) =>
+        WriteBytes(target, new UTF8Encoding(false, true).GetBytes(value));
 
     internal static void WriteBytes(List<byte> target, ReadOnlySpan<byte> value)
     {

@@ -59,13 +59,27 @@ public sealed class SemanticAdmissionFormalModelTests
             StringComparison.Ordinal);
         var callbackBoundary = source.IndexOf("ResourceAdmissionQualificationPoint.BeforeProviderCallback", winner,
             StringComparison.Ordinal);
-        var providerCall = source.IndexOf("var provider = providerSubmit(", winner, StringComparison.Ordinal);
+        var dispatchValidation = source.IndexOf("RevalidateResourceDispatch(commit, submitted.Value!)", callbackBoundary,
+            StringComparison.Ordinal);
+        var helper = source.IndexOf("private KernelResult RevalidateResourceDispatch", StringComparison.Ordinal);
+        var ownerRead = source.IndexOf("var liveOwner = ExternalOperations.Query", helper, StringComparison.Ordinal);
+        var budgetRead = source.IndexOf("var liveBudget = Budgets.Query", helper, StringComparison.Ordinal);
+        var resourceRead = source.IndexOf("var liveResource = ExternalOperations.QueryResourceBinding", helper,
+            StringComparison.Ordinal);
+        var providerCall = source.IndexOf("providerSubmit(submitted.Value!)", callbackBoundary, StringComparison.Ordinal);
 
         Assert.True(winner >= 0);
         Assert.True(durablePossibleSubmit > winner);
         Assert.True(operationSubmitted > durablePossibleSubmit);
         Assert.True(callbackBoundary > operationSubmitted);
-        Assert.True(providerCall > callbackBoundary);
+        Assert.True(dispatchValidation > callbackBoundary);
+        Assert.True(providerCall > dispatchValidation);
+        Assert.True(helper >= 0);
+        Assert.True(ownerRead > helper);
+        Assert.True(budgetRead > ownerRead);
+        Assert.True(resourceRead > budgetRead);
+        Assert.Contains("liveOwner.Value.Binding == binding", source[helper..]);
+        Assert.Contains("liveResource.Value.State == ExternalResourceBindingState.Consuming", source[helper..]);
     }
 
     [Fact]

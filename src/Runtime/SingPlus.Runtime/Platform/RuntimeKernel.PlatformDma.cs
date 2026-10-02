@@ -70,12 +70,25 @@ public sealed partial class RuntimeKernel
                 exactMapping.Message!);
         }
 
+        var usability = Regions.ValidatePlatformMappingRegionUsability(mapping.Mapping.Region,
+            new RegionOwner(process.DomainId, subject.Generation));
+        if (!usability.IsSuccess)
+            return KernelResult<PlatformDmaGrant>.Fail(usability.Error, usability.Message!);
+
         var grant = PlatformAuthority.BindDmaGrant(
             deviceLease,
             mapping,
             identity,
             new PlatformDmaRange(offset, length),
-            direction);
+            direction, () =>
+            {
+                var current = Processes.Resolve(subject);
+                if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
+                var accepts = EnsureProcessAcceptsNewEffects(current.Value!);
+                if (!accepts.IsSuccess) return accepts;
+                return Regions.ValidatePlatformMappingRegionUsability(mapping.Mapping.Region,
+                    new RegionOwner(current.Value!.DomainId, subject.Generation));
+            });
         if (grant.IsSuccess)
             TrackPlatformDmaGrant(subject, grant.Value!);
         return grant;

@@ -70,6 +70,10 @@ public sealed partial class ExternalOperationAuthority
         }
     }
 
+    internal static KernelResult ValidateCancellationSupport(ExternalCancellationSupport support) =>
+        Enum.IsDefined(support) ? KernelResult.Ok() :
+        KernelResult.Fail(KernelError.InvalidTransition, "External operation cancellation support is unknown.");
+
     public KernelResult<OperationAdmissionSnapshot> Admit(
         ExternalOperationHandle operation,
         OperationDependencySnapshot dependencies,
@@ -102,6 +106,9 @@ public sealed partial class ExternalOperationAuthority
             var record = resolved.Value!;
             if (record.State != ExternalOperationState.Prepared || record.Disposition != ExternalOperationDisposition.Active)
                 return InvalidTransition<OperationAdmissionSnapshot>(record, "Only an active Prepared operation can be admitted.");
+            var cancellationValidation = ValidateCancellationSupport(cancellationSupport);
+            if (!cancellationValidation.IsSuccess)
+                return KernelResult<OperationAdmissionSnapshot>.Fail(cancellationValidation.Error, cancellationValidation.Message!);
 
             var acquired = new List<RegionUseDescriptor>();
             foreach (var request in record.Preparation.RegionUses)

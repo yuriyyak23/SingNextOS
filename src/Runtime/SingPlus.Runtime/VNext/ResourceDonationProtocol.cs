@@ -34,7 +34,7 @@ public sealed partial class RuntimeKernel
         SipResourceAdmissionBinding effectBinding,
         SipResourceRequirementV1 requirement)
     {
-        var donation = SessionInvocations.ResolveResourceDonation(invocation, service);
+        var donation = SessionInvocations.ResolveResourceDonation(invocation, service, requireAdmission: true);
         if (!donation.IsSuccess)
             return GeneratedSipResourceAdmission.Failure((int)donation.Error, donation.Message!);
         ResourceEnvelopeV1 requested;
@@ -64,6 +64,8 @@ public sealed partial class RuntimeKernel
             {
                 var submitted = SubmitResourceExternalAdmission(admitted.Value!, effectBinding.Dependencies, () =>
                 {
+                    var permission = RevalidateResourceAdmissionCommit(admitted.Value!, afterSubmit: true);
+                    if (!permission.IsSuccess) return permission;
                     var active = SessionInvocations.ActivateResourceDonation(invocation, service);
                     if (!active.IsSuccess)
                         return KernelResult.Fail(active.Error, active.Message!);
@@ -75,7 +77,7 @@ public sealed partial class RuntimeKernel
                                 ? providerError
                                 : KernelError.PlatformFaulted,
                             result.Message ?? "Provider submission failed.");
-                });
+                }, () => RevalidateResourceAdmissionCommit(admitted.Value!));
                 return submitted.IsSuccess
                     ? GeneratedSipSubmitResult.Ok()
                     : GeneratedSipSubmitResult.Failure((int)submitted.Error, submitted.Message!);
@@ -93,6 +95,8 @@ public sealed partial class RuntimeKernel
         ResourceEnvelopeV1 donatedEnvelope,
         AdmissionQosHint priorityCeiling)
     {
+        lock (_requestResponseCorrelationGate)
+        {
         if (requirement.DonationPolicy != SipResourceDonationPolicyV1.AcceptNarrowed)
             return KernelResult<ResourceDonationBinding>.Fail(KernelError.DelegationDenied,
                 "The generated SIP contract does not accept resource donation.");
@@ -128,6 +132,9 @@ public sealed partial class RuntimeKernel
         if (source.Value!.AssuranceCeiling > requirement.AssuranceCeiling)
             return KernelResult<ResourceDonationBinding>.Fail(KernelError.DelegationDenied,
                 "Donation assurance exceeds the generated contract ceiling.");
+        var invocationAdmission = SessionInvocations.ValidateResourceDonationBindingAdmission(invocation, caller, service);
+        if (!invocationAdmission.IsSuccess)
+            return KernelResult<ResourceDonationBinding>.Fail(invocationAdmission.Error, invocationAdmission.Message!);
 
         var delegated = CapabilityAuthority.Delegate(sourceGrant, callerProcess.Value.DomainId,
             serviceProcess.Value!.DomainId, CapabilityRights.Delegate, service.Generation, constraints => constraints with
@@ -165,6 +172,7 @@ public sealed partial class RuntimeKernel
         _ = Budgets.CancelLeasePreSubmit(caller, binding.Lease);
         _ = CapabilityAuthority.Revoke(binding.DerivedGrant);
         return KernelResult<ResourceDonationBinding>.Fail(bound.Error, bound.Message!);
+        }
     }
 
     internal KernelResult<ResourceDonationBinding> DeriveNestedResourceDonation(
@@ -176,7 +184,9 @@ public sealed partial class RuntimeKernel
         ResourceAssuranceV1 assuranceCeiling,
         AdmissionQosHint priorityCeiling)
     {
-        var parent = SessionInvocations.ResolveResourceDonation(parentInvocation, server);
+        lock (_requestResponseCorrelationGate)
+        {
+        var parent = SessionInvocations.ResolveResourceDonation(parentInvocation, server, requireAdmission: true);
         if (!parent.IsSuccess) return KernelResult<ResourceDonationBinding>.Fail(parent.Error, parent.Message!);
         var source = parent.Value!;
         ResourceEnvelopeV1 envelope;
@@ -187,6 +197,10 @@ public sealed partial class RuntimeKernel
             PriorityRank(priorityCeiling) > PriorityRank(source.PriorityCeiling))
             return KernelResult<ResourceDonationBinding>.Fail(KernelError.DelegationDenied,
                 "Nested donation may only narrow amount, assurance, priority and semantic scope.");
+        var childAdmission = SessionInvocations.ValidateResourceDonationBindingAdmission(
+            downstreamInvocation, server, downstream);
+        if (!childAdmission.IsSuccess)
+            return KernelResult<ResourceDonationBinding>.Fail(childAdmission.Error, childAdmission.Message!);
         var session = ResolveSession(server, downstreamInvocation.Session);
         if (!session.IsSuccess || session.Value!.Service != downstream)
             return KernelResult<ResourceDonationBinding>.Fail(session.Error == KernelError.None ? KernelError.WrongSessionOwner : session.Error,
@@ -229,24 +243,20 @@ public sealed partial class RuntimeKernel
         _ = Budgets.CancelLeasePreSubmit(source.ChargingOwner, binding.Lease);
         _ = CapabilityAuthority.Revoke(binding.DerivedGrant);
         return KernelResult<ResourceDonationBinding>.Fail(bound.Error, bound.Message!);
+        }
     }
 
     internal KernelResult CloseResourceDonation(ProcessHandle service, EndpointSessionInvocationHandle invocation, bool submitMayHaveOccurred)
     {
         lock (_requestResponseCorrelationGate)
         {
-        if (!submitMayHaveOccurred)
-        {
-            var current = SessionInvocations.InspectResourceDonation(invocation, service);
-            if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
-            if (current.Value!.State is not (ResourceDonationState.Bound or ResourceDonationState.Returned))
-                return KernelResult.Fail(KernelError.InvalidTransition,
-                    "A possible or quarantined donation cannot be returned as pre-submit closure.");
-            var cancelled = Budgets.CancelLeasePreSubmit(current.Value.ChargingOwner, current.Value.Lease);
-            if (!cancelled.IsSuccess) return KernelResult.Fail(cancelled.Error, cancelled.Message!);
-        }
-        var closed = SessionInvocations.CloseResourceDonation(invocation, service,
-            submitMayHaveOccurred ? ResourceDonationState.Quarantined : ResourceDonationState.Returned);
+        var closed = submitMayHaveOccurred
+            ? SessionInvocations.CloseResourceDonation(invocation, service, ResourceDonationState.Quarantined)
+            : SessionInvocations.ReturnResourceDonationPreSubmit(invocation, service, current =>
+            {
+                var cancelled = Budgets.CancelLeasePreSubmit(current.ChargingOwner, current.Lease);
+                return cancelled.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(cancelled.Error, cancelled.Message!);
+            });
         if (!closed.IsSuccess) return KernelResult.Fail(closed.Error, closed.Message!);
         var binding = closed.Value!;
         _ = CapabilityAuthority.Revoke(binding.DerivedGrant);
@@ -261,8 +271,13 @@ public sealed partial class RuntimeKernel
     {
         lock (_requestResponseCorrelationGate)
         {
-        var donation = SessionInvocations.ResolveResourceDonation(invocation, service);
+        var donation = SessionInvocations.ResolveResourceDonation(invocation, service, requireAdmission: true);
         if (!donation.IsSuccess) return KernelResult.Fail(donation.Error, donation.Message!);
+        var process = Processes.Resolve(service);
+        if (!process.IsSuccess) return KernelResult.Fail(process.Error, process.Message!);
+        var permission = CapabilityAuthority.ValidateResourceUse(donation.Value!.DerivedGrant,
+            process.Value!.DomainId, service.Generation, 1, donation.Value.Envelope);
+        if (!permission.IsSuccess) return KernelResult.Fail(permission.Error, permission.Message!);
         var bound = Budgets.BindLease(donation.Value!.ChargingOwner, donation.Value.Lease);
         if (!bound.IsSuccess) return KernelResult.Fail(bound.Error, bound.Message!);
         var consuming = Budgets.BeginConsumption(donation.Value.ChargingOwner, donation.Value.Lease);

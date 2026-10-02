@@ -12,6 +12,19 @@ function Get-Sha256([string]$Path) {
 }
 
 $filter = 'FullyQualifiedName~PreemptionContractsV1Tests|FullyQualifiedName~V6RestartAdmissionTests|FullyQualifiedName~V6StatefulResumeAccountingTests|FullyQualifiedName~V6ManagedStatefulResumeProviderTests|FullyQualifiedName~V6ManagedSafePointProviderTests|FullyQualifiedName~ExternalOperationLifecycleTests|FullyQualifiedName~SemanticAdmissionSentryTests|FullyQualifiedName~CancellationContainmentSemanticsV1Tests|FullyQualifiedName~Phase04DeadlineCancellationTests|FullyQualifiedName=SingPlus.Tests.Runtime.HybridCpuExternalOperationProviderTests.CancellationReceiptDistinguishesPreSubmitClosureFromPendingPostSubmitEffect|FullyQualifiedName=SingPlus.Tests.Architecture.V6ArchitectureGuardTests.V6GateRegistryIsClosedCompleteAndDefaultOff'
+$filter += '|FullyQualifiedName~Phase8ResidualVirtualizationTests.ExecutableArtifactBindOrStartReceiptLossPinsChildAndMapping|FullyQualifiedName=SingPlus.Tests.Virtualization.Phase8ResidualVirtualizationTests.RevokedParentMappingCannotReachExecutableChildStartProvider'
+$filter += '|FullyQualifiedName~Phase8ResidualVirtualizationTests.GuestUnmapCannotOvertakeExecutableBindOrStartCallback'
+$filter += '|FullyQualifiedName~Phase8ResidualVirtualizationTests.BoundArtifactPinsOnlyItsExactGuestMappingAfterCallbackSettles'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Virtualization.Phase8ResidualVirtualizationTests.TypedSipV3ArtifactContourPinsMappingAfterRetiredWorkUntilReleaseEvidence'
+$filter += '|FullyQualifiedName~Phase8ResidualVirtualizationTests.ParentAuthorizationRevokedInsideExecutableCallbackPreventsPublication'
+$filter += '|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.ChildTransitionCallbackFaultOrResetCannotPublishLateState|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ConcurrentChildTransitionHasOneProviderCallback'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.TransitionCallbackRejectsGuestMapEventAndTrapBeforeProvider|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.ChildEffectCallbackRejectsOverlappingTransition|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.VirtualEffectCallbackFaultOrResetCannotPublishLateEvidence'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ReentrantChildCloseCannotInvokeProviderTwice|FullyQualifiedName=SingPlus.Tests.Virtualization.Phase8ResidualVirtualizationTests.NestedCreateCallbackBlocksImmediateParentTransition|FullyQualifiedName=SingPlus.Tests.Virtualization.Phase8ResidualVirtualizationTests.ImmediateParentTransitionCallbackRejectsNestedCreateBeforeProvider'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ChildCreateCallbackPinsParentBeforeChildBindingPublication|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ParentRevokeCallbackRejectsChildCreateBeforeProvider'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ResetInsideChildCreateCallbackPinsNewParentGeneration|FullyQualifiedName=SingPlus.Tests.Virtualization.Phase8ResidualVirtualizationTests.ResetInsideNestedCreateCallbackCannotPublishLateChild'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ResetInsideRootBindCallbackPinsSubjectWithoutInventingLease|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.LostRootBindReceiptPinsProcessReclaimWithoutProviderLease|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.RootBindCallbackRejectsDuplicateAdmissionBeforeProvider|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ProcessExitInsideRootBindCallbackRevokesPublishedBindingBeforeReclaim|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ParentRevokeCallbackRejectsNewMappingBeforeProvider|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.MappingCallbackCannotRevokeParentBeforePublication|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.MappingReceiptLossPinsParentAndLocalReservation|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.BackendResetInsideMappingCallbackFaultPinsLateLease|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ProcessExitInsideMappingCallbackTracksLateMappingForExactTeardown|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.LostMappingReceiptBlocksProcessReclaim|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ResetFaultedMappingKeepsBudgetAndRegionPinnedAcrossTeardownRetries|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ResetBeforeNotAcceptedMappingReplyDoesNotReleaseRegion|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.StableNotAcceptedMappingReplyReleasesLocalReservation'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformDeviceLeaseTests.DeviceBindCallbackBlocksParentRevokeBeforeLeasePublication|FullyQualifiedName=SingPlus.Tests.Platform.PlatformDeviceLeaseTests.ResetInsideDeviceBindCallbackPinsNewParentGeneration|FullyQualifiedName=SingPlus.Tests.Platform.PlatformDeviceLeaseTests.ParentRevokeCallbackRejectsDeviceBindBeforeProvider'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.VirtualIoBindCallbackRejectsOverlappingChildTransition|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ChildTransitionCallbackRejectsVirtualIoBindBeforeProvider|FullyQualifiedName=SingPlus.Tests.Virtualization.Phase8ResidualVirtualizationTests.ReentrantExecutableStartCannotEnterProviderTwice'
 $adapterFilter = 'FullyQualifiedName~AdapterBoundaryTests|FullyQualifiedName~SemanticTraceInstrumentationTests'
 $evidenceInputs = @(
     'contracts/SingPlus.Contracts/PreemptionContracts.cs',
@@ -23,6 +36,16 @@ $evidenceInputs = @(
     'src/Runtime/SingPlus.Runtime/V6/V6ManagedStatefulResumeProvider.cs',
     'src/Runtime/SingPlus.Runtime/V6/V6ManagedSafePointProvider.cs',
     'src/Runtime/SingPlus.Runtime/V6/V6FeatureGates.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.ChildDomains.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.BackendEpoch.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/RuntimeKernel.Platform.cs',
+    'src/Runtime/SingPlus.Runtime/RuntimeKernel.ProcessTeardown.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.Device.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.GuestMemory.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.VirtualEffects.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.VirtualIo.cs',
+    'src/Platform/SingPlus.Platform.HybridCpu/HybridCpuPlatformAuthorityProvider.ChildDomains.cs',
     'src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetAuthority.cs',
     'src/Runtime/SingPlus.Runtime/ExternalOperations/ExternalOperationAuthority.cs',
     'src/Runtime/SingPlus.Runtime/ExternalOperations/HybridCpuExternalOperationProvider.cs',
@@ -36,6 +59,10 @@ $evidenceInputs = @(
     'tests/SingPlus.Tests/Runtime/V6StatefulResumeAccountingTests.cs',
     'tests/SingPlus.Tests/Runtime/V6ManagedStatefulResumeProviderTests.cs',
     'tests/SingPlus.Tests/Runtime/V6ManagedSafePointProviderTests.cs',
+    'tests/SingPlus.Tests/Virtualization/Phase8ResidualVirtualizationTests.cs',
+    'tests/SingPlus.Tests/Platform/PlatformAuthorityBridgeChildDomainTests.cs',
+    'tests/SingPlus.Tests/Platform/PlatformDeviceLeaseTests.cs',
+    'tests/SingPlus.Platform.HybridCpu.Tests/Phase504ExecutableAdapterTests.cs',
     'tests/SingPlus.Tests/Runtime/ExternalOperationLifecycleTests.cs',
     'tests/SingPlus.Tests/Runtime/HybridCpuExternalOperationProviderTests.cs',
     'tests/SingPlus.Tests/Runtime/SemanticAdmissionSentryTests.cs',
@@ -63,7 +90,7 @@ try {
     $passed = [int]$match.Groups[2].Value
     $skipped = [int]$match.Groups[3].Value
     $total = [int]$match.Groups[4].Value
-    if ($failed -ne 0 -or $passed -ne 130 -or $skipped -ne 0 -or $total -ne 130) {
+    if ($failed -ne 0 -or $passed -ne 243 -or $skipped -ne 0 -or $total -ne 243) {
         throw "Unexpected P08 counts: failed=$failed passed=$passed skipped=$skipped total=$total"
     }
     $adapterOutput = & dotnet test 'tools\HybridCpu_ExecutableAdapter.Tests\HybridCpu_ExecutableAdapter.Tests.csproj' --no-restore --filter $adapterFilter 2>&1 | Out-String
@@ -74,7 +101,7 @@ try {
     $adapterPassed = [int]$adapterMatch.Groups[2].Value
     $adapterSkipped = [int]$adapterMatch.Groups[3].Value
     $adapterTotal = [int]$adapterMatch.Groups[4].Value
-    if ($adapterFailed -ne 0 -or $adapterPassed -ne 15 -or $adapterSkipped -ne 0 -or $adapterTotal -ne 15) {
+    if ($adapterFailed -ne 0 -or $adapterPassed -ne 83 -or $adapterSkipped -ne 0 -or $adapterTotal -ne 83) {
         throw "Unexpected P08 adapter counts: failed=$adapterFailed passed=$adapterPassed skipped=$adapterSkipped total=$adapterTotal"
     }
     $raceFilter = 'FullyQualifiedName~V6ManagedStatefulResumeProviderTests.ConcurrentResumeHasOneRestoreWinner'

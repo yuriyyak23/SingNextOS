@@ -8,6 +8,631 @@ namespace SingPlus.Tests.Platform;
 public sealed class PlatformOwnedRegionMappingV2Tests
 {
     [Fact]
+    public void DamageAfterMappingPublicationDeniesVisibilityBeforeProvider()
+    {
+        var provider = new ExactMappingProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 708, 780);
+        var region = kernel.AllocateBuffer<byte>(owner, 4096).Value!;
+        var binding = kernel.BindPlatformDomain(owner).Value!;
+        var capability = MintRegionCapability(kernel, owner, region.Handle,
+            CapabilityRights.Map | CapabilityRights.Read);
+        var mapping = kernel.MapPlatformOwnedRegionSlice(owner, binding, capability,
+            region.Handle, 0, 4096, PlatformMemoryAccess.Read).Value!;
+        var regionOwner = new RegionOwner(process.DomainId, owner.Generation);
+        Assert.True(kernel.Regions.QuarantineSubrange(region.Handle, regionOwner,
+            new(1, new("test-provider", "bank-0", 1, 1), 1,
+                ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(8, 8))).IsSuccess);
+
+        var visibility = kernel.PreparePlatformRegionMappingForConsumer(owner, mapping,
+            PlatformMemoryConsumerClass.ExternalExecutionDomain, PlatformMemoryVisibilityRequirement.PublicationFence);
+        Assert.Equal(KernelError.Quarantined, visibility.Error);
+        Assert.Equal(0, provider.VisibilityCalls);
+        Assert.True(kernel.Regions.HasPlatformMappingReservation(region.Handle, regionOwner));
+        Assert.True(kernel.RevokePlatformRegionMapping(owner, mapping).IsSuccess);
+        Assert.Single(kernel.Regions.SnapshotDamage());
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void DamageInsideMappingCallbackPreservesBudgetUntilExactClosure(bool exactSlice, bool concurrent)
+    {
+        var provider = new ExactMappingProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 705, 750);
+        var admin = TestFixtures.Create(kernel, 95, 950).Handle;
+        var administration = kernel.MintCapability(new DomainId(950), admin,
+            ResourceKind.KernelService, CapabilityResourceIds.BudgetAdministration,
+            CapabilityRights.Configure).Value!.CapabilityId;
+        var budget = kernel.AdmitProcessBudget(admin, administration, owner, "revoke-map",
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 4096),
+                new(ServiceBudgetDimension.PinnedMappedMemoryBytes, 4096)]).Value!.ProcessBudget;
+        var region = kernel.AllocateBuffer<byte>(owner, 4096).Value!;
+        var binding = kernel.BindPlatformDomain(owner).Value!;
+        var capability = MintRegionCapability(kernel, owner, region.Handle,
+            CapabilityRights.Map | CapabilityRights.Read);
+        KernelResult<RegionDamageDescriptorV1> Damage() => kernel.Regions.QuarantineSubrange(
+            region.Handle, new RegionOwner(process.DomainId, owner.Generation),
+            new(1, new("test-provider", "bank-0", 1, 1), 1,
+                ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(8, 8)));
+        provider.BeforeMapReturn = () => Assert.True((concurrent
+            ? Task.Run(Damage).GetAwaiter().GetResult() : Damage()).IsSuccess);
+        var mapping = exactSlice
+            ? kernel.MapPlatformOwnedRegionSlice(owner, binding, capability,
+                region.Handle, 0, 4096, PlatformMemoryAccess.Read).Value!.Mapping
+            : kernel.MapPlatformOwnedRegion(owner, binding, capability,
+                region.Handle, PlatformMemoryAccess.Read).Value!;
+        Assert.Equal(KernelError.PlatformBindingRevoked,
+            kernel.PlatformAuthority.ValidateMapping(mapping, binding.Subject).Error);
+        Assert.False(kernel.MapPlatformOwnedRegion(owner, binding, capability,
+            region.Handle, PlatformMemoryAccess.Read).IsSuccess);
+        Assert.Equal(1, provider.MapCalls);
+        var regionOwner = new RegionOwner(process.DomainId, owner.Generation);
+        Assert.True(kernel.Regions.HasPlatformMappingReservation(region.Handle, regionOwner));
+        Assert.Equal(4096UL, kernel.QueryBudget(budget).Value!.Usage.Single(usage =>
+            usage.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used);
+        provider.CompletionState = PlatformCompletionState.Draining;
+        Assert.Equal(KernelError.PlatformBindingDraining, kernel.RevokePlatformRegionMapping(owner, mapping).Error);
+        var stale = mapping with { Generation = new PlatformRegionMappingGeneration(mapping.Generation.Value + 1) };
+        Assert.Equal(KernelError.StaleGeneration, kernel.RevokePlatformRegionMapping(owner, stale).Error);
+        provider.CompletionState = PlatformCompletionState.Closed;
+        provider.ReturnStaleCompletionGeneration = true;
+        Assert.Equal(KernelError.StaleGeneration, kernel.RevokePlatformRegionMapping(owner, mapping).Error);
+        Assert.True(kernel.Regions.HasPlatformMappingReservation(region.Handle, regionOwner));
+        Assert.Equal(4096UL, kernel.QueryBudget(budget).Value!.Usage.Single(usage =>
+            usage.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used);
+        provider.ReturnStaleCompletionGeneration = false;
+        Assert.True(kernel.RevokePlatformRegionMapping(owner, mapping).IsSuccess);
+        Assert.False(kernel.Regions.HasPlatformMappingReservation(region.Handle, regionOwner));
+        Assert.Equal(0UL, kernel.QueryBudget(budget).Value!.Usage.Single(usage =>
+            usage.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used);
+        Assert.Equal(KernelError.PlatformBindingRevoked,
+            kernel.RevokePlatformRegionMapping(owner, mapping).Error);
+        Assert.Single(kernel.Regions.SnapshotDamage());
+    }
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DelegatedRootRevokeAfterMappingPublicationPreservesClosureHandle(bool exactSlice)
+    {
+        var provider = new ExactMappingProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 705, 750);
+        var admin = TestFixtures.Create(kernel, 95, 950).Handle;
+        var administration = kernel.MintCapability(new DomainId(950), admin,
+            ResourceKind.KernelService, CapabilityResourceIds.BudgetAdministration,
+            CapabilityRights.Configure).Value!.CapabilityId;
+        var budget = kernel.AdmitProcessBudget(admin, administration, owner, "revoke-map",
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 4096),
+                new(ServiceBudgetDimension.PinnedMappedMemoryBytes, 4096)]).Value!.ProcessBudget;
+        var region = kernel.AllocateBuffer<byte>(owner, 4096).Value!;
+        var binding = kernel.BindPlatformDomain(owner).Value!;
+        var root = MintRegionCapability(kernel, owner, region.Handle,
+            CapabilityRights.Map | CapabilityRights.Read | CapabilityRights.Delegate);
+        var capability = kernel.DelegateCapability(owner, owner, root,
+            CapabilityRights.Map | CapabilityRights.Read).Value!.CapabilityId;
+        var mapping = exactSlice
+            ? kernel.MapPlatformOwnedRegionSlice(owner, binding, capability,
+                region.Handle, 0, 4096, PlatformMemoryAccess.Read).Value!.Mapping
+            : kernel.MapPlatformOwnedRegion(owner, binding, capability,
+                region.Handle, PlatformMemoryAccess.Read).Value!;
+        provider.CompletionState = PlatformCompletionState.Draining;
+        Assert.Equal(KernelError.PlatformBindingDraining, kernel.RevokeCapability(root).Error);
+        Assert.Equal(KernelError.PlatformBindingRevoked,
+            kernel.PlatformAuthority.ValidateMapping(mapping, binding.Subject).Error);
+        Assert.False(kernel.MapPlatformOwnedRegion(owner, binding, capability,
+            region.Handle, PlatformMemoryAccess.Read).IsSuccess);
+        Assert.Equal(1, provider.MapCalls);
+        var regionOwner = new RegionOwner(process.DomainId, owner.Generation);
+        Assert.True(kernel.Regions.HasPlatformMappingReservation(region.Handle, regionOwner));
+        Assert.Equal(4096UL, kernel.QueryBudget(budget).Value!.Usage.Single(usage =>
+            usage.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used);
+        provider.CompletionState = PlatformCompletionState.Draining;
+        Assert.Equal(KernelError.PlatformBindingDraining, kernel.RevokeCapability(root).Error);
+        var stale = mapping with { Generation = new PlatformRegionMappingGeneration(mapping.Generation.Value + 1) };
+        Assert.Equal(KernelError.StaleGeneration, kernel.RevokePlatformRegionMapping(owner, stale).Error);
+        provider.CompletionState = PlatformCompletionState.Closed;
+        provider.ReturnStaleCompletionGeneration = true;
+        Assert.Equal(KernelError.StaleGeneration, kernel.RevokeCapability(root).Error);
+        Assert.True(kernel.Regions.HasPlatformMappingReservation(region.Handle, regionOwner));
+        Assert.Equal(4096UL, kernel.QueryBudget(budget).Value!.Usage.Single(usage =>
+            usage.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used);
+        provider.ReturnStaleCompletionGeneration = false;
+        Assert.True(kernel.RevokeCapability(root).IsSuccess);
+        Assert.False(kernel.Regions.HasPlatformMappingReservation(region.Handle, regionOwner));
+        Assert.Equal(0UL, kernel.QueryBudget(budget).Value!.Usage.Single(usage =>
+            usage.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used);
+        Assert.True(kernel.RevokeCapability(root).IsSuccess);
+        Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+    }
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void DelegatedRootRevokeInsideMappingCallbackPreservesClosureHandle(bool exactSlice, bool concurrent)
+    {
+        var provider = new ExactMappingProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 705, 750);
+        var admin = TestFixtures.Create(kernel, 95, 950).Handle;
+        var administration = kernel.MintCapability(new DomainId(950), admin,
+            ResourceKind.KernelService, CapabilityResourceIds.BudgetAdministration,
+            CapabilityRights.Configure).Value!.CapabilityId;
+        var budget = kernel.AdmitProcessBudget(admin, administration, owner, "revoke-map",
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 4096),
+                new(ServiceBudgetDimension.PinnedMappedMemoryBytes, 4096)]).Value!.ProcessBudget;
+        var region = kernel.AllocateBuffer<byte>(owner, 4096).Value!;
+        var binding = kernel.BindPlatformDomain(owner).Value!;
+        var root = MintRegionCapability(kernel, owner, region.Handle,
+            CapabilityRights.Map | CapabilityRights.Read | CapabilityRights.Delegate);
+        var capability = kernel.DelegateCapability(owner, owner, root,
+            CapabilityRights.Map | CapabilityRights.Read).Value!.CapabilityId;
+        provider.BeforeMapReturn = () =>
+            Assert.Equal(KernelError.PlatformBindingDraining, (concurrent
+                ? Task.Run(() => kernel.RevokeCapability(root)).GetAwaiter().GetResult()
+                : kernel.RevokeCapability(root)).Error);
+        var mapping = exactSlice
+            ? kernel.MapPlatformOwnedRegionSlice(owner, binding, capability,
+                region.Handle, 0, 4096, PlatformMemoryAccess.Read).Value!.Mapping
+            : kernel.MapPlatformOwnedRegion(owner, binding, capability,
+                region.Handle, PlatformMemoryAccess.Read).Value!;
+        Assert.Equal(KernelError.PlatformBindingRevoked,
+            kernel.PlatformAuthority.ValidateMapping(mapping, binding.Subject).Error);
+        Assert.False(kernel.MapPlatformOwnedRegion(owner, binding, capability,
+            region.Handle, PlatformMemoryAccess.Read).IsSuccess);
+        Assert.Equal(1, provider.MapCalls);
+        var regionOwner = new RegionOwner(process.DomainId, owner.Generation);
+        Assert.True(kernel.Regions.HasPlatformMappingReservation(region.Handle, regionOwner));
+        Assert.Equal(4096UL, kernel.QueryBudget(budget).Value!.Usage.Single(usage =>
+            usage.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used);
+        provider.CompletionState = PlatformCompletionState.Draining;
+        Assert.Equal(KernelError.PlatformBindingDraining, kernel.RevokeCapability(root).Error);
+        var stale = mapping with { Generation = new PlatformRegionMappingGeneration(mapping.Generation.Value + 1) };
+        Assert.Equal(KernelError.StaleGeneration, kernel.RevokePlatformRegionMapping(owner, stale).Error);
+        provider.CompletionState = PlatformCompletionState.Closed;
+        provider.ReturnStaleCompletionGeneration = true;
+        Assert.Equal(KernelError.StaleGeneration, kernel.RevokeCapability(root).Error);
+        Assert.True(kernel.Regions.HasPlatformMappingReservation(region.Handle, regionOwner));
+        Assert.Equal(4096UL, kernel.QueryBudget(budget).Value!.Usage.Single(usage =>
+            usage.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used);
+        provider.ReturnStaleCompletionGeneration = false;
+        Assert.True(kernel.RevokeCapability(root).IsSuccess);
+        Assert.False(kernel.Regions.HasPlatformMappingReservation(region.Handle, regionOwner));
+        Assert.Equal(0UL, kernel.QueryBudget(budget).Value!.Usage.Single(usage =>
+            usage.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used);
+        Assert.True(kernel.RevokeCapability(root).IsSuccess);
+        Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+    }
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void CapabilityRevokeInsideMappingCallbackPreservesClosureHandle(bool exactSlice, bool concurrent)
+    {
+        var provider = new ExactMappingProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 705, 750);
+        var admin = TestFixtures.Create(kernel, 95, 950).Handle;
+        var administration = kernel.MintCapability(new DomainId(950), admin,
+            ResourceKind.KernelService, CapabilityResourceIds.BudgetAdministration,
+            CapabilityRights.Configure).Value!.CapabilityId;
+        var budget = kernel.AdmitProcessBudget(admin, administration, owner, "revoke-map",
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 4096),
+                new(ServiceBudgetDimension.PinnedMappedMemoryBytes, 4096)]).Value!.ProcessBudget;
+        var region = kernel.AllocateBuffer<byte>(owner, 4096).Value!;
+        var binding = kernel.BindPlatformDomain(owner).Value!;
+        var capability = MintRegionCapability(kernel, owner, region.Handle,
+            CapabilityRights.Map | CapabilityRights.Read);
+        provider.BeforeMapReturn = () =>
+            Assert.Equal(KernelError.PlatformBindingDraining, (concurrent
+                ? Task.Run(() => kernel.RevokeCapability(capability)).GetAwaiter().GetResult()
+                : kernel.RevokeCapability(capability)).Error);
+        var mapping = exactSlice
+            ? kernel.MapPlatformOwnedRegionSlice(owner, binding, capability,
+                region.Handle, 0, 4096, PlatformMemoryAccess.Read).Value!.Mapping
+            : kernel.MapPlatformOwnedRegion(owner, binding, capability,
+                region.Handle, PlatformMemoryAccess.Read).Value!;
+        Assert.Equal(KernelError.PlatformBindingRevoked,
+            kernel.PlatformAuthority.ValidateMapping(mapping, binding.Subject).Error);
+        Assert.False(kernel.MapPlatformOwnedRegion(owner, binding, capability,
+            region.Handle, PlatformMemoryAccess.Read).IsSuccess);
+        Assert.Equal(1, provider.MapCalls);
+        var regionOwner = new RegionOwner(process.DomainId, owner.Generation);
+        Assert.True(kernel.Regions.HasPlatformMappingReservation(region.Handle, regionOwner));
+        Assert.Equal(4096UL, kernel.QueryBudget(budget).Value!.Usage.Single(usage =>
+            usage.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used);
+        provider.CompletionState = PlatformCompletionState.Draining;
+        Assert.Equal(KernelError.PlatformBindingDraining, kernel.RevokeCapability(capability).Error);
+        var stale = mapping with { Generation = new PlatformRegionMappingGeneration(mapping.Generation.Value + 1) };
+        Assert.Equal(KernelError.StaleGeneration, kernel.RevokePlatformRegionMapping(owner, stale).Error);
+        provider.CompletionState = PlatformCompletionState.Closed;
+        provider.ReturnStaleCompletionGeneration = true;
+        Assert.Equal(KernelError.StaleGeneration, kernel.RevokeCapability(capability).Error);
+        Assert.True(kernel.Regions.HasPlatformMappingReservation(region.Handle, regionOwner));
+        Assert.Equal(4096UL, kernel.QueryBudget(budget).Value!.Usage.Single(usage =>
+            usage.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used);
+        provider.ReturnStaleCompletionGeneration = false;
+        Assert.True(kernel.RevokeCapability(capability).IsSuccess);
+        Assert.False(kernel.Regions.HasPlatformMappingReservation(region.Handle, regionOwner));
+        Assert.Equal(0UL, kernel.QueryBudget(budget).Value!.Usage.Single(usage =>
+            usage.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used);
+        Assert.True(kernel.RevokeCapability(capability).IsSuccess);
+        Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+    }
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void DelegatedRootMappingWithLostReceiptCannotReportClosure(bool exactSlice, bool reset)
+    {
+        var provider = new ExactMappingProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 706, 760);
+        var admin = TestFixtures.Create(kernel, 96, 960).Handle;
+        var administration = kernel.MintCapability(new DomainId(960), admin,
+            ResourceKind.KernelService, CapabilityResourceIds.BudgetAdministration,
+            CapabilityRights.Configure).Value!.CapabilityId;
+        var budget = kernel.AdmitProcessBudget(admin, administration, owner, "revoke-lost-map",
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 4096),
+                new(ServiceBudgetDimension.PinnedMappedMemoryBytes, 4096)]).Value!.ProcessBudget;
+        var region = kernel.AllocateBuffer<byte>(owner, 4096).Value!;
+        var binding = kernel.BindPlatformDomain(owner).Value!;
+        var root = MintRegionCapability(kernel, owner, region.Handle,
+            CapabilityRights.Map | CapabilityRights.Read | CapabilityRights.Delegate);
+        var capability = kernel.DelegateCapability(owner, owner, root,
+            CapabilityRights.Map | CapabilityRights.Read).Value!.CapabilityId;
+        provider.BeforeMapReturn = () =>
+        {
+            Assert.Equal(KernelError.PlatformBindingDraining, kernel.RevokeCapability(root).Error);
+            if (reset) Assert.True(kernel.PlatformAuthority.ObserveBackendReset().IsSuccess);
+            throw new InvalidOperationException("Effect possible, receipt lost.");
+        };
+        var error = exactSlice
+            ? kernel.MapPlatformOwnedRegionSlice(owner, binding, capability,
+                region.Handle, 0, 4096, PlatformMemoryAccess.Read).Error
+            : kernel.MapPlatformOwnedRegion(owner, binding, capability,
+                region.Handle, PlatformMemoryAccess.Read).Error;
+        Assert.Equal(KernelError.PlatformFaulted, error);
+        for (var retry = 0; retry < 2; retry++)
+        {
+            Assert.False(kernel.RevokeCapability(root).IsSuccess);
+            Assert.False(kernel.TerminateProcess(owner).IsSuccess);
+            Assert.True(kernel.Processes.Resolve(owner).IsSuccess);
+            Assert.True(kernel.Regions.HasPlatformMappingReservation(region.Handle,
+                new RegionOwner(process.DomainId, owner.Generation)));
+            Assert.Equal(4096UL, kernel.QueryBudget(budget).Value!.Usage.Single(usage =>
+                usage.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used);
+        }
+        Assert.Empty((global::System.Collections.IDictionary)typeof(RuntimeKernel)
+            .GetField("_pendingPlatformMappingAdmissions", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(kernel)!);
+        Assert.Empty((global::System.Collections.IEnumerable)typeof(RuntimeKernel)
+            .GetField("_pendingPlatformMappingCapabilities", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(kernel)!);
+    }
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void RevokedMappingWithLostReceiptCannotReportClosure(bool exactSlice, bool reset)
+    {
+        var provider = new ExactMappingProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 706, 760);
+        var admin = TestFixtures.Create(kernel, 96, 960).Handle;
+        var administration = kernel.MintCapability(new DomainId(960), admin,
+            ResourceKind.KernelService, CapabilityResourceIds.BudgetAdministration,
+            CapabilityRights.Configure).Value!.CapabilityId;
+        var budget = kernel.AdmitProcessBudget(admin, administration, owner, "revoke-lost-map",
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 4096),
+                new(ServiceBudgetDimension.PinnedMappedMemoryBytes, 4096)]).Value!.ProcessBudget;
+        var region = kernel.AllocateBuffer<byte>(owner, 4096).Value!;
+        var binding = kernel.BindPlatformDomain(owner).Value!;
+        var capability = MintRegionCapability(kernel, owner, region.Handle,
+            CapabilityRights.Map | CapabilityRights.Read);
+        provider.BeforeMapReturn = () =>
+        {
+            Assert.Equal(KernelError.PlatformBindingDraining, kernel.RevokeCapability(capability).Error);
+            if (reset) Assert.True(kernel.PlatformAuthority.ObserveBackendReset().IsSuccess);
+            throw new InvalidOperationException("Effect possible, receipt lost.");
+        };
+        var error = exactSlice
+            ? kernel.MapPlatformOwnedRegionSlice(owner, binding, capability,
+                region.Handle, 0, 4096, PlatformMemoryAccess.Read).Error
+            : kernel.MapPlatformOwnedRegion(owner, binding, capability,
+                region.Handle, PlatformMemoryAccess.Read).Error;
+        Assert.Equal(KernelError.PlatformFaulted, error);
+        for (var retry = 0; retry < 2; retry++)
+        {
+            Assert.False(kernel.RevokeCapability(capability).IsSuccess);
+            Assert.False(kernel.TerminateProcess(owner).IsSuccess);
+            Assert.True(kernel.Processes.Resolve(owner).IsSuccess);
+            Assert.True(kernel.Regions.HasPlatformMappingReservation(region.Handle,
+                new RegionOwner(process.DomainId, owner.Generation)));
+            Assert.Equal(4096UL, kernel.QueryBudget(budget).Value!.Usage.Single(usage =>
+                usage.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used);
+        }
+        Assert.Empty((global::System.Collections.IDictionary)typeof(RuntimeKernel)
+            .GetField("_pendingPlatformMappingAdmissions", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(kernel)!);
+        Assert.Empty((global::System.Collections.IEnumerable)typeof(RuntimeKernel)
+            .GetField("_pendingPlatformMappingCapabilities", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(kernel)!);
+    }
+    [Theory]
+    [InlineData(false, 0)]
+    [InlineData(true, 0)]
+    [InlineData(false, 1)]
+    [InlineData(true, 1)]
+    [InlineData(false, 2)]
+    [InlineData(true, 2)]
+    public void RevokeCallbackNegativeAndResetRepliesPreserveExactAccounting(bool exactSlice, int outcome)
+    {
+        var provider = new ExactMappingProvider
+        {
+            MapStatus = outcome == 1 ? null : PlatformAuthorityStatus.NotAccepted,
+        };
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 709, 790);
+        var admin = TestFixtures.Create(kernel, 97, 970).Handle;
+        var administration = kernel.MintCapability(new DomainId(970), admin,
+            ResourceKind.KernelService, CapabilityResourceIds.BudgetAdministration,
+            CapabilityRights.Configure).Value!.CapabilityId;
+        var budget = kernel.AdmitProcessBudget(admin, administration, owner, "revoke-reset-map",
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 4096),
+                new(ServiceBudgetDimension.PinnedMappedMemoryBytes, 4096)]).Value!.ProcessBudget;
+        var region = kernel.AllocateBuffer<byte>(owner, 4096).Value!;
+        var binding = kernel.BindPlatformDomain(owner).Value!;
+        var capability = MintRegionCapability(kernel, owner, region.Handle,
+            CapabilityRights.Map | CapabilityRights.Read);
+        provider.BeforeMapReturn = () =>
+        {
+            Assert.Equal(KernelError.PlatformBindingDraining, kernel.RevokeCapability(capability).Error);
+            if (outcome != 0) Assert.True(kernel.PlatformAuthority.ObserveBackendReset().IsSuccess);
+        };
+        if (exactSlice)
+        {
+            var result = kernel.MapPlatformOwnedRegionSlice(owner, binding, capability,
+                region.Handle, 0, 4096, PlatformMemoryAccess.Read);
+            Assert.Equal(outcome == 1, result.IsSuccess);
+            if (outcome == 2) Assert.Equal(KernelError.PlatformFaulted, result.Error);
+        }
+        else
+        {
+            var result = kernel.MapPlatformOwnedRegion(owner, binding, capability,
+                region.Handle, PlatformMemoryAccess.Read);
+            Assert.Equal(outcome == 1, result.IsSuccess);
+            if (outcome == 2) Assert.Equal(KernelError.PlatformFaulted, result.Error);
+        }
+        var pinned = outcome != 0;
+        Assert.Equal(pinned, kernel.Regions.HasPlatformMappingReservation(region.Handle,
+            new RegionOwner(process.DomainId, owner.Generation)));
+        Assert.Equal(pinned ? 4096UL : 0UL, kernel.QueryBudget(budget).Value!.Usage.Single(usage =>
+            usage.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used);
+        Assert.Equal(!pinned, kernel.RevokeCapability(capability).IsSuccess);
+        var fresh = MintRegionCapability(kernel, owner, region.Handle,
+            CapabilityRights.Map | CapabilityRights.Read);
+        // A fresh capability does not rehabilitate the old domain generation after reset.
+        if (pinned)
+        {
+            Assert.False(kernel.MapPlatformOwnedRegion(owner, binding, fresh,
+                region.Handle, PlatformMemoryAccess.Read).IsSuccess);
+            Assert.False(kernel.TerminateProcess(owner).IsSuccess);
+        }
+        else Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.Equal(1, provider.MapCalls);
+    }
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SaturatedMappingAdmissionRejectsWithoutPartialMutation(bool exactSlice)
+    {
+        var provider = new ExactMappingProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 713, 830);
+        var region = kernel.AllocateBuffer<byte>(owner, 4096).Value!;
+        var binding = kernel.BindPlatformDomain(owner).Value!;
+        var capability = MintRegionCapability(kernel, owner, region.Handle,
+            CapabilityRights.Map | CapabilityRights.Read);
+        var admissions = (Dictionary<ProcessHandle, int>)typeof(RuntimeKernel)
+            .GetField("_pendingPlatformMappingAdmissions", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(kernel)!;
+        var capabilities = (List<CapabilityId>)typeof(RuntimeKernel)
+            .GetField("_pendingPlatformMappingCapabilities", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(kernel)!;
+        admissions.Add(owner, int.MaxValue);
+        var denied = exactSlice
+            ? kernel.MapPlatformOwnedRegionSlice(owner, binding, capability,
+                region.Handle, 0, 4096, PlatformMemoryAccess.Read).Error
+            : kernel.MapPlatformOwnedRegion(owner, binding, capability,
+                region.Handle, PlatformMemoryAccess.Read).Error;
+        Assert.Equal(KernelError.CapacityExhausted, denied);
+        Assert.Equal(int.MaxValue, admissions[owner]);
+        Assert.Empty(capabilities);
+        Assert.Equal(0, provider.MapCalls);
+        Assert.False(kernel.Regions.HasPlatformMappingReservation(region.Handle,
+            new RegionOwner(process.DomainId, owner.Generation)));
+        // Remove only the injected test saturation; the normal admission must remain usable.
+        admissions.Remove(owner);
+        var mapped = kernel.MapPlatformOwnedRegion(owner, binding, capability,
+            region.Handle, PlatformMemoryAccess.Read);
+        Assert.True(mapped.IsSuccess, mapped.Message);
+        Assert.Empty(admissions);
+        Assert.Empty(capabilities);
+        Assert.True(kernel.RevokeCapability(capability).IsSuccess);
+        Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ReusedProcessIdCannotReadmitOldMappingCapabilityOrBinding(bool exactSlice)
+    {
+        var provider = new ExactMappingProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, oldOwner) = TestFixtures.Create(kernel, 714, 840);
+        var oldRegion = kernel.AllocateBuffer<byte>(oldOwner, 4096).Value!;
+        var oldBinding = kernel.BindPlatformDomain(oldOwner).Value!;
+        var oldCapability = MintRegionCapability(kernel, oldOwner, oldRegion.Handle,
+            CapabilityRights.Map | CapabilityRights.Read);
+        Assert.True(kernel.TerminateProcess(oldOwner).IsSuccess);
+        var (_, freshOwner) = TestFixtures.Create(kernel, 714, 840, generation: 2);
+        var freshRegion = kernel.AllocateBuffer<byte>(freshOwner, 4096).Value!;
+        var freshBinding = kernel.BindPlatformDomain(freshOwner).Value!;
+        var freshCapability = MintRegionCapability(kernel, freshOwner, freshRegion.Handle,
+            CapabilityRights.Map | CapabilityRights.Read);
+        var stale = exactSlice
+            ? kernel.MapPlatformOwnedRegionSlice(oldOwner, oldBinding, oldCapability,
+                oldRegion.Handle, 0, 4096, PlatformMemoryAccess.Read).Error
+            : kernel.MapPlatformOwnedRegion(oldOwner, oldBinding, oldCapability,
+                oldRegion.Handle, PlatformMemoryAccess.Read).Error;
+        Assert.Equal(KernelError.StaleHandle, stale);
+        Assert.False(kernel.MapPlatformOwnedRegion(freshOwner, oldBinding, freshCapability,
+            freshRegion.Handle, PlatformMemoryAccess.Read).IsSuccess);
+        Assert.False(kernel.MapPlatformOwnedRegion(freshOwner, freshBinding, oldCapability,
+            freshRegion.Handle, PlatformMemoryAccess.Read).IsSuccess);
+        Assert.Equal(0, provider.MapCalls);
+        var admitted = exactSlice
+            ? kernel.MapPlatformOwnedRegionSlice(freshOwner, freshBinding, freshCapability,
+                freshRegion.Handle, 0, 4096, PlatformMemoryAccess.Read).IsSuccess
+            : kernel.MapPlatformOwnedRegion(freshOwner, freshBinding, freshCapability,
+                freshRegion.Handle, PlatformMemoryAccess.Read).IsSuccess;
+        Assert.True(admitted);
+        Assert.True(kernel.RevokeCapability(freshCapability).IsSuccess);
+        Assert.True(kernel.TerminateProcess(freshOwner).IsSuccess);
+    }
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void BudgetDeniedMappingBalancesAdmissionAndDoesNotCallProvider(bool exactSlice)
+    {
+        var provider = new ExactMappingProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 715, 850);
+        var admin = TestFixtures.Create(kernel, 98, 980).Handle;
+        var administration = kernel.MintCapability(new DomainId(980), admin,
+            ResourceKind.KernelService, CapabilityResourceIds.BudgetAdministration,
+            CapabilityRights.Configure).Value!.CapabilityId;
+        var budget = kernel.AdmitProcessBudget(admin, administration, owner, "denied-map",
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 4096),
+                new(ServiceBudgetDimension.PinnedMappedMemoryBytes, 4095)]).Value!.ProcessBudget;
+        var region = kernel.AllocateBuffer<byte>(owner, 4096).Value!;
+        var binding = kernel.BindPlatformDomain(owner).Value!;
+        var capability = MintRegionCapability(kernel, owner, region.Handle,
+            CapabilityRights.Map | CapabilityRights.Read);
+        var denied = exactSlice
+            ? kernel.MapPlatformOwnedRegionSlice(owner, binding, capability,
+                region.Handle, 0, 4096, PlatformMemoryAccess.Read).Error
+            : kernel.MapPlatformOwnedRegion(owner, binding, capability,
+                region.Handle, PlatformMemoryAccess.Read).Error;
+        Assert.Equal(KernelError.BudgetExceeded, denied);
+        Assert.Equal(0, provider.MapCalls);
+        Assert.False(kernel.Regions.HasPlatformMappingReservation(region.Handle,
+            new RegionOwner(process.DomainId, owner.Generation)));
+        Assert.Equal(0UL, kernel.QueryBudget(budget).Value!.Usage.Single(usage =>
+            usage.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used);
+        Assert.Empty((global::System.Collections.IDictionary)typeof(RuntimeKernel)
+            .GetField("_pendingPlatformMappingAdmissions", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(kernel)!);
+        Assert.Empty((global::System.Collections.IEnumerable)typeof(RuntimeKernel)
+            .GetField("_pendingPlatformMappingCapabilities", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(kernel)!);
+        Assert.True(kernel.RevokeCapability(capability).IsSuccess);
+        Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+    }
+    [Fact]
+    public void ResetBeforeNotAcceptedExactSliceReplyRetainsReservation()
+    {
+        var provider = new ExactMappingProvider { MapStatus = PlatformAuthorityStatus.NotAccepted };
+        var bridge = new PlatformAuthorityBridge(provider);
+        var owner = new PlatformDomainIdentity(new DomainId(710),
+            new ProcessHandle(new ProcessId(701), 1));
+        var binding = bridge.BindDomain(owner).Value!;
+        var region = new PlatformRegionIdentity(new(new RegionId(1), new RegionGeneration(1)),
+            new(new DomainId(710), owner.ProcessGeneration), 4096);
+        provider.BeforeMapReturn = () => Assert.True(bridge.ObserveBackendReset().IsSuccess);
+
+        var mapped = bridge.MapOwnedRegionSlice(binding, owner, new CapabilityId(8),
+            new PlatformRegionSlice(region, 0, 4096, PlatformMemoryAccess.Read),
+            retainFaultedHandleOnMalformed: true, out var retainReservation);
+
+        Assert.Equal(KernelError.PlatformFaulted, mapped.Error);
+        Assert.True(retainReservation);
+    }
+
+    [Fact]
+    public void StableNotAcceptedExactSliceReplyDoesNotRetainReservation()
+    {
+        var provider = new ExactMappingProvider { MapStatus = PlatformAuthorityStatus.NotAccepted };
+        var bridge = new PlatformAuthorityBridge(provider);
+        var owner = new PlatformDomainIdentity(new DomainId(710),
+            new ProcessHandle(new ProcessId(701), 1));
+        var binding = bridge.BindDomain(owner).Value!;
+        var region = new PlatformRegionIdentity(new(new RegionId(1), new RegionGeneration(1)),
+            new(new DomainId(710), owner.ProcessGeneration), 4096);
+
+        var mapped = bridge.MapOwnedRegionSlice(binding, owner, new CapabilityId(8),
+            new PlatformRegionSlice(region, 0, 4096, PlatformMemoryAccess.Read),
+            retainFaultedHandleOnMalformed: true, out var retainReservation);
+
+        Assert.False(mapped.IsSuccess);
+        Assert.False(retainReservation);
+        Assert.True(bridge.RevokeDomain(binding, owner).IsSuccess);
+    }
+
+    [Fact]
+    public void ProcessExitInsideExactSliceCallbackTracksLateMapping()
+    {
+        var provider = new ExactMappingProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 705, 750);
+        var region = kernel.AllocateBuffer<byte>(owner, 4096).Value!;
+        var binding = kernel.BindPlatformDomain(owner).Value!;
+        var capability = MintRegionCapability(kernel, owner, region.Handle,
+            CapabilityRights.Map | CapabilityRights.Read);
+        provider.BeforeMapReturn = () =>
+            Assert.Equal(KernelError.PlatformBindingDraining, kernel.TerminateProcess(owner).Error);
+
+        var mapped = kernel.MapPlatformOwnedRegionSlice(owner, binding, capability,
+            region.Handle, 0, 4096, PlatformMemoryAccess.Read);
+
+        Assert.True(mapped.IsSuccess, mapped.Message);
+        Assert.True(kernel.Processes.Resolve(owner).IsSuccess);
+        Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.False(kernel.Processes.Resolve(owner).IsSuccess);
+        Assert.Equal(1, provider.MapCalls);
+    }
+
+    [Fact]
+    public void ExactSliceCallbackBlocksParentRevokeUntilPublication()
+    {
+        var provider = new ExactMappingProvider();
+        var bridge = new PlatformAuthorityBridge(provider);
+        var owner = new PlatformDomainIdentity(new DomainId(710),
+            new ProcessHandle(new ProcessId(701), 1));
+        var binding = bridge.BindDomain(owner).Value!;
+        var region = new PlatformRegionIdentity(new(new RegionId(1), new RegionGeneration(1)),
+            new(new DomainId(710), owner.ProcessGeneration), 4096);
+        provider.BeforeMapReturn = () => Assert.Equal(KernelError.PlatformBindingActive,
+            bridge.RevokeDomain(binding, owner).Error);
+
+        var mapped = bridge.MapOwnedRegionSlice(binding, owner, new CapabilityId(8),
+            new PlatformRegionSlice(region, 0, 4096, PlatformMemoryAccess.Read),
+            retainFaultedHandleOnMalformed: true);
+
+        Assert.True(mapped.IsSuccess, mapped.Message);
+        Assert.Equal(1, provider.MapCalls);
+        Assert.Equal(KernelError.PlatformBindingActive, bridge.RevokeDomain(binding, owner).Error);
+    }
+
+    [Fact]
     public void InvalidRangeOwnerAndGenerationAreRejectedBeforeProviderCall()
     {
         var provider = new ExactMappingProvider();
@@ -236,6 +861,8 @@ public sealed class PlatformOwnedRegionMappingV2Tests
         private ulong _nextOperation = 1;
 
         public int MapCalls { get; private set; }
+        public Action? BeforeMapReturn { get; set; }
+        public PlatformAuthorityStatus? MapStatus { get; set; }
         public int VisibilityCalls { get; private set; }
         public PlatformRegionSlice? LastSlice { get; private set; }
         public PlatformCompletionState CompletionState { get; set; } = PlatformCompletionState.Closed;
@@ -294,6 +921,10 @@ public sealed class PlatformOwnedRegionMappingV2Tests
                 new PlatformProviderLeaseGeneration(1), domainLease, slice.Region, slice.Access);
             _mapping = lease;
             _slice = slice;
+            BeforeMapReturn?.Invoke();
+            if (MapStatus is { } status)
+                return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(
+                    status, "Exact mapping rejected after callback.");
             return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Ok(
                 new PlatformProviderOwnedRegionMapping(lease, slice));
         }

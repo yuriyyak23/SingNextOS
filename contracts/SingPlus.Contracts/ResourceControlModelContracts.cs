@@ -1,3 +1,5 @@
+using System.Text;
+
 namespace SingPlus.Contracts;
 
 public enum ResourceDimensionFamilyV1 : byte
@@ -58,8 +60,14 @@ public readonly record struct ResourceEnvelopeV1(
             throw new ArgumentOutOfRangeException(nameof(ResourceClass), "Unknown resource dimension, class, or unit.");
         if (Amount is 0 or ulong.MaxValue)
             throw new ArgumentOutOfRangeException(nameof(Amount), "Resource amount cannot use zero or maximum sentinel values.");
-        if (string.IsNullOrWhiteSpace(SemanticScope) || !string.Equals(SemanticScope, SemanticScope.Trim(), StringComparison.Ordinal))
+        if (string.IsNullOrWhiteSpace(SemanticScope) || !string.Equals(SemanticScope, SemanticScope.Trim(), StringComparison.Ordinal) ||
+            SemanticScope.Any(char.IsControl))
             throw new ArgumentException("Semantic scope must be non-empty and canonical.", nameof(SemanticScope));
+        try { _ = new UTF8Encoding(false, true).GetByteCount(SemanticScope); }
+        catch (EncoderFallbackException exception)
+        {
+            throw new ArgumentException("Semantic scope must contain valid Unicode scalar values.", nameof(SemanticScope), exception);
+        }
 
         var valid = (Family, ResourceClass, Unit, WindowNanoseconds) switch
         {

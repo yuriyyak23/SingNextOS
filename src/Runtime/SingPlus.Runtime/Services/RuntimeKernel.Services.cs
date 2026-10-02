@@ -75,7 +75,8 @@ public sealed partial class RuntimeKernel
 {
     private EndpointSessionInvocationRegistry? _endpointSessionInvocationRegistry;
     private EndpointSessionInvocationRegistry SessionInvocations =>
-        _endpointSessionInvocationRegistry ??= new EndpointSessionInvocationRegistry(CancellationScopes);
+        _endpointSessionInvocationRegistry ??= new EndpointSessionInvocationRegistry(
+            CancellationScopes, _requestResponseCorrelationGate);
 
     internal EndpointSessionInvocationRegistry.InvocationConsequenceSnapshot?
         SnapshotSessionInvocationConsequence(EndpointSessionInvocationHandle invocation) =>

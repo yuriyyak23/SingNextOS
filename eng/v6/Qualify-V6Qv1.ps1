@@ -9,7 +9,11 @@ Set-StrictMode -Version Latest
 function Get-Sha256([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
 
 $filter = 'FullyQualifiedName~QualificationVerticalContractsV1Tests|FullyQualifiedName~V6MemoryRuntimeEnforcementTests|FullyQualifiedName~SemanticAdmissionSentryTests|FullyQualifiedName~SemanticExecutionBindingV1Tests|FullyQualifiedName~ExternalOperationLifecycleTests|FullyQualifiedName~VNextPhase08ComputePlanIndependentGatesTests|FullyQualifiedName~VNextPhase07ExternalOperationResourceBindingTests|FullyQualifiedName~DmaExecutionBindingV1Tests|FullyQualifiedName~HybridCpuExternalOperationProviderTests|FullyQualifiedName=SingPlus.Tests.Architecture.V6ArchitectureGuardTests.V6GateRegistryIsClosedCompleteAndDefaultOff'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.V6TemporalRuntimeEnforcementTests.FailedPreSubmitTemporalTraceRetainsCapturedSourceAndActualLocalRelease'
 $evidenceInputs = @(
+    'contracts/SingPlus.Contracts/TemporalSemanticsV1.cs',
+    'src/Runtime/SingPlus.Runtime/V6/V6TemporalSemanticBinding.cs',
+    'tests/SingPlus.Tests/Runtime/V6TemporalRuntimeEnforcementTests.cs',
     'contracts/SingPlus.Contracts/QualificationVerticalContracts.cs',
     'contracts/SingPlus.Contracts/OperationObligations.cs',
     'contracts/SingPlus.Contracts/SemanticExtensionContracts.cs',
@@ -59,7 +63,7 @@ try {
     if (-not $match.Success) { throw 'The QV1 test runner summary could not be parsed.' }
     $failed = [int]$match.Groups[1].Value; $passed = [int]$match.Groups[2].Value
     $skipped = [int]$match.Groups[3].Value; $total = [int]$match.Groups[4].Value
-    if ($failed -ne 0 -or $passed -ne 131 -or $skipped -ne 0 -or $total -ne 131) {
+    if ($failed -ne 0 -or $passed -ne 332 -or $skipped -ne 0 -or $total -ne 332) {
         throw "Unexpected QV1 counts: failed=$failed passed=$passed skipped=$skipped total=$total"
     }
     $packageTestFilter = 'FullyQualifiedName~AdapterBoundaryTests.VersionedExternalRuntimePackageExposesAdapterSessionWithoutGrantingAuthority'

@@ -78,3 +78,11 @@ None for baseline. PCL later adds optional evidence sidecars.
 
 ## EXIT CRITERIA
 The first qualification vertical can express all required semantics without changing the meaning of any V1 field and without introducing a second owner.
+
+## 2026-10-02 C0 telemetry counter exhaustion
+
+Closed bounded managed V1 capture/drop counter slice. Existing kernel capture sequence long backing field advances by CAS only while 0 <= current < long.MaxValue; invalid/terminal values return existing CapacityExhausted without counter mutation. Last supported ID long.MaxValue is allocated exactly once. Clock observation precedes sequence allocation and remains outside owner locks. Sequence is capture identity, not gap-free publication/temporal/permission evidence; failed publication may consume a captured ID. No signed wrap, negative conversion exception after mutation or reset/ABA introduced.
+
+Existing subscription owner guards Dropped==ulong.MaxValue before overflow counter, queue/dequeue or state mutation under the final telemetry publication gate. Final MaxValue increment preserves DropOldestWithMarker/RejectSample/StopSubscription V1 behavior. Existing TelemetrySubscriptionBatch reports nonzero Dropped and Complete=false; no new completeness authority/ledger/API/enum/schema. Physical coherence/clock failure completeness and fatal allocation compensation remain separately Partial.
+
+Eleven new cases: full drop exhaustion and final drop increment across all three policies, capture -1/MinValue/MaxValue, concurrent last capture ID and concurrent last drop increment. Build 0 errors/9 warnings 21.23s before final drop race; focused 96 passed, final focused 97 passed after added race. Final broad/exact source/dependency tuple/hashes: artifacts/v6/iteration-20261002-c0-telemetry-counter-exhaustion/audit.json. All gates OFF, named managed no-wrap guard RuntimeEnforced only; Java excluded/skipped, ISA/opcode/CPU impact NONE. Next independent slice: nonfatal telemetry snapshot clock failure and existing batch incomplete consumer semantics.

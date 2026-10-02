@@ -52,7 +52,7 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDmaCompletionEvidence completionEvidence,
         PlatformDomainIdentity expectedSubject)
     {
-        var submissionValidation = ValidateDmaSubmissionIdentity(submission, expectedSubject);
+        var submissionValidation = ValidateDmaSubmissionIdentityLocked(submission, expectedSubject, observeProvider: false);
         if (!submissionValidation.IsSuccess)
         {
             return KernelResult<PlatformDmaPostCompletionVisibilityEvidence>.Fail(
@@ -60,14 +60,14 @@ public sealed partial class PlatformAuthorityBridge
                 submissionValidation.Message!);
         }
 
-        if (HasFaultPinnedDmaSubmission(submission.GrantId))
+        var record = _activeDmaSubmissions[submission.GrantId];
+        var grantRecord = _dmaGrants[submission.GrantId];
+        if (grantRecord.AcquisitionInFlight)
         {
             return KernelResult<PlatformDmaPostCompletionVisibilityEvidence>.Fail(
-                KernelError.PlatformFaulted,
-                "DMA post-completion visibility is fault-pinned and lower authority must remain closed to reclaim.");
+                KernelError.PlatformBindingDraining,
+                "The exact DMA visibility acquire is already in flight.");
         }
-
-        var record = _activeDmaSubmissions[submission.GrantId];
         if (!record.CompletionProven)
         {
             return KernelResult<PlatformDmaPostCompletionVisibilityEvidence>.Fail(
@@ -118,9 +118,121 @@ public sealed partial class PlatformAuthorityBridge
                 "Post-completion visibility for the exact DMA operation has already been consumed.");
         }
 
-        if (submission.Direction == PlatformDmaDirection.DeviceReadsMemory)
+        var backendEpoch = BackendEpoch;
+        var expectedIncarnation = grantRecord.ProviderIncarnation;
+        grantRecord.AcquisitionInFlight = true;
+        try { return FinalizePreparedVisibility(); }
+        finally { grantRecord.AcquisitionInFlight = false; }
+
+        bool VisibilityTupleRemainsExact(PlatformProviderIncarnation incarnation) =>
+            ValidateDmaSubmissionIdentityLocked(submission, expectedSubject, observeProvider: false).IsSuccess &&
+            !_dmaSubmissionFaultPins.Contains(submission.GrantId) && BackendEpoch == backendEpoch &&
+            incarnation.Value != 0 && incarnation == expectedIncarnation && record.CompletionProven &&
+            _activeDmaSubmissions.TryGetValue(submission.GrantId, out var currentRecord) &&
+            ReferenceEquals(currentRecord, record) &&
+            _dmaVisibilityStates.TryGetValue(submission.GrantId, out var currentVisibility) &&
+            ReferenceEquals(currentVisibility, visibilityState) && !visibilityState.Acquired &&
+            visibilityState.Consumed && visibilityState.LocalCycle == submission.PreparedCycle;
+
+        KernelResult<PlatformDmaPostCompletionVisibilityEvidence> FinalizePreparedVisibility()
         {
+            PlatformProviderIncarnation incarnation;
+            try { incarnation = CurrentProviderIncarnation(); }
+            catch (Exception exception)
+            {
+                FaultPinDmaSubmissionLocked(submission.GrantId);
+                return KernelResult<PlatformDmaPostCompletionVisibilityEvidence>.Fail(KernelError.PlatformFaulted,
+                    $"DMA visibility generation read failed; the effect remains pinned: {exception.Message}");
+            }
+            if (!VisibilityTupleRemainsExact(incarnation))
+            {
+                FaultPinDmaSubmissionLocked(submission.GrantId,
+                    incarnation != expectedIncarnation ? incarnation : null);
+                return KernelResult<PlatformDmaPostCompletionVisibilityEvidence>.Fail(KernelError.PlatformFaulted,
+                    "DMA visibility authority changed during generation admission; the effect remains pinned.");
+            }
+            if (submission.Direction == PlatformDmaDirection.DeviceReadsMemory)
+            {
+                QueueDmaTraceLocked(record, SemanticTraceEventKindV1.Visible);
+                CaptureVisibleDmaTraceLocked(record);
+                _activeDmaSubmissions.Remove(submission.GrantId);
+                return KernelResult<PlatformDmaPostCompletionVisibilityEvidence>.Ok(
+                    new PlatformDmaPostCompletionVisibilityEvidence(
+                        submission.OperationId,
+                        submission.Generation,
+                        submission.GrantId,
+                        submission.GrantGeneration,
+                        submission.PreparedCycle,
+                        submission.Direction,
+                        PlatformDmaPostCompletionVisibilityRequirement.None,
+                        PlatformDmaPostCompletionVisibilityOutcome.NotRequired));
+            }
+
+            if (_provider is not IPlatformDmaVisibilityProvider visibilityProvider)
+            {
+                FaultPinDmaSubmissionLocked(submission.GrantId);
+                return KernelResult<PlatformDmaPostCompletionVisibilityEvidence>.Fail(
+                    KernelError.PlatformFaulted,
+                    "The v5 DMA provider no longer exposes the acquire primitive required for post-completion visibility.");
+            }
+
+            var providerGrant = _dmaGrants[submission.GrantId].ProviderGrant;
+            PlatformAuthorityResult<PlatformProviderDmaAcquireEvidence> providerResult;
+            try
+            {
+                providerResult = visibilityProvider.AcquireDmaGrantVisibility(providerGrant);
+                incarnation = CurrentProviderIncarnation();
+            }
+            catch (Exception exception)
+            {
+                FaultPinDmaSubmissionLocked(submission.GrantId);
+                return KernelResult<PlatformDmaPostCompletionVisibilityEvidence>.Fail(
+                    KernelError.PlatformFaulted,
+                    $"The DMA provider threw during post-completion acquire; the exact mapping remains pinned: {exception.Message}");
+            }
+
+            if (!VisibilityTupleRemainsExact(incarnation))
+            {
+                FaultPinDmaSubmissionLocked(submission.GrantId,
+                    incarnation != expectedIncarnation ? incarnation : null);
+                return KernelResult<PlatformDmaPostCompletionVisibilityEvidence>.Fail(KernelError.PlatformFaulted,
+                    "DMA visibility authority changed during acquire; the effect remains pinned.");
+            }
+
+            if (!providerResult.IsSuccess)
+            {
+                if (providerResult.Status is PlatformAuthorityStatus.Faulted or
+                    PlatformAuthorityStatus.Stale or
+                    PlatformAuthorityStatus.Revoked or
+                    PlatformAuthorityStatus.WrongDomain)
+                {
+                    FaultPinDmaSubmissionLocked(submission.GrantId);
+                    return KernelResult<PlatformDmaPostCompletionVisibilityEvidence>.Fail(
+                        KernelError.PlatformFaulted,
+                        providerResult.Message ?? "Post-completion DMA acquire lost exact provider lifetime identity.");
+                }
+
+                return FromProviderFailure<PlatformDmaPostCompletionVisibilityEvidence>(
+                    providerResult.Status,
+                    providerResult.Message);
+            }
+
+            var providerEvidence = providerResult.Value!;
+            var providerValidation = PlatformDmaVisibilityContract.ValidateAcquireEvidence(
+                providerGrant,
+                visibilityState.ProviderCycle,
+                providerEvidence);
+            if (!providerValidation.IsSuccess)
+            {
+                FaultPinDmaSubmissionLocked(submission.GrantId);
+                return KernelResult<PlatformDmaPostCompletionVisibilityEvidence>.Fail(
+                    KernelError.PlatformFaulted,
+                    providerValidation.Message ?? "The provider returned malformed post-completion DMA acquire evidence.");
+            }
+
+            visibilityState.Acquired = true;
             QueueDmaTraceLocked(record, SemanticTraceEventKindV1.Visible);
+            CaptureVisibleDmaTraceLocked(record);
             _activeDmaSubmissions.Remove(submission.GrantId);
             return KernelResult<PlatformDmaPostCompletionVisibilityEvidence>.Ok(
                 new PlatformDmaPostCompletionVisibilityEvidence(
@@ -130,87 +242,9 @@ public sealed partial class PlatformAuthorityBridge
                     submission.GrantGeneration,
                     submission.PreparedCycle,
                     submission.Direction,
-                    PlatformDmaPostCompletionVisibilityRequirement.None,
-                    PlatformDmaPostCompletionVisibilityOutcome.NotRequired));
+                    PlatformDmaPostCompletionVisibilityRequirement.AcquisitionFence,
+                    PlatformDmaPostCompletionVisibilityOutcome.AcquisitionFenceSatisfied));
         }
-
-        if (_provider is not IPlatformDmaVisibilityProvider visibilityProvider)
-        {
-            FaultPinDmaSubmissionLocked(submission.GrantId);
-            return KernelResult<PlatformDmaPostCompletionVisibilityEvidence>.Fail(
-                KernelError.PlatformFaulted,
-                "The v5 DMA provider no longer exposes the acquire primitive required for post-completion visibility.");
-        }
-
-        var providerGrant = _dmaGrants[submission.GrantId].ProviderGrant;
-        PlatformAuthorityResult<PlatformProviderDmaAcquireEvidence> providerResult;
-        try
-        {
-            providerResult = visibilityProvider.AcquireDmaGrantVisibility(providerGrant);
-        }
-        catch (Exception exception)
-        {
-            FaultPinDmaSubmissionLocked(submission.GrantId);
-            return KernelResult<PlatformDmaPostCompletionVisibilityEvidence>.Fail(
-                KernelError.PlatformFaulted,
-                $"The DMA provider threw during post-completion acquire; the exact mapping remains pinned: {exception.Message}");
-        }
-
-        if (!providerResult.IsSuccess)
-        {
-            if (providerResult.Status is PlatformAuthorityStatus.Faulted or
-                PlatformAuthorityStatus.Stale or
-                PlatformAuthorityStatus.Revoked or
-                PlatformAuthorityStatus.WrongDomain)
-            {
-                FaultPinDmaSubmissionLocked(submission.GrantId);
-                return KernelResult<PlatformDmaPostCompletionVisibilityEvidence>.Fail(
-                    KernelError.PlatformFaulted,
-                    providerResult.Message ?? "Post-completion DMA acquire lost exact provider lifetime identity.");
-            }
-
-            return FromProviderFailure<PlatformDmaPostCompletionVisibilityEvidence>(
-                providerResult.Status,
-                providerResult.Message);
-        }
-
-        var providerEvidence = providerResult.Value!;
-        var providerValidation = PlatformDmaVisibilityContract.ValidateAcquireEvidence(
-            providerGrant,
-            visibilityState.ProviderCycle,
-            providerEvidence);
-        if (!providerValidation.IsSuccess)
-        {
-            FaultPinDmaSubmissionLocked(submission.GrantId);
-            return KernelResult<PlatformDmaPostCompletionVisibilityEvidence>.Fail(
-                KernelError.PlatformFaulted,
-                providerValidation.Message ?? "The provider returned malformed post-completion DMA acquire evidence.");
-        }
-
-        // An acquire receipt from an incarnation that changed inside the callback
-        // cannot close the pending write or make its mapping reusable.
-        var stillExact = ValidateDmaSubmissionIdentityLocked(submission, expectedSubject);
-        if (!stillExact.IsSuccess)
-        {
-            FaultPinDmaSubmissionLocked(submission.GrantId);
-            return KernelResult<PlatformDmaPostCompletionVisibilityEvidence>.Fail(
-                KernelError.PlatformFaulted,
-                "DMA provider or owner generation changed during post-completion acquire; the mapping remains pinned.");
-        }
-
-        visibilityState.Acquired = true;
-        QueueDmaTraceLocked(record, SemanticTraceEventKindV1.Visible);
-        _activeDmaSubmissions.Remove(submission.GrantId);
-        return KernelResult<PlatformDmaPostCompletionVisibilityEvidence>.Ok(
-            new PlatformDmaPostCompletionVisibilityEvidence(
-                submission.OperationId,
-                submission.Generation,
-                submission.GrantId,
-                submission.GrantGeneration,
-                submission.PreparedCycle,
-                submission.Direction,
-                PlatformDmaPostCompletionVisibilityRequirement.AcquisitionFence,
-                PlatformDmaPostCompletionVisibilityOutcome.AcquisitionFenceSatisfied));
     }
 
     private static KernelResult ValidateExactDmaCompletionEvidence(

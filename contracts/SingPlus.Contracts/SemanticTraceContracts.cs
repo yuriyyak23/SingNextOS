@@ -17,6 +17,11 @@ public enum SemanticTraceEventKindV1 : byte
     Released = 9,
     EffectClosedWithoutPublication = 10,
     CancellationRequested = 11,
+    ResourceAccountingQuarantined = 12,
+    CancelledBeforeSubmit = 13,
+    LocalAuthorityReleasedBeforeSubmit = 14,
+    LocalAuthorityReleasedWithoutResourceBinding = 15,
+    ResourceAccountingQuarantinedBeforeSubmit = 16,
 }
 
 public readonly record struct SemanticTraceEventV1(
@@ -46,8 +51,16 @@ public readonly record struct SemanticTraceEventV1(
 
     private static void ValidateToken(string? value, string parameter)
     {
-        if (string.IsNullOrWhiteSpace(value) || value != value.Trim() || value.Any(char.IsControl) ||
-            Encoding.UTF8.GetByteCount(value) > 256)
+        if (value is null || value.Length > 256 || string.IsNullOrWhiteSpace(value) ||
+            value != value.Trim() || value.Any(char.IsControl))
+            throw new ArgumentException("Trace identity must be a bounded canonical token.", parameter);
+        int byteCount;
+        try { byteCount = new UTF8Encoding(false, true).GetByteCount(value); }
+        catch (EncoderFallbackException exception)
+        {
+            throw new ArgumentException("Trace identity must contain valid Unicode scalar values.", parameter, exception);
+        }
+        if (byteCount > 256)
             throw new ArgumentException("Trace identity must be a bounded canonical token.", parameter);
     }
 
@@ -95,6 +108,11 @@ public enum SemanticTraceValidationStatusV1 : byte
     GenerationMismatch = 7,
 }
 
+/// <summary>
+/// Diagnostic failure identity. InvalidEvent inputs are not canonical or bounded,
+/// so their ID identifies the failure position/kind rather than the rejected payload.
+/// Exact-input attribution requires separately retained source evidence.
+/// </summary>
 public sealed record SemanticTraceCounterexampleV1(
     ushort Version,
     SemanticTraceValidationStatusV1 Status,
@@ -114,6 +132,11 @@ public sealed record SemanticTraceValidationResultV1(
     public bool IsValid => Status == SemanticTraceValidationStatusV1.Valid;
 }
 
+/// <summary>
+/// Validates observation metadata before private-event erasure. ProviderIdentity
+/// is a source label, not an authenticated provider/dependency binding; callers
+/// must retain exact source evidence separately for qualification attribution.
+/// </summary>
 public static class SemanticTraceProjectionV1
 {
     public static IReadOnlyList<SemanticTraceEventV1> Project(IEnumerable<ProviderTraceEventV1> providerTrace)
@@ -177,9 +200,13 @@ public static class SemanticTraceValidatorV1
 
         string? operation = null;
         string? generationVectorDigest = null;
+        var observedGenerationDigests = new HashSet<string>(StringComparer.Ordinal);
         ulong sequence = 0;
         SemanticTraceEventKindV1? previous = null;
         var state = LifecycleState.Initial;
+        var completionObserved = false;
+        var accountingQuarantineObserved = false;
+        var generationDriftObserved = false;
         for (var index = 0; index < events.Length; index++)
         {
             SemanticTraceEventV1 current;
@@ -192,21 +219,31 @@ public static class SemanticTraceValidatorV1
                 return Fail(SemanticTraceValidationStatusV1.MixedOperation, index, previous, current.Kind, current);
             if (current.Sequence <= sequence)
                 return Fail(SemanticTraceValidationStatusV1.NonMonotonicSequence, index, previous, current.Kind, current);
-            if (state == LifecycleState.Released)
+            if (state is LifecycleState.Released or LifecycleState.NonResourceLocallyReleased ||
+                state == LifecycleState.PreSubmitReleased && current.Kind != SemanticTraceEventKindV1.ResourceAccountingQuarantinedBeforeSubmit)
                 return Fail(SemanticTraceValidationStatusV1.EventAfterRelease, index, previous, current.Kind, current);
 
             if (generationVectorDigest is not null)
             {
                 var changed = !string.Equals(generationVectorDigest,
                     current.GenerationVectorDigest, StringComparison.Ordinal);
-                if (changed != (current.Kind == SemanticTraceEventKindV1.GenerationChanged))
+                if (changed != (current.Kind == SemanticTraceEventKindV1.GenerationChanged) ||
+                    (changed && observedGenerationDigests.Contains(current.GenerationVectorDigest)))
                     return Fail(SemanticTraceValidationStatusV1.GenerationMismatch,
                         index, previous, current.Kind, current);
             }
 
-            if (!TryAdvance(state, current.Kind, out state))
+            if ((current.Kind == SemanticTraceEventKindV1.LocalAuthorityReleasedWithoutResourceBinding &&
+                 (accountingQuarantineObserved || generationDriftObserved)) ||
+                (current.Kind == SemanticTraceEventKindV1.RetireOrComplete && completionObserved) ||
+                !TryAdvance(state, current.Kind, out state))
                 return Fail(SemanticTraceValidationStatusV1.InvalidLifecycleOrder, index, previous, current.Kind, current);
+            if (current.Kind == SemanticTraceEventKindV1.RetireOrComplete) completionObserved = true;
+            if (current.Kind is SemanticTraceEventKindV1.ResourceAccountingQuarantined or
+                SemanticTraceEventKindV1.ResourceAccountingQuarantinedBeforeSubmit) accountingQuarantineObserved = true;
+            if (current.Kind == SemanticTraceEventKindV1.GenerationChanged) generationDriftObserved = true;
             generationVectorDigest = current.GenerationVectorDigest;
+            observedGenerationDigests.Add(current.GenerationVectorDigest);
             sequence = current.Sequence;
             previous = current.Kind;
         }
@@ -216,12 +253,44 @@ public static class SemanticTraceValidatorV1
     private static bool TryAdvance(LifecycleState state, SemanticTraceEventKindV1 kind, out LifecycleState next)
     {
         next = state;
+        if (kind == SemanticTraceEventKindV1.ResourceAccountingQuarantinedBeforeSubmit)
+            // Local pre-submit release does not terminate independent accounting.
+            return state is LifecycleState.Initial or LifecycleState.PreSubmitCancelled or LifecycleState.PreSubmitReleased;
+        if (kind == SemanticTraceEventKindV1.LocalAuthorityReleasedWithoutResourceBinding)
+            return state is LifecycleState.Published or LifecycleState.Quarantined or LifecycleState.EffectClosed &&
+                   Set(LifecycleState.NonResourceLocallyReleased, out next);
+        if (kind == SemanticTraceEventKindV1.CancelledBeforeSubmit)
+            return state is LifecycleState.Initial or LifecycleState.PreSubmitCancelled &&
+                   Set(LifecycleState.PreSubmitCancelled, out next);
+        if (kind == SemanticTraceEventKindV1.LocalAuthorityReleasedBeforeSubmit)
+            return state == LifecycleState.PreSubmitCancelled &&
+                   Set(LifecycleState.PreSubmitReleased, out next);
+        // This separate local branch cannot acquire post-submit effect/closure facts.
+        if (state is LifecycleState.PreSubmitCancelled or LifecycleState.PreSubmitReleased)
+            return false;
+        if (kind == SemanticTraceEventKindV1.ResourceAccountingQuarantined)
+        {
+            // Accounting ambiguity is independent of effect containment. Observe
+            // it without restoring any lifecycle/generation/closure permission.
+            return state is not (LifecycleState.Initial or LifecycleState.Submitted or
+                LifecycleState.Settled or LifecycleState.QuarantinedSettled or
+                LifecycleState.EffectClosedSettled or LifecycleState.GenerationDriftedSettled or
+                LifecycleState.GenerationDriftedAfterPublicationSettled or
+                LifecycleState.QuarantinedAfterPublicationSettled or LifecycleState.CompletedSettled or
+                LifecycleState.VisibleSettled or LifecycleState.Released);
+        }
         if (kind == SemanticTraceEventKindV1.GenerationChanged)
         {
             // Submit and EffectPossible are one irreversible owner boundary.
             // A drift marker between them would allow a changed generation to
             // inherit a submit without accounting for its possible effect.
             if (state is LifecycleState.Initial or LifecycleState.Submitted) return false;
+            if (state is LifecycleState.Settled or LifecycleState.QuarantinedAfterPublicationSettled or
+                LifecycleState.GenerationDriftedAfterPublicationSettled)
+                return Set(LifecycleState.GenerationDriftedAfterPublicationSettled, out next);
+            if (state is LifecycleState.QuarantinedSettled or LifecycleState.EffectClosedSettled or
+                LifecycleState.GenerationDriftedSettled or LifecycleState.CompletedSettled or LifecycleState.VisibleSettled)
+                return Set(LifecycleState.GenerationDriftedSettled, out next);
             if (state is LifecycleState.Published or LifecycleState.Settled or
                 LifecycleState.GenerationDriftedAfterPublication or
                 LifecycleState.QuarantinedAfterPublication or
@@ -229,7 +298,7 @@ public static class SemanticTraceValidatorV1
                 next = LifecycleState.GenerationDriftedAfterPublication;
             else if (state is LifecycleState.EffectPossible or LifecycleState.CancellationPending or
                      LifecycleState.Completed or LifecycleState.Visible or LifecycleState.GenerationDrifted or
-                     LifecycleState.QuarantinedSettled or LifecycleState.EffectClosed or
+                     LifecycleState.Quarantined or LifecycleState.QuarantinedSettled or LifecycleState.EffectClosed or
                      LifecycleState.EffectClosedSettled)
                 next = LifecycleState.GenerationDrifted;
             return true;
@@ -237,7 +306,13 @@ public static class SemanticTraceValidatorV1
         if (kind == SemanticTraceEventKindV1.Quarantined)
         {
             if (state is LifecycleState.Initial or LifecycleState.Submitted) return false;
-            next = state is LifecycleState.Published or LifecycleState.GenerationDriftedAfterPublication or
+            if (state is LifecycleState.Settled or LifecycleState.QuarantinedAfterPublicationSettled or
+                LifecycleState.GenerationDriftedAfterPublicationSettled)
+                return Set(LifecycleState.QuarantinedAfterPublicationSettled, out next);
+            if (state is LifecycleState.QuarantinedSettled or LifecycleState.EffectClosedSettled or
+                LifecycleState.GenerationDriftedSettled or LifecycleState.CompletedSettled or LifecycleState.VisibleSettled)
+                return Set(LifecycleState.QuarantinedSettled, out next);
+            next = state is LifecycleState.Published or LifecycleState.Settled or LifecycleState.GenerationDriftedAfterPublication or
                 LifecycleState.QuarantinedAfterPublication or LifecycleState.QuarantinedAfterPublicationSettled
                 ? LifecycleState.QuarantinedAfterPublication
                 : LifecycleState.Quarantined;
@@ -253,7 +328,8 @@ public static class SemanticTraceValidatorV1
         if (kind == SemanticTraceEventKindV1.CancellationRequested)
             return state == LifecycleState.EffectPossible &&
                    Set(LifecycleState.CancellationPending, out next);
-        if (state is LifecycleState.GenerationDrifted or LifecycleState.GenerationDriftedAfterPublication)
+        if (state is LifecycleState.GenerationDrifted or LifecycleState.GenerationDriftedAfterPublication or
+            LifecycleState.GenerationDriftedSettled or LifecycleState.GenerationDriftedAfterPublicationSettled)
             return false;
         if (state == LifecycleState.QuarantinedAfterPublication)
             return kind == SemanticTraceEventKindV1.Settled &&
@@ -263,6 +339,9 @@ public static class SemanticTraceValidatorV1
         if (state == LifecycleState.Quarantined)
             return kind switch
             {
+                // Late completion observes an existing effect; it does not clear
+                // quarantine or establish visibility, publication or closure.
+                SemanticTraceEventKindV1.RetireOrComplete => true,
                 SemanticTraceEventKindV1.Settled => Set(LifecycleState.QuarantinedSettled, out next),
                 SemanticTraceEventKindV1.Released => false,
                 _ => false,
@@ -282,6 +361,12 @@ public static class SemanticTraceValidatorV1
             (LifecycleState.EffectPossible, SemanticTraceEventKindV1.RetireOrComplete) => Set(LifecycleState.Completed, out next),
             (LifecycleState.CancellationPending, SemanticTraceEventKindV1.RetireOrComplete) => Set(LifecycleState.Completed, out next),
             (LifecycleState.Completed, SemanticTraceEventKindV1.Visible) => Set(LifecycleState.Visible, out next),
+            // Accounting settlement is independent from visibility/publication.
+            // It cannot permit release until publication or exact no-publication closure.
+            (LifecycleState.Completed, SemanticTraceEventKindV1.Settled) => Set(LifecycleState.CompletedSettled, out next),
+            (LifecycleState.Visible, SemanticTraceEventKindV1.Settled) => Set(LifecycleState.VisibleSettled, out next),
+            (LifecycleState.CompletedSettled, SemanticTraceEventKindV1.Visible) => Set(LifecycleState.VisibleSettled, out next),
+            (LifecycleState.VisibleSettled, SemanticTraceEventKindV1.Published) => Set(LifecycleState.Settled, out next),
             (LifecycleState.Visible, SemanticTraceEventKindV1.Published) => Set(LifecycleState.Published, out next),
             (LifecycleState.Published, SemanticTraceEventKindV1.Settled) => Set(LifecycleState.Settled, out next),
             (LifecycleState.Settled, SemanticTraceEventKindV1.Released) => Set(LifecycleState.Released, out next),
@@ -333,6 +418,13 @@ public static class SemanticTraceValidatorV1
         QuarantinedAfterPublication,
         QuarantinedAfterPublicationSettled,
         Released,
+        GenerationDriftedSettled,
+        GenerationDriftedAfterPublicationSettled,
+        CompletedSettled,
+        VisibleSettled,
+        PreSubmitCancelled,
+        PreSubmitReleased,
+        NonResourceLocallyReleased,
     }
 }
 

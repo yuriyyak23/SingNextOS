@@ -20,3 +20,7 @@
 | remote delegation | original logical owner | P11 | V6-MULTIHOST-LEASES | partition/lease model | FutureGated |
 | energy budget | ResourceBudgetAuthority when committed | P12 | V6-ENERGY-BUDGETS | accounting/enforcement tests | measurement/upper bound |
 | compiler lowering evidence | compiler producer + verifier, no authority | PCL | V6-PROOF-CARRYING-LOWERING | mutation/digest/fallback tests | StaticAdmission |
+
+### C0 telemetry no-wrap requirements — 2026-10-02
+
+C0-TEL-COUNT-001 capture ID cannot wrap or mutate on invalid/terminal refusal; C0-TEL-COUNT-002 last signed-backing capture ID allocated once; C0-TEL-COUNT-003 Dropped exhaustion refuses before queue/state mutation; C0-TEL-COUNT-004 final overflow increment retains V1 policy and existing incomplete batch consumer. Tests: InvalidOrExhaustedCaptureSequenceCannotMutateOrWrap, ConcurrentFinalCaptureSequenceIsAllocatedExactlyOnce, ExhaustedDropCounterRefusesBeforeQueueOrStateMutation, FinalDropIncrementPreservesV1OverflowPolicyAndIncompleteBatch, ConcurrentFinalDropIncrementCannotWrapOrMutateRefusedSample. Fault IDs C0-TEL-COUNT-F01..06: invalid signed capture, terminal capture, concurrent last capture, terminal Dropped, final Dropped per policy, concurrent last Dropped. Existing RuntimeKernel field/subscription record remain owners; no trace/time identity as permission. Evidence: artifacts/v6/iteration-20261002-c0-telemetry-counter-exhaustion. Managed guard RuntimeEnforced, gates OFF; physical/clock/coherent-snapshot completeness not qualified.

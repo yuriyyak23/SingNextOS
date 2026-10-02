@@ -6,6 +6,49 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class SemanticOperationObligationsRuntimeTests
 {
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void ObligationsClockCallbackCannotReturnStaleOwnerValidation(int fault)
+    {
+        var c = Create(RegionUseMode.StagedOutput, withSession: true);
+        var obligations = Compose(c).Value!;
+        if (fault == 3)
+        {
+            Assert.True(c.Kernel.ExternalOperations.Admit(c.Operation, new(1, 1)).IsSuccess);
+            obligations = Compose(c).Value!;
+        }
+        var clockCalled = false;
+        c.Time.OnRead = () =>
+        {
+            clockCalled = true;
+            if (fault == 1)
+            {
+                var owner = new RegionOwner(new(2101), c.Principal.Generation);
+                var use = c.Kernel.Regions.AcquireUse(c.Region, owner, RegionUseMode.ExclusiveWrite, new(0, 16)).Value!;
+                Assert.True(c.Kernel.Regions.ReleaseUse(use.Handle, owner).IsSuccess);
+            }
+            if (fault == 2) Assert.True(c.Kernel.CloseSession(c.Principal, c.Session!.Value).IsSuccess);
+            if (fault == 3) Assert.True(c.Kernel.ExternalOperations.RecordSubmission(c.Operation, new(1, 1)).IsSuccess);
+        };
+        var result = c.Kernel.RevalidateOperationObligationsV1(obligations);
+        Assert.True(clockCalled);
+        Assert.Equal(fault == 0, result.IsSuccess);
+        if (fault != 0) Assert.Equal(fault == 2 ? KernelError.SessionClosed : KernelError.StaleGeneration, result.Error);
+        Assert.Empty(c.Kernel.Budgets.InspectionSnapshot());
+        if (fault == 3)
+        {
+            var operation = c.Kernel.ExternalOperations.Query(c.Operation).Value!;
+            Assert.Equal(ExternalOperationState.Submitted, operation.State);
+            foreach (var use in operation.Admission!.RegionUses)
+                Assert.Equal(KernelError.RegionUseConflict,
+                    c.Kernel.Regions.ReleaseUse(use.Handle, operation.Principal).Error);
+        }
+        else Assert.All(c.Kernel.Regions.SnapshotUses(), use => Assert.Equal(RegionUseState.Released, use.State));
+    }
+
     [Fact]
     public void ComposerCapturesExactLiveRegionEpochAndRevalidatesWithoutMutation()
     {
@@ -150,7 +193,14 @@ public sealed class SemanticOperationObligationsRuntimeTests
     private sealed class TestTimeProvider(DateTimeOffset now) : TimeProvider
     {
         private DateTimeOffset _now = now;
-        public override DateTimeOffset GetUtcNow() => _now;
+        internal Action? OnRead { get; set; }
+        public override DateTimeOffset GetUtcNow()
+        {
+            var callback = OnRead;
+            OnRead = null;
+            callback?.Invoke();
+            return _now;
+        }
         public void Advance(TimeSpan elapsed) => _now += elapsed;
     }
 }

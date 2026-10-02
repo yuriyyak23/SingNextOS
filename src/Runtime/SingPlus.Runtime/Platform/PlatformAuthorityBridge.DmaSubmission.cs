@@ -69,14 +69,15 @@ public sealed partial class PlatformAuthorityBridge
     internal KernelResult<PlatformDmaSubmission> SubmitDmaGrant(
         PlatformDmaGrant grant,
         PlatformDmaPrepareEvidence prepareEvidence,
-        PlatformDomainIdentity expectedSubject)
+        PlatformDomainIdentity expectedSubject,
+        Func<KernelResult> revalidateRegion)
     {
         // Keep the bridge lock order stable: DSC1 state precedes DMA state.
         // RuntimeKernel holds its platform-memory-use gate outside both.
         lock (_dsc1Gate)
         lock (_dmaCompletionGate)
             return SubmitDmaGrantLocked(grant, prepareEvidence, expectedSubject, null,
-                null, out _);
+                null, revalidateRegion, out _);
     }
 
     internal KernelResult<(PlatformDmaSubmission Submission, DmaExecutionBindingV1 Binding)>
@@ -86,6 +87,7 @@ public sealed partial class PlatformAuthorityBridge
             PlatformDomainIdentity expectedSubject,
             ulong regionMutationGeneration,
             ISemanticTraceSinkV1? traceSink,
+            Func<KernelResult> revalidateRegion,
             out DmaTraceObserver? ambiguityTrace)
     {
         ambiguityTrace = null;
@@ -93,7 +95,7 @@ public sealed partial class PlatformAuthorityBridge
         lock (_dmaCompletionGate)
         {
             var result = SubmitDmaGrantLocked(grant, prepareEvidence, expectedSubject,
-                regionMutationGeneration, traceSink, out ambiguityTrace);
+                regionMutationGeneration, traceSink, revalidateRegion, out ambiguityTrace);
             if (!result.IsSuccess)
                 return KernelResult<(PlatformDmaSubmission, DmaExecutionBindingV1)>.Fail(
                     result.Error, result.Message!);
@@ -111,6 +113,7 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDomainIdentity expectedSubject,
         ulong? regionMutationGeneration,
         ISemanticTraceSinkV1? traceSink,
+        Func<KernelResult> revalidateRegion,
         out DmaTraceObserver? ambiguityTrace)
     {
         ambiguityTrace = null;
@@ -214,16 +217,56 @@ public sealed partial class PlatformAuthorityBridge
                 "The current DMA visibility cycle was already consumed and cannot be submitted.");
         }
 
-        var providerGrant = _dmaGrants[grant.GrantId].ProviderGrant;
         var grantRecord = _dmaGrants[grant.GrantId];
-        var submitIncarnation = CurrentProviderIncarnation();
+        grantRecord.SubmissionInFlight = true;
+        try
+        {
+            return SubmitDmaGrantProviderLocked(grant, expectedSubject, regionMutationGeneration,
+                traceSink, submissionProvider, grantRecord, visibilityState, revalidateRegion, out ambiguityTrace);
+        }
+        finally { grantRecord.SubmissionInFlight = false; }
+    }
+
+    private KernelResult<PlatformDmaSubmission> SubmitDmaGrantProviderLocked(
+        PlatformDmaGrant grant, PlatformDomainIdentity expectedSubject,
+        ulong? regionMutationGeneration, ISemanticTraceSinkV1? traceSink,
+        IPlatformDmaSubmissionProvider submissionProvider, DmaGrantRecord grantRecord,
+        DmaVisibilityState visibilityState, Func<KernelResult> revalidateRegion,
+        out DmaTraceObserver? ambiguityTrace)
+    {
+        ambiguityTrace = null;
+        var providerGrant = grantRecord.ProviderGrant;
         var submitBackendEpoch = BackendEpoch;
+        PlatformProviderIncarnation submitIncarnation;
+        try { submitIncarnation = CurrentProviderIncarnation(); }
+        catch (Exception exception)
+        {
+            _dmaSubmissionFaultPins.Add(grant.GrantId);
+            return KernelResult<PlatformDmaSubmission>.Fail(KernelError.PlatformFaulted,
+                $"DMA generation is unavailable before submission; mapping remains pinned: {exception.Message}");
+        }
+        if (BackendEpoch != submitBackendEpoch || HasFaultPinnedDmaSubmission(grant.GrantId) ||
+            HasActiveDmaSubmission(grant.GrantId) ||
+            !ValidateDeviceLease(grant.DeviceLease, expectedSubject).IsSuccess ||
+            !ValidateExactMapping(grant.Mapping, expectedSubject).IsSuccess ||
+            !_dmaVisibilityStates.TryGetValue(grant.GrantId, out var currentVisibility) ||
+            !ReferenceEquals(currentVisibility, visibilityState) || visibilityState.Acquired || visibilityState.Consumed)
+        {
+            _dmaSubmissionFaultPins.Add(grant.GrantId);
+            return KernelResult<PlatformDmaSubmission>.Fail(KernelError.PlatformFaulted,
+                "DMA authorization, visibility cycle or backend changed before submission; mapping remains pinned.");
+        }
         if (submitIncarnation.Value == 0 || submitIncarnation != grantRecord.ProviderIncarnation)
         {
             return KernelResult<PlatformDmaSubmission>.Fail(
                 KernelError.StaleGeneration,
                 "The DMA provider restarted or reset after the exact grant was admitted.");
         }
+        // Region facts remain owned by RuntimeKernel's existing RegionAuthority.
+        // The trusted consumer re-reads them after the provider-owned getter.
+        var regionAdmission = revalidateRegion();
+        if (!regionAdmission.IsSuccess)
+            return KernelResult<PlatformDmaSubmission>.Fail(regionAdmission.Error, regionAdmission.Message!);
         var request = new PlatformProviderDmaSubmitRequest(
             providerGrant,
             visibilityState.ProviderCycle);
@@ -290,12 +333,16 @@ public sealed partial class PlatformAuthorityBridge
                 : null;
         }
         PlatformAuthorityResult<PlatformProviderDmaSubmission> providerResult;
+        PlatformProviderIncarnation observedIncarnation;
+        PlatformBackendEpoch observedEpoch;
         try
         {
             providerResult = admittedBinding is { } exactBinding
                 ? ((IPlatformDmaBoundSubmissionProvider)submissionProvider)
                     .SubmitDmaBound(request, exactBinding)
                 : submissionProvider.SubmitDma(request);
+            observedIncarnation = CurrentProviderIncarnation();
+            observedEpoch = BackendEpoch;
         }
         catch (Exception exception)
         {
@@ -305,9 +352,6 @@ public sealed partial class PlatformAuthorityBridge
                 KernelError.PlatformFaulted,
                 $"The DMA provider threw during submission; acceptance is ambiguous and the exact mapping remains pinned: {exception.Message}");
         }
-
-        var observedIncarnation = CurrentProviderIncarnation();
-        var observedEpoch = BackendEpoch;
         if (observedIncarnation != submitIncarnation || observedEpoch != submitBackendEpoch)
         {
             _dmaSubmissionFaultPins.Add(grant.GrantId);

@@ -6,7 +6,242 @@ namespace SingPlus.Tests.Contracts;
 
 public sealed class SemanticExtensionContractsV1Tests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void MissingMandatoryGuaranteeDeniesBeforeAnySemanticCallback(bool optionalFirst)
+    {
+        var first = Clause(Memory, optionalFirst ? SemanticExtensionRequirement.Optional : SemanticExtensionRequirement.Mandatory,
+            "exclusive");
+        var missing = Clause(new("zzz.missing"), SemanticExtensionRequirement.Mandatory, "required");
+        int callbacks = 0;
+        var result = SemanticExtensionRefinementV1.Evaluate(OperationSemanticExtensionsV1.Create([first, missing]),
+            ExecutionGuaranteeExtensionsV1.Create(optionalFirst ? [] : [first]),
+            new HashSet<SemanticExtensionClassId> { Memory, missing.ClassId },
+            (_, _) => { callbacks++; return true; }, _ => { callbacks++; return true; });
+        Assert.Equal(SemanticExtensionMatchStatus.MissingMandatory, result.Status);
+        Assert.Equal(missing.ClassId, result.ClassId);
+        Assert.Equal(0, callbacks);
+    }
+
+    [Fact]
+    public void SupportSnapshotPreservesInputSetContainsComparer()
+    {
+        var required = Clause(new("class.lower"), SemanticExtensionRequirement.Mandatory, "value");
+        var comparer = EqualityComparer<SemanticExtensionClassId>.Create(
+            (left, right) => StringComparer.OrdinalIgnoreCase.Equals(left.Value, right.Value),
+            value => StringComparer.OrdinalIgnoreCase.GetHashCode(value.Value));
+        var supported = new HashSet<SemanticExtensionClassId>(comparer) { new("CLASS.LOWER") };
+        var decision = SemanticExtensionRefinementV1.Evaluate(OperationSemanticExtensionsV1.Create([required]),
+            ExecutionGuaranteeExtensionsV1.Create([required]), supported, (_, _) => true, _ => false);
+        Assert.Equal(SemanticExtensionMatchStatus.Refines, decision.Status);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SemanticCallbackCannotChangeLaterClassSupportDecision(bool removeKnown)
+    {
+        var first = Clause(Memory, SemanticExtensionRequirement.Mandatory, "exclusive");
+        var second = Clause(new("zzz.later"), removeKnown ? SemanticExtensionRequirement.Mandatory : SemanticExtensionRequirement.Optional,
+            "opaque");
+        var supported = new HashSet<SemanticExtensionClassId> { Memory };
+        if (removeKnown) supported.Add(second.ClassId);
+        int secondRefinements = 0;
+        var decision = SemanticExtensionRefinementV1.Evaluate(OperationSemanticExtensionsV1.Create([first, second]),
+            ExecutionGuaranteeExtensionsV1.Create([first, second]), supported,
+            (_, required) =>
+            {
+                if (required.ClassId == Memory)
+                {
+                    if (removeKnown) supported.Remove(second.ClassId);
+                    else supported.Add(second.ClassId);
+                }
+                else secondRefinements++;
+                return true;
+            }, _ => false);
+        Assert.Equal(removeKnown ? SemanticExtensionMatchStatus.Refines : SemanticExtensionMatchStatus.OptionalAbsenceNotAllowed,
+            decision.Status);
+        Assert.Equal(removeKnown ? 1 : 0, secondRefinements);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void UnknownMandatoryRequirementDeniesBeforeAnySemanticCallback(bool optionalKnown)
+    {
+        var known = Clause(Memory, optionalKnown ? SemanticExtensionRequirement.Optional : SemanticExtensionRequirement.Mandatory,
+            "exclusive");
+        var unknown = Clause(new("zzz.requirement-unknown"), SemanticExtensionRequirement.Mandatory, "opaque");
+        int callbacks = 0;
+        var decision = SemanticExtensionRefinementV1.Evaluate(OperationSemanticExtensionsV1.Create([known, unknown]),
+            ExecutionGuaranteeExtensionsV1.Create(optionalKnown ? [] : [known]),
+            new HashSet<SemanticExtensionClassId> { Memory },
+            (_, _) => { callbacks++; return true; }, _ => { callbacks++; return true; });
+        Assert.Equal(SemanticExtensionMatchStatus.UnknownMandatory, decision.Status);
+        Assert.Equal(unknown.ClassId, decision.ClassId);
+        Assert.Equal(0, callbacks);
+    }
+
+    [Theory]
+    [InlineData(0xd800)]
+    [InlineData(0xdc00)]
+    public void MalformedUtf16IdentifiersCannotAliasReplacementCharacterDigests(int codeUnit)
+    {
+        var malformed = new string((char)codeUnit, 1);
+        Assert.Throws<ArgumentException>(() => SemanticExtensionClauseV1.Create(
+            new(malformed), "schema/1", 1, SemanticExtensionRequirement.Mandatory, []));
+        Assert.Throws<ArgumentException>(() => SemanticExtensionClauseV1.Create(
+            new("class"), malformed, 1, SemanticExtensionRequirement.Mandatory, []));
+    }
+
     private static readonly SemanticExtensionClassId Memory = new("memory.staged-exclusive");
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void BindingBaseDigestsRejectUppercaseAndMixedCase(bool guarantee, bool mixed)
+    {
+        var changed = mixed ? "A" + new string('a', 63) : new string('A', 64);
+        Assert.Throws<ArgumentException>(() => SemanticBindingExtensionSetV1.Create(
+            guarantee ? Hex('a') : changed, guarantee ? changed : Hex('b'),
+            OperationSemanticExtensionsV1.Create([]), ExecutionGuaranteeExtensionsV1.Create([]), []));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ClauseEnumerationStopsAtOverflowWitness(bool guaranteeFamily)
+    {
+        var observed = 0;
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+        {
+            if (guaranteeFamily) _ = ExecutionGuaranteeExtensionsV1.Create(Values());
+            else _ = OperationSemanticExtensionsV1.Create(Values());
+        });
+        Assert.Equal(65, observed);
+        IEnumerable<SemanticExtensionClauseV1> Values()
+        {
+            for (var index = 0; ; index++)
+            {
+                if (++observed > 65) throw new InvalidOperationException("Enumeration exceeded clause overflow witness.");
+                yield return Clause(new($"class-{index:D2}"), SemanticExtensionRequirement.Mandatory, "value");
+            }
+        }
+    }
+
+    [Fact]
+    public void MaximumClauseCountPreservesBothFamilyCanonicalDigests()
+    {
+        var values = Enumerable.Range(0, 64).Select(index =>
+            Clause(new($"class-{index:D2}"), SemanticExtensionRequirement.Mandatory, "value")).ToArray();
+        var operation = OperationSemanticExtensionsV1.Create(values);
+        var guarantee = ExecutionGuaranteeExtensionsV1.Create(values.Reverse());
+        Assert.Equal(64, operation.Clauses.Count);
+        Assert.Equal(operation.Digest, guarantee.Digest);
+        Assert.Equal(operation.Digest, OperationSemanticExtensionsV1.Create(values.Reverse()).Digest);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void GenerationOwnerRejectsOversizedOrMalformedUnicode(int kind)
+    {
+        var owner = kind switch
+        {
+            0 => new string('a', 97),
+            1 => string.Concat(Enumerable.Repeat("\U0001f680", 25)),
+            _ => "\ud800"
+        };
+        Assert.Throws<ArgumentException>(() => GenerationBinding([new(owner, 1)]));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void GenerationOwnerPreservesExactUtf8Boundary(bool supplementary)
+    {
+        var owner = supplementary ? string.Concat(Enumerable.Repeat("\U0001f680", 24)) : new string('a', 96);
+        var binding = GenerationBinding([new(owner, 1)]);
+        Assert.Equal(owner, Assert.Single(binding.Generations).Owner);
+        Assert.Equal(binding.Digest, GenerationBinding([new(owner, 1)]).Digest);
+    }
+
+    [Fact]
+    public void GenerationEnumerationStopsAtOverflowWitness()
+    {
+        var observed = 0;
+        Assert.Throws<ArgumentException>(() => GenerationBinding(Values()));
+        Assert.Equal(33, observed);
+        IEnumerable<SemanticGenerationSnapshotV1> Values()
+        {
+            for (var index = 0; ; index++)
+            {
+                if (++observed > 33) throw new InvalidOperationException("Enumeration exceeded overflow witness.");
+                yield return new($"owner-{index}", 1);
+            }
+        }
+    }
+
+    [Fact]
+    public void MaximumGenerationCountPreservesCanonicalOrder()
+    {
+        var values = Enumerable.Range(0, 32).Select(index => new SemanticGenerationSnapshotV1($"owner-{index:D2}", 1)).ToArray();
+        Assert.Equal(32, GenerationBinding(values).Generations.Count);
+        Assert.Equal(GenerationBinding(values).Digest, GenerationBinding(values.Reverse()).Digest);
+    }
+
+    private static SemanticBindingExtensionSetV1 GenerationBinding(IEnumerable<SemanticGenerationSnapshotV1> values) =>
+        SemanticBindingExtensionSetV1.Create(Hex('a'), Hex('b'), OperationSemanticExtensionsV1.Create([]),
+            ExecutionGuaranteeExtensionsV1.Create([]), values);
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void UnknownMandatoryProviderClauseIsDeniedBeforeRefinement(bool emptyRequirements)
+    {
+        var known = Clause(Memory, SemanticExtensionRequirement.Mandatory, "exclusive");
+        var unknown = Clause(new("zzz.provider-unknown"), SemanticExtensionRequirement.Mandatory, "opaque");
+        var required = OperationSemanticExtensionsV1.Create(emptyRequirements ? [] : [known]);
+        var offered = ExecutionGuaranteeExtensionsV1.Create([known, unknown]);
+        var decision = SemanticExtensionRefinementV1.Evaluate(required, offered,
+            new HashSet<SemanticExtensionClassId> { Memory },
+            (_, _) => throw new InvalidOperationException("Unknown mandatory must deny before refinement."),
+            _ => throw new InvalidOperationException("Mandatory cannot downgrade to optional absence."));
+        Assert.Equal(SemanticExtensionMatchStatus.UnknownMandatory, decision.Status);
+    }
+
+    [Fact]
+    public void AdditionalUnknownOptionalProviderClauseRetainsDigestWithoutWeakeningRequirement()
+    {
+        var known = Clause(Memory, SemanticExtensionRequirement.Mandatory, "exclusive");
+        var baseline = ExecutionGuaranteeExtensionsV1.Create([known]);
+        var offered = ExecutionGuaranteeExtensionsV1.Create([known,
+            Clause(new("zzz.provider-unknown"), SemanticExtensionRequirement.Optional, "opaque")]);
+        Assert.NotEqual(baseline.Digest, offered.Digest);
+        var decision = SemanticExtensionRefinementV1.Evaluate(OperationSemanticExtensionsV1.Create([known]),
+            offered, new HashSet<SemanticExtensionClassId> { Memory },
+            (provided, required) => provided.Payload.Span.SequenceEqual(required.Payload.Span), _ => false);
+        Assert.True(decision.IsAccepted);
+    }
+    [Fact]
+    public void ValidSupplementaryUnicodeAndReplacementCharacterRemainExactAndBounded()
+    {
+        var exact = string.Concat(Enumerable.Repeat("\U0001f680", 24));
+        var clause = SemanticExtensionClauseV1.Create(new(exact), "schema/\ufffd", 1,
+            SemanticExtensionRequirement.Mandatory, []);
+        var set = OperationSemanticExtensionsV1.Create([clause]);
+        var parsed = OperationSemanticExtensionsV1.ParseCanonical(set.SerializeCanonical());
+        Assert.Equal(exact, parsed.Clauses.Single().ClassId.Value);
+        Assert.Equal("schema/\ufffd", parsed.Clauses.Single().SchemaId);
+        Assert.Equal(set.Digest, parsed.Digest);
+        Assert.Throws<ArgumentException>(() => SemanticExtensionClauseV1.Create(new(exact + "a"),
+            "schema/1", 1, SemanticExtensionRequirement.Mandatory, []));
+    }
+
     private static readonly SemanticExtensionClassId Dma = new("dma.generation-binding");
 
     [Fact]

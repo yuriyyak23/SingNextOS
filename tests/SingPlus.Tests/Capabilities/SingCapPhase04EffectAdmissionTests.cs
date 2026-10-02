@@ -8,6 +8,117 @@ namespace SingPlus.Tests.Capabilities;
 public sealed class SingCapPhase04EffectAdmissionTests
 {
     [Fact]
+    public void QualificationHookFollowsActualFinalSessionRevalidationAndClockObservation()
+    {
+        var clock = new OperationClock();
+        var s = SessionScenario(CapabilityRights.Execute, 1, clock);
+        s.Kernel.EffectAdmissionQualificationHook = new AdmissionHook(point =>
+        {
+            if (point == EffectAdmissionQualificationPoint.AfterFinalSessionRevalidation)
+                clock.Next = () => throw new InvalidOperationException("hook-injected clock fault");
+        });
+        var admitted = s.Kernel.AdmitSessionCapabilityEffect(s.Caller, s.Service, s.Session, s.Capability,
+            ResourceKind.File, "file:namespace", 1, CapabilityOperation.Execute, quotaAmount: 1, oneShot: true);
+        Assert.True(admitted.IsSuccess, admitted.Message);
+        Assert.NotNull(clock.Next);
+        clock.Next = null;
+        admitted.Value!.Dispose();
+        Assert.Equal(0, s.Kernel.EndpointSessions.ActivePinCount(s.Session));
+        Assert.Equal(0, s.Kernel.CapabilityAuthority.ActiveOperationLeaseCount);
+        Assert.Equal(0UL, s.Kernel.CapabilityAuthority.InspectConstraints(s.Capability)!.Value.SharedRemaining);
+    }
+
+    private sealed class AdmissionHook(Action<EffectAdmissionQualificationPoint> action) : IEffectAdmissionQualificationHook
+    {
+        public void At(EffectAdmissionQualificationPoint point) => action(point);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public async Task BlockedOperationClockDoesNotHoldCapabilityGateAndRevokeDeniesAdmission(int path)
+    {
+        var clock = new OperationClock();
+        var authority = new RuntimeKernel(null, clock).CapabilityAuthority;
+        var cap = authority.Mint(new(1), new(10), ResourceKind.File, "file:clock", CapabilityRights.Execute,
+            1, 1, null, null, 1, 1).Value!.CapabilityId;
+        var handle = authority.GetHandleV2(cap, new(10), 1).Value;
+        using var entered = new ManualResetEventSlim(false);
+        using var release = new ManualResetEventSlim(false);
+        clock.Next = () => { entered.Set(); Assert.True(release.Wait(TimeSpan.FromSeconds(10))); };
+        var admission = Task.Run(() => path == 0
+            ? authority.ValidateOperationAdmission(cap, new(10), 1, ResourceKind.File, "file:clock", 1, CapabilityOperation.Execute).Error
+            : path == 1
+                ? authority.AcquireOperationAuthority(cap, new(10), 1, ResourceKind.File, "file:clock", 1,
+                    CapabilityOperation.Execute, quotaAmount: 1, oneShot: true).Error
+                : authority.AcquireOperationAuthority(handle, new(10), 1, ResourceKind.File, "file:clock", 1,
+                    CapabilityOperation.Execute, quotaAmount: 1, oneShot: true).Error);
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.True((await Task.Run(() => authority.Revoke(cap)).WaitAsync(TimeSpan.FromSeconds(10))).IsSuccess);
+        }
+        finally { release.Set(); }
+        Assert.Equal(KernelError.CapabilityRevoked, await admission.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal(0, authority.ActiveOperationLeaseCount);
+        Assert.Equal(1UL, authority.InspectConstraints(cap)!.Value.SharedRemaining);
+        Assert.Equal(0UL, authority.InspectConstraints(cap)!.Value.HandleConsumed);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void OperationClockFailureCannotConsumeQuotaOrOneShot(int path)
+    {
+        var clock = new OperationClock();
+        var authority = new RuntimeKernel(null, clock).CapabilityAuthority;
+        var cap = authority.Mint(new(1), new(10), ResourceKind.File, "file:clock", CapabilityRights.Execute,
+            1, 1, null, null, 1, 1).Value!.CapabilityId;
+        var handle = authority.GetHandleV2(cap, new(10), 1).Value;
+        clock.Next = () => throw new InvalidOperationException("injected clock");
+        var error = path == 0
+            ? authority.ValidateOperationAdmission(cap, new(10), 1, ResourceKind.File, "file:clock", 1, CapabilityOperation.Execute).Error
+            : path == 1
+                ? authority.AcquireOperationAuthority(cap, new(10), 1, ResourceKind.File, "file:clock", 1,
+                    CapabilityOperation.Execute, quotaAmount: 1, oneShot: true).Error
+                : authority.AcquireOperationAuthority(handle, new(10), 1, ResourceKind.File, "file:clock", 1,
+                    CapabilityOperation.Execute, quotaAmount: 1, oneShot: true).Error;
+        Assert.Equal(KernelError.PlatformFaulted, error);
+        Assert.Equal(0, authority.ActiveOperationLeaseCount);
+        Assert.Equal(1UL, authority.InspectConstraints(cap)!.Value.SharedRemaining);
+        Assert.Equal(0UL, authority.InspectConstraints(cap)!.Value.HandleConsumed);
+        using var recovered = authority.AcquireOperationAuthority(cap, new(10), 1, ResourceKind.File, "file:clock", 1,
+            CapabilityOperation.Execute, quotaAmount: 1, oneShot: true).Value!;
+        Assert.NotNull(recovered);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void ClockSessionCloseFaultOrRevokeRefusesBeforeConsumptiveCommitAndBalancesPins(int fault)
+    {
+        var clock = new OperationClock();
+        var s = SessionScenario(CapabilityRights.Execute, 1, clock);
+        clock.Next = () =>
+        {
+            if (fault == 0) Assert.Equal(KernelError.SessionDraining, s.Kernel.EndpointSessions.Close(s.Session, s.Caller).Error);
+            else if (fault == 1) throw new InvalidOperationException("injected clock");
+            else Assert.True(s.Kernel.CapabilityAuthority.Revoke(s.Capability).IsSuccess);
+        };
+        var refused = s.Kernel.AdmitSessionCapabilityEffect(s.Caller, s.Service, s.Session, s.Capability,
+            ResourceKind.File, "file:namespace", 1, CapabilityOperation.Execute, quotaAmount: 1, oneShot: true);
+        Assert.Equal(fault == 0 ? KernelError.SessionClosed : fault == 1 ? KernelError.PlatformFaulted : KernelError.CapabilityRevoked,
+            refused.Error);
+        Assert.Equal(0, s.Kernel.EndpointSessions.ActivePinCount(s.Session));
+        Assert.Equal(0, s.Kernel.CapabilityAuthority.ActiveOperationLeaseCount);
+        Assert.Equal(1UL, s.Kernel.CapabilityAuthority.InspectConstraints(s.Capability)!.Value.SharedRemaining);
+        Assert.Equal(0UL, s.Kernel.CapabilityAuthority.InspectConstraints(s.Capability)!.Value.HandleConsumed);
+    }
+
+    private sealed class OperationClock : TimeProvider
+    {
+        public Action? Next { get; set; }
+        public override DateTimeOffset GetUtcNow() { var next = Next; Next = null; next?.Invoke(); return DateTimeOffset.UtcNow; }
+    }
+
+    [Fact]
     public void RevokedAncestorInvalidatesDeepDescendantAndSnapshots()
     {
         var authority = Authority();
@@ -162,9 +273,9 @@ public sealed class SingCapPhase04EffectAdmissionTests
 
     private static (RuntimeKernel Kernel, ProcessHandle Caller, ProcessHandle Service,
         EndpointSessionHandle Session, CapabilityId Capability) SessionScenario(
-        CapabilityRights rights = CapabilityRights.Read, ulong quota = ulong.MaxValue)
+        CapabilityRights rights = CapabilityRights.Read, ulong quota = ulong.MaxValue, TimeProvider? clock = null)
     {
-        var kernel = new RuntimeKernel();
+        var kernel = new RuntimeKernel(null, clock);
         var (_, caller) = TestFixtures.Create(kernel, 1, 10);
         var (_, service) = TestFixtures.Create(kernel, 2, 20);
         var capability = kernel.CapabilityAuthority.Mint(new(20), new(10), ResourceKind.File,

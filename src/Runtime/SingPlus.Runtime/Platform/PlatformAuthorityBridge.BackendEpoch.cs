@@ -65,6 +65,8 @@ public sealed partial class PlatformAuthorityBridge
         var previous = BackendEpoch;
         if (!exhausted) _backendEpoch++;
         var current = BackendEpoch;
+        foreach (var subject in _pendingDomainBinds)
+            _unresolvedDomainBinds.Add(subject);
 
         var faultPinnedMappings = 0;
         foreach (var record in _mappings.Values)
@@ -156,6 +158,9 @@ public sealed partial class PlatformAuthorityBridge
             {
                 AuthorityState = DomainAuthorityState.Quarantined,
                 SecureCreateMayHaveEffect = record.SecureCreateMayHaveEffect,
+                DeviceBindMayHaveEffect = record.DeviceBindMayHaveEffect || record.PendingDeviceBinds != 0,
+                MappingMayHaveEffect = record.MappingMayHaveEffect || record.PendingMappings != 0,
+                ChildCreateMayHaveEffect = record.ChildCreateMayHaveEffect || record.PendingChildCreates != 0,
                 PendingSecureCreates = record.PendingSecureCreates,
                 ParentRevokeMayHaveEffect = record.ParentRevokeMayHaveEffect,
                 ExecutionPolicy = record.ExecutionPolicy,

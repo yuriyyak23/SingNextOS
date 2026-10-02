@@ -13,6 +13,30 @@ function Get-Sha256([string]$Path) {
 
 $filter = 'FullyQualifiedName~FaultReconciliationPolicyV1Tests|FullyQualifiedName~RasFailureContractsV1Tests|FullyQualifiedName~V6RasFailureConsequenceTests|FullyQualifiedName~V6BoundedEvidenceReconcilerTests|FullyQualifiedName~Phase10ProviderConformanceTests|FullyQualifiedName~CxlType3MemoryProviderTests|FullyQualifiedName=SingPlus.Tests.Architecture.V6ArchitectureGuardTests.V6GateRegistryIsClosedCompleteAndDefaultOff|FullyQualifiedName=SingPlus.Tests.Runtime.ExternalOperationLifecycleTests.ProviderLossRequiresExplicitClosureOrContainmentBeforeLocalRelease|FullyQualifiedName=SingPlus.Tests.Runtime.V6MemoryRuntimeEnforcementTests.ProviderLossProjectsToQuarantineWithoutInventingRelease|FullyQualifiedName=SingPlus.Tests.Runtime.HybridCpuExternalOperationProviderTests.CancellationReceiptDistinguishesPreSubmitClosureFromPendingPostSubmitEffect|FullyQualifiedName=SingPlus.Tests.Runtime.HybridCpuExternalOperationProviderTests.ReconfigureAfterSubmitRejectsStaleClosureAndKeepsRegionPinned|FullyQualifiedName=SingPlus.Tests.Runtime.HybridCpuExternalOperationProviderTests.ReconfigureBeforeSubmitClosesLocalAdmissionWithoutInventingEffect|FullyQualifiedName=SingPlus.Tests.Runtime.HybridCpuExternalOperationProviderTests.ReconfigureAfterCompletionOrVisibilityProjectsProviderLossWithoutPublication|FullyQualifiedName=SingPlus.Tests.Runtime.HybridCpuExternalOperationProviderTests.ReconfigureAfterReleasePreservesPublishedTerminalDecision|FullyQualifiedName=SingPlus.Tests.Runtime.HybridCpuExternalOperationProviderTests.ReconfiguredOperationRequiresCurrentGenerationAndExplicitClosureForReconciliation|FullyQualifiedName=SingPlus.Tests.Runtime.HybridCpuExternalOperationProviderTests.ReconfigureGenerationAbaNeverReauthorizesOldRequest|FullyQualifiedName=SingPlus.Tests.Runtime.HybridCpuExternalOperationProviderTests.PublicationCallbackReentryIsFailClosedAndGenerationChangeWaitsForBoundaryExit'
 $filter += '|FullyQualifiedName~PlatformDmaSubmissionTests.TrustedBackendResetDuringSubmitPinsPossibleEffectWithoutProviderIncarnationDrift|FullyQualifiedName~PlatformDmaSubmissionTests.ProviderThrowDuringGrantRevokePinsMappingAfterPossibleClosure'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformDmaSubmissionTests.AlreadyRevokedStatusWithoutResetCannotProveExactGrantClosure'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformDmaGrantTests.RejectedProviderGrantRevokedStatusDoesNotProveCleanup|FullyQualifiedName=SingPlus.Tests.Platform.PlatformDeviceLeaseTests.ProviderRevokedStatusCannotCloseExactDeviceLease'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformDeviceLeaseTests.DeviceBindReceiptLossQuarantinesParentDomain'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ResetInsideRootBindCallbackPinsSubjectWithoutInventingLease|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.LostRootBindReceiptPinsProcessReclaimWithoutProviderLease|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.RootBindCallbackRejectsDuplicateAdmissionBeforeProvider|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ProcessExitInsideRootBindCallbackRevokesPublishedBindingBeforeReclaim|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ParentRevokeCallbackRejectsNewMappingBeforeProvider|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.MappingCallbackCannotRevokeParentBeforePublication|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.MappingReceiptLossPinsParentAndLocalReservation|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.BackendResetInsideMappingCallbackFaultPinsLateLease|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ProcessExitInsideMappingCallbackTracksLateMappingForExactTeardown|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.LostMappingReceiptBlocksProcessReclaim|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ResetFaultedMappingKeepsBudgetAndRegionPinnedAcrossTeardownRetries|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ResetBeforeNotAcceptedMappingReplyDoesNotReleaseRegion|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.StableNotAcceptedMappingReplyReleasesLocalReservation'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformDeviceLeaseTests.DeviceBindCallbackBlocksParentRevokeBeforeLeasePublication|FullyQualifiedName=SingPlus.Tests.Platform.PlatformDeviceLeaseTests.ResetInsideDeviceBindCallbackPinsNewParentGeneration|FullyQualifiedName=SingPlus.Tests.Platform.PlatformDeviceLeaseTests.ParentRevokeCallbackRejectsDeviceBindBeforeProvider'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ReentrantVirtualIoRevokeCannotEnterProviderTwice'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ReentrantChildCloseCannotInvokeProviderTwice|FullyQualifiedName=SingPlus.Tests.Virtualization.Phase8ResidualVirtualizationTests.NestedCreateCallbackBlocksImmediateParentTransition|FullyQualifiedName=SingPlus.Tests.Virtualization.Phase8ResidualVirtualizationTests.ImmediateParentTransitionCallbackRejectsNestedCreateBeforeProvider'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ChildCreateCallbackPinsParentBeforeChildBindingPublication|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ParentRevokeCallbackRejectsChildCreateBeforeProvider'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ResetInsideChildCreateCallbackPinsNewParentGeneration|FullyQualifiedName=SingPlus.Tests.Virtualization.Phase8ResidualVirtualizationTests.ResetInsideNestedCreateCallbackCannotPublishLateChild'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformDeviceLeaseTests.BackendResetPreservesUnknownDeviceBindPin|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.BackendResetPreservesUnknownChildCreatePin|FullyQualifiedName=SingPlus.Tests.Virtualization.Phase8ResidualVirtualizationTests.NestedCreateReceiptLossPinsImmediateParentAndRoot'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ParentDomainWaitsForExactPublishedChildClosure|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.ChildCreateReceiptLossOrAmbiguousStatusPinsParent|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.MalformedChildCreateRequiresExactCleanupBeforeParentClose'
+$filter += '|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.GuestMapReceiptLossOrAmbiguousStatusPinsChildAndParentMapping|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.VirtualIoBindReceiptLossOrAmbiguousStatusPinsChildAndDevice|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.BackendResetDuringGuestOrVirtualIoAdmissionCannotPublishChild'
+$filter += '|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.MalformedGuestOrVirtualIoAdmissionNeedsExactCompensation'
+$filter += '|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.ParentAuthorizationRevokedInsideChildAdmissionPinsPossibleEffect|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.ProviderIncarnationDriftInsideChildAdmissionPinsParent'
+$filter += '|FullyQualifiedName~Phase8ResidualVirtualizationTests.ExecutableArtifactBindOrStartReceiptLossPinsChildAndMapping|FullyQualifiedName=SingPlus.Tests.Virtualization.Phase8ResidualVirtualizationTests.RevokedParentMappingCannotReachExecutableChildStartProvider'
+$filter += '|FullyQualifiedName~Phase8ResidualVirtualizationTests.BoundArtifactPinsOnlyItsExactGuestMappingAfterCallbackSettles'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Virtualization.Phase8ResidualVirtualizationTests.TypedSipV3ArtifactContourPinsMappingAfterRetiredWorkUntilReleaseEvidence'
+$filter += '|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.ChildTransitionCallbackFaultOrResetCannotPublishLateState|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ConcurrentChildTransitionHasOneProviderCallback'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.TransitionCallbackRejectsGuestMapEventAndTrapBeforeProvider|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.ChildEffectCallbackRejectsOverlappingTransition|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.VirtualEffectCallbackFaultOrResetCannotPublishLateEvidence'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.VirtualIoBindCallbackRejectsOverlappingChildTransition|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ChildTransitionCallbackRejectsVirtualIoBindBeforeProvider|FullyQualifiedName=SingPlus.Tests.Virtualization.Phase8ResidualVirtualizationTests.ReentrantExecutableStartCannotEnterProviderTwice'
+$filter += '|FullyQualifiedName~PlatformDeviceLeaseTests.DeviceBindNonAcceptanceWithoutExactNoEffectPinsParentDomain'
+$filter += '|FullyQualifiedName~PlatformIrqBindingTests.RevokedOrThrowingInterruptClosureKeepsDevicePinned|FullyQualifiedName~PlatformMmioLeaseTests.RevokedOrThrowingMmioClosureKeepsDevicePinned'
+$filter += '|FullyQualifiedName~PlatformIrqBindingTests.MalformedInterruptCleanupWithoutExactSuccessPinsParentDevice|FullyQualifiedName~PlatformMmioLeaseTests.MalformedMmioCleanupWithoutExactSuccessPinsParentDevice'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformIrqBindingTests.InterruptBindReceiptLossPinsParentDevice|FullyQualifiedName=SingPlus.Tests.Platform.PlatformMmioLeaseTests.MmioMapReceiptLossPinsParentDevice'
 $filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.EffectPublicationSemanticsV1Tests.ProviderLossDuringAmbiguousPublicationClosureCannotClearPossibleEffect'
 $filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.EffectPublicationSemanticsV1Tests.RegionDamageDuringPublicationCannotBecomePublishedEvidence'
 $filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.ExternalOperationLifecycleTests.ProviderLossInvalidatesWritableUseAtTerminalMutationEpochWithoutReclaim'
@@ -51,6 +75,19 @@ $filter += '|FullyQualifiedName~PlatformBorrowReadGrantTeardownTests|FullyQualif
 $filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase06ResourceDonationTests.PossibleSubmitCannotDowngradeDonationToPreSubmitReturn|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase06ResourceDonationTests.PossibleSubmitAndPreSubmitReturnHaveOneDonationWinner'
 $filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase06ResourceDonationTests.GeneratedSubmitBlocksLatePreSubmitReturnDuringSessionDrain|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase06ResourceDonationTests.SessionCloseWithoutLivePinQuarantinesBoundDonationInsteadOfAssumingPreSubmitClosure'
 $filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase06ResourceDonationTests.GeneratedSubmitAfterSessionCloseWithoutPinCannotRefundOrCallProvider'
+$filter += '|FullyQualifiedName~EndpointSessionCancellationTests.AmbiguousSettlementBlocksDonationBindingAndActivation|FullyQualifiedName~EndpointSessionCancellationTests.DonationReturnReservationExcludesSettlementAndPreservesFaultConsequence'
+$filter += '|FullyQualifiedName~VNextPhase06ResourceDonationTests.NestedDonationPreservesProvenanceAndConservesOneLeaseLineage'
+$filter += '|FullyQualifiedName~VNextPhase06ResourceDonationTests.ConcurrentDuplicateNestedDonationHasOneSplitAndPreservesHeldCapacity'
+$filter += '|FullyQualifiedName~EndpointSessionCancellationTests.SettlementAdmissionWaitsForCorrelationGateAndCallbackReleasesIt'
+$filter += '|FullyQualifiedName~VNextPhase06ResourceDonationTests.ConcurrentInitialDonationBindingHasOneReservationAndOneDerivedRecord|FullyQualifiedName~VNextPhase06ResourceDonationTests.StaleIdentityWideningAndAmbientReuseFailClosedBeforeCharging'
+$filter += '|FullyQualifiedName~VNextPhase06ResourceDonationTests.RevokedDonationCannotBeginConsumptionAndBudgetRemainsReserved'
+$filter += '|FullyQualifiedName~VNextPhase06ResourceDonationTests.GeneratedSentryConsumesExactInvocationDonationWithoutSecondCharge'
+$filter += '|FullyQualifiedName~VNextPhase07ExternalOperationResourceBindingTests.DisposedAdmissionCannotWinSubmitOrMutateSubmitState'
+$filter += '|FullyQualifiedName~VNextPhase07ExternalOperationResourceBindingTests.FailedFinalSentryClosesAdmissionBeforeLateSubmit|FullyQualifiedName~VNextPhase07ExternalOperationResourceBindingTests.LosingFinalSentryCannotCompensateConcurrentSubmitWinner'
+$filter += '|FullyQualifiedName~VNextPhase16DurableResourceAdmissionTests.DeniedCompensationCannotJournalPreSubmitClosure'
+$filter += '|FullyQualifiedName~VNextPhase16DurableResourceAdmissionTests.PrepareFailureCleanupJournalsOnlyOwnerConfirmedCancellation'
+$filter += '|FullyQualifiedName~VNextPhase16DurableResourceAdmissionTests.CancellationAppendFailureRetriesOnlyExactVerifiedClosure|FullyQualifiedName~VNextPhase16DurableResourceAdmissionTests.PreparedAppendFailureHasNoSubmitAndUsesVerifiedCleanupHistory|FullyQualifiedName~VNextPhase16DurableResourceAdmissionTests.CancellationTerminalReplayRejectsConflictingExactTuple'
+$filter += '|FullyQualifiedName~VNextPhase16ResourceBudgetRecoveryJournalTests.LiveReplayRejectsAuthenticatedForkWithoutChangingObservedPrefix|FullyQualifiedName~VNextPhase16ResourceBudgetRecoveryJournalTests.LiveReplayAcceptsAuthenticatedExtensionOfObservedPrefix'
 $evidenceInputs = @(
     'contracts/SingPlus.Contracts/FaultReconciliationContracts.cs',
     'contracts/SingPlus.Contracts/RasFailureContracts.cs',
@@ -65,6 +102,7 @@ $evidenceInputs = @(
     'src/Runtime/SingPlus.Runtime/Channels/ChannelRegistry.cs',
     'src/Runtime/SingPlus.Runtime/Channels/ResponseRegistry.cs',
     'src/Runtime/SingPlus.Runtime/RuntimeKernel.Responses.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/RuntimeKernel.Platform.cs',
     'src/Runtime/SingPlus.Runtime/RuntimeKernel.ProcessTeardown.cs',
     'src/Runtime/SingPlus.Runtime/Services/EndpointSessionRegistry.cs',
     'src/Runtime/SingPlus.Runtime/Services/EndpointSessionInvocationRegistry.cs',
@@ -82,6 +120,15 @@ $evidenceInputs = @(
     'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.DmaSubmission.cs',
     'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.DmaTrace.cs',
     'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.Dma.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.Device.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.ChildDomains.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.VirtualEffects.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.GuestMemory.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.VirtualIo.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.BackendEpoch.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.Irq.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.Mmio.cs',
     'src/Runtime/SingPlus.Runtime/V6/V6BoundedEvidenceReconciler.cs',
     'src/Runtime/SingPlus.Runtime/V6/V6FeatureGates.cs',
     'tests/SingPlus.Tests/Contracts/FaultReconciliationPolicyV1Tests.cs',
@@ -109,6 +156,12 @@ $evidenceInputs = @(
     'tests/SingPlus.Tests/Runtime/HybridCpuExternalOperationProviderTests.cs',
     'tests/SingPlus.Tests/Runtime/V6MemoryRuntimeEnforcementTests.cs',
     'tests/SingPlus.Tests/Platform/PlatformDmaSubmissionTests.cs',
+    'tests/SingPlus.Tests/Platform/PlatformDmaGrantTests.cs',
+    'tests/SingPlus.Tests/Platform/PlatformDeviceLeaseTests.cs',
+    'tests/SingPlus.Tests/Platform/PlatformAuthorityBridgeChildDomainTests.cs',
+    'tests/SingPlus.Tests/Virtualization/Phase8ResidualVirtualizationTests.cs',
+    'tests/SingPlus.Tests/Platform/PlatformIrqBindingTests.cs',
+    'tests/SingPlus.Tests/Platform/PlatformMmioLeaseTests.cs',
     'tests/SingPlus.Tests/Architecture/V6ArchitectureGuardTests.cs',
     'eng/v6/Qualify-V6P10Ras.ps1'
 )
@@ -123,7 +176,7 @@ try {
     $passed = [int]$match.Groups[2].Value
     $skipped = [int]$match.Groups[3].Value
     $total = [int]$match.Groups[4].Value
-    if ($failed -ne 0 -or $passed -ne 133 -or $skipped -ne 0 -or $total -ne 133) {
+    if ($failed -ne 0 -or $passed -ne 309 -or $skipped -ne 0 -or $total -ne 309) {
         throw "Unexpected P10 counts: failed=$failed passed=$passed skipped=$skipped total=$total"
     }
 
@@ -261,7 +314,8 @@ try {
             'src/Runtime/SingPlus.Runtime/Regions/RuntimeKernel.Regions.cs',
             'src/Runtime/SingPlus.Runtime/Channels/RuntimeKernel.Channels.cs',
             'src/Runtime/SingPlus.Runtime/RuntimeKernel.Responses.cs',
-            'src/Runtime/SingPlus.Runtime/RuntimeKernel.ProcessTeardown.cs',
+            'src/Runtime/SingPlus.Runtime/Platform/RuntimeKernel.Platform.cs',
+    'src/Runtime/SingPlus.Runtime/RuntimeKernel.ProcessTeardown.cs',
             'src/Runtime/SingPlus.Runtime/Services/EndpointSessionRegistry.cs',
             'src/Runtime/SingPlus.Runtime/Services/EndpointSessionInvocationRegistry.cs',
             'src/Sip/SingPlus.Sip/Regions/BorrowLease.cs',
@@ -411,6 +465,57 @@ try {
     }
     $jsonPath = Join-Path $OutputDirectory 'qualification.json'
     $markdownPath = Join-Path $OutputDirectory 'qualification.md'
+    $artifact.requirementIds += 'P10-INVOCATION-AMBIGUOUS-READMISSION-01'
+    $artifact.requirementClassification.VerifiedExisting += 'Invocation owner rejects new service acceptance during settlement or after ambiguous callback failure without mutating acceptance; late terminal response retains uncertainty'
+    $artifact.requirementIds += 'P10-DONATION-AMBIGUITY-ADMISSION-01'
+    $artifact.testIds += 'EndpointSessionCancellationTests.AmbiguousSettlementBlocksDonationBindingAndActivation'
+    $artifact.requirementClassification.VerifiedExisting += 'Donation binding/activation deny settlement in flight and retained failed effect; admission resolution separated from terminal cleanup'
+    $artifact.requirementIds += 'P10-DONATION-RETURN-OBSERVED-AMBIGUITY-01'
+    $artifact.requirementClassification.VerifiedExisting += 'Already observed settlement ambiguity denies pre-submit donation return before budget cancellation and at owner transition'
+    $artifact.requirementClassification.VerifiedExisting += 'Donation return reservation excludes new settlement and activation across budget callback outside owner lock; denial retries and callback loss/session loss preserve conservative consequence'
+    $artifact.requirementIds += 'P10-DONATION-RETURN-SETTLEMENT-INTERLOCK-01'
+    $artifact.testIds += 'EndpointSessionCancellationTests.DonationReturnReservationExcludesSettlementAndPreservesFaultConsequence'
+    $artifact.requirementIds += 'P03-DONATION-SPLIT-PREVALIDATION-01'
+    $artifact.requirementClassification.VerifiedExisting += 'Already bound child invocation denied before capability derivation/budget split; duplicate denial preserves parent capacity and total held budget'
+    $artifact.requirementClassification.Partial += 'Nested donation parent/child may change after prevalidation; exact owner reservation across derivation and split remains required'
+    $artifact.requirementIds += 'P03-NESTED-DONATION-CORRELATION-SERIALIZATION-01'
+    $artifact.testIds += 'VNextPhase06ResourceDonationTests.ConcurrentDuplicateNestedDonationHasOneSplitAndPreservesHeldCapacity'
+    $artifact.requirementClassification.VerifiedExisting += 'Nested split uses existing correlation lock shared with return/submit; 16 concurrent duplicate trials have one split winner and preserve capacity'
+    $artifact.requirementIds += 'P10-SETTLEMENT-CORRELATION-ADMISSION-01'
+    $artifact.testIds += 'EndpointSessionCancellationTests.SettlementAdmissionWaitsForCorrelationGateAndCallbackReleasesIt'
+    $artifact.requirementClassification.VerifiedExisting += 'Runtime settlement reserves under existing correlation gate before invocation lock; callback executes outside both locks; nested split and settlement cannot overlap reservation'
+    $artifact.requirementClassification.VerifiedExisting += 'Initial donation binding validates exact invocation before derivation/reservation under shared correlation gate; stale and duplicate admission do not create capability records'
+    $artifact.requirementIds += 'P03-INITIAL-DONATION-ADMISSION-01'
+    $artifact.testIds += 'VNextPhase06ResourceDonationTests.ConcurrentInitialDonationBindingHasOneReservationAndOneDerivedRecord'
+    $artifact.requirementIds += 'P03-DONATION-GRANT-REVALIDATION-01'
+    $artifact.testIds += 'VNextPhase06ResourceDonationTests.RevokedDonationCannotBeginConsumptionAndBudgetRemainsReserved'
+    $artifact.requirementClassification.VerifiedExisting += 'Internal managed possible-submit helper denies already revoked derived grant before budget mutation; helper has tests-only callers, no production provider coverage claim'
+    $artifact.requirementIds += 'P03-DONATED-SUBMIT-FINAL-SENTRY-01'
+    $artifact.testIds += 'VNextPhase06ResourceDonationTests.GeneratedSentryConsumesExactInvocationDonationWithoutSecondCharge'
+    $artifact.requirementClassification.VerifiedExisting += 'Generated donated submit invokes existing authority final sentry; revoke after prepare prevents provider callback and permits only exact pre-submit compensation'
+    $artifact.requirementIds += 'P03-DONATED-PROVIDER-BOUNDARY-REVALIDATION-01'
+    $artifact.requirementClassification.VerifiedExisting += 'Generated donated provider boundary rejects observed revoke after submit marker before actual callback; consuming budget/external owner quarantine retained without refund'
+    $artifact.requirementClassification.Partial += 'Cross-owner revoke after final live permission check remains separate atomic admission gap; observed hook test does not prove all concurrent interleavings'
+    $artifact.requirementIds += 'P10-ADMISSION-DISPOSE-SUBMIT-WINNER-01'
+    $artifact.testIds += 'VNextPhase07ExternalOperationResourceBindingTests.DisposedAdmissionCannotWinSubmitOrMutateSubmitState'
+    $artifact.requirementClassification.VerifiedExisting += 'Disposed resource admission cannot win submit; disposal and submit share existing atomic state, preventing late compensation after submit winner'
+    $artifact.requirementIds += 'P10-FINAL-SENTRY-COMPENSATION-WINNER-01'
+    $artifact.testIds += @('VNextPhase07ExternalOperationResourceBindingTests.FailedFinalSentryClosesAdmissionBeforeLateSubmit','VNextPhase07ExternalOperationResourceBindingTests.LosingFinalSentryCannotCompensateConcurrentSubmitWinner')
+    $artifact.requirementClassification.VerifiedExisting += 'Losing final sentry must win shared unused-admission CAS before compensation; actual submit winner preserves Consuming/Submitted through losing sentry and dispose'
+    $artifact.requirementIds += 'P10-COMPENSATION-OWNER-CONFIRMATION-01'
+    $artifact.testIds += 'VNextPhase16DurableResourceAdmissionTests.DeniedCompensationCannotJournalPreSubmitClosure'
+    $artifact.requirementClassification.VerifiedExisting += 'Owner-denied compensation retains quarantine and durable conservative charge; physical closure remains FutureGated'
+    $artifact.requirementIds += 'P10-PREPARE-CLEANUP-OWNER-CONFIRMATION-01'
+    $artifact.testIds += 'VNextPhase16DurableResourceAdmissionTests.PrepareFailureCleanupJournalsOnlyOwnerConfirmedCancellation'
+    $artifact.requirementClassification.VerifiedExisting += 'Prepare exception cleanup after durable Prepared uses owner-confirmed cancellation; denied budget transition preserves quarantine across cold recovery'
+    $artifact.requirementIds += 'P10-PRE-SUBMIT-JOURNAL-ACK-01'
+    $artifact.testIds += @('VNextPhase16DurableResourceAdmissionTests.CancellationAppendFailureRetriesOnlyExactVerifiedClosure','VNextPhase16DurableResourceAdmissionTests.PreparedAppendFailureHasNoSubmitAndUsesVerifiedCleanupHistory','VNextPhase16DurableResourceAdmissionTests.CancellationTerminalReplayRejectsConflictingExactTuple')
+    $artifact.requirementClassification.VerifiedExisting += 'Prepared/cancellation append failure before write and after full frame preserves exact recovery history; cancelled terminal replay requires matching owner generation, correlation generation, amounts and empty charge'
+    $artifact.requirementIds += 'P10-JOURNAL-PREFIX-CONTINUITY-01'
+    $artifact.requirementIds += 'P10-ACTIVE-OPERATION-ADMISSION-01'
+    $artifact.requirementClassification.VerifiedExisting += 'Generated donated final admission rejects Cancelled/CancellationPending operation disposition before callback; pre-marker cancellation refunds only owner-confirmed no-effect path, post-marker quarantine retains charge'
+    $artifact.testIds += @('VNextPhase16ResourceBudgetRecoveryJournalTests.LiveReplayRejectsAuthenticatedForkWithoutChangingObservedPrefix','VNextPhase16ResourceBudgetRecoveryJournalTests.LiveReplayAcceptsAuthenticatedExtensionOfObservedPrefix')
+    $artifact.requirementClassification.VerifiedExisting += 'Live journal replay/append reject equal-length and longer authenticated forks at previously observed prefix before cursor mutation; valid extensions and lost-ack replay remain supported'
     $artifact | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $jsonPath -Encoding utf8NoBOM
     @"
 # P10 RAS/failure-domain evidence

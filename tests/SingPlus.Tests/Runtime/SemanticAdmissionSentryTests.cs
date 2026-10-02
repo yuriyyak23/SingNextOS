@@ -9,6 +9,152 @@ namespace SingPlus.Tests.Runtime;
 public sealed class SemanticAdmissionSentryTests
 {
     [Fact]
+    public async Task SharedSessionInFlightCancellationCannotCloseOrExecuteTwice()
+    {
+        var context = Create();
+        using var commit = context.Commit;
+        using var resume = new ManualResetEventSlim();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        var provider = new V6SharedOperationSessionProvider(context.Kernel, commit,
+            new(new(Guid.NewGuid()), new(1)), context.ProviderGenerations, _ =>
+            {
+                Interlocked.Increment(ref calls);
+                entered.SetResult();
+                if (!resume.Wait(TimeSpan.FromSeconds(10)))
+                    return KernelResult.Fail(KernelError.PlatformFaulted, "Test callback rendezvous expired.");
+                return KernelResult.Ok();
+            });
+        var semantic = new Hc.ExternalOperationSemanticRequest(Hc.ExternalOperationContract.Version,
+            new(Guid.NewGuid()), Hc.ExternalEffectClass.NonIdempotent,
+            Hc.ExternalVisibilityRequirement.StagedOutput, Hc.ExternalCancellationMode.ExactAcknowledgement,
+            Hc.ExternalReplayEffectClass.StagedReversibleUntilPublish);
+        var request = Assert.IsType<Hc.ExternalOperationAdmissionReceipt>(provider.Admit(semantic).Receipt).Request;
+        Hc.ExternalOperationProviderPollResult? late = null;
+        var submitting = Task.Run(() => context.Kernel.SubmitSemanticResourceExternalAdmissionWithBinding(
+            commit, context.Dependencies, context.Binding, context.Obligations, context.Guarantees,
+            context.Refinement, ProviderIdentity, context.ProviderGenerations,
+            new Provider(context.Binding), new Runtime(context.Binding), binding =>
+            {
+                Assert.True(provider.AttachCommittedBinding(binding).IsSuccess);
+                late = provider.Submit(request);
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Cancelled callback effect remains ambiguous.");
+            }));
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(Hc.ExternalOperationProviderPollStatus.Stale, provider.Submit(request).Status);
+            Assert.Equal(Hc.ExternalOperationProviderPollStatus.Pending, provider.Poll(request).Status);
+            Assert.Equal(Hc.ExternalOperationCancellationOutcome.Ambiguous,
+                provider.RequestCancellation(request).Outcome);
+            Assert.False(context.Kernel.ReleaseExternalOperation(context.Principal, context.Operation,
+                new(false, false)).IsSuccess);
+            Assert.NotEqual(ExternalOperationState.Released,
+                context.Kernel.QueryExternalOperation(context.Principal, context.Operation).Value!.State);
+        }
+        finally
+        {
+            resume.Set();
+            await submitting.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        Assert.False((await submitting).IsSuccess);
+        Assert.Equal(Hc.ExternalOperationProviderPollStatus.Faulted, late!.Status);
+        Assert.Equal(1, calls);
+        Assert.Equal(ExternalOperationDisposition.ProviderLost,
+            context.Kernel.QueryExternalOperation(context.Principal, context.Operation).Value!.Disposition);
+        Assert.Equal(BudgetReservationState.Quarantined, context.Kernel.Budgets.Query(context.Lease).Value!.State);
+    }
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SharedSessionBudgetLossAfterAttachDeniesBeforeExecutionCallback(bool regionDamage)
+    {
+        var context = Create();
+        using var commit = context.Commit;
+        var calls = 0;
+        var provider = new V6SharedOperationSessionProvider(context.Kernel, commit,
+            new(new(Guid.NewGuid()), new(1)), context.ProviderGenerations,
+            _ => { calls++; return KernelResult.Ok(); });
+        var session = new ExternalOperationAdapterSession(provider);
+        var semantic = new Hc.ExternalOperationSemanticRequest(Hc.ExternalOperationContract.Version,
+            new(Guid.NewGuid()), Hc.ExternalEffectClass.NonIdempotent,
+            Hc.ExternalVisibilityRequirement.StagedOutput, Hc.ExternalCancellationMode.ExactAcknowledgement,
+            Hc.ExternalReplayEffectClass.StagedReversibleUntilPublish);
+        Assert.Equal(ExternalOperationAdapterStatus.Accepted, session.Admit(semantic));
+        var result = context.Kernel.SubmitSemanticResourceExternalAdmissionWithBinding(
+            commit, context.Dependencies, context.Binding, context.Obligations, context.Guarantees,
+            context.Refinement, ProviderIdentity, context.ProviderGenerations,
+            new Provider(context.Binding), new Runtime(context.Binding), binding =>
+            {
+                Assert.True(provider.AttachCommittedBinding(binding).IsSuccess);
+                if (regionDamage)
+                {
+                    var use = context.Kernel.QueryExternalOperation(context.Principal, context.Operation)
+                        .Value!.Admission!.RegionUses[0];
+                    Assert.True(context.Kernel.Regions.QuarantineSubrange(use.Region, use.Principal,
+                        new(1, new("test-provider", "bank-0", 1, 1), 1,
+                            ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(0, 8))).IsSuccess);
+                }
+                else
+                    Assert.True(context.Kernel.Budgets.QuarantineLease(commit.BudgetOwner, commit.Lease).IsSuccess);
+                Assert.NotEqual(ExternalOperationAdapterStatus.Accepted, session.Submit(semantic.Correlation));
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Budget changed before callback.");
+            });
+        Assert.Equal(0, calls);
+        Assert.False(result.IsSuccess);
+        Assert.Equal(BudgetReservationState.Quarantined, context.Kernel.Budgets.Query(context.Lease).Value!.State);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void SharedSessionCannotAcceptLateCallbackSuccessAfterOwnerCancellation(int invalidation)
+    {
+        var context = Create();
+        using var commit = context.Commit;
+        var provider = new V6SharedOperationSessionProvider(context.Kernel, commit,
+            new(new(Guid.NewGuid()), new(1)), context.ProviderGenerations, _ =>
+            {
+                if (invalidation == 2)
+                {
+                    var use = context.Kernel.QueryExternalOperation(context.Principal, context.Operation)
+                        .Value!.Admission!.RegionUses[0];
+                    Assert.True(context.Kernel.Regions.QuarantineSubrange(use.Region, use.Principal,
+                        new(1, new("test-provider", "bank-0", 1, 1), 1,
+                            ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(0, 8))).IsSuccess);
+                }
+                else if (invalidation == 1)
+                    Assert.True(context.Kernel.Budgets.QuarantineLease(commit.BudgetOwner, commit.Lease).IsSuccess);
+                else
+                    Assert.True(context.Kernel.CancelExternalOperation(context.Principal,
+                        context.Operation, providerCancellationSupported: false).IsSuccess);
+                return KernelResult.Ok();
+            });
+        var session = new ExternalOperationAdapterSession(provider);
+        var semantic = new Hc.ExternalOperationSemanticRequest(Hc.ExternalOperationContract.Version,
+            new(Guid.NewGuid()), Hc.ExternalEffectClass.NonIdempotent,
+            Hc.ExternalVisibilityRequirement.StagedOutput, Hc.ExternalCancellationMode.ExactAcknowledgement,
+            Hc.ExternalReplayEffectClass.StagedReversibleUntilPublish);
+        Assert.Equal(ExternalOperationAdapterStatus.Accepted, session.Admit(semantic));
+        ExternalOperationAdapterStatus? observed = null;
+        var result = context.Kernel.SubmitSemanticResourceExternalAdmissionWithBinding(
+            commit, context.Dependencies, context.Binding, context.Obligations, context.Guarantees,
+            context.Refinement, ProviderIdentity, context.ProviderGenerations,
+            new Provider(context.Binding), new Runtime(context.Binding), binding =>
+            {
+                Assert.True(provider.AttachCommittedBinding(binding).IsSuccess);
+                observed = session.Submit(semantic.Correlation);
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Owner changed during callback.");
+            });
+        Assert.NotEqual(ExternalOperationAdapterStatus.Accepted, observed);
+        Assert.False(result.IsSuccess);
+        Assert.Equal(BudgetReservationState.Quarantined, context.Kernel.Budgets.Query(context.Lease).Value!.State);
+        Assert.Equal(ExternalOperationDisposition.ProviderLost,
+            context.Kernel.QueryExternalOperation(context.Principal, context.Operation).Value!.Disposition);
+    }
+
+    [Fact]
     public void SharedSessionRejectsSemanticsOutsideExactStagedContour()
     {
         var context = Create();
@@ -169,8 +315,10 @@ public sealed class SemanticAdmissionSentryTests
             context.Kernel.Budgets.Query(context.Lease).Value!.State);
     }
 
-    [Fact]
-    public void SharedSessionObservesOnlyCommittedOwnerLifecycleStages()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SharedSessionObservesOnlyCommittedOwnerLifecycleStages(bool regionDamage)
     {
         var context = Create();
         using var commit = context.Commit;
@@ -196,6 +344,13 @@ public sealed class SemanticAdmissionSentryTests
             });
         Assert.True(submitted.IsSuccess, submitted.Message);
         Assert.Equal(ExternalOperationAdapterStatus.Pending, session.Poll(semantic.Correlation));
+        if (regionDamage)
+        {
+            var use = context.Kernel.QueryExternalOperation(context.Principal, context.Operation).Value!.Admission!.RegionUses[0];
+            Assert.True(context.Kernel.Regions.QuarantineSubrange(use.Region, use.Principal,
+                new(1, new("test-provider", "bank-0", 1, 1), 1,
+                    ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(0, 8))).IsSuccess);
+        }
         Assert.False(context.Kernel.RecordExternalOperationVisibility(context.Principal,
             new(submitted.Value!, ExternalVisibilityRequirement.PublicationFence, true)).IsSuccess);
         Assert.True(context.Kernel.RecordExternalOperationCompletion(context.Principal,
@@ -206,6 +361,18 @@ public sealed class SemanticAdmissionSentryTests
             new(submitted.Value!, ExternalVisibilityRequirement.PublicationFence, true)).IsSuccess);
         Assert.Equal(ExternalOperationAdapterStatus.Accepted, session.Poll(semantic.Correlation));
         Assert.Equal(ExternalOperationAdapterStatus.Pending, session.Poll(semantic.Correlation));
+        if (regionDamage)
+        {
+            var calls = 0;
+            Assert.False(context.Kernel.PublishExternalOperation(context.Principal, context.Operation,
+                context.Dependencies, new(ExternalPublicationPolicy.Staged), () => calls++).IsSuccess);
+            Assert.Equal(0, calls);
+            Assert.NotEqual(ExternalOperationAdapterStatus.Accepted, session.Poll(semantic.Correlation));
+            Assert.False(context.Kernel.ReleaseExternalOperation(context.Principal, context.Operation, new(false, false)).IsSuccess);
+            Assert.NotEqual(ExternalOperationState.Released,
+                context.Kernel.QueryExternalOperation(context.Principal, context.Operation).Value!.State);
+            return;
+        }
         Assert.True(context.Kernel.PublishExternalOperation(context.Principal, context.Operation,
             context.Dependencies, new(ExternalPublicationPolicy.Staged), () => { }).IsSuccess);
         Assert.Equal(ExternalOperationAdapterStatus.Accepted, session.Poll(semantic.Correlation));
@@ -642,6 +809,68 @@ public sealed class SemanticAdmissionSentryTests
             context.Kernel.Budgets.Query(context.Lease).Value!.State);
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void AdditionalSentryCannotHideCapabilityRevocationBeforeSubmit(int mutation)
+    {
+        var context = Create();
+        using var commit = context.Commit;
+        var calls = 0;
+        var damageRecorded = false;
+        var providerRevoked = false;
+        var providerReads = 0;
+        var provider = new Provider(context.Binding, denyWhen: () =>
+        {
+            providerReads++;
+            return providerRevoked;
+        });
+        var result = context.Kernel.SubmitSemanticResourceExternalAdmission(commit, context.Dependencies,
+            context.Binding, context.Obligations, context.Guarantees, context.Refinement,
+            ProviderIdentity, context.ProviderGenerations, provider, new Runtime(context.Binding),
+            () => { calls++; return KernelResult.Ok(); }, () =>
+            {
+                if (mutation == 1) _ = context.Kernel.RevokeCapability(commit.EffectCapability);
+                if (mutation == 2) providerRevoked = true;
+                if (mutation == 3)
+                {
+                    var use = context.Kernel.QueryExternalOperation(context.Principal, context.Operation).Value!.Admission!.RegionUses[0];
+                    damageRecorded = context.Kernel.Regions.QuarantineSubrange(use.Region, use.Principal,
+                        new(1, new("test-provider", "bank-0", 1, 1), 1,
+                            ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(0, 8))).IsSuccess;
+                }
+                return KernelResult.Ok();
+            });
+        if (mutation == 3) Assert.True(damageRecorded);
+        Assert.Equal(mutation == 0, result.IsSuccess);
+        Assert.Equal(mutation == 0 ? 1 : 0, calls);
+        Assert.Equal(2, providerReads);
+        Assert.Equal(mutation == 0 ? BudgetReservationState.Consuming : BudgetReservationState.CancelledPreSubmit,
+            context.Kernel.Budgets.Query(context.Lease).Value!.State);
+    }
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void AdmissionDecisionRejectsNoncanonicalSourceLabels(int malformed)
+    {
+        var context = Create();
+        using var commit = context.Commit;
+        var calls = 0;
+        var invalid = "source-" + (char)0xD800;
+        var result = Submit(context,
+            new Provider(context.Binding, evidence: malformed == 1 ? invalid : "provider-evidence"),
+            new Runtime(context.Binding, identity: malformed == 2 ? "runtime-" + (char)1 : "runtime",
+                evidence: malformed == 3 ? invalid : "runtime-evidence"),
+            () => { calls++; return KernelResult.Ok(); });
+        Assert.Equal(malformed == 0, result.IsSuccess);
+        Assert.Equal(malformed == 0 ? 1 : 0, calls);
+        Assert.Equal(malformed == 0 ? BudgetReservationState.Consuming : BudgetReservationState.CancelledPreSubmit,
+            context.Kernel.Budgets.Query(context.Lease).Value!.State);
+    }
     private static KernelResult<OperationBinding> Submit(Context context,
         ISemanticProviderAdmissionService provider, IRuntimeLegalityService runtime,
         Func<KernelResult> callback) =>
@@ -722,25 +951,25 @@ public sealed class SemanticAdmissionSentryTests
     private const string ProviderIdentity = "hybridcpu:external-runtime";
 
     private sealed class Provider(SemanticExecutionBindingV1 binding, bool deny = false,
-        Func<bool>? denyWhen = null)
+        Func<bool>? denyWhen = null, string evidence = "test-provider")
         : ISemanticProviderAdmissionService
     {
         public KernelResult<ProviderAdmissionDecisionV1> Revalidate(SemanticExecutionBindingV1 _) =>
             KernelResult<ProviderAdmissionDecisionV1>.Ok(new(1, binding.Digest, binding.ProviderIdentity,
                 binding.ProviderGenerationDigest, binding.ProviderRequestCorrelation,
                 deny || denyWhen?.Invoke() == true
-                    ? SemanticGateDecisionStatusV1.Denied : SemanticGateDecisionStatusV1.Allowed, "test-provider"));
+                    ? SemanticGateDecisionStatusV1.Denied : SemanticGateDecisionStatusV1.Allowed, evidence));
     }
 
     private sealed class Runtime(SemanticExecutionBindingV1 binding, bool deny = false,
-        Action? beforeDecision = null) : IRuntimeLegalityService
+        Action? beforeDecision = null, string identity = "test-runtime", string evidence = "test-runtime-evidence") : IRuntimeLegalityService
     {
         public KernelResult<RuntimeLegalityDecisionV1> Evaluate(SemanticExecutionBindingV1 _)
         {
             beforeDecision?.Invoke();
-            return KernelResult<RuntimeLegalityDecisionV1>.Ok(new(1, binding.Digest, "test-runtime", 1,
+            return KernelResult<RuntimeLegalityDecisionV1>.Ok(new(1, binding.Digest, identity, 1,
                 deny ? SemanticGateDecisionStatusV1.Denied : SemanticGateDecisionStatusV1.Allowed,
-                "test-runtime-evidence"));
+                evidence));
         }
     }
 

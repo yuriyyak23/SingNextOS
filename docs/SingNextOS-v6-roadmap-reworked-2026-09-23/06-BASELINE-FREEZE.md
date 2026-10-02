@@ -1,5 +1,20 @@
 # Iteration 0 — Live Baseline Freeze
 
+## Current working-tree observation — 2026-09-30
+
+The frozen tuple below is historical, not the current qualification identity. Current
+SingNextOS HEAD is `c0472dbf5a5a92f0973a1b3c649cb2fb06212f9f` with uncommitted source changes.
+Current project references pin `HybridCPU.ExternalRuntime/1.6.0` and
+`HybridCPU.ExternalRuntime.Contracts/1.14.0`; `1.3.0` must not be used as the current tuple.
+Observed SDK is `11.0.100-rc.1.26425.128`, target `net11.0`.
+HybridCPU ISE has source, project files and package artifacts, but no `.git` metadata.
+No HybridCPU source SHA is asserted. Package presence/version is not adapter qualification.
+
+The admission/revocation wave records exact input and binary/package hashes in
+`artifacts/v6/iteration-20260930-p04-capability-map-admission`. Its scope is managed
+mapping authorization/accounting; physical closure and deployment qualification remain
+FutureGated. Earlier qualification counts/hashes are not transferred to the changed binaries.
+All new v6 gates remain OFF. ISA/opcode/CPU architecture impact: NONE.
 ## BASELINE_STATUS
 
 `DRIFT_NON_MATERIAL`

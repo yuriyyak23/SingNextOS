@@ -63,7 +63,9 @@ public sealed partial class RuntimeKernel
             }
         }
 
-        var endpoints = Channels.Create(protocol, leftProcess.Value, rightProcess.Value, capacity);
+        var created = Channels.Create(protocol, leftProcess.Value, rightProcess.Value, capacity);
+        if (!created.IsSuccess) return created;
+        var endpoints = created.Value;
         if (responseProtocol is not null)
         {
             Responses.RegisterChannel(
@@ -194,8 +196,7 @@ public sealed partial class RuntimeKernel
             if (!receive.IsSuccess) return receive;
 
             Responses.MarkDelivered(endpoint, receive.Value!, receiver);
-            if (_ipcBudgetReservations.Remove((endpoint.ChannelId, receive.Value!.Sequence), out var charge))
-                _ = ReleaseAttachedBudget(charge.Sender, charge.Reservation);
+            ReleaseIpcBudget((endpoint.ChannelId, receive.Value!.Sequence));
             RecordTrace(receiver, TraceEventKind.IpcReceived, null, "ipc",
                 $"{endpoint.ChannelId.Value}:{receive.Value.Sequence}", "received", "delivered");
             return receive;

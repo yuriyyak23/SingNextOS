@@ -38,6 +38,7 @@ internal sealed class KernelEventRegistry
         public KernelEvent? Pending { get; set; }
         public WaiterRecord? Waiter { get; set; }
         public EndpointState State { get; set; }
+        public int PendingIrqAdmissions { get; set; }
     }
 
     private readonly object _gate = new();
@@ -74,6 +75,50 @@ internal sealed class KernelEventRegistry
         }
     }
 
+    internal KernelResult BeginIrqBindingAdmission(ProcessHandle owner, KernelEventEndpoint endpoint)
+    {
+        lock (_gate)
+        {
+            var valid = ValidateLocked(owner, endpoint);
+            if (!valid.IsSuccess) return valid;
+            var record = _endpoints[endpoint.EndpointId];
+            if (record.State != EndpointState.Active)
+                return KernelResult.Fail(KernelError.PlatformBindingDraining,
+                    "Endpoint closing state denies new IRQ admission.");
+            if (record.PendingIrqAdmissions == int.MaxValue)
+                return KernelResult.Fail(KernelError.CapacityExhausted,
+                    "Endpoint IRQ admission accounting is exhausted.");
+            record.PendingIrqAdmissions++;
+            return KernelResult.Ok();
+        }
+    }
+
+    internal KernelResult CommitIrqBindingAdmission(ProcessHandle owner,
+        KernelEventEndpoint endpoint, Func<KernelResult> commit)
+    {
+        lock (_gate)
+        {
+            var valid = ValidateLocked(owner, endpoint);
+            if (!valid.IsSuccess) return valid;
+            var record = _endpoints[endpoint.EndpointId];
+            if (record.State != EndpointState.Active || record.PendingIrqAdmissions == 0)
+                return KernelResult.Fail(KernelError.PlatformBindingDraining,
+                    "Exact endpoint admission no longer permits IRQ publication.");
+            // This callback only commits local owner state, without provider calls.
+            return commit();
+        }
+    }
+    internal void EndIrqBindingAdmission(KernelEventEndpoint endpoint)
+    {
+        lock (_gate)
+        {
+            if (!_endpoints.TryGetValue(endpoint.EndpointId, out var record) ||
+                record.Endpoint != endpoint || record.PendingIrqAdmissions <= 0)
+                throw new InvalidOperationException("Exact endpoint IRQ admission accounting was lost.");
+            // OwnerClosing is allowed here: it denies new effects, but does not erase pending admission.
+            record.PendingIrqAdmissions--;
+        }
+    }
     public KernelResult Validate(ProcessHandle owner, KernelEventEndpoint endpoint)
     {
         lock (_gate)
@@ -384,11 +429,11 @@ internal sealed class KernelEventRegistry
             if (!validation.IsSuccess) return validation;
 
             var record = _endpoints[endpoint.EndpointId];
-            if (record.Staged is not null)
+            if (record.Staged is not null || record.PendingIrqAdmissions != 0)
             {
                 return KernelResult.Fail(
                     KernelError.PlatformBindingDraining,
-                    "The kernel event endpoint has an in-flight publication reservation.");
+                    "The kernel event endpoint has an in-flight IRQ admission or publication reservation.");
             }
 
             record.Pending = null;
@@ -440,11 +485,11 @@ internal sealed class KernelEventRegistry
             var records = _endpoints.Values
                 .Where(record => record.State != EndpointState.Closed && record.Endpoint.Owner == owner)
                 .ToArray();
-            if (records.Any(static record => record.Staged is not null))
+            if (records.Any(static record => record.Staged is not null || record.PendingIrqAdmissions != 0))
             {
                 return KernelResult.Fail(
                     KernelError.PlatformBindingDraining,
-                    "A kernel event source still owns a staged publication during process teardown.");
+                    "A kernel event source still owns IRQ admission or staged publication during process teardown.");
             }
 
             foreach (var record in records)

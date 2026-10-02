@@ -1,3 +1,4 @@
+using SingPlus.Contracts;
 using SingPlus.Platform;
 
 namespace SingPlus.Runtime;
@@ -21,9 +22,18 @@ public sealed partial class PlatformAuthorityBridge
         PlatformProviderIncarnation providerIncarnation)
     {
         public PlatformDmaGrant Grant { get; } = grant;
-        public PlatformProviderDmaGrant ProviderGrant { get; } = providerGrant;
+        public PlatformProviderDmaGrant ProviderGrant { get; set; } = providerGrant;
         public PlatformProviderIncarnation ProviderIncarnation { get; } = providerIncarnation;
         public bool PlatformClosed { get; set; }
+        public bool PreparationInFlight { get; set; }
+        public bool SubmissionInFlight { get; set; }
+        public bool ClosureInFlight { get; set; }
+        public bool AcquisitionInFlight { get; set; }
+        // Observation metadata only; never read by grant admission or reclaim.
+        public ulong ClosureBackendEpoch { get; set; }
+        public SemanticTraceEventV1? LastVisibleTrace { get; set; }
+        public ulong LastVisibleProviderGeneration { get; set; }
+        public ulong LastVisibleBackendEpoch { get; set; }
         public PlatformProviderDmaCopySubmissionId? CopySubmissionId { get; set; }
         public PlatformProviderDmaCopySubmissionGeneration? CopyGeneration { get; set; }
         public PlatformDmaGrantId? CopyPeerGrantId { get; set; }
@@ -37,7 +47,8 @@ public sealed partial class PlatformAuthorityBridge
         PlatformOwnedRegionSliceMapping mapping,
         PlatformDomainIdentity expectedSubject,
         PlatformDmaRange range,
-        PlatformDmaDirection direction)
+        PlatformDmaDirection direction,
+        Func<KernelResult> revalidateOwner)
     {
         lock (_dmaCompletionGate)
         {
@@ -46,7 +57,7 @@ public sealed partial class PlatformAuthorityBridge
                 mapping,
                 expectedSubject,
                 range,
-                direction);
+                direction, revalidateOwner);
         }
     }
 
@@ -55,7 +66,8 @@ public sealed partial class PlatformAuthorityBridge
         PlatformOwnedRegionSliceMapping mapping,
         PlatformDomainIdentity expectedSubject,
         PlatformDmaRange range,
-        PlatformDmaDirection direction)
+        PlatformDmaDirection direction,
+        Func<KernelResult> revalidateOwner)
     {
         var deviceValidation = ValidateDeviceLease(deviceLease, expectedSubject);
         if (!deviceValidation.IsSuccess)
@@ -125,93 +137,108 @@ public sealed partial class PlatformAuthorityBridge
                 requestValidation.Message ?? "The DMA grant admission request is invalid.");
         }
 
-        var providerIncarnation = CurrentProviderIncarnation();
-        if (providerIncarnation.Value == 0)
-        {
-            return KernelResult<PlatformDmaGrant>.Fail(
-                KernelError.PlatformFaulted,
-                "The DMA provider returned an invalid zero runtime incarnation.");
-        }
+        if (_nextDmaGrantId is 0 or ulong.MaxValue)
+            return KernelResult<PlatformDmaGrant>.Fail(KernelError.CapacityExhausted,
+                "Local DMA grant identity capacity is exhausted before provider admission.");
         var backendEpoch = BackendEpoch;
-        PlatformAuthorityResult<PlatformProviderDmaGrant> providerResult;
-        try { providerResult = dmaProvider.BindDmaGrant(request); }
-        catch (Exception exception)
+        var providerIncarnation = deviceRecord.ProviderIncarnation;
+        var grant = new PlatformDmaGrant(new(_nextDmaGrantId++), new(1),
+            deviceLease, mapping, range, direction);
+        var record = new DmaGrantRecord(grant, default, providerIncarnation) { PreparationInFlight = true };
+        _dmaGrants.Add(grant.GrantId, record);
+        try { return AdmitPreparedGrant(); }
+        finally { record.PreparationInFlight = false; }
+
+        KernelResult RevalidateAdmission()
         {
-            PinUnclosedDmaAdmission(deviceLease, mapping, range, direction,
-                default, providerIncarnation);
-            return KernelResult<PlatformDmaGrant>.Fail(KernelError.PlatformFaulted,
-                $"The DMA provider threw during grant admission; the mapping and device remain pinned: {exception.Message}");
-        }
-        if (!providerResult.IsSuccess)
-        {
-            PinUnclosedDmaAdmission(deviceLease, mapping, range, direction,
-                default, providerIncarnation);
-            return FromProviderFailure<PlatformDmaGrant>(
-                providerResult.Status,
-                providerResult.Message);
+            if (BackendEpoch != backendEpoch || _dmaSubmissionFaultPins.Contains(grant.GrantId))
+                return KernelResult.Fail(KernelError.PlatformFaulted, "DMA grant admission lost backend continuity.");
+            var device = ValidateDeviceLease(deviceLease, expectedSubject);
+            if (!device.IsSuccess) return device;
+            var exactMapping = ValidateExactMapping(mapping, expectedSubject);
+            if (!exactMapping.IsSuccess) return exactMapping;
+            if (!ReferenceEquals(_deviceLeases[deviceLease.LeaseId], deviceRecord) ||
+                !ReferenceEquals(_mappings[mapping.Mapping.MappingId], mappingRecord) ||
+                mappingRecord.ProviderIncarnation != providerIncarnation)
+                return KernelResult.Fail(KernelError.PlatformFaulted, "DMA admission owner identity changed.");
+            return revalidateOwner();
         }
 
-        var providerGrant = providerResult.Value!;
-        if (CurrentProviderIncarnation() != providerIncarnation || BackendEpoch != backendEpoch)
+        KernelResult<PlatformDmaGrant> AdmitPreparedGrant()
         {
-            RevokeRejectedDmaAdmissionOrPin(dmaProvider, deviceLease, mapping,
-                range, direction, providerGrant, providerIncarnation, backendEpoch);
-            return KernelResult<PlatformDmaGrant>.Fail(
-                KernelError.StaleGeneration,
-                "The DMA provider or local backend generation changed while the grant was being admitted.");
-        }
-        var providerValidation = PlatformDmaGrantContract.ValidateGrant(request, providerGrant);
-        if (!providerValidation.IsSuccess)
-        {
-            RevokeRejectedDmaAdmissionOrPin(dmaProvider, deviceLease, mapping,
-                range, direction, providerGrant, providerIncarnation, backendEpoch);
-            return KernelResult<PlatformDmaGrant>.Fail(
-                KernelError.PlatformFaulted,
-                providerValidation.Message ?? "The provider returned malformed DMA grant authority.");
+            PlatformProviderIncarnation observed;
+            try { observed = CurrentProviderIncarnation(); }
+            catch (Exception exception)
+            {
+                FaultPinDmaSubmissionLocked(grant.GrantId);
+                return KernelResult<PlatformDmaGrant>.Fail(KernelError.PlatformFaulted,
+                    $"DMA admission generation read failed; dependencies remain pinned: {exception.Message}");
+            }
+            var admission = RevalidateAdmission();
+            if (!admission.IsSuccess || observed.Value == 0 || observed != providerIncarnation)
+            {
+                if (BackendEpoch != backendEpoch || observed.Value == 0 || observed != providerIncarnation ||
+                    _dmaSubmissionFaultPins.Contains(grant.GrantId))
+                {
+                    FaultPinDmaSubmissionLocked(grant.GrantId);
+                    return KernelResult<PlatformDmaGrant>.Fail(KernelError.PlatformFaulted,
+                        "DMA admission continuity changed before the provider callback; dependencies remain pinned.");
+                }
+                _dmaGrants.Remove(grant.GrantId); // Pure pre-effect refusal, not provider closure.
+                return KernelResult<PlatformDmaGrant>.Fail(admission.Error, admission.Message!);
+            }
+
+            PlatformAuthorityResult<PlatformProviderDmaGrant> providerResult;
+            try
+            {
+                providerResult = dmaProvider.BindDmaGrant(request);
+                if (providerResult.IsSuccess) record.ProviderGrant = providerResult.Value!;
+                observed = CurrentProviderIncarnation();
+            }
+            catch (Exception exception)
+            {
+                FaultPinDmaSubmissionLocked(grant.GrantId);
+                return KernelResult<PlatformDmaGrant>.Fail(KernelError.PlatformFaulted,
+                    $"DMA admission or post-response generation read failed; dependencies remain pinned: {exception.Message}");
+            }
+            if (!providerResult.IsSuccess)
+            {
+                FaultPinDmaSubmissionLocked(grant.GrantId);
+                return FromProviderFailure<PlatformDmaGrant>(providerResult.Status, providerResult.Message);
+            }
+            if (observed != providerIncarnation || BackendEpoch != backendEpoch)
+                return Reject(observed != providerIncarnation ? KernelError.StaleGeneration : KernelError.PlatformFaulted,
+                    "DMA provider or backend generation changed during grant admission.");
+            var fresh = RevalidateAdmission();
+            if (!fresh.IsSuccess) return Reject(fresh.Error, fresh.Message!);
+            var providerValidation = PlatformDmaGrantContract.ValidateGrant(request, record.ProviderGrant);
+            if (!providerValidation.IsSuccess)
+                return Reject(KernelError.PlatformFaulted, providerValidation.Message ?? "Malformed provider DMA grant.");
+            return KernelResult<PlatformDmaGrant>.Ok(grant);
         }
 
-        var grant = new PlatformDmaGrant(
-            new PlatformDmaGrantId(_nextDmaGrantId++),
-            new PlatformDmaGrantGeneration(1),
-            deviceLease,
-            mapping,
-            range,
-            direction);
-        _dmaGrants.Add(grant.GrantId, new DmaGrantRecord(grant, providerGrant, providerIncarnation));
-        return KernelResult<PlatformDmaGrant>.Ok(grant);
+        KernelResult<PlatformDmaGrant> Reject(KernelError error, string message)
+        {
+            if (RevokeRejectedDmaAdmissionOrPin(dmaProvider, record, backendEpoch))
+                _dmaGrants.Remove(grant.GrantId);
+            return KernelResult<PlatformDmaGrant>.Fail(error, message);
+        }
     }
 
-    private void RevokeRejectedDmaAdmissionOrPin(
-        IPlatformDmaGrantProvider dmaProvider, PlatformDeviceLease deviceLease,
-        PlatformOwnedRegionSliceMapping mapping, PlatformDmaRange range,
-        PlatformDmaDirection direction, PlatformProviderDmaGrant providerGrant,
-        PlatformProviderIncarnation providerIncarnation, PlatformBackendEpoch backendEpoch)
+    private bool RevokeRejectedDmaAdmissionOrPin(
+        IPlatformDmaGrantProvider dmaProvider, DmaGrantRecord record, PlatformBackendEpoch backendEpoch)
     {
         try
         {
-            var closure = dmaProvider.RevokeDmaGrant(providerGrant);
-            if ((closure.IsSuccess || closure.Status == PlatformAuthorityStatus.Revoked) &&
-                CurrentProviderIncarnation() == providerIncarnation && BackendEpoch == backendEpoch)
-                return;
+            var closure = dmaProvider.RevokeDmaGrant(record.ProviderGrant);
+            if (closure.IsSuccess && CurrentProviderIncarnation() == record.ProviderIncarnation &&
+                BackendEpoch == backendEpoch)
+                return true;
         }
         catch (Exception) { /* An exception cannot establish closure. */ }
-        PinUnclosedDmaAdmission(deviceLease, mapping, range, direction,
-            providerGrant, providerIncarnation);
+        FaultPinDmaSubmissionLocked(record.Grant.GrantId);
+        return false;
     }
-
-    private void PinUnclosedDmaAdmission(
-        PlatformDeviceLease deviceLease, PlatformOwnedRegionSliceMapping mapping,
-        PlatformDmaRange range, PlatformDmaDirection direction,
-        PlatformProviderDmaGrant providerGrant, PlatformProviderIncarnation providerIncarnation)
-    {
-        // The provider may have materialized authority even without a usable
-        // admission receipt. Keep the existing bridge owner dependencies live.
-        var grant = new PlatformDmaGrant(new PlatformDmaGrantId(_nextDmaGrantId++),
-            new PlatformDmaGrantGeneration(1), deviceLease, mapping, range, direction);
-        _dmaGrants.Add(grant.GrantId, new DmaGrantRecord(grant, providerGrant, providerIncarnation));
-        FaultPinDmaSubmissionLocked(grant.GrantId);
-    }
-
     internal KernelResult RevokeDmaGrant(
         PlatformDmaGrant grant,
         PlatformDomainIdentity expectedSubject)
@@ -226,6 +253,9 @@ public sealed partial class PlatformAuthorityBridge
     {
         var validation = ValidateDmaGrantIdentity(grant, expectedSubject);
         if (!validation.IsSuccess) return validation;
+        if (_dmaGrants[grant.GrantId].PreparationInFlight || _dmaGrants[grant.GrantId].SubmissionInFlight ||
+            _dmaGrants[grant.GrantId].ClosureInFlight || _dmaGrants[grant.GrantId].AcquisitionInFlight)
+            return KernelResult.Fail(KernelError.PlatformBindingDraining, "DMA grant admission is in flight.");
 
         if (HasFaultPinnedDmaSubmission(grant.GrantId))
         {
@@ -256,9 +286,26 @@ public sealed partial class PlatformAuthorityBridge
                 "The provider that materialized the DMA grant no longer exposes DMA grant closure.");
         }
 
-        var providerIncarnation = CurrentProviderIncarnation();
+        record.ClosureInFlight = true;
+        try { return RevokeDmaGrantProviderLocked(grant, record, dmaProvider); }
+        finally { record.ClosureInFlight = false; }
+    }
+
+    private KernelResult RevokeDmaGrantProviderLocked(
+        PlatformDmaGrant grant, DmaGrantRecord record, IPlatformDmaGrantProvider dmaProvider)
+    {
+        // Reading provider generation is itself a callback boundary.
         var backendEpoch = BackendEpoch;
-        if (providerIncarnation.Value == 0 ||
+        PlatformProviderIncarnation providerIncarnation;
+        try { providerIncarnation = CurrentProviderIncarnation(); }
+        catch (Exception exception)
+        {
+            FaultPinDmaSubmissionLocked(grant.GrantId);
+            return KernelResult.Fail(KernelError.PlatformFaulted,
+                $"DMA provider generation is unavailable before closure; the grant and mapping remain pinned: {exception.Message}");
+        }
+        if (BackendEpoch != backendEpoch || HasFaultPinnedDmaSubmission(grant.GrantId) ||
+            HasActiveDmaSubmission(grant.GrantId) || providerIncarnation.Value == 0 ||
             providerIncarnation != record.ProviderIncarnation)
         {
             FaultPinDmaSubmissionLocked(grant.GrantId);
@@ -267,14 +314,19 @@ public sealed partial class PlatformAuthorityBridge
         }
 
         PlatformAuthorityResult providerResult;
-        try { providerResult = dmaProvider.RevokeDmaGrant(record.ProviderGrant); }
+        PlatformProviderIncarnation closureIncarnation;
+        try
+        {
+            providerResult = dmaProvider.RevokeDmaGrant(record.ProviderGrant);
+            closureIncarnation = CurrentProviderIncarnation();
+        }
         catch (Exception exception)
         {
             FaultPinDmaSubmissionLocked(grant.GrantId);
             return KernelResult.Fail(KernelError.PlatformFaulted,
                 $"The DMA provider threw during grant closure; the grant and mapping remain pinned: {exception.Message}");
         }
-        if (CurrentProviderIncarnation() != providerIncarnation ||
+        if (closureIncarnation != providerIncarnation ||
             BackendEpoch != backendEpoch)
         {
             FaultPinDmaSubmissionLocked(grant.GrantId);
@@ -283,19 +335,19 @@ public sealed partial class PlatformAuthorityBridge
         }
         if (!providerResult.IsSuccess)
         {
-            if (providerResult.Status == PlatformAuthorityStatus.Revoked)
+            // A terminal or already-revoked status does not identify the exact
+            // grant generation whose effects have been contained. Once the
+            // closure callback ran, an unsuccessful result may follow an effect.
+            if (providerResult.Status != PlatformAuthorityStatus.NotAccepted)
             {
-                MarkDmaGrantClosed(grant.GrantId, record);
-                return KernelResult.Ok();
-            }
-
-            if (providerResult.Status is PlatformAuthorityStatus.Faulted or
-                PlatformAuthorityStatus.Stale or PlatformAuthorityStatus.WrongDomain)
                 FaultPinDmaSubmissionLocked(grant.GrantId);
+                return KernelResult.Fail(KernelError.PlatformFaulted,
+                    "DMA grant closure lacks exact containment evidence; the grant and mapping remain pinned.");
+            }
             return FromProviderFailure(providerResult.Status, providerResult.Message);
         }
 
-        MarkDmaGrantClosed(grant.GrantId, record);
+        MarkDmaGrantClosed(grant.GrantId, record, backendEpoch);
         return KernelResult.Ok();
     }
 
@@ -315,6 +367,8 @@ public sealed partial class PlatformAuthorityBridge
         if (!validation.IsSuccess) return validation;
 
         var record = _dmaGrants[grant.GrantId];
+        if (record.PreparationInFlight || record.SubmissionInFlight || record.ClosureInFlight || record.AcquisitionInFlight)
+            return KernelResult.Fail(KernelError.PlatformBindingDraining, "DMA grant admission is in flight.");
         if (record.PlatformClosed)
         {
             return KernelResult.Fail(
@@ -377,9 +431,12 @@ public sealed partial class PlatformAuthorityBridge
         }
     }
 
-    private void MarkDmaGrantClosed(PlatformDmaGrantId grantId, DmaGrantRecord record)
+    private void MarkDmaGrantClosed(PlatformDmaGrantId grantId, DmaGrantRecord record,
+        PlatformBackendEpoch closureEpoch)
     {
         record.PlatformClosed = true;
+        // Preserve the exact epoch validated for closure, not a later observation.
+        record.ClosureBackendEpoch = closureEpoch.Value;
         _dmaVisibilityStates.Remove(grantId);
         _activeDmaSubmissions.Remove(grantId);
         _dmaSubmissionFaultPins.Remove(grantId);

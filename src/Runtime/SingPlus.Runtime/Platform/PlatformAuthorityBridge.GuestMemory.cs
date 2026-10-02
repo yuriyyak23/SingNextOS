@@ -25,22 +25,99 @@ public sealed partial class PlatformAuthorityBridge
                 parent.ProviderLease.Region.ByteLength, parent.ProviderLease.Access)), guestRange, access);
         var validation = PlatformGuestMemoryContract.ValidateRequest(request, childRecord.State);
         if (!validation.IsSuccess) return FromProviderFailure<PlatformGuestMapping>(validation.Status, validation.Message);
-        var result = provider.MapGuestRegion(request);
+        if (!ValidateMappingClosureGeneration(parent).IsSuccess)
+        {
+            childRecord.State = PlatformChildDomainState.Faulted;
+            return KernelResult<PlatformGuestMapping>.Fail(KernelError.PlatformFaulted,
+                "Parent mapping provider generation changed before guest admission.");
+        }
+        lock (_secureDomainLifecycleGate)
+        {
+            if (parent.LocalAuthorizationRevoked || parent.ClosureState != PlatformExternalClosureState.Active ||
+                childRecord.State == PlatformChildDomainState.Faulted || childRecord.TransitionInFlight)
+                return KernelResult<PlatformGuestMapping>.Fail(KernelError.PlatformBindingRevoked,
+                    "Parent mapping or child changed before guest admission.");
+            parent.PendingGuestMaps++;
+            childRecord.PendingChildEffects++;
+        }
+        try
+        {
+        var backendEpoch = BackendEpoch;
+        PlatformAuthorityResult<PlatformProviderGuestRegionMappingLease> result;
+        try { result = provider.MapGuestRegion(request); }
+        catch (Exception exception) when (exception is not StackOverflowException)
+        {
+            childRecord.State = PlatformChildDomainState.Faulted;
+            parent.ClosureState = PlatformExternalClosureState.Faulted;
+            return KernelResult<PlatformGuestMapping>.Fail(KernelError.PlatformFaulted,
+                $"Guest mapping may have taken effect without a receipt: {exception.Message}");
+        }
+        if (BackendEpoch != backendEpoch ||
+            childRecord.State == PlatformChildDomainState.Faulted ||
+            parent.ClosureState != PlatformExternalClosureState.Active ||
+            parent.LocalAuthorizationRevoked ||
+            !ValidateMappingClosureGeneration(parent).IsSuccess)
+        {
+            childRecord.State = PlatformChildDomainState.Faulted;
+            parent.ClosureState = PlatformExternalClosureState.Faulted;
+            return KernelResult<PlatformGuestMapping>.Fail(KernelError.PlatformFaulted,
+                "Backend generation changed during guest mapping; parents remain pinned.");
+        }
         if (!result.IsSuccess)
         {
-            QuarantineChild(childRecord, result.Status);
+            if (result.Status != PlatformAuthorityStatus.NotAccepted)
+            {
+                childRecord.State = PlatformChildDomainState.Faulted;
+                parent.ClosureState = PlatformExternalClosureState.Faulted;
+            }
             return FromProviderFailure<PlatformGuestMapping>(result.Status, result.Message);
         }
         var leaseValidation = PlatformGuestMemoryContract.ValidateLease(request, result.Value!);
         if (!leaseValidation.IsSuccess)
         {
-            _ = provider.UnmapGuestRegion(result.Value!);
-            childRecord.State = PlatformChildDomainState.Faulted;
+            var cleanupProven = false;
+            try
+            {
+                var cleanup = provider.UnmapGuestRegion(result.Value!);
+                cleanupProven = cleanup.IsSuccess &&
+                    PlatformGuestMemoryContract.ValidateClosureReceipt(result.Value!, cleanup.Value!).IsSuccess &&
+                    BackendEpoch == backendEpoch;
+            }
+            catch (Exception exception) when (exception is not StackOverflowException)
+            {
+                // Lost cleanup receipt cannot release the parent mapping.
+            }
+            if (!cleanupProven)
+            {
+                childRecord.State = PlatformChildDomainState.Faulted;
+                parent.ClosureState = PlatformExternalClosureState.Faulted;
+            }
             return KernelResult<PlatformGuestMapping>.Fail(KernelError.PlatformFaulted, leaseValidation.Message!);
         }
-        var mapping = new PlatformGuestMapping(new(_nextGuestBindingId++), new(1), child, parentMapping);
-        _guestBindings.Add(mapping.MappingId, new(mapping, result.Value!));
-        return KernelResult<PlatformGuestMapping>.Ok(mapping);
+        lock (_secureDomainLifecycleGate)
+        {
+            if (BackendEpoch != backendEpoch || parent.LocalAuthorizationRevoked ||
+                parent.ClosureState != PlatformExternalClosureState.Active ||
+                childRecord.State == PlatformChildDomainState.Faulted)
+            {
+                childRecord.State = PlatformChildDomainState.Faulted;
+                parent.ClosureState = PlatformExternalClosureState.Faulted;
+                return KernelResult<PlatformGuestMapping>.Fail(KernelError.PlatformFaulted,
+                    "Guest mapping changed before local publication; parent remains pinned.");
+            }
+            var mapping = new PlatformGuestMapping(new(_nextGuestBindingId++), new(1), child, parentMapping);
+            _guestBindings.Add(mapping.MappingId, new(mapping, result.Value!));
+            return KernelResult<PlatformGuestMapping>.Ok(mapping);
+        }
+        }
+        finally
+        {
+            lock (_secureDomainLifecycleGate)
+            {
+                parent.PendingGuestMaps--;
+                childRecord.PendingChildEffects--;
+            }
+        }
     }
 
     internal KernelResult UnmapChildGuestRegion(PlatformGuestMapping mapping)
@@ -58,7 +135,19 @@ public sealed partial class PlatformAuthorityBridge
         if (_provider is not IPlatformGuestMemoryProvider provider)
             return KernelResult.Fail(KernelError.PlatformUnsupported, "Guest-memory provider is unavailable.");
         var backendEpoch = BackendEpoch;
-        record.Closure = PlatformExternalClosureState.Draining;
+        lock (_secureDomainLifecycleGate)
+        {
+            if (record.PendingExecutableEffects != 0)
+                return KernelResult.Fail(KernelError.PlatformBindingActive,
+                    "Executable artifact bind or start must settle before guest unmap.");
+            if (_executableArtifacts.Values.Any(artifact => artifact.Binding.GuestMapping == mapping))
+                return KernelResult.Fail(KernelError.PlatformBindingActive,
+                    "Bound executable artifact has no exact release evidence for this guest mapping.");
+            if (record.Closure != PlatformExternalClosureState.Active)
+                return KernelResult.Fail(KernelError.PlatformBindingRevoked,
+                    "Guest mapping closure is already in progress.");
+            record.Closure = PlatformExternalClosureState.Draining;
+        }
         PlatformAuthorityResult<PlatformGuestRegionMappingClosureReceipt> result;
         try { result = provider.UnmapGuestRegion(record.ProviderLease); }
         catch (Exception exception) when (exception is not StackOverflowException)
@@ -84,7 +173,8 @@ public sealed partial class PlatformAuthorityBridge
             record.Closure = PlatformExternalClosureState.Faulted;
             return KernelResult.Fail(KernelError.PlatformFaulted, validation.Message!);
         }
-        record.Closure = PlatformExternalClosureState.Closed;
+        lock (_secureDomainLifecycleGate)
+            record.Closure = PlatformExternalClosureState.Closed;
         return KernelResult.Ok();
     }
 }

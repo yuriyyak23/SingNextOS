@@ -345,6 +345,138 @@ public sealed class Phase7EvidenceSecureComputeTests
         Assert.Equal(0, scenario.Provider.ParentRevokeCalls);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SecureTransitionResetOrThrowQuarantinesBeforeKernelStatePublication(bool throws)
+    {
+        var scenario = Create(secureAvailability: PlatformFeatureAvailability.ProductionSecure,
+            withSecureCapability: true);
+        scenario.Provider.ProvenProperties = [SecureProperty.PrivateMemory];
+        var secure = scenario.Kernel.CreateSecureDomain(scenario.Owner, scenario.SecureCapability,
+            scenario.Parent, new([SecureProperty.PrivateMemory], 4096)).Value!;
+        scenario.Provider.BeforeSecureTransition = throws
+            ? () => throw new InvalidOperationException("after possible transition effect")
+            : () => Assert.True(scenario.Kernel.ObservePlatformBackendReset().IsSuccess);
+
+        var transitioned = scenario.Kernel.TransitionSecureDomain(scenario.Owner, secure.Domain,
+            secure.ExecuteCapability, PlatformSecureDomainTransition.BeginDrain);
+        var retry = scenario.Kernel.TransitionSecureDomain(scenario.Owner, secure.Domain,
+            secure.ExecuteCapability, PlatformSecureDomainTransition.BeginDrain);
+
+        Assert.Equal(KernelError.PlatformFaulted, transitioned.Error);
+        Assert.False(retry.IsSuccess);
+        Assert.Equal(1, scenario.Provider.SecureTransitionCalls);
+        Assert.False(scenario.Kernel.RevokePlatformDomain(scenario.Owner, scenario.Parent).IsSuccess);
+    }
+
+    [Fact]
+    public void ResetAfterSecureTransitionReceiptCannotPublishKernelState()
+    {
+        var scenario = Create(secureAvailability: PlatformFeatureAvailability.ProductionSecure,
+            withSecureCapability: true);
+        scenario.Provider.ProvenProperties = [SecureProperty.PrivateMemory];
+        var secure = scenario.Kernel.CreateSecureDomain(scenario.Owner, scenario.SecureCapability,
+            scenario.Parent, new([SecureProperty.PrivateMemory], 4096)).Value!;
+        scenario.Kernel.BeforeSecureDomainTransitionLocalCommit = () =>
+            Assert.True(scenario.Kernel.ObservePlatformBackendReset().IsSuccess);
+
+        var transitioned = scenario.Kernel.TransitionSecureDomain(scenario.Owner, secure.Domain,
+            secure.ExecuteCapability, PlatformSecureDomainTransition.BeginDrain);
+
+        Assert.Equal(KernelError.PlatformFaulted, transitioned.Error);
+        Assert.Equal(1, scenario.Provider.SecureTransitionCalls);
+        Assert.False(scenario.Kernel.DestroySecureDomain(scenario.Owner, secure.Domain,
+            secure.ConfigureCapability).IsSuccess);
+    }
+
+    [Fact]
+    public async Task ConcurrentSecureTransitionHasOneProviderCallback()
+    {
+        var scenario = Create(secureAvailability: PlatformFeatureAvailability.ProductionSecure,
+            withSecureCapability: true);
+        scenario.Provider.ProvenProperties = [SecureProperty.PrivateMemory];
+        var secure = scenario.Kernel.CreateSecureDomain(scenario.Owner, scenario.SecureCapability,
+            scenario.Parent, new([SecureProperty.PrivateMemory], 4096)).Value!;
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        scenario.Provider.BeforeSecureTransition = () =>
+        {
+            entered.Set();
+            Assert.True(release.Wait(TimeSpan.FromSeconds(10)));
+        };
+        var first = Task.Run(() => scenario.Kernel.TransitionSecureDomain(scenario.Owner,
+            secure.Domain, secure.ExecuteCapability, PlatformSecureDomainTransition.BeginDrain));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.False(scenario.Kernel.TransitionSecureDomain(scenario.Owner, secure.Domain,
+                secure.ExecuteCapability, PlatformSecureDomainTransition.BeginDrain).IsSuccess);
+            Assert.Equal(1, scenario.Provider.SecureTransitionCalls);
+        }
+        finally { release.Set(); }
+        Assert.True((await first).IsSuccess);
+        Assert.Equal(1, scenario.Provider.SecureTransitionCalls);
+    }
+
+    [Fact]
+    public async Task SecureDestroyCannotOverlapInFlightPublicTransition()
+    {
+        var scenario = Create(secureAvailability: PlatformFeatureAvailability.ProductionSecure,
+            withSecureCapability: true);
+        scenario.Provider.ProvenProperties = [SecureProperty.PrivateMemory];
+        var secure = scenario.Kernel.CreateSecureDomain(scenario.Owner, scenario.SecureCapability,
+            scenario.Parent, new([SecureProperty.PrivateMemory], 4096)).Value!;
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        scenario.Provider.BeforeSecureTransition = () =>
+        {
+            entered.Set();
+            Assert.True(release.Wait(TimeSpan.FromSeconds(10)));
+        };
+        var transition = Task.Run(() => scenario.Kernel.TransitionSecureDomain(scenario.Owner,
+            secure.Domain, secure.ExecuteCapability, PlatformSecureDomainTransition.BeginDrain));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.Equal(KernelError.PlatformBindingActive,
+                scenario.Kernel.DestroySecureDomain(scenario.Owner, secure.Domain,
+                    secure.ConfigureCapability).Error);
+            Assert.Equal(1, scenario.Provider.SecureTransitionCalls);
+        }
+        finally { release.Set(); }
+        Assert.True((await transition).IsSuccess);
+    }
+
+    [Fact]
+    public async Task PublicTransitionCannotOverlapInFlightSecureDestroy()
+    {
+        var scenario = Create(secureAvailability: PlatformFeatureAvailability.ProductionSecure,
+            withSecureCapability: true);
+        scenario.Provider.ProvenProperties = [SecureProperty.PrivateMemory];
+        var secure = scenario.Kernel.CreateSecureDomain(scenario.Owner, scenario.SecureCapability,
+            scenario.Parent, new([SecureProperty.PrivateMemory], 4096)).Value!;
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        scenario.Provider.BeforeSecureTransition = () =>
+        {
+            entered.Set();
+            Assert.True(release.Wait(TimeSpan.FromSeconds(10)));
+        };
+        var destroy = Task.Run(() => scenario.Kernel.DestroySecureDomain(scenario.Owner,
+            secure.Domain, secure.ConfigureCapability));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.Equal(KernelError.PlatformBindingActive,
+                scenario.Kernel.TransitionSecureDomain(scenario.Owner, secure.Domain,
+                    secure.ExecuteCapability, PlatformSecureDomainTransition.BeginDrain).Error);
+            Assert.Equal(1, scenario.Provider.SecureTransitionCalls);
+        }
+        finally { release.Set(); }
+        Assert.True((await destroy).IsSuccess);
+    }
+
     [Fact]
     public void SecureRegionBlocksMappingReclaimUntilExactUnbind()
     {
@@ -367,6 +499,168 @@ public sealed class Phase7EvidenceSecureComputeTests
         Assert.True(scenario.Kernel.CloseSecureRegion(scenario.Owner, secure.Value.Domain, secure.Value.MemoryCapability, mapping.Value).IsSuccess);
         var revoked = scenario.Kernel.RevokePlatformRegionMapping(scenario.Owner, mapping.Value);
         Assert.True(revoked.IsSuccess, revoked.Message);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task InFlightSecureRegionMutationBlocksTransitionAndMappingRevoke(bool unbind)
+    {
+        var scenario = Create(secureAvailability: PlatformFeatureAvailability.ProductionSecure, withSecureCapability: true);
+        scenario.Provider.ProvenProperties = [SecureProperty.PrivateMemory];
+        var buffer = scenario.Kernel.AllocateBuffer<byte>(scenario.Owner, 128).Value!;
+        var process = scenario.Kernel.Processes.Resolve(scenario.Owner).Value!;
+        var capability = scenario.Kernel.MintCapability(process.DomainId, scenario.Owner, ResourceKind.MemoryRegion,
+            CapabilityResourceIds.MemoryRegion(buffer.Handle.RegionId), CapabilityRights.Map | CapabilityRights.Read | CapabilityRights.Write).Value!.CapabilityId;
+        var mapping = scenario.Kernel.MapPlatformOwnedRegion(scenario.Owner, scenario.Parent, capability, buffer.Handle,
+            PlatformMemoryAccess.Read | PlatformMemoryAccess.Write).Value!;
+        var secure = scenario.Kernel.CreateSecureDomain(scenario.Owner, scenario.SecureCapability, scenario.Parent,
+            new([SecureProperty.PrivateMemory], 4096)).Value!;
+        if (unbind) Assert.True(scenario.Kernel.BindSecureRegion(scenario.Owner, secure.Domain,
+            secure.MemoryCapability, mapping, PlatformSecureRegionClass.Private).IsSuccess);
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        Action pause = () => { entered.Set(); Assert.True(release.Wait(TimeSpan.FromSeconds(10))); };
+        if (unbind) scenario.Provider.BeforeSecureUnbind = pause;
+        else scenario.Provider.BeforeSecureBind = pause;
+        var mutation = Task.Run(() => unbind
+            ? scenario.Kernel.CloseSecureRegion(scenario.Owner, secure.Domain, secure.MemoryCapability, mapping)
+            : scenario.Kernel.BindSecureRegion(scenario.Owner, secure.Domain, secure.MemoryCapability,
+                mapping, PlatformSecureRegionClass.Private));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.Equal(KernelError.PlatformBindingActive, scenario.Kernel.TransitionSecureDomain(scenario.Owner,
+                secure.Domain, secure.ExecuteCapability, PlatformSecureDomainTransition.BeginDrain).Error);
+            Assert.Equal(KernelError.PlatformBindingActive,
+                scenario.Kernel.RevokePlatformRegionMapping(scenario.Owner, mapping).Error);
+            Assert.Equal(0, scenario.Provider.SecureTransitionCalls);
+        }
+        finally { release.Set(); }
+        Assert.True((await mutation).IsSuccess);
+        if (unbind)
+            Assert.True(scenario.Kernel.RevokePlatformRegionMapping(scenario.Owner, mapping).IsSuccess);
+        else
+            Assert.Equal(KernelError.PlatformBindingActive,
+                scenario.Kernel.RevokePlatformRegionMapping(scenario.Owner, mapping).Error);
+    }
+
+    [Fact]
+    public async Task MappingRevocationDrainingRejectsLateSecureBindBeforeProvider()
+    {
+        var scenario = Create(secureAvailability: PlatformFeatureAvailability.ProductionSecure, withSecureCapability: true);
+        scenario.Provider.ProvenProperties = [SecureProperty.PrivateMemory];
+        var buffer = scenario.Kernel.AllocateBuffer<byte>(scenario.Owner, 128).Value!;
+        var process = scenario.Kernel.Processes.Resolve(scenario.Owner).Value!;
+        var capability = scenario.Kernel.MintCapability(process.DomainId, scenario.Owner, ResourceKind.MemoryRegion,
+            CapabilityResourceIds.MemoryRegion(buffer.Handle.RegionId), CapabilityRights.Map | CapabilityRights.Read | CapabilityRights.Write).Value!.CapabilityId;
+        var mapping = scenario.Kernel.MapPlatformOwnedRegion(scenario.Owner, scenario.Parent, capability, buffer.Handle,
+            PlatformMemoryAccess.Read | PlatformMemoryAccess.Write).Value!;
+        var secure = scenario.Kernel.CreateSecureDomain(scenario.Owner, scenario.SecureCapability, scenario.Parent,
+            new([SecureProperty.PrivateMemory], 4096)).Value!;
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        scenario.Provider.BeforeMappingRevoke = () => { entered.Set(); Assert.True(release.Wait(TimeSpan.FromSeconds(10))); };
+        var revoke = Task.Run(() => scenario.Kernel.RevokePlatformRegionMapping(scenario.Owner, mapping));
+        Task<KernelResult>? bind = null;
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            bind = Task.Run(() => scenario.Kernel.BindSecureRegion(scenario.Owner, secure.Domain,
+                secure.MemoryCapability, mapping, PlatformSecureRegionClass.Private));
+            Assert.Equal(0, scenario.Provider.SecureBindCalls);
+        }
+        finally { release.Set(); }
+        Assert.True((await revoke).IsSuccess);
+        Assert.NotNull(bind);
+        Assert.False((await bind).IsSuccess);
+        Assert.Equal(0, scenario.Provider.SecureBindCalls);
+    }
+
+    [Fact]
+    public async Task BridgeMappingRevocationDrainingRejectsConcurrentSecureBind()
+    {
+        var scenario = Create(secureAvailability: PlatformFeatureAvailability.ProductionSecure, withSecureCapability: true);
+        scenario.Provider.ProvenProperties = [SecureProperty.PrivateMemory];
+        var buffer = scenario.Kernel.AllocateBuffer<byte>(scenario.Owner, 128).Value!;
+        var process = scenario.Kernel.Processes.Resolve(scenario.Owner).Value!;
+        var capability = scenario.Kernel.MintCapability(process.DomainId, scenario.Owner, ResourceKind.MemoryRegion,
+            CapabilityResourceIds.MemoryRegion(buffer.Handle.RegionId), CapabilityRights.Map | CapabilityRights.Read | CapabilityRights.Write).Value!.CapabilityId;
+        var mapping = scenario.Kernel.MapPlatformOwnedRegion(scenario.Owner, scenario.Parent, capability, buffer.Handle,
+            PlatformMemoryAccess.Read | PlatformMemoryAccess.Write).Value!;
+        var bridge = scenario.Kernel.PlatformAuthority;
+        var secure = bridge.CreateSecureDomain(scenario.Parent, scenario.Parent.Subject,
+            new([SecureProperty.PrivateMemory], 4096)).Value!;
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        scenario.Provider.BeforeMappingRevoke = () => { entered.Set(); Assert.True(release.Wait(TimeSpan.FromSeconds(10))); };
+        var revoke = Task.Run(() => bridge.BeginRegionMappingRevocation(mapping, scenario.Parent.Subject,
+            PlatformRegionRevocationPolicy.DrainBeforeRevoke));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.False(bridge.BindSecureRegion(secure, mapping, PlatformSecureRegionClass.Private).IsSuccess);
+            Assert.Equal(0, scenario.Provider.SecureBindCalls);
+        }
+        finally { release.Set(); }
+        Assert.True((await revoke).IsSuccess);
+    }
+
+    [Fact]
+    public async Task BridgeInFlightSecureBindRejectsMappingRevocation()
+    {
+        var scenario = Create(secureAvailability: PlatformFeatureAvailability.ProductionSecure, withSecureCapability: true);
+        scenario.Provider.ProvenProperties = [SecureProperty.PrivateMemory];
+        var buffer = scenario.Kernel.AllocateBuffer<byte>(scenario.Owner, 128).Value!;
+        var process = scenario.Kernel.Processes.Resolve(scenario.Owner).Value!;
+        var capability = scenario.Kernel.MintCapability(process.DomainId, scenario.Owner, ResourceKind.MemoryRegion,
+            CapabilityResourceIds.MemoryRegion(buffer.Handle.RegionId), CapabilityRights.Map | CapabilityRights.Read | CapabilityRights.Write).Value!.CapabilityId;
+        var mapping = scenario.Kernel.MapPlatformOwnedRegion(scenario.Owner, scenario.Parent, capability, buffer.Handle,
+            PlatformMemoryAccess.Read | PlatformMemoryAccess.Write).Value!;
+        var bridge = scenario.Kernel.PlatformAuthority;
+        var secure = bridge.CreateSecureDomain(scenario.Parent, scenario.Parent.Subject,
+            new([SecureProperty.PrivateMemory], 4096)).Value!;
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        scenario.Provider.BeforeSecureBind = () => { entered.Set(); Assert.True(release.Wait(TimeSpan.FromSeconds(10))); };
+        var bind = Task.Run(() => bridge.BindSecureRegion(secure, mapping, PlatformSecureRegionClass.Private));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.Equal(KernelError.PlatformBindingActive,
+                bridge.BeginRegionMappingRevocation(mapping, scenario.Parent.Subject,
+                    PlatformRegionRevocationPolicy.DrainBeforeRevoke).Error);
+        }
+        finally { release.Set(); }
+        Assert.True((await bind).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ResetAfterSecureRegionProviderReceiptPreventsLocalCommit(bool unbind)
+    {
+        var scenario = Create(secureAvailability: PlatformFeatureAvailability.ProductionSecure, withSecureCapability: true);
+        scenario.Provider.ProvenProperties = [SecureProperty.PrivateMemory];
+        var buffer = scenario.Kernel.AllocateBuffer<byte>(scenario.Owner, 128).Value!;
+        var process = scenario.Kernel.Processes.Resolve(scenario.Owner).Value!;
+        var capability = scenario.Kernel.MintCapability(process.DomainId, scenario.Owner, ResourceKind.MemoryRegion,
+            CapabilityResourceIds.MemoryRegion(buffer.Handle.RegionId), CapabilityRights.Map | CapabilityRights.Read | CapabilityRights.Write).Value!.CapabilityId;
+        var mapping = scenario.Kernel.MapPlatformOwnedRegion(scenario.Owner, scenario.Parent, capability, buffer.Handle,
+            PlatformMemoryAccess.Read | PlatformMemoryAccess.Write).Value!;
+        var secure = scenario.Kernel.CreateSecureDomain(scenario.Owner, scenario.SecureCapability, scenario.Parent,
+            new([SecureProperty.PrivateMemory], 4096)).Value!;
+        if (unbind) Assert.True(scenario.Kernel.BindSecureRegion(scenario.Owner, secure.Domain,
+            secure.MemoryCapability, mapping, PlatformSecureRegionClass.Private).IsSuccess);
+        scenario.Kernel.BeforeSecureRegionLocalCommit = () =>
+            Assert.True(scenario.Kernel.ObservePlatformBackendReset().IsSuccess);
+        var result = unbind
+            ? scenario.Kernel.CloseSecureRegion(scenario.Owner, secure.Domain, secure.MemoryCapability, mapping)
+            : scenario.Kernel.BindSecureRegion(scenario.Owner, secure.Domain, secure.MemoryCapability,
+                mapping, PlatformSecureRegionClass.Private);
+        Assert.Equal(KernelError.PlatformFaulted, result.Error);
+        Assert.False(scenario.Kernel.RevokePlatformRegionMapping(scenario.Owner, mapping).IsSuccess);
+        Assert.False(scenario.Kernel.DestroySecureDomain(scenario.Owner, secure.Domain, secure.ConfigureCapability).IsSuccess);
     }
 
     [Theory]
@@ -662,12 +956,15 @@ public sealed class Phase7EvidenceSecureComputeTests
         public int SecureRevokeCalls { get; private set; }
         public int SecureUnbindCalls { get; private set; }
         public int SecureBindCalls { get; private set; }
+        public Action? BeforeMappingRevoke { get; set; }
         public Action? BeforeSecureBind { get; set; }
         public bool FailSecureBind { get; set; }
         public bool MalformedSecureBind { get; set; }
         public Action? BeforeSecureUnbind { get; set; }
         public Action? BeforeSecureRevoke { get; set; }
         public int DrainCalls { get; private set; }
+        public int SecureTransitionCalls { get; private set; }
+        public Action? BeforeSecureTransition { get; set; }
         public int OrdinaryVirtualDomainCalls { get; private set; }
         public int ParentRevokeCalls { get; private set; }
         public Action? BeforeParentRevoke { get; set; }
@@ -690,7 +987,11 @@ public sealed class Phase7EvidenceSecureComputeTests
         }
         public PlatformAuthorityResult<PlatformProviderRegionMappingLease> MapOwnedRegion(PlatformProviderDomainLease domainLease, PlatformRegionIdentity region, PlatformMemoryAccess access) => _host.MapOwnedRegion(domainLease, region, access);
         public PlatformAuthorityResult RevokeRegionMapping(PlatformProviderRegionMappingLease mapping, PlatformRegionRevocationPolicy policy) => _host.RevokeRegionMapping(mapping, policy);
-        public PlatformAuthorityResult<PlatformRegionRevocationTicket> BeginRegionMappingRevocation(PlatformProviderRegionMappingLease mapping, PlatformRegionRevocationPolicy policy) => _host.BeginRegionMappingRevocation(mapping, policy);
+        public PlatformAuthorityResult<PlatformRegionRevocationTicket> BeginRegionMappingRevocation(PlatformProviderRegionMappingLease mapping, PlatformRegionRevocationPolicy policy)
+        {
+            BeforeMappingRevoke?.Invoke();
+            return _host.BeginRegionMappingRevocation(mapping, policy);
+        }
         public PlatformAuthorityResult<PlatformCompletionReceipt> ObserveCompletion(PlatformOperationIdentity operation) => _host.ObserveCompletion(operation);
         public PlatformAuthorityResult<PlatformEvidenceCatalog> QueryEvidenceCatalog(PlatformEvidenceCatalogRequest request) { CatalogCalls++; return PlatformAuthorityResult<PlatformEvidenceCatalog>.Ok(new([
             new(new("runtime.health", 1), EvidenceVisibilityClass.SecurityMeasurement, new("host-model"), false),
@@ -747,6 +1048,8 @@ public sealed class Phase7EvidenceSecureComputeTests
         }
         public PlatformAuthorityResult<PlatformSecureDomainTransitionReceipt> TransitionSecureDomain(PlatformProviderSecureDomainLease domain, PlatformSecureDomainTransition transition)
         {
+            SecureTransitionCalls++;
+            BeforeSecureTransition?.Invoke();
             if (transition == PlatformSecureDomainTransition.BeginDrain) DrainCalls++;
             return PlatformAuthorityResult<PlatformSecureDomainTransitionReceipt>.Ok(new(domain, transition, true));
         }

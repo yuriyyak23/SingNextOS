@@ -492,12 +492,23 @@ public sealed class SecureExecutionBindingTests
         Assert.Equal(0, c.Base.Provider.EventEffects);
         Assert.Equal(CxlMemoryPlacementState.MigrationRequired,
             c.Memory.Query(c.InputPlacement.PlacementId).Value!.State);
-        Assert.Equal(ExternalOperationState.Released,
+        Assert.Equal(ExternalOperationState.Submitted,
             c.Base.Kernel.QueryExternalOperation(c.Base.Owner, c.Execution.Operation).Value!.State);
         Assert.True(c.Base.Kernel.Regions.Validate(c.Input.Handle, c.Owner).IsSuccess);
         var currentFabric = c.Bridge.QueryFabric(c.Fabric.BindingId);
         Assert.True(currentFabric.IsSuccess, currentFabric.Message);
-        CloseComposedWorkload(c, currentFabric.Value!);
+        Assert.False(c.Memory.Close(c.InputPlacement.PlacementId).IsSuccess);
+        Assert.False(c.Memory.Close(c.OutputPlacement.PlacementId).IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingActive, c.Bridge.ReleaseFabric(currentFabric.Value!).Error);
+        Assert.False(c.Base.Kernel.RevokePlatformDevice(c.Base.Owner, c.Device).IsSuccess);
+        Assert.False(c.Base.Kernel.DestroySecureDomain(c.Base.Owner, c.Base.Secure.Domain,
+            c.Base.Secure.ConfigureCapability).IsSuccess);
+        Assert.False(c.Base.Kernel.DestroyVirtualDomain(c.Base.Owner, c.Base.Virtual.Domain,
+            c.Base.Virtual.ConfigureCapability).IsSuccess);
+        Assert.False(c.Base.Kernel.TerminateProcess(c.Base.Owner).IsSuccess);
+        Assert.False(c.Base.Kernel.QueryProcessTeardown(c.Base.Owner).Value.LocalReclaimCompleted);
+        Assert.Equal(KernelError.PlatformBindingActive, c.Base.Kernel.Regions.ReserveBacking(c.Input.Handle, c.Owner).Error);
+        Assert.Equal(KernelError.PlatformBindingActive, c.Base.Kernel.Regions.ReserveBacking(c.Output.Handle, c.Owner).Error);
     }
 
     [Fact]
@@ -601,14 +612,7 @@ public sealed class SecureExecutionBindingTests
 
     private static void CloseComposedWorkload(ComposedWorkload c, CxlFabricBinding currentFabric)
     {
-        Assert.True(c.Base.Kernel.CloseVirtualIo(c.VirtualIo).IsSuccess);
-        Assert.True(c.Base.Kernel.CloseSecureGuestRegion(c.InputSecure).IsSuccess);
-        Assert.True(c.Base.Kernel.CloseSecureGuestRegion(c.OutputSecure).IsSuccess);
-        Assert.True(c.Base.Kernel.CloseGuestRegionMapping(c.Base.Owner, c.Base.Virtual.Domain,
-            c.Base.Virtual.MemoryCapability, c.InputGuest.Mapping).IsSuccess);
-        Assert.True(c.Base.Kernel.CloseGuestRegionMapping(c.Base.Owner, c.Base.Virtual.Domain,
-            c.Base.Virtual.MemoryCapability, c.OutputGuest.Mapping).IsSuccess);
-        Assert.True(c.Base.Kernel.CloseSecureExecution(c.SecureExecution).IsSuccess);
+        CloseComposedGuestAuthority(c);
         Assert.True(c.Memory.Close(c.InputPlacement.PlacementId).IsSuccess);
         Assert.True(c.Memory.Close(c.OutputPlacement.PlacementId).IsSuccess);
         Assert.True(c.Bridge.ReleaseFabric(currentFabric).IsSuccess);
@@ -620,6 +624,18 @@ public sealed class SecureExecutionBindingTests
             c.Base.Virtual.ConfigureCapability).IsSuccess);
         var terminated = c.Base.Kernel.TerminateProcess(c.Base.Owner);
         Assert.True(terminated.IsSuccess, terminated.Message);
+    }
+
+    private static void CloseComposedGuestAuthority(ComposedWorkload c)
+    {
+        Assert.True(c.Base.Kernel.CloseVirtualIo(c.VirtualIo).IsSuccess);
+        Assert.True(c.Base.Kernel.CloseSecureGuestRegion(c.InputSecure).IsSuccess);
+        Assert.True(c.Base.Kernel.CloseSecureGuestRegion(c.OutputSecure).IsSuccess);
+        Assert.True(c.Base.Kernel.CloseGuestRegionMapping(c.Base.Owner, c.Base.Virtual.Domain,
+            c.Base.Virtual.MemoryCapability, c.InputGuest.Mapping).IsSuccess);
+        Assert.True(c.Base.Kernel.CloseGuestRegionMapping(c.Base.Owner, c.Base.Virtual.Domain,
+            c.Base.Virtual.MemoryCapability, c.OutputGuest.Mapping).IsSuccess);
+        Assert.True(c.Base.Kernel.CloseSecureExecution(c.SecureExecution).IsSuccess);
     }
 
     private sealed record ComposedWorkload(Scenario Base, RegionOwner Owner,

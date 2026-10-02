@@ -43,7 +43,7 @@ public sealed class VNextPhase15TelemetryAuthorityBoundaryTests
         Assert.False(model.Deterministic);
         Assert.False(correlation.AuthorizesEffect);
         Assert.False(correlation.AuthorizesProviderSubmission);
-        Assert.Equal(before, authority.Query(lease).Value);
+        BudgetSnapshotAssertions.Equal(before, authority.Query(lease).Value!);
         Assert.Equal(beforeAccount.Usage, authority.Query(account).Value!.Usage);
     }
 

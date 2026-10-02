@@ -102,8 +102,43 @@ public sealed partial class PlatformAuthorityBridge
                 "The platform provider does not expose grant-scoped DMA visibility preparation.");
         }
 
-        var providerGrant = _dmaGrants[grant.GrantId].ProviderGrant;
-        var providerResult = visibilityProvider.PrepareDmaGrantVisibility(providerGrant);
+        var record = _dmaGrants[grant.GrantId];
+        var providerGrant = record.ProviderGrant;
+        var epoch = BackendEpoch;
+        PlatformProviderIncarnation incarnation;
+        PlatformProviderIncarnation observedIncarnation;
+        PlatformAuthorityResult<PlatformProviderDmaPrepareEvidence> providerResult;
+        record.PreparationInFlight = true;
+        try
+        {
+            incarnation = CurrentProviderIncarnation();
+            if (BackendEpoch != epoch || incarnation.Value == 0 || incarnation != record.ProviderIncarnation ||
+                HasFaultPinnedDmaSubmission(grant.GrantId) || HasActiveDmaSubmission(grant.GrantId) ||
+                !ValidateDeviceLease(grant.DeviceLease, expectedSubject).IsSuccess ||
+                !ValidateExactMapping(grant.Mapping, expectedSubject).IsSuccess)
+            {
+                _dmaSubmissionFaultPins.Add(grant.GrantId);
+                return KernelResult<PlatformDmaPrepareEvidence>.Fail(KernelError.PlatformFaulted,
+                    "DMA continuity changed before preparation; grant remains pinned.");
+            }
+            providerResult = visibilityProvider.PrepareDmaGrantVisibility(providerGrant);
+            observedIncarnation = CurrentProviderIncarnation();
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        {
+            _dmaSubmissionFaultPins.Add(grant.GrantId);
+            return KernelResult<PlatformDmaPrepareEvidence>.Fail(KernelError.PlatformFaulted,
+                $"DMA preparation receipt was lost; grant remains pinned: {exception.GetType().Name}.");
+        }
+        finally { record.PreparationInFlight = false; }
+        if (observedIncarnation != incarnation || BackendEpoch != epoch ||
+            !_dmaGrants.TryGetValue(grant.GrantId, out var current) || !ReferenceEquals(current, record) ||
+            !ValidateDmaGrant(grant, expectedSubject).IsSuccess)
+        {
+            _dmaSubmissionFaultPins.Add(grant.GrantId);
+            return KernelResult<PlatformDmaPrepareEvidence>.Fail(KernelError.PlatformFaulted,
+                "DMA grant or backend continuity changed during preparation; grant remains pinned.");
+        }
         if (!providerResult.IsSuccess)
         {
             return FromProviderFailure<PlatformDmaPrepareEvidence>(
@@ -206,8 +241,46 @@ public sealed partial class PlatformAuthorityBridge
                 "The provider that prepared DMA visibility no longer exposes CPU acquire.");
         }
 
-        var providerGrant = _dmaGrants[grant.GrantId].ProviderGrant;
-        var providerResult = visibilityProvider.AcquireDmaGrantVisibility(providerGrant);
+        var record = _dmaGrants[grant.GrantId];
+        var providerGrant = record.ProviderGrant;
+        var epoch = BackendEpoch;
+        PlatformProviderIncarnation incarnation;
+        PlatformProviderIncarnation observedIncarnation;
+        PlatformAuthorityResult<PlatformProviderDmaAcquireEvidence> providerResult;
+        record.AcquisitionInFlight = true;
+        try
+        {
+            incarnation = CurrentProviderIncarnation();
+            if (BackendEpoch != epoch || incarnation.Value == 0 || incarnation != record.ProviderIncarnation ||
+                HasFaultPinnedDmaSubmission(grant.GrantId) || HasActiveDmaSubmission(grant.GrantId) ||
+                !ValidateDeviceLease(grant.DeviceLease, expectedSubject).IsSuccess ||
+                !ValidateExactMapping(grant.Mapping, expectedSubject).IsSuccess ||
+                !_dmaVisibilityStates.TryGetValue(grant.GrantId, out var preparedState) ||
+                !ReferenceEquals(preparedState, state) || state.Consumed || state.Acquired)
+            {
+                _dmaSubmissionFaultPins.Add(grant.GrantId);
+                return KernelResult<PlatformDmaAcquireEvidence>.Fail(KernelError.PlatformFaulted,
+                    "DMA visibility cycle or continuity changed before acquire; grant remains pinned.");
+            }
+            providerResult = visibilityProvider.AcquireDmaGrantVisibility(providerGrant);
+            observedIncarnation = CurrentProviderIncarnation();
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        {
+            _dmaSubmissionFaultPins.Add(grant.GrantId);
+            return KernelResult<PlatformDmaAcquireEvidence>.Fail(KernelError.PlatformFaulted,
+                $"DMA acquire receipt was lost; grant remains pinned: {exception.GetType().Name}.");
+        }
+        finally { record.AcquisitionInFlight = false; }
+        if (observedIncarnation != incarnation || BackendEpoch != epoch ||
+            !_dmaGrants.TryGetValue(grant.GrantId, out var current) || !ReferenceEquals(current, record) ||
+            !_dmaVisibilityStates.TryGetValue(grant.GrantId, out var currentState) || !ReferenceEquals(currentState, state) ||
+            !ValidateDmaGrant(grant, expectedSubject).IsSuccess)
+        {
+            _dmaSubmissionFaultPins.Add(grant.GrantId);
+            return KernelResult<PlatformDmaAcquireEvidence>.Fail(KernelError.PlatformFaulted,
+                "DMA grant, visibility cycle or backend continuity changed during acquire; grant remains pinned.");
+        }
         if (!providerResult.IsSuccess)
         {
             return FromProviderFailure<PlatformDmaAcquireEvidence>(

@@ -53,6 +53,299 @@ public sealed class Phase8ResidualVirtualizationTests
     }
 
     [Fact]
+    public void NestedCreateReceiptLossPinsImmediateParentAndRoot()
+    {
+        var provider = new NestedProvider(null, false, false, false, false, false)
+        {
+            ThrowAfterNestedMaterialize = true,
+        };
+        var bridge = new PlatformAuthorityBridge(provider);
+        var subject = new PlatformDomainIdentity(new DomainId(1),
+            new ProcessHandle(new ProcessId(1), 1));
+        var root = bridge.BindDomain(subject).Value!;
+        var intent = Intent(PlatformChildAuthorityClass.Lifecycle | PlatformChildAuthorityClass.GuestMemory);
+        var parent = bridge.CreateChildDomain(root, subject, intent).Value!;
+
+        Assert.Equal(KernelError.PlatformFaulted,
+            bridge.CreateNestedChildDomain(parent, subject.Process, intent).Error);
+        Assert.Equal(KernelError.PlatformFaulted,
+            bridge.TransitionChildDomain(parent, PlatformChildDomainTransition.BeginDrain).Error);
+        Assert.Equal(KernelError.PlatformBindingActive, bridge.RevokeDomain(root, subject).Error);
+        Assert.DoesNotContain("parent-close", provider.CallLog);
+    }
+
+    [Fact]
+    public void NestedCreateCallbackBlocksImmediateParentTransition()
+    {
+        var provider = new NestedProvider(null, false, false, false, false, false);
+        var bridge = new PlatformAuthorityBridge(provider);
+        var subject = new PlatformDomainIdentity(new DomainId(1),
+            new ProcessHandle(new ProcessId(1), 1));
+        var root = bridge.BindDomain(subject).Value!;
+        var intent = Intent(PlatformChildAuthorityClass.Lifecycle | PlatformChildAuthorityClass.GuestMemory);
+        var parent = bridge.CreateChildDomain(root, subject, intent).Value!;
+        provider.AfterNestedMaterialize = () => Assert.Equal(KernelError.PlatformBindingActive,
+            bridge.TransitionChildDomain(parent, PlatformChildDomainTransition.BeginDrain).Error);
+
+        Assert.True(bridge.CreateNestedChildDomain(parent, subject.Process, intent).IsSuccess);
+        Assert.Equal(1, provider.NestedCreateCalls);
+    }
+
+    [Fact]
+    public void ResetInsideNestedCreateCallbackCannotPublishLateChild()
+    {
+        var provider = new NestedProvider(null, false, false, false, false, false);
+        var bridge = new PlatformAuthorityBridge(provider);
+        var subject = new PlatformDomainIdentity(new DomainId(1),
+            new ProcessHandle(new ProcessId(1), 1));
+        var root = bridge.BindDomain(subject).Value!;
+        var intent = Intent(PlatformChildAuthorityClass.Lifecycle | PlatformChildAuthorityClass.GuestMemory);
+        var parent = bridge.CreateChildDomain(root, subject, intent).Value!;
+        provider.AfterNestedMaterialize = () => Assert.True(bridge.ObserveBackendReset().IsSuccess);
+
+        Assert.Equal(KernelError.PlatformFaulted,
+            bridge.CreateNestedChildDomain(parent, subject.Process, intent).Error);
+        Assert.Equal(1, provider.NestedCreateCalls);
+        Assert.Equal(KernelError.PlatformFaulted,
+            bridge.TransitionChildDomain(parent, PlatformChildDomainTransition.BeginDrain).Error);
+        Assert.True(bridge.TryGetQuarantinedDomainBinding(subject, out var current));
+        Assert.NotEqual(root.Generation, current.Generation);
+        Assert.Equal(KernelError.PlatformBindingActive, bridge.RevokeDomain(current, subject).Error);
+    }
+
+    [Fact]
+    public void ImmediateParentTransitionCallbackRejectsNestedCreateBeforeProvider()
+    {
+        var provider = new NestedProvider(null, false, false, false, false, false);
+        var bridge = new PlatformAuthorityBridge(provider);
+        var subject = new PlatformDomainIdentity(new DomainId(1),
+            new ProcessHandle(new ProcessId(1), 1));
+        var root = bridge.BindDomain(subject).Value!;
+        var intent = Intent(PlatformChildAuthorityClass.Lifecycle | PlatformChildAuthorityClass.GuestMemory);
+        var parent = bridge.CreateChildDomain(root, subject, intent).Value!;
+        provider.BeforeChildTransition = () => Assert.Equal(KernelError.PlatformBindingActive,
+            bridge.CreateNestedChildDomain(parent, subject.Process, intent).Error);
+
+        Assert.True(bridge.TransitionChildDomain(parent,
+            PlatformChildDomainTransition.BeginDrain).IsSuccess);
+        Assert.Equal(0, provider.NestedCreateCalls);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ExecutableArtifactBindOrStartReceiptLossPinsChildAndMapping(bool start)
+    {
+        var provider = new NestedProvider(null, false, false, false, false, true)
+        {
+            ThrowAfterArtifactBind = !start,
+            ThrowAfterArtifactStart = start,
+        };
+        var bridge = new PlatformAuthorityBridge(provider);
+        var subject = new PlatformDomainIdentity(new DomainId(1),
+            new ProcessHandle(new ProcessId(1), 1));
+        var root = bridge.BindDomain(subject).Value!;
+        var intent = Intent(PlatformChildAuthorityClass.Lifecycle |
+            PlatformChildAuthorityClass.Execution | PlatformChildAuthorityClass.GuestMemory);
+        var child = bridge.CreateChildDomain(root, subject, intent).Value!;
+        var region = new PlatformRegionIdentity(new(new RegionId(5), new RegionGeneration(1)),
+            new(new DomainId(1), subject.ProcessGeneration), 4096);
+        var parentMapping = bridge.MapOwnedRegion(root, subject, new CapabilityId(8), region,
+            PlatformMemoryAccess.Read | PlatformMemoryAccess.Write).Value!;
+        var guest = bridge.MapChildGuestRegion(child, parentMapping,
+            new(0, 4096), PlatformGuestMemoryAccess.Read).Value!;
+
+        if (start)
+        {
+            var artifact = bridge.BindChildExecutableArtifact(child, guest,
+                new byte[] { 0x56, 0x33 }, 1).Value!;
+            Assert.Equal(KernelError.PlatformFaulted,
+                bridge.StartChildExecutableArtifact(artifact).Error);
+        }
+        else
+        {
+            Assert.Equal(KernelError.PlatformFaulted,
+                bridge.BindChildExecutableArtifact(child, guest,
+                    new byte[] { 0x56, 0x33 }, 1).Error);
+        }
+        Assert.Equal(KernelError.PlatformFaulted, bridge.ValidateMapping(parentMapping, subject).Error);
+        Assert.Equal(KernelError.PlatformFaulted,
+            bridge.TransitionChildDomain(child, PlatformChildDomainTransition.BeginDrain).Error);
+        Assert.Equal(KernelError.PlatformBindingActive, bridge.RevokeDomain(root, subject).Error);
+    }
+
+    [Fact]
+    public void RevokedParentMappingCannotReachExecutableChildStartProvider()
+    {
+        var provider = new NestedProvider(null, false, false, false, false, true);
+        var bridge = new PlatformAuthorityBridge(provider);
+        var subject = new PlatformDomainIdentity(new DomainId(1),
+            new ProcessHandle(new ProcessId(1), 1));
+        var root = bridge.BindDomain(subject).Value!;
+        var intent = Intent(PlatformChildAuthorityClass.Lifecycle |
+            PlatformChildAuthorityClass.Execution | PlatformChildAuthorityClass.GuestMemory);
+        var child = bridge.CreateChildDomain(root, subject, intent).Value!;
+        var region = new PlatformRegionIdentity(new(new RegionId(5), new RegionGeneration(1)),
+            new(new DomainId(1), subject.ProcessGeneration), 4096);
+        var parentMapping = bridge.MapOwnedRegion(root, subject, new CapabilityId(8), region,
+            PlatformMemoryAccess.Read | PlatformMemoryAccess.Write).Value!;
+        var guest = bridge.MapChildGuestRegion(child, parentMapping,
+            new(0, 4096), PlatformGuestMemoryAccess.Read).Value!;
+        var artifact = bridge.BindChildExecutableArtifact(child, guest,
+            new byte[] { 0x56, 0x33 }, 1).Value!;
+
+        Assert.Single(bridge.BeginCapabilityRevocation(new CapabilityId(8), static id => id == new CapabilityId(8)));
+        Assert.False(bridge.StartChildExecutableArtifact(artifact).IsSuccess);
+        Assert.Equal(0, provider.ArtifactStartCalls);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void BoundArtifactPinsOnlyItsExactGuestMappingAfterCallbackSettles(bool start)
+    {
+        var provider = new NestedProvider(null, false, false, false, false, true);
+        var bridge = new PlatformAuthorityBridge(provider);
+        var subject = new PlatformDomainIdentity(new DomainId(1),
+            new ProcessHandle(new ProcessId(1), 1));
+        var root = bridge.BindDomain(subject).Value!;
+        var intent = Intent(PlatformChildAuthorityClass.Lifecycle |
+            PlatformChildAuthorityClass.Execution | PlatformChildAuthorityClass.GuestMemory);
+        var child = bridge.CreateChildDomain(root, subject, intent).Value!;
+        var region = new PlatformRegionIdentity(new(new RegionId(5), new RegionGeneration(1)),
+            new(new DomainId(1), subject.ProcessGeneration), 8192);
+        var parent = bridge.MapOwnedRegion(root, subject, new CapabilityId(8), region,
+            PlatformMemoryAccess.Read | PlatformMemoryAccess.Write).Value!;
+        var boundGuest = bridge.MapChildGuestRegion(child, parent,
+            new(0, 4096), PlatformGuestMemoryAccess.Read).Value!;
+        var otherGuest = bridge.MapChildGuestRegion(child, parent,
+            new(4096, 4096), PlatformGuestMemoryAccess.Read).Value!;
+        var artifact = bridge.BindChildExecutableArtifact(child, boundGuest,
+            new byte[] { 0x56, 0x33 }, 1).Value!;
+
+        Assert.Equal(KernelError.PlatformBindingActive,
+            bridge.UnmapChildGuestRegion(boundGuest).Error);
+        Assert.Equal(0, provider.GuestUnmapCalls);
+        Assert.True(bridge.UnmapChildGuestRegion(otherGuest).IsSuccess);
+        Assert.Equal(1, provider.GuestUnmapCalls);
+        if (start)
+            Assert.True(bridge.StartChildExecutableArtifact(artifact).IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingActive,
+            bridge.UnmapChildGuestRegion(boundGuest).Error);
+        Assert.Equal(1, provider.GuestUnmapCalls);
+        Assert.True(bridge.TransitionChildDomain(child,
+            PlatformChildDomainTransition.BeginDrain).IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingActive, bridge.CloseChildDomain(child).Error);
+        Assert.Equal(KernelError.PlatformBindingActive,
+            bridge.BeginRegionMappingRevocation(parent, subject,
+                PlatformRegionRevocationPolicy.DrainBeforeRevoke).Error);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void GuestUnmapCannotOvertakeExecutableBindOrStartCallback(bool start)
+    {
+        var provider = new NestedProvider(null, false, false, false, false, true);
+        var bridge = new PlatformAuthorityBridge(provider);
+        var subject = new PlatformDomainIdentity(new DomainId(1),
+            new ProcessHandle(new ProcessId(1), 1));
+        var root = bridge.BindDomain(subject).Value!;
+        var intent = Intent(PlatformChildAuthorityClass.Lifecycle |
+            PlatformChildAuthorityClass.Execution | PlatformChildAuthorityClass.GuestMemory);
+        var child = bridge.CreateChildDomain(root, subject, intent).Value!;
+        var region = new PlatformRegionIdentity(new(new RegionId(5), new RegionGeneration(1)),
+            new(new DomainId(1), subject.ProcessGeneration), 4096);
+        var parent = bridge.MapOwnedRegion(root, subject, new CapabilityId(8), region,
+            PlatformMemoryAccess.Read | PlatformMemoryAccess.Write).Value!;
+        var guest = bridge.MapChildGuestRegion(child, parent,
+            new(0, 4096), PlatformGuestMemoryAccess.Read).Value!;
+        Action probe = () =>
+        {
+            Assert.Equal(KernelError.PlatformBindingActive,
+                bridge.UnmapChildGuestRegion(guest).Error);
+            Assert.Equal(KernelError.PlatformBindingActive,
+                bridge.TransitionChildDomain(child, PlatformChildDomainTransition.BeginDrain).Error);
+        };
+
+        if (start)
+        {
+            var artifact = bridge.BindChildExecutableArtifact(child, guest,
+                new byte[] { 0x56, 0x33 }, 1).Value!;
+            provider.AfterArtifactStart = probe;
+            Assert.True(bridge.StartChildExecutableArtifact(artifact).IsSuccess);
+        }
+        else
+        {
+            provider.AfterArtifactBind = probe;
+            Assert.True(bridge.BindChildExecutableArtifact(child, guest,
+                new byte[] { 0x56, 0x33 }, 1).IsSuccess);
+        }
+    }
+
+    [Fact]
+    public void ReentrantExecutableStartCannotEnterProviderTwice()
+    {
+        var provider = new NestedProvider(null, false, false, false, false, true);
+        var bridge = new PlatformAuthorityBridge(provider);
+        var subject = new PlatformDomainIdentity(new DomainId(1),
+            new ProcessHandle(new ProcessId(1), 1));
+        var root = bridge.BindDomain(subject).Value!;
+        var intent = Intent(PlatformChildAuthorityClass.Lifecycle |
+            PlatformChildAuthorityClass.Execution | PlatformChildAuthorityClass.GuestMemory);
+        var child = bridge.CreateChildDomain(root, subject, intent).Value!;
+        var region = new PlatformRegionIdentity(new(new RegionId(5), new RegionGeneration(1)),
+            new(new DomainId(1), subject.ProcessGeneration), 4096);
+        var parent = bridge.MapOwnedRegion(root, subject, new CapabilityId(8), region,
+            PlatformMemoryAccess.Read | PlatformMemoryAccess.Write).Value!;
+        var guest = bridge.MapChildGuestRegion(child, parent,
+            new(0, 4096), PlatformGuestMemoryAccess.Read).Value!;
+        var artifact = bridge.BindChildExecutableArtifact(child, guest,
+            new byte[] { 0x56, 0x33 }, 1).Value!;
+        provider.AfterArtifactStart = () => Assert.False(bridge.StartChildExecutableArtifact(artifact).IsSuccess);
+
+        Assert.True(bridge.StartChildExecutableArtifact(artifact).IsSuccess);
+        Assert.Equal(1, provider.ArtifactStartCalls);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ParentAuthorizationRevokedInsideExecutableCallbackPreventsPublication(bool start)
+    {
+        var provider = new NestedProvider(null, false, false, false, false, true);
+        var bridge = new PlatformAuthorityBridge(provider);
+        var subject = new PlatformDomainIdentity(new DomainId(1),
+            new ProcessHandle(new ProcessId(1), 1));
+        var root = bridge.BindDomain(subject).Value!;
+        var intent = Intent(PlatformChildAuthorityClass.Lifecycle |
+            PlatformChildAuthorityClass.Execution | PlatformChildAuthorityClass.GuestMemory);
+        var child = bridge.CreateChildDomain(root, subject, intent).Value!;
+        var region = new PlatformRegionIdentity(new(new RegionId(5), new RegionGeneration(1)),
+            new(new DomainId(1), subject.ProcessGeneration), 4096);
+        var parent = bridge.MapOwnedRegion(root, subject, new CapabilityId(8), region,
+            PlatformMemoryAccess.Read | PlatformMemoryAccess.Write).Value!;
+        var guest = bridge.MapChildGuestRegion(child, parent,
+            new(0, 4096), PlatformGuestMemoryAccess.Read).Value!;
+        Action revoke = () => Assert.Single(bridge.BeginCapabilityRevocation(new CapabilityId(8), static id => id == new CapabilityId(8)));
+
+        if (start)
+        {
+            var artifact = bridge.BindChildExecutableArtifact(child, guest,
+                new byte[] { 0x56, 0x33 }, 1).Value!;
+            provider.AfterArtifactStart = revoke;
+            Assert.Equal(KernelError.PlatformFaulted, bridge.StartChildExecutableArtifact(artifact).Error);
+        }
+        else
+        {
+            provider.AfterArtifactBind = revoke;
+            Assert.Equal(KernelError.PlatformFaulted, bridge.BindChildExecutableArtifact(child, guest,
+                new byte[] { 0x56, 0x33 }, 1).Error);
+        }
+        Assert.Equal(KernelError.PlatformFaulted, bridge.UnmapChildGuestRegion(guest).Error);
+    }
+
+    [Fact]
     public void WrongOwnerAndAmplifiedRuntimeRequestNeverReachNestedProvider()
     {
         var scenario = CreateScenario();
@@ -357,7 +650,7 @@ public sealed class Phase8ResidualVirtualizationTests
     }
 
     [Fact]
-    public async Task TypedSipV3ArtifactContourRunsCreateMapAdmitStartRetiredWorkAndDestroy()
+    public async Task TypedSipV3ArtifactContourPinsMappingAfterRetiredWorkUntilReleaseEvidence()
     {
         var scenario = CreateScenario(executableArtifact: true);
         var service = TestFixtures.Create(scenario.Kernel, 505, 5005).Handle;
@@ -388,8 +681,16 @@ public sealed class Phase8ResidualVirtualizationTests
         Assert.NotNull(scenario.Provider.LastExecutionReceipt);
         Assert.True(scenario.Provider.LastExecutionReceipt!.Value.IsTerminal);
         Assert.True(scenario.Provider.LastExecutionReceipt!.Value.RetiredWorkUnits > 0);
-        await Dispatch(client.CloseGuestRegionMappingAsync(new(domain.Domain, domain.MemoryCapability, mapping.Mapping)), host);
-        await Dispatch(client.DestroyAsync(new(domain.Domain, domain.ConfigureCapability)), host);
+        Assert.Equal(KernelError.PlatformBindingActive,
+            scenario.Kernel.CloseGuestRegionMapping(scenario.Owner, domain.Domain,
+                domain.MemoryCapability, mapping.Mapping).Error);
+        Assert.Equal(0, scenario.Provider.GuestUnmapCalls);
+        Assert.Equal(VirtualDomainState.Quarantined,
+            scenario.Kernel.QueryVirtualDomain(scenario.Owner, domain.Domain).Value);
+        Assert.False(scenario.Kernel.DestroyVirtualDomain(scenario.Owner, domain.Domain,
+            domain.ConfigureCapability).IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingActive,
+            scenario.Kernel.ReleaseRegion(scenario.Owner, region).Error);
         Assert.True(scenario.Kernel.CloseSession(scenario.Owner, session).IsSuccess);
     }
 
@@ -462,6 +763,14 @@ public sealed class Phase8ResidualVirtualizationTests
         }
 
         public int NestedCreateCalls { get; private set; }
+        public bool ThrowAfterNestedMaterialize { get; set; }
+        public Action? AfterNestedMaterialize { get; set; }
+        public Action? BeforeChildTransition { get; set; }
+        public bool ThrowAfterArtifactBind { get; set; }
+        public bool ThrowAfterArtifactStart { get; set; }
+        public Action? AfterArtifactBind { get; set; }
+        public Action? AfterArtifactStart { get; set; }
+        public int ArtifactStartCalls { get; private set; }
         public int TrapCalls { get; private set; }
         public int GuestUnmapCalls { get; private set; }
         public int NestedCloseCalls { get; private set; }
@@ -537,6 +846,9 @@ public sealed class Phase8ResidualVirtualizationTests
                         request.ChildIntent.Authority.ParentAuthority | PlatformChildAuthorityClass.Execution) }
                     : request.ChildIntent);
             _nested[LastNestedLease.LeaseId] = true;
+            AfterNestedMaterialize?.Invoke();
+            if (ThrowAfterNestedMaterialize)
+                throw new InvalidOperationException("Nested child materialized without receipt.");
             return PlatformAuthorityResult<PlatformProviderNestedDomainLease>.Ok(new(LastNestedLease,
                 _wrongNestedImmediateParent ? new PlatformProviderChildDomainLeaseId(999) : request.ParentChildLease.LeaseId,
                 request.ParentChildLease.Generation));
@@ -545,6 +857,7 @@ public sealed class Phase8ResidualVirtualizationTests
         public PlatformAuthorityResult TransitionChildDomain(PlatformProviderChildDomainLease lease,
             PlatformChildDomainTransition transition)
         {
+            BeforeChildTransition?.Invoke();
             if (transition == PlatformChildDomainTransition.BeginDrain)
                 CallLog.Add(_nested.ContainsKey(lease.LeaseId) ? "nested-drain" : "root-drain");
             return PlatformAuthorityResult.Ok();
@@ -595,19 +908,30 @@ public sealed class Phase8ResidualVirtualizationTests
         }
 
         public PlatformAuthorityResult<PlatformExecutableArtifactReceipt> BindExecutableArtifact(
-            PlatformExecutableArtifactRequest request) => PlatformAuthorityResult<PlatformExecutableArtifactReceipt>.Ok(new(
-                new(1), new(1), request.ChildLease.LeaseId, request.ChildLease.Generation,
+            PlatformExecutableArtifactRequest request)
+        {
+            var receipt = new PlatformExecutableArtifactReceipt(new(1), new(1),
+                request.ChildLease.LeaseId, request.ChildLease.Generation,
                 request.GuestMapping.LeaseId, request.GuestMapping.Generation,
                 request.ChildLease.ParentDomainLease.LeaseId, request.ChildLease.ParentDomainLease.Generation,
-                new string('a', 64), request.MaximumExecutionSteps));
+                new string('a', 64), request.MaximumExecutionSteps);
+            if (ThrowAfterArtifactBind)
+                throw new InvalidOperationException("Artifact binding receipt lost.");
+            AfterArtifactBind?.Invoke();
+            return PlatformAuthorityResult<PlatformExecutableArtifactReceipt>.Ok(receipt);
+        }
 
         public PlatformAuthorityResult<PlatformChildExecutionReceipt> StartExecutableArtifact(
             PlatformChildExecutionStartRequest request)
         {
+            ArtifactStartCalls++;
             LastExecutionReceipt = new(request.Artifact.ArtifactId, request.Artifact.ArtifactGeneration,
                 request.Artifact.ChildLeaseId, request.Artifact.ChildGeneration, request.Artifact.MappingLeaseId,
                 request.Artifact.MappingGeneration, request.Artifact.ParentLeaseId, request.Artifact.ParentGeneration,
                 request.Artifact.ContentDigest, request.OperationId, request.OperationGeneration, new(1), 1, 1, 0, true);
+            if (ThrowAfterArtifactStart)
+                throw new InvalidOperationException("Artifact start receipt lost.");
+            AfterArtifactStart?.Invoke();
             return PlatformAuthorityResult<PlatformChildExecutionReceipt>.Ok(LastExecutionReceipt.Value);
         }
     }

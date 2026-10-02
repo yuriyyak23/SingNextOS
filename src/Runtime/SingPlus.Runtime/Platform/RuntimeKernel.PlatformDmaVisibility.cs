@@ -36,6 +36,9 @@ public sealed partial class RuntimeKernel
         }
 
         var identity = PlatformIdentity(process);
+        var usable = ValidateDmaGrantRegionUsability(grant, identity);
+        if (!usable.IsSuccess)
+            return KernelResult<PlatformDmaPrepareEvidence>.Fail(usable.Error, usable.Message!);
         return PlatformAuthority.PrepareDmaGrantVisibility(grant, identity);
     }
 

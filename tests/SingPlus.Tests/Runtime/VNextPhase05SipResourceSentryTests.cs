@@ -16,6 +16,40 @@ internal interface IVNextP05ResourceService
 
 public sealed class VNextPhase05SipResourceSentryTests
 {
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void ResourceRequirementRejectsMalformedScopeBeforeManifestOrResolver(int fault)
+    {
+        var scope = fault switch
+        {
+            0 => "host:" + (char)0xd800,
+            1 => "host:" + (char)0xdc00,
+            2 => "host:\ncompute",
+            _ => "host:\0compute"
+        };
+        Assert.Throws<ArgumentException>(() => new SipResourceRequirementV1(1,
+            ResourceClassV1.ComputeTime, ResourceUnitV1.Nanoseconds, 10, scope,
+            ResourceAssuranceV1.RuntimeEnforced, SipResourceDonationPolicyV1.None));
+    }
+
+    [Fact]
+    public void ResourceRequirementPreservesScalarScopeAndOrdinalIdentity()
+    {
+        static SipResourceRequirementV1 Requirement(string scope) => new(1,
+            ResourceClassV1.ComputeTime, ResourceUnitV1.Nanoseconds, 10, scope,
+            ResourceAssuranceV1.RuntimeEnforced, SipResourceDonationPolicyV1.None);
+        var scope = "host:é🚀\ufffd";
+        var requirement = Requirement(scope);
+        Assert.Equal(scope, requirement.SemanticScope);
+        Assert.NotEqual(requirement.CanonicalIdentity, Requirement("host:e\u0301🚀\ufffd").CanonicalIdentity);
+        var manifest = new ServiceManifestV1(new("scalar"), new("1"), new string('a', 64),
+            TestFixtures.Manifest(951, 1951), resourceUseRequirements: [requirement]);
+        Assert.Equal(scope, Assert.Single(manifest.ResourceUseRequirements).SemanticScope);
+    }
+
     [Fact]
     public void GeneratedSentryFailsClosedWithoutLiveResolver()
     {

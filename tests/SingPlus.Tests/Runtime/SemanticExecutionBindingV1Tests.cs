@@ -7,6 +7,140 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class SemanticExecutionBindingV1Tests
 {
+    public static IEnumerable<object[]> InvalidBindingDigests()
+    {
+        for (var field = 0; field < 2; field++)
+            for (var fault = 0; fault < 5; fault++) yield return [field, fault];
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidBindingDigests))]
+    public void BindingTypedDigestRequiresExactLowercaseSha256(int field, int fault)
+    {
+        var binding = Bind(Create()) with { Digest = default };
+        var digest = fault switch
+        {
+            0 => new string('a', 63), 1 => new string('a', 65),
+            2 => new string('g', 64), 3 => new string('A', 64), _ => "opaque-token",
+        };
+        binding = field == 0 ? binding with { ObligationsDigest = new(digest) }
+            : binding with { GuaranteesDigest = new(digest) };
+        Assert.Throws<ArgumentException>(() => binding.Canonicalize());
+    }
+
+    public static IEnumerable<object[]> InvalidBindingTokens()
+    {
+        for (var field = 0; field < 5; field++)
+            for (var fault = 0; fault < 4; fault++) yield return [field, fault];
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidBindingTokens))]
+    public void BindingDigestRejectsNonScalarAndControlFramedFields(int field, int fault)
+    {
+        var binding = Bind(Create()) with { Digest = default };
+        var token = fault switch { 0 => "token\uD800", 1 => "token\uDC00", 2 => "token\ntail", _ => "token\0tail" };
+        binding = field switch
+        {
+            0 => binding with { ProviderIdentity = token },
+            1 => binding with { MeasurementContractIdentity = token },
+            2 => binding with { ResourceEnvelope = binding.ResourceEnvelope with { SemanticScope = token } },
+            3 => binding with { ObligationsDigest = new(token) },
+            _ => binding with { GuaranteesDigest = new(token) },
+        };
+        Assert.Throws<ArgumentException>(() => binding.Canonicalize());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void BindingConstructorRejectsMalformedIdentityWithoutReservationMutation(bool measurement)
+    {
+        var c = Create();
+        var before = c.Kernel.QueryBudget(c.Lease).Value!;
+        var result = c.Kernel.CreateSemanticExecutionBindingV1(c.Obligations, c.Guarantees, c.Principal,
+            c.Lease, OperationObligationsV1Tests.Envelope(10), measurement ? "hybridcpu:external-runtime" : "provider\uD800",
+            ExecutionGuaranteesV1Tests.Request().Correlation, c.ProviderGenerations,
+            measurement ? "measurement\uDC00" : "unsupported");
+        Assert.Equal(KernelError.InvalidMessage, result.Error);
+        Assert.Null(result.Value);
+        BudgetSnapshotAssertions.Equal(before, c.Kernel.QueryBudget(c.Lease).Value!);
+    }
+
+    [Fact]
+    public void ScalarBindingIdentitiesRetainV1DigestAndDistinctUnicodeWithoutNormalization()
+    {
+        var binding = Bind(Create());
+        Assert.Equal(binding.Digest, binding.Canonicalize().Digest);
+        var scalar = (binding with { Digest = default, ProviderIdentity = "provider:é🚀",
+            MeasurementContractIdentity = "measurement:\uFFFD" }).Canonicalize();
+        Assert.Equal(scalar.Digest, scalar.Canonicalize().Digest);
+        Assert.NotEqual(scalar.Digest,
+            (scalar with { Digest = default, ProviderIdentity = "provider:e\u0301🚀" }).Canonicalize().Digest);
+    }
+
+    [Fact]
+    public void MalformedProviderGuaranteeTupleCannotPublishBindingOrMutateBudget()
+    {
+        var c = Create();
+        var before = c.Kernel.QueryBudget(c.Lease).Value!;
+        var invalid = c.Guarantees with { Digest = default, ProviderExecutionClass = "provider\uD800" };
+        var result = c.Kernel.CreateSemanticExecutionBindingV1(c.Obligations, invalid, c.Principal,
+            c.Lease, OperationObligationsV1Tests.Envelope(10), "hybridcpu:external-runtime",
+            ExecutionGuaranteesV1Tests.Request().Correlation, c.ProviderGenerations);
+        Assert.Equal(KernelError.InvalidMessage, result.Error);
+        Assert.Null(result.Value);
+        BudgetSnapshotAssertions.Equal(before, c.Kernel.QueryBudget(c.Lease).Value!);
+        Assert.Equal(ExternalOperationState.Prepared,
+            c.Kernel.ExternalOperations.Query(c.Obligations.Operation).Value!.State);
+        Assert.Empty(c.Kernel.Regions.SnapshotUses());
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void BindingConstructorClockMutationCannotPublishStaleCorrelationOrChangeBudget(int fault)
+    {
+        var c = Create();
+        var before = c.Kernel.QueryBudget(c.Lease).Value!;
+        var clockCalled = false;
+        c.Time.OnRead = () =>
+        {
+            clockCalled = true;
+            if (fault == 1)
+            {
+                var owner = new RegionOwner(new(2201), c.Principal.Generation);
+                var use = c.Kernel.Regions.AcquireUse(c.Region, owner, RegionUseMode.ExclusiveWrite, new(0, 16)).Value!;
+                Assert.True(c.Kernel.Regions.ReleaseUse(use.Handle, owner).IsSuccess);
+            }
+            if (fault == 2)
+            {
+                Assert.True(c.Kernel.ExternalOperations.Admit(c.Obligations.Operation, new(1, 1)).IsSuccess);
+                Assert.True(c.Kernel.ExternalOperations.RecordSubmission(c.Obligations.Operation, new(1, 1)).IsSuccess);
+            }
+        };
+        var result = c.Kernel.CreateSemanticExecutionBindingV1(c.Obligations, c.Guarantees, c.Principal,
+            c.Lease, OperationObligationsV1Tests.Envelope(10), "hybridcpu:external-runtime",
+            ExecutionGuaranteesV1Tests.Request().Correlation, c.ProviderGenerations);
+        Assert.True(clockCalled);
+        Assert.Equal(fault == 0, result.IsSuccess);
+        if (fault != 0)
+        {
+            Assert.Equal(KernelError.StaleGeneration, result.Error);
+            Assert.Null(result.Value);
+        }
+        BudgetSnapshotAssertions.Equal(before, c.Kernel.QueryBudget(c.Lease).Value!);
+        if (fault == 2)
+        {
+            var operation = c.Kernel.ExternalOperations.Query(c.Obligations.Operation).Value!;
+            Assert.Equal(ExternalOperationState.Submitted, operation.State);
+            foreach (var use in operation.Admission!.RegionUses)
+                Assert.Equal(KernelError.RegionUseConflict,
+                    c.Kernel.Regions.ReleaseUse(use.Handle, operation.Principal).Error);
+        }
+    }
+
     [Fact]
     public void BindingCorrelatesExactOperationObligationsGuaranteesLeaseAndOpaqueProviderGeneration()
     {
@@ -169,6 +303,13 @@ public sealed class SemanticExecutionBindingV1Tests
     private sealed class TestTimeProvider(DateTimeOffset now) : TimeProvider
     {
         private DateTimeOffset _now = now;
-        public override DateTimeOffset GetUtcNow() => _now;
+        internal Action? OnRead { get; set; }
+        public override DateTimeOffset GetUtcNow()
+        {
+            var callback = OnRead;
+            OnRead = null;
+            callback?.Invoke();
+            return _now;
+        }
     }
 }

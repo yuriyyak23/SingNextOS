@@ -106,7 +106,8 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDmaGrant destinationGrant,
         PlatformDmaPrepareEvidence destinationPrepare,
         PlatformDomainIdentity destinationSubject,
-        ulong destinationMutationGeneration)
+        ulong destinationMutationGeneration,
+        Func<KernelResult> revalidateRegions)
     {
         lock (_dsc1Gate)
         lock (_dmaCompletionGate)
@@ -153,87 +154,122 @@ public sealed partial class PlatformAuthorityBridge
             if (!destinationMapping.IsSuccess)
                 return KernelResult<PlatformDmaCopyPairSubmission>.Fail(destinationMapping.Error, destinationMapping.Message!);
 
-            var incarnation = CurrentProviderIncarnation();
-            var backendEpoch = BackendEpoch;
             var sourceRecord = _dmaGrants[sourceGrant.GrantId];
             var destinationRecord = _dmaGrants[destinationGrant.GrantId];
-            if (incarnation.Value == 0 || sourceRecord.ProviderIncarnation != incarnation ||
-                destinationRecord.ProviderIncarnation != incarnation)
-                return KernelResult<PlatformDmaCopyPairSubmission>.Fail(KernelError.StaleGeneration,
-                    "The DMA provider restarted after one of the exact copy grants was admitted.");
-            var sourceBinding = CreateDmaExecutionBinding(sourceGrant, sourceSubject,
-                sourceMutationGeneration, incarnation, DmaEffectStateV1.Admitted);
-            var destinationBinding = CreateDmaExecutionBinding(destinationGrant, destinationSubject,
-                destinationMutationGeneration, incarnation, DmaEffectStateV1.Admitted);
-            var request = new PlatformProviderDmaCopySubmitRequest(
-                new(sourceRecord.ProviderGrant, source.Value!.ProviderCycle),
-                new(destinationRecord.ProviderGrant, destination.Value!.ProviderCycle),
-                sourceBinding, destinationBinding);
-            var requestValidation = PlatformDmaCopySubmissionContract.ValidateRequest(request);
-            if (!requestValidation.IsSuccess)
-                return KernelResult<PlatformDmaCopyPairSubmission>.Fail(KernelError.PlatformFaulted,
-                    requestValidation.Message ?? "The bridge constructed an invalid atomic DMA copy request.");
+            sourceRecord.SubmissionInFlight = destinationRecord.SubmissionInFlight = true;
+            try { return SubmitPreparedPair(); }
+            finally { sourceRecord.SubmissionInFlight = destinationRecord.SubmissionInFlight = false; }
 
-            PlatformAuthorityResult<PlatformProviderDmaCopySubmission> providerResult;
-            try { providerResult = copyProvider.SubmitDmaCopy(request); }
-            catch (Exception exception)
+            KernelResult<PlatformDmaCopyPairSubmission> SubmitPreparedPair()
             {
-                PinBoth();
-                return KernelResult<PlatformDmaCopyPairSubmission>.Fail(KernelError.PlatformFaulted,
-                    $"The atomic DMA copy provider threw; both exact mappings remain pinned: {exception.Message}");
-            }
-            if (CurrentProviderIncarnation() != incarnation || BackendEpoch != backendEpoch)
-            {
-                PinBoth();
-                return KernelResult<PlatformDmaCopyPairSubmission>.Fail(KernelError.PlatformFaulted,
-                    "The DMA provider incarnation or local backend epoch changed during atomic copy acceptance; both mappings remain pinned.");
-            }
-            if (!providerResult.IsSuccess)
-            {
-                if (providerResult.Status != PlatformAuthorityStatus.NotAccepted) PinBoth();
-                return FromProviderFailure<PlatformDmaCopyPairSubmission>(
-                    providerResult.Status, providerResult.Message);
-            }
-            var providerSubmission = providerResult.Value!;
-            var providerValidation = PlatformDmaCopySubmissionContract.ValidateSubmission(request, providerSubmission);
-            if (!providerValidation.IsSuccess)
-            {
-                PinBoth();
-                return KernelResult<PlatformDmaCopyPairSubmission>.Fail(KernelError.PlatformFaulted,
-                    providerValidation.Message ?? "The provider returned malformed atomic DMA copy evidence.");
-            }
+                var backendEpoch = BackendEpoch;
+                PlatformProviderIncarnation incarnation;
+                try { incarnation = CurrentProviderIncarnation(); }
+                catch (Exception exception)
+                {
+                    PinBoth();
+                    return KernelResult<PlatformDmaCopyPairSubmission>.Fail(KernelError.PlatformFaulted,
+                        $"DMA copy generation is unavailable before submission; both mappings remain pinned: {exception.Message}");
+                }
+                if (BackendEpoch != backendEpoch ||
+                    !CopyLegRemainsAdmissible(sourceGrant, sourceSubject, source.Value!.Visibility) ||
+                    !CopyLegRemainsAdmissible(destinationGrant, destinationSubject, destination.Value!.Visibility))
+                {
+                    PinBoth();
+                    return KernelResult<PlatformDmaCopyPairSubmission>.Fail(KernelError.PlatformFaulted,
+                        "DMA copy authorization, cycles or backend changed before submission; both mappings remain pinned.");
+                }
+                if (incarnation.Value == 0 || sourceRecord.ProviderIncarnation != incarnation ||
+                    destinationRecord.ProviderIncarnation != incarnation)
+                    return KernelResult<PlatformDmaCopyPairSubmission>.Fail(KernelError.StaleGeneration,
+                        "The DMA provider restarted after one of the exact copy grants was admitted.");
+                var regions = revalidateRegions();
+                if (!regions.IsSuccess)
+                    return KernelResult<PlatformDmaCopyPairSubmission>.Fail(regions.Error, regions.Message!);
+                var sourceBinding = CreateDmaExecutionBinding(sourceGrant, sourceSubject,
+                    sourceMutationGeneration, incarnation, DmaEffectStateV1.Admitted);
+                var destinationBinding = CreateDmaExecutionBinding(destinationGrant, destinationSubject,
+                    destinationMutationGeneration, incarnation, DmaEffectStateV1.Admitted);
+                var request = new PlatformProviderDmaCopySubmitRequest(
+                    new(sourceRecord.ProviderGrant, source.Value!.ProviderCycle),
+                    new(destinationRecord.ProviderGrant, destination.Value!.ProviderCycle),
+                    sourceBinding, destinationBinding);
+                var requestValidation = PlatformDmaCopySubmissionContract.ValidateRequest(request);
+                if (!requestValidation.IsSuccess)
+                    return KernelResult<PlatformDmaCopyPairSubmission>.Fail(KernelError.PlatformFaulted,
+                        requestValidation.Message ?? "The bridge constructed an invalid atomic DMA copy request.");
 
-            var sourceSubmission = LocalSubmission(sourceGrant, sourcePrepare);
-            var destinationSubmission = LocalSubmission(destinationGrant, destinationPrepare);
-            try
-            {
-                _activeDmaSubmissions.Add(sourceGrant.GrantId, new(sourceSubmission,
-                    providerSubmission.SourceSubmission,
+                // Reserve both local identities before an irreversible callback.
+                // The earlier capacity check may precede a reentrant getter.
+                if (_nextDmaOperationId is 0 or ulong.MaxValue)
+                    return KernelResult<PlatformDmaCopyPairSubmission>.Fail(KernelError.CapacityExhausted,
+                        "Two local DMA operation identities are unavailable after final admission.");
+                var sourceSubmission = LocalSubmission(sourceGrant, sourcePrepare);
+                var destinationSubmission = LocalSubmission(destinationGrant, destinationPrepare);
+                PlatformAuthorityResult<PlatformProviderDmaCopySubmission> providerResult;
+                PlatformProviderIncarnation observedIncarnation;
+                try
+                {
+                    providerResult = copyProvider.SubmitDmaCopy(request);
+                    observedIncarnation = CurrentProviderIncarnation();
+                }
+                catch (Exception exception)
+                {
+                    PinBoth();
+                    return KernelResult<PlatformDmaCopyPairSubmission>.Fail(KernelError.PlatformFaulted,
+                        $"The atomic DMA copy provider threw; both exact mappings remain pinned: {exception.Message}");
+                }
+                if (observedIncarnation != incarnation || BackendEpoch != backendEpoch)
+                {
+                    PinBoth();
+                    return KernelResult<PlatformDmaCopyPairSubmission>.Fail(KernelError.PlatformFaulted,
+                        "The DMA provider incarnation or local backend epoch changed during atomic copy acceptance; both mappings remain pinned.");
+                }
+                if (!providerResult.IsSuccess)
+                {
+                    if (providerResult.Status != PlatformAuthorityStatus.NotAccepted) PinBoth();
+                    return FromProviderFailure<PlatformDmaCopyPairSubmission>(
+                        providerResult.Status, providerResult.Message);
+                }
+                var providerSubmission = providerResult.Value!;
+                var providerValidation = PlatformDmaCopySubmissionContract.ValidateSubmission(request, providerSubmission);
+                if (!providerValidation.IsSuccess)
+                {
+                    PinBoth();
+                    return KernelResult<PlatformDmaCopyPairSubmission>.Fail(KernelError.PlatformFaulted,
+                        providerValidation.Message ?? "The provider returned malformed atomic DMA copy evidence.");
+                }
+
+                try
+                {
+                    _activeDmaSubmissions.Add(sourceGrant.GrantId, new(sourceSubmission,
+                        providerSubmission.SourceSubmission,
+                        sourceBinding with { EffectState = DmaEffectStateV1.EffectPossible },
+                        providerSubmission.CopySubmissionId, providerSubmission.Generation));
+                    _activeDmaSubmissions.Add(destinationGrant.GrantId, new(destinationSubmission,
+                        providerSubmission.DestinationSubmission,
+                        destinationBinding with { EffectState = DmaEffectStateV1.EffectPossible },
+                        providerSubmission.CopySubmissionId, providerSubmission.Generation));
+                    sourceRecord.CopySubmissionId = destinationRecord.CopySubmissionId =
+                        providerSubmission.CopySubmissionId;
+                    sourceRecord.CopyGeneration = destinationRecord.CopyGeneration =
+                        providerSubmission.Generation;
+                    sourceRecord.CopyPeerGrantId = destinationGrant.GrantId;
+                    destinationRecord.CopyPeerGrantId = sourceGrant.GrantId;
+                    source.Value!.Visibility.Consumed = true;
+                    destination.Value!.Visibility.Consumed = true;
+                }
+                catch (Exception exception) when (exception is OutOfMemoryException or InvalidOperationException)
+                {
+                    PinBoth();
+                    return KernelResult<PlatformDmaCopyPairSubmission>.Fail(KernelError.PlatformFaulted,
+                        $"Atomic provider acceptance could not be tracked locally; both mappings remain pinned: {exception.Message}");
+                }
+                return KernelResult<PlatformDmaCopyPairSubmission>.Ok(new(sourceSubmission,
+                    destinationSubmission,
                     sourceBinding with { EffectState = DmaEffectStateV1.EffectPossible },
-                    providerSubmission.CopySubmissionId, providerSubmission.Generation));
-                _activeDmaSubmissions.Add(destinationGrant.GrantId, new(destinationSubmission,
-                    providerSubmission.DestinationSubmission,
-                    destinationBinding with { EffectState = DmaEffectStateV1.EffectPossible },
-                    providerSubmission.CopySubmissionId, providerSubmission.Generation));
-                sourceRecord.CopySubmissionId = destinationRecord.CopySubmissionId =
-                    providerSubmission.CopySubmissionId;
-                sourceRecord.CopyGeneration = destinationRecord.CopyGeneration =
-                    providerSubmission.Generation;
-                sourceRecord.CopyPeerGrantId = destinationGrant.GrantId;
-                destinationRecord.CopyPeerGrantId = sourceGrant.GrantId;
-                source.Value!.Visibility.Consumed = true;
-                destination.Value!.Visibility.Consumed = true;
+                    destinationBinding with { EffectState = DmaEffectStateV1.EffectPossible }));
             }
-            catch (Exception exception) when (exception is OutOfMemoryException or InvalidOperationException)
-            {
-                PinBoth();
-                return KernelResult<PlatformDmaCopyPairSubmission>.Fail(KernelError.PlatformFaulted,
-                    $"Atomic provider acceptance could not be tracked locally; both mappings remain pinned: {exception.Message}");
-            }
-            return KernelResult<PlatformDmaCopyPairSubmission>.Ok(new(sourceSubmission,
-                destinationSubmission,
-                sourceBinding with { EffectState = DmaEffectStateV1.EffectPossible },
-                destinationBinding with { EffectState = DmaEffectStateV1.EffectPossible }));
 
             void PinBoth()
             {
@@ -242,6 +278,14 @@ public sealed partial class PlatformAuthorityBridge
             }
         }
     }
+
+    private bool CopyLegRemainsAdmissible(
+        PlatformDmaGrant grant, PlatformDomainIdentity subject, DmaVisibilityState expectedVisibility) =>
+        !HasFaultPinnedDmaSubmission(grant.GrantId) && !HasActiveDmaSubmission(grant.GrantId) &&
+        ValidateDeviceLease(grant.DeviceLease, subject).IsSuccess &&
+        ValidateExactMapping(grant.Mapping, subject).IsSuccess &&
+        _dmaVisibilityStates.TryGetValue(grant.GrantId, out var visibility) &&
+        ReferenceEquals(visibility, expectedVisibility) && !visibility.Acquired && !visibility.Consumed;
 
     private KernelResult<CopyLegState> ValidateCopyLeg(
         PlatformDmaGrant grant,

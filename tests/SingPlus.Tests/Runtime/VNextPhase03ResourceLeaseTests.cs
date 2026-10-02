@@ -38,7 +38,7 @@ public sealed class VNextPhase03ResourceLeaseTests
         Assert.Equal(BudgetReservationState.Released, settled.Value!.State);
         Assert.Equal([Amount(6)], settled.Value.ChargedAmounts);
         Assert.Equal(6UL, Used(authority.Query(processAccount).Value!));
-        Assert.Equal(settled.Value, authority.SettleLease(process, lease, [Amount(1)]).Value);
+        BudgetSnapshotAssertions.Equal(settled.Value, authority.SettleLease(process, lease, [Amount(1)]).Value!);
         Assert.Equal(6UL, Used(authority.Query(processAccount).Value!));
         Assert.Equal(6UL, Used(authority.Release(process, lease).IsSuccess
             ? authority.Query(processAccount).Value! : throw new Xunit.Sdk.XunitException("terminal release must be idempotent")));

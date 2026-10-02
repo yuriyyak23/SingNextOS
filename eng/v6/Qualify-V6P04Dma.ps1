@@ -12,7 +12,7 @@ function Get-Sha256([string]$Path) {
 }
 
 function Invoke-QualifiedTests([string]$Project, [string]$Filter, [int]$Expected) {
-    $output = & dotnet test $Project --no-restore --filter $Filter 2>&1 | Out-String
+    $output = & dotnet test $Project --no-restore -m:1 -p:UseSharedCompilation=false --filter $Filter 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "P04 tests failed for $Project.`n$output" }
     $match = [regex]::Match($output, 'Failed:\s+(\d+), Passed:\s+(\d+), Skipped:\s+(\d+), Total:\s+(\d+)')
     if (-not $match.Success) { throw "The test runner summary could not be parsed for $Project." }
@@ -34,20 +34,51 @@ function Invoke-QualifiedTests([string]$Project, [string]$Filter, [int]$Expected
 $runtimeFilter = 'FullyQualifiedName~PlatformDmaGrantTests|FullyQualifiedName~PlatformDmaVisibilityTests|FullyQualifiedName~PlatformDmaSubmissionTests|FullyQualifiedName~PlatformDmaCopySubmissionContractTests|FullyQualifiedName~PlatformDmaCompletionTests|FullyQualifiedName~PlatformDmaPostCompletionLifecycleTests|FullyQualifiedName~PlatformDmaDsc1MappingInterlockTests|FullyQualifiedName=SingPlus.Tests.Architecture.V6ArchitectureGuardTests.V6GateRegistryIsClosedCompleteAndDefaultOff'
 $runtimeFilter += '|FullyQualifiedName~PlatformDeviceLeaseTests.MalformedProviderDeviceAuthorityFailsClosedAndIsRevoked|FullyQualifiedName~PlatformBorrowReadGrantTests.DeniedRevokedFaultedOrMalformedGrantAdmissionFailsClosed'
 $runtimeFilter += '|FullyQualifiedName~PlatformDeviceLeaseTests.MalformedDeviceCleanupFailureQuarantinesExistingDeviceOwner|FullyQualifiedName~PlatformBorrowReadGrantTests.MalformedBorrowMappingCleanupAmbiguityPinsBorrowLifetime'
-$runtimeFilter += '|FullyQualifiedName~PlatformBorrowReadGrantTeardownTests'
+$runtimeFilter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformDeviceLeaseTests.ProviderRevokedStatusCannotCloseExactDeviceLease'
+$runtimeFilter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformDeviceLeaseTests.DeviceBindReceiptLossQuarantinesParentDomain'
+$runtimeFilter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformDeviceLeaseTests.DeviceBindCallbackBlocksParentRevokeBeforeLeasePublication|FullyQualifiedName=SingPlus.Tests.Platform.PlatformDeviceLeaseTests.ResetInsideDeviceBindCallbackPinsNewParentGeneration|FullyQualifiedName=SingPlus.Tests.Platform.PlatformDeviceLeaseTests.ParentRevokeCallbackRejectsDeviceBindBeforeProvider'
+$runtimeFilter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformDeviceLeaseTests.BackendResetPreservesUnknownDeviceBindPin|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.BackendResetPreservesUnknownChildCreatePin|FullyQualifiedName=SingPlus.Tests.Virtualization.Phase8ResidualVirtualizationTests.NestedCreateReceiptLossPinsImmediateParentAndRoot'
+$runtimeFilter += '|FullyQualifiedName~PlatformDeviceLeaseTests.DeviceBindNonAcceptanceWithoutExactNoEffectPinsParentDomain'
+$runtimeFilter += '|FullyQualifiedName~PlatformIrqBindingTests.RevokedOrThrowingInterruptClosureKeepsDevicePinned|FullyQualifiedName~PlatformMmioLeaseTests.RevokedOrThrowingMmioClosureKeepsDevicePinned'
+$runtimeFilter += '|FullyQualifiedName~PlatformIrqBindingTests.MalformedInterruptCleanupWithoutExactSuccessPinsParentDevice|FullyQualifiedName~PlatformMmioLeaseTests.MalformedMmioCleanupWithoutExactSuccessPinsParentDevice'
+$runtimeFilter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformIrqBindingTests.InterruptBindReceiptLossPinsParentDevice|FullyQualifiedName=SingPlus.Tests.Platform.PlatformMmioLeaseTests.MmioMapReceiptLossPinsParentDevice'
+$runtimeFilter += '|FullyQualifiedName~PlatformBorrowReadGrantTeardownTests|FullyQualifiedName=SingPlus.Tests.Platform.PlatformOwnedRegionMappingV2Tests.ExactSliceCallbackBlocksParentRevokeUntilPublication|FullyQualifiedName=SingPlus.Tests.Platform.PlatformOwnedRegionMappingV2Tests.ProcessExitInsideExactSliceCallbackTracksLateMapping|FullyQualifiedName=SingPlus.Tests.Platform.PlatformOwnedRegionMappingV2Tests.ResetBeforeNotAcceptedExactSliceReplyRetainsReservation|FullyQualifiedName=SingPlus.Tests.Platform.PlatformOwnedRegionMappingV2Tests.StableNotAcceptedExactSliceReplyDoesNotRetainReservation'
 $runtimeFilter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformBackendResetEpochTests.TerminalBackendEpochStillQuarantinesOldAuthorityAndDeniesNewBinding'
+$runtimeFilter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ResetInsideRootBindCallbackPinsSubjectWithoutInventingLease|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.LostRootBindReceiptPinsProcessReclaimWithoutProviderLease|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.RootBindCallbackRejectsDuplicateAdmissionBeforeProvider|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ProcessExitInsideRootBindCallbackRevokesPublishedBindingBeforeReclaim|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ParentRevokeCallbackRejectsNewMappingBeforeProvider|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.MappingCallbackCannotRevokeParentBeforePublication|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.MappingReceiptLossPinsParentAndLocalReservation|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.BackendResetInsideMappingCallbackFaultPinsLateLease|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ProcessExitInsideMappingCallbackTracksLateMappingForExactTeardown|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.LostMappingReceiptBlocksProcessReclaim|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ResetFaultedMappingKeepsBudgetAndRegionPinnedAcrossTeardownRetries|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ResetBeforeNotAcceptedMappingReplyDoesNotReleaseRegion|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.StableNotAcceptedMappingReplyReleasesLocalReservation'
 $runtimeFilter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.BackendResetQuarantinedVirtualIoCannotInvokeLateProviderRevoke'
+$runtimeFilter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ReentrantVirtualIoRevokeCannotEnterProviderTwice'
+$runtimeFilter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ReentrantChildCloseCannotInvokeProviderTwice|FullyQualifiedName=SingPlus.Tests.Virtualization.Phase8ResidualVirtualizationTests.NestedCreateCallbackBlocksImmediateParentTransition|FullyQualifiedName=SingPlus.Tests.Virtualization.Phase8ResidualVirtualizationTests.ImmediateParentTransitionCallbackRejectsNestedCreateBeforeProvider'
+$runtimeFilter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ChildCreateCallbackPinsParentBeforeChildBindingPublication|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ParentRevokeCallbackRejectsChildCreateBeforeProvider'
+$runtimeFilter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ResetInsideChildCreateCallbackPinsNewParentGeneration|FullyQualifiedName=SingPlus.Tests.Virtualization.Phase8ResidualVirtualizationTests.ResetInsideNestedCreateCallbackCannotPublishLateChild'
 $runtimeFilter += '|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.BackendResetInsideClosureCallbackCannotTurnLateReceiptIntoClosure'
 $runtimeFilter += '|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.ClosureCallbackExceptionPinsGuestOrVirtualIoWithoutRetry'
 $runtimeFilter += '|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.ChildCloseCallbackResetOrThrowCannotCloseOrRetry'
+$runtimeFilter += '|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.ChildTransitionCallbackFaultOrResetCannotPublishLateState|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ConcurrentChildTransitionHasOneProviderCallback'
+$runtimeFilter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.TransitionCallbackRejectsGuestMapEventAndTrapBeforeProvider|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.ChildEffectCallbackRejectsOverlappingTransition|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.VirtualEffectCallbackFaultOrResetCannotPublishLateEvidence'
+$runtimeFilter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.VirtualIoBindCallbackRejectsOverlappingChildTransition|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ChildTransitionCallbackRejectsVirtualIoBindBeforeProvider|FullyQualifiedName=SingPlus.Tests.Virtualization.Phase8ResidualVirtualizationTests.ReentrantExecutableStartCannotEnterProviderTwice'
+$runtimeFilter += '|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.GuestMapReceiptLossOrAmbiguousStatusPinsChildAndParentMapping|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.VirtualIoBindReceiptLossOrAmbiguousStatusPinsChildAndDevice|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.BackendResetDuringGuestOrVirtualIoAdmissionCannotPublishChild'
+$runtimeFilter += '|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.ParentMappingRevocationWaitsForExactGuestClosure|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.ParentMappingRevocationWaitsForInFlightGuestAdmission'
+$runtimeFilter += '|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.MalformedGuestOrVirtualIoAdmissionNeedsExactCompensation'
+$runtimeFilter += '|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.ParentAuthorizationRevokedInsideChildAdmissionPinsPossibleEffect|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.ProviderIncarnationDriftInsideChildAdmissionPinsParent'
+$runtimeFilter += '|FullyQualifiedName~Phase8ResidualVirtualizationTests.ExecutableArtifactBindOrStartReceiptLossPinsChildAndMapping|FullyQualifiedName=SingPlus.Tests.Virtualization.Phase8ResidualVirtualizationTests.RevokedParentMappingCannotReachExecutableChildStartProvider'
+$runtimeFilter += '|FullyQualifiedName~Phase8ResidualVirtualizationTests.GuestUnmapCannotOvertakeExecutableBindOrStartCallback'
+$runtimeFilter += '|FullyQualifiedName~Phase8ResidualVirtualizationTests.BoundArtifactPinsOnlyItsExactGuestMappingAfterCallbackSettles'
+$runtimeFilter += '|FullyQualifiedName=SingPlus.Tests.Virtualization.Phase8ResidualVirtualizationTests.TypedSipV3ArtifactContourPinsMappingAfterRetiredWorkUntilReleaseEvidence'
+$runtimeFilter += '|FullyQualifiedName~Phase8ResidualVirtualizationTests.ParentAuthorizationRevokedInsideExecutableCallbackPreventsPublication'
+$runtimeFilter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ParentDomainWaitsForExactPublishedChildClosure|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.ChildCreateReceiptLossOrAmbiguousStatusPinsParent|FullyQualifiedName~PlatformAuthorityBridgeChildDomainTests.MalformedChildCreateRequiresExactCleanupBeforeParentClose'
 $runtimeFilter += '|FullyQualifiedName~Phase7EvidenceSecureComputeTests.SecureRegionUnbindResetOrThrowKeepsMappingPinned|FullyQualifiedName~Phase7EvidenceSecureComputeTests.SecureDomainRevokeResetOrThrowKeepsDomainPinned'
 $runtimeFilter += '|FullyQualifiedName~Phase7EvidenceSecureComputeTests.SecureRegionBindResetOrThrowPinsMappingWithoutPublishedLease|FullyQualifiedName~Phase7EvidenceSecureComputeTests.FailedOrMalformedSecureRegionBindPinsMappingWithoutExactClosure'
 $runtimeFilter += '|FullyQualifiedName~Phase7EvidenceSecureComputeTests.AmbiguousSecureCreatePinsParentWithoutPublishedLease|FullyQualifiedName~Phase7EvidenceSecureComputeTests.MalformedSecureCreateCleanupFaultPinsParent|FullyQualifiedName~Phase7EvidenceSecureComputeTests.MalformedSecureCreateWithExactCleanupDoesNotPinParent|FullyQualifiedName~Phase7EvidenceSecureComputeTests.ParentDomainClosesOnlyAfterSecureChildExactClosure'
 $runtimeFilter += '|FullyQualifiedName~Phase7EvidenceSecureComputeTests.SecureCreateCallbackCannotRevokeParentBeforeLeasePublication'
 $runtimeFilter += '|FullyQualifiedName~Phase7EvidenceSecureComputeTests.ConcurrentParentRevokeCannotPassInFlightSecureCreate|FullyQualifiedName~Phase7EvidenceSecureComputeTests.ConcurrentSecureCreateCannotPassInFlightParentRevoke|FullyQualifiedName~Phase7EvidenceSecureComputeTests.ParentRevokeResetOrThrowRetainsPossibleEffectPin'
 $runtimeFilter += '|FullyQualifiedName~Phase7EvidenceSecureComputeTests.ResetBetweenBridgeAdmissionAndKernelPublicationCannotIssueSecureHandle|FullyQualifiedName~Phase7EvidenceSecureComputeTests.ProcessExitBeforeSecureHandlePublicationAttemptsExactChildClosure|FullyQualifiedName~Phase7EvidenceSecureComputeTests.FailedLocalPublicationCleanupRetainsUnpublishedSecureChildPin'
+$runtimeFilter += '|FullyQualifiedName~Phase7EvidenceSecureComputeTests.SecureTransitionResetOrThrowQuarantinesBeforeKernelStatePublication|FullyQualifiedName~Phase7EvidenceSecureComputeTests.ResetAfterSecureTransitionReceiptCannotPublishKernelState|FullyQualifiedName~Phase7EvidenceSecureComputeTests.ConcurrentSecureTransitionHasOneProviderCallback|FullyQualifiedName~Phase7EvidenceSecureComputeTests.SecureDestroyCannotOverlapInFlightPublicTransition|FullyQualifiedName~Phase7EvidenceSecureComputeTests.PublicTransitionCannotOverlapInFlightSecureDestroy'
+$runtimeFilter += '|FullyQualifiedName~Phase7EvidenceSecureComputeTests.InFlightSecureRegionMutationBlocksTransitionAndMappingRevoke|FullyQualifiedName~Phase7EvidenceSecureComputeTests.MappingRevocationDrainingRejectsLateSecureBindBeforeProvider|FullyQualifiedName~Phase7EvidenceSecureComputeTests.BridgeMappingRevocationDrainingRejectsConcurrentSecureBind|FullyQualifiedName~Phase7EvidenceSecureComputeTests.BridgeInFlightSecureBindRejectsMappingRevocation|FullyQualifiedName~Phase7EvidenceSecureComputeTests.ResetAfterSecureRegionProviderReceiptPreventsLocalCommit'
+$runtimeFilter += '|FullyQualifiedName~PlatformOwnedRegionMappingV2Tests.CapabilityRevokeInsideMappingCallbackPreservesClosureHandle|FullyQualifiedName~PlatformOwnedRegionMappingV2Tests.RevokedMappingWithLostReceiptCannotReportClosure|FullyQualifiedName~PlatformOwnedRegionMappingV2Tests.RevokeCallbackNegativeAndResetRepliesPreserveExactAccounting'
+$runtimeFilter += '|FullyQualifiedName~PlatformOwnedRegionMappingV2Tests.SaturatedMappingAdmissionRejectsWithoutPartialMutation|FullyQualifiedName~PlatformOwnedRegionMappingV2Tests.ReusedProcessIdCannotReadmitOldMappingCapabilityOrBinding|FullyQualifiedName~PlatformOwnedRegionMappingV2Tests.BudgetDeniedMappingBalancesAdmissionAndDoesNotCallProvider'
 $hybridFilter = 'FullyQualifiedName~HybridCpuDmaGrantTests|FullyQualifiedName~HybridCpuDmaVisibilityTests'
 $evidenceInputs = @(
+    'contracts/SingPlus.Contracts/DmaGrantClosureObservationV1.cs',
     'contracts/SingPlus.Contracts/DmaExecutionBindingV1.cs',
     'src/Platform/SingPlus.Platform.Abstractions/PlatformAuthorityContracts.cs',
     'src/Platform/SingPlus.Platform.Abstractions/PlatformDmaGrantContracts.cs',
@@ -58,8 +89,14 @@ $evidenceInputs = @(
     'src/Platform/SingPlus.Platform.Abstractions/PlatformDmaPageFaultContracts.cs',
     'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.Dma.cs',
     'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.ChildDomains.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.VirtualEffects.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.GuestMemory.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.VirtualIo.cs',
     'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.MappingV2.cs',
     'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.Device.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.Irq.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.Mmio.cs',
     'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.BorrowReadGrant.cs',
     'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.BackendEpoch.cs',
     'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.Virtualization.cs',
@@ -85,10 +122,13 @@ $evidenceInputs = @(
     'src/Runtime/SingPlus.Runtime/Platform/RuntimeKernel.PlatformBackendReset.cs',
     'tests/SingPlus.Tests/Platform/PlatformBackendResetEpochTests.cs',
     'tests/SingPlus.Tests/Platform/PlatformAuthorityBridgeChildDomainTests.cs',
+    'tests/SingPlus.Tests/Platform/PlatformOwnedRegionMappingV2Tests.cs',
+    'tests/SingPlus.Tests/Virtualization/Phase8ResidualVirtualizationTests.cs',
     'tests/SingPlus.Tests/Platform/Phase7EvidenceSecureComputeTests.cs',
     'src/Runtime/SingPlus.Runtime/V6/V6PlatformDmaSemanticSubmission.cs',
     'src/Runtime/SingPlus.Runtime/Regions/RegionAuthority.cs',
     'src/Runtime/SingPlus.Runtime/RuntimeKernel.ProcessTeardown.cs',
+    'src/Runtime/SingPlus.Runtime/RuntimeKernel.cs',
     'src/Sip/SingPlus.Sip/Regions/BorrowLease.cs',
     'src/Sip/SingPlus.Sip/Regions/OwnedBuffer.cs',
     'src/Runtime/SingPlus.Runtime/V6/V6FeatureGates.cs',
@@ -96,6 +136,8 @@ $evidenceInputs = @(
     'tests/SingPlus.Tests/Platform/PlatformDmaSubmissionTests.cs',
     'tests/SingPlus.Tests/Platform/PlatformDmaGrantTests.cs',
     'tests/SingPlus.Tests/Platform/PlatformDeviceLeaseTests.cs',
+    'tests/SingPlus.Tests/Platform/PlatformIrqBindingTests.cs',
+    'tests/SingPlus.Tests/Platform/PlatformMmioLeaseTests.cs',
     'tests/SingPlus.Tests/Platform/PlatformBorrowReadGrantTests.cs',
     'tests/SingPlus.Tests/Platform/PlatformBorrowReadGrantTeardownTests.cs',
     'tests/SingPlus.Tests/Platform/PlatformDmaCopySubmissionContractTests.cs',
@@ -113,8 +155,19 @@ $evidenceInputs = @(
 
 Push-Location $RepositoryRoot
 try {
+    $runtimeFilter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformOwnedRegionMappingV2Tests.DamageInsideMappingCallbackPreservesBudgetUntilExactClosure|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.DamageInsideMappingCallbackPreservesReceiptButRevokesLocalAuthorization'
+    $runtimeFilter += '|FullyQualifiedName~PlatformOwnedRegionMappingV2Tests.DelegatedRootRevokeInsideMappingCallback|FullyQualifiedName~PlatformOwnedRegionMappingV2Tests.DelegatedRootRevokeAfterMappingPublication|FullyQualifiedName~PlatformOwnedRegionMappingV2Tests.DelegatedRootMappingWithLostReceipt'
+    $runtimeFilter += '|FullyQualifiedName~PlatformIrqBindingTests.DelegatedRootIrqRevoke|FullyQualifiedName~PlatformMmioLeaseTests.DelegatedRootMmioRevoke'
+    $runtimeFilter += '|FullyQualifiedName~PlatformIrqBindingTests.IrqAdmissionCallback|FullyQualifiedName~PlatformIrqBindingTests.DeviceClosureCallbackRefusesIrq'
+    $runtimeFilter += '|FullyQualifiedName~PlatformIrqBindingTests.IrqAdmissionCallbackKeepsExactEndpoint|FullyQualifiedName~PlatformIrqBindingTests.IrqAdmissionFailureBalancesEndpoint'
+    $runtimeFilter += '|FullyQualifiedName~PlatformIrqBindingTests.IrqAdmissionRootRevoke|FullyQualifiedName~PlatformIrqBindingTests.IrqAdmissionNotAcceptedNeedsExact|FullyQualifiedName~PlatformIrqBindingTests.ProcessExitDuringIrqAdmission|FullyQualifiedName~PlatformIrqBindingTests.IrqAdmissionGenerationGetterRevocation'
+    $runtimeFilter += '|FullyQualifiedName~PlatformIrqBindingTests.IrqClosureCallbackBlocks|FullyQualifiedName~PlatformIrqBindingTests.IrqClosureGenerationGetterInterlock'
+    $runtimeFilter += '|FullyQualifiedName~PlatformIrqBindingTests.IrqDeliveryUsesFreshPermission|FullyQualifiedName~PlatformIrqBindingTests.IrqDeliveryGenerationGetterRevoke|FullyQualifiedName~PlatformIrqBindingTests.IrqDeliveryResetOrException|FullyQualifiedName~PlatformIrqBindingTests.FaultedInterruptCompletionCannotAuthorize|FullyQualifiedName~PlatformIrqBindingTests.NotAcceptedInterruptCompletion|FullyQualifiedName~PlatformIrqBindingTests.ProcessReclaimWaitsForAdmittedCompletion'
+    $runtimeFilter += '|FullyQualifiedName~PlatformMmioLeaseTests.MmioClosureCallbackRejects|FullyQualifiedName~PlatformMmioLeaseTests.MmioClosureGenerationGetter|FullyQualifiedName~PlatformMmioLeaseTests.MmioClosureNotAccepted'
+    $runtimeFilter += '|FullyQualifiedName~PlatformMmioLeaseTests.MmioBindRevoke|FullyQualifiedName~PlatformMmioLeaseTests.MmioBindParentInterlock|FullyQualifiedName~PlatformMmioLeaseTests.MmioAdmissionGetter|FullyQualifiedName~PlatformMmioLeaseTests.MmioAdmissionStale'
+    $runtimeFilter += '|FullyQualifiedName~PlatformMmioLeaseTests.MmioBindFailureNeeds|FullyQualifiedName~PlatformMmioLeaseTests.MmioLostReceiptKeeps'
     $runs = @(
-        Invoke-QualifiedTests 'tests\SingPlus.Tests\SingPlus.Tests.csproj' $runtimeFilter 204
+        Invoke-QualifiedTests 'tests\SingPlus.Tests\SingPlus.Tests.csproj' ($runtimeFilter + '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformOwnedRegionMappingV2Tests.DamageAfterMappingPublicationDeniesVisibilityBeforeProvider') 635
         Invoke-QualifiedTests 'tests\SingPlus.Platform.HybridCpu.Tests\SingPlus.Platform.HybridCpu.Tests.csproj' $hybridFilter 6
     )
     New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
@@ -353,7 +406,7 @@ try {
             constructDigestsMedianNanoseconds = [double]$performance.summary.constructDigestsMedianNanoseconds
             canonicalRoundTripMedianNanoseconds = [double]$performance.summary.canonicalRoundTripMedianNanoseconds
             supportsGatePromotion = $false
-            interpretation = 'DmaExecutionBindingV1 contract/sideband CPU overhead only; functional provider submit/complete/race and V1 ambiguous-cleanup coverage is in the 173 selected runtime tests.'
+            interpretation = 'DmaExecutionBindingV1 contract/sideband CPU overhead only; functional coverage and exact selected runtime counts are recorded separately in tests and totals.'
         }
         featureGate = [ordered]@{
             roadmapGate = 'V6-DMA-TRANSLATION-BINDING'
@@ -402,11 +455,29 @@ try {
     }
     $jsonPath = Join-Path $OutputDirectory 'qualification.json'
     $markdownPath = Join-Path $OutputDirectory 'qualification.md'
+    $artifact.requirementIds += 'P04-LOCAL-REVOKE-BEFORE-PROVIDER-CASCADE-01'
+    $artifact.testIds += 'PlatformDmaDsc1MappingInterlockTests.CapabilityRevokeDeniesMappingBeforeDsc1CancellationCallback'
+    $artifact.requirementClassification.VerifiedExisting += 'Mapping local authorization is marked revoked before DSC1 cancellation or any later provider cascade'
+    $artifact.requirementIds += @('P04-CAP-MAP-ADMISSION-01', 'P04-LOST-RECEIPT-REVOKE-CLOSURE-01', 'P04-REVOKE-EXACT-ACCOUNTING-01')
+    $artifact.testIds += @('PlatformOwnedRegionMappingV2Tests.CapabilityRevokeInsideMappingCallbackPreservesClosureHandle',
+        'PlatformOwnedRegionMappingV2Tests.RevokedMappingWithLostReceiptCannotReportClosure',
+        'PlatformOwnedRegionMappingV2Tests.RevokeCallbackNegativeAndResetRepliesPreserveExactAccounting')
+    $artifact.requirementClassification.VerifiedExisting += @('V1/V2 pending mapping blocks capability closure while local authorization is revoked',
+        'Lost-receipt exception persists a faulted mapping-owner correlation so repeated revoke cannot report closure',
+        'Stale closure generations preserve Region reservation and mapped-memory budget; exact retry releases both')
+    $artifact.requirementClassification.Partial += 'Lost mapping receipt remains fault-pinned: no exact provider reconciliation consumer has been established'
+    $artifact.requirementIds += @('P04-ADMISSION-CAPACITY-NO-PARTIAL-MUTATION-01', 'P04-PROCESS-ID-REUSE-MAPPING-01', 'P04-BUDGET-DENIAL-COUNTER-BALANCE-01')
+    $artifact.testIds += @('PlatformOwnedRegionMappingV2Tests.SaturatedMappingAdmissionRejectsWithoutPartialMutation',
+        'PlatformOwnedRegionMappingV2Tests.ReusedProcessIdCannotReadmitOldMappingCapabilityOrBinding',
+        'PlatformOwnedRegionMappingV2Tests.BudgetDeniedMappingBalancesAdmissionAndDoesNotCallProvider')
+    $artifact.requirementClassification.VerifiedExisting += @('V1/V2 process admission saturation rejects before mutation, reservation and provider call',
+        'Reused ProcessId requires fresh process handle, capability and domain binding',
+        'V1/V2 mapped-memory budget denial balances pending accounting without provider entry')
     $artifact | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $jsonPath -Encoding utf8NoBOM
     @"
 # P04 DMA composition evidence
 
-- Result: 179/179 selected tests passed across the managed runtime and HybridCPU adapter projects.
+- Result: selected tests passed across the managed runtime and HybridCPU adapter projects; exact current counts are in qualification.json tests and totals.
 - Grant admission cleanup: a failed provider bind or unconfirmed revoke of a rejected grant retains a bridge-owned fault pin, blocking mapping and device closure. Confirmed cleanup of a malformed grant permits normal closure; this is deterministic managed provider evidence.
 - Bound submit failure: only explicit provider `NotAccepted` permits retry. Denied, unavailable, stale or faulted responses retain possible-effect quarantine and prevent grant revoke; this is managed adapter evidence only.
 - V1 malformed admission: ambiguous mapping, borrow mapping, or device cleanup retains the existing owner reservation and blocks reclaim while preserving the fail-closed V1 result.

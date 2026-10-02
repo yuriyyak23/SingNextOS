@@ -88,6 +88,18 @@ public sealed partial class RuntimeKernel
             return KernelResult.Fail(KernelError.InvalidMessage, exception.Message);
         }
 
+        var live = RevalidateOperationObligationOwners(exact);
+        if (!live.IsSuccess) return live;
+        var now = _operabilityTimeProvider.GetUtcNow().UtcTicks;
+        live = RevalidateOperationObligationOwners(exact);
+        if (!live.IsSuccess) return live;
+        if (now < exact.Temporal.NotBeforeUtcTicks || now >= exact.Temporal.ExpiresUtcTicks)
+            return KernelResult.Fail(KernelError.DeadlineExpired, "Operation obligations are outside their exact temporal interval.");
+        return KernelResult.Ok();
+    }
+
+    private KernelResult RevalidateOperationObligationOwners(OperationObligationsV1 exact)
+    {
         var process = Processes.Resolve(exact.Principal);
         if (!process.IsSuccess) return KernelResult.Fail(process.Error, process.Message!);
         var owner = new RegionOwner(process.Value!.DomainId, exact.Principal.Generation);
@@ -131,9 +143,6 @@ public sealed partial class RuntimeKernel
             }
         }
 
-        var now = _operabilityTimeProvider.GetUtcNow().UtcTicks;
-        if (now < exact.Temporal.NotBeforeUtcTicks || now >= exact.Temporal.ExpiresUtcTicks)
-            return KernelResult.Fail(KernelError.DeadlineExpired, "Operation obligations are outside their exact temporal interval.");
         return KernelResult.Ok();
     }
 }

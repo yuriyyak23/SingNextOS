@@ -19,6 +19,18 @@ internal readonly record struct V6PlatformDmaCopyCompletion(
 
 public sealed partial class RuntimeKernel
 {
+    internal KernelResult<DmaGrantClosureObservationV1> QueryV6PlatformDmaGrantClosure(
+        ProcessHandle subject, PlatformDmaGrant grant)
+    {
+        lock (_platformMemoryUseGate)
+        {
+            var resolved = Processes.Resolve(subject);
+            return resolved.IsSuccess
+                ? PlatformAuthority.QueryDmaGrantClosureObservation(grant, PlatformIdentity(resolved.Value!))
+                : KernelResult<DmaGrantClosureObservationV1>.Fail(resolved.Error, resolved.Message!);
+        }
+    }
+
     internal KernelResult<V6PlatformDmaExecution> SubmitV6PlatformDma(
         ProcessHandle subject,
         PlatformDmaGrant grant,
@@ -52,12 +64,16 @@ public sealed partial class RuntimeKernel
         var effect = EnsureProcessAcceptsNewEffects(process);
         if (!effect.IsSuccess)
             return KernelResult<V6PlatformDmaExecution>.Fail(effect.Error, effect.Message!);
+        var usable = ValidateDmaGrantRegionUsability(grant, PlatformIdentity(process));
+        if (!usable.IsSuccess)
+            return KernelResult<V6PlatformDmaExecution>.Fail(usable.Error, usable.Message!);
         var region = Regions.Validate(grant.Mapping.Region,
             new RegionOwner(process.DomainId, subject.Generation));
         if (!region.IsSuccess)
             return KernelResult<V6PlatformDmaExecution>.Fail(region.Error, region.Message!);
         var submitted = PlatformAuthority.SubmitDmaGrantBound(grant, prepareEvidence,
             PlatformIdentity(process), region.Value!.MutationEpoch.Value, traceSink,
+            () => RevalidatePlatformDmaRegionSubmission(subject, grant, region.Value!.MutationEpoch.Value),
             out ambiguityTrace);
         return submitted.IsSuccess
             ? KernelResult<V6PlatformDmaExecution>.Ok(new(
@@ -84,7 +100,14 @@ public sealed partial class RuntimeKernel
             var submitted = PlatformAuthority.SubmitDmaCopyPairBound(
                 sourceGrant, sourcePrepare, source.Value!.Subject, source.Value.MutationGeneration,
                 destinationGrant, destinationPrepare, destination.Value!.Subject,
-                destination.Value.MutationGeneration);
+                destination.Value.MutationGeneration,
+                () =>
+                {
+                    var sourceRegion = RevalidatePlatformDmaRegionSubmission(sourceSubject, sourceGrant, source.Value.MutationGeneration);
+                    return sourceRegion.IsSuccess
+                        ? RevalidatePlatformDmaRegionSubmission(destinationSubject, destinationGrant, destination.Value.MutationGeneration)
+                        : sourceRegion;
+                });
             return submitted.IsSuccess
                 ? KernelResult<V6PlatformDmaCopyExecution>.Ok(new(
                     new(submitted.Value.Source, submitted.Value.SourceBinding),
@@ -157,6 +180,9 @@ public sealed partial class RuntimeKernel
         var effect = EnsureProcessAcceptsNewEffects(process);
         if (!effect.IsSuccess)
             return KernelResult<(PlatformDomainIdentity, ulong)>.Fail(effect.Error, effect.Message!);
+        var usable = ValidateDmaGrantRegionUsability(grant, PlatformIdentity(process));
+        if (!usable.IsSuccess)
+            return KernelResult<(PlatformDomainIdentity, ulong)>.Fail(usable.Error, usable.Message!);
         var region = Regions.Validate(grant.Mapping.Region,
             new RegionOwner(process.DomainId, subject.Generation));
         return region.IsSuccess

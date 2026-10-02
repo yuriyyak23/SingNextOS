@@ -22,6 +22,7 @@ public sealed partial class PlatformAuthorityBridge
         public object DeliveryGate { get; } = new();
         public bool DeliveryInProgress { get; set; }
         public bool DeliveryFailed { get; set; }
+        public SemanticTraceEventV1? LastQueuedEvent { get; set; }
     }
 
     private void RegisterDmaTraceLocked(DmaSubmissionRecord record, ISemanticTraceSinkV1 sink)
@@ -105,10 +106,48 @@ public sealed partial class PlatformAuthorityBridge
         var evidence = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(
             FormattableString.Invariant(
                 $"dma-owner/v1|{observer.Correlation}|{sequence}|{(byte)kind}|{observer.GenerationDigest}"))));
-        observer.Pending.Enqueue(new SemanticTraceEventV1(
+        var item = new SemanticTraceEventV1(
             SemanticTraceEventV1.CurrentVersion, observer.Correlation, sequence, kind,
-            "singnext.platform-dma", observer.GenerationDigest, evidence).Validate());
+            "singnext.platform-dma", observer.GenerationDigest, evidence).Validate();
+        observer.Pending.Enqueue(item);
+        observer.LastQueuedEvent = item;
     }
+
+    private void CaptureVisibleDmaTraceLocked(DmaSubmissionRecord record)
+    {
+        // One bounded observation per existing grant, overwritten on each exact visible cycle.
+        var grant = _dmaGrants[record.Submission.GrantId];
+        grant.LastVisibleTrace = record.Trace?.LastQueuedEvent;
+        grant.LastVisibleProviderGeneration = record.Trace?.ProviderGeneration ?? 0;
+        grant.LastVisibleBackendEpoch = record.Trace?.BackendEpoch ?? 0;
+    }
+
+    internal KernelResult<DmaGrantClosureObservationV1> QueryDmaGrantClosureObservation(
+        PlatformDmaGrant grant, PlatformDomainIdentity subject)
+    {
+        lock (_dmaCompletionGate)
+        {
+            var identity = ValidateDmaGrantIdentity(grant, subject);
+            if (!identity.IsSuccess)
+                return KernelResult<DmaGrantClosureObservationV1>.Fail(identity.Error, identity.Message!);
+            var record = _dmaGrants[grant.GrantId];
+            if (!record.PlatformClosed)
+                return KernelResult<DmaGrantClosureObservationV1>.Fail(KernelError.PlatformBindingDraining,
+                    "Exact grant closure has not committed.");
+            if (record.LastVisibleTrace is not { } visible ||
+                record.LastVisibleProviderGeneration != record.ProviderIncarnation.Value ||
+                record.LastVisibleBackendEpoch != record.ClosureBackendEpoch)
+                return KernelResult<DmaGrantClosureObservationV1>.Fail(KernelError.PlatformUnsupported,
+                    "No exact traced visibility prefix is available for this grant closure.");
+            return KernelResult<DmaGrantClosureObservationV1>.Ok(new(
+                DmaGrantClosureObservationV1.CurrentVersion, DmaGrantIdentityDigest(grant),
+                record.ProviderIncarnation.Value, record.ClosureBackendEpoch, visible));
+        }
+    }
+
+    internal static string DmaGrantIdentityDigest(PlatformDmaGrant grant) =>
+        Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(
+            FormattableString.Invariant($"dma-grant/v1|{grant.GrantId.Value}|{grant.Generation.Value}|{grant.DeviceLease.LeaseId.Value}|{grant.DeviceLease.Generation.Value}|{grant.DeviceLease.DomainBinding.BindingId.Value}|{grant.DeviceLease.DomainBinding.Generation.Value}|{grant.DeviceLease.DomainBinding.Subject.DomainId.Value}|{grant.DeviceLease.DomainBinding.Subject.ProcessId.Value}|{grant.DeviceLease.DomainBinding.Subject.ProcessGeneration}|{grant.Mapping.Mapping.MappingId.Value}|{grant.Mapping.Mapping.Generation.Value}|{grant.Mapping.Region.RegionId.Value}|{grant.Mapping.Region.Generation.Value}|{grant.Mapping.Offset}|{grant.Mapping.Length}|{grant.Range.Offset}|{grant.Range.Length}|{(int)grant.Direction}"))));
 
     private static string DmaTraceGenerationDigest(
         DmaExecutionBindingV1 binding, ulong providerGeneration, ulong backendEpoch)

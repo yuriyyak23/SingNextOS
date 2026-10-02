@@ -12,8 +12,17 @@ function Get-Sha256([string]$Path) {
 }
 
 $filter = 'FullyQualifiedName~SemanticRefinementV1Tests|FullyQualifiedName~TemporalSemanticsV1Tests|FullyQualifiedName~V6TemporalRuntimeEnforcementTests|FullyQualifiedName~V6TemporalCapacityReservationTests|FullyQualifiedName~VNextPhase11TemporalClaimBoundaryTests|FullyQualifiedName~Phase05ResourceBudgetTests|FullyQualifiedName~VNextPhase06ResourceDonationTests|FullyQualifiedName~VNextPhase07ExternalOperationResourceBindingTests|FullyQualifiedName=SingPlus.Tests.Architecture.V6ArchitectureGuardTests.V6GateRegistryIsClosedCompleteAndDefaultOff'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase04CrossOwnerAdmissionTests.RevocationAtDispatchBoundaryCannotUsePinnedAuthorityForNewCallback'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase04CrossOwnerAdmissionTests.KernelCapabilityAdmissionUsesConfiguredOwnerClock|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase04CrossOwnerAdmissionTests.EffectLifetimeIsFreshAtResourceCallbackBoundary'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase04CrossOwnerAdmissionTests.OperationAdmissionQueryMatchesAcquireWithoutQuotaOrLeaseMutation'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase04CrossOwnerAdmissionTests.ClockReadRevocationCannotReturnOperationPermissionOrMutateQuota|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase04CrossOwnerAdmissionTests.OperationQueryBoundaryDoesNotReserveOrResurrectAuthority'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase04CrossOwnerAdmissionTests.ResourceClockReadRevocationCannotReturnGrantOrAllocateLease|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase04CrossOwnerAdmissionTests.ResourceClockRevokeDuringLeaseAcquisitionCannotPublishAdmission'
 $evidenceInputs = @(
+    'tests/SingPlus.Tests/Runtime/VNextPhase04CrossOwnerAdmissionTests.cs',
     'contracts/SingPlus.Contracts/TemporalSemanticsV1.cs',
+    'contracts/SingPlus.Contracts/SemanticExtensionContracts.cs',
+    'contracts/SingPlus.Contracts/OperationObligations.cs',
+    'contracts/SingPlus.Contracts/ExecutionGuarantees.cs',
     'contracts/SingPlus.Contracts/SemanticRefinementContracts.cs',
     'docs/SingNextOS-v6-roadmap-reworked-2026-09-23/ADR-002-RESOURCE-RESERVATION-AND-UPPER-BOUND.md',
     'contracts/SingPlus.Contracts/ResourceControlModelContracts.cs',
@@ -23,6 +32,7 @@ $evidenceInputs = @(
     'src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetAuthority.cs',
     'src/Runtime/SingPlus.Runtime/VNext/ResourceAdmissionProtocol.cs',
     'src/Runtime/SingPlus.Runtime/VNext/ResourceDonationProtocol.cs',
+    'src/Runtime/SingPlus.Runtime/VNext/SemanticAdmissionSentry.cs',
     'src/Runtime/SingPlus.Runtime/VNext/ExternalOperationResourceBinding.cs',
     'src/Runtime/SingPlus.Runtime/Deadlines/CancellationScopeAuthority.cs',
     'src/Runtime/SingPlus.Runtime/V6/V6TemporalSemanticBinding.cs',
@@ -55,7 +65,7 @@ try {
     $passed = [int]$match.Groups[2].Value
     $skipped = [int]$match.Groups[3].Value
     $total = [int]$match.Groups[4].Value
-    if ($failed -ne 0 -or $passed -ne 83 -or $skipped -ne 0 -or $total -ne 83) {
+    if ($failed -ne 0 -or $passed -ne 217 -or $skipped -ne 0 -or $total -ne 217) {
         throw "Unexpected P03 counts: failed=$failed passed=$passed skipped=$skipped total=$total"
     }
     $boundRaceFilter = 'FullyQualifiedName~V6TemporalCapacityReservationTests.ConcurrentBoundSubmitHasOneOwnerTransitionAndOneProviderCallback'
@@ -269,6 +279,21 @@ try {
     $artifact.testIds += 'VNextPhase07ExternalOperationResourceBindingTests.ProviderLossWithQuarantinedResourceBindingCannotReleaseRegion'
     $jsonPath = Join-Path $OutputDirectory 'qualification.json'
     $markdownPath = Join-Path $OutputDirectory 'qualification.md'
+    $artifact.requirementIds += 'P03-EXACT-TEMPORAL-SCHEMA-ADMISSION-01'
+    $artifact.testIds += 'V6TemporalRuntimeEnforcementTests.MatchingUnknownTemporalSchemasCannotBorrowV1PayloadPermission'
+    $artifact.requirementClassification.VerifiedExisting += 'Temporal admission rejects unknown schema ID or version even when requirement and guarantee match and contain canonical V1 payload'
+    $artifact.requirementIds += 'P03-STRICT-TEMPORAL-SCOPE-UNICODE-01'
+    $artifact.testIds += @('TemporalSemanticsV1Tests.MalformedScopeCannotAliasCanonicalReplacementBytes','TemporalSemanticsV1Tests.SupplementaryScopeRoundTripsAtExactUtf8Boundary')
+    $artifact.requirementClassification.VerifiedExisting += 'Temporal scope rejects malformed UTF16 before canonical bytes; valid supplementary Unicode exact byte boundary preserved'
+    $artifact.requirementIds += 'P03-ACTIVE-OPERATION-ADMISSION-01'
+    $artifact.requirementIds += 'C0-PROVIDER-UNKNOWN-MANDATORY-01'
+    $artifact.requirementIds += 'C0-CANONICAL-BASE-DIGEST-01'
+    $artifact.testIds += 'V6TemporalRuntimeEnforcementTests.AlteredBaseDigestSidecarCannotPassFreshTemporalBinding'
+    $artifact.requirementClassification.VerifiedExisting += 'Altered canonical base obligation/guarantee digest sidecar fails temporal fresh binding with no submit and budget remains Bound'
+    $artifact.testIds += 'V6TemporalRuntimeEnforcementTests.UnknownMandatoryProviderCompanionCannotHideBehindTemporalGuarantee'
+    $artifact.requirementClassification.VerifiedExisting += 'Managed temporal consumer refuses unknown mandatory provider companion while preserving bound lease and unsubmitted admission'
+    $artifact.testIds += 'VNextPhase06ResourceDonationTests.GeneratedSentryConsumesExactInvocationDonationWithoutSecondCharge'
+    $artifact.requirementClassification.VerifiedExisting += 'Final donation admission rejects cancelled operation disposition before provider callback; post-marker cancellation preserves consuming charge through quarantine, pre-marker closure remains owner-confirmed'
     $artifact | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $jsonPath -Encoding utf8NoBOM
     @"
 # P03 temporal/resource evidence

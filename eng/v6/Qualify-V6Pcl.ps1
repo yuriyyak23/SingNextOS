@@ -59,7 +59,7 @@ try {
     if (-not $match.Success) { throw 'The PCL test runner summary could not be parsed.' }
     $failed = [int]$match.Groups[1].Value; $passed = [int]$match.Groups[2].Value
     $skipped = [int]$match.Groups[3].Value; $total = [int]$match.Groups[4].Value
-    if ($failed -ne 0 -or $passed -ne 37 -or $skipped -ne 0 -or $total -ne 37) {
+    if ($failed -ne 0 -or $passed -ne 60 -or $skipped -ne 0 -or $total -ne 60) {
         throw "Unexpected PCL counts: failed=$failed passed=$passed skipped=$skipped total=$total"
     }
 

@@ -17,7 +17,7 @@ public sealed class V6EnergyBudgetTests
         var first = authority.SettleLease(process, lease, [Amount(60)]).Value!;
         var replay = authority.SettleLease(process, lease, [Amount(90)]).Value!;
 
-        Assert.Equal(first, replay);
+        BudgetSnapshotAssertions.Equal(first, replay);
         Assert.Equal(60UL, Used(authority.Query(account).Value!));
         Assert.Equal([Amount(60)], first.ChargedAmounts);
     }

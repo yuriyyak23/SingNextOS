@@ -73,16 +73,22 @@ public sealed class CapabilityAwareServiceSupervisor
         if (!control.IsSuccess) return control;
         lock (_gate)
         {
-            if (_records.ContainsKey(definition.Identity))
-                return KernelResult.Fail(KernelError.DuplicateIdentity, $"Managed service '{definition.Identity.Name}' is already registered.");
-            _records.Add(definition.Identity, new(definition));
-            var graph = ValidateAcyclicGraphLocked();
-            if (!graph.IsSuccess)
+            var principal = _kernel.Processes.Resolve(_principal);
+            if (!principal.IsSuccess) return KernelResult.Fail(KernelError.SupervisorDenied, principal.Message!);
+            return _kernel.CapabilityAuthority.CommitSupervisorRegistration(_controlCapability,
+                principal.Value!.DomainId, _principal.Generation, () =>
             {
-                _records.Remove(definition.Identity);
-                return graph;
-            }
-            return KernelResult.Ok();
+                if (_records.ContainsKey(definition.Identity))
+                    return KernelResult.Fail(KernelError.DuplicateIdentity, $"Managed service '{definition.Identity.Name}' is already registered.");
+                _records.Add(definition.Identity, new(definition));
+                var graph = ValidateAcyclicGraphLocked();
+                if (!graph.IsSuccess)
+                {
+                    _records.Remove(definition.Identity);
+                    return graph;
+                }
+                return KernelResult.Ok();
+            });
         }
     }
 
@@ -176,7 +182,7 @@ public sealed class CapabilityAwareServiceSupervisor
             if (!exact.IsSuccess) return KernelResult<StructuredTelemetrySnapshot>.Fail(exact.Error, exact.Message!);
             snapshot = Snapshot(exact.Value!);
         }
-        return _kernel.ProjectSupervisorTelemetry(instance.Process, snapshot);
+        return _kernel.ProjectSupervisorTelemetry(_principal, _controlCapability, instance.Process, snapshot);
     }
 
     public KernelResult<ServiceHealthSnapshot> ReportHealth(ServiceInstanceHandle instance, ServiceHealthState state, string reason)

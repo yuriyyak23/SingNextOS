@@ -7,6 +7,29 @@ namespace SingPlus.Tests.Platform;
 
 public sealed class PlatformDmaGrantTests
 {
+    [Theory]
+    [InlineData(PlatformDmaDirection.DeviceReadsMemory)]
+    [InlineData(PlatformDmaDirection.DeviceWritesMemory)]
+    public void PublishedMappingDamageDeniesNewDmaGrantBeforeProvider(PlatformDmaDirection direction)
+    {
+        var scenario = CreateScenario(1320, 1390,
+            PlatformDeviceRights.Read | PlatformDeviceRights.Write | PlatformDeviceRights.Configure,
+            PlatformMemoryAccess.Read | PlatformMemoryAccess.Write);
+        var process = scenario.Kernel.Processes.Resolve(scenario.Subject).Value!;
+        var owner = new RegionOwner(process.DomainId, scenario.Subject.Generation);
+        var region = scenario.Mapping.Mapping.Region;
+        Assert.True(scenario.Kernel.Regions.QuarantineSubrange(region, owner,
+            new(1, new("test-provider", "bank-0", 1, 1), 1,
+                ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(96, 8))).IsSuccess);
+
+        var grant = scenario.Kernel.BindPlatformDma(scenario.Subject, scenario.Device,
+            scenario.Mapping, 32, 128, direction);
+        Assert.Equal(KernelError.Quarantined, grant.Error);
+        Assert.Equal(0, scenario.Provider.DmaBindCalls);
+        Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(region, owner));
+        Assert.Single(scenario.Kernel.Regions.SnapshotDamage());
+    }
+
     [Fact]
     public void ExactDeviceAndMappingMaterializeBoundedAdmissionOnlyGrant()
     {
@@ -203,6 +226,24 @@ public sealed class PlatformDmaGrantTests
     }
 
     [Fact]
+    public void ExplicitNotAcceptedGrantClosureCanRetryWithoutReclaimingEarly()
+    {
+        var scenario = CreateScenario(1311, 1410,
+            PlatformDeviceRights.Read | PlatformDeviceRights.Configure,
+            PlatformMemoryAccess.Read);
+        var grant = scenario.Kernel.BindPlatformDma(scenario.Subject, scenario.Device,
+            scenario.Mapping, 0, 32, PlatformDmaDirection.DeviceReadsMemory).Value!;
+        scenario.Provider.DmaRevokeStatus = PlatformAuthorityStatus.NotAccepted;
+
+        Assert.False(scenario.Kernel.RevokePlatformDma(scenario.Subject, grant).IsSuccess);
+        Assert.False(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+        scenario.Provider.DmaRevokeStatus = null;
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, grant).IsSuccess);
+        Assert.Equal(3, scenario.Provider.DmaRevokeCalls);
+        Assert.True(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+    }
+
+    [Fact]
     public void DmaFeatureIsAdmissionOnlyAndPublicGrantContainsNoProviderOrHardwareIdentity()
     {
         var scenario = CreateScenario(1308, 1380,
@@ -288,6 +329,26 @@ public sealed class PlatformDmaGrantTests
         var revoke = scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping);
         Assert.Equal(cleanupFails, !revoke.IsSuccess);
         Assert.Equal(cleanupFails ? 0 : 1, scenario.Provider.MappingRevokeCalls);
+    }
+
+    [Fact]
+    public void RejectedProviderGrantRevokedStatusDoesNotProveCleanup()
+    {
+        var scenario = CreateScenario(1312, 1420,
+            PlatformDeviceRights.Read | PlatformDeviceRights.Configure,
+            PlatformMemoryAccess.Read);
+        scenario.Provider.ReturnMalformedGrant = true;
+        scenario.Provider.DmaRevokeStatus = PlatformAuthorityStatus.Revoked;
+
+        var bind = scenario.Kernel.BindPlatformDma(scenario.Subject, scenario.Device,
+            scenario.Mapping, 0, 32, PlatformDmaDirection.DeviceReadsMemory);
+
+        Assert.Equal(KernelError.PlatformFaulted, bind.Error);
+        Assert.Equal(1, scenario.Provider.DmaRevokeCalls);
+        Assert.Equal(KernelError.PlatformFaulted,
+            scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).Error);
+        Assert.Equal(0, scenario.Provider.MappingRevokeCalls);
+        Assert.False(scenario.Kernel.RevokePlatformDevice(scenario.Subject, scenario.Device).IsSuccess);
     }
 
     private static Scenario CreateScenario(

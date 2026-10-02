@@ -11,6 +11,7 @@ public sealed partial class RuntimeKernel
         public required BudgetReservationHandle? BudgetReservation { get; init; }
         public Queue<StructuredTelemetrySnapshot> Queue { get; } = new();
         public ulong Dropped { get; set; }
+        public bool ObservationFailed { get; set; }
     }
 
     private readonly object _telemetryGate = new();
@@ -25,15 +26,35 @@ public sealed partial class RuntimeKernel
         CapabilityId? inspectionCapability = null)
     {
         var access = ValidateTelemetryProjection(requester, subject, projection, inspectionCapability);
-        return access.IsSuccess
-            ? BuildTelemetry(subject, projection, supervisor: null)
-            : KernelResult<StructuredTelemetrySnapshot>.Fail(access.Error, access.Message!);
+        if (!access.IsSuccess) return KernelResult<StructuredTelemetrySnapshot>.Fail(access.Error, access.Message!);
+        var snapshot = BuildTelemetry(subject, projection, supervisor: null);
+        if (!snapshot.IsSuccess) return snapshot;
+        // Snapshot collection may call an injected clock. Only fresh owner permission can publish it.
+        var committed = CommitTelemetryPublication(requester, subject, projection, inspectionCapability,
+            false, static () => KernelResult.Ok());
+        return committed.IsSuccess ? snapshot : KernelResult<StructuredTelemetrySnapshot>.Fail(committed.Error, committed.Message!);
     }
 
     internal KernelResult<StructuredTelemetrySnapshot> ProjectSupervisorTelemetry(
-        ProcessHandle subject,
-        ServiceSupervisorSnapshot supervisor) =>
-        BuildTelemetry(subject, TelemetryProjectionClass.ServiceAggregate, supervisor);
+        ProcessHandle principal, CapabilityId controlCapability, ProcessHandle subject,
+        ServiceSupervisorSnapshot supervisor)
+    {
+        var snapshot = BuildTelemetry(subject, TelemetryProjectionClass.ServiceAggregate, supervisor);
+        if (!snapshot.IsSuccess) return snapshot;
+        lock (_platformMemoryUseGate)
+        {
+            var caller = Processes.Resolve(principal);
+            if (!caller.IsSuccess)
+                return KernelResult<StructuredTelemetrySnapshot>.Fail(KernelError.SupervisorDenied, caller.Message!);
+            var target = Processes.Resolve(subject);
+            if (!target.IsSuccess)
+                return KernelResult<StructuredTelemetrySnapshot>.Fail(target.Error, target.Message!);
+            // This owner commit has no callbacks and never acquires the supervisor lock.
+            var committed = CapabilityAuthority.CommitSupervisorTelemetryPublication(controlCapability,
+                caller.Value!.DomainId, principal.Generation);
+            return committed.IsSuccess ? snapshot : KernelResult<StructuredTelemetrySnapshot>.Fail(committed.Error, committed.Message!);
+        }
+    }
 
     public KernelResult<TelemetrySubscriptionAdmission> StartTelemetrySubscription(
         ProcessHandle owner,
@@ -43,11 +64,21 @@ public sealed partial class RuntimeKernel
         TelemetrySubscriptionOverflowPolicy overflowPolicy,
         CapabilityId? inspectionCapability = null)
     {
+        lock (_platformMemoryUseGate)
+            return StartTelemetrySubscriptionLocked(owner, subject, projection, capacity, overflowPolicy, inspectionCapability);
+    }
+
+    private KernelResult<TelemetrySubscriptionAdmission> StartTelemetrySubscriptionLocked(
+        ProcessHandle owner, ProcessHandle subject, TelemetryProjectionClass projection, int capacity,
+        TelemetrySubscriptionOverflowPolicy overflowPolicy, CapabilityId? inspectionCapability)
+    {
         if (capacity <= 0 || capacity > StructuredTelemetryContract.MaximumSubscriptionEntries ||
             !Enum.IsDefined(overflowPolicy))
             return KernelResult<TelemetrySubscriptionAdmission>.Fail(KernelError.InvalidMessage, "Telemetry subscription configuration is invalid or unbounded.");
         var access = ValidateTelemetryProjection(owner, subject, projection, inspectionCapability);
         if (!access.IsSuccess) return KernelResult<TelemetrySubscriptionAdmission>.Fail(access.Error, access.Message!);
+        var effects = ValidateTelemetryAdmissionProcesses(owner, subject);
+        if (!effects.IsSuccess) return KernelResult<TelemetrySubscriptionAdmission>.Fail(effects.Error, effects.Message!);
         var component = _components.Values.SingleOrDefault(record => record.Process == owner);
         if (component is null || component.Manifest.TelemetryPolicy.Visibility == ServiceTelemetryVisibility.None)
             return KernelResult<TelemetrySubscriptionAdmission>.Fail(KernelError.ProjectionDenied, "The owning manifest does not admit telemetry buffering.");
@@ -57,24 +88,58 @@ public sealed partial class RuntimeKernel
         var budget = ReserveAttachedBudget(owner, [new(ServiceBudgetDimension.TraceTelemetryBufferBytes, bytes)],
             BudgetReservationLifetime.TraceTelemetryBuffer);
         if (!budget.IsSuccess) return KernelResult<TelemetrySubscriptionAdmission>.Fail(budget.Error, budget.Message!);
-
-        lock (_telemetryGate)
+        access = ValidateTelemetryProjection(owner, subject, projection, inspectionCapability);
+        effects = ValidateTelemetryAdmissionProcesses(owner, subject);
+        if (!access.IsSuccess || !effects.IsSuccess)
         {
-            if (_nextTelemetrySubscriptionId == 0)
-            {
-                _ = ReleaseAttachedBudget(owner, budget.Value);
-                return KernelResult<TelemetrySubscriptionAdmission>.Fail(KernelError.CapacityExhausted, "Telemetry subscription identity space is exhausted.");
-            }
-            var handle = new TelemetrySubscriptionHandle(new(_nextTelemetrySubscriptionId++), new(1));
-            var admission = new TelemetrySubscriptionAdmission(handle, owner, subject, projection, capacity, bytes, overflowPolicy, TelemetrySubscriptionState.Active);
-            _telemetrySubscriptions.Add(handle.SubscriptionId, new()
-            {
-                Admission = admission,
-                InspectionCapability = inspectionCapability,
-                BudgetReservation = budget.Value,
-            });
-            return KernelResult<TelemetrySubscriptionAdmission>.Ok(admission);
+            _ = ReleaseAttachedBudget(owner, budget.Value);
+            var refused = !access.IsSuccess ? access : effects;
+            return KernelResult<TelemetrySubscriptionAdmission>.Fail(refused.Error, refused.Message!);
         }
+
+        TelemetrySubscriptionAdmission? published = null;
+        KernelResult Publish()
+        {
+            lock (_telemetryGate)
+            {
+                if (_nextTelemetrySubscriptionId == 0)
+                    return KernelResult.Fail(KernelError.CapacityExhausted, "Telemetry subscription identity space is exhausted.");
+                var handle = new TelemetrySubscriptionHandle(new(_nextTelemetrySubscriptionId++), new(1));
+                published = new(handle, owner, subject, projection, capacity, bytes, overflowPolicy, TelemetrySubscriptionState.Active);
+                _telemetrySubscriptions.Add(handle.SubscriptionId, new()
+                {
+                    Admission = published,
+                    InspectionCapability = inspectionCapability,
+                    BudgetReservation = budget.Value,
+                });
+                return KernelResult.Ok();
+            }
+        }
+        var requiresInspection = owner != subject ||
+            projection is not (TelemetryProjectionClass.SelfOperational or TelemetryProjectionClass.ServiceAggregate);
+        var caller = Processes.Resolve(owner);
+        var committed = !caller.IsSuccess
+            ? KernelResult.Fail(caller.Error, caller.Message!)
+            : requiresInspection
+            ? CapabilityAuthority.CommitTelemetryPublication(inspectionCapability!.Value,
+                caller.Value!.DomainId, owner.Generation, Publish)
+            : Publish();
+        if (committed.IsSuccess) return KernelResult<TelemetrySubscriptionAdmission>.Ok(published!);
+        // Compensation can emit trace callbacks; never run it under capability or telemetry locks.
+        _ = ReleaseAttachedBudget(owner, budget.Value);
+        return KernelResult<TelemetrySubscriptionAdmission>.Fail(committed.Error, committed.Message!);
+    }
+
+    private KernelResult ValidateTelemetryAdmissionProcesses(ProcessHandle owner, ProcessHandle subject)
+    {
+        foreach (var handle in new[] { owner, subject })
+        {
+            var resolved = Processes.Resolve(handle);
+            if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+            var effect = EnsureProcessAcceptsNewEffects(resolved.Value!);
+            if (!effect.IsSuccess) return effect;
+        }
+        return KernelResult.Ok();
     }
 
     public KernelResult SampleTelemetrySubscription(ProcessHandle owner, TelemetrySubscriptionHandle handle)
@@ -94,9 +159,22 @@ public sealed partial class RuntimeKernel
         }
 
         var projected = ProjectTelemetry(owner, admission.Subject, admission.Projection, capability);
-        if (!projected.IsSuccess) return KernelResult.Fail(projected.Error, projected.Message!);
-        lock (_telemetryGate)
+        if (!projected.IsSuccess)
         {
+            if (projected.Error is KernelError.PlatformFaulted or KernelError.CapacityExhausted)
+            {
+                lock (_telemetryGate)
+                {
+                    var exact = ResolveTelemetrySubscriptionLocked(owner, handle);
+                    if (exact.IsSuccess) exact.Value!.ObservationFailed = true;
+                }
+            }
+            return KernelResult.Fail(projected.Error, projected.Message!);
+        }
+        KernelResult PublishSample()
+        {
+          lock (_telemetryGate)
+          {
             var resolved = ResolveTelemetrySubscriptionLocked(owner, handle);
             if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
             var record = resolved.Value!;
@@ -104,6 +182,8 @@ public sealed partial class RuntimeKernel
                 return KernelResult.Fail(KernelError.TelemetryStopped, "Telemetry subscription closed while sampling.");
             if (record.Queue.Count >= record.Admission.Capacity)
             {
+                if (record.Dropped == ulong.MaxValue)
+                    return KernelResult.Fail(KernelError.CapacityExhausted, "Telemetry drop counter is exhausted.");
                 record.Dropped++;
                 if (record.Admission.OverflowPolicy == TelemetrySubscriptionOverflowPolicy.RejectSample)
                     return KernelResult.Fail(KernelError.TelemetryBackpressure, "The bounded telemetry subscription is full.");
@@ -116,26 +196,66 @@ public sealed partial class RuntimeKernel
             }
             record.Queue.Enqueue(projected.Value!);
             return KernelResult.Ok();
+          }
         }
+        return CommitTelemetryPublication(owner, admission.Subject, admission.Projection, capability, true, PublishSample);
     }
 
     public KernelResult<TelemetrySubscriptionBatch> ReadTelemetrySubscription(
-        ProcessHandle owner,
-        TelemetrySubscriptionHandle handle)
+        ProcessHandle owner, TelemetrySubscriptionHandle handle)
     {
+        TelemetrySubscriptionAdmission admission;
+        CapabilityId? capability;
         var process = Processes.Resolve(owner);
         if (!process.IsSuccess) return KernelResult<TelemetrySubscriptionBatch>.Fail(process.Error, process.Message!);
         lock (_telemetryGate)
         {
             var resolved = ResolveTelemetrySubscriptionLocked(owner, handle);
             if (!resolved.IsSuccess) return KernelResult<TelemetrySubscriptionBatch>.Fail(resolved.Error, resolved.Message!);
-            var record = resolved.Value!;
-            var snapshots = record.Queue.ToArray();
-            record.Queue.Clear();
-            return KernelResult<TelemetrySubscriptionBatch>.Ok(new(record.Admission, snapshots, record.Dropped, record.Dropped == 0));
+            admission = resolved.Value!.Admission;
+            capability = resolved.Value.InspectionCapability;
         }
+        TelemetrySubscriptionBatch? batch = null;
+        KernelResult PublishRead()
+        {
+            lock (_telemetryGate)
+            {
+                var resolved = ResolveTelemetrySubscriptionLocked(owner, handle);
+                if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+                var record = resolved.Value!;
+                var snapshots = record.Queue.ToArray();
+                batch = new(record.Admission, snapshots, record.Dropped, record.Dropped == 0 && !record.ObservationFailed);
+                record.Queue.Clear();
+                return KernelResult.Ok();
+            }
+        }
+        var committed = CommitTelemetryPublication(owner, admission.Subject, admission.Projection, capability, false, PublishRead);
+        return committed.IsSuccess
+            ? KernelResult<TelemetrySubscriptionBatch>.Ok(batch!)
+            : KernelResult<TelemetrySubscriptionBatch>.Fail(committed.Error, committed.Message!);
     }
 
+    private KernelResult CommitTelemetryPublication(ProcessHandle owner, ProcessHandle subject,
+        TelemetryProjectionClass projection, CapabilityId? capability, bool newEffect, Func<KernelResult> publish)
+    {
+        lock (_platformMemoryUseGate)
+        {
+            var access = ValidateTelemetryProjection(owner, subject, projection, capability);
+            if (!access.IsSuccess) return access;
+            if (newEffect)
+            {
+                var effects = ValidateTelemetryAdmissionProcesses(owner, subject);
+                if (!effects.IsSuccess) return effects;
+            }
+            var process = Processes.Resolve(owner);
+            if (!process.IsSuccess) return KernelResult.Fail(process.Error, process.Message!);
+            var requiresInspection = owner != subject ||
+                projection is not (TelemetryProjectionClass.SelfOperational or TelemetryProjectionClass.ServiceAggregate);
+            return requiresInspection
+                ? CapabilityAuthority.CommitTelemetryPublication(capability!.Value, process.Value!.DomainId, owner.Generation, publish)
+                : publish();
+        }
+    }
     public KernelResult<TelemetrySubscriptionAdmission> CloseTelemetrySubscription(
         ProcessHandle owner,
         TelemetrySubscriptionHandle handle)
@@ -233,8 +353,17 @@ public sealed partial class RuntimeKernel
                 ? supervisor.Dependencies.Count(binding => binding.Kind == ServiceDependencyKind.Optional)
                 : 0,
             supervisor.State is ServiceLifecycleState.Quarantined or ServiceLifecycleState.CrashLoop || supervisor.BlockingReason is not null);
+        // Clock collection is observational and can reenter; it precedes sequence allocation.
+        long timestamp;
+        try { timestamp = _operabilityTimeProvider.GetTimestamp(); }
+        catch (Exception exception) when (exception is not (OutOfMemoryException or StackOverflowException))
+        {
+            return KernelResult<StructuredTelemetrySnapshot>.Fail(KernelError.PlatformFaulted, "Telemetry observation clock failed.");
+        }
+        var sequence = NextTelemetryCaptureSequence();
+        if (!sequence.IsSuccess) return KernelResult<StructuredTelemetrySnapshot>.Fail(sequence.Error, sequence.Message!);
         var snapshot = new StructuredTelemetrySnapshot(
-            subject, projection, checked((ulong)Interlocked.Increment(ref _telemetryCaptureSequence)), _operabilityTimeProvider.GetTimestamp(), usage,
+            subject, projection, sequence.Value, timestamp, usage,
             new(regions.Aggregate(0UL, static (sum, region) => checked(sum + (ulong)region.Region.ByteLength)), regions.Length, pinned, pinned,
                 ipc.Channels, component?.Sessions.Count ?? 0, ipc.QueuedMessages),
             new(operations.Count(operation => operation.State == ExternalOperationState.Prepared),
@@ -254,6 +383,19 @@ public sealed partial class RuntimeKernel
             new(committed, failed, deleted, stored), new(trace.Sessions, trace.BufferedEvents, trace.DroppedEvents), service,
             projection == TelemetryProjectionClass.PrivilegedSystemDiagnostics ? 0 : 1);
         return KernelResult<StructuredTelemetrySnapshot>.Ok(snapshot);
+    }
+
+    private KernelResult<ulong> NextTelemetryCaptureSequence()
+    {
+        while (true)
+        {
+            var current = Volatile.Read(ref _telemetryCaptureSequence);
+            if (current < 0 || current == long.MaxValue)
+                return KernelResult<ulong>.Fail(KernelError.CapacityExhausted, "Telemetry capture sequence is exhausted or invalid.");
+            var next = current + 1;
+            if (Interlocked.CompareExchange(ref _telemetryCaptureSequence, next, current) == current)
+                return KernelResult<ulong>.Ok((ulong)next);
+        }
     }
 
     private KernelResult<TelemetrySubscriptionRecord> ResolveTelemetrySubscriptionLocked(

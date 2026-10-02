@@ -27,7 +27,8 @@ public sealed partial class RuntimeKernel
         Regions.RegisterPayload(descriptor.Handle, buffer);
         resolved.Value.AddRegion(descriptor.Handle);
         if (budget.Value is { } reservation)
-            _regionBudgetReservations.Add(descriptor.Handle.RegionId, (owner, reservation));
+            lock (_regionBudgetReservationsGate)
+                _regionBudgetReservations.Add(descriptor.Handle, (owner, reservation));
         return KernelResult<OwnedBuffer<T>>.Ok(buffer);
         }
     }
@@ -52,7 +53,8 @@ public sealed partial class RuntimeKernel
         Regions.RegisterPayload(descriptor.Handle, region);
         resolved.Value.AddRegion(descriptor.Handle);
         if (budget.Value is { } reservation)
-            _regionBudgetReservations.Add(descriptor.Handle.RegionId, (owner, reservation));
+            lock (_regionBudgetReservationsGate)
+                _regionBudgetReservations.Add(descriptor.Handle, (owner, reservation));
         return KernelResult<OwnedRegion<T>>.Ok(region);
         }
     }
@@ -84,7 +86,7 @@ public sealed partial class RuntimeKernel
         Regions.ReplacePayload(oldHandle, transfer.Value, moved);
         sourceProcess.Value.RemoveRegion(oldHandle);
         targetProcess.Value.AddRegion(transfer.Value);
-        CompleteRegionBudgetTransfer(source, target, oldHandle.RegionId, targetBudget.Value);
+        CompleteRegionBudgetTransfer(source, target, oldHandle, transfer.Value, targetBudget.Value);
         return KernelResult<OwnedBuffer<T>>.Ok(moved);
         }
     }
@@ -102,7 +104,7 @@ public sealed partial class RuntimeKernel
         if (!release.IsSuccess) return release;
         transferable.InvalidateForRuntime();
         resolved.Value.RemoveRegion(handle);
-        ReleaseRegionBudget(owner, handle.RegionId);
+        ReleaseRegionBudget(owner, handle);
         return KernelResult.Ok();
     }
 
@@ -133,7 +135,7 @@ public sealed partial class RuntimeKernel
         Regions.ReplacePayload(oldHandle, transfer.Value, moved);
         sourceProcess.Value.RemoveRegion(oldHandle);
         targetProcess.Value.AddRegion(transfer.Value);
-        CompleteRegionBudgetTransfer(source, target, oldHandle.RegionId, targetBudget.Value);
+        CompleteRegionBudgetTransfer(source, target, oldHandle, transfer.Value, targetBudget.Value);
         return KernelResult<OwnedRegion<T>>.Ok(moved);
         }
     }
@@ -151,7 +153,7 @@ public sealed partial class RuntimeKernel
         if (!release.IsSuccess) return release;
         transferable.InvalidateForRuntime();
         resolved.Value.RemoveRegion(handle);
-        ReleaseRegionBudget(owner, handle.RegionId);
+        ReleaseRegionBudget(owner, handle);
         return KernelResult.Ok();
     }
 

@@ -9,6 +9,7 @@ Set-StrictMode -Version Latest
 function Get-Sha256([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
 
 $filter = 'FullyQualifiedName~DeviceTrustContractsV1Tests|FullyQualifiedName~CxlSecurityAndMultiHostTests|FullyQualifiedName~CxlType2AcceleratorServiceTests|FullyQualifiedName~PlatformDeviceLeaseTests|FullyQualifiedName~SecureExecutionBindingTests|FullyQualifiedName~Phase7EvidenceSecureComputeTests|FullyQualifiedName=SingPlus.Tests.Architecture.V6ArchitectureGuardTests.V6GateRegistryIsClosedCompleteAndDefaultOff'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ResetInsideRootBindCallbackPinsSubjectWithoutInventingLease|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.LostRootBindReceiptPinsProcessReclaimWithoutProviderLease|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.RootBindCallbackRejectsDuplicateAdmissionBeforeProvider|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ProcessExitInsideRootBindCallbackRevokesPublishedBindingBeforeReclaim|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ParentRevokeCallbackRejectsNewMappingBeforeProvider|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.MappingCallbackCannotRevokeParentBeforePublication|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.MappingReceiptLossPinsParentAndLocalReservation|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.BackendResetInsideMappingCallbackFaultPinsLateLease|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ProcessExitInsideMappingCallbackTracksLateMappingForExactTeardown|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.LostMappingReceiptBlocksProcessReclaim|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ResetFaultedMappingKeepsBudgetAndRegionPinnedAcrossTeardownRetries|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.ResetBeforeNotAcceptedMappingReplyDoesNotReleaseRegion|FullyQualifiedName=SingPlus.Tests.Platform.PlatformAuthorityBridgeChildDomainTests.StableNotAcceptedMappingReplyReleasesLocalReservation'
 $evidenceInputs = @(
     'contracts/SingPlus.Contracts/DeviceTrustContracts.cs',
     'contracts/SingPlus.Contracts/EvidenceContracts.cs',
@@ -19,6 +20,10 @@ $evidenceInputs = @(
     'src/Runtime/SingPlus.Runtime/Cxl/CxlSecurityAuthority.cs',
     'src/Runtime/SingPlus.Runtime/Cxl/CxlType2AcceleratorService.cs',
     'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.Device.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.BackendEpoch.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/RuntimeKernel.Platform.cs',
+    'src/Runtime/SingPlus.Runtime/RuntimeKernel.ProcessTeardown.cs',
     'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.SecureCompute.cs',
     'src/Runtime/SingPlus.Runtime/SecureCompute/RuntimeKernel.SecureCompute.cs',
     'src/Runtime/SingPlus.Runtime/V6/V6FeatureGates.cs',
@@ -28,6 +33,7 @@ $evidenceInputs = @(
     'tests/SingPlus.Tests/Platform/PlatformDeviceLeaseTests.cs',
     'tests/SingPlus.Tests/Platform/SecureExecutionBindingTests.cs',
     'tests/SingPlus.Tests/Platform/Phase7EvidenceSecureComputeTests.cs',
+    'tests/SingPlus.Tests/Platform/PlatformAuthorityBridgeChildDomainTests.cs',
     'tests/SingPlus.Tests/Architecture/V6ArchitectureGuardTests.cs',
     'tools/SingPlus.SingCapQualification/SingPlus.SingCapQualification.csproj',
     'tools/SingPlus.SingCapQualification/Program.cs',
@@ -43,7 +49,7 @@ try {
     if (-not $match.Success) { throw 'The P09 test runner summary could not be parsed.' }
     $failed = [int]$match.Groups[1].Value; $passed = [int]$match.Groups[2].Value
     $skipped = [int]$match.Groups[3].Value; $total = [int]$match.Groups[4].Value
-    if ($failed -ne 0 -or $passed -ne 172 -or $skipped -ne 0 -or $total -ne 172) {
+    if ($failed -ne 0 -or $passed -ne 208 -or $skipped -ne 0 -or $total -ne 208) {
         throw "Unexpected P09 counts: failed=$failed passed=$passed skipped=$skipped total=$total"
     }
     New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null

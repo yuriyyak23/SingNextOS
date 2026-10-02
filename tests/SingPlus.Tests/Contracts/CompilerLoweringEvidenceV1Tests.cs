@@ -4,6 +4,45 @@ namespace SingPlus.Tests.Contracts;
 
 public sealed class CompilerLoweringEvidenceV1Tests
 {
+    public static IEnumerable<object[]> InvalidUnicodeTokens() =>
+        Enumerable.Range(0, 11).SelectMany(field => new[]
+        { new object[] { field, false }, new object[] { field, true } });
+
+    [Theory]
+    [MemberData(nameof(InvalidUnicodeTokens))]
+    public void InvalidUnicodeCannotEnterCanonicalLoweringFacts(int field, bool lowSurrogate)
+    {
+        var bad = "fact:" + (lowSurrogate ? '\uDC00' : '\uD800');
+        Action validate = field switch
+        {
+            0 => () => CompilerLoweringEvidenceV1.Create(bad, D('a'), D('b'), D('c'), D('d'), Footprints()),
+            1 => () => new LoweringFootprintFactV1(bad, 0, 1, LoweringFootprintAccessV1.Read).Validate(),
+            2 => () => new LoweringAliasFactV1(bad, "output", true).Validate(),
+            3 => () => new LoweringAliasFactV1("input", bad, true).Validate(),
+            4 => () => new LoweringOrderingFactV1(bad, true, true).Validate(),
+            5 => () => new LoweringNumericModeFactV1(bad, "nearest", "wrap", 128).Validate(),
+            6 => () => new LoweringNumericModeFactV1("add", bad, "wrap", 128).Validate(),
+            7 => () => new LoweringNumericModeFactV1("add", "nearest", bad, 128).Validate(),
+            8 => () => new LoweringSafePointFactV1(bad, 0, D('e')).Validate(),
+            9 => () => new LoweringStaticResourceEstimateFactV1(bad, 1, "count").Validate(),
+            _ => () => new LoweringStaticResourceEstimateFactV1("estimate", 1, bad).Validate(),
+        };
+        Assert.ThrowsAny<ArgumentException>(validate);
+    }
+
+    [Fact]
+    public void ValidUnicodeLoweringFactsRetainExactCanonicalBytes()
+    {
+        var evidence = Evidence(safePoints: [new("точка-😀", 0, D('e'))],
+            resourceEstimates: [new("ресурс-零", 1, "count")]);
+        Assert.Contains("точка-😀", global::System.Text.Encoding.UTF8.GetString(evidence.SerializeCanonical()));
+        Assert.Equal(evidence.EvidenceDigest, Evidence(safePoints: [new("точка-😀", 0, D('e'))],
+            resourceEstimates: [new("ресурс-零", 1, "count")]).EvidenceDigest);
+        Assert.False(evidence.AuthorizesExecution);
+        var metadata = CompilerLoweringEvidenceMetadataCodecV1.Emit(CompilerLoweringEvidenceEnvelopeV1.Create(evidence));
+        Assert.Equal(evidence.EvidenceDigest, CompilerLoweringEvidenceMetadataCodecV1.Parse(metadata).EvidenceDigest);
+    }
+
     [Fact]
     public void CanonicalEvidenceIsOrderIndependentImmutableAndNonAuthoritative()
     {

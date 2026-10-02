@@ -61,7 +61,7 @@ try {
     $passed = [int]$match.Groups[2].Value + [int]$adapterMatch.Groups[2].Value
     $skipped = [int]$match.Groups[3].Value + [int]$adapterMatch.Groups[3].Value
     $total = [int]$match.Groups[4].Value + [int]$adapterMatch.Groups[4].Value
-    if ($failed -ne 0 -or $passed -ne 64 -or $skipped -ne 0 -or $total -ne 64) {
+    if ($failed -ne 0 -or $passed -ne 73 -or $skipped -ne 0 -or $total -ne 73) {
         throw "Unexpected P01 runtime test counts: failed=$failed passed=$passed skipped=$skipped total=$total"
     }
 
@@ -202,6 +202,9 @@ try {
     }
     $jsonPath = Join-Path $OutputDirectory 'qualification.json'
     $markdownPath = Join-Path $OutputDirectory 'qualification.md'
+    $artifact.requirementIds += 'P01-EXACT-MEMORY-SCHEMA-ADMISSION-01'
+    $artifact.testIds += 'V6MemoryRuntimeEnforcementTests.MatchingUnknownMemorySchemasCannotBorrowV1PayloadPermission'
+    $artifact.requirementClassification.VerifiedExisting += 'Exact supported memory schema ID/version required before V1 payload interpretation; denial preserves Bound budget'
     $artifact | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $jsonPath -Encoding utf8NoBOM
     @"
 # P01 staged-memory runtime qualification evidence

@@ -5,6 +5,1082 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class V6TemporalCapacityReservationTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ForeignPreSubmitCancellationCannotRefundClaimedTemporalCapacity(bool bound)
+    {
+        var c = BoundCancellationContext(admitBinding: false);
+        var binding = (bound
+            ? c.Coordinator.AdmitBoundToExternalOperation(c.Owner, c.Budget, c.Operation, Temporal(40))
+            : c.Coordinator.Admit(c.Owner, c.Budget, "foreign-cancel-guard", Temporal(40))).Value!;
+        Assert.Equal(KernelError.InvalidTransition, c.Kernel.Budgets.CancelLeasePreSubmit(c.Owner, c.Budget).Error);
+        Assert.Equal(KernelError.InvalidTransition, c.Kernel.Budgets.CancelLeasePreSubmit(c.Owner, c.Budget, Guid.NewGuid()).Error);
+        Assert.Equal(BudgetReservationState.Bound, c.Kernel.QueryBudget(c.Budget).Value!.State);
+        Assert.Equal(40UL, c.Provider.ReservedNanoseconds);
+        Assert.True(c.Coordinator.CancelAdmitted(binding).IsSuccess);
+        Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+        Assert.Equal(BudgetReservationState.CancelledPreSubmit, c.Kernel.QueryBudget(c.Budget).Value!.State);
+        Assert.Equal(KernelError.InvalidTransition, c.Kernel.Budgets.CancelLeasePreSubmit(c.Owner, c.Budget).Error);
+        Assert.True(c.Kernel.Budgets.CancelLeasePreSubmit(c.Owner, c.Budget, binding.Id).IsSuccess);
+    }
+
+    [Fact]
+    public void ProvisionalTemporalClaimCannotBeCancelledBeforeCommitOrExactAbandonment()
+    {
+        var c = Create(100, 100, 40);
+        var composition = Guid.NewGuid();
+        Assert.True(c.Budgets.ClaimTemporalComposition(c.Owner, c.Budget, composition).IsSuccess);
+        Assert.Equal(KernelError.InvalidTransition, c.Budgets.CancelLeasePreSubmit(c.Owner, c.Budget).Error);
+        Assert.Equal(KernelError.InvalidTransition, c.Budgets.CancelLeasePreSubmit(c.Owner, c.Budget, composition).Error);
+        Assert.Equal(40UL, Used(c));
+        c.Budgets.AbandonTemporalComposition(c.Owner, c.Budget, composition);
+        Assert.True(c.Budgets.CancelLeasePreSubmit(c.Owner, c.Budget).IsSuccess);
+        Assert.Equal(0UL, Used(c));
+    }
+
+    [Fact]
+    public async Task ForeignCancellationOverlappingActualCoordinatorCannotRefundTwice()
+    {
+        var c = BoundCancellationContext();
+        using var start = new ManualResetEventSlim(false);
+        var foreign = Task.Run(() => { start.Wait(); return c.Kernel.Budgets.CancelLeasePreSubmit(c.Owner, c.Budget); });
+        var actual = Task.Run(() => { start.Wait(); return c.Coordinator.CancelAdmitted(c.Binding); });
+        start.Set();
+        Assert.Equal(KernelError.InvalidTransition, (await foreign).Error);
+        Assert.True((await actual).IsSuccess);
+        Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+        Assert.Equal(BudgetReservationState.CancelledPreSubmit, c.Kernel.QueryBudget(c.Budget).Value!.State);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void GenericReleaseCannotDetachCommittedTemporalCapacity(bool bound)
+    {
+        var c = BoundCancellationContext(admitBinding: false);
+        var binding = (bound
+            ? c.Coordinator.AdmitBoundToExternalOperation(c.Owner, c.Budget, c.Operation, Temporal(40))
+            : c.Coordinator.Admit(c.Owner, c.Budget, "generic-release-guard", Temporal(40))).Value!;
+        Assert.Equal(KernelError.InvalidTransition, c.Kernel.ReleaseBudget(c.Owner, c.Budget).Error);
+        Assert.Equal(KernelError.InvalidTransition, c.Kernel.Budgets.Release(c.Owner, c.Budget).Error);
+        Assert.Equal(BudgetReservationState.Bound, c.Kernel.QueryBudget(c.Budget).Value!.State);
+        Assert.Equal(40UL, c.Provider.ReservedNanoseconds);
+        var stale = c.Budget with { Generation = new(c.Budget.Generation.Value + 1) };
+        Assert.Equal(BudgetReservationState.Stale, c.Kernel.ReleaseBudget(c.Owner, stale).Value!.State);
+        Assert.Equal(KernelError.WrongRegionOwner, c.Kernel.ReleaseBudget(c.Owner with { Generation = c.Owner.Generation + 1 }, c.Budget).Error);
+        Assert.True(c.Coordinator.CancelAdmitted(binding).IsSuccess);
+        Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+        Assert.Equal(BudgetReservationState.CancelledPreSubmit, c.Kernel.QueryBudget(c.Budget).Value!.State);
+        Assert.True(c.Kernel.ReleaseBudget(c.Owner, c.Budget).IsSuccess);
+    }
+
+    [Fact]
+    public void UnpublishedTemporalClaimPinsReleaseUntilActualAbandonment()
+    {
+        var c = Create(100, 100, 40);
+        var composition = Guid.NewGuid();
+        Assert.True(c.Budgets.ClaimTemporalComposition(c.Owner, c.Budget, composition).IsSuccess);
+        Assert.Equal(KernelError.InvalidTransition, c.Budgets.ReleaseExplicit(c.Owner, c.Budget).Error);
+        Assert.Equal(40UL, Used(c));
+        c.Budgets.AbandonTemporalComposition(c.Owner, c.Budget, Guid.NewGuid());
+        Assert.Equal(KernelError.InvalidTransition, c.Budgets.ReleaseExplicit(c.Owner, c.Budget).Error);
+        c.Budgets.AbandonTemporalComposition(c.Owner, c.Budget, composition);
+        Assert.True(c.Budgets.ReleaseExplicit(c.Owner, c.Budget).IsSuccess);
+        Assert.Equal(0UL, Used(c));
+    }
+
+    [Fact]
+    public void FailedModelCapacityAdmissionAbandonsClaimBeforeExplicitRelease()
+    {
+        var c = Create(100, 1, 40);
+        Assert.False(c.Coordinator.Admit(c.Owner, c.Budget, "capacity-refusal-release", Temporal(40)).IsSuccess);
+        Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+        Assert.True(c.Budgets.ReleaseExplicit(c.Owner, c.Budget).IsSuccess);
+        Assert.Equal(0UL, Used(c));
+    }
+
+    [Fact]
+    public async Task GenericReleaseOverlappingTemporalAdmissionCannotDetachAdmittedCapacity()
+    {
+        var c = BoundCancellationContext(admitBinding: false);
+        using var start = new ManualResetEventSlim(false);
+        var admission = Task.Run(() => { start.Wait(); return c.Coordinator.AdmitBoundToExternalOperation(c.Owner, c.Budget, c.Operation, Temporal(40)); });
+        var release = Task.Run(() => { start.Wait(); return c.Kernel.ReleaseBudget(c.Owner, c.Budget); });
+        start.Set();
+        var admitted = await admission;
+        var released = await release;
+        if (admitted.IsSuccess)
+        {
+            Assert.Equal(KernelError.InvalidTransition, released.Error);
+            Assert.Equal(BudgetReservationState.Bound, c.Kernel.QueryBudget(c.Budget).Value!.State);
+            Assert.Equal(40UL, c.Provider.ReservedNanoseconds);
+            Assert.True(c.Coordinator.CancelAdmitted(admitted.Value!).IsSuccess);
+        }
+        else
+        {
+            Assert.True(released.IsSuccess, released.Message);
+            Assert.Equal(BudgetReservationState.Released, c.Kernel.QueryBudget(c.Budget).Value!.State);
+            Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+        }
+    }
+
+    [Fact]
+    public void TemporalSettlementCannotFabricateExternalResourceSettlementTrace()
+    {
+        var c = BoundCancellationContext();
+        var result = c.Coordinator.SubmitBoundExternalOperation(c.Binding, new(1, 1),
+            KernelResult.Ok, KernelResult.Ok, KernelResult.Ok, () =>
+            {
+                Assert.True(c.Kernel.RecordExternalOperationProviderLoss(c.Owner, c.Operation).IsSuccess);
+                return KernelResult.Fail(KernelError.PlatformFaulted, "provider lost");
+            });
+        Assert.False(result.IsSuccess);
+        var beforeRelease = c.Kernel.QueryExternalOperation(c.Owner, c.Operation).Value!;
+        var generationDigest = new string('a', 64); // Offline observation fixture; never admission evidence.
+        var prefix = V6ExternalOperationTraceProjection.ProjectPublishedPrefix(beforeRelease, generationDigest);
+        Assert.Equal([SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+            SemanticTraceEventKindV1.Quarantined], prefix.Select(item => item.Kind));
+        Assert.True(SemanticTraceValidatorV1.Validate(prefix).IsValid);
+        Assert.All(prefix, item => Assert.False(item.AuthorizesEffect));
+        Assert.Equal(BudgetReservationState.Quarantined, c.Kernel.Budgets.Query(c.Budget).Value!.State);
+        Assert.True(c.Kernel.ReleaseExternalOperation(c.Owner, c.Operation,
+            new(ProviderResourcesClosed: true, ProviderUnavailable: true)).IsSuccess);
+        var released = c.Kernel.QueryExternalOperation(c.Owner, c.Operation).Value!;
+        Assert.DoesNotContain(released.Transitions, item => item.Event == "ResourceSettled");
+        var localReleased = V6ExternalOperationTraceProjection.ProjectPublishedPrefix(released, generationDigest);
+        Assert.Equal([SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+            SemanticTraceEventKindV1.Quarantined, SemanticTraceEventKindV1.LocalAuthorityReleasedWithoutResourceBinding],
+            localReleased.Select(item => item.Kind));
+        Assert.True(SemanticTraceValidatorV1.Validate(localReleased).IsValid);
+        Assert.DoesNotContain(localReleased, item => item.Kind is SemanticTraceEventKindV1.Settled or
+            SemanticTraceEventKindV1.EffectClosedWithoutPublication or SemanticTraceEventKindV1.Released);
+        Assert.Equal(BudgetReservationState.Quarantined, c.Kernel.Budgets.Query(c.Budget).Value!.State);
+        Assert.True(c.Coordinator.ReconcileQuarantinedBoundExternalOperation(c.Binding).IsSuccess);
+        Assert.Equal(BudgetReservationState.Released, c.Kernel.Budgets.Query(c.Budget).Value!.State);
+        Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+        var afterSettlement = c.Kernel.QueryExternalOperation(c.Owner, c.Operation).Value!;
+        Assert.DoesNotContain(afterSettlement.Transitions, item => item.Event == "ResourceSettled");
+        Assert.Equal(localReleased,
+            V6ExternalOperationTraceProjection.ProjectPublishedPrefix(afterSettlement, generationDigest));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ReleasedExactProviderRecordAllowsKnownReceiptReconciliation(bool bound)
+    {
+        var c = BoundCancellationContext(admitBinding: false);
+        var binding = (bound
+            ? c.Coordinator.AdmitBoundToExternalOperation(c.Owner, c.Budget, c.Operation, Temporal(40))
+            : c.Coordinator.Admit(c.Owner, c.Budget, "released-provider-retry", Temporal(40))).Value!;
+        KernelResult Callback()
+        {
+            Assert.True(c.Provider.Release(binding.ProviderReservation.Handle).IsSuccess);
+            if (bound) Assert.True(c.Kernel.RecordExternalOperationProviderLoss(c.Owner, c.Operation).IsSuccess);
+            return KernelResult.Fail(KernelError.PlatformFaulted, "model capacity closed; response lost");
+        }
+        var submitted = bound
+            ? c.Coordinator.SubmitBoundExternalOperation(binding, new(1, 1),
+                KernelResult.Ok, KernelResult.Ok, KernelResult.Ok, Callback)
+            : c.Coordinator.Submit(binding, KernelResult.Ok, KernelResult.Ok, KernelResult.Ok, Callback);
+        Assert.False(submitted.IsSuccess);
+        Assert.Equal(BudgetReservationState.Quarantined, c.Kernel.Budgets.Query(c.Budget).Value!.State);
+        Assert.Equal(V6TemporalProviderReservationState.Released,
+            c.Provider.Query(binding.ProviderReservation.Handle).Value!.State);
+        Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+        var denied = bound
+            ? c.Coordinator.ReconcileQuarantinedBoundExternalOperation(binding)
+            : c.Coordinator.ReconcileQuarantined(binding,
+                () => KernelResult.Fail(KernelError.ExternalEffectUncontained, "closure denied"));
+        Assert.False(denied.IsSuccess);
+        Assert.Equal(BudgetReservationState.Quarantined, c.Kernel.Budgets.Query(c.Budget).Value!.State);
+        if (bound)
+            Assert.True(c.Kernel.ReleaseExternalOperation(c.Owner, c.Operation,
+                new(ProviderResourcesClosed: true, ProviderUnavailable: true)).IsSuccess);
+        var reconciled = bound
+            ? c.Coordinator.ReconcileQuarantinedBoundExternalOperation(binding)
+            : c.Coordinator.ReconcileQuarantined(binding, KernelResult.Ok);
+        Assert.True(reconciled.IsSuccess, reconciled.Message);
+        Assert.Equal(BudgetReservationState.Released, c.Kernel.Budgets.Query(c.Budget).Value!.State);
+        Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+        var fresh = c.Provider.Reserve("after-reconciliation", Temporal(40).ComputeEnvelope).Value!;
+        Assert.True(c.Provider.ReconcileAndRelease(binding.ProviderReservation.Handle).IsSuccess);
+        Assert.Equal(40UL, c.Provider.ReservedNanoseconds);
+        Assert.Equal(KernelError.StaleGeneration,
+            c.Provider.ReconcileAndRelease(binding.ProviderReservation.Handle with { Generation = 2 }).Error);
+        Assert.Equal(V6TemporalProviderReservationState.Reserved, c.Provider.Query(fresh.Handle).Value!.State);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void BoundOwnerDenialReleaseResetRetainsBudgetUntilExactOwnerClosure(bool terminal)
+    {
+        var c = BoundCancellationContext(terminalProvider: terminal);
+        c.Provider.InjectResetBeforeNextRelease();
+        var callbacks = 0;
+        var denied = c.Coordinator.SubmitBoundExternalOperation(c.Binding, new(2, 2),
+            KernelResult.Ok, KernelResult.Ok, KernelResult.Ok,
+            () => { callbacks++; return KernelResult.Ok(); });
+        Assert.Equal(KernelError.ExternalEffectUncontained, denied.Error);
+        Assert.Equal(0, callbacks);
+        Assert.Equal(BudgetReservationState.Quarantined, c.Kernel.Budgets.Query(c.Budget).Value!.State);
+        Assert.Equal(V6TemporalProviderReservationState.Quarantined,
+            c.Provider.Query(c.Binding.ProviderReservation.Handle).Value!.State);
+        Assert.Equal(40UL, c.Provider.ReservedNanoseconds);
+        var owner = c.Kernel.QueryExternalOperation(c.Owner, c.Operation).Value!;
+        Assert.Equal(ExternalOperationDisposition.Cancelled, owner.Disposition);
+        Assert.DoesNotContain(owner.Transitions, transition => transition.Event == "Submitted");
+        Assert.Equal(KernelError.ExternalEffectUncontained,
+            c.Coordinator.ReconcileQuarantinedBoundExternalOperation(c.Binding).Error);
+        Assert.Equal(BudgetReservationState.Quarantined, c.Kernel.Budgets.Query(c.Budget).Value!.State);
+
+        Assert.True(c.Kernel.ReleaseExternalOperation(c.Owner, c.Operation,
+            new(ProviderResourcesClosed: false, ProviderUnavailable: false)).IsSuccess);
+        var reconciled = c.Coordinator.ReconcileQuarantinedBoundExternalOperation(c.Binding);
+        Assert.True(reconciled.IsSuccess, reconciled.Message);
+        Assert.Equal(BudgetReservationState.Released, c.Kernel.Budgets.Query(c.Budget).Value!.State);
+        Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+    }
+
+    [Fact]
+    public async Task ConcurrentProviderUseAndCancellationHaveOneClosureOrder()
+    {
+        for (var repeat = 0; repeat < 12; repeat++)
+        {
+            var c = Create(100, 100, 40);
+            var binding = c.Coordinator.Admit(c.Owner, c.Budget, "cancel-use-race", Temporal(40)).Value!;
+            var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var use = Task.Run(async () => { await start.Task; return c.Provider.BeginUse(binding.ProviderReservation.Handle); });
+            var cancel = Task.Run(async () => { await start.Task; return c.Coordinator.CancelAdmitted(binding); });
+            start.SetResult();
+            await Task.WhenAll(use, cancel);
+            if (use.Result.IsSuccess)
+            {
+                Assert.False(cancel.Result.IsSuccess);
+                Assert.Equal(BudgetReservationState.Quarantined, c.Budgets.Query(c.Budget).Value!.State);
+                Assert.Equal(V6TemporalProviderReservationState.Quarantined,
+                    c.Provider.Query(binding.ProviderReservation.Handle).Value!.State);
+                Assert.Equal(40UL, c.Provider.ReservedNanoseconds);
+            }
+            else
+            {
+                Assert.True(cancel.Result.IsSuccess, cancel.Result.Message);
+                Assert.Equal(BudgetReservationState.CancelledPreSubmit, c.Budgets.Query(c.Budget).Value!.State);
+                Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ChangedProviderUseBeforeSubmitCannotTurnIntoBudgetCancellation(bool quarantined)
+    {
+        var c = Create(100, 100, 40);
+        var binding = c.Coordinator.Admit(c.Owner, c.Budget, "submit-closure-fault", Temporal(40)).Value!;
+        var callbacks = 0;
+        var result = c.Coordinator.Submit(binding, KernelResult.Ok, KernelResult.Ok, () =>
+        {
+            Assert.True((quarantined ? c.Provider.Quarantine(binding.ProviderReservation.Handle)
+                : c.Provider.BeginUse(binding.ProviderReservation.Handle)).IsSuccess);
+            return KernelResult.Ok();
+        }, () => { callbacks++; return KernelResult.Ok(); });
+        Assert.False(result.IsSuccess);
+        Assert.Equal(0, callbacks);
+        Assert.Equal(BudgetReservationState.Quarantined, c.Budgets.Query(c.Budget).Value!.State);
+        Assert.Equal(V6TemporalProviderReservationState.Quarantined,
+            c.Provider.Query(binding.ProviderReservation.Handle).Value!.State);
+        Assert.Equal(40UL, c.Provider.ReservedNanoseconds);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void CancellationWithoutExactUnusedProviderClosureCannotRefundBudget(int fault)
+    {
+        var c = Create(100, 100, 40);
+        if (fault == 2)
+            typeof(V6ManagedTemporalCapacityProvider).GetField("_providerGeneration",
+                global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!
+                .SetValue(c.Provider, ulong.MaxValue);
+        var binding = c.Coordinator.Admit(c.Owner, c.Budget, "cancel-closure-fault", Temporal(40)).Value!;
+        if (fault == 0) Assert.True(c.Provider.BeginUse(binding.ProviderReservation.Handle).IsSuccess);
+        if (fault == 1) Assert.True(c.Provider.Quarantine(binding.ProviderReservation.Handle).IsSuccess);
+        if (fault == 2) c.Provider.InjectResetBeforeNextRelease();
+
+        Assert.False(c.Coordinator.CancelAdmitted(binding).IsSuccess);
+        Assert.Equal(BudgetReservationState.Quarantined, c.Budgets.Query(c.Budget).Value!.State);
+        Assert.Equal(V6TemporalProviderReservationState.Quarantined,
+            c.Provider.Query(binding.ProviderReservation.Handle).Value!.State);
+        Assert.Equal(40UL, c.Provider.ReservedNanoseconds);
+        Assert.Equal(KernelError.BudgetExceeded, c.Budgets.Reserve(c.Owner, [Amount(100)],
+            BudgetReservationLifetime.ExternalEffect, AdmissionQosHint.None).Error);
+        Assert.False(c.Coordinator.CancelAdmitted(binding).IsSuccess);
+        Assert.Equal(BudgetReservationState.Quarantined, c.Budgets.Query(c.Budget).Value!.State);
+    }
+
+    private static void AssertBudgetSnapshotEqual(BudgetReservationSnapshot expected, BudgetReservationSnapshot actual)
+    {
+        Assert.Equal(expected with { Amounts = actual.Amounts, ChargedAmounts = actual.ChargedAmounts }, actual);
+        Assert.Equal<BudgetAmount>(expected.Amounts, actual.Amounts);
+        Assert.Equal<BudgetAmount>(expected.ChargedAmounts!, actual.ChargedAmounts!);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ReservationSnapshotCollectionsCannotMutateOwnerFacts(bool charged)
+    {
+        var c = Create(100, 100, 40);
+        if (charged)
+        {
+            Assert.True(c.Budgets.BeginConsumption(c.Owner, c.Budget).IsSuccess);
+            Assert.True(c.Budgets.SettleLease(c.Owner, c.Budget, [Amount(5)]).IsSuccess);
+        }
+        var snapshot = c.Budgets.Query(c.Budget).Value!;
+        var values = charged ? snapshot.ChargedAmounts! : snapshot.Amounts;
+        var mutable = Assert.IsAssignableFrom<IList<BudgetAmount>>(values);
+        Assert.True(mutable.IsReadOnly);
+        Assert.Throws<NotSupportedException>(() => mutable[0] = Amount(0));
+        var fresh = c.Budgets.Query(c.Budget).Value!;
+        Assert.NotSame(values, charged ? fresh.ChargedAmounts : fresh.Amounts);
+        Assert.Equal(charged ? 5UL : 40UL, (charged ? fresh.ChargedAmounts! : fresh.Amounts).Single().Amount);
+        if (charged) Assert.True(c.Budgets.IsExactSettledExternalLease(c.Owner, c.Budget, 5));
+        else
+        {
+            Assert.True(c.Budgets.CancelLeasePreSubmit(c.Owner, c.Budget).IsSuccess);
+            _ = BoundBudget(c.Budgets, c.Owner, 100);
+        }
+    }
+
+    [Fact]
+    public async Task ConcurrentSnapshotMutationCannotChangeReservationOrRefund()
+    {
+        var c = Create(100, 100, 40);
+        await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => Task.Run(() =>
+        {
+            var snapshot = c.Budgets.Query(c.Budget).Value!;
+            var list = Assert.IsAssignableFrom<IList<BudgetAmount>>(snapshot.Amounts);
+            Assert.Throws<NotSupportedException>(() => list[0] = Amount(0));
+        })));
+        Assert.Equal(40UL, c.Budgets.Query(c.Budget).Value!.Amounts.Single().Amount);
+        Assert.True(c.Budgets.CancelLeasePreSubmit(c.Owner, c.Budget).IsSuccess);
+        _ = BoundBudget(c.Budgets, c.Owner, 100);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void ForeignSettlementConsumerCannotMutateClaimedBudget(int method)
+    {
+        var c = Create(100, 100, 40);
+        var binding = c.Coordinator.Admit(c.Owner, c.Budget, "foreign-settlement", Temporal(40)).Value!;
+        _ = c.Coordinator.Submit(binding, KernelResult.Ok, KernelResult.Ok, KernelResult.Ok,
+            () => method == 0 ? KernelResult.Ok() : KernelResult.Fail(KernelError.PlatformUnavailable, "lost"));
+        var before = c.Budgets.Query(c.Budget).Value!;
+        var foreign = Guid.NewGuid();
+        var result = method switch
+        {
+            0 => c.Budgets.SettleLease(c.Owner, c.Budget, [], foreign),
+            1 => c.Budgets.ReconcileLease(c.Owner, c.Budget, foreign),
+            _ => c.Budgets.SettleReportedComputeOverrun(c.Owner, c.Budget, 45, foreign),
+        };
+        Assert.Equal(KernelError.InvalidTransition, result.Error);
+        AssertBudgetSnapshotEqual(before, c.Budgets.Query(c.Budget).Value!);
+        Assert.Equal(40UL, c.Provider.ReservedNanoseconds);
+    }
+
+    [Fact]
+    public async Task GenericSettlementCannotOvertakeTemporalSettlementOrReuseTerminalResponse()
+    {
+        var c = Create(100, 100, 40);
+        var binding = c.Coordinator.Admit(c.Owner, c.Budget, "settlement-race", Temporal(40)).Value!;
+        var submitted = c.Coordinator.Submit(binding, KernelResult.Ok, KernelResult.Ok, KernelResult.Ok, KernelResult.Ok).Value!;
+        var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var generic = Task.Run(async () => { await start.Task; return c.Budgets.SettleLease(c.Owner, c.Budget, []); });
+        var exact = Task.Run(async () => { await start.Task; return c.Coordinator.Settle(submitted, 5); });
+        start.SetResult();
+        Assert.Equal(KernelError.InvalidTransition, (await generic).Error);
+        Assert.True((await exact).IsSuccess);
+        var terminal = c.Budgets.Query(c.Budget).Value!;
+        Assert.Equal(5UL, terminal.ChargedAmounts!.Single().Amount);
+        Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+        Assert.Equal(KernelError.InvalidTransition, c.Budgets.SettleLease(c.Owner, c.Budget, []).Error);
+        AssertBudgetSnapshotEqual(terminal, c.Budgets.Query(c.Budget).Value!);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void GenericSettlementOrReconciliationCannotCloseTemporalBudget(bool quarantined)
+    {
+        var c = Create(100, 100, 40);
+        var binding = c.Coordinator.Admit(c.Owner, c.Budget, "settlement-owner", Temporal(40)).Value!;
+        var submitted = c.Coordinator.Submit(binding, KernelResult.Ok, KernelResult.Ok, KernelResult.Ok,
+            () => quarantined ? KernelResult.Fail(KernelError.PlatformUnavailable, "lost receipt") : KernelResult.Ok());
+        Assert.Equal(!quarantined, submitted.IsSuccess);
+        var before = c.Budgets.Query(c.Budget).Value!;
+        var generic = quarantined ? c.Budgets.ReconcileLease(c.Owner, c.Budget) : c.Budgets.SettleLease(c.Owner, c.Budget, []);
+        Assert.Equal(KernelError.InvalidTransition, generic.Error);
+        AssertBudgetSnapshotEqual(before, c.Budgets.Query(c.Budget).Value!);
+        Assert.Equal(40UL, c.Provider.ReservedNanoseconds);
+    }
+
+    [Fact]
+    public void GenericCorrectiveSettlementCannotCloseClaimedOverrunBudget()
+    {
+        var c = Create(100, 100, 40);
+        var binding = c.Coordinator.Admit(c.Owner, c.Budget, "corrective-owner", Temporal(40)).Value!;
+        var submitted = c.Coordinator.Submit(binding, KernelResult.Ok, KernelResult.Ok, KernelResult.Ok, KernelResult.Ok).Value!;
+        Assert.Equal(KernelError.BudgetExceeded, c.Coordinator.Settle(submitted, 45).Error);
+        var before = c.Budgets.Query(c.Budget).Value!;
+        Assert.Equal(KernelError.InvalidTransition, c.Budgets.SettleReportedComputeOverrun(c.Owner, c.Budget, 45).Error);
+        AssertBudgetSnapshotEqual(before, c.Budgets.Query(c.Budget).Value!);
+        Assert.Equal(40UL, c.Provider.ReservedNanoseconds);
+        Assert.True(c.Coordinator.ReconcileReportedOverrun(binding, KernelResult.Ok).IsSuccess);
+        Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+        Assert.Equal(45UL, c.Budgets.Query(c.Budget).Value!.ChargedAmounts!.Single().Amount);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ProvisionalOrForeignCompositionCannotBeginConsumption(bool provisional)
+    {
+        var c = Create(100, 100, 40);
+        var id = Guid.NewGuid();
+        Assert.True(c.Budgets.ClaimTemporalComposition(c.Owner, c.Budget, id).IsSuccess);
+        if (!provisional) Assert.True(c.Budgets.CommitTemporalComposition(c.Owner, c.Budget, id).IsSuccess);
+        var before = c.Budgets.Query(c.Budget).Value!;
+        Assert.Equal(KernelError.InvalidTransition,
+            c.Budgets.BeginConsumption(c.Owner, c.Budget, provisional ? id : Guid.NewGuid()).Error);
+        AssertBudgetSnapshotEqual(before, c.Budgets.Query(c.Budget).Value!);
+        Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+    }
+
+    [Fact]
+    public void UnclaimedLegacyConsumptionRemainsCompatible()
+    {
+        var c = Create(100, 100, 40);
+        Assert.True(c.Budgets.BeginConsumption(c.Owner, c.Budget).IsSuccess);
+        Assert.Equal(BudgetReservationState.Consuming, c.Budgets.Query(c.Budget).Value!.State);
+        Assert.True(c.Budgets.SettleLease(c.Owner, c.Budget, [Amount(5)]).IsSuccess);
+        Assert.Equal(BudgetReservationState.Released, c.Budgets.Query(c.Budget).Value!.State);
+    }
+
+    [Fact]
+    public void AbandonedProvisionalClaimCannotBeUsedAsConsumptionIdentity()
+    {
+        var c = Create(100, 100, 40);
+        var id = Guid.NewGuid();
+        Assert.True(c.Budgets.ClaimTemporalComposition(c.Owner, c.Budget, id).IsSuccess);
+        c.Budgets.AbandonTemporalComposition(c.Owner, c.Budget, id);
+        Assert.Equal(KernelError.InvalidTransition, c.Budgets.BeginConsumption(c.Owner, c.Budget, id).Error);
+        Assert.Equal(BudgetReservationState.Bound, c.Budgets.Query(c.Budget).Value!.State);
+        Assert.True(c.Budgets.BeginConsumption(c.Owner, c.Budget).IsSuccess);
+    }
+
+    [Fact]
+    public async Task GenericConsumerCannotOvertakeTemporalSubmit()
+    {
+        var c = Create(100, 100, 40);
+        var binding = c.Coordinator.Admit(c.Owner, c.Budget, "consumer-race", Temporal(40)).Value!;
+        var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        var generic = Task.Run(async () => { await start.Task; return c.Budgets.BeginConsumption(c.Owner, c.Budget); });
+        var submit = Task.Run(async () =>
+        {
+            await start.Task;
+            return c.Coordinator.Submit(binding, KernelResult.Ok, KernelResult.Ok, KernelResult.Ok,
+                () => { calls++; return KernelResult.Ok(); });
+        });
+        start.SetResult();
+        Assert.Equal(KernelError.InvalidTransition, (await generic).Error);
+        var submitted = await submit;
+        Assert.True(submitted.IsSuccess, submitted.Message);
+        Assert.Equal(1, calls);
+        Assert.Equal(40UL, c.Provider.ReservedNanoseconds);
+        Assert.True(c.Coordinator.Settle(submitted.Value!, 5).IsSuccess);
+        Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+    }
+
+    [Fact]
+    public void GenericConsumptionCannotTakeClaimedTemporalLease()
+    {
+        var c = Create(100, 100, 40);
+        var binding = c.Coordinator.Admit(c.Owner, c.Budget, "claimed-consumer", Temporal(40)).Value!;
+        var before = c.Budgets.Query(c.Budget).Value!;
+        Assert.Equal(KernelError.InvalidTransition, c.Budgets.BeginConsumption(c.Owner, c.Budget).Error);
+        AssertBudgetSnapshotEqual(before, c.Budgets.Query(c.Budget).Value!);
+        Assert.Equal(40UL, c.Provider.ReservedNanoseconds);
+        var callbacks = 0;
+        var submitted = c.Coordinator.Submit(binding, KernelResult.Ok, KernelResult.Ok, KernelResult.Ok,
+            () => { callbacks++; return KernelResult.Ok(); });
+        Assert.True(submitted.IsSuccess, submitted.Message);
+        Assert.Equal(1, callbacks);
+        Assert.True(c.Coordinator.Settle(submitted.Value!, 5).IsSuccess);
+        Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void StaleOrForeignCompositionCommitCannotMutateExactClaim(int mismatch)
+    {
+        var c = Create(100, 100, 40);
+        var id = Guid.NewGuid();
+        Assert.True(c.Budgets.ClaimTemporalComposition(c.Owner, c.Budget, id).IsSuccess);
+        var owner = mismatch == 0 ? c.Owner with { Generation = c.Owner.Generation + 1 } : c.Owner;
+        var budget = mismatch == 1 ? c.Budget with { Generation = new(c.Budget.Generation.Value + 1) } : c.Budget;
+        Assert.False(c.Budgets.CommitTemporalComposition(owner, budget, mismatch == 2 ? Guid.NewGuid() : id).IsSuccess);
+        Assert.Equal(BudgetReservationState.Bound, c.Budgets.Query(c.Budget).Value!.State);
+        Assert.Equal(KernelError.DuplicateIdentity,
+            c.Budgets.ClaimTemporalComposition(c.Owner, c.Budget, Guid.NewGuid()).Error);
+        Assert.True(c.Budgets.CommitTemporalComposition(c.Owner, c.Budget, id).IsSuccess);
+        c.Budgets.AbandonTemporalComposition(c.Owner, c.Budget, id);
+        Assert.Equal(KernelError.DuplicateIdentity,
+            c.Budgets.ClaimTemporalComposition(c.Owner, c.Budget, Guid.NewGuid()).Error);
+        Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+    }
+
+    [Fact]
+    public async Task CompositionCommitAndAbandonHaveOneOwnerBoundary()
+    {
+        var c = Create(100, 100, 40);
+        var id = Guid.NewGuid();
+        Assert.True(c.Budgets.ClaimTemporalComposition(c.Owner, c.Budget, id).IsSuccess);
+        var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var commit = Task.Run(async () =>
+        {
+            await start.Task;
+            return c.Budgets.CommitTemporalComposition(c.Owner, c.Budget, id);
+        });
+        var abandon = Task.Run(async () =>
+        {
+            await start.Task;
+            c.Budgets.AbandonTemporalComposition(c.Owner, c.Budget, id);
+        });
+        start.SetResult();
+        var committed = await commit;
+        await abandon;
+        var next = c.Budgets.ClaimTemporalComposition(c.Owner, c.Budget, Guid.NewGuid());
+        if (committed.IsSuccess) Assert.Equal(KernelError.DuplicateIdentity, next.Error);
+        else Assert.True(next.IsSuccess, next.Message);
+        Assert.Equal(BudgetReservationState.Bound, c.Budgets.Query(c.Budget).Value!.State);
+        Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void PublishedCompositionCannotBeAbandonedEvenWithExactId(bool bound)
+    {
+        var c = BoundCancellationContext(admitBinding: bound);
+        var first = bound ? c.Binding : c.Coordinator.Admit(c.Owner, c.Budget, "published-claim", Temporal(40)).Value!;
+        c.Kernel.Budgets.AbandonTemporalComposition(c.Owner, c.Budget, first.Id);
+        var other = new V6TemporalCapacityCoordinator(c.Kernel, c.Provider);
+        Assert.Equal(KernelError.DuplicateIdentity,
+            other.Admit(c.Owner, c.Budget, "after-exact-rollback", Temporal(40)).Error);
+        Assert.Equal(40UL, c.Provider.ReservedNanoseconds);
+        Assert.Equal(BudgetReservationState.Bound, c.Kernel.Budgets.Query(c.Budget).Value!.State);
+        Assert.True(c.Coordinator.CancelAdmitted(first).IsSuccess);
+        Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void UnusedCompensationCannotReleaseInUseOrQuarantinedCapacity(bool quarantined)
+    {
+        var provider = new V6ManagedTemporalCapacityProvider(100);
+        var reservation = provider.Reserve("unused-only-compensation", Temporal(40).ComputeEnvelope).Value!;
+        Assert.True(provider.BeginUse(reservation.Handle).IsSuccess);
+        if (quarantined) Assert.True(provider.Quarantine(reservation.Handle).IsSuccess);
+        var before = provider.Query(reservation.Handle).Value!;
+        Assert.Equal(KernelError.InvalidTransition, provider.Release(reservation.Handle, unusedOnly: true).Error);
+        Assert.Equal(before, provider.Query(reservation.Handle).Value!);
+        Assert.Equal(40UL, provider.ReservedNanoseconds);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    public void BoundAdmissionRevalidatesOwnerAfterInitialRead(int transition)
+    {
+        var c = BoundCancellationContext(terminalProvider: transition == 3, admitBinding: false);
+        if (transition >= 3) c.Provider.InjectResetBeforeNextRelease();
+        var gate = typeof(V6TemporalCapacityCoordinator).GetField("_sync",
+            global::System.Reflection.BindingFlags.Instance |
+            global::System.Reflection.BindingFlags.NonPublic)!.GetValue(c.Coordinator)!;
+        KernelResult<V6TemporalCapacityBinding> result = default;
+        Exception? workerFailure = null;
+        var worker = new Thread(() =>
+        {
+            try { result = c.Coordinator.AdmitBoundToExternalOperation(c.Owner, c.Budget, c.Operation, Temporal(40)); }
+            catch (Exception exception) { workerFailure = exception; }
+        });
+        Monitor.Enter(gate);
+        try
+        {
+            worker.Start();
+            // The fresh worker has no other contended lock: waiting here means
+            // it completed the initial owner query and reached coordinator admission.
+            Assert.True(SpinWait.SpinUntil(() =>
+                (worker.ThreadState & ThreadState.WaitSleepJoin) != 0, TimeSpan.FromSeconds(10)));
+            if (transition == 1)
+                Assert.True(c.Kernel.RecordExternalOperationSubmission(c.Owner, c.Operation, new(1, 1)).IsSuccess);
+            else
+            {
+                Assert.True(c.Kernel.CancelExternalOperation(c.Owner, c.Operation, false).IsSuccess);
+                if (transition == 2)
+                    Assert.True(c.Kernel.ReleaseExternalOperation(c.Owner, c.Operation,
+                        new(ProviderResourcesClosed: false, ProviderUnavailable: false)).IsSuccess);
+            }
+        }
+        finally
+        {
+            Monitor.Exit(gate);
+            Assert.True(worker.Join(TimeSpan.FromSeconds(10)));
+        }
+        Assert.Null(workerFailure);
+        Assert.Equal(transition == 3 ? KernelError.ExternalEffectUncontained : KernelError.InvalidTransition, result.Error);
+        Assert.Null(result.Value);
+        Assert.Equal(transition == 3 ? 40UL : 0UL, c.Provider.ReservedNanoseconds);
+        Assert.Equal(transition == 3 ? BudgetReservationState.Quarantined : BudgetReservationState.Bound,
+            c.Kernel.Budgets.Query(c.Budget).Value!.State);
+        if (transition is 0 or 2 or 4)
+        {
+            var retry = new V6TemporalCapacityCoordinator(c.Kernel, c.Provider)
+                .Admit(c.Owner, c.Budget, "fresh-after-unpublished-reserve", Temporal(40));
+            Assert.True(retry.IsSuccess, retry.Message);
+            if (transition == 4) Assert.Equal(2UL, c.Provider.ProviderGeneration);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void StaleTemporalCompositionAdmissionCannotConsumeExactBudgetClaim(bool staleOwner)
+    {
+        var c = Create(100, 100, 40);
+        var other = new V6TemporalCapacityCoordinator(c.Budgets, c.Provider);
+        var owner = staleOwner ? c.Owner with { Generation = c.Owner.Generation + 1 } : c.Owner;
+        var budget = staleOwner ? c.Budget : c.Budget with
+        { Generation = new(c.Budget.Generation.Value + 1) };
+        Assert.False(other.Admit(owner, budget, "stale-composition", Temporal(40)).IsSuccess);
+        Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+        var exact = c.Coordinator.Admit(c.Owner, c.Budget, "exact-composition", Temporal(40));
+        Assert.True(exact.IsSuccess, exact.Message);
+        Assert.True(c.Coordinator.CancelAdmitted(exact.Value!).IsSuccess);
+    }
+
+    [Fact]
+    public void ForeignCompositionRollbackCannotRemoveWinnerClaim()
+    {
+        var c = Create(100, 100, 40);
+        var first = c.Coordinator.Admit(c.Owner, c.Budget, "winner-claim", Temporal(40)).Value!;
+        c.Budgets.AbandonTemporalComposition(c.Owner, c.Budget, Guid.NewGuid());
+        var other = new V6TemporalCapacityCoordinator(c.Budgets, c.Provider);
+        Assert.Equal(KernelError.DuplicateIdentity,
+            other.Admit(c.Owner, c.Budget, "foreign-rollback", Temporal(40)).Error);
+        Assert.Equal(40UL, c.Provider.ReservedNanoseconds);
+        Assert.True(c.Coordinator.CancelAdmitted(first).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DifferentCoordinatorsCannotComposeOneBudgetTwice(bool differentProvider)
+    {
+        var c = Create(100, 100, 40);
+        var first = c.Coordinator.Admit(c.Owner, c.Budget, "first-coordinator", Temporal(40)).Value!;
+        var otherProvider = differentProvider ? new V6ManagedTemporalCapacityProvider(100) : c.Provider;
+        var other = new V6TemporalCapacityCoordinator(c.Budgets, otherProvider);
+        Assert.Equal(KernelError.DuplicateIdentity,
+            other.Admit(c.Owner, c.Budget, "second-coordinator", Temporal(40)).Error);
+        Assert.Equal(40UL, c.Provider.ReservedNanoseconds);
+        if (differentProvider) Assert.Equal(0UL, otherProvider.ReservedNanoseconds);
+        Assert.Equal(BudgetReservationState.Bound, c.Budgets.Query(c.Budget).Value!.State);
+        Assert.True(c.Coordinator.CancelAdmitted(first).IsSuccess);
+        Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+    }
+
+    [Fact]
+    public void FailedProviderReserveDoesNotRetainBudgetCompositionClaim()
+    {
+        var c = Create(100, 100, 40);
+        var small = new V6ManagedTemporalCapacityProvider(20);
+        var rejected = new V6TemporalCapacityCoordinator(c.Budgets, small);
+        Assert.Equal(KernelError.BudgetExceeded,
+            rejected.Admit(c.Owner, c.Budget, "too-large", Temporal(40)).Error);
+        Assert.Equal(0UL, small.ReservedNanoseconds);
+        var accepted = c.Coordinator.Admit(c.Owner, c.Budget, "retry-other-provider", Temporal(40));
+        Assert.True(accepted.IsSuccess, accepted.Message);
+        Assert.True(c.Coordinator.CancelAdmitted(accepted.Value!).IsSuccess);
+    }
+
+    [Fact]
+    public async Task DifferentCoordinatorsHaveOneBudgetCompositionWinner()
+    {
+        var c = Create(400, 400, 40);
+        var coordinators = Enumerable.Range(0, 8)
+            .Select(_ => new V6TemporalCapacityCoordinator(c.Budgets, c.Provider)).ToArray();
+        var results = await Task.WhenAll(coordinators.Select((coordinator, index) => Task.Run(() =>
+            coordinator.Admit(c.Owner, c.Budget, $"cross-coordinator:{index}", Temporal(40)))));
+        var winner = Assert.Single(results, result => result.IsSuccess).Value!;
+        Assert.All(results.Where(result => !result.IsSuccess),
+            result => Assert.Equal(KernelError.DuplicateIdentity, result.Error));
+        Assert.Equal(40UL, c.Provider.ReservedNanoseconds);
+        Assert.True(coordinators[Array.FindIndex(results, result => result.IsSuccess)].CancelAdmitted(winner).IsSuccess);
+        Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+    }
+
+    [Fact]
+    public void TerminalResetInsideBoundSubmitRetainsBothReservationsDespiteUnchangedGeneration()
+    {
+        var c = BoundCancellationContext(terminalProvider: true);
+        var callbacks = 0;
+        var result = c.Coordinator.SubmitBoundExternalOperation(c.Binding, new(1, 1),
+            KernelResult.Ok, KernelResult.Ok, KernelResult.Ok, () =>
+            {
+                callbacks++;
+                Assert.Equal(KernelError.CapacityExhausted, c.Provider.Reset().Error);
+                return KernelResult.Ok();
+            });
+        Assert.Equal(KernelError.StaleGeneration, result.Error);
+        Assert.Equal(1, callbacks);
+        Assert.Equal(ulong.MaxValue, c.Provider.ProviderGeneration);
+        Assert.Equal(40UL, c.Provider.ReservedNanoseconds);
+        Assert.Equal(V6TemporalProviderReservationState.Quarantined,
+            c.Provider.Query(c.Binding.ProviderReservation.Handle).Value!.State);
+        Assert.Equal(BudgetReservationState.Quarantined, c.Kernel.Budgets.Query(c.Budget).Value!.State);
+        Assert.Equal(ExternalOperationState.Submitted,
+            c.Kernel.QueryExternalOperation(c.Owner, c.Operation).Value!.State);
+        Assert.Equal(KernelError.ExternalEffectUncontained,
+            c.Coordinator.ReconcileQuarantinedBoundExternalOperation(c.Binding).Error);
+        Assert.Equal(40UL, c.Provider.ReservedNanoseconds);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ExhaustedProviderResetCannotLeaveOldGenerationUsable(bool inUse)
+    {
+        var provider = new V6ManagedTemporalCapacityProvider(100);
+        typeof(V6ManagedTemporalCapacityProvider).GetField("_providerGeneration",
+            global::System.Reflection.BindingFlags.Instance |
+            global::System.Reflection.BindingFlags.NonPublic)!.SetValue(provider, ulong.MaxValue);
+        var reservation = provider.Reserve("terminal-generation", Temporal(40).ComputeEnvelope).Value!;
+        if (inUse) Assert.True(provider.BeginUse(reservation.Handle).IsSuccess);
+
+        Assert.Equal(KernelError.CapacityExhausted, provider.Reset().Error);
+        Assert.Equal(ulong.MaxValue, provider.ProviderGeneration);
+        Assert.Equal(40UL, provider.ReservedNanoseconds);
+        Assert.Equal(V6TemporalProviderReservationState.Quarantined,
+            provider.Query(reservation.Handle).Value!.State);
+        Assert.False(provider.BeginUse(reservation.Handle).IsSuccess);
+        Assert.False(provider.Release(reservation.Handle).IsSuccess);
+        Assert.Equal(KernelError.CapacityExhausted,
+            provider.Reserve("fresh-after-terminal-reset", Temporal(40).ComputeEnvelope).Error);
+        Assert.Equal(KernelError.CapacityExhausted, provider.Reset().Error);
+        Assert.Equal(40UL, provider.ReservedNanoseconds);
+        Assert.True(provider.ReconcileAndRelease(reservation.Handle).IsSuccess);
+        Assert.Equal(0UL, provider.ReservedNanoseconds);
+        Assert.Equal(KernelError.CapacityExhausted,
+            provider.Reserve("after-explicit-model-reconciliation", Temporal(40).ComputeEnvelope).Error);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void BoundCancellationResetCannotTurnSubmittedEffectIntoNoEffectRelease(bool submitted)
+    {
+        var c = BoundCancellationContext();
+        var generation = c.Provider.ProviderGeneration;
+        if (submitted)
+            Assert.True(c.Kernel.RecordExternalOperationSubmission(c.Owner, c.Operation, new(1, 1)).IsSuccess);
+        c.Provider.InjectResetBeforeNextRelease();
+        var cancellation = c.Coordinator.CancelAdmitted(c.Binding);
+        if (!submitted)
+        {
+            Assert.True(cancellation.IsSuccess, cancellation.Message);
+            Assert.Equal(generation + 1, c.Provider.ProviderGeneration);
+            Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+            Assert.Equal(BudgetReservationState.CancelledPreSubmit, c.Kernel.Budgets.Query(c.Budget).Value!.State);
+            Assert.Equal(ExternalOperationDisposition.Cancelled,
+                c.Kernel.QueryExternalOperation(c.Owner, c.Operation).Value!.Disposition);
+            Assert.Equal(KernelError.InvalidTransition,
+                c.Kernel.RecordExternalOperationSubmission(c.Owner, c.Operation, new(1, 1)).Error);
+        }
+        else
+        {
+            Assert.Equal(KernelError.ExternalEffectUncontained, cancellation.Error);
+            Assert.Equal(generation, c.Provider.ProviderGeneration);
+            Assert.Equal(KernelError.InvalidTransition, c.Provider.Release(c.Binding.ProviderReservation.Handle).Error);
+            Assert.Equal(generation, c.Provider.ProviderGeneration);
+            Assert.True(c.Provider.Reset().IsSuccess);
+            Assert.Equal(generation + 1, c.Provider.ProviderGeneration);
+            Assert.Equal(40UL, c.Provider.ReservedNanoseconds);
+            Assert.Equal(V6TemporalProviderReservationState.Quarantined,
+                c.Provider.Query(c.Binding.ProviderReservation.Handle).Value!.State);
+            Assert.Equal(BudgetReservationState.Quarantined, c.Kernel.Budgets.Query(c.Budget).Value!.State);
+            Assert.Equal(KernelError.ExternalEffectUncontained,
+                c.Coordinator.ReconcileQuarantinedBoundExternalOperation(c.Binding).Error);
+            Assert.Equal(40UL, c.Provider.ReservedNanoseconds);
+        }
+    }
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task BoundCancelAndSubmitOverlapPreservesTheWinningOwnerBoundary(bool callbackInFlight)
+    {
+        var c = BoundCancellationContext();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var proceed = new ManualResetEventSlim(false);
+        var callbacks = 0;
+        KernelResult Pause()
+        {
+            entered.TrySetResult();
+            if (!proceed.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException("Temporal overlap rendezvous.");
+            return KernelResult.Ok();
+        }
+        var submit = Task.Run(() => c.Coordinator.SubmitBoundExternalOperation(c.Binding, new(1, 1),
+            callbackInFlight ? KernelResult.Ok : Pause, KernelResult.Ok, KernelResult.Ok,
+            () => { callbacks++; return callbackInFlight ? Pause() : KernelResult.Ok(); }));
+        KernelResult<V6TemporalCapacityBinding> result;
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            var cancellation = c.Coordinator.CancelAdmitted(c.Binding);
+            if (callbackInFlight)
+            {
+                Assert.Equal(KernelError.InvalidTransition, cancellation.Error);
+                Assert.Equal(40UL, c.Provider.ReservedNanoseconds);
+                Assert.Equal(BudgetReservationState.Consuming, c.Kernel.Budgets.Query(c.Budget).Value!.State);
+            }
+            else
+            {
+                Assert.True(cancellation.IsSuccess, cancellation.Message);
+                Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+                Assert.Equal(ExternalOperationDisposition.Cancelled,
+                    c.Kernel.QueryExternalOperation(c.Owner, c.Operation).Value!.Disposition);
+            }
+        }
+        finally { proceed.Set(); result = await submit; }
+        Assert.Equal(callbackInFlight ? 1 : 0, callbacks);
+        Assert.Equal(callbackInFlight, result.IsSuccess);
+        Assert.Equal(callbackInFlight ? BudgetReservationState.Consuming : BudgetReservationState.CancelledPreSubmit,
+            c.Kernel.Budgets.Query(c.Budget).Value!.State);
+    }
+
+    [Fact]
+    public void FailedBoundBudgetCancellationClearsInterlockWithoutInventingEffectClosure()
+    {
+        var c = BoundCancellationContext();
+        Assert.True(c.Kernel.Budgets.QuarantineLease(c.Owner, c.Budget).IsSuccess);
+        Assert.False(c.Coordinator.CancelAdmitted(c.Binding).IsSuccess);
+        Assert.Equal(40UL, c.Provider.ReservedNanoseconds);
+        Assert.Equal(ExternalOperationDisposition.Cancelled,
+            c.Kernel.QueryExternalOperation(c.Owner, c.Operation).Value!.Disposition);
+        var callbacks = 0;
+        Assert.False(c.Coordinator.SubmitBoundExternalOperation(c.Binding, new(1, 1),
+            KernelResult.Ok, KernelResult.Ok, KernelResult.Ok,
+            () => { callbacks++; return KernelResult.Ok(); }).IsSuccess);
+        Assert.Equal(0, callbacks);
+        Assert.Equal(0UL, c.Provider.ReservedNanoseconds);
+        Assert.Equal(BudgetReservationState.Quarantined, c.Kernel.Budgets.Query(c.Budget).Value!.State);
+    }
+
+    private static (RuntimeKernel Kernel, ProcessHandle Owner, BudgetReservationHandle Budget,
+        ExternalOperationHandle Operation, V6ManagedTemporalCapacityProvider Provider,
+        V6TemporalCapacityCoordinator Coordinator, V6TemporalCapacityBinding Binding) BoundCancellationContext(bool terminalProvider = false, bool admitBinding = true)
+    {
+        var kernel = new RuntimeKernel();
+        var admin = TestFixtures.Create(kernel, 9970, 9971).Handle;
+        var owner = TestFixtures.Create(kernel, 9972, 9973).Handle;
+        var authority = kernel.MintCapability(new(9971), admin, ResourceKind.KernelService,
+            CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        Assert.True(kernel.AdmitProcessBudget(admin, authority, owner, "temporal-overlap", [Amount(100)]).IsSuccess);
+        var budget = BoundBudget(kernel.Budgets, owner, 40);
+        var output = kernel.AllocateBuffer<byte>(owner, 8).Value!;
+        var operation = kernel.PrepareExternalOperation(owner,
+            [new(output.Handle, RegionUseMode.StagedOutput, new(0, 8))],
+            ExternalVisibilityRequirement.PublicationFence, ExternalPublicationPolicy.Staged).Value!.Operation;
+        Assert.True(kernel.AdmitExternalOperation(owner, operation, new(1, 1), new("temporal-overlap-provider")).IsSuccess);
+        var provider = new V6ManagedTemporalCapacityProvider(100);
+        if (terminalProvider)
+            typeof(V6ManagedTemporalCapacityProvider).GetField("_providerGeneration",
+                global::System.Reflection.BindingFlags.Instance |
+                global::System.Reflection.BindingFlags.NonPublic)!.SetValue(provider, ulong.MaxValue);
+        var coordinator = new V6TemporalCapacityCoordinator(kernel, provider);
+        var binding = admitBinding ? coordinator.AdmitBoundToExternalOperation(owner, budget, operation, Temporal(40)).Value! : null!;
+        return (kernel, owner, budget, operation, provider, coordinator, binding);
+    }
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void BoundCancellationRequiresOwnerPreSubmitClosureAndPreservesSubmittedPins(bool submitted)
+    {
+        var kernel = new RuntimeKernel();
+        var admin = TestFixtures.Create(kernel, 9960, 9961).Handle;
+        var owner = TestFixtures.Create(kernel, 9962, 9963).Handle;
+        var authority = kernel.MintCapability(new(9961), admin, ResourceKind.KernelService,
+            CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        Assert.True(kernel.AdmitProcessBudget(admin, authority, owner, "temporal-bound-cancel", [Amount(100)]).IsSuccess);
+        var budget = BoundBudget(kernel.Budgets, owner, 40);
+        var output = kernel.AllocateBuffer<byte>(owner, 8).Value!;
+        var operation = kernel.PrepareExternalOperation(owner,
+            [new(output.Handle, RegionUseMode.StagedOutput, new(0, 8))],
+            ExternalVisibilityRequirement.PublicationFence, ExternalPublicationPolicy.Staged).Value!.Operation;
+        Assert.True(kernel.AdmitExternalOperation(owner, operation, new(1, 1), new("temporal-bound-cancel-provider")).IsSuccess);
+        var provider = new V6ManagedTemporalCapacityProvider(100);
+        var coordinator = new V6TemporalCapacityCoordinator(kernel, provider);
+        var bound = coordinator.AdmitBoundToExternalOperation(owner, budget, operation, Temporal(40)).Value!;
+        Assert.Equal(KernelError.InvalidTransition,
+            coordinator.CancelAdmitted(bound with { Owner = owner with { Generation = owner.Generation + 1 } }).Error);
+        Assert.Equal(ExternalOperationDisposition.Active, kernel.QueryExternalOperation(owner, operation).Value!.Disposition);
+        if (submitted) Assert.True(kernel.RecordExternalOperationSubmission(owner, operation, new(1, 1)).IsSuccess);
+        var cancelled = coordinator.CancelAdmitted(bound);
+        var effect = kernel.QueryExternalOperation(owner, operation).Value!;
+        if (submitted)
+        {
+            Assert.Equal(KernelError.ExternalEffectUncontained, cancelled.Error);
+            Assert.Equal(40UL, provider.ReservedNanoseconds);
+            Assert.Equal(BudgetReservationState.Quarantined, kernel.Budgets.Query(budget).Value!.State);
+            Assert.Equal(V6TemporalProviderReservationState.Quarantined, provider.Query(bound.ProviderReservation.Handle).Value!.State);
+            Assert.Equal(ExternalOperationDisposition.CancellationPending, effect.Disposition);
+        }
+        else
+        {
+            Assert.True(cancelled.IsSuccess, cancelled.Message);
+            Assert.Equal(0UL, provider.ReservedNanoseconds);
+            Assert.Equal(BudgetReservationState.CancelledPreSubmit, kernel.Budgets.Query(budget).Value!.State);
+            Assert.Equal(ExternalOperationDisposition.Cancelled, effect.Disposition);
+            Assert.Equal(KernelError.InvalidTransition, kernel.RecordExternalOperationSubmission(owner, operation, new(1, 1)).Error);
+        }
+    }
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CancelledPreSubmitOwnerCannotAcquireTemporalCapacityBinding(bool admitted)
+    {
+        var kernel = new RuntimeKernel();
+        var admin = TestFixtures.Create(kernel, 9950, 9951).Handle;
+        var owner = TestFixtures.Create(kernel, 9952, 9953).Handle;
+        var authority = kernel.MintCapability(new(9951), admin, ResourceKind.KernelService,
+            CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        Assert.True(kernel.AdmitProcessBudget(admin, authority, owner, "temporal-cancelled",
+            [Amount(100)]).IsSuccess);
+        var budget = BoundBudget(kernel.Budgets, owner, 40);
+        var output = kernel.AllocateBuffer<byte>(owner, 8).Value!;
+        var operation = kernel.PrepareExternalOperation(owner,
+            [new(output.Handle, RegionUseMode.StagedOutput, new(0, 8))],
+            ExternalVisibilityRequirement.PublicationFence, ExternalPublicationPolicy.Staged).Value!.Operation;
+        if (admitted) Assert.True(kernel.AdmitExternalOperation(owner, operation,
+            new(1, 1), new("temporal-cancelled-provider")).IsSuccess);
+        Assert.True(kernel.CancelExternalOperation(owner, operation, false).IsSuccess);
+        var provider = new V6ManagedTemporalCapacityProvider(100);
+        var coordinator = new V6TemporalCapacityCoordinator(kernel, provider);
+        Assert.Equal(KernelError.InvalidTransition,
+            coordinator.AdmitBoundToExternalOperation(owner, budget, operation, Temporal(40)).Error);
+        Assert.Equal(0UL, provider.ReservedNanoseconds);
+        Assert.Equal(BudgetReservationState.Bound, kernel.Budgets.Query(budget).Value!.State);
+        Assert.Equal(ExternalOperationDisposition.Cancelled,
+            kernel.QueryExternalOperation(owner, operation).Value!.Disposition);
+    }
+    [Fact]
+    public void CancellingDistinctBudgetBindingPreservesOtherAdmissionAndCapacity()
+    {
+        var context = Create(100, 100, 40);
+        var otherBudget = BoundBudget(context.Budgets, context.Owner, 40);
+        var first = context.Coordinator.Admit(context.Owner, context.Budget, "operation:isolated:first", Temporal(40)).Value!;
+        var second = context.Coordinator.Admit(context.Owner, otherBudget, "operation:isolated:second", Temporal(40)).Value!;
+        Assert.Equal(80UL, context.Provider.ReservedNanoseconds);
+        Assert.True(context.Coordinator.CancelAdmitted(first).IsSuccess);
+        Assert.Equal(40UL, context.Provider.ReservedNanoseconds);
+        Assert.Equal(BudgetReservationState.Bound, context.Budgets.Query(otherBudget).Value!.State);
+        var submitted = context.Coordinator.Submit(second, KernelResult.Ok, KernelResult.Ok, KernelResult.Ok, KernelResult.Ok);
+        Assert.True(submitted.IsSuccess, submitted.Message);
+        Assert.True(context.Coordinator.Settle(submitted.Value!, 10).IsSuccess);
+        Assert.Equal(0UL, context.Provider.ReservedNanoseconds);
+    }
+    [Fact]
+    public void OneBudgetCannotAcquireSecondTemporalBindingOrCancelFirstAdmission()
+    {
+        var context = Create(100, 100, 40);
+        var first = context.Coordinator.Admit(context.Owner, context.Budget, "operation:first", Temporal(40)).Value!;
+        var second = context.Coordinator.Admit(context.Owner, context.Budget, "operation:second", Temporal(40));
+        Assert.Equal(KernelError.DuplicateIdentity, second.Error);
+        Assert.Equal(40UL, context.Provider.ReservedNanoseconds);
+        Assert.Equal(BudgetReservationState.Bound, context.Budgets.Query(context.Budget).Value!.State);
+        var calls = 0;
+        var submitted = context.Coordinator.Submit(first, KernelResult.Ok, KernelResult.Ok, KernelResult.Ok,
+            () => { calls++; return KernelResult.Ok(); });
+        Assert.True(submitted.IsSuccess, submitted.Message);
+        Assert.Equal(1, calls);
+        Assert.True(context.Coordinator.Settle(submitted.Value!, 10).IsSuccess);
+        Assert.Equal(0UL, context.Provider.ReservedNanoseconds);
+    }
+
+    [Fact]
+    public async Task ConcurrentBudgetBindingAdmissionHasOneCapacityWinner()
+    {
+        var context = Create(100, 100, 40);
+        var admissions = await Task.WhenAll(Enumerable.Range(0, 8).Select(index => Task.Run(() =>
+            context.Coordinator.Admit(context.Owner, context.Budget, $"operation:race:{index}", Temporal(40)))));
+        var winner = Assert.Single(admissions, result => result.IsSuccess).Value!;
+        Assert.All(admissions.Where(result => !result.IsSuccess), result => Assert.Equal(KernelError.DuplicateIdentity, result.Error));
+        Assert.Equal(40UL, context.Provider.ReservedNanoseconds);
+        Assert.Equal(BudgetReservationState.Bound, context.Budgets.Query(context.Budget).Value!.State);
+        Assert.True(context.Coordinator.CancelAdmitted(winner).IsSuccess);
+        Assert.Equal(0UL, context.Provider.ReservedNanoseconds);
+    }
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void InvalidUnicodeCorrelationCannotReserveCapacityOrConsumeBudget(bool lowSurrogate)
+    {
+        var context = Create(100, 100, 40);
+        var malformed = "operation:" + (lowSurrogate ? (char)0xDC00 : (char)0xD800);
+        var result = context.Coordinator.Admit(context.Owner, context.Budget, malformed, Temporal(40));
+        Assert.Equal(KernelError.PlatformUnsupported, result.Error);
+        Assert.Equal(0UL, context.Provider.ReservedNanoseconds);
+        Assert.Equal(BudgetReservationState.Bound, context.Budgets.Query(context.Budget).Value!.State);
+        var valid = context.Coordinator.Admit(context.Owner, context.Budget, "operation:😀", Temporal(40));
+        Assert.True(valid.IsSuccess, valid.Message);
+        Assert.Equal(40UL, context.Provider.ReservedNanoseconds);
+        Assert.True(context.Coordinator.CancelAdmitted(valid.Value!).IsSuccess);
+        Assert.Equal(0UL, context.Provider.ReservedNanoseconds);
+    }
+    [Fact]
+    public void BudgetQuarantineDuringSuccessfulSubmitCannotPublishTemporalSuccess()
+    {
+        var context = Create(100, 100, 40);
+        var binding = context.Coordinator.Admit(context.Owner, context.Budget,
+            "operation:budget-loss:during-submit", Temporal(40)).Value!;
+        var result = context.Coordinator.Submit(binding, KernelResult.Ok,
+            KernelResult.Ok, KernelResult.Ok, () =>
+            {
+                Assert.True(context.Budgets.QuarantineLease(context.Owner, context.Budget).IsSuccess);
+                return KernelResult.Ok();
+            });
+
+        Assert.Equal(KernelError.StaleGeneration, result.Error);
+        Assert.Equal(BudgetReservationState.Quarantined, context.Budgets.Query(context.Budget).Value!.State);
+        Assert.Equal(V6TemporalProviderReservationState.Quarantined,
+            context.Provider.Query(binding.ProviderReservation.Handle).Value!.State);
+        Assert.Equal(40UL, Used(context));
+        Assert.Equal(40UL, context.Provider.ReservedNanoseconds);
+    }
+
     [Fact]
     public void StaleReleaseCannotTriggerInjectedResetOfLiveReservation()
     {
@@ -228,8 +1304,10 @@ public sealed class V6TemporalCapacityReservationTests
         Assert.Equal(BudgetReservationState.Released, kernel.Budgets.Query(budget).Value!.State);
     }
 
-    [Fact]
-    public void BoundOwnerSubmitDenialClosesCapacityBeforeProviderCallback()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void BoundOwnerSubmitDenialClosesCapacityBeforeProviderCallback(bool competingOwnerSubmit)
     {
         var kernel = new RuntimeKernel();
         var admin = TestFixtures.Create(kernel, 9930, 9931).Handle;
@@ -255,14 +1333,33 @@ public sealed class V6TemporalCapacityReservationTests
 
         var denied = coordinator.SubmitBoundExternalOperation(bound,
             new OperationDependencySnapshot(2, 2), KernelResult.Ok, KernelResult.Ok,
-            KernelResult.Ok, () => { callbacks++; return KernelResult.Ok(); });
+            () =>
+            {
+                if (competingOwnerSubmit)
+                    Assert.True(kernel.RecordExternalOperationSubmission(owner, operation, new(1, 1)).IsSuccess);
+                return KernelResult.Ok();
+            }, () => { callbacks++; return KernelResult.Ok(); });
 
         Assert.False(denied.IsSuccess);
         Assert.Equal(0, callbacks);
+        if (competingOwnerSubmit)
+        {
+            Assert.Equal(KernelError.StaleGeneration, denied.Error);
+            Assert.Equal(50UL, provider.ReservedNanoseconds);
+            Assert.Equal(BudgetReservationState.Bound, kernel.Budgets.Query(budget).Value!.State);
+            var effect = kernel.QueryExternalOperation(owner, operation).Value!;
+            Assert.Equal(ExternalOperationState.Submitted, effect.State);
+            Assert.Equal(ExternalOperationDisposition.Active, effect.Disposition);
+            return;
+        }
         Assert.Equal(0UL, provider.ReservedNanoseconds);
         Assert.Equal(BudgetReservationState.Released, kernel.Budgets.Query(budget).Value!.State);
         Assert.Equal(ExternalOperationState.Admitted,
             kernel.QueryExternalOperation(owner, operation).Value!.State);
+        Assert.Equal(ExternalOperationDisposition.Cancelled,
+            kernel.QueryExternalOperation(owner, operation).Value!.Disposition);
+        Assert.Equal(KernelError.InvalidTransition,
+            kernel.RecordExternalOperationSubmission(owner, operation, new(1, 1)).Error);
         Assert.Equal(KernelError.InvalidTransition,
             coordinator.ReconcileQuarantinedBoundExternalOperation(bound).Error);
     }
@@ -308,8 +1405,10 @@ public sealed class V6TemporalCapacityReservationTests
         Assert.Equal(BudgetReservationState.Consuming, kernel.Budgets.Query(budget).Value!.State);
     }
 
-    [Fact]
-    public void BoundOwnerLossDuringSuccessfulProviderCallbackStillQuarantinesCapacity()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void BoundOwnerLossDuringSuccessfulProviderCallbackStillQuarantinesCapacity(bool loseBudget)
     {
         var kernel = new RuntimeKernel();
         var admin = TestFixtures.Create(kernel, 9950, 9951).Handle;
@@ -336,7 +1435,9 @@ public sealed class V6TemporalCapacityReservationTests
         var result = coordinator.SubmitBoundExternalOperation(bound, dependencies,
             KernelResult.Ok, KernelResult.Ok, KernelResult.Ok, () =>
             {
-                Assert.True(kernel.RecordExternalOperationProviderLoss(owner, operation).IsSuccess);
+                Assert.True(loseBudget
+                    ? kernel.Budgets.QuarantineLease(owner, budget).IsSuccess
+                    : kernel.RecordExternalOperationProviderLoss(owner, operation).IsSuccess);
                 return KernelResult.Ok();
             });
 
@@ -346,6 +1447,16 @@ public sealed class V6TemporalCapacityReservationTests
             provider.Query(bound.ProviderReservation.Handle).Value!.State);
         Assert.Equal(KernelError.ExternalEffectUncontained,
             coordinator.ReconcileQuarantinedBoundExternalOperation(bound).Error);
+        Assert.Equal(50UL, provider.ReservedNanoseconds);
+        Assert.Equal(BudgetReservationState.Quarantined, kernel.Budgets.Query(budget).Value!.State);
+        if (loseBudget)
+            Assert.True(kernel.RecordExternalOperationProviderLoss(owner, operation).IsSuccess);
+        Assert.True(kernel.ReleaseExternalOperation(owner, operation,
+            new(ProviderResourcesClosed: true, ProviderUnavailable: true)).IsSuccess);
+        var reconciled = coordinator.ReconcileQuarantinedBoundExternalOperation(bound);
+        Assert.True(reconciled.IsSuccess, reconciled.Message);
+        Assert.Equal(BudgetReservationState.Released, kernel.Budgets.Query(budget).Value!.State);
+        Assert.Equal(0UL, provider.ReservedNanoseconds);
     }
 
     [Theory]
@@ -395,7 +1506,9 @@ public sealed class V6TemporalCapacityReservationTests
         var context = Create(100, 100, 50);
         var binding = context.Coordinator.Admit(context.Owner, context.Budget,
             "operation:capacity:budget-cancelled", Temporal(50)).Value!;
-        Assert.True(context.Budgets.CancelLeasePreSubmit(context.Owner, context.Budget).IsSuccess);
+        // Fault injection through the exact existing quantitative consumer;
+        // generic cancellation cannot detach another composition's charge.
+        Assert.True(context.Budgets.CancelLeasePreSubmit(context.Owner, context.Budget, binding.Id).IsSuccess);
         var effects = 0;
 
         var stale = context.Coordinator.Submit(binding,

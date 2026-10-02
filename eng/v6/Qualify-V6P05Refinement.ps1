@@ -5,11 +5,16 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$unknownCancellationTests = '|FullyQualifiedName=SingPlus.Tests.Runtime.ExternalOperationLifecycleTests.UnknownCancellationSupportCannotMutateScopeBudgetOrRegionAdmission|FullyQualifiedName=SingPlus.Tests.Runtime.ExternalOperationLifecycleTests.OwnerAdmissionRejectsUnknownCancellationSupportBeforeUseAcquisition'
 Set-StrictMode -Version Latest
+
 function Get-Sha256([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
 
 $filter = 'FullyQualifiedName~SemanticRefinementV1Tests|FullyQualifiedName~SemanticExtensionContractsV1Tests|FullyQualifiedName~MemorySemanticsV1Tests|FullyQualifiedName~TemporalSemanticsV1Tests|FullyQualifiedName~DmaExecutionBindingV1Tests|FullyQualifiedName~FailureDurabilitySemanticsV1Tests|FullyQualifiedName~SemanticTraceContractsV1Tests|FullyQualifiedName~SemanticAdmissionSentryTests|FullyQualifiedName~V6MemoryRuntimeEnforcementTests|FullyQualifiedName~Phase16SemanticTraceEquivalenceTests|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundSubmitEmitsNonAuthoritativeTraceAfterOwnerCommit|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundSubmitTraceSinkFailureCannotChangeCommittedEffect|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundDmaCompletionTrace|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundDmaResetTrace|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundDmaTraceSinkMayReenterAfterOwnerLock|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundDmaVisibilityTrace|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundDmaResetDuringAcquireTrace|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundDmaTraceRetainsOrderedEventsAcrossReentrantRemoval|FullyQualifiedName=SingPlus.Tests.Architecture.V6ArchitectureGuardTests.V6GateRegistryIsClosedCompleteAndDefaultOff|FullyQualifiedName=SingPlus.Tests.Architecture.RepositoryArchitecturePolicyTests.EveryProjectIsClassifiedAndEveryProjectReferenceIsAllowed|FullyQualifiedName=SingPlus.Tests.Architecture.RepositoryArchitecturePolicyTests.ExecutableAdapterMayConsumeOnlyExactlyPinnedExternalFacadePackages'
 $filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.PublishedOperationCannotReleaseRegionWhileResourceSettlementIsInFlight'
+$filter += $unknownCancellationTests
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.HybridCpuExternalOperationProviderTests.NonResourceProviderReleaseProjectsOnlyActualLocalAuthorityFact'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Architecture.V6ArchitectureGuardTests.DmaClosureObservationHasNoRuntimeAdmissionConsumer'
 $filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.ProviderLossWithQuarantinedResourceBindingCannotReleaseRegion'
 $filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.FailedRegionInvalidationStillQuarantinesResourceBoundProviderLoss'
 $filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.FailedBudgetQuarantineReportsUncontainedProviderLossAndKeepsResourcePinned'
@@ -25,6 +30,8 @@ $filter += '|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundDmaBackendRese
 $filter += '|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundDmaBackendResetPreservesLastObservedProviderGeneration'
 $filter += '|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundDmaPageFaultBackendResetDoesNotObserveLaterProviderDrift'
 $filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformDmaSubmissionTests.V6BoundDmaGrantRevokeDoesNotInventTracePublicationOrRelease'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformDmaSubmissionTests.AlreadyRevokedStatusWithoutResetCannotProveExactGrantClosure'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformDmaGrantTests.ExplicitNotAcceptedGrantClosureCanRetryWithoutReclaimingEarly'
 $filter += '|FullyQualifiedName~PlatformDmaSubmissionTests.V6AmbiguousSubmitTraceRetainsPossibleEffectAndQuarantine|FullyQualifiedName~PlatformDmaSubmissionTests.V6DeniedSubmitQuarantinesPossibleEffectTrace|FullyQualifiedName~PlatformDmaSubmissionTests.V6BoundTransportUnavailableRetainsPossibleWriteAndBlocksRevoke'
 $filter += '|FullyQualifiedName~PlatformDmaSubmissionTests.V6AmbiguousSubmitTraceSinkReentersAfterOwnerLockAndCannotReleaseGrant|FullyQualifiedName~PlatformDmaSubmissionTests.V6AmbiguousSubmitTraceSinkFailureCannotReleaseGrant'
 $filter += '|FullyQualifiedName~PlatformDmaSubmissionTests.V6LostProviderIncarnationQuarantinesWithoutInventingGenerationDigest'
@@ -32,9 +39,30 @@ $filter += '|FullyQualifiedName~SessionLifecycleTraceContractsV1Tests|FullyQuali
 $filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.ServiceDiscoverySessionTests.ConcurrentCloseAndProcessTeardownRecordOneDrainingTransition'
 $filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.EndpointSessionCancellationTests.FailedAcceptedInlineSettlementDoesNotAssertEffectContainment|FullyQualifiedName=SingPlus.Tests.Runtime.EndpointSessionCancellationTests.AcceptedCancellationAndSessionCloseRetainPossibleEffectInEitherOrder'
 $filter += '|FullyQualifiedName~EndpointSessionCancellationTests.FailedQueuedSettlementCallbackRetainsPossibleEffectWithoutServiceAcceptance'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Platform.PlatformDmaSubmissionTests.V6BoundDmaGrantRevokeDoesNotInventTracePublicationOrRelease'
+$filter += '|FullyQualifiedName~V6GrantClosureSidecar|FullyQualifiedName~DmaGrantClosureObservationV1Tests'
+$filter += '|FullyQualifiedName~V6DmaPreparationGenerationGetter'
+$filter += '|FullyQualifiedName~V6DmaAcquireGenerationGetter'
+$filter += '|FullyQualifiedName~V6DmaSubmitGenerationGetter'
+$filter += '|FullyQualifiedName~V6DmaSubmitRegionRevalidation'
+$filter += '|FullyQualifiedName~V6DmaCopyGenerationGetter'
+$filter += '|FullyQualifiedName~PageFaultGenerationGetter'
+$filter += '|FullyQualifiedName~CompletionGenerationGetter'
+$filter += '|FullyQualifiedName~PostCompletionGenerationGetter'
+$filter += '|FullyQualifiedName~DmaIdentityGenerationGetter'
+$filter += '|FullyQualifiedName~DmaGrantAdmissionGenerationGetter|FullyQualifiedName~DmaGrantAdmissionIdentityExhaustion'
+$filter += '|FullyQualifiedName~DeviceAdmissionGenerationGetter|FullyQualifiedName~DeviceAdmissionConcurrentRevoke|FullyQualifiedName~DeviceAdmissionIdentityExhaustion'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.V6TemporalCapacityReservationTests.TemporalSettlementCannotFabricateExternalResourceSettlementTrace'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.V6TemporalRuntimeEnforcementTests.TemporalTraceObserverCannotAuthorizeLateCallbackOrVetoSubmit'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.V6TemporalRuntimeEnforcementTests.NullTemporalCallbackCannotCommitOwnerOrEmitTrace'
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.V6TemporalRuntimeEnforcementTests.FailedPreSubmitTemporalTraceRetainsCapturedSourceAndActualLocalRelease'
 $evidenceInputs = @(
+    'tests/SingPlus.Tests/Runtime/V6TemporalRuntimeEnforcementTests.cs',
+    'src/Runtime/SingPlus.Runtime/V6/V6TemporalSemanticBinding.cs',
     'contracts/SingPlus.Contracts/SemanticRefinementContracts.cs',
     'contracts/SingPlus.Contracts/SemanticExtensionContracts.cs',
+    'contracts/SingPlus.Contracts/OperationObligations.cs',
+    'contracts/SingPlus.Contracts/ExecutionGuarantees.cs',
     'contracts/SingPlus.Contracts/SemanticTraceContracts.cs',
     'contracts/SingPlus.Contracts/SessionLifecycleTraceContractsV1.cs',
     'contracts/SingPlus.Contracts/MemorySemanticsV1.cs',
@@ -54,6 +82,8 @@ $evidenceInputs = @(
     'src/Runtime/SingPlus.Runtime/Channels/ChannelRegistry.cs',
     'src/Runtime/SingPlus.Runtime/ExternalOperations/RuntimeKernel.ExternalOperations.cs',
     'src/Runtime/SingPlus.Runtime/ExternalOperations/ExternalOperationAuthority.cs',
+    'src/Runtime/SingPlus.Runtime/ExternalOperations/HybridCpuExternalOperationProvider.cs',
+    'tests/SingPlus.Tests/Runtime/HybridCpuExternalOperationProviderTests.cs',
     'src/Runtime/SingPlus.Runtime/Regions/RegionAuthority.cs',
     'src/Runtime/SingPlus.Runtime/VNext/ExternalOperationResourceBinding.cs',
     'src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetAuthority.cs',
@@ -75,10 +105,12 @@ $evidenceInputs = @(
     'tools/HybridCpu_ExecutableAdapter/HybridCpu_ExecutableAdapter.csproj',
     'tools/HybridCpu_ExecutableAdapter/Adapter/HybridCpuExecutableChildAdapter.cs',
     'tools/HybridCpu_ExecutableAdapter.Tests/HybridCpu_ExecutableAdapter.Tests.csproj',
+    'tools/HybridCpu_ExecutableAdapter.Tests/AdapterBoundaryTests.cs',
     'tools/HybridCpu_ExecutableAdapter.Tests/SemanticTraceInstrumentationTests.cs',
     'tests/SingPlus.Tests/Contracts/SemanticRefinementV1Tests.cs',
     'tests/SingPlus.Tests/Contracts/SemanticExtensionContractsV1Tests.cs',
     'tests/SingPlus.Tests/Contracts/SemanticTraceContractsV1Tests.cs',
+    'tests/SingPlus.Tests/Runtime/ExternalOperationLifecycleTests.cs',
     'tests/SingPlus.Tests/Contracts/SessionLifecycleTraceContractsV1Tests.cs',
     'tests/SingPlus.Tests/Contracts/FailureDurabilitySemanticsV1Tests.cs',
     'tests/SingPlus.Tests/Runtime/SemanticAdmissionSentryTests.cs',
@@ -87,14 +119,20 @@ $evidenceInputs = @(
     'tests/SingPlus.Tests/Runtime/EndpointSessionCancellationTests.cs',
     'tests/SingPlus.Tests/Runtime/VNextPhase07ExternalOperationResourceBindingTests.cs',
     'tests/SingPlus.Tests/Platform/PlatformDmaSubmissionTests.cs',
+    'tests/SingPlus.Tests/Platform/PlatformDmaGrantTests.cs',
     'tests/SingPlus.Tests/SipJobs/Phase16SemanticTraceEquivalenceTests.cs',
     'tests/SingPlus.Tests/Architecture/V6ArchitectureGuardTests.cs',
     'tools/SingPlus.SingCapQualification/SingPlus.SingCapQualification.csproj',
     'tools/SingPlus.SingCapQualification/Program.cs',
     'tools/SingPlus.SingCapQualification/V6P05RefinementPerformanceQualification.cs',
+    'contracts/SingPlus.Contracts/DmaGrantClosureObservationV1.cs',
+    'tests/SingPlus.Tests/Contracts/DmaGrantClosureObservationV1Tests.cs',
+    'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.Dma.cs',
+    'docs/SingNextOS-v6-roadmap-reworked-2026-09-23/ADR-003-DMA-GRANT-CLOSURE-OBSERVATION.md',
     'eng/v6/Qualify-V6P05Refinement.ps1'
 )
 
+$filter += '|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.CancelledAdmittedOperationCannotBindNewResourceLease|FullyQualifiedName=SingPlus.Tests.Runtime.VNextPhase07ExternalOperationResourceBindingTests.SubmittedOperationWithUnconsumedLeaseCannotClaimPreSubmitResourceCancellation'
 Push-Location $RepositoryRoot
 try {
     $coreOutput = & dotnet test 'tests\SingPlus.Tests\SingPlus.Tests.csproj' --no-restore --filter $filter 2>&1 | Out-String
@@ -110,7 +148,7 @@ try {
     $passed = ($matches | ForEach-Object { [int]$_.Groups[2].Value } | Measure-Object -Sum).Sum
     $skipped = ($matches | ForEach-Object { [int]$_.Groups[3].Value } | Measure-Object -Sum).Sum
     $total = ($matches | ForEach-Object { [int]$_.Groups[4].Value } | Measure-Object -Sum).Sum
-    if ($failed -ne 0 -or $passed -ne 178 -or $skipped -ne 0 -or $total -ne 178) {
+    if ($failed -ne 0 -or $passed -ne 682 -or $skipped -ne 0 -or $total -ne 682) {
         throw "Unexpected P05 counts: failed=$failed passed=$passed skipped=$skipped total=$total"
     }
     New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
@@ -137,7 +175,7 @@ try {
         sliceStatus = 'managed-cancel-and-ambiguous-publication-trace-qualified; cross-project-generation-trace-partial'
         requirementClassification = [ordered]@{
             VerifiedExisting = @('external-operation owner records exact ambiguous-publication and reconciliation transitions', 'EndpointSessionRegistry records Active, Draining and Closed state changes under its owner lock in a bounded non-authoritative journal')
-            Partial = @('selected staged managed trace projects cancellation request, ambiguity, exact closure, settlement, and release', 'v6 bound DMA emits committed submit/effect, completion and post-completion visibility or reset-quarantine; final grant closure is not yet emitted', 'checker requires explicit marker for changed generation digest but no complete live per-transition vector exists across projects')
+            Partial = @('selected staged managed trace projects cancellation request, ambiguity, exact closure, settlement, and release', 'v6 bound DMA emits committed submit/effect, completion and post-completion visibility or reset-quarantine; exact grant closure is separately observed by an additive sidecar; generic Released is not emitted', 'checker requires explicit marker for changed generation digest but no complete live per-transition vector exists across projects')
             Missing = @('fresh mutable provider-generation vector on each owner transition', 'direct-coherent and physical-provider trace qualification', 'atomic cross-owner session/channel/invocation transition stream and exact external effect closure source')
             Contradicted = @('failed publication callback implies no external effect', 'post-submit cancellation request implies effect containment', 'GenerationChanged marker with unchanged digest is valid evidence')
             ExternalBlocked = @('physical provider trace producer and qualification environment')
@@ -206,7 +244,7 @@ try {
             'Direct-coherent publication and physical provider transitions are outside this staged-owner projection qualification.',
             'No external finite-model run is tuple-bound into this artifact.',
             'Passing the checker does not promote hardware or production claims.',
-            'DMA active submission trace ends at post-completion visibility. Grant revoke owns later closure, but the generic trace validator requires Published and Settled before Released; DMA owner has no such publication/settlement transitions. A Released projection would invent evidence, so final grant closure remains outside the trace scope.'
+            'DMA active submission trace ends at post-completion visibility. Grant revoke owns later closure, but the generic trace validator requires Published and Settled before Released; DMA owner has no such publication/settlement transitions. A Released projection would invent evidence, so grant closure uses a distinct sidecar validator; generic Released remains outside the trace scope.'
             'The additive session trace covers EndpointSessionRegistry state changes only. Exact-generation ChannelRegistry and EndpointSessionInvocationRegistry snapshots can be correlated after quiescence; actual channel closure and invocation consequence are not yet events in one atomic cross-owner stream. An accepted failed-inline effect remains possible after both session and channel close. Exact provider closure is absent and cannot be inferred from Closed.'
             'The bounded managed session owner journal is always on for this contour; its per-transition overhead is not separately characterized, so no session instrumentation performance claim is made.'
         )
@@ -344,6 +382,73 @@ try {
         'docs/SingNextOS-v6-roadmap-reworked-2026-09-23/ADR-002-RESOURCE-RESERVATION-AND-UPPER-BOUND.md')
     $artifact.coverage.dimensions += 'reservation capacity and enforced consumption upper bounds are incomparable; temporal amounts use opposite directions only within their own assurance branch'
     $jsonPath = Join-Path $OutputDirectory 'qualification.json'; $markdownPath = Join-Path $OutputDirectory 'qualification.md'
+    $artifact.requirementIds += 'P05-DMA-GRANT-NO-FABRICATED-RELEASE-01'
+    $artifact.testIds += 'PlatformDmaSubmissionTests.V6BoundDmaGrantRevokeDoesNotInventTracePublicationOrRelease'
+    $artifact.coverage.trace += 'exact grant revoke does not fabricate generic Published, Settled or Released events; lifecycle validator rejects invented release'
+    $artifact.requirementIds += 'P05-DMA-GRANT-CLOSURE-SIDECAR-01'
+    $artifact.testIds += @('PlatformDmaSubmissionTests.V6GrantClosureSidecarProjectsExactVisiblePrefixWithoutPublication',
+        'PlatformDmaSubmissionTests.V6GrantClosureSidecarDoesNotExistAfterAmbiguousRevoke',
+        'PlatformDmaSubmissionTests.V6GrantClosureSidecarCannotRepairTraceSinkLoss',
+        'PlatformDmaSubmissionTests.V6GrantClosureSidecarDoesNotReuseAnEarlierVisibleCycle',
+        'DmaGrantClosureObservationV1Tests')
+    $artifact.requirementClassification.VerifiedExisting += 'Exact successful managed grant closure exposes separate non-authoritative sidecar tied to latest traced Visible event; offline consumer rejects stale or missing prefix/tuple'
+    $artifact.changedFiles += @('contracts/SingPlus.Contracts/DmaGrantClosureObservationV1.cs',
+        'tests/SingPlus.Tests/Contracts/DmaGrantClosureObservationV1Tests.cs',
+        'src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.Dma.cs',
+        'docs/SingNextOS-v6-roadmap-reworked-2026-09-23/ADR-003-DMA-GRANT-CLOSURE-OBSERVATION.md')
+    $artifact.requirementIds += 'C0-DMA-CLOSURE-CANONICAL-PARSER-01'
+    $artifact.testIds += @('DmaGrantClosureObservationV1Tests.CanonicalBytesRoundTripForOfflineConsumer',
+        'DmaGrantClosureObservationV1Tests.EveryTruncatedPrefixAndTrailingByteIsRejected',
+        'DmaGrantClosureObservationV1Tests.OverlongTokenLengthAndMalformedUtf8AreRejected',
+        'DmaGrantClosureObservationV1Tests.UnknownVersionAndHugeTokenLengthAreRejectedBeforeConsumption')
+    $artifact.requirementClassification.VerifiedExisting += 'Bounded canonical closure parser rejects truncated, trailing, overlong, malformed UTF8 and unknown-version payloads; actual runtime observation roundtrips into offline projection consumer'
+    $artifact.requirementIds += 'C0-STRICT-IDENTIFIER-UNICODE-01'
+    $artifact.testIds += 'SemanticExtensionContractsV1Tests.MalformedUtf16IdentifiersCannotAliasReplacementCharacterDigests'
+    $artifact.testIds += 'SemanticExtensionContractsV1Tests.ValidSupplementaryUnicodeAndReplacementCharacterRemainExactAndBounded'
+    $artifact.requirementClassification.VerifiedExisting += 'Canonical extension identifiers reject malformed UTF16 before digest encoding; valid supplementary Unicode and exact byte limits preserved'
+    $artifact.requirementIds += 'P05-STRICT-TRACE-UNICODE-01'
+    $artifact.testIds += @('SemanticTraceContractsV1Tests.MalformedUnicodeTraceIdentifiersFailClosed','SemanticTraceContractsV1Tests.TraceTokensPreserveValidSupplementaryUnicodeAtExactByteBoundary')
+    $artifact.requirementClassification.VerifiedExisting += 'Trace tokens reject malformed UTF16 before observation and counterexample hashing; valid supplementary Unicode and byte limits preserved'
+    $artifact.requirementIds += 'A0-DMA-CLOSURE-CONSUMER-BOUNDARY-01'
+    $artifact.requirementIds += 'C0-PROVIDER-UNKNOWN-MANDATORY-01'
+    $artifact.requirementIds += 'C0-GENERATION-TOKEN-BOUND-01'
+    $artifact.requirementIds += 'C0-BOUNDED-MATERIALIZATION-01'
+    $artifact.requirementIds += 'C0-CANONICAL-BASE-DIGEST-01'
+    $artifact.testIds += @('SemanticExtensionContractsV1Tests.BindingBaseDigestsRejectUppercaseAndMixedCase','V6MemoryRuntimeEnforcementTests.AlteredBaseDigestSidecarCannotPassFreshMemoryBinding')
+    $artifact.requirementClassification.VerifiedExisting += 'Additive binding requires lowercase base SHA256 matching actual V1 producers; altered obligation/guarantee digest sidecars fail fresh memory binding without submit/budget mutation'
+    $artifact.testIds += @('SemanticExtensionContractsV1Tests.ClauseEnumerationStopsAtOverflowWitness','SemanticExtensionContractsV1Tests.MaximumClauseCountPreservesBothFamilyCanonicalDigests')
+    $artifact.requirementClassification.VerifiedExisting += 'Operation and guarantee clause enumeration stops at 65th overflow witness; generation owners are validated before duplicate hashing and ordering; UTF16 length precheck precedes whitespace/Unicode scanning while exact UTF8 boundary semantics remain unchanged'
+    $artifact.testIds += @('SemanticExtensionContractsV1Tests.GenerationOwnerRejectsOversizedOrMalformedUnicode','SemanticExtensionContractsV1Tests.GenerationOwnerPreservesExactUtf8Boundary','SemanticExtensionContractsV1Tests.GenerationEnumerationStopsAtOverflowWitness','SemanticExtensionContractsV1Tests.MaximumGenerationCountPreservesCanonicalOrder')
+    $artifact.requirementClassification.VerifiedExisting += 'Generation snapshot owner tokens use existing strict Unicode/UTF8 token validation with 96-byte bound; enumeration stops at 33rd overflow witness before sorting/encoding an unbounded sequence; valid 32-entry canonical order retained'
+    $artifact.testIds += @('SemanticExtensionContractsV1Tests.UnknownMandatoryProviderClauseIsDeniedBeforeRefinement','SemanticExtensionContractsV1Tests.AdditionalUnknownOptionalProviderClauseRetainsDigestWithoutWeakeningRequirement','V6MemoryRuntimeEnforcementTests.UnknownMandatoryProviderCompanionCannotHideBehindMemoryGuarantee')
+    $artifact.requirementClassification.VerifiedExisting += 'Unknown mandatory provider guarantee companion is rejected before refinement; additional unknown optional remains digest-bound without weakening requested known clause; managed memory consumer refuses without budget/submit mutation'
+    $artifact.testIds += 'V6ArchitectureGuardTests.DmaClosureObservationHasNoRuntimeAdmissionConsumer'
+    $artifact.requirementClassification.VerifiedExisting += 'DMA closure observation is not an input to runtime APIs; offline projection checker has no direct runtime source call. Guard is StaticAdmission only, not physical closure evidence.'
+    $artifact.testIds += @('ExternalOperationLifecycleTests.UnknownCancellationSupportCannotMutateScopeBudgetOrRegionAdmission',
+        'ExternalOperationLifecycleTests.OwnerAdmissionRejectsUnknownCancellationSupportBeforeUseAcquisition')
+    $artifact.testIds += @('SemanticTraceContractsV1Tests.AccountingQuarantineCannotPrecedeEffectOrResurrectSettledAccounting',
+        'SemanticTraceContractsV1Tests.AccountingObservationCannotClearProviderQuarantineOrGenerationDrift',
+        'SemanticTraceContractsV1Tests.AccountingQuarantineAndProviderQuarantineAreDistinctMandatoryObservations',
+        'V6MemoryRuntimeEnforcementTests.AccountingQuarantineReconciliationPreservesLivePublicationAndExactSettlement',
+        'V6MemoryRuntimeEnforcementTests.JournalFailureAfterAccountingSettlementRetainsObservationUntilExactKernelRetry')
+    $artifact.testIds += @('SemanticTraceContractsV1Tests.PreSubmitCancellationCannotAuthorizePostSubmitEvents',
+        'SemanticTraceContractsV1Tests.PreSubmitBranchRetainsCommittedCancellationAndRequiresExactLocalRelease',
+        'SemanticTraceContractsV1Tests.PreSubmitReleasedBranchRejectsLateEventsAndChangedGeneration',
+        'V6MemoryRuntimeEnforcementTests.ActualPreSubmitTeardownProjectsCancellationAndLocalRelease',
+        'V6MemoryRuntimeEnforcementTests.ActualPreSubmitCancellationReleaseRejectsStaleRetryWithoutInventingClosure')
+    $artifact.testIds += @('SemanticTraceContractsV1Tests.NonResourceLocalReleaseCannotBypassActiveAccountingOrDriftFacts',
+        'SemanticTraceContractsV1Tests.NonResourceLocalReleaseIsTerminalObservationAndCannotReplaceGenericRelease',
+        'HybridCpuExternalOperationProviderTests.NonResourceProviderReleaseProjectsOnlyActualLocalAuthorityFact')
+    $artifact.testIds += @('V6MemoryRuntimeEnforcementTests.FailedPreSubmitMemoryTraceRetainsCancellationUntilActualLocalRelease',
+        'V6MemoryRuntimeEnforcementTests.PreSubmitTraceReentrantTeardownDrainsCommittedLocalReleaseOutsideOwnerLocks',
+        'V6MemoryRuntimeEnforcementTests.FailedPreSubmitSinkCannotVetoCompensationOrLocalRelease',
+        'V6MemoryRuntimeEnforcementTests.FailedPreSubmitTraceRejectsUnknownOrForeignCapturedSidecar',
+        'V6MemoryRuntimeEnforcementTests.LosingPreSubmitAttemptCannotStealSubmitWinnersTraceOrRefundBudget',
+        'V6TemporalRuntimeEnforcementTests.FailedPreSubmitTemporalTraceRetainsCapturedSourceAndActualLocalRelease')
+    $artifact.testIds += @('SemanticTraceContractsV1Tests.PreSubmitAccountingMarkerCannotBeSubstitutedAfterEffectBoundary',
+        'SemanticTraceContractsV1Tests.PreSubmitAccountingSurvivesCancellationLocalReleaseAndCannotImplyNoResourceClosure',
+        'V6MemoryRuntimeEnforcementTests.FailedPreSubmitAccountingCompensationRetainsLiveMarkerAndBudgetPin',
+        'V6MemoryRuntimeEnforcementTests.ActualPreSubmitAccountingHistoryBeforeSubmitRetainsPossibleEffectAndRejectsPhaseSubstitution')
     $artifact | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $jsonPath -Encoding utf8NoBOM
     @"
 # P05 executable refinement evidence
@@ -369,7 +474,7 @@ try {
 - DMA generation digest is canonical for the last observed provider incarnation and local backend epoch, including repeated backend reset after unobserved provider drift; backend-stale denial does not invent an unobserved provider generation.
 - Ambiguous bound DMA submit emits possible effect and quarantine outside owner locks; observed reset generation is explicit, while definite provider denial emits no possible-effect trace.
 - Direct v6 bound DMA emits committed submit/effect, completion, and post-completion visibility or reset-quarantine after owner locks. Malformed page-fault evidence, reset during page-fault resolution, and trusted backend reset emit quarantine; the latter also changes the local epoch digest. The observer handle retains ordered events across pending-record removal; sink failure cannot alter DMA decisions. Final grant closure remains outside this trace scope.
-- Grant revoke after visibility has a distinct owner transition, while the generic validator requires Published and Settled before Released. No DMA owner transition proves those steps, so final grant closure is still excluded from the trace projection.
+- Grant revoke after visibility has a distinct owner transition, while the generic validator requires Published and Settled before Released. No DMA owner transition proves those steps, so grant closure is projected separately by DmaGrantClosureObservationV1 without changing the generic trace.
 - Session expiration, inline pin draining, and channel closure currently have no P05 trace projection or differential consumer; managed lifecycle enforcement does not establish a refinement claim for those events.
 - Gate: `V6-FORMAL-REFINEMENT` remains OFF.
 - HybridCPU contour: executable Start emits non-authoritative `SemanticTraceEventV1` submit/effect/terminal observations; observation failure cannot alter execution outcome.

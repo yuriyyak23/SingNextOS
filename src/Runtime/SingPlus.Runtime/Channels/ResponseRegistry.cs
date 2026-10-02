@@ -56,12 +56,15 @@ internal sealed class ResponseRegistry
     }
 
     private readonly RegionAuthority _regions;
+    private readonly Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>> _transferRegion;
     private readonly ChannelRegistry _requestChannels;
     private readonly Dictionary<ChannelId, ChannelRecord> _channels = [];
 
-    internal ResponseRegistry(RegionAuthority regions, ChannelRegistry channels)
+    internal ResponseRegistry(RegionAuthority regions, ChannelRegistry channels,
+        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>> transferRegion)
     {
         _regions = regions;
+        _transferRegion = transferRegion;
         _requestChannels = channels;
         channels.ChannelClosed += CloseChannel;
     }
@@ -266,7 +269,7 @@ internal sealed class ResponseRegistry
         var regionValidation = _regions.Validate(oldHandle, source);
         if (!regionValidation.IsSuccess)
             return KernelResult<object>.Fail(regionValidation.Error, regionValidation.Message!);
-        var transfer = _regions.Transfer(oldHandle, source, target);
+        var transfer = _transferRegion(responder, requester, oldHandle, null);
         if (!transfer.IsSuccess)
             return KernelResult<object>.Fail(transfer.Error, transfer.Message!);
         var moved = owned.TransferForRuntime(transfer.Value);

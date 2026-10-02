@@ -7,8 +7,23 @@ namespace SingPlus.Runtime;
 public sealed partial class RuntimeKernel
 {
     private readonly Dictionary<ProcessHandle, List<PlatformMmioLease>> _processPlatformMmioLeases = [];
+    private readonly List<CapabilityId> _pendingPlatformMmioCapabilities = [];
 
     public KernelResult<PlatformMmioLease> BindPlatformMmio(
+        ProcessHandle subject, PlatformDeviceLease deviceLease, CapabilityId mmioCapabilityId,
+        long offset, long length, PlatformMmioAccess access)
+    {
+        lock (_platformMemoryUseGate)
+        {
+            if (_pendingPlatformMmioCapabilities.Count == int.MaxValue)
+                return KernelResult<PlatformMmioLease>.Fail(KernelError.CapacityExhausted, "MMIO admission accounting is exhausted.");
+            _pendingPlatformMmioCapabilities.Add(mmioCapabilityId);
+        }
+        try { return BindPlatformMmioAdmitted(subject, deviceLease, mmioCapabilityId, offset, length, access); }
+        finally { lock (_platformMemoryUseGate) _pendingPlatformMmioCapabilities.Remove(mmioCapabilityId); }
+    }
+
+    private KernelResult<PlatformMmioLease> BindPlatformMmioAdmitted(
         ProcessHandle subject,
         PlatformDeviceLease deviceLease,
         CapabilityId mmioCapabilityId,
@@ -99,15 +114,32 @@ public sealed partial class RuntimeKernel
                 request.Message ?? "The requested MMIO range is invalid.");
         }
 
+        KernelResult Authorize(Func<KernelResult> commit)
+        {
+            lock (_platformMemoryUseGate)
+                return CapabilityAuthority.CommitMmioAdmission(mmioCapabilityId, process.DomainId,
+                    subject.Generation, requiredCapabilityRights, descriptor.ResourceId, () =>
+                    {
+                        var current = Processes.Resolve(subject);
+                        if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
+                        if (!ReferenceEquals(current.Value, process))
+                            return KernelResult.Fail(KernelError.StaleGeneration, "Exact MMIO process incarnation changed.");
+                        var accepting = EnsureProcessAcceptsNewEffects(current.Value!);
+                        return accepting.IsSuccess ? commit() : accepting;
+                    });
+        }
         var lease = PlatformAuthority.BindMmio(
             deviceLease,
             identity,
             mmioCapabilityId,
             region,
             range,
-            access);
-        if (lease.IsSuccess)
-            TrackPlatformMmioLease(subject, lease.Value!);
+            access, Authorize, (candidate, commit) => Authorize(() =>
+            {
+                var result = commit();
+                if (result.IsSuccess) TrackPlatformMmioLease(subject, candidate);
+                return result;
+            }));
         return lease;
     }
 
@@ -129,7 +161,7 @@ public sealed partial class RuntimeKernel
     internal KernelResult CascadePlatformMmioCapabilityRevocation(CapabilityId capabilityId)
     {
         KernelResult? firstFailure = null;
-        foreach (var lease in PlatformAuthority.BeginMmioCapabilityRevocation(capabilityId))
+        foreach (var lease in PlatformAuthority.BeginMmioCapabilityRevocation(capabilityId, id => CapabilityAuthority.DependsOnCapability(id, capabilityId)))
         {
             var revoke = PlatformAuthority.RevokeMmio(
                 lease,
@@ -143,7 +175,12 @@ public sealed partial class RuntimeKernel
             UntrackPlatformMmioLease(lease);
         }
 
-        return firstFailure ?? KernelResult.Ok();
+        if (firstFailure is { } failed) return failed;
+        if (_pendingPlatformMmioCapabilities.Any(id => CapabilityAuthority.DependsOnCapability(id, capabilityId)))
+            return KernelResult.Fail(KernelError.PlatformBindingDraining, "MMIO admission must settle before capability closure.");
+        if (PlatformAuthority.HasUnresolvedMmioEffect(id => CapabilityAuthority.DependsOnCapability(id, capabilityId)))
+            return KernelResult.Fail(KernelError.PlatformFaulted, "MMIO receipt/closure is unresolved; parent remains pinned.");
+        return KernelResult.Ok();
     }
 
     private KernelResult AdvancePlatformMmioLeasesForDevice(PlatformDeviceLease deviceLease)
@@ -170,8 +207,13 @@ public sealed partial class RuntimeKernel
         SingProcess process,
         ProcessHandle handle)
     {
-        if (!_processPlatformMmioLeases.TryGetValue(handle, out var leases) || leases.Count == 0)
-            return KernelResult.Ok();
+        PlatformMmioLease[] leases;
+        lock (_platformMemoryUseGate)
+        {
+            if (!_processPlatformMmioLeases.TryGetValue(handle, out var tracked) || tracked.Count == 0)
+                return KernelResult.Ok();
+            leases = tracked.ToArray();
+        }
 
         var identity = PlatformIdentity(process);
         KernelResult? firstFailure = null;
@@ -204,11 +246,14 @@ public sealed partial class RuntimeKernel
 
     private void UntrackPlatformMmioLease(PlatformMmioLease lease)
     {
+        lock (_platformMemoryUseGate)
+        {
         foreach (var entry in _processPlatformMmioLeases.ToArray())
         {
             entry.Value.RemoveAll(existing => existing.LeaseId == lease.LeaseId);
             if (entry.Value.Count == 0)
                 _processPlatformMmioLeases.Remove(entry.Key);
+        }
         }
     }
 }

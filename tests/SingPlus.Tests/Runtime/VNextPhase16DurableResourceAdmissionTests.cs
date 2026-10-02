@@ -7,6 +7,146 @@ public sealed class VNextPhase16DurableResourceAdmissionTests
 {
     private static readonly byte[] Key = Enumerable.Range(33, 32).Select(static value => (byte)value).ToArray();
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void CancellationTerminalReplayRejectsConflictingExactTuple(int conflict)
+    {
+        WithJournal((path, context) =>
+        {
+            using var commit = Prepare(context).Value!;
+            Assert.True(context.Kernel.CompensateResourceAdmissionBeforeSubmit(commit).IsSuccess);
+            var method = typeof(RuntimeKernel).GetMethod("AppendResourceRecovery",
+                global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!;
+            var owner = conflict == 0 ? commit.BudgetOwner with { Generation = commit.BudgetOwner.Generation + 1 } : commit.BudgetOwner;
+            var correlation = conflict == 1 ? commit.ProviderCorrelation with
+            {
+                Generation = new(commit.ProviderCorrelation.Generation.Value + 1)
+            } : commit.ProviderCorrelation;
+            var envelope = conflict == 2 ? commit.Envelope with { Amount = commit.Envelope.Amount + 1 } : commit.Envelope;
+            IReadOnlyList<BudgetAmount> charged = conflict == 3 ? [new(ServiceBudgetDimension.ComputeTimeNanoseconds, 1)] : [];
+            var result = (KernelResult)method.Invoke(context.Kernel,
+                [commit.Lease, owner, envelope, correlation, ResourceBudgetRecoveryTransition.CancelledPreSubmit, charged])!;
+            Assert.Equal(KernelError.Quarantined, result.Error);
+            Assert.Equal(2UL, Kernel(path).ResourceBudgetRecovery!.LastSequence);
+            Assert.Empty(Kernel(path).ResourceBudgetRecovery!.ConservativeRecoveryCharge);
+        });
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CancellationAppendFailureRetriesOnlyExactVerifiedClosure(bool frameWritten)
+    {
+        WithJournalStore((path, context, store) =>
+        {
+            using var commit = Prepare(context).Value!;
+            store.ThrowBeforeNextWrite = !frameWritten;
+            store.ThrowAfterNextWrite = frameWritten;
+            Assert.Equal(KernelError.Quarantined,
+                context.Kernel.CompensateResourceAdmissionBeforeSubmit(commit).Error);
+            Assert.Equal(BudgetReservationState.CancelledPreSubmit,
+                context.Kernel.Budgets.Query(commit.Lease).Value!.State);
+            var before = Kernel(path).ResourceBudgetRecovery!;
+            Assert.Equal(frameWritten ? ResourceBudgetRecoveryTransition.CancelledPreSubmit : ResourceBudgetRecoveryTransition.Prepared,
+                Assert.Single(before.Items).LastPayload.Transition);
+            if (frameWritten) Assert.Empty(before.ConservativeRecoveryCharge);
+            else Assert.Equal(10UL, Assert.Single(before.ConservativeRecoveryCharge).Amount);
+            Assert.True(context.Kernel.CompensateResourceAdmissionBeforeSubmit(commit).IsSuccess);
+            var after = Kernel(path).ResourceBudgetRecovery!;
+            Assert.Equal(2UL, after.LastSequence);
+            Assert.Empty(after.ConservativeRecoveryCharge);
+        });
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void PreparedAppendFailureHasNoSubmitAndUsesVerifiedCleanupHistory(bool frameWritten)
+    {
+        WithJournalStore((path, context, store) =>
+        {
+            store.ThrowBeforeNextWrite = !frameWritten;
+            store.ThrowAfterNextWrite = frameWritten;
+            Assert.Equal(KernelError.Quarantined, Prepare(context).Error);
+            var owner = context.Kernel.QueryExternalOperation(context.Process, context.Operation).Value!;
+            Assert.Null(owner.Binding);
+            Assert.Equal(ExternalOperationDisposition.Cancelled, owner.Disposition);
+            var binding = context.Kernel.ExternalOperations.QueryResourceBinding(context.Operation).Value!;
+            Assert.Equal(BudgetReservationState.CancelledPreSubmit, context.Kernel.Budgets.Query(binding.Lease).Value!.State);
+            var recovered = Kernel(path).ResourceBudgetRecovery!;
+            Assert.Empty(recovered.ConservativeRecoveryCharge);
+            if (frameWritten)
+                Assert.Equal(ResourceBudgetRecoveryTransition.CancelledPreSubmit, Assert.Single(recovered.Items).LastPayload.Transition);
+            else Assert.Empty(recovered.Items);
+        });
+    }
+
+    private static void WithJournalStore(Action<string, Context, CompleteFrameThenThrowStore> action)
+        => WithJournal((path, _) =>
+        {
+            var store = new CompleteFrameThenThrowStore(new FileResourceBudgetJournalStore(path));
+            action(path, Create(new RuntimeKernel(null, null, new RuntimeKernelRecoveryOptions(path, Key), store)), store);
+        });
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void PrepareFailureCleanupJournalsOnlyOwnerConfirmedCancellation(bool denyCancellation)
+    {
+        WithJournal((path, context) =>
+        {
+            BudgetReservationHandle lease = default;
+            context.Kernel.ResourceAdmissionQualificationHook = new AdmissionHook(point =>
+            {
+                if (point != ResourceAdmissionQualificationPoint.AfterLocalCommit) return;
+                lease = context.Kernel.ExternalOperations.QueryResourceBinding(context.Operation).Value!.Lease;
+                if (denyCancellation)
+                    Assert.True(context.Kernel.Budgets.QuarantineLease(context.Process, lease).IsSuccess);
+                throw new IOException("failure after prepared journal");
+            });
+            Assert.Equal(KernelError.PlatformFaulted, Prepare(context).Error);
+            Assert.Equal(denyCancellation ? BudgetReservationState.Quarantined : BudgetReservationState.CancelledPreSubmit,
+                context.Kernel.Budgets.Query(lease).Value!.State);
+            Assert.Equal(denyCancellation ? ExternalResourceBindingState.Quarantined : ExternalResourceBindingState.CancelledPreSubmit,
+                context.Kernel.ExternalOperations.QueryResourceBinding(context.Operation).Value!.State);
+            var recovery = Kernel(path).ResourceBudgetRecovery!;
+            Assert.Equal(denyCancellation ? ResourceBudgetRecoveryTransition.Quarantined : ResourceBudgetRecoveryTransition.CancelledPreSubmit,
+                Assert.Single(recovery.Items).LastPayload.Transition);
+            if (denyCancellation) Assert.Equal(10UL, Assert.Single(recovery.ConservativeRecoveryCharge).Amount);
+            else Assert.Empty(recovery.ConservativeRecoveryCharge);
+        });
+    }
+
+    private sealed class AdmissionHook(Action<ResourceAdmissionQualificationPoint> action) : IResourceAdmissionQualificationHook
+    {
+        public void At(ResourceAdmissionQualificationPoint point) => action(point);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DeniedCompensationCannotJournalPreSubmitClosure(bool dispose)
+    {
+        WithJournal((path, context) =>
+        {
+            using var commit = Prepare(context).Value!;
+            Assert.True(context.Kernel.Budgets.QuarantineLease(commit.BudgetOwner, commit.Lease).IsSuccess);
+            if (dispose) commit.Dispose();
+            else Assert.Equal(KernelError.Quarantined,
+                context.Kernel.SubmitResourceExternalAdmission(commit, context.Dependencies,
+                    KernelResult.Ok, () => KernelResult.Fail(KernelError.PlatformDenied, "sentry denial")).Error);
+            Assert.Equal(BudgetReservationState.Quarantined, context.Kernel.Budgets.Query(commit.Lease).Value!.State);
+            Assert.Equal(ExternalResourceBindingState.Quarantined,
+                context.Kernel.ExternalOperations.QueryResourceBinding(commit.Operation).Value!.State);
+            var backlog = Assert.Single(Kernel(path).ResourceBudgetRecovery!.ReconciliationBacklog);
+            Assert.Equal(ResourceBudgetRecoveryTransition.Quarantined, backlog.LastPayload.Transition);
+            Assert.Equal(10UL, Assert.Single(Kernel(path).ResourceBudgetRecovery!.ConservativeRecoveryCharge).Amount);
+        });
+    }
+
     [Fact]
     public void PossibleSubmitIsDurableBeforeCallbackAndColdRestartDoesNotResurrectLease()
     {
@@ -370,9 +510,15 @@ public sealed class VNextPhase16DurableResourceAdmissionTests
         : IResourceBudgetJournalStore
     {
         internal bool ThrowAfterNextWrite { get; set; }
+        internal bool ThrowBeforeNextWrite { get; set; }
         public IReadOnlyList<byte[]> ReadFrames() => inner.ReadFrames();
         public void AppendFrame(ReadOnlySpan<byte> frame)
         {
+            if (ThrowBeforeNextWrite)
+            {
+                ThrowBeforeNextWrite = false;
+                throw new IOException("Simulated append rejection before any file frame.");
+            }
             inner.AppendFrame(frame);
             if (!ThrowAfterNextWrite) return;
             ThrowAfterNextWrite = false;

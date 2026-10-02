@@ -11,8 +11,38 @@ public readonly record struct PlatformInterruptPollResult(
 public sealed partial class RuntimeKernel
 {
     private readonly Dictionary<ProcessHandle, List<PlatformIrqBinding>> _processPlatformIrqBindings = [];
+    private readonly List<CapabilityId> _pendingPlatformIrqCapabilities = [];
 
     public KernelResult<PlatformIrqBinding> BindPlatformInterrupt(
+        ProcessHandle subject,
+        PlatformDeviceLease deviceLease,
+        CapabilityId irqCapabilityId,
+        KernelEventEndpoint eventEndpoint)
+    {
+        var resolved = Processes.Resolve(subject);
+        if (!resolved.IsSuccess)
+            return KernelResult<PlatformIrqBinding>.Fail(resolved.Error, resolved.Message!);
+        var effect = EnsureProcessAcceptsNewEffects(resolved.Value!);
+        if (!effect.IsSuccess)
+            return KernelResult<PlatformIrqBinding>.Fail(effect.Error, effect.Message!);
+        lock (_platformMemoryUseGate)
+        {
+            if (_pendingPlatformIrqCapabilities.Count == int.MaxValue)
+                return KernelResult<PlatformIrqBinding>.Fail(KernelError.CapacityExhausted,
+                    "IRQ capability admission accounting is exhausted.");
+            _pendingPlatformIrqCapabilities.Add(irqCapabilityId);
+        }
+        try
+        {
+            var admitted = _kernelEvents.BeginIrqBindingAdmission(subject, eventEndpoint);
+            if (!admitted.IsSuccess)
+                return KernelResult<PlatformIrqBinding>.Fail(admitted.Error, admitted.Message!);
+            try { return BindPlatformInterruptWithEndpointAdmission(subject, deviceLease, irqCapabilityId, eventEndpoint); }
+            finally { _kernelEvents.EndIrqBindingAdmission(eventEndpoint); }
+        }
+        finally { lock (_platformMemoryUseGate) _pendingPlatformIrqCapabilities.Remove(irqCapabilityId); }
+    }
+    private KernelResult<PlatformIrqBinding> BindPlatformInterruptWithEndpointAdmission(
         ProcessHandle subject,
         PlatformDeviceLease deviceLease,
         CapabilityId irqCapabilityId,
@@ -99,18 +129,66 @@ public sealed partial class RuntimeKernel
                 request.Message ?? "The semantic interrupt source is invalid.");
         }
 
-        var binding = PlatformAuthority.BindIrq(
-            deviceLease,
-            identity,
-            irqCapabilityId,
-            source,
-            eventEndpoint);
-        if (binding.IsSuccess)
-            TrackPlatformIrqBinding(subject, binding.Value!);
-        return binding;
-    }
+        KernelResult RevalidateSource()
+        {
+            var current = Processes.Resolve(subject);
+            if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
+            if (!ReferenceEquals(current.Value, process))
+                return KernelResult.Fail(KernelError.StaleGeneration, "Exact IRQ process incarnation changed.");
+            var currentEffect = EnsureProcessAcceptsNewEffects(current.Value!);
+            if (!currentEffect.IsSuccess) return currentEffect;
+            var currentCapability = CapabilityAuthority.Validate(irqCapabilityId,
+                current.Value!.DomainId, subject.Generation, CapabilityRights.Signal);
+            if (!currentCapability.IsSuccess)
+                return KernelResult.Fail(currentCapability.Error, currentCapability.Message!);
+            return _kernelEvents.CommitIrqBindingAdmission(subject, eventEndpoint, static () => KernelResult.Ok());
+        }
 
-    public KernelResult<PlatformInterruptPollResult> PollPlatformInterrupt(
+        return PlatformAuthority.BindIrq(deviceLease, identity, irqCapabilityId, source, eventEndpoint,
+            RevalidateSource, (candidate, commit) =>
+            {
+                lock (_platformMemoryUseGate)
+                {
+                    return CapabilityAuthority.CommitIrqBindingAdmission(irqCapabilityId,
+                        process.DomainId, subject.Generation, descriptor.ResourceId, () =>
+                        {
+                            // Capability validation may call an injected clock: recheck the exact process afterward.
+                            var current = Processes.Resolve(subject);
+                            if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
+                            if (!ReferenceEquals(current.Value, process))
+                                return KernelResult.Fail(KernelError.StaleGeneration, "Exact IRQ process incarnation changed.");
+                            var currentEffect = EnsureProcessAcceptsNewEffects(current.Value!);
+                            if (!currentEffect.IsSuccess) return currentEffect;
+                            return _kernelEvents.CommitIrqBindingAdmission(subject, eventEndpoint, () =>
+                            {
+                                var published = commit();
+                                if (published.IsSuccess) TrackPlatformIrqBinding(subject, candidate);
+                                return published;
+                            });
+                        });
+                }
+            });
+    }
+    public KernelResult<PlatformInterruptPollResult> PollPlatformInterrupt(ProcessHandle subject, PlatformIrqBinding binding)
+    {
+        var resolved = Processes.Resolve(subject);
+        if (!resolved.IsSuccess) return KernelResult<PlatformInterruptPollResult>.Fail(resolved.Error, resolved.Message!);
+        var effect = EnsureProcessAcceptsNewEffects(resolved.Value!);
+        if (!effect.IsSuccess) return KernelResult<PlatformInterruptPollResult>.Fail(effect.Error, effect.Message!);
+        var endpoint = _kernelEvents.Validate(subject, binding.EventEndpoint);
+        if (!endpoint.IsSuccess) return KernelResult<PlatformInterruptPollResult>.Fail(endpoint.Error, endpoint.Message!);
+        var admitted = PlatformAuthority.BeginIrqDelivery(binding, PlatformIdentity(resolved.Value!));
+        if (!admitted.IsSuccess) return KernelResult<PlatformInterruptPollResult>.Fail(admitted.Error, admitted.Message!);
+        try { return PollPlatformInterruptAdmitted(subject, binding); }
+        catch (Exception exception) when (exception is not StackOverflowException)
+        {
+            PlatformAuthority.FaultIrqDelivery(binding);
+            return KernelResult<PlatformInterruptPollResult>.Fail(KernelError.PlatformFaulted,
+                $"IRQ delivery lost continuity; exact binding remains pinned: {exception.Message}");
+        }
+        finally { PlatformAuthority.EndIrqDelivery(binding); }
+    }
+    private KernelResult<PlatformInterruptPollResult> PollPlatformInterruptAdmitted(
         ProcessHandle subject,
         PlatformIrqBinding binding)
     {
@@ -147,7 +225,44 @@ public sealed partial class RuntimeKernel
                 validation.Message!);
         }
 
-        var observed = PlatformAuthority.PollIrq(binding, identity);
+        KernelResult AuthorizeSource(CapabilityId sourceId, Func<KernelResult> admit)
+        {
+            lock (_platformMemoryUseGate)
+            {
+                var current = Processes.Resolve(subject);
+                if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
+                if (!ReferenceEquals(current.Value, process))
+                    return KernelResult.Fail(KernelError.StaleGeneration, "IRQ delivery process incarnation changed.");
+                var active = EnsureProcessAcceptsNewEffects(current.Value!);
+                if (!active.IsSuccess) return active;
+                var source = CapabilityAuthority.Validate(sourceId, process.DomainId, subject.Generation, CapabilityRights.Signal);
+                if (!source.IsSuccess) return KernelResult.Fail(source.Error, source.Message!);
+                if (source.Value!.ResourceKind != ResourceKind.Irq ||
+                    !CapabilityResourceIds.TryParseIrq(source.Value.ResourceId, out var irq) ||
+                    irq.DeviceResourceId != binding.DeviceLease.Device.ResourceId || irq.SourceResourceId != binding.Source.ResourceId ||
+                    (irq.Trigger == IrqTriggerMode.Edge ? PlatformInterruptTrigger.Edge : PlatformInterruptTrigger.Level) != binding.Source.Trigger)
+                    return KernelResult.Fail(KernelError.WrongCapabilityResource, "IRQ delivery source does not match exact binding.");
+                current = Processes.Resolve(subject);
+                if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
+                if (!ReferenceEquals(current.Value, process))
+                    return KernelResult.Fail(KernelError.StaleGeneration, "IRQ delivery process incarnation changed during source validation.");
+                active = EnsureProcessAcceptsNewEffects(current.Value!);
+                if (!active.IsSuccess) return active;
+                return CapabilityAuthority.CommitIrqBindingAdmission(sourceId, process.DomainId,
+                    subject.Generation, source.Value.ResourceId, () =>
+                    {
+                        var exact = Processes.Resolve(subject);
+                        if (!exact.IsSuccess) return KernelResult.Fail(exact.Error, exact.Message!);
+                        if (!ReferenceEquals(exact.Value, process))
+                            return KernelResult.Fail(KernelError.StaleGeneration, "IRQ delivery process changed during final admission.");
+                        var accepting = EnsureProcessAcceptsNewEffects(exact.Value!);
+                        if (!accepting.IsSuccess) return accepting;
+                        var endpoint = _kernelEvents.Validate(subject, binding.EventEndpoint);
+                        return endpoint.IsSuccess ? admit() : endpoint;
+                    });
+            }
+        }
+        var observed = PlatformAuthority.PollIrq(binding, identity, AuthorizeSource);
         if (!observed.IsSuccess)
         {
             return KernelResult<PlatformInterruptPollResult>.Fail(
@@ -178,7 +293,7 @@ public sealed partial class RuntimeKernel
         var completed = PlatformAuthority.CompleteIrqDelivery(
             binding,
             identity,
-            delivery.ProviderSequence);
+            delivery.ProviderSequence, AuthorizeSource);
         if (!completed.IsSuccess)
         {
             var rollback = _kernelEvents.RollbackExact(subject, staged.Value!);
@@ -197,6 +312,7 @@ public sealed partial class RuntimeKernel
         var committed = _kernelEvents.CommitExact(subject, staged.Value!);
         if (!committed.IsSuccess)
         {
+            PlatformAuthority.FaultIrqDelivery(binding);
             return KernelResult<PlatformInterruptPollResult>.Fail(
                 KernelError.PlatformFaulted,
                 "Interrupt delivery completed but the exact staged local event could not be committed.");
@@ -224,7 +340,7 @@ public sealed partial class RuntimeKernel
     internal KernelResult CascadePlatformIrqCapabilityRevocation(CapabilityId capabilityId)
     {
         KernelResult? firstFailure = null;
-        foreach (var binding in PlatformAuthority.BeginIrqCapabilityRevocation(capabilityId))
+        foreach (var binding in PlatformAuthority.BeginIrqCapabilityRevocation(capabilityId, id => CapabilityAuthority.DependsOnCapability(id, capabilityId)))
         {
             var revoke = PlatformAuthority.RevokeIrq(
                 binding,
@@ -238,7 +354,14 @@ public sealed partial class RuntimeKernel
             UntrackPlatformIrqBinding(binding);
         }
 
-        return firstFailure ?? KernelResult.Ok();
+        if (firstFailure is { } failed) return failed;
+        if (_pendingPlatformIrqCapabilities.Any(id => CapabilityAuthority.DependsOnCapability(id, capabilityId)))
+            return KernelResult.Fail(KernelError.PlatformBindingDraining,
+                "An admitted IRQ effect must settle before capability closure.");
+        if (PlatformAuthority.HasUnresolvedIrqEffect(id => CapabilityAuthority.DependsOnCapability(id, capabilityId)))
+            return KernelResult.Fail(KernelError.PlatformFaulted,
+                "An IRQ effect lacks an exact closure receipt; parent remains pinned.");
+        return KernelResult.Ok();
     }
 
     private KernelResult AdvancePlatformIrqBindingsForDevice(PlatformDeviceLease deviceLease)
@@ -285,12 +408,17 @@ public sealed partial class RuntimeKernel
         SingProcess process,
         ProcessHandle handle)
     {
-        if (!_processPlatformIrqBindings.TryGetValue(handle, out var bindings) || bindings.Count == 0)
-            return KernelResult.Ok();
+        PlatformIrqBinding[] bindings;
+        lock (_platformMemoryUseGate)
+        {
+            if (!_processPlatformIrqBindings.TryGetValue(handle, out var tracked) || tracked.Count == 0)
+                return KernelResult.Ok();
+            bindings = tracked.ToArray();
+        }
 
         var identity = PlatformIdentity(process);
         KernelResult? firstFailure = null;
-        foreach (var binding in bindings.ToArray())
+        foreach (var binding in bindings)
         {
             var revoke = PlatformAuthority.RevokeIrq(binding, identity);
             if (!revoke.IsSuccess)
@@ -309,6 +437,8 @@ public sealed partial class RuntimeKernel
         ProcessHandle process,
         PlatformIrqBinding binding)
     {
+        lock (_platformMemoryUseGate)
+        {
         if (!_processPlatformIrqBindings.TryGetValue(process, out var bindings))
         {
             bindings = [];
@@ -317,15 +447,19 @@ public sealed partial class RuntimeKernel
 
         if (!bindings.Any(existing => existing.BindingId == binding.BindingId))
             bindings.Add(binding);
+        }
     }
 
     private void UntrackPlatformIrqBinding(PlatformIrqBinding binding)
     {
+        lock (_platformMemoryUseGate)
+        {
         foreach (var entry in _processPlatformIrqBindings.ToArray())
         {
             entry.Value.RemoveAll(existing => existing.BindingId == binding.BindingId);
             if (entry.Value.Count == 0)
                 _processPlatformIrqBindings.Remove(entry.Key);
+        }
         }
     }
 }

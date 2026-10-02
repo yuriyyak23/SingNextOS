@@ -1,11 +1,14 @@
 using SingPlus.Contracts;
+using SingPlus.Sip;
 
 namespace SingPlus.Runtime;
 
 public sealed partial class RuntimeKernel
 {
-    private readonly Dictionary<RegionId, (ProcessHandle Owner, BudgetReservationHandle Reservation)> _regionBudgetReservations = [];
+    private readonly Dictionary<RegionHandle, (ProcessHandle Owner, BudgetReservationHandle Reservation)> _regionBudgetReservations = [];
+    private readonly object _regionBudgetReservationsGate = new();
     private readonly Dictionary<ExternalOperationHandle, (ProcessHandle Owner, BudgetReservationHandle Reservation)> _externalOperationBudgetReservations = [];
+    private readonly object _externalOperationBudgetReservationsGate = new();
     private readonly Dictionary<(ChannelId Channel, ulong Sequence), (ProcessHandle Sender, ProcessHandle Receiver, BudgetReservationHandle Reservation)> _ipcBudgetReservations = [];
     private readonly Dictionary<PlatformRegionMappingId, (ProcessHandle Owner, BudgetReservationHandle Reservation)> _mappingBudgetReservations = [];
 
@@ -90,7 +93,7 @@ public sealed partial class RuntimeKernel
 
     public KernelResult<BudgetReservationSnapshot> ReleaseBudget(
         ProcessHandle owner,
-        BudgetReservationHandle reservation) => Budgets.Release(owner, reservation);
+        BudgetReservationHandle reservation) => Budgets.ReleaseExplicit(owner, reservation);
 
     public KernelResult<BudgetAccountSnapshot> QueryBudget(BudgetAccountHandle account) => Budgets.Query(account);
 
@@ -101,7 +104,9 @@ public sealed partial class RuntimeKernel
         ProcessHandle target,
         RegionHandle region)
     {
-        var sourceCharged = _regionBudgetReservations.ContainsKey(region.RegionId);
+        bool sourceCharged;
+        lock (_regionBudgetReservationsGate)
+            sourceCharged = _regionBudgetReservations.ContainsKey(region);
         if (sourceCharged && !Budgets.HasProcessAccount(target))
             return KernelResult<BudgetReservationHandle?>.Fail(KernelError.BudgetNotConfigured, "Budgeted ownership cannot transfer into an unbudgeted process generation.");
         if (!Budgets.HasProcessAccount(target)) return KernelResult<BudgetReservationHandle?>.Ok(null);
@@ -111,22 +116,108 @@ public sealed partial class RuntimeKernel
             BudgetReservationLifetime.LocalResource);
     }
 
+    // TCB-only composition used by real queued/inline request and response owners.
+    // The pair preparation callback only acquires its separate local Region loan.
+    private KernelResult<RegionHandle> TransferRegionForIpc(
+        SingProcess source, SingProcess target, RegionHandle region, Func<KernelResult>? preparePairBorrow)
+    {
+        lock (_platformMemoryUseGate)
+        {
+            var sourceHandle = new ProcessHandle(source.ProcessId, source.Generation);
+            var targetHandle = new ProcessHandle(target.ProcessId, target.Generation);
+            var sourceResolved = Processes.Resolve(sourceHandle);
+            var targetResolved = Processes.Resolve(targetHandle);
+            if (!sourceResolved.IsSuccess) return KernelResult<RegionHandle>.Fail(sourceResolved.Error, sourceResolved.Message!);
+            if (!targetResolved.IsSuccess) return KernelResult<RegionHandle>.Fail(targetResolved.Error, targetResolved.Message!);
+            if (!ReferenceEquals(sourceResolved.Value, source) || !ReferenceEquals(targetResolved.Value, target))
+                return KernelResult<RegionHandle>.Fail(KernelError.StaleHandle, "IPC transfer requires the exact live process records.");
+            var sourceEffect = EnsureProcessAcceptsNewEffects(source);
+            if (!sourceEffect.IsSuccess) return KernelResult<RegionHandle>.Fail(sourceEffect.Error, sourceEffect.Message!);
+            var targetEffect = EnsureProcessAcceptsNewEffects(target);
+            if (!targetEffect.IsSuccess) return KernelResult<RegionHandle>.Fail(targetEffect.Error, targetEffect.Message!);
+            var owner = new RegionOwner(source.DomainId, source.Generation);
+            var valid = Regions.Validate(region, owner);
+            if (!valid.IsSuccess) return KernelResult<RegionHandle>.Fail(valid.Error, valid.Message!);
+            var budget = PrepareRegionBudgetTransfer(sourceHandle, targetHandle, region);
+            if (!budget.IsSuccess) return KernelResult<RegionHandle>.Fail(budget.Error, budget.Message!);
+            KernelResult<RegionHandle> moved;
+            try
+            {
+                if (preparePairBorrow is not null)
+                {
+                  var prepared = preparePairBorrow();
+                  if (!prepared.IsSuccess)
+                  {
+                      _ = ReleaseAttachedBudget(targetHandle, budget.Value);
+                      return KernelResult<RegionHandle>.Fail(prepared.Error, prepared.Message!);
+                  }
+                }
+                // Pair preparation can reenter kernel lifecycle code. Its result
+                // does not preserve permission from the earlier process snapshot.
+                var freshSource = Processes.Resolve(sourceHandle);
+                var freshTarget = Processes.Resolve(targetHandle);
+                if (!freshSource.IsSuccess || !freshTarget.IsSuccess ||
+                    !ReferenceEquals(freshSource.Value, source) || !ReferenceEquals(freshTarget.Value, target))
+                {
+                    _ = ReleaseAttachedBudget(targetHandle, budget.Value);
+                    return KernelResult<RegionHandle>.Fail(KernelError.StaleHandle, "IPC transfer process incarnation changed during preparation.");
+                }
+                var freshSourceEffect = EnsureProcessAcceptsNewEffects(source);
+                var freshTargetEffect = EnsureProcessAcceptsNewEffects(target);
+                if (!freshSourceEffect.IsSuccess || !freshTargetEffect.IsSuccess)
+                {
+                    _ = ReleaseAttachedBudget(targetHandle, budget.Value);
+                    var refused = !freshSourceEffect.IsSuccess ? freshSourceEffect : freshTargetEffect;
+                    return KernelResult<RegionHandle>.Fail(refused.Error, refused.Message!);
+                }
+                moved = Regions.Transfer(region, owner, new RegionOwner(target.DomainId, target.Generation));
+            }
+            catch (Exception exception)
+            {
+                if (budget.Value is { } exact) _ = Budgets.QuarantineLease(targetHandle, exact);
+                return KernelResult<RegionHandle>.Fail(KernelError.PlatformFaulted,
+                  $"IPC ownership composition failed with uncertain local mutation: {exception.Message}");
+            }
+            if (!moved.IsSuccess)
+            {
+                _ = ReleaseAttachedBudget(targetHandle, budget.Value);
+                return moved;
+            }
+            CompleteRegionBudgetTransfer(sourceHandle, targetHandle, region, moved.Value, budget.Value);
+            return moved;
+        }
+    }
+
     private void CompleteRegionBudgetTransfer(
         ProcessHandle source,
         ProcessHandle target,
-        RegionId region,
+        RegionHandle oldRegion,
+        RegionHandle newRegion,
         BudgetReservationHandle? targetReservation)
     {
-        if (_regionBudgetReservations.Remove(region, out var prior))
-            _ = ReleaseAttachedBudget(source, prior.Reservation);
+        var payer = source;
+        lock (_regionBudgetReservationsGate)
+            if (_regionBudgetReservations.TryGetValue(oldRegion, out var prior)) payer = prior.Owner;
+        // V1 Region authorization is domain/generation scoped. A valid cohort
+        // peer may transfer a Region whose quantitative payer is another process.
+        ReleaseRegionBudget(payer, oldRegion);
         if (targetReservation is { } exact)
-            _regionBudgetReservations[region] = (target, exact);
+            lock (_regionBudgetReservationsGate)
+                _regionBudgetReservations.Add(newRegion, (target, exact));
     }
 
-    private void ReleaseRegionBudget(ProcessHandle owner, RegionId region)
+    private void ReleaseRegionBudget(ProcessHandle owner, RegionHandle region)
     {
-        if (_regionBudgetReservations.Remove(region, out var charge))
-            _ = ReleaseAttachedBudget(owner, charge.Reservation);
+        (ProcessHandle Owner, BudgetReservationHandle Reservation) charge;
+        lock (_regionBudgetReservationsGate)
+            if (!_regionBudgetReservations.TryGetValue(region, out charge) || charge.Owner != owner)
+                return;
+        // Region release/transfer is independent of quantitative settlement.
+        // A transferred generation must not overwrite an unresolved prior charge.
+        if (!ReleaseAttachedBudget(charge.Owner, charge.Reservation).IsSuccess) return;
+        lock (_regionBudgetReservationsGate)
+            if (_regionBudgetReservations.TryGetValue(region, out var current) && current == charge)
+                _regionBudgetReservations.Remove(region);
     }
 
     private KernelResult ReleaseMappingBudget(PlatformRegionMappingId mapping)
@@ -140,30 +231,71 @@ public sealed partial class RuntimeKernel
 
     private void ReleaseClosedIpcBudgetsForProcess(ProcessHandle process)
     {
-        foreach (var item in _ipcBudgetReservations.Where(item => item.Value.Sender == process || item.Value.Receiver == process).ToArray())
-        {
-            _ = ReleaseAttachedBudget(item.Value.Sender, item.Value.Reservation);
-            _ipcBudgetReservations.Remove(item.Key);
-        }
+        (ChannelId Channel, ulong Sequence)[] pending;
+        lock (_requestResponseCorrelationGate)
+            pending = _ipcBudgetReservations.Where(item => item.Value.Sender == process ||
+                item.Value.Receiver == process).Select(item => item.Key).ToArray();
+        foreach (var key in pending) ReleaseIpcBudget(key);
     }
 
-    private void ReleaseReclaimedRegionBudgetsForProcess(ProcessHandle process)
+    private void ReleaseClosedIpcBudgetsForChannel(ChannelId channel)
     {
-        foreach (var item in _regionBudgetReservations.Where(item => item.Value.Owner == process).ToArray())
-        {
-            _ = ReleaseAttachedBudget(process, item.Value.Reservation);
-            _regionBudgetReservations.Remove(item.Key);
-        }
+        (ChannelId Channel, ulong Sequence)[] pending;
+        lock (_requestResponseCorrelationGate)
+            pending = _ipcBudgetReservations.Keys.Where(key => key.Channel == channel).ToArray();
+        foreach (var key in pending) ReleaseIpcBudget(key);
+    }
+
+    private void ReleaseIpcBudget((ChannelId Channel, ulong Sequence) key)
+    {
+        (ProcessHandle Sender, ProcessHandle Receiver, BudgetReservationHandle Reservation) charge;
+        lock (_requestResponseCorrelationGate)
+            if (!_ipcBudgetReservations.TryGetValue(key, out charge)) return;
+        // Delivered/closed queue lifetime is not quantitative settlement.
+        // Retain the exact routing association when the budget owner refuses.
+        if (!ReleaseAttachedBudget(charge.Sender, charge.Reservation).IsSuccess) return;
+        lock (_requestResponseCorrelationGate)
+            if (_ipcBudgetReservations.TryGetValue(key, out var current) && current == charge)
+                _ipcBudgetReservations.Remove(key);
+    }
+
+    private void ReleaseReclaimedRegionBudgetsForProcess(ProcessHandle process, IReadOnlyList<RegionHandle> reclaimed)
+    {
+        var exactReclaimed = reclaimed.ToHashSet();
+        KeyValuePair<RegionHandle, (ProcessHandle Owner, BudgetReservationHandle Reservation)>[] pending;
+        lock (_regionBudgetReservationsGate)
+            // Preserve the existing final-process retry and also route actual domain
+            // reclaim results to exact charges belonging to earlier cohort members.
+            pending = _regionBudgetReservations.Where(item => item.Value.Owner == process ||
+                exactReclaimed.Contains(item.Key)).ToArray();
+        foreach (var item in pending)
+            ReleaseRegionBudget(item.Value.Owner, item.Key);
     }
 
     private void ReconcileReleasedExternalOperationBudgets(ProcessHandle process)
     {
-        foreach (var item in _externalOperationBudgetReservations.Where(item => item.Value.Owner == process).ToArray())
+        KeyValuePair<ExternalOperationHandle, (ProcessHandle Owner, BudgetReservationHandle Reservation)>[] pending;
+        lock (_externalOperationBudgetReservationsGate)
+            pending = _externalOperationBudgetReservations.Where(item => item.Value.Owner == process).ToArray();
+        foreach (var item in pending)
         {
             var operation = ExternalOperations.Query(item.Key);
             if (!operation.IsSuccess || operation.Value!.State != ExternalOperationState.Released) continue;
-            _ = ReleaseAttachedBudget(process, item.Value.Reservation);
-            _externalOperationBudgetReservations.Remove(item.Key);
+            ReleaseExternalOperationBudget(process, item.Key);
         }
+    }
+
+    private void ReleaseExternalOperationBudget(ProcessHandle owner, ExternalOperationHandle operation)
+    {
+        (ProcessHandle Owner, BudgetReservationHandle Reservation) charge;
+        lock (_externalOperationBudgetReservationsGate)
+            if (!_externalOperationBudgetReservations.TryGetValue(operation, out charge) || charge.Owner != owner)
+                return;
+        // Local operation release is not quantitative settlement. Keep the exact
+        // association for the existing release/teardown retry if the budget owner refuses.
+        if (!ReleaseAttachedBudget(charge.Owner, charge.Reservation).IsSuccess) return;
+        lock (_externalOperationBudgetReservationsGate)
+            if (_externalOperationBudgetReservations.TryGetValue(operation, out var current) && current == charge)
+                _externalOperationBudgetReservations.Remove(operation);
     }
 }

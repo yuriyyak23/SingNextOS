@@ -24,9 +24,15 @@ public sealed class ResourceBudgetAuthority
         public required BudgetAmount[] Amounts { get; set; }
         public required BudgetReservationLifetime Lifetime { get; init; }
         public required AdmissionQosHint QosHint { get; init; }
+        // Release provenance belongs to this quantitative owner. Observation of
+        // the reservation handle does not detach a live runtime resource charge.
+        public bool RuntimeAttached { get; init; }
         public BudgetReservationState State { get; set; }
         public BudgetAmount[] ChargedAmounts { get; set; } = [];
         public bool SettlementTerminal { get; set; }
+        // One-shot composition identity, not execution permission or a capacity ledger.
+        public Guid? TemporalComposition { get; set; }
+        public bool TemporalCompositionCommitted { get; set; }
     }
 
     private static readonly ServiceBudgetDimension[] AllDimensions = Enum.GetValues<ServiceBudgetDimension>();
@@ -199,7 +205,8 @@ public sealed class ResourceBudgetAuthority
             return ReserveCore(owner, account,
                 [new(ServiceBudgetDimension.CheckpointStorageBytes, bytes)],
                 BudgetReservationLifetime.CheckpointImage,
-                AdmissionQosHint.Background);
+                AdmissionQosHint.Background,
+                runtimeAttached: true);
         }
     }
 
@@ -213,7 +220,7 @@ public sealed class ResourceBudgetAuthority
         {
             if (!_processAccounts.TryGetValue(owner, out var account))
                 return KernelResult<BudgetReservationSnapshot?>.Ok(null);
-            var reserved = ReserveCore(owner, account, amounts, lifetime, qosHint);
+            var reserved = ReserveCore(owner, account, amounts, lifetime, qosHint, runtimeAttached: true);
             return reserved.IsSuccess
                 ? KernelResult<BudgetReservationSnapshot?>.Ok(reserved.Value)
                 : KernelResult<BudgetReservationSnapshot?>.Fail(reserved.Error, reserved.Message!);
@@ -222,7 +229,16 @@ public sealed class ResourceBudgetAuthority
 
     internal KernelResult<BudgetReservationSnapshot> Release(
         ProcessHandle owner,
-        BudgetReservationHandle reservation)
+        BudgetReservationHandle reservation) => ReleaseCore(owner, reservation, runtimeConsumer: true);
+
+    internal KernelResult<BudgetReservationSnapshot> ReleaseExplicit(
+        ProcessHandle owner,
+        BudgetReservationHandle reservation) => ReleaseCore(owner, reservation, runtimeConsumer: false);
+
+    private KernelResult<BudgetReservationSnapshot> ReleaseCore(
+        ProcessHandle owner,
+        BudgetReservationHandle reservation,
+        bool runtimeConsumer)
     {
         lock (_gate)
         {
@@ -234,6 +250,12 @@ public sealed class ResourceBudgetAuthority
                 return KernelResult<BudgetReservationSnapshot>.Ok(Snapshot(record));
             if (record.State == BudgetReservationState.CancelledPreSubmit)
                 return KernelResult<BudgetReservationSnapshot>.Ok(Snapshot(record));
+            if (record.TemporalComposition is not null)
+                return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.InvalidTransition,
+                    "A claimed temporal composition requires its existing cancellation or settlement consumer.");
+            if (record.RuntimeAttached && !runtimeConsumer)
+                return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.InvalidTransition,
+                    "Runtime-attached capacity requires its existing resource release consumer.");
             if (record.State is BudgetReservationState.Consuming or BudgetReservationState.Quarantined or BudgetReservationState.Reconciled or BudgetReservationState.Settling)
                 return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.InvalidTransition, "A possibly consumed lease requires settlement or reconciliation, not release.");
 
@@ -254,8 +276,71 @@ public sealed class ResourceBudgetAuthority
     internal KernelResult<BudgetReservationSnapshot> BindLease(ProcessHandle owner, BudgetReservationHandle reservation) =>
         Transition(owner, reservation, BudgetReservationState.Reserved, BudgetReservationState.Bound);
 
-    internal KernelResult<BudgetReservationSnapshot> BeginConsumption(ProcessHandle owner, BudgetReservationHandle reservation) =>
-        Transition(owner, reservation, BudgetReservationState.Bound, BudgetReservationState.Consuming);
+    internal KernelResult ClaimTemporalComposition(ProcessHandle owner,
+        BudgetReservationHandle reservation, Guid composition)
+    {
+        if (composition == Guid.Empty)
+            return KernelResult.Fail(KernelError.InvalidMessage, "Temporal composition identity is empty.");
+        lock (_gate)
+        {
+            var resolved = ResolveReservation(owner, reservation);
+            if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+            var record = resolved.Value!;
+            if (record.TemporalComposition is not null)
+                return KernelResult.Fail(KernelError.DuplicateIdentity, "Budget already belongs to a temporal composition.");
+            if (record.State != BudgetReservationState.Bound || record.Lifetime != BudgetReservationLifetime.ExternalEffect)
+                return KernelResult.Fail(KernelError.InvalidTransition, "Temporal composition requires an idle bound external lease.");
+            record.TemporalComposition = composition;
+            return KernelResult.Ok();
+        }
+    }
+
+    // Only an unpublished composition whose model reserve failed can abandon its claim.
+    internal void AbandonTemporalComposition(ProcessHandle owner,
+        BudgetReservationHandle reservation, Guid composition)
+    {
+        lock (_gate)
+        {
+            var resolved = ResolveReservation(owner, reservation);
+            if (resolved.IsSuccess && !resolved.Value!.TemporalCompositionCommitted &&
+                resolved.Value.TemporalComposition == composition)
+                resolved.Value.TemporalComposition = null;
+        }
+    }
+
+    internal KernelResult CommitTemporalComposition(ProcessHandle owner,
+        BudgetReservationHandle reservation, Guid composition)
+    {
+        lock (_gate)
+        {
+            var resolved = ResolveReservation(owner, reservation);
+            if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+            var record = resolved.Value!;
+            if (composition == Guid.Empty || record.TemporalComposition != composition ||
+                record.State != BudgetReservationState.Bound)
+                return KernelResult.Fail(KernelError.InvalidTransition,
+                    "Only the exact idle provisional temporal composition can commit.");
+            record.TemporalCompositionCommitted = true;
+            return KernelResult.Ok();
+        }
+    }
+
+    internal KernelResult<BudgetReservationSnapshot> BeginConsumption(ProcessHandle owner,
+        BudgetReservationHandle reservation, Guid? temporalComposition = null)
+    {
+        lock (_gate)
+        {
+            var resolved = ResolveReservation(owner, reservation);
+            if (!resolved.IsSuccess)
+                return KernelResult<BudgetReservationSnapshot>.Fail(resolved.Error, resolved.Message!);
+            var record = resolved.Value!;
+            // Association selects the quantitative consumer, never execution authority.
+            if (!MatchesTemporalConsumer(record, temporalComposition))
+                return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.InvalidTransition,
+                    "Consumption must match the lease's committed temporal composition, if any.");
+            return Transition(owner, reservation, BudgetReservationState.Bound, BudgetReservationState.Consuming);
+        }
+    }
 
     internal KernelResult<BudgetReservationSnapshot> QuarantineLease(ProcessHandle owner, BudgetReservationHandle reservation)
     {
@@ -272,13 +357,17 @@ public sealed class ResourceBudgetAuthority
         }
     }
 
-    internal KernelResult<BudgetReservationSnapshot> ReconcileLease(ProcessHandle owner, BudgetReservationHandle reservation)
+    internal KernelResult<BudgetReservationSnapshot> ReconcileLease(ProcessHandle owner,
+        BudgetReservationHandle reservation, Guid? temporalComposition = null)
     {
         lock (_gate)
         {
             var resolved = ResolveReservation(owner, reservation);
             if (!resolved.IsSuccess) return KernelResult<BudgetReservationSnapshot>.Fail(resolved.Error, resolved.Message!);
             var record = resolved.Value!;
+            if (!MatchesTemporalConsumer(record, temporalComposition))
+                return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.InvalidTransition,
+                    "Reconciliation must match the committed temporal consumer, if any.");
             if (record.State == BudgetReservationState.Reconciled) return KernelResult<BudgetReservationSnapshot>.Ok(Snapshot(record));
             if (record.State != BudgetReservationState.Quarantined)
                 return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.InvalidTransition, "Only a quarantined lease can be reconciled.");
@@ -287,13 +376,17 @@ public sealed class ResourceBudgetAuthority
         }
     }
 
-    internal KernelResult<BudgetReservationSnapshot> CancelLeasePreSubmit(ProcessHandle owner, BudgetReservationHandle reservation)
+    internal KernelResult<BudgetReservationSnapshot> CancelLeasePreSubmit(ProcessHandle owner,
+        BudgetReservationHandle reservation, Guid? temporalComposition = null)
     {
         lock (_gate)
         {
             var resolved = ResolveReservation(owner, reservation);
             if (!resolved.IsSuccess) return KernelResult<BudgetReservationSnapshot>.Fail(resolved.Error, resolved.Message!);
             var record = resolved.Value!;
+            if (!MatchesTemporalConsumer(record, temporalComposition))
+                return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.InvalidTransition,
+                    "Pre-submit cancellation must match the committed temporal consumer, if any.");
             if (record.State == BudgetReservationState.CancelledPreSubmit) return KernelResult<BudgetReservationSnapshot>.Ok(Snapshot(record));
             if (record.State is not (BudgetReservationState.Reserved or BudgetReservationState.Bound))
                 return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.InvalidTransition, "Pre-submit cancellation is no longer safe.");
@@ -305,13 +398,17 @@ public sealed class ResourceBudgetAuthority
     }
 
     internal KernelResult<BudgetReservationSnapshot> SettleLease(
-        ProcessHandle owner, BudgetReservationHandle reservation, IReadOnlyList<BudgetAmount> actualUsage)
+        ProcessHandle owner, BudgetReservationHandle reservation, IReadOnlyList<BudgetAmount> actualUsage,
+        Guid? temporalComposition = null)
     {
         lock (_gate)
         {
             var resolved = ResolveReservation(owner, reservation);
             if (!resolved.IsSuccess) return KernelResult<BudgetReservationSnapshot>.Fail(resolved.Error, resolved.Message!);
             var record = resolved.Value!;
+            if (!MatchesTemporalConsumer(record, temporalComposition))
+                return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.InvalidTransition,
+                    "Settlement must match the committed temporal consumer, if any.");
             if (record.SettlementTerminal) return KernelResult<BudgetReservationSnapshot>.Ok(Snapshot(record));
             if (record.State is not (BudgetReservationState.Consuming or BudgetReservationState.Reconciled))
                 return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.InvalidTransition, "Lease is not eligible for settlement.");
@@ -354,7 +451,8 @@ public sealed class ResourceBudgetAuthority
     // decides whether every ancestor can retain the extra charge; this is not a
     // reservation or evidence that the provider enforced an upper bound.
     internal KernelResult<BudgetReservationSnapshot> SettleReportedComputeOverrun(
-        ProcessHandle owner, BudgetReservationHandle reservation, ulong reportedNanoseconds)
+        ProcessHandle owner, BudgetReservationHandle reservation, ulong reportedNanoseconds,
+        Guid? temporalComposition = null)
     {
         lock (_gate)
         {
@@ -362,6 +460,9 @@ public sealed class ResourceBudgetAuthority
             if (!resolved.IsSuccess)
                 return KernelResult<BudgetReservationSnapshot>.Fail(resolved.Error, resolved.Message!);
             var record = resolved.Value!;
+            if (!MatchesTemporalConsumer(record, temporalComposition))
+                return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.InvalidTransition,
+                    "Corrective settlement must match the committed temporal consumer, if any.");
             if (record.State != BudgetReservationState.Quarantined || record.SettlementTerminal ||
                 record.Lifetime != BudgetReservationLifetime.ExternalEffect || record.Amounts.Length != 1 ||
                 record.Amounts[0].Dimension != ServiceBudgetDimension.ComputeTimeNanoseconds ||
@@ -474,7 +575,8 @@ public sealed class ResourceBudgetAuthority
         BudgetAccountHandle account,
         IReadOnlyList<BudgetAmount> amounts,
         BudgetReservationLifetime lifetime,
-        AdmissionQosHint qosHint)
+        AdmissionQosHint qosHint,
+        bool runtimeAttached = false)
     {
         if (!Enum.IsDefined(lifetime) || !Enum.IsDefined(qosHint))
             return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.InvalidMessage, "Budget lifetime or QoS hint is invalid.");
@@ -505,6 +607,7 @@ public sealed class ResourceBudgetAuthority
             Amounts = amounts.OrderBy(static amount => amount.Dimension).ToArray(),
             Lifetime = lifetime,
             QosHint = qosHint,
+            RuntimeAttached = runtimeAttached,
             State = BudgetReservationState.Active,
         };
         _reservations.Add(handle.ReservationId, record);
@@ -528,6 +631,10 @@ public sealed class ResourceBudgetAuthority
         _nextReservationId = id == ulong.MaxValue ? 0 : id + 1;
         return new(new(id), new(1));
     }
+
+    private static bool MatchesTemporalConsumer(ReservationRecord record, Guid? composition) =>
+        record.TemporalComposition == composition &&
+        (composition is null || record.TemporalCompositionCommitted);
 
     private KernelResult<ReservationRecord> ResolveReservation(ProcessHandle owner, BudgetReservationHandle reservation)
     {
@@ -600,8 +707,9 @@ public sealed class ResourceBudgetAuthority
     }
 
     private static BudgetReservationSnapshot Snapshot(ReservationRecord record) => new(
-        record.Handle, record.Account, record.Owner, record.Amounts, record.Lifetime, record.QosHint, record.State,
-        ChargedAmounts: record.ChargedAmounts);
+        record.Handle, record.Account, record.Owner, Array.AsReadOnly(record.Amounts.ToArray()),
+        record.Lifetime, record.QosHint, record.State,
+        ChargedAmounts: Array.AsReadOnly(record.ChargedAmounts.ToArray()));
 
     private static BudgetReservationSnapshot Stale(BudgetReservationHandle handle, ProcessHandle owner) => new(
         handle, default, owner, [], BudgetReservationLifetime.LocalResource, AdmissionQosHint.None, BudgetReservationState.Stale);

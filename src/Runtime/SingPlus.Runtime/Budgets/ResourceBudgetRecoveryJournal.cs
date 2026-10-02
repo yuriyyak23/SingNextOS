@@ -90,8 +90,9 @@ internal interface IResourceBudgetJournalStore
 }
 
 /// <summary>
-/// Append-only file store. Each frame is length-prefixed and flushed to stable
-/// storage before AppendFrame returns. A torn final frame fails closed on replay.
+/// Append-only file store. Each length-prefixed frame requests WriteThrough and
+/// Flush(flushToDisk: true) before AppendFrame returns. Physical power-loss durability
+/// requires qualification of the exact storage stack. A torn final frame fails closed on replay.
 /// </summary>
 internal sealed class FileResourceBudgetJournalStore(string path) : IResourceBudgetJournalStore
 {
@@ -234,6 +235,9 @@ internal sealed class ResourceBudgetRecoveryJournal
         if (current.LastSequence < _lastSequence ||
             current.LastSequence != 0 && current.JournalEpoch != _epoch)
             throw new InvalidDataException("Recovery journal history regressed or changed epoch.");
+        if (_lastSequence != 0 && !CryptographicOperations.FixedTimeEquals(
+                DecodeFrame(frames[checked((int)(_lastSequence - 1))]).Authenticator, _lastAuthenticator))
+            throw new InvalidDataException("Recovery journal replaced the previously observed authenticated prefix.");
         if (current.LastSequence > _lastSequence)
         {
             _lastSequence = current.LastSequence;
@@ -289,6 +293,7 @@ internal sealed class ResourceBudgetRecoveryJournal
         (prior, next) switch
         {
             (ResourceBudgetRecoveryTransition.Prepared, ResourceBudgetRecoveryTransition.PossibleSubmit) => true,
+            (ResourceBudgetRecoveryTransition.Prepared, ResourceBudgetRecoveryTransition.Quarantined) => true,
             (ResourceBudgetRecoveryTransition.Prepared, ResourceBudgetRecoveryTransition.CancelledPreSubmit) => true,
             (ResourceBudgetRecoveryTransition.PossibleSubmit, ResourceBudgetRecoveryTransition.Quarantined) => true,
             (ResourceBudgetRecoveryTransition.PossibleSubmit, ResourceBudgetRecoveryTransition.SettledExact or

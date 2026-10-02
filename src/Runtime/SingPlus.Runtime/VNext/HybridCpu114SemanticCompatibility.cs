@@ -114,6 +114,10 @@ internal sealed record SemanticExecutionBindingV1(
             ProviderRequestCorrelation.Equals(default(Hc.ExternalRequestCorrelation)) ||
             string.IsNullOrWhiteSpace(ProviderGenerationDigest) || string.IsNullOrWhiteSpace(MeasurementContractIdentity))
             throw new ArgumentException("Semantic execution binding correlation is incomplete.");
+        ValidateCanonicalDigest(ObligationsDigest.Value);
+        ValidateCanonicalDigest(GuaranteesDigest.Value);
+        ValidateCanonicalToken(ProviderIdentity);
+        ValidateCanonicalToken(MeasurementContractIdentity);
         if (ProviderContract != new ProviderContractIdentityV1(
                 HybridCpu114SemanticCompatibility.PackageId,
                 HybridCpu114SemanticCompatibility.PackageVersion,
@@ -122,6 +126,7 @@ internal sealed record SemanticExecutionBindingV1(
         if (HybridCpu114SemanticCompatibility.GenerationDigest(ProviderGenerations) != ProviderGenerationDigest)
             throw new ArgumentException("Provider generation digest does not match the exact opaque generation set.");
         var envelope = ResourceEnvelope.Canonicalize();
+        ValidateCanonicalToken(envelope.SemanticScope);
         if (!Enum.IsDefined(VisibilityRequirement) || !Enum.IsDefined(PublicationPolicy))
             throw new ArgumentOutOfRangeException(nameof(PublicationPolicy));
         var canonical = this with { ResourceEnvelope = envelope, Digest = default };
@@ -129,6 +134,25 @@ internal sealed record SemanticExecutionBindingV1(
         if (!string.IsNullOrEmpty(Digest.Value) && Digest != expected)
             throw new ArgumentException("Semantic execution binding digest mismatch.", nameof(Digest));
         return canonical with { Digest = expected };
+    }
+
+    private static void ValidateCanonicalToken(string value)
+    {
+        if (value != value.Trim() || value.Any(char.IsControl))
+            throw new ArgumentException("Binding digest fields must be canonical tokens without control characters.");
+        try { _ = new UTF8Encoding(false, true).GetByteCount(value); }
+        catch (EncoderFallbackException exception)
+        {
+            throw new ArgumentException("Binding digest fields must contain valid Unicode scalar values.",
+                nameof(value), exception);
+        }
+    }
+
+    private static void ValidateCanonicalDigest(string value)
+    {
+        if (value.Length != 64 || value.Any(character =>
+                character is not (>= '0' and <= '9') and not (>= 'a' and <= 'f')))
+            throw new ArgumentException("Binding evidence digests must be exact lowercase SHA256 values.");
     }
 
     private static string ComputeDigest(SemanticExecutionBindingV1 value)
@@ -147,6 +171,6 @@ internal sealed record SemanticExecutionBindingV1(
             value.ProviderContract.PackageVersion, value.ProviderContract.SchemaIdentity,
             value.MeasurementContractIdentity, (int)value.VisibilityRequirement,
             (int)value.PublicationPolicy);
-        return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(payload)));
+        return Convert.ToHexStringLower(SHA256.HashData(new UTF8Encoding(false, true).GetBytes(payload)));
     }
 }

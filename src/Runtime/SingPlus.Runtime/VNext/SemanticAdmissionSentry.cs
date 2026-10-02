@@ -177,7 +177,9 @@ public sealed partial class RuntimeKernel
         ISemanticProviderAdmissionService providerAdmission,
         IRuntimeLegalityService runtimeLegality,
         Func<OperationBinding, KernelResult> providerSubmit,
-        Func<KernelResult>? additionalFinalSentry = null)
+        Func<KernelResult>? additionalFinalSentry = null,
+        Action? submissionObservation = null,
+        Action? preSubmitFailureObservation = null)
     {
         ArgumentNullException.ThrowIfNull(commit);
         ArgumentNullException.ThrowIfNull(binding);
@@ -199,7 +201,7 @@ public sealed partial class RuntimeKernel
                     decision.ProviderIdentity != binding.ProviderIdentity ||
                     decision.ProviderGenerationDigest != binding.ProviderGenerationDigest ||
                     decision.Correlation != binding.ProviderRequestCorrelation ||
-                    string.IsNullOrWhiteSpace(decision.EvidenceIdentity))
+                    !IsCanonicalSemanticDecisionIdentity(decision.EvidenceIdentity))
                     return KernelResult.Fail(KernelError.PlatformDenied, "Exact provider admission gate denied or became stale.");
                 return KernelResult.Ok();
             }
@@ -224,9 +226,12 @@ public sealed partial class RuntimeKernel
             if (legalityDecision.Version != RuntimeLegalityDecisionV1.CurrentVersion ||
                 legalityDecision.Status != SemanticGateDecisionStatusV1.Allowed ||
                 legalityDecision.BindingDigest != binding.Digest || legalityDecision.RuntimeGeneration == 0 ||
-                string.IsNullOrWhiteSpace(legalityDecision.RuntimeIdentity) ||
-                string.IsNullOrWhiteSpace(legalityDecision.EvidenceIdentity))
+                !IsCanonicalSemanticDecisionIdentity(legalityDecision.RuntimeIdentity) ||
+                !IsCanonicalSemanticDecisionIdentity(legalityDecision.EvidenceIdentity))
                 return KernelResult.Fail(KernelError.PlatformDenied, "Independent runtime legality gate denied or became stale.");
+
+            var additional = additionalFinalSentry?.Invoke() ?? KernelResult.Ok();
+            if (!additional.IsSuccess) return additional;
 
             // Runtime legality may have triggered a provider reset or admission revocation.
             providerGate = RevalidateProvider();
@@ -239,11 +244,19 @@ public sealed partial class RuntimeKernel
             if (!singNext.IsSuccess) return singNext;
             var finalAuthority = RevalidateResourceAdmissionCommit(commit);
             if (!finalAuthority.IsSuccess) return finalAuthority;
-            return additionalFinalSentry?.Invoke() ?? KernelResult.Ok();
-        });
+            return KernelResult.Ok();
+        }, submissionObservation, preSubmitFailureObservation);
     }
 
-    private KernelResult RevalidateResourceAdmissionCommit(ResourceAdmissionCommit commit)
+    private static bool IsCanonicalSemanticDecisionIdentity(string? identity)
+    {
+        if (string.IsNullOrWhiteSpace(identity) || identity != identity.Trim() || identity.Any(char.IsControl))
+            return false;
+        try { _ = new UTF8Encoding(false, true).GetByteCount(identity); }
+        catch (EncoderFallbackException) { return false; }
+        return true;
+    }
+    private KernelResult RevalidateResourceAdmissionCommit(ResourceAdmissionCommit commit, bool afterSubmit = false)
     {
         var process = Processes.Resolve(commit.Principal);
         if (!process.IsSuccess) return KernelResult.Fail(process.Error, process.Message!);
@@ -255,15 +268,40 @@ public sealed partial class RuntimeKernel
         if (effect.Value!.ResourceKind != commit.EffectResourceKind ||
             !string.Equals(effect.Value.ResourceId, commit.EffectResourceId, StringComparison.Ordinal))
             return KernelResult.Fail(KernelError.WrongCapabilityResource, "Effect capability resource changed before submit.");
+        var operationAdmission = CapabilityAuthority.ValidateOperationAdmission(commit.EffectCapability,
+            process.Value.DomainId, commit.Principal.Generation, commit.EffectResourceKind,
+            commit.EffectResourceId, commit.EffectResourceGeneration, CapabilityOperation.Execute);
+        if (!operationAdmission.IsSuccess) return operationAdmission;
         var resource = CapabilityAuthority.ValidateResourceUse(commit.ResourceGrant,
             process.Value.DomainId, commit.Principal.Generation, commit.ResourceGeneration, commit.Envelope);
         if (!resource.IsSuccess) return KernelResult.Fail(resource.Error, resource.Message!);
+        var records = RevalidateAdmissionCapabilityRecords(commit.Principal, commit.EffectCapability,
+            commit.EffectResourceGeneration, commit.ResourceGrant, commit.ResourceGeneration);
+        if (!records.IsSuccess) return records;
         var lease = Budgets.Query(commit.Lease);
-        if (!lease.IsSuccess || lease.Value!.Owner != commit.BudgetOwner || lease.Value.State != BudgetReservationState.Bound)
+        if (!lease.IsSuccess || lease.Value!.Owner != commit.BudgetOwner ||
+            lease.Value.State != (afterSubmit ? BudgetReservationState.Consuming : BudgetReservationState.Bound))
             return KernelResult.Fail(KernelError.StaleGeneration, "Bound budget lease changed before submit.");
         var operation = ExternalOperations.Query(commit.Operation);
-        return operation.IsSuccess && operation.Value!.State == ExternalOperationState.Admitted
+        return operation.IsSuccess && operation.Value!.Disposition == ExternalOperationDisposition.Active && operation.Value.State ==
+            (afterSubmit ? ExternalOperationState.Submitted : ExternalOperationState.Admitted)
             ? KernelResult.Ok()
-            : KernelResult.Fail(KernelError.StaleGeneration, "External operation changed before submit.");
+            : KernelResult.Fail(KernelError.StaleGeneration, "External operation state or disposition changed before provider admission.");
+    }
+
+    private KernelResult RevalidateAdmissionCapabilityRecords(ProcessHandle principal,
+        CapabilityId effectCapability, ulong effectResourceGeneration, CapabilityId resourceGrant, ulong resourceGeneration)
+    {
+        var process = Processes.Resolve(principal);
+        if (!process.IsSuccess) return KernelResult.Fail(process.Error, process.Message!);
+        var accepts = EnsureProcessAcceptsNewEffects(process.Value!);
+        if (!accepts.IsSuccess) return accepts;
+        // These owner reads invoke no virtual clock or other user callback.
+        var effect = CapabilityAuthority.Validate(effectCapability, process.Value!.DomainId,
+            principal.Generation, CapabilityRights.Execute, effectResourceGeneration);
+        if (!effect.IsSuccess) return KernelResult.Fail(effect.Error, effect.Message!);
+        var resource = CapabilityAuthority.Validate(resourceGrant, process.Value.DomainId,
+            principal.Generation, CapabilityRights.None, resourceGeneration);
+        return resource.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(resource.Error, resource.Message!);
     }
 }

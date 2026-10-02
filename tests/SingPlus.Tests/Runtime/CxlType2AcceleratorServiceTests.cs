@@ -8,6 +8,104 @@ namespace SingPlus.Tests.Runtime;
 public sealed class CxlType2AcceleratorServiceTests
 {
     [Fact]
+    public void Type2LiveOperationPinsFabricUntilExplicitProviderRelease()
+    {
+        var s = CreateScenario();
+        var execution = s.Service.Submit(s.Handle, s.Plan, [s.Candidate], s.Subject, s.Lease, s.Endpoint, s.Fabric, 1).Value!;
+        Assert.Equal(KernelError.PlatformBindingActive, s.Bridge.ReleaseFabric(s.Fabric).Error);
+        Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.RevokePlatformDevice(s.Handle, s.Lease).Error);
+        Assert.True(s.Service.CompleteVisiblePublish(s.Handle, execution, [s.Candidate], () => { }).IsSuccess);
+        Assert.True(s.Bridge.ReleaseFabric(s.Fabric).IsSuccess);
+        Assert.True(s.Kernel.RevokePlatformDevice(s.Handle, s.Lease).IsSuccess);
+    }
+
+    [Fact]
+    public void Type2CancellationAcknowledgementCannotReleaseParentWithoutClosure()
+    {
+        var s = CreateScenario();
+        var execution = s.Service.Submit(s.Handle, s.Plan, [s.Candidate], s.Subject, s.Lease, s.Endpoint, s.Fabric, 1).Value!;
+        Assert.True(s.Accelerator.Cancel(execution.Submission).IsSuccess);
+        Assert.Equal(ExternalOperationCompletionDisposition.Cancelled, s.Accelerator.ObserveCompletion(execution.Submission).Value.Disposition);
+        s.Accelerator.ReleaseFails = true;
+        Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingActive, s.Bridge.ReleaseFabric(s.Fabric).Error);
+        Assert.True(s.Kernel.Regions.Validate(s.Input.Handle, new(s.Subject.DomainId, s.Handle.Generation)).IsSuccess);
+        s.Accelerator.ReleaseFails = false;
+        Assert.True(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+    }
+
+    [Fact]
+    public void Type2FreshSourceRejectsDirectCapabilityOwnerRevokeBeforeSubmit()
+    {
+        var s = CreateScenario();
+        var cap = DeviceCapability(s);
+        Assert.True(s.Kernel.CapabilityAuthority.Revoke(cap).IsSuccess);
+        var result = s.Service.Submit(s.Handle, s.Plan, [s.Candidate], s.Subject, s.Lease, s.Endpoint, s.Fabric, 1);
+        Assert.Equal(KernelError.CapabilityRevoked, result.Error);
+        Assert.Equal(0, s.Accelerator.SubmitCount);
+        Assert.True(s.Bridge.ReleaseFabric(s.Fabric).IsSuccess);
+    }
+
+    [Fact]
+    public async Task Type2PendingCallbackPinsParentAndRejectsConcurrentReconfiguration()
+    {
+        SubmitHookAccelerator? hook = null;
+        var s = CreateScenario(acceleratorFactory: model => hook = new(model));
+        using var entered = new ManualResetEventSlim();
+        using var resume = new ManualResetEventSlim();
+        hook!.AfterSubmit = () => { entered.Set(); if (!resume.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException(); };
+        var pending = Task.Run(() => s.Service.Submit(s.Handle, s.Plan, [s.Candidate], s.Subject, s.Lease, s.Endpoint, s.Fabric, 1));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+            Assert.Equal(KernelError.PlatformBindingActive, s.Bridge.ReleaseFabric(s.Fabric).Error);
+            Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.RevokePlatformDevice(s.Handle, s.Lease).Error);
+            Assert.Equal(KernelError.PlatformBindingDraining, s.FabricManager.BeginReconfiguration(s.Fabric).Error);
+        }
+        finally { resume.Set(); }
+        var execution = await pending;
+        Assert.True(execution.IsSuccess, execution.Message);
+        Assert.True(s.Service.CompleteVisiblePublish(s.Handle, execution.Value!, [s.Candidate], () => { }).IsSuccess);
+        Assert.True(s.Bridge.ReleaseFabric(s.Fabric).IsSuccess);
+    }
+
+    [Fact]
+    public void Type2CallbackRevokeRetainsLateReceiptForRealTeardown()
+    {
+        SubmitHookAccelerator? hook = null;
+        var s = CreateScenario(acceleratorFactory: model => hook = new(model));
+        hook!.AfterSubmit = () => Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.RevokeCapability(DeviceCapability(s)).Error);
+        var submitted = s.Service.Submit(s.Handle, s.Plan, [s.Candidate], s.Subject, s.Lease, s.Endpoint, s.Fabric, 1);
+        Assert.Equal(KernelError.ExternalEffectUncontained, submitted.Error);
+        Assert.Equal(KernelError.PlatformBindingActive, s.Bridge.ReleaseFabric(s.Fabric).Error);
+        Assert.True(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+    }
+
+    private static CapabilityId DeviceCapability(Scenario s) => s.Kernel.CapabilityAuthority.InspectionSnapshot()
+        .Single(item => item.Descriptor.ResourceKind == ResourceKind.Device && item.Descriptor.ResourceId == s.Lease.Device.ResourceId)
+        .Descriptor.CapabilityId;
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Type2LostReleaseReplyOrSourceResetRetainsParent(bool resetSource)
+    {
+        SubmitHookAccelerator? hook = null;
+        var s = CreateScenario(acceleratorFactory: model => hook = new(model));
+        var execution = s.Service.Submit(s.Handle, s.Plan, [s.Candidate], s.Subject, s.Lease, s.Endpoint, s.Fabric, 1).Value!;
+        hook!.AfterRelease = () =>
+        {
+            if (resetSource) Assert.True(s.Memory.HotRemove(s.Endpoint.EndpointId).IsSuccess);
+            else throw new IOException("Lost exact release reply after provider closure.");
+        };
+        Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.Equal(KernelError.PlatformBindingActive, s.Bridge.ReleaseFabric(s.Fabric).Error);
+        hook.AfterRelease = null;
+        Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.True(s.Kernel.Regions.Validate(s.Input.Handle, new(s.Subject.DomainId, s.Handle.Generation)).IsSuccess);
+    }
+
+    [Fact]
     public void StagedOperationTraversesCommonLifecycleBeforePublication()
     {
         var s = CreateScenario();
@@ -658,7 +756,8 @@ public sealed class CxlType2AcceleratorServiceTests
         ];
     }
 
-    private static Scenario CreateScenario(bool direct = false)
+    private static Scenario CreateScenario(bool direct = false,
+        Func<CxlType2ModelAccelerator, ICxlType2AcceleratorProvider>? acceleratorFactory = null)
     {
         var platform = new AuthorityProvider();
         var kernel = new RuntimeKernel(platform);
@@ -694,7 +793,7 @@ public sealed class CxlType2AcceleratorServiceTests
         var accelerator = new CxlType2ModelAccelerator();
         var manager = new CxlFabricManagerAuthority(kernel, memory);
         Assert.True(manager.Register(fabric).IsSuccess);
-        var service = new CxlType2AcceleratorService(kernel, bridge, accelerator, manager);
+        var service = new CxlType2AcceleratorService(kernel, bridge, acceleratorFactory?.Invoke(accelerator) ?? accelerator, manager);
         return new(kernel, handle, subject, lease, memory, endpoint, fabric, input, output, candidate, plan, accelerator, service, bridge, security, manager);
     }
 
@@ -703,6 +802,27 @@ public sealed class CxlType2AcceleratorServiceTests
         SingPlus.Sip.OwnedBuffer<byte> Input, SingPlus.Sip.OwnedBuffer<byte> Output, ComputeProviderCandidate Candidate,
         ComputePlan Plan, CxlType2ModelAccelerator Accelerator, CxlType2AcceleratorService Service,
         CxlAuthorityBridge Bridge, CxlSecurityModelProvider Security, CxlFabricManagerAuthority FabricManager);
+
+    private sealed class SubmitHookAccelerator(ICxlType2AcceleratorProvider inner) : ICxlType2AcceleratorProvider
+    {
+        internal Action? AfterSubmit { get; set; }
+        internal Action? AfterRelease { get; set; }
+        public PlatformAuthorityResult<CxlAcceleratorSubmission> Submit(CxlAcceleratorRequest request)
+        {
+            var result = inner.Submit(request);
+            AfterSubmit?.Invoke();
+            return result;
+        }
+        public PlatformAuthorityResult<CxlAcceleratorCompletion> ObserveCompletion(CxlAcceleratorSubmission submission) => inner.ObserveCompletion(submission);
+        public PlatformAuthorityResult<CxlAcceleratorVisibility> AcquireVisibility(CxlAcceleratorSubmission submission, ExternalVisibilityRequirement requirement) => inner.AcquireVisibility(submission, requirement);
+        public PlatformAuthorityResult Cancel(CxlAcceleratorSubmission submission) => inner.Cancel(submission);
+        public PlatformAuthorityResult Release(CxlAcceleratorSubmission submission)
+        {
+            var result = inner.Release(submission);
+            AfterRelease?.Invoke();
+            return result;
+        }
+    }
 
     private sealed class CoherentStub : ICxlCoherentAccessProvider
     {

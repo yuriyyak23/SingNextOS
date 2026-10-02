@@ -13,6 +13,12 @@ public readonly record struct PlatformDeviceLease(
     PlatformDeviceIdentity Device,
     PlatformDeviceRights Rights);
 
+// An opaque parent-lifetime reservation, never an authorization or closure receipt.
+internal sealed class CxlDeviceReservation(PlatformDeviceLease lease)
+{
+    internal PlatformDeviceLease Lease { get; } = lease;
+}
+
 public sealed partial class PlatformAuthorityBridge
 {
     private sealed class DeviceLeaseRecord(
@@ -30,6 +36,12 @@ public sealed partial class PlatformAuthorityBridge
         public bool LocalAuthorizationRevoked { get; set; }
         public bool PlatformClosed { get; set; }
         public bool FaultPinned { get; set; }
+        public int PendingIrqBinds { get; set; }
+        public CapabilityId? UnresolvedIrqCapabilityId { get; set; }
+        public int PendingMmioBinds { get; set; }
+        public CapabilityId? UnresolvedMmioCapabilityId { get; set; }
+        public bool ClosureInFlight { get; set; }
+        public HashSet<CxlDeviceReservation> CxlChildren { get; } = [];
     }
 
     private readonly Dictionary<PlatformDeviceLeaseId, DeviceLeaseRecord> _deviceLeases = [];
@@ -40,7 +52,9 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDomainIdentity expectedSubject,
         CapabilityId authorityCapabilityId,
         PlatformDeviceIdentity device,
-        PlatformDeviceRights rights)
+        PlatformDeviceRights rights,
+        Func<KernelResult> revalidateAuthorization,
+        Func<PlatformDeviceLease, Func<KernelResult>, KernelResult> commitAuthorization)
     {
         var bindingValidation = ValidateDomain(binding, expectedSubject);
         if (!bindingValidation.IsSuccess)
@@ -76,78 +90,175 @@ public sealed partial class PlatformAuthorityBridge
         }
 
         var domainRecord = _domains[binding.BindingId];
-        var providerIncarnation = CurrentProviderIncarnation();
-        var backendEpoch = BackendEpoch;
-        if (providerIncarnation.Value == 0)
-            return KernelResult<PlatformDeviceLease>.Fail(KernelError.PlatformFaulted,
-                "The device provider returned an invalid zero runtime incarnation.");
-        var providerResult = deviceProvider.BindDevice(
-            domainRecord.ProviderLease,
-            device,
-            rights);
-        if (!providerResult.IsSuccess)
+        PlatformProviderIncarnation providerIncarnation;
+        PlatformBackendEpoch backendEpoch;
+        PlatformDeviceLeaseId localLeaseId;
+        lock (_secureDomainLifecycleGate)
         {
-            if (RequiresDomainQuarantine(providerResult.Status))
-                QuarantineDomain(domainRecord);
-
-            return FromProviderFailure<PlatformDeviceLease>(
-                providerResult.Status,
-                providerResult.Message);
+            if (domainRecord.ParentRevokeMayHaveEffect)
+                return KernelResult<PlatformDeviceLease>.Fail(KernelError.PlatformBindingActive,
+                    "Parent-domain revoke is already in flight.");
+            if (domainRecord.PendingDeviceBinds != 0)
+                return KernelResult<PlatformDeviceLease>.Fail(KernelError.PlatformBindingActive,
+                    "Device admission is already pending in this parent domain.");
+            if (domainRecord.AuthorityState != DomainAuthorityState.Active ||
+                domainRecord.DeviceBindMayHaveEffect)
+                return KernelResult<PlatformDeviceLease>.Fail(KernelError.PlatformFaulted,
+                    "Parent domain changed before device binding admission.");
+            if (_nextDeviceLeaseId is 0 or ulong.MaxValue)
+                return KernelResult<PlatformDeviceLease>.Fail(KernelError.CapacityExhausted, "Local device lease identity capacity is exhausted.");
+            localLeaseId = new(_nextDeviceLeaseId++);
+            domainRecord.PendingDeviceBinds++;
+            backendEpoch = BackendEpoch;
         }
-
-        var providerLease = providerResult.Value!;
-        var providerValidation = PlatformDeviceLeaseContract.ValidateLease(
-            domainRecord.ProviderLease,
-            device,
-            rights,
-            providerLease);
-        if (!providerValidation.IsSuccess)
+        try
         {
-            var cleanupProven = false;
+            try { providerIncarnation = CurrentProviderIncarnation(); }
+            catch (Exception exception) when (exception is not StackOverflowException)
+            {
+                domainRecord.DeviceBindMayHaveEffect = true;
+                QuarantineDomain(domainRecord);
+                return KernelResult<PlatformDeviceLease>.Fail(KernelError.PlatformFaulted,
+                    $"Device admission generation read failed; the parent remains quarantined: {exception.Message}");
+            }
+            var authorization = revalidateAuthorization();
+            lock (_secureDomainLifecycleGate)
+            {
+                if (providerIncarnation.Value == 0 || BackendEpoch != backendEpoch || _backendEpochExhausted ||
+                    !_domains.TryGetValue(binding.BindingId, out var exactDomain) || exactDomain != domainRecord ||
+                    domainRecord.AuthorityState != DomainAuthorityState.Active || domainRecord.ParentRevokeMayHaveEffect)
+                {
+                    domainRecord.DeviceBindMayHaveEffect = true;
+                    QuarantineDomain(domainRecord);
+                    return KernelResult<PlatformDeviceLease>.Fail(KernelError.PlatformFaulted,
+                        "Parent/device admission continuity changed during generation observation.");
+                }
+            }
+            if (!authorization.IsSuccess)
+                return KernelResult<PlatformDeviceLease>.Fail(authorization.Error, authorization.Message!);
+            PlatformAuthorityResult<PlatformProviderDeviceLease> providerResult;
             try
             {
-                var cleanup = deviceProvider.RevokeDevice(providerLease);
-                cleanupProven = cleanup.IsSuccess && providerLease.LeaseId.Value != 0 &&
-                    providerLease.Generation.Value != 0 &&
-                    CurrentProviderIncarnation() == providerIncarnation &&
-                    BackendEpoch == backendEpoch;
+                providerResult = deviceProvider.BindDevice(
+                    domainRecord.ProviderLease,
+                    device,
+                    rights);
             }
             catch (Exception exception) when (exception is not StackOverflowException)
             {
-                // A missing cleanup receipt leaves the provider lease ambiguous.
-            }
-            if (!cleanupProven)
-            {
-                var quarantinedLease = new PlatformDeviceLease(
-                    new PlatformDeviceLeaseId(_nextDeviceLeaseId++),
-                    new PlatformDeviceLeaseGeneration(1), binding, device, rights);
-                _deviceLeases.Add(quarantinedLease.LeaseId,
-                    new DeviceLeaseRecord(quarantinedLease, providerLease,
-                        authorityCapabilityId, providerIncarnation, backendEpoch)
-                    {
-                        FaultPinned = true,
-                    });
+                // The callback can materialize a device lease before losing its receipt.
+                // The domain is the only published owner that can retain that effect.
+                domainRecord.DeviceBindMayHaveEffect = true;
                 QuarantineDomain(domainRecord);
+                return KernelResult<PlatformDeviceLease>.Fail(KernelError.PlatformFaulted,
+                    $"Device binding may have taken effect without a receipt: {exception.Message}");
             }
-            return KernelResult<PlatformDeviceLease>.Fail(KernelError.PlatformFaulted,
-                providerValidation.Message ?? "The provider returned malformed device authority.");
-        }
+            var generationStable = false;
+            try
+            {
+                generationStable = CurrentProviderIncarnation() == providerIncarnation &&
+                    BackendEpoch == backendEpoch && !_backendEpochExhausted &&
+                    _domains.TryGetValue(binding.BindingId, out var currentDomain) && currentDomain == domainRecord;
+            }
+            catch (Exception exception) when (exception is not StackOverflowException)
+            {
+                // Losing the generation read after the callback is also ambiguous.
+            }
+            if (!generationStable && !providerResult.IsSuccess)
+            {
+                domainRecord.DeviceBindMayHaveEffect = true;
+                QuarantineDomain(domainRecord);
+                return KernelResult<PlatformDeviceLease>.Fail(KernelError.PlatformFaulted,
+                    "Provider generation changed during device binding; the domain remains quarantined.");
+            }
+            if (!providerResult.IsSuccess)
+            {
+                if (providerResult.Status != PlatformAuthorityStatus.NotAccepted)
+                {
+                    domainRecord.DeviceBindMayHaveEffect = true;
+                    QuarantineDomain(domainRecord);
+                }
 
-        var lease = new PlatformDeviceLease(
-            new PlatformDeviceLeaseId(_nextDeviceLeaseId++),
-            new PlatformDeviceLeaseGeneration(1),
-            binding,
-            device,
-            rights);
-        var leaseRecord = new DeviceLeaseRecord(lease, providerLease, authorityCapabilityId,
-            providerIncarnation, backendEpoch);
-        if (CurrentProviderIncarnation() != providerIncarnation || BackendEpoch != backendEpoch)
-            leaseRecord.FaultPinned = true;
-        _deviceLeases.Add(lease.LeaseId, leaseRecord);
-        return KernelResult<PlatformDeviceLease>.Ok(lease);
+                return FromProviderFailure<PlatformDeviceLease>(
+                    providerResult.Status,
+                    providerResult.Message);
+            }
+
+            var providerLease = providerResult.Value!;
+            var lease = new PlatformDeviceLease(localLeaseId, new(1), binding, device, rights);
+            var leaseRecord = new DeviceLeaseRecord(lease, providerLease, authorityCapabilityId,
+                providerIncarnation, backendEpoch) { FaultPinned = !generationStable };
+            authorization = revalidateAuthorization();
+            var providerValidation = PlatformDeviceLeaseContract.ValidateLease(
+                domainRecord.ProviderLease, device, rights, providerLease);
+            if (!providerValidation.IsSuccess || !authorization.IsSuccess)
+                return RejectLease(authorization.IsSuccess
+                    ? KernelResult.Fail(KernelError.PlatformFaulted,
+                        providerValidation.Message ?? "The provider returned malformed device authority.")
+                    : authorization);
+
+            var publication = commitAuthorization(lease, () =>
+            {
+                lock (_secureDomainLifecycleGate)
+                {
+                    if (BackendEpoch != backendEpoch || _backendEpochExhausted ||
+                        !_domains.TryGetValue(binding.BindingId, out var currentDomain) || currentDomain != domainRecord ||
+                        domainRecord.AuthorityState != DomainAuthorityState.Active || domainRecord.ParentRevokeMayHaveEffect)
+                        return KernelResult.Fail(KernelError.PlatformFaulted,
+                            "Parent domain changed before device lease publication.");
+                    _deviceLeases.Add(lease.LeaseId, leaseRecord);
+                    return KernelResult.Ok();
+                }
+            });
+            return publication.IsSuccess ? KernelResult<PlatformDeviceLease>.Ok(lease) : RejectLease(publication);
+
+            KernelResult<PlatformDeviceLease> RejectLease(KernelResult rejection)
+            {
+                var cleanupProven = false;
+                try
+                {
+                    var cleanup = deviceProvider.RevokeDevice(providerLease);
+                    cleanupProven = cleanup.IsSuccess && providerLease.LeaseId.Value != 0 &&
+                        providerLease.Generation.Value != 0 && CurrentProviderIncarnation() == providerIncarnation &&
+                        BackendEpoch == backendEpoch;
+                }
+                catch (Exception exception) when (exception is not StackOverflowException)
+                {
+                    // A missing cleanup receipt leaves the provider lease ambiguous.
+                }
+                if (!cleanupProven)
+                {
+                    leaseRecord.FaultPinned = true;
+                    leaseRecord.LocalAuthorizationRevoked = !authorization.IsSuccess ||
+                        rejection.Error == KernelError.CapabilityRevoked;
+                    lock (_secureDomainLifecycleGate) _deviceLeases.Add(lease.LeaseId, leaseRecord);
+                    QuarantineDomain(domainRecord);
+                }
+                return KernelResult<PlatformDeviceLease>.Fail(rejection.Error, rejection.Message!);
+            }
+        }
+        finally { lock (_secureDomainLifecycleGate) domainRecord.PendingDeviceBinds--; }
     }
 
     internal KernelResult RevokeDevice(
+        PlatformDeviceLease lease,
+        PlatformDomainIdentity expectedSubject)
+    {
+        DeviceLeaseRecord record;
+        lock (_secureDomainLifecycleGate)
+        {
+            var identity = ValidateDeviceLeaseIdentity(lease, expectedSubject);
+            if (!identity.IsSuccess) return identity;
+            record = _deviceLeases[lease.LeaseId];
+            if (record.PendingIrqBinds != 0 || record.PendingMmioBinds != 0 || record.ClosureInFlight || record.CxlChildren.Count != 0)
+                return KernelResult.Fail(KernelError.PlatformBindingActive,
+                    "Device closure requires completed IRQ/MMIO admission and exact CXL child closure.");
+            record.ClosureInFlight = true;
+        }
+        try { return RevokeDeviceCore(lease, expectedSubject); }
+        finally { lock (_secureDomainLifecycleGate) record.ClosureInFlight = false; }
+    }
+    private KernelResult RevokeDeviceCore(
         PlatformDeviceLease lease,
         PlatformDomainIdentity expectedSubject)
     {
@@ -190,15 +301,14 @@ public sealed partial class PlatformAuthorityBridge
                 "The device provider or local backend generation changed during closure; the lease remains pinned.");
         if (!providerResult.IsSuccess)
         {
-            if (providerResult.Status == PlatformAuthorityStatus.Revoked)
+            // Revoked reports provider state, not exact containment of this
+            // lease generation. Callback failure may follow an external effect.
+            if (providerResult.Status != PlatformAuthorityStatus.NotAccepted)
             {
-                record.PlatformClosed = true;
-                return KernelResult.Ok();
-            }
-
-            if (providerResult.Status is PlatformAuthorityStatus.Faulted or
-                PlatformAuthorityStatus.Stale or PlatformAuthorityStatus.WrongDomain)
                 record.FaultPinned = true;
+                return KernelResult.Fail(KernelError.PlatformFaulted,
+                    "Device closure lacks exact containment evidence; the lease and parent remain pinned.");
+            }
             return FromProviderFailure(providerResult.Status, providerResult.Message);
         }
 
@@ -235,20 +345,83 @@ public sealed partial class PlatformAuthorityBridge
         return KernelResult.Ok();
     }
 
-    internal IReadOnlyList<PlatformDeviceLease> BeginDeviceCapabilityRevocation(
-        CapabilityId capabilityId)
+    internal KernelResult<CapabilityId> CxlDeviceSource(PlatformDeviceLease lease, PlatformDomainIdentity subject)
     {
-        var affected = _deviceLeases.Values
-            .Where(record =>
-                !record.PlatformClosed &&
-                record.AuthorityCapabilityId == capabilityId)
-            .OrderBy(record => record.Lease.LeaseId.Value)
-            .ToArray();
+        DeviceLeaseRecord record;
+        lock (_secureDomainLifecycleGate)
+        {
+            var valid = ValidateDeviceLease(lease, subject);
+            if (!valid.IsSuccess) return KernelResult<CapabilityId>.Fail(valid.Error, valid.Message!);
+            record = _deviceLeases[lease.LeaseId];
+        }
+        // Provider generation reads must stay outside local admission locks.
+        if (!ValidateDeviceClosureGeneration(record))
+            return KernelResult<CapabilityId>.Fail(KernelError.PlatformFaulted, "CXL device source continuity is lost.");
+        return KernelResult<CapabilityId>.Ok(record.AuthorityCapabilityId);
+    }
 
-        foreach (var record in affected)
-            record.LocalAuthorizationRevoked = true;
+    internal KernelResult CommitCxlDeviceAdmission(PlatformDeviceLease lease, PlatformDomainIdentity subject,
+        Func<KernelResult> commit)
+    {
+        lock (_secureDomainLifecycleGate)
+        {
+            var valid = ValidateDeviceLease(lease, subject);
+            if (!valid.IsSuccess) return valid;
+            var record = _deviceLeases[lease.LeaseId];
+            if (record.ClosureInFlight || BackendEpoch != record.BackendEpoch)
+                return KernelResult.Fail(KernelError.PlatformBindingActive, "CXL admission cannot overlap device closure or reset.");
+            // Trusted local state only. No provider callbacks under this gate.
+            return commit();
+        }
+    }
 
-        return affected.Select(static record => record.Lease).ToArray();
+    internal KernelResult AddCxlDeviceReservation(CxlDeviceReservation reservation)
+    {
+        lock (_secureDomainLifecycleGate)
+        {
+            if (!_deviceLeases.TryGetValue(reservation.Lease.LeaseId, out var record) || record.Lease != reservation.Lease)
+                return KernelResult.Fail(KernelError.StaleGeneration, "CXL parent reservation requires the exact device lease.");
+            return record.CxlChildren.Add(reservation) ? KernelResult.Ok()
+                : KernelResult.Fail(KernelError.PlatformBindingActive, "CXL parent reservation is already registered.");
+        }
+    }
+
+    internal KernelResult ReleaseCxlDeviceReservation(CxlDeviceReservation reservation)
+    {
+        DeviceLeaseRecord record;
+        lock (_secureDomainLifecycleGate)
+        {
+            if (!_deviceLeases.TryGetValue(reservation.Lease.LeaseId, out record!) || record.Lease != reservation.Lease ||
+                !record.CxlChildren.Contains(reservation))
+                return KernelResult.Fail(KernelError.StaleGeneration, "CXL parent reservation is not exact or already released.");
+        }
+        if (!ValidateDeviceClosureGeneration(record))
+            return KernelResult.Fail(KernelError.PlatformFaulted, "CXL parent continuity was lost before reservation release.");
+        lock (_secureDomainLifecycleGate)
+        {
+            if (BackendEpoch != record.BackendEpoch || !record.CxlChildren.Remove(reservation))
+                return KernelResult.Fail(KernelError.PlatformFaulted, "CXL parent reservation remains pinned after continuity loss.");
+            return KernelResult.Ok();
+        }
+    }
+
+    internal IReadOnlyList<PlatformDeviceLease> BeginDeviceCapabilityRevocation(
+        CapabilityId capabilityId, Func<CapabilityId, bool> dependsOnRevokedCapability)
+    {
+        lock (_secureDomainLifecycleGate)
+        {
+            var affected = _deviceLeases.Values
+                .Where(record =>
+                    !record.PlatformClosed &&
+                    dependsOnRevokedCapability(record.AuthorityCapabilityId))
+                .OrderBy(record => record.Lease.LeaseId.Value)
+                .ToArray();
+
+            foreach (var record in affected)
+                record.LocalAuthorizationRevoked = true;
+
+            return affected.Select(static record => record.Lease).ToArray();
+        }
     }
 
     internal bool HasActiveDeviceLeases(PlatformDomainBinding binding) =>

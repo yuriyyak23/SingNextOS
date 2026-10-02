@@ -39,6 +39,15 @@ public sealed record V6ClaimEvidenceTuple(
             ContractIdentity, ProviderIdentity];
         if (tokens.Any(value => string.IsNullOrWhiteSpace(value) || value != value.Trim() || value.Any(char.IsControl)))
             throw new ArgumentException("Claim tuple contains a missing or non-canonical identity.");
+        try
+        {
+            var utf8 = new System.Text.UTF8Encoding(false, true);
+            foreach (var token in tokens) _ = utf8.GetByteCount(token);
+        }
+        catch (System.Text.EncoderFallbackException exception)
+        {
+            throw new ArgumentException("Claim identity must contain valid Unicode scalar values.", exception);
+        }
         ValidateDigest(FeatureGateSetDigest, nameof(FeatureGateSetDigest));
         ValidateDigest(QualificationArtifactDigest, nameof(QualificationArtifactDigest));
         return this;
@@ -46,7 +55,8 @@ public sealed record V6ClaimEvidenceTuple(
 
     private static void ValidateDigest(string? value, string parameter)
     {
-        if (value is null || value.Length != 64 || value.Any(character => !Uri.IsHexDigit(character)))
+        if (value is null || value.Length != 64 ||
+            value.Any(character => character is not (>= '0' and <= '9' or >= 'a' and <= 'f')))
             throw new ArgumentException("Claim tuple digest must be canonical SHA-256 hex.", parameter);
     }
 }

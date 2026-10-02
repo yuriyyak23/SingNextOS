@@ -31,13 +31,16 @@ public sealed class ChannelRegistry
 
     private readonly CapabilityAuthority _capabilities;
     private readonly RegionAuthority _regions;
+    private readonly Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>> _transferRegion;
     private readonly Dictionary<ChannelId, ChannelRecord> _channels = [];
     private ulong _nextChannelId = 1;
 
-    internal ChannelRegistry(CapabilityAuthority capabilities, RegionAuthority regions)
+    internal ChannelRegistry(CapabilityAuthority capabilities, RegionAuthority regions,
+        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>> transferRegion)
     {
         _capabilities = capabilities;
         _regions = regions;
+        _transferRegion = transferRegion;
     }
 
     internal event Action<ChannelId>? ChannelClosed;
@@ -48,9 +51,13 @@ public sealed class ChannelRegistry
         return new(selected.Length, selected.Sum(static record => record.Queue.Count));
     }
 
-    internal (ChannelEndpointHandle Left, ChannelEndpointHandle Right) Create(ProtocolDefinitionV1 protocol, SingProcess left, SingProcess right, int capacity)
+    internal KernelResult<(ChannelEndpointHandle Left, ChannelEndpointHandle Right)> Create(ProtocolDefinitionV1 protocol, SingProcess left, SingProcess right, int capacity)
     {
         if (capacity <= 0) throw new ArgumentOutOfRangeException(nameof(capacity));
+        // Reserve the terminal allocator value; never wrap into an old identity.
+        if (_nextChannelId is 0 or ulong.MaxValue)
+            return KernelResult<(ChannelEndpointHandle, ChannelEndpointHandle)>.Fail(
+                KernelError.CapacityExhausted, "Channel identity allocator is exhausted.");
         var id = new ChannelId(_nextChannelId++);
         var record = new ChannelRecord
         {
@@ -65,7 +72,8 @@ public sealed class ChannelRegistry
             State = protocol.InitialState
         };
         _channels.Add(id, record);
-        return (new ChannelEndpointHandle(id, new EndpointId(1), 1), new ChannelEndpointHandle(id, new EndpointId(2), 1));
+        return KernelResult<(ChannelEndpointHandle, ChannelEndpointHandle)>.Ok(
+            (new ChannelEndpointHandle(id, new EndpointId(1), 1), new ChannelEndpointHandle(id, new EndpointId(2), 1)));
     }
 
     public KernelResult<ChannelEndpoint> GetEndpoint(ChannelEndpointHandle handle)
@@ -161,6 +169,8 @@ public sealed class ChannelRegistry
         var payloadValidation = ValidateRequestPayload(message.RequestPayload, copiedPayload, secondaryPayload: null);
         if (!payloadValidation.IsSuccess)
             return KernelResult<ulong>.Fail(payloadValidation.Error, payloadValidation.Message!);
+        if (record.Sequence == ulong.MaxValue)
+            return KernelResult<ulong>.Fail(KernelError.CapacityExhausted, "Channel sequence is exhausted.");
 
         record.Sequence++;
         record.State = transition.ToState;
@@ -200,6 +210,8 @@ public sealed class ChannelRegistry
         var payloadValidation = ValidateRequestPayload(message.RequestPayload, payload, secondaryPayload: null);
         if (!payloadValidation.IsSuccess)
             return KernelResult<InlineBorrowProjection<T>>.Fail(payloadValidation.Error, payloadValidation.Message!);
+        if (record.Sequence == ulong.MaxValue)
+            return KernelResult<InlineBorrowProjection<T>>.Fail(KernelError.CapacityExhausted, "Channel sequence is exhausted.");
 
         var transferable = (ITransferableOwnedPayload)payload;
         if (!transferable.IsValidForRuntime)
@@ -263,6 +275,8 @@ public sealed class ChannelRegistry
         var payloadValidation = ValidateRequestPayload(message.RequestPayload, payload, secondaryPayload: null);
         if (!payloadValidation.IsSuccess)
             return KernelResult<InlineMoveProjection<T>>.Fail(payloadValidation.Error, payloadValidation.Message!);
+        if (record.Sequence == ulong.MaxValue)
+            return KernelResult<InlineMoveProjection<T>>.Fail(KernelError.CapacityExhausted, "Channel sequence is exhausted.");
 
         var transferable = (ITransferableOwnedPayload)payload;
         if (!transferable.IsValidForRuntime)
@@ -281,7 +295,7 @@ public sealed class ChannelRegistry
         {
             return KernelResult<InlineMoveProjection<T>>.Fail(KernelError.InvalidRegionState, exception.Message);
         }
-        var transfer = _regions.Transfer(oldHandle, owner, target);
+        var transfer = _transferRegion(sender, receiver, oldHandle, null);
         if (!transfer.IsSuccess)
             return KernelResult<InlineMoveProjection<T>>.Fail(transfer.Error, transfer.Message!);
         var moved = (OwnedBuffer<T>)transferable.TransferForRuntime(transfer.Value);
@@ -317,6 +331,8 @@ public sealed class ChannelRegistry
         if (!capabilityValidation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(capabilityValidation.Error, capabilityValidation.Message!);
         var payloadValidation = ValidateRequestPayload(message.RequestPayload, payload, secondaryPayload);
         if (!payloadValidation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(payloadValidation.Error, payloadValidation.Message!);
+        if (record.Sequence == ulong.MaxValue)
+            return KernelResult<ChannelEnvelope>.Fail(KernelError.CapacityExhausted, "Channel sequence is exhausted.");
 
         object? queuedPayload = payload;
         object? queuedSecondaryPayload = secondaryPayload;
@@ -368,7 +384,7 @@ public sealed class ChannelRegistry
                 {
                     return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidRegionState, exception.Message);
                 }
-                var transfer = _regions.Transfer(oldHandle, owner, new RegionOwner(receiver.DomainId, receiver.Generation));
+                var transfer = _transferRegion(sender, receiver, oldHandle, null);
                 if (!transfer.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(transfer.Error, transfer.Message!);
                 queuedPayload = owned.TransferForRuntime(transfer.Value);
                 _regions.ReplacePayload(oldHandle, transfer.Value, (ITransferableOwnedPayload)queuedPayload);
@@ -426,27 +442,25 @@ public sealed class ChannelRegistry
         var consumeIndex = 1 - borrowIndex;
         var borrowed = payloads[borrowIndex];
         var consumed = payloads[consumeIndex];
-        var acquired = _regions.AcquireLoan(borrowed.Handle, owner, borrower);
-        if (!acquired.IsSuccess)
-            return KernelResult<(object, object)>.Fail(acquired.Error, acquired.Message!);
-
-        var grant = acquired.Value!;
-        object borrowedLease;
-        try
-        {
-            borrowedLease = borrowed.CreateBorrowLeaseForRuntime(grant.Handle, grant.Lifetime);
-        }
-        catch (InvalidOperationException exception)
-        {
-            _ = _regions.RevokeLoan(grant.Handle, owner);
-            return KernelResult<(object, object)>.Fail(KernelError.InvalidRegionState, exception.Message);
-        }
-
         var oldConsumedHandle = consumed.Handle;
-        var transfer = _regions.Transfer(oldConsumedHandle, owner, borrower);
+        BorrowLeaseHandle? acquiredLease = null;
+        object? borrowedLease = null;
+        var transfer = _transferRegion(sender, receiver, oldConsumedHandle, () =>
+        {
+            var acquired = _regions.AcquireLoan(borrowed.Handle, owner, borrower);
+            if (!acquired.IsSuccess) return KernelResult.Fail(acquired.Error, acquired.Message!);
+            var grant = acquired.Value!;
+            acquiredLease = grant.Handle;
+            try { borrowedLease = borrowed.CreateBorrowLeaseForRuntime(grant.Handle, grant.Lifetime); }
+            catch (InvalidOperationException exception)
+            {
+                return KernelResult.Fail(KernelError.InvalidRegionState, exception.Message);
+            }
+            return KernelResult.Ok();
+        });
         if (!transfer.IsSuccess)
         {
-            _ = _regions.RevokeLoan(grant.Handle, owner);
+            if (acquiredLease is { } lease) _ = _regions.RevokeLoan(lease, owner);
             return KernelResult<(object, object)>.Fail(transfer.Error, transfer.Message!);
         }
 
@@ -456,8 +470,8 @@ public sealed class ChannelRegistry
         receiver.AddRegion(transfer.Value);
 
         return borrowIndex == 0
-            ? KernelResult<(object, object)>.Ok((borrowedLease, moved))
-            : KernelResult<(object, object)>.Ok((moved, borrowedLease));
+            ? KernelResult<(object, object)>.Ok((borrowedLease!, moved))
+            : KernelResult<(object, object)>.Ok((moved, borrowedLease!));
     }
 
     internal KernelResult<ChannelEnvelope> Receive(SingProcess receiver, ChannelEndpointHandle endpoint)
