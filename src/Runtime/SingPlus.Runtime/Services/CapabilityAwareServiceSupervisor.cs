@@ -48,6 +48,9 @@ public sealed class CapabilityAwareServiceSupervisor
     }
 
     private readonly RuntimeKernel _kernel;
+    private sealed record DependencyRebindWork(ManagedServiceDefinition Definition, ServiceInstanceHandle Dependent,
+        ServiceLifecycleState State, ServiceDependencyBinding[] Bindings, ServiceEndpointDescriptor Descriptor,
+        ServiceDependencyRequirementV1 Dependency, ServiceInstanceHandle Provider);
     private readonly ProcessHandle _principal;
     private readonly CapabilityId _controlCapability;
     private readonly TimeProvider _timeProvider;
@@ -75,7 +78,7 @@ public sealed class CapabilityAwareServiceSupervisor
         {
             var principal = _kernel.Processes.Resolve(_principal);
             if (!principal.IsSuccess) return KernelResult.Fail(KernelError.SupervisorDenied, principal.Message!);
-            return _kernel.CapabilityAuthority.CommitSupervisorRegistration(_controlCapability,
+            return _kernel.CapabilityAuthority.CommitSupervisorRecordPublication(_controlCapability,
                 principal.Value!.DomainId, _principal.Generation, () =>
             {
                 if (_records.ContainsKey(definition.Identity))
@@ -166,9 +169,21 @@ public sealed class CapabilityAwareServiceSupervisor
         var control = ValidateControl();
         if (!control.IsSuccess) return KernelResult<ServiceSupervisorSnapshot>.Fail(control.Error, control.Message!);
         lock (_gate)
-            return _records.TryGetValue(identity, out var record)
-                ? KernelResult<ServiceSupervisorSnapshot>.Ok(Snapshot(record))
-                : KernelResult<ServiceSupervisorSnapshot>.Fail(KernelError.ComponentNotFound, $"Managed service '{identity.Name}' is not registered.");
+        {
+            var principal = _kernel.Processes.Resolve(_principal);
+            if (!principal.IsSuccess) return KernelResult<ServiceSupervisorSnapshot>.Fail(KernelError.SupervisorDenied, principal.Message!);
+            ServiceSupervisorSnapshot? snapshot = null;
+            var committed = _kernel.CapabilityAuthority.CommitSupervisorRecordPublication(_controlCapability,
+                principal.Value!.DomainId, _principal.Generation, () =>
+                {
+                    if (!_records.TryGetValue(identity, out var record))
+                        return KernelResult.Fail(KernelError.ComponentNotFound, $"Managed service '{identity.Name}' is not registered.");
+                    snapshot = Snapshot(record);
+                    return KernelResult.Ok();
+                });
+            return committed.IsSuccess ? KernelResult<ServiceSupervisorSnapshot>.Ok(snapshot!)
+                : KernelResult<ServiceSupervisorSnapshot>.Fail(committed.Error, committed.Message!);
+        }
     }
 
     public KernelResult<StructuredTelemetrySnapshot> ProjectTelemetry(ServiceInstanceHandle instance)
@@ -192,15 +207,38 @@ public sealed class CapabilityAwareServiceSupervisor
         if (!Enum.IsDefined(state)) return KernelResult<ServiceHealthSnapshot>.Fail(KernelError.InvalidTransition, "Health state is undefined.");
         ComponentIdentity identity;
         ServiceHealthSnapshot health;
+        // Validate the local instance before observing time, then revalidate after the callback.
         lock (_gate)
         {
-            var exact = ResolveExactLocked(instance);
-            if (!exact.IsSuccess) return KernelResult<ServiceHealthSnapshot>.Fail(exact.Error, exact.Message!);
-            identity = exact.Value!.Definition.Identity;
-            health = new(instance, state, _timeProvider.GetTimestamp(), reason ?? string.Empty);
-            exact.Value.Health = health;
-            if (state == ServiceHealthState.Degraded && exact.Value.State == ServiceLifecycleState.Ready)
-                exact.Value.State = ServiceLifecycleState.Degraded;
+            var initial = ResolveExactLocked(instance);
+            if (!initial.IsSuccess) return KernelResult<ServiceHealthSnapshot>.Fail(initial.Error, initial.Message!);
+        }
+        long timestamp;
+        try { timestamp = _timeProvider.GetTimestamp(); }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        {
+            return KernelResult<ServiceHealthSnapshot>.Fail(KernelError.PlatformFaulted, "Supervisor health clock observation failed.");
+        }
+        lock (_gate)
+        {
+            var principal = _kernel.Processes.Resolve(_principal);
+            if (!principal.IsSuccess) return KernelResult<ServiceHealthSnapshot>.Fail(KernelError.SupervisorDenied, principal.Message!);
+            ComponentIdentity committedIdentity = default;
+            var observation = new ServiceHealthSnapshot(instance, state, timestamp, reason ?? string.Empty);
+            var committed = _kernel.CapabilityAuthority.CommitSupervisorRecordPublication(_controlCapability,
+                principal.Value!.DomainId, _principal.Generation, () =>
+                {
+                    var exact = ResolveExactLocked(instance);
+                    if (!exact.IsSuccess) return KernelResult.Fail(exact.Error, exact.Message!);
+                    committedIdentity = exact.Value!.Definition.Identity;
+                    exact.Value.Health = observation;
+                    if (state == ServiceHealthState.Degraded && exact.Value.State == ServiceLifecycleState.Ready)
+                        exact.Value.State = ServiceLifecycleState.Degraded;
+                    return KernelResult.Ok();
+                });
+            if (!committed.IsSuccess) return KernelResult<ServiceHealthSnapshot>.Fail(committed.Error, committed.Message!);
+            identity = committedIdentity;
+            health = observation;
         }
         if (state is ServiceHealthState.Unhealthy or ServiceHealthState.Failed)
         {
@@ -215,17 +253,40 @@ public sealed class CapabilityAwareServiceSupervisor
     {
         var control = ValidateControl();
         if (!control.IsSuccess) return KernelResult<ServiceDrainReceipt>.Fail(control.Error, control.Message!);
-        ComponentIdentity identity;
         lock (_gate)
         {
-            var exact = ResolveExactLocked(instance);
-            if (!exact.IsSuccess) return KernelResult<ServiceDrainReceipt>.Fail(exact.Error, exact.Message!);
-            identity = exact.Value!.Definition.Identity;
-            exact.Value.State = ServiceLifecycleState.Draining;
-            exact.Value.Health = Health(exact.Value, ServiceHealthState.Draining, planned ? "Planned drain requested." : "Failure drain requested.");
+            var initial = ResolveExactLocked(instance);
+            if (!initial.IsSuccess) return KernelResult<ServiceDrainReceipt>.Fail(initial.Error, initial.Message!);
+        }
+        long timestamp;
+        try { timestamp = _timeProvider.GetTimestamp(); }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        {
+            return KernelResult<ServiceDrainReceipt>.Fail(KernelError.PlatformFaulted, "Drain request clock observation failed.");
+        }
+        ComponentIdentity identity = default;
+        var health = new ServiceHealthSnapshot(instance, ServiceHealthState.Draining, timestamp,
+            planned ? "Planned drain requested." : "Failure drain requested.");
+        lock (_gate)
+        {
+            var principal = _kernel.Processes.Resolve(_principal);
+            if (!principal.IsSuccess)
+                return KernelResult<ServiceDrainReceipt>.Fail(KernelError.SupervisorDenied, principal.Message!);
+            var committed = _kernel.CapabilityAuthority.CommitSupervisorRecordPublication(_controlCapability,
+                principal.Value!.DomainId, _principal.Generation, () =>
+                {
+                    var exact = ResolveExactLocked(instance);
+                    if (!exact.IsSuccess) return KernelResult.Fail(exact.Error, exact.Message!);
+                    identity = exact.Value!.Definition.Identity;
+                    exact.Value.State = ServiceLifecycleState.Draining;
+                    exact.Value.Health = health;
+                    return KernelResult.Ok();
+                });
+            if (!committed.IsSuccess)
+                return KernelResult<ServiceDrainReceipt>.Fail(committed.Error, committed.Message!);
         }
 
-        var drained = _kernel.DrainComponent(identity);
+        var drained = _kernel.DrainComponent(identity, instance.Process);
         return CompleteDrain(identity, instance, planned, drained);
     }
 
@@ -252,24 +313,44 @@ public sealed class CapabilityAwareServiceSupervisor
         if (!control.IsSuccess) return KernelResult<ServiceDrainReceipt>.Fail(control.Error, control.Message!);
         lock (_gate)
         {
-            var exact = ResolveExactLocked(instance);
-            if (!exact.IsSuccess) return KernelResult<ServiceDrainReceipt>.Fail(exact.Error, exact.Message!);
-            var record = exact.Value!;
-            record.State = timeoutPolicy == ServiceDrainTimeoutPolicy.Quarantine
-                ? ServiceLifecycleState.Quarantined
-                : ServiceLifecycleState.Draining;
-            record.Health = Health(
-                record,
-                timeoutPolicy == ServiceDrainTimeoutPolicy.Quarantine ? ServiceHealthState.Quarantined : ServiceHealthState.Draining,
-                "Drain deadline expired; no closure or reclaim was inferred.");
-            record.BlockingReason = "Drain deadline expired before exact closure/containment.";
-            var receipt = new ServiceDrainReceipt(new(instance, planned), Snapshot(record), ClosureProven: false);
-            return timeoutPolicy == ServiceDrainTimeoutPolicy.Quarantine
-                ? KernelResult<ServiceDrainReceipt>.Ok(receipt)
-                : KernelResult<ServiceDrainReceipt>.Fail(KernelError.ReplacementBlocked, record.BlockingReason);
+            var initial = ResolveExactLocked(instance);
+            if (!initial.IsSuccess) return KernelResult<ServiceDrainReceipt>.Fail(initial.Error, initial.Message!);
+        }
+        long timestamp;
+        try { timestamp = _timeProvider.GetTimestamp(); }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        {
+            return KernelResult<ServiceDrainReceipt>.Fail(KernelError.PlatformFaulted, "Drain timeout clock observation failed.");
+        }
+        var quarantine = timeoutPolicy == ServiceDrainTimeoutPolicy.Quarantine;
+        var health = new ServiceHealthSnapshot(instance,
+            quarantine ? ServiceHealthState.Quarantined : ServiceHealthState.Draining, timestamp,
+            "Drain deadline expired; no closure or reclaim was inferred.");
+        const string blockingReason = "Drain deadline expired before exact closure/containment.";
+        lock (_gate)
+        {
+            var principal = _kernel.Processes.Resolve(_principal);
+            if (!principal.IsSuccess)
+                return KernelResult<ServiceDrainReceipt>.Fail(KernelError.SupervisorDenied, principal.Message!);
+            ServiceDrainReceipt? receipt = null;
+            var committed = _kernel.CapabilityAuthority.CommitSupervisorRecordPublication(_controlCapability,
+                principal.Value!.DomainId, _principal.Generation, () =>
+                {
+                    var exact = ResolveExactLocked(instance);
+                    if (!exact.IsSuccess) return KernelResult.Fail(exact.Error, exact.Message!);
+                    var record = exact.Value!;
+                    record.State = quarantine ? ServiceLifecycleState.Quarantined : ServiceLifecycleState.Draining;
+                    record.Health = health;
+                    record.BlockingReason = blockingReason;
+                    receipt = new ServiceDrainReceipt(new(instance, planned), Snapshot(record), ClosureProven: false);
+                    return KernelResult.Ok();
+                });
+            if (!committed.IsSuccess)
+                return KernelResult<ServiceDrainReceipt>.Fail(committed.Error, committed.Message!);
+            return quarantine ? KernelResult<ServiceDrainReceipt>.Ok(receipt!) :
+                KernelResult<ServiceDrainReceipt>.Fail(KernelError.ReplacementBlocked, blockingReason);
         }
     }
-
     public KernelResult<ServiceReplacementReceipt> Replace(ServiceInstanceHandle previous, ManagedServiceDefinition next)
     {
         ArgumentNullException.ThrowIfNull(next);
@@ -308,13 +389,25 @@ public sealed class CapabilityAwareServiceSupervisor
             restartAfterDrain = record.RestartAfterDrain;
         }
 
-        if (state == ServiceLifecycleState.Draining && instance is { } drainingInstance)
+        if (state == ServiceLifecycleState.Stopped && restartAfterDrain)
+        {
+            var scheduled = ScheduleRestart(identity);
+            if (!scheduled.IsSuccess) return KernelResult<ServiceSupervisorSnapshot>.Fail(scheduled.Error, scheduled.Message!);
+        }
+        // Quarantine records uncertainty, not an irreversible terminal verdict.
+        // Progress the real closure consumer; only its exact reclaimable result
+        // may move this generation to Stopped and permit restart scheduling.
+        if (state is ServiceLifecycleState.Draining or ServiceLifecycleState.Quarantined &&
+            instance is { } drainingInstance)
         {
             var observed = _kernel.ObserveComponentTeardown(identity);
             var completion = CompleteDrain(identity, drainingInstance, planned: !restartAfterDrain, observed);
             if (!completion.IsSuccess) return KernelResult<ServiceSupervisorSnapshot>.Fail(completion.Error, completion.Message!);
             if (completion.Value!.ClosureProven && restartAfterDrain)
-                ScheduleRestart(identity);
+            {
+                var scheduled = ScheduleRestart(identity);
+                if (!scheduled.IsSuccess) return KernelResult<ServiceSupervisorSnapshot>.Fail(scheduled.Error, scheduled.Message!);
+            }
         }
 
         lock (_gate)
@@ -323,43 +416,54 @@ public sealed class CapabilityAwareServiceSupervisor
             state = record.State;
             eligible = record.RestartEligibleTimestamp;
         }
-        if (state == ServiceLifecycleState.RestartBackoff && eligible is { } timestamp && _timeProvider.GetTimestamp() >= timestamp)
+        if (state == ServiceLifecycleState.RestartBackoff && eligible is { } timestamp)
         {
-            ManagedServiceDefinition? replacement = null;
-            ServiceInstanceHandle prior;
-            lock (_gate)
+            long now;
+            try { now = _timeProvider.GetTimestamp(); }
+            catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
             {
-                var record = _records[identity];
-                prior = record.Instance!.Value;
-                var generation = checked(prior.Process.Generation + 1);
-                if (record.Definition.ReplacementFactory is { } factory)
-                {
-                    try
-                    {
-                        replacement = new ManagedServiceDefinition(factory(generation), record.Definition.PrimaryServiceName, record.Definition.ReadinessPolicy, record.Definition.DependencyFailurePolicy, record.Definition.ReplacementFactory);
-                    }
-                    catch (Exception exception)
-                    {
-                        record.State = ServiceLifecycleState.Failed;
-                        record.BlockingReason = $"Fresh-admission factory failed: {exception.Message}";
-                    }
-                }
-                else
-                {
-                    record.State = ServiceLifecycleState.Failed;
-                    record.BlockingReason = "Restart policy has no fresh-admission factory.";
-                }
+                return KernelResult<ServiceSupervisorSnapshot>.Fail(KernelError.PlatformFaulted, "Restart eligibility clock failed.");
             }
-            if (replacement is not null)
+            if (now >= timestamp)
             {
+                ManagedServiceDefinition? definition = null;
+                ServiceInstanceHandle prior = default;
+                lock (_gate)
+                {
+                    var principal = _kernel.Processes.Resolve(_principal);
+                    if (!principal.IsSuccess) return KernelResult<ServiceSupervisorSnapshot>.Fail(KernelError.SupervisorDenied, principal.Message!);
+                    var captured = _kernel.CapabilityAuthority.CommitSupervisorRecordPublication(_controlCapability,
+                        principal.Value!.DomainId, _principal.Generation, () =>
+                        {
+                            if (!_records.TryGetValue(identity, out var current) || current.State != ServiceLifecycleState.RestartBackoff ||
+                                current.RestartEligibleTimestamp != eligible || current.Instance != instance)
+                                return KernelResult.Fail(KernelError.StaleGeneration, "Restart source changed during eligibility observation.");
+                            definition = current.Definition;
+                            prior = current.Instance!.Value;
+                            return KernelResult.Ok();
+                        });
+                    if (!captured.IsSuccess) return KernelResult<ServiceSupervisorSnapshot>.Fail(captured.Error, captured.Message!);
+                }
+                ManagedServiceDefinition replacement;
+                try
+                {
+                    var factory = definition!.ReplacementFactory;
+                    if (factory is null) return KernelResult<ServiceSupervisorSnapshot>.Fail(KernelError.ReplacementBlocked, "Restart factory is absent.");
+                    var generation = checked(prior.Process.Generation + 1);
+                    replacement = new ManagedServiceDefinition(factory(generation), definition.PrimaryServiceName,
+                        definition.ReadinessPolicy, definition.DependencyFailurePolicy, factory);
+                }
+                catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+                {
+                    return KernelResult<ServiceSupervisorSnapshot>.Fail(KernelError.PlatformFaulted, "Fresh-admission factory failed; restart dispatch was not committed.");
+                }
                 var replaced = AdmitReplacement(prior, replacement);
                 if (!replaced.IsSuccess) return KernelResult<ServiceSupervisorSnapshot>.Fail(replaced.Error, replaced.Message!);
             }
         }
 
-        lock (_gate) return KernelResult<ServiceSupervisorSnapshot>.Ok(Snapshot(_records[identity]));
+        return Query(identity);
     }
-
     private KernelResult<ServiceSupervisorSnapshot> HandleFailure(ServiceInstanceHandle instance, string reason)
     {
         ComponentIdentity identity;
@@ -373,11 +477,16 @@ public sealed class CapabilityAwareServiceSupervisor
             exact.Value.BlockingReason = reason;
         }
 
-        PropagateDependencyFailure(identity);
-        var faulted = _kernel.FaultComponent(identity);
+        var propagation = PropagateDependencyFailure(identity, instance);
+        var faulted = _kernel.FaultComponent(identity, instance.Process);
         var drain = CompleteDrain(identity, instance, planned: false, faulted);
+        if (!propagation.IsSuccess) return KernelResult<ServiceSupervisorSnapshot>.Fail(propagation.Error, propagation.Message!);
         if (!drain.IsSuccess) return KernelResult<ServiceSupervisorSnapshot>.Fail(drain.Error, drain.Message!);
-        if (drain.Value!.ClosureProven) ScheduleRestart(identity);
+        if (drain.Value!.ClosureProven)
+        {
+            var scheduled = ScheduleRestart(identity);
+            if (!scheduled.IsSuccess) return KernelResult<ServiceSupervisorSnapshot>.Fail(scheduled.Error, scheduled.Message!);
+        }
         lock (_gate) return KernelResult<ServiceSupervisorSnapshot>.Ok(Snapshot(_records[identity]));
     }
 
@@ -386,76 +495,84 @@ public sealed class CapabilityAwareServiceSupervisor
         ManagedServiceDefinition definition,
         ComponentLifecycleSnapshot component)
     {
+        var expectedProcess = new ProcessHandle(definition.Admission.Manifest.Process.ProcessId,
+            definition.Admission.Manifest.Process.Generation);
+        if (component.Identity != identity || component.Process != expectedProcess ||
+            component.ManifestDigest != definition.Admission.Manifest.NormalizedDigest)
+            return KernelResult<ServiceStartReceipt>.Fail(KernelError.StaleGeneration, "Admission result does not match the exact managed definition.");
         var providedInstances = new Dictionary<ServiceContractIdentity, ServiceInstanceHandle>();
         ServiceInstanceHandle instance = default;
         foreach (var provided in definition.Admission.Manifest.ProvidedContracts)
         {
             var descriptor = _kernel.ResolveByServiceName(provided.ServiceName);
             if (!descriptor.IsSuccess)
-                return CompensateIncompleteAdmission(identity, descriptor.Error, descriptor.Message!);
-            var providedInstance = component.ServiceInstances.SingleOrDefault(candidate => candidate.ServiceId == descriptor.Value!.Service.Id);
+                return CompensateIncompleteAdmission(identity, definition, component.Process, descriptor.Error, descriptor.Message!);
+            var providedInstance = component.ServiceInstances.SingleOrDefault(candidate => candidate.ServiceId == descriptor.Value!.Service.Id && candidate.Generation == descriptor.Value.Generation && candidate.Process == component.Process);
             if (providedInstance == default)
-                return CompensateIncompleteAdmission(identity, KernelError.ServiceNotFound, $"Provided service '{provided.ServiceName}' was not materialized by component admission.");
+                return CompensateIncompleteAdmission(identity, definition, component.Process, KernelError.ServiceNotFound, $"Provided service '{provided.ServiceName}' was not materialized by component admission.");
             providedInstances.Add(provided.Contract, providedInstance);
             if (string.Equals(provided.ServiceName, definition.PrimaryServiceName, StringComparison.Ordinal))
                 instance = providedInstance;
         }
         if (instance == default)
-            return CompensateIncompleteAdmission(identity, KernelError.ServiceNotFound, "Primary service instance was not materialized by component admission.");
+            return CompensateIncompleteAdmission(identity, definition, component.Process, KernelError.ServiceNotFound, "Primary service instance was not materialized by component admission.");
 
-        List<ServiceDependencyBinding> bindings = [];
-        var degraded = component.Admission.Disposition == ManifestAdmissionDisposition.Degraded;
-        KernelError? completionError = null;
-        string? completionMessage = null;
+        long timestamp;
+        try { timestamp = _timeProvider.GetTimestamp(); }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        {
+            return CompensateIncompleteAdmission(identity, definition, component.Process,
+                KernelError.PlatformFaulted, "Admission readiness clock observation failed.");
+        }
+        KernelResult committed;
         lock (_gate)
         {
-            var record = _records[identity];
-            if (record.State != ServiceLifecycleState.Admitting && record.State != ServiceLifecycleState.RestartBackoff)
-            {
-                completionError = KernelError.InvalidTransition;
-                completionMessage = "Supervisor state changed during component admission.";
-            }
-            else
-            {
-                record.State = ServiceLifecycleState.Starting;
-                foreach (var dependency in definition.Admission.Manifest.Dependencies)
-                {
-                    var provider = ResolveProviderRecordLocked(dependency.Contract);
-                    if (provider is not null && provider.ProvidedInstances.TryGetValue(dependency.Contract, out var providerInstance))
-                        bindings.Add(new(instance, providerInstance, dependency.Contract, dependency.Kind));
-                    else if (dependency.Kind == ServiceDependencyKind.Optional)
-                        degraded = true;
-                    else if (definition.ReadinessPolicy == ServiceReadinessPolicy.HardDependenciesBound)
+            var principal = _kernel.Processes.Resolve(_principal);
+            committed = !principal.IsSuccess ? KernelResult.Fail(KernelError.SupervisorDenied, principal.Message!) :
+                _kernel.CapabilityAuthority.CommitSupervisorRecordPublication(_controlCapability,
+                    principal.Value!.DomainId, _principal.Generation, () =>
                     {
-                        completionError = KernelError.DependencyUnavailable;
-                        completionMessage = "Hard dependency is not bound to an exact ready generation.";
-                        break;
-                    }
-                }
-                if (completionError is null)
-                {
-                    record.Instance = instance;
-                    record.ProvidedInstances.Clear();
-                    foreach (var provided in providedInstances) record.ProvidedInstances.Add(provided.Key, provided.Value);
-                    record.Bindings.Clear();
-                    record.Bindings.AddRange(bindings);
-                    record.State = degraded ? ServiceLifecycleState.Degraded : ServiceLifecycleState.Ready;
-                    record.Health = Health(record, degraded ? ServiceHealthState.Degraded : ServiceHealthState.Ready,
-                        degraded ? "Service admitted with explicit optional degradation." : "Service and required dependencies are ready.");
-                    record.RestartEligibleTimestamp = null;
-                    record.RestartAfterDrain = false;
-                    record.BlockingReason = null;
-                }
-            }
+                        if (!_records.TryGetValue(identity, out var record) || !ReferenceEquals(record.Definition, definition))
+                            return KernelResult.Fail(KernelError.StaleGeneration, "Managed definition changed before readiness publication.");
+                        if (record.State is not ServiceLifecycleState.Admitting and not ServiceLifecycleState.RestartBackoff)
+                            return KernelResult.Fail(KernelError.InvalidTransition, "Supervisor state changed during component admission.");
+                        List<ServiceDependencyBinding> bindings = [];
+                        var degraded = component.Admission.Disposition == ManifestAdmissionDisposition.Degraded;
+                        foreach (var dependency in definition.Admission.Manifest.Dependencies)
+                        {
+                            var provider = ResolveProviderRecordLocked(dependency.Contract);
+                            if (provider is not null && provider.ProvidedInstances.TryGetValue(dependency.Contract, out var providerInstance))
+                                bindings.Add(new(instance, providerInstance, dependency.Contract, dependency.Kind));
+                            else if (dependency.Kind == ServiceDependencyKind.Optional)
+                                degraded = true;
+                            else if (definition.ReadinessPolicy == ServiceReadinessPolicy.HardDependenciesBound)
+                                return KernelResult.Fail(KernelError.DependencyUnavailable, "Hard dependency is not bound to an exact ready generation.");
+                        }
+                        var health = new ServiceHealthSnapshot(instance,
+                            degraded ? ServiceHealthState.Degraded : ServiceHealthState.Ready, timestamp,
+                            degraded ? "Service admitted with explicit optional degradation." : "Service and required dependencies are ready.");
+                        record.Instance = instance;
+                        record.ProvidedInstances.Clear();
+                        foreach (var provided in providedInstances) record.ProvidedInstances.Add(provided.Key, provided.Value);
+                        record.Bindings.Clear();
+                        record.Bindings.AddRange(bindings);
+                        record.State = degraded ? ServiceLifecycleState.Degraded : ServiceLifecycleState.Ready;
+                        record.Health = health;
+                        record.RestartEligibleTimestamp = null;
+                        record.RestartAfterDrain = false;
+                        record.BlockingReason = null;
+                        return KernelResult.Ok();
+                    });
         }
-        if (completionError is { } error)
-            return CompensateIncompleteAdmission(identity, error, completionMessage!);
-        RebindDependents(identity);
-        lock (_gate)
-        {
-            var snapshot = Snapshot(_records[identity]);
-            return KernelResult<ServiceStartReceipt>.Ok(new(new(identity, definition.Admission.Manifest.NormalizedDigest), snapshot));
-        }
+        if (!committed.IsSuccess)
+            return CompensateIncompleteAdmission(identity, definition, component.Process, committed.Error, committed.Message!);
+        var rebound = RebindDependents(identity, instance);
+        if (!rebound.IsSuccess) return KernelResult<ServiceStartReceipt>.Fail(rebound.Error, rebound.Message!);
+        var observed = Query(identity);
+        if (!observed.IsSuccess) return KernelResult<ServiceStartReceipt>.Fail(observed.Error, observed.Message!);
+        if (observed.Value!.Instance != instance || observed.Value.ManifestDigest != component.ManifestDigest)
+            return KernelResult<ServiceStartReceipt>.Fail(KernelError.StaleGeneration, "Published admission changed before receipt observation.");
+        return KernelResult<ServiceStartReceipt>.Ok(new(new(identity, definition.Admission.Manifest.NormalizedDigest), observed.Value));
     }
 
     private KernelResult<ServiceDrainReceipt> CompleteDrain(
@@ -464,40 +581,83 @@ public sealed class CapabilityAwareServiceSupervisor
         bool planned,
         KernelResult<ComponentLifecycleSnapshot> result)
     {
+        if (result.IsSuccess && (result.Value!.Identity != identity || result.Value.Process != instance.Process))
+            return KernelResult<ServiceDrainReceipt>.Fail(KernelError.StaleGeneration, "Closure snapshot does not match the exact service process.");
         var closure = result.IsSuccess && result.Value!.State == ComponentLifecycleState.Reclaimable;
         var unsafeOutcome = !closure && IsUnsafeTeardown(
-            identity,
-            result.IsSuccess ? KernelError.None : result.Error);
+            identity, result.IsSuccess ? KernelError.None : result.Error);
+        var state = closure ? ServiceLifecycleState.Stopped :
+            unsafeOutcome ? ServiceLifecycleState.Quarantined : ServiceLifecycleState.Draining;
+        var healthState = closure ? ServiceHealthState.Stopped :
+            unsafeOutcome ? ServiceHealthState.Quarantined : ServiceHealthState.Draining;
+        var reason = closure ? "Old process/provider authority reached exact reclaimable closure." :
+            result.Message ?? (unsafeOutcome ? "External effect closure is ambiguous." : "Exact teardown is still draining.");
+        long timestamp;
+        try { timestamp = _timeProvider.GetTimestamp(); }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        {
+            return KernelResult<ServiceDrainReceipt>.Fail(KernelError.PlatformFaulted, "Drain completion clock observation failed.");
+        }
+        var health = new ServiceHealthSnapshot(instance, healthState, timestamp, reason);
         lock (_gate)
         {
-            var record = _records[identity];
-            if (closure)
-            {
-                record.State = ServiceLifecycleState.Stopped;
-                record.Health = Health(record, ServiceHealthState.Stopped, "Old process/provider authority reached exact reclaimable closure.");
-                record.BlockingReason = null;
-            }
-            else if (unsafeOutcome)
-            {
-                record.State = ServiceLifecycleState.Quarantined;
-                record.Health = Health(record, ServiceHealthState.Quarantined, result.Message ?? "External effect closure is ambiguous.");
-                record.BlockingReason = result.Message ?? result.Error.ToString();
-            }
-            else
-            {
-                record.State = ServiceLifecycleState.Draining;
-                record.Health = Health(record, ServiceHealthState.Draining, result.Message ?? "Exact teardown is still draining.");
-                record.BlockingReason = result.Message;
-            }
-            var receipt = new ServiceDrainReceipt(new(instance, planned), Snapshot(record), closure);
+            var principal = _kernel.Processes.Resolve(_principal);
+            if (!principal.IsSuccess)
+                return KernelResult<ServiceDrainReceipt>.Fail(KernelError.SupervisorDenied, principal.Message!);
+            ServiceDrainReceipt? receipt = null;
+            var committed = _kernel.CapabilityAuthority.CommitSupervisorRecordPublication(_controlCapability,
+                principal.Value!.DomainId, _principal.Generation, () =>
+                {
+                    var exact = ResolveExactLocked(instance);
+                    if (!exact.IsSuccess) return KernelResult.Fail(exact.Error, exact.Message!);
+                    var record = exact.Value!;
+                    if (record.Definition.Identity != identity)
+                        return KernelResult.Fail(KernelError.StaleGeneration, "Drain identity changed before publication.");
+                    record.State = state;
+                    record.Health = health;
+                    record.BlockingReason = closure ? null :
+                        unsafeOutcome ? result.Message ?? result.Error.ToString() : result.Message;
+                    receipt = new ServiceDrainReceipt(new(instance, planned), Snapshot(record), closure);
+                    return KernelResult.Ok();
+                });
+            if (!committed.IsSuccess)
+                return KernelResult<ServiceDrainReceipt>.Fail(committed.Error, committed.Message!);
             if (!result.IsSuccess && !unsafeOutcome && result.Error != KernelError.PlatformBindingDraining)
                 return KernelResult<ServiceDrainReceipt>.Fail(result.Error, result.Message!);
-            return KernelResult<ServiceDrainReceipt>.Ok(receipt);
+            return KernelResult<ServiceDrainReceipt>.Ok(receipt!);
         }
     }
-
     private KernelResult<ServiceReplacementReceipt> AdmitReplacement(ServiceInstanceHandle previous, ManagedServiceDefinition next)
     {
+        var control = ValidateControl();
+        if (!control.IsSuccess) return KernelResult<ServiceReplacementReceipt>.Fail(control.Error, control.Message!);
+        lock (_gate)
+        {
+            var exact = ResolveExactLocked(previous);
+            if (!exact.IsSuccess) return KernelResult<ServiceReplacementReceipt>.Fail(exact.Error, exact.Message!);
+            var contract = ValidateReplacementDefinition(exact.Value!, previous, next);
+            if (!contract.IsSuccess) return KernelResult<ServiceReplacementReceipt>.Fail(contract.Error, contract.Message!);
+        }
+        KernelResult preflight;
+        try { preflight = _kernel.ValidateReplacementAdmission(next.Admission, previous.Process); }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        {
+            return KernelResult<ServiceReplacementReceipt>.Fail(KernelError.PlatformFaulted, "Replacement admission preflight failed.");
+        }
+        if (!preflight.IsSuccess) return KernelResult<ServiceReplacementReceipt>.Fail(preflight.Error, preflight.Message!);
+        lock (_gate)
+        {
+            var principal = _kernel.Processes.Resolve(_principal);
+            if (!principal.IsSuccess) return KernelResult<ServiceReplacementReceipt>.Fail(KernelError.SupervisorDenied, principal.Message!);
+            var validated = _kernel.CapabilityAuthority.CommitSupervisorRecordPublication(_controlCapability,
+                principal.Value!.DomainId, _principal.Generation, () =>
+                {
+                    var exact = ResolveExactLocked(previous);
+                    return exact.IsSuccess ? ValidateReplacementDefinition(exact.Value!, previous, next)
+                        : KernelResult.Fail(exact.Error, exact.Message!);
+                });
+            if (!validated.IsSuccess) return KernelResult<ServiceReplacementReceipt>.Fail(validated.Error, validated.Message!);
+        }
         var retired = _kernel.RetireReclaimableComponent(next.Identity, previous.Process);
         if (!retired.IsSuccess) return KernelResult<ServiceReplacementReceipt>.Fail(retired.Error, retired.Message!);
         lock (_gate)
@@ -527,132 +687,280 @@ public sealed class CapabilityAwareServiceSupervisor
         return KernelResult<ServiceReplacementReceipt>.Ok(new(new(previous, next.Admission.Manifest.NormalizedDigest), completed.Value!.Snapshot, true));
     }
 
-    private void ScheduleRestart(ComponentIdentity identity)
+    private KernelResult ScheduleRestart(ComponentIdentity identity)
     {
+        Record record;
+        long[] attempts;
+        ServiceInstanceHandle? instance;
         lock (_gate)
         {
-            var record = _records[identity];
-            var policy = record.Definition.Admission.Manifest.RestartPolicy;
-            if (policy.Mode == ServiceRestartMode.Never || record.Definition.ReplacementFactory is null)
+            if (!_records.TryGetValue(identity, out record!)) return KernelResult.Fail(KernelError.ComponentNotFound, "Restart record is absent.");
+            if (record.State != ServiceLifecycleState.Stopped || !record.RestartAfterDrain)
+                return KernelResult.Fail(KernelError.ReplacementBlocked, "Restart scheduling requires completed old-generation drain.");
+            attempts = record.RestartAttempts.ToArray();
+            instance = record.Instance;
+        }
+        var policy = record.Definition.Admission.Manifest.RestartPolicy;
+        var disabled = policy.Mode == ServiceRestartMode.Never || record.Definition.ReplacementFactory is null;
+        long now = 0;
+        long? eligible = null;
+        long[] retained = attempts;
+        ulong delay = 0;
+        bool exhausted = false;
+        if (!disabled)
+        {
+            try
             {
-                record.State = ServiceLifecycleState.Failed;
-                record.BlockingReason = policy.Mode == ServiceRestartMode.Never ? "Restart policy is Never." : "Fresh-admission replacement factory is absent.";
-                return;
+                now = _timeProvider.GetTimestamp();
+                retained = attempts.Where(timestamp => _timeProvider.GetElapsedTime(timestamp, now).TotalMilliseconds <= policy.WindowMilliseconds).ToArray();
+                exhausted = retained.Length >= policy.MaximumAttempts;
+                if (!exhausted)
+                {
+                    var multiplier = 1UL << Math.Min(retained.Length, 30);
+                    var scaled = policy.InitialBackoffMilliseconds > ulong.MaxValue / multiplier
+                        ? ulong.MaxValue : policy.InitialBackoffMilliseconds * multiplier;
+                    delay = Math.Min(policy.MaximumBackoffMilliseconds, scaled);
+                    eligible = AddMilliseconds(now, delay);
+                }
             }
-            var now = _timeProvider.GetTimestamp();
-            record.RestartAttempts.RemoveAll(timestamp => _timeProvider.GetElapsedTime(timestamp, now).TotalMilliseconds > policy.WindowMilliseconds);
-            if (record.RestartAttempts.Count >= policy.MaximumAttempts)
+            catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
             {
-                record.State = ServiceLifecycleState.CrashLoop;
-                record.Health = Health(record, ServiceHealthState.Failed, "Bounded restart window is exhausted.");
-                record.BlockingReason = "Crash-loop restart limit reached.";
-                return;
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Restart clock/window/backoff observation failed; scheduling was not committed.");
             }
-            var exponent = Math.Min(record.RestartAttempts.Count, 30);
-            var multiplier = 1UL << exponent;
-            var scaled = policy.InitialBackoffMilliseconds > ulong.MaxValue / multiplier
-                ? ulong.MaxValue
-                : policy.InitialBackoffMilliseconds * multiplier;
-            var delay = Math.Min(policy.MaximumBackoffMilliseconds, scaled);
-            record.RestartAttempts.Add(now);
-            record.RestartEligibleTimestamp = AddMilliseconds(now, delay);
-            record.State = ServiceLifecycleState.RestartBackoff;
-            record.Health = Health(record, ServiceHealthState.Stopped, $"Fresh admission eligible after bounded backoff ({delay} ms).");
+        }
+        lock (_gate)
+        {
+            var principal = _kernel.Processes.Resolve(_principal);
+            if (!principal.IsSuccess) return KernelResult.Fail(KernelError.SupervisorDenied, principal.Message!);
+            return _kernel.CapabilityAuthority.CommitSupervisorRecordPublication(_controlCapability,
+                principal.Value!.DomainId, _principal.Generation, () =>
+                {
+                    if (!_records.TryGetValue(identity, out var current) || !ReferenceEquals(current, record) ||
+                        current.Instance != instance || current.State != ServiceLifecycleState.Stopped ||
+                        !current.RestartAfterDrain || !current.RestartAttempts.SequenceEqual(attempts))
+                        return KernelResult.Fail(KernelError.StaleGeneration, "Restart source changed during observation.");
+                    if (disabled)
+                    {
+                        current.State = ServiceLifecycleState.Failed;
+                        current.BlockingReason = policy.Mode == ServiceRestartMode.Never ? "Restart policy is Never." : "Fresh-admission replacement factory is absent.";
+                        return KernelResult.Ok();
+                    }
+                    current.RestartAttempts.Clear();
+                    current.RestartAttempts.AddRange(retained);
+                    if (exhausted)
+                    {
+                        current.State = ServiceLifecycleState.CrashLoop;
+                        current.Health = new(instance!.Value, ServiceHealthState.Failed, now, "Bounded restart window is exhausted.");
+                        current.BlockingReason = "Crash-loop restart limit reached.";
+                    }
+                    else
+                    {
+                        current.RestartAttempts.Add(now);
+                        current.RestartEligibleTimestamp = eligible;
+                        current.State = ServiceLifecycleState.RestartBackoff;
+                        current.Health = new(instance!.Value, ServiceHealthState.Stopped, now, $"Fresh admission eligible after bounded backoff ({delay} ms).");
+                    }
+                    return KernelResult.Ok();
+                });
         }
     }
-
-    private void RebindDependents(ComponentIdentity providerIdentity)
+    private KernelResult RebindDependents(ComponentIdentity providerIdentity, ServiceInstanceHandle expectedProvider)
     {
-        (ComponentIdentity Identity, ServiceEndpointDescriptor Descriptor, ServiceDependencyRequirementV1 Dependency)[] work;
+        DependencyRebindWork[] work;
+        ManagedServiceDefinition providerDefinition;
         lock (_gate)
         {
-            if (!_records.TryGetValue(providerIdentity, out var provider) || provider.Instance is null) return;
+            if (!_records.TryGetValue(providerIdentity, out var provider) || provider.Instance != expectedProvider)
+                return KernelResult.Fail(KernelError.StaleGeneration, "Dependency provider changed before rebind capture.");
+            providerDefinition = provider.Definition;
             var provided = provider.Definition.Admission.Manifest.ProvidedContracts.Select(item => item.Contract).ToHashSet();
             var candidates = _records.Values
                 .Where(record => record.Definition.Identity != providerIdentity && record.Instance is not null && record.State is ServiceLifecycleState.Ready or ServiceLifecycleState.Degraded)
-                .SelectMany(record => record.Definition.Admission.Manifest.Dependencies.Where(dependency => provided.Contains(dependency.Contract)).Select(dependency => (record.Definition.Identity, dependency)))
+                .SelectMany(record => record.Definition.Admission.Manifest.Dependencies.Where(dependency => provided.Contains(dependency.Contract)).Select(dependency => (record, dependency)))
                 .ToArray();
-            var resolvedWork = new List<(ComponentIdentity, ServiceEndpointDescriptor, ServiceDependencyRequirementV1)>();
+            var resolvedWork = new List<DependencyRebindWork>();
             foreach (var item in candidates)
             {
                 var resolved = _kernel.ResolveByContract(item.dependency.Contract);
-                if (resolved.IsSuccess && resolved.Value!.Length == 1)
-                    resolvedWork.Add((item.Identity, resolved.Value[0], item.dependency));
+                if (!resolved.IsSuccess || resolved.Value!.Length != 1 ||
+                    !provider.ProvidedInstances.TryGetValue(item.dependency.Contract, out var exactProvider))
+                    return KernelResult.Fail(KernelError.DependencyUnavailable, "Rebind requires one exact declared provider.");
+                var descriptor = resolved.Value[0];
+                if (descriptor.Service.Id != exactProvider.ServiceId || descriptor.Generation != exactProvider.Generation ||
+                    exactProvider.Process != expectedProvider.Process || exactProvider.Domain != expectedProvider.Domain)
+                    return KernelResult.Fail(KernelError.StaleGeneration, "Resolved dependency descriptor does not match the captured provider.");
+                resolvedWork.Add(new(item.record.Definition, item.record.Instance!.Value, item.record.State,
+                    item.record.Bindings.ToArray(), descriptor, item.dependency, exactProvider));
             }
             work = resolvedWork.ToArray();
         }
 
-        foreach (var item in work)
+        for (var index = 0; index < work.Length; index++)
         {
-            var rebound = _kernel.RebindComponentDependency(item.Identity, item.Descriptor);
+            var item = work[index];
+            long timestamp;
+            try { timestamp = _timeProvider.GetTimestamp(); }
+            catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+            {
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Dependency rebind clock failed before dispatch.");
+            }
             lock (_gate)
             {
-                var dependent = _records[item.Identity];
-                if (!rebound.IsSuccess)
-                {
-                    dependent.State = ServiceLifecycleState.Degraded;
-                    dependent.Health = Health(dependent, ServiceHealthState.Degraded, rebound.Message ?? "Dependency rebind failed.");
-                    continue;
-                }
-                var provider = _records[providerIdentity];
-                dependent.Bindings.RemoveAll(binding => binding.Contract == item.Dependency.Contract);
-                dependent.Bindings.Add(new(dependent.Instance!.Value, provider.ProvidedInstances[item.Dependency.Contract], item.Dependency.Contract, item.Dependency.Kind));
-                if (dependent.State == ServiceLifecycleState.Degraded && AllHardDependenciesBoundLocked(dependent))
-                {
-                    dependent.State = ServiceLifecycleState.Ready;
-                    dependent.Health = Health(dependent, ServiceHealthState.Ready, "Dependency rebound to the fresh exact generation.");
-                }
+                var principal = _kernel.Processes.Resolve(_principal);
+                if (!principal.IsSuccess) return KernelResult.Fail(KernelError.SupervisorDenied, principal.Message!);
+                var admitted = _kernel.CapabilityAuthority.CommitSupervisorRecordPublication(_controlCapability,
+                    principal.Value!.DomainId, _principal.Generation,
+                    () => ValidateDependencyRebindLocked(providerIdentity, expectedProvider, providerDefinition, item));
+                if (!admitted.IsSuccess) return admitted;
+            }
+            var rebound = _kernel.RebindComponentDependency(item.Definition.Identity, item.Dependent.Process,
+                item.Descriptor, _principal, _controlCapability);
+            lock (_gate)
+            {
+                var principal = _kernel.Processes.Resolve(_principal);
+                if (!principal.IsSuccess) return KernelResult.Fail(KernelError.SupervisorDenied, principal.Message!);
+                var published = _kernel.CapabilityAuthority.CommitSupervisorRecordPublication(_controlCapability,
+                    principal.Value!.DomainId, _principal.Generation, () =>
+                    {
+                        var exact = ValidateDependencyRebindLocked(providerIdentity, expectedProvider, providerDefinition, item);
+                        if (!exact.IsSuccess) return exact;
+                        var dependent = ResolveExactLocked(item.Dependent).Value!;
+                        if (!rebound.IsSuccess)
+                        {
+                            dependent.State = ServiceLifecycleState.Degraded;
+                            dependent.Health = new(item.Dependent, ServiceHealthState.Degraded, timestamp,
+                                rebound.Message ?? "Dependency rebind failed.");
+                            return KernelResult.Ok();
+                        }
+                        var bindings = item.Bindings.Where(binding => binding.Contract != item.Dependency.Contract).ToList();
+                        bindings.Add(new(item.Dependent, item.Provider, item.Dependency.Contract, item.Dependency.Kind));
+                        var ready = item.State == ServiceLifecycleState.Degraded &&
+                            AllHardDependenciesBoundLocked(item.Definition, bindings);
+                        dependent.Bindings.Clear();
+                        dependent.Bindings.AddRange(bindings);
+                        if (ready)
+                        {
+                            dependent.State = ServiceLifecycleState.Ready;
+                            dependent.Health = new(item.Dependent, ServiceHealthState.Ready, timestamp,
+                                "Dependency rebound to the fresh exact generation.");
+                        }
+                        return KernelResult.Ok();
+                    });
+                if (!published.IsSuccess) return published;
+                // Only our committed publication advances snapshots for further
+                // contracts on this same dependent. External changes still fail
+                // the next exact comparison.
+                var current = ResolveExactLocked(item.Dependent).Value!;
+                for (var next = index + 1; next < work.Length; next++)
+                    if (work[next].Dependent == item.Dependent)
+                        work[next] = work[next] with { State = current.State, Bindings = current.Bindings.ToArray() };
             }
         }
+        return KernelResult.Ok();
     }
 
-    private KernelResult<ServiceStartReceipt> CompensateIncompleteAdmission(ComponentIdentity identity, KernelError error, string message)
+    private KernelResult ValidateDependencyRebindLocked(ComponentIdentity providerIdentity,
+        ServiceInstanceHandle expectedProvider, ManagedServiceDefinition providerDefinition, DependencyRebindWork item)
     {
-        var drained = _kernel.DrainComponent(identity);
-        var unsafeOutcome = !drained.IsSuccess && IsUnsafeTeardown(identity, drained.Error);
+        if (!_records.TryGetValue(providerIdentity, out var provider) || provider.Instance != expectedProvider ||
+            !ReferenceEquals(provider.Definition, providerDefinition) ||
+            provider.State is not ServiceLifecycleState.Ready and not ServiceLifecycleState.Degraded ||
+            !provider.ProvidedInstances.TryGetValue(item.Dependency.Contract, out var provided) || provided != item.Provider)
+            return KernelResult.Fail(KernelError.StaleGeneration, "Exact dependency provider changed before rebind commit.");
+        var exact = ResolveExactLocked(item.Dependent);
+        if (!exact.IsSuccess) return KernelResult.Fail(exact.Error, exact.Message!);
+        var dependent = exact.Value!;
+        if (!ReferenceEquals(dependent.Definition, item.Definition) || !dependent.Bindings.SequenceEqual(item.Bindings))
+            return KernelResult.Fail(KernelError.StaleGeneration, "Dependent definition or bindings changed before rebind commit.");
+        return dependent.State == item.State ? KernelResult.Ok()
+            : KernelResult.Fail(KernelError.InvalidTransition, "Dependent lifecycle changed before rebind commit.");
+    }
+
+    private KernelResult<ServiceStartReceipt> CompensateIncompleteAdmission(
+        ComponentIdentity identity, ManagedServiceDefinition definition, ProcessHandle process, KernelError error, string message)
+    {
+        // Cleanup consumes only the admitted generation; identity cannot redirect it.
+        var drained = _kernel.DrainComponent(identity, process);
+        var closure = drained.IsSuccess && drained.Value!.Reclaimable;
+        var unsafeOutcome = !closure && IsUnsafeTeardown(identity, drained.IsSuccess ? KernelError.None : drained.Error);
         lock (_gate)
         {
-            var record = _records[identity];
-            if (drained.IsSuccess && drained.Value!.State == ComponentLifecycleState.Reclaimable)
-            {
-                record.State = ServiceLifecycleState.Stopped;
-                record.BlockingReason = message;
-            }
-            else if (unsafeOutcome)
-            {
-                record.State = ServiceLifecycleState.Quarantined;
-                record.BlockingReason = drained.Message ?? message;
-            }
-            else
-            {
-                record.State = ServiceLifecycleState.Draining;
-                record.BlockingReason = drained.Message ?? message;
-            }
+            var principal = _kernel.Processes.Resolve(_principal);
+            if (principal.IsSuccess)
+                _ = _kernel.CapabilityAuthority.CommitSupervisorRecordPublication(_controlCapability,
+                    principal.Value!.DomainId, _principal.Generation, () =>
+                    {
+                        if (!_records.TryGetValue(identity, out var record) || !ReferenceEquals(record.Definition, definition))
+                            return KernelResult.Fail(KernelError.StaleGeneration, "Compensation definition has been replaced.");
+                        if (record.State is not ServiceLifecycleState.Admitting and not ServiceLifecycleState.RestartBackoff)
+                            return KernelResult.Fail(KernelError.InvalidTransition, "Compensation cannot overwrite a published service instance.");
+                        record.State = closure ? ServiceLifecycleState.Stopped :
+                            unsafeOutcome ? ServiceLifecycleState.Quarantined : ServiceLifecycleState.Draining;
+                        record.BlockingReason = closure ? message : drained.Message ?? message;
+                        return KernelResult.Ok();
+                    });
         }
         return KernelResult<ServiceStartReceipt>.Fail(error, message);
     }
-
-    private void PropagateDependencyFailure(ComponentIdentity failedIdentity)
+    private KernelResult PropagateDependencyFailure(ComponentIdentity failedIdentity, ServiceInstanceHandle failed)
     {
-        (ServiceInstanceHandle Instance, ServiceFailurePropagationPolicy Policy)[] dependents;
+        (ServiceInstanceHandle Instance, ManagedServiceDefinition Definition, ServiceLifecycleState State)[] dependents;
         lock (_gate)
         {
+            if (!_records.TryGetValue(failedIdentity, out var provider) || provider.Instance != failed)
+                return KernelResult.Fail(KernelError.StaleGeneration, "Failed provider generation changed before propagation.");
             dependents = _records.Values
-                .Where(record => record.Instance is not null && record.Bindings.Any(binding =>
-                    _records[failedIdentity].Instance is { } failed && binding.Provider == failed))
-                .Select(record => (record.Instance!.Value, record.Definition.DependencyFailurePolicy))
-                .ToArray();
-            foreach (var item in dependents.Where(item => item.Policy == ServiceFailurePropagationPolicy.DegradeDependent))
+                .Where(record => record.Instance is not null && record.Bindings.Any(binding => binding.Provider == failed))
+                .Select(record => (record.Instance!.Value, record.Definition, record.State)).ToArray();
+        }
+        var degraded = dependents.Where(item => item.Definition.DependencyFailurePolicy == ServiceFailurePropagationPolicy.DegradeDependent).ToArray();
+        long timestamp = 0;
+        if (degraded.Length != 0)
+        {
+            try { timestamp = _timeProvider.GetTimestamp(); }
+            catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
             {
-                var record = ResolveExactLocked(item.Instance).Value!;
-                record.State = ServiceLifecycleState.Degraded;
-                record.Health = Health(record, ServiceHealthState.Degraded, "Exact hard dependency generation failed.");
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Dependency failure clock observation failed.");
             }
         }
-        foreach (var item in dependents.Where(item => item.Policy != ServiceFailurePropagationPolicy.DegradeDependent))
-            _ = Drain(item.Instance, planned: item.Policy == ServiceFailurePropagationPolicy.StopDependent);
+        lock (_gate)
+        {
+            var principal = _kernel.Processes.Resolve(_principal);
+            if (!principal.IsSuccess) return KernelResult.Fail(KernelError.SupervisorDenied, principal.Message!);
+            var committed = _kernel.CapabilityAuthority.CommitSupervisorRecordPublication(_controlCapability,
+                principal.Value!.DomainId, _principal.Generation, () =>
+                {
+                    if (!_records.TryGetValue(failedIdentity, out var provider) || provider.Instance != failed ||
+                        provider.State != ServiceLifecycleState.Failed)
+                        return KernelResult.Fail(KernelError.StaleGeneration, "Failed provider changed before dependency publication.");
+                    // Validate the entire captured batch before publishing any peer change.
+                    foreach (var item in dependents)
+                    {
+                        var exact = ResolveExactLocked(item.Instance);
+                        if (!exact.IsSuccess) return KernelResult.Fail(exact.Error, exact.Message!);
+                        var record = exact.Value!;
+                        if (!ReferenceEquals(record.Definition, item.Definition) || !record.Bindings.Any(binding => binding.Provider == failed))
+                            return KernelResult.Fail(KernelError.StaleGeneration, "Dependent definition or binding changed before propagation.");
+                        if (record.State != item.State)
+                            return KernelResult.Fail(KernelError.InvalidTransition, "Dependent state changed before propagation.");
+                    }
+                    foreach (var item in degraded)
+                    {
+                        var record = ResolveExactLocked(item.Instance).Value!;
+                        record.State = ServiceLifecycleState.Degraded;
+                        record.Health = new(item.Instance, ServiceHealthState.Degraded, timestamp, "Exact hard dependency generation failed.");
+                    }
+                    return KernelResult.Ok();
+                });
+            if (!committed.IsSuccess) return committed;
+        }
+        foreach (var item in dependents.Where(item => item.Definition.DependencyFailurePolicy != ServiceFailurePropagationPolicy.DegradeDependent))
+        {
+            var drained = Drain(item.Instance, planned: item.Definition.DependencyFailurePolicy == ServiceFailurePropagationPolicy.StopDependent);
+            if (!drained.IsSuccess) return KernelResult.Fail(drained.Error, drained.Message!);
+        }
+        return KernelResult.Ok();
     }
-
     private KernelResult ValidateControl()
     {
         var capability = _kernel.ValidateCapability(_principal, _controlCapability, CapabilityRights.Configure | CapabilityRights.Execute);
@@ -735,10 +1043,12 @@ public sealed class CapabilityAwareServiceSupervisor
             candidate.State is ServiceLifecycleState.Ready or ServiceLifecycleState.Degraded &&
             candidate.Definition.Admission.Manifest.ProvidedContracts.Any(provided => provided.Contract == contract));
 
-    private static bool AllHardDependenciesBoundLocked(Record record) =>
-        record.Definition.Admission.Manifest.Dependencies
+    private bool AllHardDependenciesBoundLocked(ManagedServiceDefinition definition, IReadOnlyList<ServiceDependencyBinding> bindings) =>
+        definition.Admission.Manifest.Dependencies
             .Where(dependency => dependency.Kind == ServiceDependencyKind.Hard)
-            .All(dependency => record.Bindings.Any(binding => binding.Contract == dependency.Contract));
+            .All(dependency => ResolveProviderRecordLocked(dependency.Contract) is { } provider &&
+                provider.ProvidedInstances.TryGetValue(dependency.Contract, out var exact) &&
+                bindings.Any(binding => binding.Contract == dependency.Contract && binding.Provider == exact));
 
     private bool IsUnsafeTeardown(ComponentIdentity identity, KernelError error)
     {
@@ -749,9 +1059,6 @@ public sealed class CapabilityAwareServiceSupervisor
             ReclaimExternalState.ExternalStateUnknown or ReclaimExternalState.Quarantined;
     }
 
-    private ServiceHealthSnapshot Health(Record record, ServiceHealthState state, string reason) =>
-        new(record.Instance ?? throw new InvalidOperationException("Health observation requires an exact service instance."), state, _timeProvider.GetTimestamp(), reason);
-
     private ServiceSupervisorSnapshot Snapshot(Record record) =>
         new(record.Definition.Identity, record.Instance, record.State, record.Health, record.Bindings.ToArray(),
             (uint)record.RestartAttempts.Count, record.RestartEligibleTimestamp,
@@ -759,7 +1066,9 @@ public sealed class CapabilityAwareServiceSupervisor
 
     private long AddMilliseconds(long timestamp, ulong milliseconds)
     {
-        var delta = checked((long)Math.Ceiling(milliseconds * (double)_timeProvider.TimestampFrequency / 1000d));
+        var frequency = _timeProvider.TimestampFrequency;
+        if (frequency <= 0) throw new InvalidOperationException("Restart timestamp frequency must be positive.");
+        var delta = checked((long)Math.Ceiling(milliseconds * (double)frequency / 1000d));
         return checked(timestamp + delta);
     }
 }

@@ -5,28 +5,41 @@ namespace SingPlus.Runtime;
 
 public sealed class DomainRegistry
 {
+    private readonly object _gate = new();
     private readonly Dictionary<DomainId, HashSet<ProcessHandle>> _domains = [];
 
     internal void Add(SingProcess process)
     {
-        if (!_domains.TryGetValue(process.DomainId, out var handles))
+        lock (_gate)
         {
-            handles = [];
-            _domains.Add(process.DomainId, handles);
+            if (!_domains.TryGetValue(process.DomainId, out var handles))
+            {
+                handles = [];
+                _domains.Add(process.DomainId, handles);
+            }
+            handles.Add(new ProcessHandle(process.ProcessId, process.Generation));
         }
-        handles.Add(new ProcessHandle(process.ProcessId, process.Generation));
     }
 
     internal bool Remove(SingProcess process)
     {
-        if (!_domains.TryGetValue(process.DomainId, out var handles)) return true;
-        handles.Remove(new ProcessHandle(process.ProcessId, process.Generation));
-        if (handles.Count != 0) return false;
-        _domains.Remove(process.DomainId);
-        return true;
+        lock (_gate)
+        {
+            if (!_domains.TryGetValue(process.DomainId, out var handles)) return true;
+            handles.Remove(new ProcessHandle(process.ProcessId, process.Generation));
+            if (handles.Count != 0) return false;
+            _domains.Remove(process.DomainId);
+            return true;
+        }
     }
 
-    public bool Contains(DomainId domainId) => _domains.ContainsKey(domainId);
+    public bool Contains(DomainId domainId)
+    {
+        lock (_gate) return _domains.ContainsKey(domainId);
+    }
 
-    public IReadOnlyList<DomainId> Snapshot() => _domains.Keys.OrderBy(static id => id.Value).ToArray();
+    public IReadOnlyList<DomainId> Snapshot()
+    {
+        lock (_gate) return _domains.Keys.OrderBy(static id => id.Value).ToArray();
+    }
 }

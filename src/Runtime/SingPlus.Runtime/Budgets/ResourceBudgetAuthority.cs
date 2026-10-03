@@ -119,48 +119,79 @@ public sealed class ResourceBudgetAuthority
         }
     }
 
-    internal KernelResult<BudgetAccountSnapshot> CreateChild(
-        BudgetAccountHandle parent,
-        BudgetAccountLevel level,
-        string ownerCorrelation,
-        IReadOnlyList<BudgetAmount> limits)
+    private KernelResult<AccountRecord> PrepareChildRecord(BudgetAccountHandle parent,
+        BudgetAccountLevel level, string correlation, IReadOnlyList<BudgetAmount> limits,
+        BudgetAccountHandle handle, AccountRecord parentRecord)
+    {
+        if ((int)level != (int)parentRecord.Level + 1)
+            return KernelResult<AccountRecord>.Fail(KernelError.InvalidTransition, "Budget hierarchy must be System -> Service -> ProcessDomain.");
+        if (limits.Count > 0)
+        {
+            var validation = ValidateAmounts(limits);
+            if (!validation.IsSuccess) return KernelResult<AccountRecord>.Fail(validation.Error, validation.Message!);
+        }
+        var selected = new Dictionary<ServiceBudgetDimension, ulong>(parentRecord.Limits);
+        foreach (var limit in limits)
+        {
+            if (limit.Amount > parentRecord.Limits[limit.Dimension])
+                return KernelResult<AccountRecord>.Fail(KernelError.BudgetExceeded, $"Child {limit.Dimension} limit exceeds its parent limit.");
+            selected[limit.Dimension] = limit.Amount;
+        }
+        return KernelResult<AccountRecord>.Ok(new AccountRecord
+        {
+            Handle = handle, Level = level, Parent = parent, OwnerCorrelation = correlation, Limits = selected,
+        });
+    }
+
+    internal KernelResult<BudgetAccountSnapshot> CreateChild(BudgetAccountHandle parent,
+        BudgetAccountLevel level, string ownerCorrelation, IReadOnlyList<BudgetAmount> limits)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(ownerCorrelation);
         lock (_gate)
         {
             var parentResult = ResolveAccount(parent);
             if (!parentResult.IsSuccess) return KernelResult<BudgetAccountSnapshot>.Fail(parentResult.Error, parentResult.Message!);
-            var parentRecord = parentResult.Value!;
-            if ((int)level != (int)parentRecord.Level + 1)
-                return KernelResult<BudgetAccountSnapshot>.Fail(KernelError.InvalidTransition, "Budget hierarchy must be System -> Service -> ProcessDomain.");
-            if (limits.Count > 0)
-            {
-                var validation = ValidateAmounts(limits);
-                if (!validation.IsSuccess) return KernelResult<BudgetAccountSnapshot>.Fail(validation.Error, validation.Message!);
-            }
-            var selected = new Dictionary<ServiceBudgetDimension, ulong>(parentRecord.Limits);
-            foreach (var limit in limits)
-            {
-                if (limit.Amount > parentRecord.Limits[limit.Dimension])
-                    return KernelResult<BudgetAccountSnapshot>.Fail(KernelError.BudgetExceeded, $"Child {limit.Dimension} limit exceeds its parent limit.");
-                selected[limit.Dimension] = limit.Amount;
-            }
+            var handle = new BudgetAccountHandle(new(_nextAccountId), new(1));
+            var prepared = PrepareChildRecord(parent, level, ownerCorrelation, limits, handle, parentResult.Value!);
+            if (!prepared.IsSuccess) return KernelResult<BudgetAccountSnapshot>.Fail(prepared.Error, prepared.Message!);
             if (_nextAccountId == 0)
                 return KernelResult<BudgetAccountSnapshot>.Fail(KernelError.CapacityExhausted, "Budget account identity space is exhausted.");
-            var handle = new BudgetAccountHandle(new(_nextAccountId++), new(1));
-            var record = new AccountRecord
-            {
-                Handle = handle,
-                Level = level,
-                Parent = parent,
-                OwnerCorrelation = ownerCorrelation,
-                Limits = selected,
-            };
-            _accounts.Add(handle.AccountId, record);
-            return KernelResult<BudgetAccountSnapshot>.Ok(Snapshot(record));
+            _accounts.Add(handle.AccountId, prepared.Value!);
+            _nextAccountId++;
+            return KernelResult<BudgetAccountSnapshot>.Ok(Snapshot(prepared.Value!));
         }
     }
 
+    internal KernelResult<ProcessBudgetAdmission> CreateProcessHierarchy(ProcessHandle process,
+        string serviceCorrelation, string processCorrelation, IReadOnlyList<BudgetAmount> limits)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(serviceCorrelation);
+        ArgumentException.ThrowIfNullOrWhiteSpace(processCorrelation);
+        lock (_gate)
+        {
+            if (_processAccounts.ContainsKey(process))
+                return KernelResult<ProcessBudgetAdmission>.Fail(KernelError.DuplicateIdentity, "Process generation already has a budget account.");
+            var root = ResolveAccount(SystemBudget);
+            if (!root.IsSuccess) return KernelResult<ProcessBudgetAdmission>.Fail(root.Error, root.Message!);
+            var serviceHandle = new BudgetAccountHandle(new(_nextAccountId), new(1));
+            var service = PrepareChildRecord(SystemBudget, BudgetAccountLevel.Service, serviceCorrelation,
+                limits, serviceHandle, root.Value!);
+            if (!service.IsSuccess) return KernelResult<ProcessBudgetAdmission>.Fail(service.Error, service.Message!);
+            // Two identities are required. The final pair may consume MaxValue-1 and MaxValue,
+            // after which zero remains the existing terminal exhausted sentinel.
+            if (_nextAccountId == 0 || _nextAccountId == ulong.MaxValue)
+                return KernelResult<ProcessBudgetAdmission>.Fail(KernelError.CapacityExhausted, "Two budget account identities are required.");
+            var processHandle = new BudgetAccountHandle(new(_nextAccountId + 1), new(1));
+            var child = PrepareChildRecord(serviceHandle, BudgetAccountLevel.ProcessDomain, processCorrelation,
+                limits, processHandle, service.Value!);
+            if (!child.IsSuccess) return KernelResult<ProcessBudgetAdmission>.Fail(child.Error, child.Message!);
+            _accounts.Add(serviceHandle.AccountId, service.Value!);
+            _accounts.Add(processHandle.AccountId, child.Value!);
+            _processAccounts.Add(process, processHandle);
+            _nextAccountId = unchecked(_nextAccountId + 2);
+            return KernelResult<ProcessBudgetAdmission>.Ok(new(process, serviceHandle, processHandle));
+        }
+    }
     internal KernelResult AttachProcess(ProcessHandle process, BudgetAccountHandle account)
     {
         lock (_gate)
@@ -563,6 +594,13 @@ public sealed class ResourceBudgetAuthority
             var serviceResolved = ResolveAccount(serviceAccount);
             if (!processResolved.IsSuccess || !serviceResolved.IsSuccess)
                 return KernelResult.Fail(KernelError.StaleGeneration, "Budget hierarchy is stale.");
+            if (processResolved.Value!.Level != BudgetAccountLevel.ProcessDomain ||
+                serviceResolved.Value!.Level != BudgetAccountLevel.Service ||
+                processResolved.Value.Parent != serviceAccount || serviceResolved.Value.Parent != SystemBudget)
+                return KernelResult.Fail(KernelError.StaleGeneration, "Budget retirement requires the exact process/service parent hierarchy.");
+            if (_processAccounts.Any(item => item.Key != process && item.Value == processAccount) ||
+                _accounts.Values.Any(item => !item.Retired && item.Parent == serviceAccount && item.Handle != processAccount))
+                return KernelResult.Fail(KernelError.ReplacementBlocked, "Other live process attachments or children keep the service hierarchy live.");
             _processAccounts.Remove(process);
             processResolved.Value!.Retired = true;
             serviceResolved.Value!.Retired = true;

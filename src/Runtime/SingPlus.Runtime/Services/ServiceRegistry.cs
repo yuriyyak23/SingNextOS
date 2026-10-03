@@ -88,6 +88,16 @@ internal sealed class ServiceRegistry
         }
     }
 
+    internal KernelResult<T> CommitSessionAdmission<T>(ServiceEndpointDescriptor descriptor, Func<Record, KernelResult<T>> commit)
+    {
+        lock (_gate)
+        {
+            var exact = Resolve(descriptor);
+            // Trusted local channel/session commit; no provider or lifecycle callback.
+            return exact.IsSuccess ? commit(exact.Value!) : KernelResult<T>.Fail(exact.Error, exact.Message!);
+        }
+    }
+
     internal KernelResult<ServiceEndpointDescriptor[]> ResolveByContract(ServiceContractIdentity contract)
     {
         lock (_gate)

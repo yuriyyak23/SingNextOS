@@ -212,9 +212,6 @@ public sealed partial class RuntimeKernel
             return KernelResult<ProcessTeardownRecord>.Fail(KernelError.InvalidTransition,
                 $"Cannot begin teardown from state {process.State} without a tracked record.");
 
-        var nativeServices = DrainNativeServicesForProcess(handle);
-        if (!nativeServices.IsSuccess)
-            return KernelResult<ProcessTeardownRecord>.Fail(nativeServices.Error, nativeServices.Message!);
         process.SetState(ProcessState.Exiting);
         // Revoke local access immediately. Region backing and possible external
         // effects remain pinned until their existing owners prove closure.
@@ -225,9 +222,6 @@ public sealed partial class RuntimeKernel
         ReleaseClosedIpcBudgetsForProcess(handle);
         CloseTraceSessionsForProcess(handle);
         CloseTelemetrySubscriptionsForProcess(handle);
-        var sessionsClosed = CloseSessionsForProcess(handle);
-        if (!sessionsClosed.IsSuccess)
-            return KernelResult<ProcessTeardownRecord>.Fail(sessionsClosed.Error, sessionsClosed.Message!);
         _kernelEvents.BeginCloseForProcess(handle);
 
         var mappings = new Dictionary<PlatformRegionMappingId, PlatformRegionMapping>();
@@ -258,6 +252,10 @@ public sealed partial class RuntimeKernel
 
     private KernelResult PrepareComposedAuthorityTeardown(ProcessHandle handle)
     {
+        var native = DrainNativeServicesForProcess(handle);
+        if (!native.IsSuccess) return native;
+        var sessions = CloseSessionsForProcess(handle);
+        if (!sessions.IsSuccess) return sessions;
         var process = Processes.Resolve(handle);
         if (!process.IsSuccess) return KernelResult.Fail(process.Error, process.Message!);
         var owner = new RegionOwner(process.Value!.DomainId, process.Value.Generation);

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using SingPlus.Boot;
+using SingPlus.Boot.Demos;
 using SingPlus.Kernel;
 using SingPlus.Kernel.Hal;
 
@@ -7,15 +8,60 @@ internal class Program
 {
     private static int Main(string[] args)
     {
-KernelConsole.Configure(new HostKernelConsole());
-var exitCode = KernelEntryPoint.Run(HostDebugBootPipeline.Create(args));
-
-        if (exitCode == 0 && Debugger.IsAttached)
+        KernelConsole.Configure(new HostKernelConsole());
+        var parsed = EmulatorOptions.Parse(args);
+        if (parsed.ShowHelp)
         {
-            KernelConsole.Write("[boot] debugger attached; press Enter to stop\r\n".AsSpan());
-            Console.ReadLine();
+            EmulatorOptions.WriteHelp(Console.Out);
+            return 0;
         }
 
-        return exitCode;
+        if (parsed.Options is null)
+        {
+            Console.Error.WriteLine($"[emulator] {parsed.Error}");
+            EmulatorOptions.WriteHelp(Console.Error);
+            return 2;
+        }
+
+        var stages = HostDebugBootPipeline.Create(parsed.Options, out var session);
+        try
+        {
+            var exitCode = KernelEntryPoint.Run(stages);
+            if (exitCode != 0) return exitCode;
+
+            foreach (var demo in session.Options.Demos)
+            {
+                var name = EmulatorOptions.DemoName(demo);
+                EmulatorConsole.Info($"[demo] running '{name}'\r\n");
+                var result = DemoWorkloads.Run(demo, session);
+                if (!result.IsSuccess)
+                {
+                    EmulatorConsole.Error($"[demo] '{name}' failed: {result.Error}\r\n");
+                    return 1;
+                }
+                EmulatorConsole.Ok($"[demo] '{name}' passed\r\n");
+            }
+
+            if (session.Options.ScriptPath is { } scriptPath)
+                return EmulatorShell.RunScript(session, scriptPath);
+
+            if (session.Options.WantsInteractiveShell(Debugger.IsAttached))
+            {
+                EmulatorShell.RunInteractive(session);
+                return 0;
+            }
+
+            if (session.Options.PauseRequested)
+            {
+                KernelConsole.Write("[boot] press Enter to stop\r\n".AsSpan());
+                Console.ReadLine();
+            }
+
+            return 0;
+        }
+        finally
+        {
+            session.Shutdown(message => EmulatorConsole.Detail($"[emulator] shutdown: {message}\r\n"));
+        }
     }
 }

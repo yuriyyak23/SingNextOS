@@ -18,7 +18,39 @@ public sealed partial class RuntimeKernel
         return EvaluateComponentAdmissionCore(plan).Result;
     }
 
-    private ComponentAdmissionEvaluation EvaluateComponentAdmissionCore(ComponentAdmissionPlan plan)
+    internal KernelResult ValidateReplacementAdmission(ComponentAdmissionPlan plan, ProcessHandle previous)
+    {
+        var imports = ValidateComponentContractImports(plan);
+        if (!imports.IsSuccess) return imports;
+        var evaluation = EvaluateComponentAdmissionCore(plan, previous);
+        if (evaluation.Error is { } error) return KernelResult.Fail(error, evaluation.Message!);
+        var process = Processes.ValidateCreation(plan.Manifest.Process);
+        if (!process.IsSuccess) return process;
+        foreach (var grant in plan.Grants)
+        {
+            // The subject domain may be materialized by CreateProcess. This is a request,
+            // not issuer authority; MintCapability still performs its live owner check.
+            if (grant.IssuerDomain == plan.Manifest.Process.DomainId) continue;
+            var issuer = ValidateCapabilityIssuerPresence(grant.IssuerDomain);
+            if (!issuer.IsSuccess) return issuer;
+        }
+        return KernelResult.Ok();
+    }
+
+    private static KernelResult ValidateComponentContractImports(ComponentAdmissionPlan plan)
+    {
+        if (plan.ManifestV2 is { } v2)
+        {
+            var declared = v2.StaticCapabilityImports.ToArray();
+            var supplied = plan.Grants.Select(static grant => grant.Requirement)
+                .OrderBy(static item => item.ResourceKind).ThenBy(static item => item.ResourceId, StringComparer.Ordinal).ThenBy(static item => item.Rights).ToArray();
+            if (!declared.SequenceEqual(supplied))
+                return KernelResult.Fail(KernelError.InvalidManifest, "Runtime grants must exactly match the V2 static capability imports.");
+        }
+        return KernelResult.Ok();
+    }
+
+    private ComponentAdmissionEvaluation EvaluateComponentAdmissionCore(ComponentAdmissionPlan plan, ProcessHandle? replacementOf = null)
     {
         var manifest = plan.Manifest;
         var decisions = new List<ManifestRequirementDecisionV1>();
@@ -31,7 +63,16 @@ public sealed partial class RuntimeKernel
 
         if (!manifest.MatchesImage(plan.Image.Span))
             return Denied(KernelError.ComponentDigestMismatch, "Component image digest does not match its manifest.");
-        if (_components.ContainsKey(manifest.Identity))
+        if (replacementOf is { } previous)
+        {
+            if (!_components.TryGetValue(manifest.Identity, out var old) || old.Process != previous ||
+                previous.Generation == ulong.MaxValue || manifest.Process.ProcessId != previous.ProcessId ||
+                manifest.Process.Generation != previous.Generation + 1)
+                return Denied(KernelError.StaleGeneration, "Replacement preflight requires the exact tracked old process and next generation.");
+            if (old.State != ComponentLifecycleState.Reclaimable)
+                return Denied(KernelError.ReplacementBlocked, "Replacement preflight requires exact old component closure.");
+        }
+        else if (_components.ContainsKey(manifest.Identity))
             return Denied(KernelError.DuplicateIdentity, $"Component '{manifest.Identity.Name}' is already tracked.");
         if (!RegistrationsMatchManifest(manifest, plan.ProvidedServices))
             return Denied(KernelError.InvalidManifest, "Provided service registrations do not exactly match the component manifest.");

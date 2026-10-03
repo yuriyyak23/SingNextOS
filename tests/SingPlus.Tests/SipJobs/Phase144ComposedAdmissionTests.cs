@@ -160,7 +160,7 @@ public sealed class Phase144ComposedAdmissionTests
     }
 
     [Fact]
-    public void CloseAfterFinalRevalidationCannotInvalidatePinnedCommitAndCleanupIsOwnerDefined()
+    public void CloseAfterPreparedRevalidationDeniesCommitAndCleanupIsOwnerDefined()
     {
         var scenario = CreateScenario(quota: 1, rights: CapabilityRights.Execute);
         KernelResult close = default;
@@ -174,19 +174,14 @@ public sealed class Phase144ComposedAdmissionTests
             quotaAmount: 1, oneShot: true);
 
         Assert.Equal(KernelError.SessionDraining, close.Error);
-        Assert.True(admitted.IsSuccess);
-        Assert.Equal(1, scenario.Kernel.CapabilityAuthority.ActiveOperationLeaseCount);
-        Assert.Equal(1, scenario.Kernel.EndpointSessions.ActivePinCount(scenario.Session));
-
-        admitted.Value!.Dispose();
-
+        Assert.Equal(KernelError.SessionClosed, admitted.Error);
         Assert.Equal(0, scenario.Kernel.CapabilityAuthority.ActiveOperationLeaseCount);
         Assert.Equal(0, scenario.Kernel.EndpointSessions.ActivePinCount(scenario.Session));
         Assert.Equal(KernelError.StaleGeneration,
             scenario.Kernel.Channels.GetEndpoint(scenario.CallerEndpoint).Error);
         var quota = scenario.Kernel.CapabilityAuthority.InspectConstraints(scenario.Capability)!.Value;
-        Assert.Equal(0UL, quota.SharedRemaining);
-        Assert.Equal(1UL, quota.HandleConsumed);
+        Assert.Equal(1UL, quota.SharedRemaining);
+        Assert.Equal(0UL, quota.HandleConsumed);
     }
 
     [Fact]

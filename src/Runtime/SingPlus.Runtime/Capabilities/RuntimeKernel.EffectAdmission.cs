@@ -31,6 +31,8 @@ public sealed partial class RuntimeKernel
         if (!process.IsSuccess) return KernelResult<EffectAdmissionLease>.Fail(process.Error, process.Message!);
         var effect = EnsureProcessAcceptsNewEffects(process.Value!);
         if (!effect.IsSuccess) return KernelResult<EffectAdmissionLease>.Fail(effect.Error, effect.Message!);
+        var provider = ValidateEffectAdmissionProcess(service);
+        if (!provider.IsSuccess) return KernelResult<EffectAdmissionLease>.Fail(provider.Error, provider.Message!);
 
         EffectAdmissionAttemptId attempt;
         lock (_effectAdmissionIdentityGate)
@@ -64,10 +66,27 @@ public sealed partial class RuntimeKernel
                     if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
                     var accepts = EnsureProcessAcceptsNewEffects(current.Value!);
                     if (!accepts.IsSuccess) return accepts;
+                    var providerCurrent = ValidateEffectAdmissionProcess(service);
+                    if (!providerCurrent.IsSuccess) return providerCurrent;
                     var finalSession = EndpointSessions.RevalidatePin(sessionPin.Value!);
                     if (!finalSession.IsSuccess) return KernelResult.Fail(finalSession.Error, finalSession.Message!);
                     EffectAdmissionQualificationHook?.At(EffectAdmissionQualificationPoint.AfterFinalSessionRevalidation);
                     return KernelResult.Ok();
+                }, commitConsumer: commit =>
+                {
+                    lock (_platformMemoryUseGate)
+                    {
+                        // Callbacks above were preparation. Freeze both exact
+                        // process owners and the real session around source
+                        // quota/one-shot commit; no permission comes from a pin.
+                        var callerCurrent = ValidateEffectAdmissionProcess(caller);
+                        if (!callerCurrent.IsSuccess)
+                            return KernelResult<OperationAuthorityLease>.Fail(callerCurrent.Error, callerCurrent.Message!);
+                        var providerCurrent = ValidateEffectAdmissionProcess(service);
+                        if (!providerCurrent.IsSuccess)
+                            return KernelResult<OperationAuthorityLease>.Fail(providerCurrent.Error, providerCurrent.Message!);
+                        return EndpointSessions.CommitPinnedEffectAdmission(sessionPin.Value!, commit);
+                    }
                 });
             if (!acquired.IsSuccess)
                 return KernelResult<EffectAdmissionLease>.Fail(acquired.Error, acquired.Message!);
@@ -86,6 +105,13 @@ public sealed partial class RuntimeKernel
             if (sessionPin.Value is { } remainingPin)
                 FinalizeSessionPin(remainingPin, session);
         }
+    }
+
+    private KernelResult ValidateEffectAdmissionProcess(ProcessHandle handle)
+    {
+        var current = Processes.Resolve(handle);
+        return current.IsSuccess ? EnsureProcessAcceptsNewEffects(current.Value!)
+            : KernelResult.Fail(current.Error, current.Message!);
     }
 
     internal KernelResult<EffectAdmissionLease> AdmitSessionCapabilityEffect(

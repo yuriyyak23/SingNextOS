@@ -94,7 +94,8 @@ public sealed class CapabilityAuthority
     private ulong _nextQuotaAccountId = 1;
     private ulong _nextOperationLeaseId = 1;
     private bool _identityExhausted;
-    private bool _issuanceCallbackInProgress;
+    // Admission-only callback reentry guard, not capability authority or permission.
+    private readonly ThreadLocal<bool> _issuanceCallbackInProgress = new();
 
     public CapabilityAuthority()
         : this(new AuthorityRealmId(Guid.NewGuid()), CapabilityAuthorityLimits.Default, 1, Guid.NewGuid, TimeProvider.System) { }
@@ -120,9 +121,11 @@ public sealed class CapabilityAuthority
     internal KernelResult<CapabilityDescriptorV1> Mint(
         DomainId issuerDomainId, DomainId subjectDomainId, ResourceKind resourceKind,
         string resourceId, CapabilityRights rights, ulong subjectGeneration,
-        ulong resourceGeneration = 1)
+        ulong resourceGeneration = 1,
+        Func<Func<KernelResult<CapabilityDescriptorV1>>, KernelResult<CapabilityDescriptorV1>>? commitConsumer = null)
         => Mint(issuerDomainId, subjectDomainId, resourceKind, resourceId, rights, subjectGeneration,
-            resourceGeneration, range: null, session: null, quota: ulong.MaxValue, delegationDepth: 16);
+            resourceGeneration, range: null, session: null, quota: ulong.MaxValue, delegationDepth: 16,
+            commitConsumer: commitConsumer);
 
     internal KernelResult<CapabilityDescriptorV1> Mint(
         DomainId issuerDomainId, DomainId subjectDomainId, ResourceKind resourceKind,
@@ -132,58 +135,97 @@ public sealed class CapabilityAuthority
         CapabilityConstraintSchema schema = CapabilityConstraintSchema.V1,
         IEnumerable<CapabilityOperation>? operations = null,
         long notBeforeUtcTicks = 0, long expiresUtcTicks = long.MaxValue,
-        ResourceUseConstraintV1? resourceUse = null)
+        ResourceUseConstraintV1? resourceUse = null,
+        Func<Func<KernelResult<CapabilityDescriptorV1>>, KernelResult<CapabilityDescriptorV1>>? commitConsumer = null)
     {
+        if (rights == CapabilityRights.None) throw new ArgumentOutOfRangeException(nameof(rights));
+        if (_issuanceCallbackInProgress.Value || (commitConsumer is not null && Monitor.IsEntered(_gate)))
+            return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapacityExhausted, "Capability issuance cannot reenter an issuance callback.");
+        if (string.IsNullOrWhiteSpace(resourceId)) throw new ArgumentException("Resource id is required.", nameof(resourceId));
+        if (subjectGeneration == 0) throw new ArgumentOutOfRangeException(nameof(subjectGeneration));
+        if (resourceGeneration == 0) throw new ArgumentOutOfRangeException(nameof(resourceGeneration));
+        var subject = new SubjectIdentity(subjectDomainId, subjectGeneration);
+        ulong subjectEpoch;
+        QuotaAccountReference preparedQuota;
         lock (_gate)
         {
-            if (rights == CapabilityRights.None) throw new ArgumentOutOfRangeException(nameof(rights));
-            if (_issuanceCallbackInProgress)
-                return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapacityExhausted, "Capability issuance cannot reenter an issuance callback.");
-            if (string.IsNullOrWhiteSpace(resourceId)) throw new ArgumentException("Resource id is required.", nameof(resourceId));
-            if (subjectGeneration == 0) throw new ArgumentOutOfRangeException(nameof(subjectGeneration));
-            if (resourceGeneration == 0) throw new ArgumentOutOfRangeException(nameof(resourceGeneration));
             if (_nextQuotaAccountId == 0)
                 return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapacityExhausted, "Capability quota-account identity space is exhausted.");
-            var subject = new SubjectIdentity(subjectDomainId, subjectGeneration);
             var capacity = EnsureCapacity(subject);
             if (!capacity.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(capacity.Error, capacity.Message!);
-            var quotaAccountReference = new QuotaAccountReference(_nextQuotaAccountId);
-            var subjectEpoch = CurrentEpoch(subjectDomainId);
-            EffectiveCapabilityConstraints constraints;
-            _issuanceCallbackInProgress = true;
+            subjectEpoch = CurrentEpoch(subjectDomainId);
+            preparedQuota = new(_nextQuotaAccountId);
+        }
+        EffectiveCapabilityConstraints constraints;
+        _issuanceCallbackInProgress.Value = true;
+        try
+        {
             try
             {
+                // Caller collections/canonicalization are preparation, outside
+                // the source owner gate. No quota identity is reserved here.
                 constraints = new EffectiveCapabilityConstraints(schema, new(rights),
                     new(resourceKind, resourceId, resourceGeneration, null, null),
                     new(operations ?? OperationsFor(rights)), range,
                     new(notBeforeUtcTicks, expiresUtcTicks), new(null, 0, (rights & CapabilityRights.Delegate) != 0),
-                    new(session), new(delegationDepth), new(quotaAccountReference, quota), resourceUse).Canonicalize();
+                    new(session), new(delegationDepth), new(preparedQuota, quota), resourceUse).Canonicalize();
             }
             catch (Exception exception) when (exception is ArgumentException or NotSupportedException or OverflowException)
             {
                 return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.DelegationDenied, exception.Message);
             }
-            finally { _issuanceCallbackInProgress = false; }
-            if (subjectEpoch != CurrentEpoch(subjectDomainId))
-                return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapabilityRevoked, "Subject domain changed during capability canonicalization.");
-            capacity = EnsureCapacity(subject);
-            if (!capacity.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(capacity.Error, capacity.Message!);
-            var identity = AllocateIdentity();
-            if (!identity.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(identity.Error, identity.Message!);
-            if (subjectEpoch != CurrentEpoch(subjectDomainId))
-                return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapabilityRevoked, "Subject domain changed during capability identity allocation.");
-            capacity = EnsureCapacity(subject);
-            if (!capacity.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(capacity.Error, capacity.Message!);
-            var (id, nonce) = identity.Value;
-            var account = new QuotaAccount(quotaAccountReference, quota);
-            _nextQuotaAccountId = _nextQuotaAccountId == ulong.MaxValue ? 0 : _nextQuotaAccountId + 1;
-            var record = new CapabilityRecord(id, nonce, issuerDomainId, subjectDomainId, subjectGeneration,
-                resourceKind, resourceId, resourceGeneration, rights, CurrentEpoch(subjectDomainId), null, constraints, account);
-            _records.Add(id, record);
-            _opaqueIndex.Add(nonce, id);
-            IncrementLive(record);
-            return KernelResult<CapabilityDescriptorV1>.Ok(record.ProjectV1());
+            for (var attempt = 0; attempt < NonceCollisionRetryLimit; attempt++)
+            {
+                lock (_gate)
+                {
+                    if (subjectEpoch != CurrentEpoch(subjectDomainId))
+                        return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapabilityRevoked, "Subject domain changed during capability preparation.");
+                    var capacity = EnsureCapacity(subject);
+                    if (!capacity.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(capacity.Error, capacity.Message!);
+                    if (_nextQuotaAccountId == 0 || _identityExhausted || _records.ContainsKey(new CapabilityId(_nextId)))
+                        return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapacityExhausted, "Capability issuance identity space is exhausted or colliding.");
+                }
+                var nonce = _nonceFactory();
+                if (nonce == Guid.Empty) continue;
+                var collided = false;
+                KernelResult<CapabilityDescriptorV1> CommitSource()
+                {
+                    lock (_gate)
+                    {
+                        if (subjectEpoch != CurrentEpoch(subjectDomainId))
+                            return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapabilityRevoked, "Subject domain changed during capability preparation.");
+                        var capacity = EnsureCapacity(subject);
+                        if (!capacity.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(capacity.Error, capacity.Message!);
+                        if (_nextQuotaAccountId == 0 || _identityExhausted || _records.ContainsKey(new CapabilityId(_nextId)))
+                            return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapacityExhausted, "Capability issuance identity space is exhausted or colliding.");
+                        if (_opaqueIndex.ContainsKey(nonce))
+                        {
+                            collided = true;
+                            return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapacityExhausted, "Capability nonce collision requires fresh preparation.");
+                        }
+                        var id = new CapabilityId(_nextId);
+                        var quotaReference = new QuotaAccountReference(_nextQuotaAccountId);
+                        // Fresh authoritative quota identity replaces prepared
+                        // canonical metadata; frozen inputs invoke no callbacks.
+                        var committed = constraints with { Quota = new(quotaReference, quota) };
+                        var account = new QuotaAccount(quotaReference, quota);
+                        var record = new CapabilityRecord(id, nonce, issuerDomainId, subjectDomainId, subjectGeneration,
+                            resourceKind, resourceId, resourceGeneration, rights, subjectEpoch, null, committed, account);
+                        _records.Add(id, record);
+                        _opaqueIndex.Add(nonce, id);
+                        IncrementLive(record);
+                        if (_nextId == ulong.MaxValue) _identityExhausted = true;
+                        else _nextId++;
+                        _nextQuotaAccountId = _nextQuotaAccountId == ulong.MaxValue ? 0 : _nextQuotaAccountId + 1;
+                        return KernelResult<CapabilityDescriptorV1>.Ok(record.ProjectV1());
+                    }
+                }
+                var issued = commitConsumer is null ? CommitSource() : commitConsumer(CommitSource);
+                if (!collided) return issued;
+            }
+            return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapacityExhausted, "Opaque identity allocation failed closed after bounded collision retries.");
         }
+        finally { _issuanceCallbackInProgress.Value = false; }
     }
 
     internal KernelResult<CapabilityDescriptorV1> Delegate(
@@ -194,13 +236,16 @@ public sealed class CapabilityAuthority
     internal KernelResult<CapabilityDescriptorV1> Delegate(
         CapabilityId sourceId, DomainId delegatorDomain, DomainId targetDomain,
         CapabilityRights rights, ulong targetGeneration,
-        Func<EffectiveCapabilityConstraints, EffectiveCapabilityConstraints>? derive)
+        Func<EffectiveCapabilityConstraints, EffectiveCapabilityConstraints>? derive,
+        Func<Func<KernelResult<CapabilityDescriptorV1>>, KernelResult<CapabilityDescriptorV1>>? commitConsumer = null)
     {
+        if (_issuanceCallbackInProgress.Value || (commitConsumer is not null && Monitor.IsEntered(_gate)))
+            return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapacityExhausted, "Capability issuance cannot reenter an issuance callback.");
+        CapabilityRecord source;
+        ulong targetEpoch;
         lock (_gate)
         {
-            if (_issuanceCallbackInProgress)
-                return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapacityExhausted, "Capability issuance cannot reenter an issuance callback.");
-            if (!_records.TryGetValue(sourceId, out var source))
+            if (!_records.TryGetValue(sourceId, out source!))
                 return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapabilityNotFound, $"Capability {sourceId} does not exist.");
             var validation = ValidateRecord(source, delegatorDomain, source.SubjectGeneration, CapabilityRights.Delegate, null);
             if (!validation.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(validation.Error, validation.Message!);
@@ -208,55 +253,87 @@ public sealed class CapabilityAuthority
                 return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.DelegationDenied, "Delegated rights must be a non-empty subset of the source capability.");
             var capacity = EnsureCapacity(new SubjectIdentity(targetDomain, targetGeneration));
             if (!capacity.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(capacity.Error, capacity.Message!);
-            var targetEpoch = CurrentEpoch(targetDomain);
-            EffectiveCapabilityConstraints child;
-            try
-            {
-                if (source.Constraints.DelegationDepth.RemainingDepth == 0)
-                    return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.DelegationDenied, "Delegation depth is exhausted.");
-                var baseline = source.Constraints with
-                {
-                    Rights = new(rights),
-                    Operations = new(OperationsFor(rights)),
-                    TargetSubject = new(targetDomain, targetGeneration,
-                        source.Constraints.TargetSubject.AllowsRetarget && (rights & CapabilityRights.Delegate) != 0),
-                    DelegationDepth = new((ushort)(source.Constraints.DelegationDepth.RemainingDepth - 1))
-                };
-                child = (derive?.Invoke(baseline) ?? baseline).Canonicalize();
-            }
-            catch (Exception exception) when (exception is ArgumentException or NotSupportedException or OverflowException)
-            {
-                return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.DelegationDenied, exception.Message);
-            }
-            if (child.TargetSubject.DomainId != targetDomain || child.TargetSubject.Generation != targetGeneration || child.Rights.Rights != rights)
-                return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.DelegationDenied, "Child subject and rights must match the requested delegation.");
-            if (!EffectiveCapabilityConstraints.IsSubset(child, source.Constraints))
-                return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.DelegationDenied, "Child constraints are not a canonical subset of the parent.");
-            validation = ValidateRecord(source, delegatorDomain, source.SubjectGeneration, CapabilityRights.Delegate, null);
-            if (!validation.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(validation.Error, validation.Message!);
-            if (targetEpoch != CurrentEpoch(targetDomain))
-                return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapabilityRevoked, "Target domain changed during capability derivation.");
-            capacity = EnsureCapacity(new SubjectIdentity(targetDomain, targetGeneration));
-            if (!capacity.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(capacity.Error, capacity.Message!);
-            var identity = AllocateIdentity();
-            if (!identity.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(identity.Error, identity.Message!);
-            validation = ValidateRecord(source, delegatorDomain, source.SubjectGeneration, CapabilityRights.Delegate, null);
-            if (!validation.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(validation.Error, validation.Message!);
-            if (targetEpoch != CurrentEpoch(targetDomain))
-                return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapabilityRevoked, "Target domain changed during capability identity allocation.");
-            capacity = EnsureCapacity(new SubjectIdentity(targetDomain, targetGeneration));
-            if (!capacity.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(capacity.Error, capacity.Message!);
-            var (id, nonce) = identity.Value;
-            var record = new CapabilityRecord(id, nonce, delegatorDomain, targetDomain, targetGeneration,
-                source.ResourceKind, source.ResourceId, source.ResourceGeneration, rights,
-                CurrentEpoch(targetDomain), sourceId, child, source.QuotaAccount);
-            _records.Add(id, record);
-            _opaqueIndex.Add(nonce, id);
-            IncrementLive(record);
-            return KernelResult<CapabilityDescriptorV1>.Ok(record.ProjectV1());
+            if (source.Constraints.DelegationDepth.RemainingDepth == 0)
+                return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.DelegationDenied, "Delegation depth is exhausted.");
+            targetEpoch = CurrentEpoch(targetDomain);
         }
+        EffectiveCapabilityConstraints child;
+        try
+        {
+            // Immutable metadata only: caller derivation/canonicalization runs
+            // outside the authoritative source gate and grants no permission.
+            var baseline = source.Constraints with
+            {
+                Rights = new(rights), Operations = new(OperationsFor(rights)),
+                TargetSubject = new(targetDomain, targetGeneration,
+                    source.Constraints.TargetSubject.AllowsRetarget && (rights & CapabilityRights.Delegate) != 0),
+                DelegationDepth = new((ushort)(source.Constraints.DelegationDepth.RemainingDepth - 1))
+            };
+            child = (derive?.Invoke(baseline) ?? baseline).Canonicalize();
+        }
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException or OverflowException)
+        {
+            return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.DelegationDenied, exception.Message);
+        }
+        if (child.TargetSubject.DomainId != targetDomain || child.TargetSubject.Generation != targetGeneration || child.Rights.Rights != rights)
+            return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.DelegationDenied, "Child subject and rights must match the requested delegation.");
+        if (!EffectiveCapabilityConstraints.IsSubset(child, source.Constraints))
+            return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.DelegationDenied, "Child constraints are not a canonical subset of the parent.");
+        KernelResult ValidateFreshSource()
+        {
+            if (!_records.TryGetValue(sourceId, out var current) || !ReferenceEquals(current, source))
+                return KernelResult.Fail(KernelError.CapabilityNotFound, "Captured source is no longer the authoritative record.");
+            var validation = ValidateRecord(current, delegatorDomain, current.SubjectGeneration, CapabilityRights.Delegate, null);
+            if (!validation.IsSuccess) return validation;
+            if (targetEpoch != CurrentEpoch(targetDomain))
+                return KernelResult.Fail(KernelError.CapabilityRevoked, "Target domain changed during capability preparation.");
+            var capacity = EnsureCapacity(new SubjectIdentity(targetDomain, targetGeneration));
+            if (!capacity.IsSuccess) return capacity;
+            if (_identityExhausted || _records.ContainsKey(new CapabilityId(_nextId)))
+                return KernelResult.Fail(KernelError.CapacityExhausted, "Capability identity space is exhausted or colliding.");
+            return KernelResult.Ok();
+        }
+        for (var attempt = 0; attempt < NonceCollisionRetryLimit; attempt++)
+        {
+            lock (_gate)
+            {
+                var validation = ValidateFreshSource();
+                if (!validation.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(validation.Error, validation.Message!);
+            }
+            Guid nonce;
+            _issuanceCallbackInProgress.Value = true;
+            try { nonce = _nonceFactory(); }
+            finally { _issuanceCallbackInProgress.Value = false; }
+            if (nonce == Guid.Empty) continue;
+            var collided = false;
+            KernelResult<CapabilityDescriptorV1> CommitSource()
+            {
+                lock (_gate)
+                {
+                    var validation = ValidateFreshSource();
+                    if (!validation.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(validation.Error, validation.Message!);
+                    if (_opaqueIndex.ContainsKey(nonce))
+                    {
+                        collided = true;
+                        return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapacityExhausted, "Capability nonce collision requires fresh preparation.");
+                    }
+                    var id = new CapabilityId(_nextId);
+                    var record = new CapabilityRecord(id, nonce, delegatorDomain, targetDomain, targetGeneration,
+                        source.ResourceKind, source.ResourceId, source.ResourceGeneration, rights,
+                        targetEpoch, sourceId, child, source.QuotaAccount);
+                    _records.Add(id, record);
+                    _opaqueIndex.Add(nonce, id);
+                    IncrementLive(record);
+                    if (_nextId == ulong.MaxValue) _identityExhausted = true;
+                    else _nextId++;
+                    return KernelResult<CapabilityDescriptorV1>.Ok(record.ProjectV1());
+                }
+            }
+            var delegated = commitConsumer is null ? CommitSource() : commitConsumer(CommitSource);
+            if (!collided) return delegated;
+        }
+        return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapacityExhausted, "Opaque identity allocation failed closed after bounded collision retries.");
     }
-
     public KernelResult<CapabilityDescriptorV1> Validate(
         CapabilityId id, DomainId subject, ulong generation, CapabilityRights requiredRights,
         ulong? expectedResourceGeneration = null)
@@ -420,19 +497,24 @@ public sealed class CapabilityAuthority
         CapabilityHandleV2 source, DomainId delegatorDomain, DomainId targetDomain,
         CapabilityRights rights, ulong targetGeneration)
     {
+        CapabilityId sourceId;
         lock (_gate)
         {
             var resolved = ResolveV2(source);
             if (!resolved.IsSuccess)
                 return KernelResult<CapabilityHandleV2>.Fail(resolved.Error, resolved.Message!);
-            var delegated = Delegate(resolved.Value!.Id, delegatorDomain, targetDomain, rights, targetGeneration);
-            if (!delegated.IsSuccess)
-                return KernelResult<CapabilityHandleV2>.Fail(delegated.Error, delegated.Message!);
-            var child = _records[delegated.Value!.CapabilityId];
+            sourceId = resolved.Value!.Id;
+        }
+        var delegated = Delegate(sourceId, delegatorDomain, targetDomain, rights, targetGeneration);
+        if (!delegated.IsSuccess)
+            return KernelResult<CapabilityHandleV2>.Fail(delegated.Error, delegated.Message!);
+        lock (_gate)
+        {
+            if (!_records.TryGetValue(delegated.Value!.CapabilityId, out var child))
+                return KernelResult<CapabilityHandleV2>.Fail(KernelError.CapabilityNotFound, "Delegation committed but projection record is unavailable.");
             return KernelResult<CapabilityHandleV2>.Ok(child.ProjectV2(RealmId).Handle);
         }
     }
-
     internal KernelResult Revoke(CapabilityHandleV2 handle)
     {
         lock (_gate)
@@ -469,15 +551,44 @@ public sealed class CapabilityAuthority
         }
     }
 
-    internal KernelResult CommitSupervisorRegistration(CapabilityId id, DomainId subject,
+    internal KernelResult<T> CommitBudgetAdministration<T>(CapabilityId id, DomainId subject,
+        ulong generation, Func<KernelResult<T>> commit)
+    {
+        lock (_gate)
+        {
+            var valid = Validate(id, subject, generation, CapabilityRights.Configure);
+            if (!valid.IsSuccess) return KernelResult<T>.Fail(valid.Error, valid.Message!);
+            if (valid.Value!.ResourceKind != ResourceKind.KernelService ||
+                valid.Value.ResourceId != CapabilityResourceIds.BudgetAdministration)
+                return KernelResult<T>.Fail(KernelError.SupervisorDenied, "Budget administration requires the exact kernel budget capability.");
+            // Trusted quantitative owner commit with a private array only. No caller collection,
+            // provider, clock, trace or lifecycle callback may run while this gate is held.
+            return commit();
+        }
+    }
+
+    internal KernelResult CommitSupervisorRecordPublication(CapabilityId id, DomainId subject,
         ulong generation, Func<KernelResult> publish)
     {
         lock (_gate)
         {
             var valid = CommitSupervisorTelemetryPublication(id, subject, generation);
-            // Trusted local registry/graph mutation only; caller already holds the supervisor gate.
+            // Trusted local registry/graph mutation or snapshot only; caller holds the supervisor gate.
             // No clock, factory, kernel lifecycle, provider or trace callback here.
             return valid.IsSuccess ? publish() : valid;
+        }
+    }
+
+    internal KernelResult<T> CommitSupervisorSessionAdmission<T>(CapabilityId id, DomainId subject,
+        ulong generation, Func<KernelResult<T>> commit)
+    {
+        lock (_gate)
+        {
+            var valid = CommitSupervisorTelemetryPublication(id, subject, generation);
+            // Trusted lifetime-free local channel/session creation only. The caller
+            // holds process-lifecycle and exact service admission gates. No native,
+            // provider, clock, caller collection or supervisor callback here.
+            return valid.IsSuccess ? commit() : KernelResult<T>.Fail(valid.Error, valid.Message!);
         }
     }
 
@@ -629,7 +740,8 @@ public sealed class CapabilityAuthority
         CapabilityId id, DomainId subject, ulong subjectGeneration,
         ResourceKind resourceKind, string resourceId, ulong resourceGeneration,
         CapabilityOperation operation, EndpointSessionHandle? session = null,
-        ulong quotaAmount = 0, bool oneShot = false, Func<KernelResult>? revalidateConsumer = null)
+        ulong quotaAmount = 0, bool oneShot = false, Func<KernelResult>? revalidateConsumer = null,
+        Func<Func<KernelResult<OperationAuthorityLease>>, KernelResult<OperationAuthorityLease>>? commitConsumer = null)
     {
         var time = ReadOperationAdmissionClock(id, subject, subjectGeneration, resourceKind,
             resourceId, resourceGeneration, operation, session);
@@ -648,28 +760,35 @@ public sealed class CapabilityAuthority
             var consumer = revalidateConsumer();
             if (!consumer.IsSuccess) return KernelResult<OperationAuthorityLease>.Fail(consumer.Error, consumer.Message!);
         }
-        lock (_gate)
+        // Actual consumer may freeze its existing local lifecycle/session owners
+        // around the pure source commit. Clock/callback preparation stays above.
+        return commitConsumer is null ? CommitSource() : commitConsumer(CommitSource);
+
+        KernelResult<OperationAuthorityLease> CommitSource()
         {
-            if (!_records.TryGetValue(id, out var record))
-                return KernelResult<OperationAuthorityLease>.Fail(KernelError.CapabilityNotFound, "Capability does not exist.");
-            var validation = ValidateOperationAdmission(record, subject, subjectGeneration,
-                resourceKind, resourceId, resourceGeneration, operation, session, time.Value);
-            if (!validation.IsSuccess) return KernelResult<OperationAuthorityLease>.Fail(validation.Error, validation.Message!);
-            if (_nextOperationLeaseId == 0)
-                return KernelResult<OperationAuthorityLease>.Fail(KernelError.CapacityExhausted, "Operation-authority lease identity space is exhausted.");
-            if (quotaAmount != 0)
+            lock (_gate)
             {
-                if (quotaAmount > record.Constraints.Quota.PerHandleCeiling - record.QuotaConsumed ||
-                    !record.QuotaAccount.TryConsume(quotaAmount))
-                    return KernelResult<OperationAuthorityLease>.Fail(KernelError.BudgetExceeded, "Capability operation quota is exhausted.");
-                record.QuotaConsumed += quotaAmount;
+                if (!_records.TryGetValue(id, out var record))
+                    return KernelResult<OperationAuthorityLease>.Fail(KernelError.CapabilityNotFound, "Capability does not exist.");
+                var validation = ValidateOperationAdmission(record, subject, subjectGeneration,
+                    resourceKind, resourceId, resourceGeneration, operation, session, time.Value);
+                if (!validation.IsSuccess) return KernelResult<OperationAuthorityLease>.Fail(validation.Error, validation.Message!);
+                if (_nextOperationLeaseId == 0)
+                    return KernelResult<OperationAuthorityLease>.Fail(KernelError.CapacityExhausted, "Operation-authority lease identity space is exhausted.");
+                if (quotaAmount != 0)
+                {
+                    if (quotaAmount > record.Constraints.Quota.PerHandleCeiling - record.QuotaConsumed ||
+                        !record.QuotaAccount.TryConsume(quotaAmount))
+                        return KernelResult<OperationAuthorityLease>.Fail(KernelError.BudgetExceeded, "Capability operation quota is exhausted.");
+                    record.QuotaConsumed += quotaAmount;
+                }
+                if (oneShot) TransitionOutOfActive(record, CapabilityRecordState.Consumed);
+                var leaseId = new OperationAuthorityLeaseId(_nextOperationLeaseId++);
+                _operationLeases.Add(leaseId);
+                var lease = new OperationAuthorityLease(this, leaseId, id, subject, subjectGeneration,
+                    record.Constraints.Resource, operation, session, RevocationPolicyFor(operation));
+                return KernelResult<OperationAuthorityLease>.Ok(lease);
             }
-            if (oneShot) TransitionOutOfActive(record, CapabilityRecordState.Consumed);
-            var leaseId = new OperationAuthorityLeaseId(_nextOperationLeaseId++);
-            _operationLeases.Add(leaseId);
-            var lease = new OperationAuthorityLease(this, leaseId, id, subject, subjectGeneration,
-                record.Constraints.Resource, operation, session, RevocationPolicyFor(operation));
-            return KernelResult<OperationAuthorityLease>.Ok(lease);
         }
     }
 
@@ -782,33 +901,6 @@ public sealed class CapabilityAuthority
         return KernelResult<CapabilityRecord>.Ok(record);
     }
 
-    private KernelResult<(CapabilityId Id, Guid Nonce)> AllocateIdentity()
-    {
-        if (_identityExhausted)
-            return KernelResult<(CapabilityId, Guid)>.Fail(KernelError.CapacityExhausted, "Capability identity space is exhausted.");
-        var id = new CapabilityId(_nextId);
-        if (_records.ContainsKey(id))
-            return KernelResult<(CapabilityId, Guid)>.Fail(KernelError.CapacityExhausted, "Capability identity collision detected.");
-        Guid nonce = default;
-        var allocated = false;
-        for (var attempt = 0; attempt < NonceCollisionRetryLimit; attempt++)
-        {
-            _issuanceCallbackInProgress = true;
-            try { nonce = _nonceFactory(); }
-            finally { _issuanceCallbackInProgress = false; }
-            if (nonce != Guid.Empty && _records.Values.All(record => record.Nonce != nonce))
-            {
-                allocated = true;
-                break;
-            }
-        }
-        if (!allocated)
-            return KernelResult<(CapabilityId, Guid)>.Fail(KernelError.CapacityExhausted, "Opaque identity allocation failed closed after bounded collision retries.");
-        if (_nextId == ulong.MaxValue) _identityExhausted = true;
-        else _nextId++;
-        return KernelResult<(CapabilityId, Guid)>.Ok((id, nonce));
-    }
-
     private KernelResult<CapabilityDescriptorV1> ValidateAndProject(
         CapabilityRecord record, DomainId subject, ulong generation,
         CapabilityRights requiredRights, ulong? expectedResourceGeneration)
@@ -899,3 +991,8 @@ public sealed class CapabilityAuthority
         if ((rights & CapabilityRights.Execute) != 0) yield return CapabilityOperation.Execute;
     }
 }
+
+
+
+
+

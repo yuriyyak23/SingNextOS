@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using SingPlus.Contracts;
 using SingPlus.Kernel;
@@ -13,32 +14,53 @@ public static class HostDebugBootPipeline
     public static IReadOnlyList<IKernelBootStage> Create(IReadOnlyList<string> arguments)
     {
         ArgumentNullException.ThrowIfNull(arguments);
-        var context = new Context();
-        var argumentResult = ParseSipArguments(arguments, context);
+        var parsed = EmulatorOptions.Parse(arguments);
+        if (parsed.Options is null)
+        {
+            var error = parsed.Error ?? "Command-line help must be handled before boot.";
+            return [new Stage("host-debug arguments", () => KernelBootStageResult.Failure(error))];
+        }
+
+        return Create(parsed.Options, out _);
+    }
+
+    public static IReadOnlyList<IKernelBootStage> Create(EmulatorOptions options, out EmulatorSession session)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        var context = new Context(new EmulatorSession(options));
+        session = context.Session;
         List<IKernelBootStage> stages =
         [
-            new Stage("host-debug arguments", () => argumentResult),
+            new Stage("host environment capture", () =>
+            {
+                context.Session.EnvironmentFacts.Add($"OS: {RuntimeInformation.OSDescription}");
+                context.Session.EnvironmentFacts.Add($"OS architecture: {RuntimeInformation.OSArchitecture}");
+                context.Session.EnvironmentFacts.Add($"Process architecture: {RuntimeInformation.ProcessArchitecture}");
+                context.Session.EnvironmentFacts.Add($"Runtime: {RuntimeInformation.FrameworkDescription}");
+                context.Session.EnvironmentFacts.Add($"Working directory: {Environment.CurrentDirectory}");
+                return KernelBootStageResult.Success();
+            }),
             new Stage("runtime authority graph", () =>
             {
                 // No platform provider is installed in this profile. CXL and HybridCPU
                 // discovery/admission therefore remain unavailable rather than mocked.
-                context.Runtime = new RuntimeKernel();
+                context.Session.Runtime = new RuntimeKernel();
                 return KernelBootStageResult.Success();
             }),
             new Stage("external platform backend exclusion", () =>
             {
-                if (context.Runtime is null)
+                if (context.Session.Runtime is null)
                     return KernelBootStageResult.Failure("Runtime authority graph is unavailable.");
 
-                return context.Runtime.QueryPlatformFeatures().Features.Count == 0
+                return context.Session.Runtime.QueryPlatformFeatures().Features.Count == 0
                     ? KernelBootStageResult.Success()
                     : KernelBootStageResult.Failure("A platform backend was unexpectedly installed in host-debug mode.");
             }),
             new Stage("system process manifest", () =>
             {
-                context.Manifest = new SingProcessManifestV1(
-                    new ProcessId(1),
-                    new DomainId(1),
+                context.Session.SystemManifest = new SingProcessManifestV1(
+                    new ProcessId(EmulatorSession.SystemProcessIdValue),
+                    new DomainId(EmulatorSession.SystemDomainIdValue),
                     generation: 1,
                     entryIdentity: "singplus.host-debug.system",
                     executionRole: ExecutionRole.Kernel,
@@ -47,39 +69,44 @@ public static class HostDebugBootPipeline
             }),
             new Stage("system process materialization", () =>
             {
-                if (context.Runtime is null || context.Manifest is null)
+                if (context.Session.Runtime is null || context.Session.SystemManifest is null)
                     return KernelBootStageResult.Failure("Runtime or system manifest is unavailable.");
 
-                var created = context.Runtime.CreateProcess(context.Manifest);
+                var created = context.Session.Runtime.CreateProcess(context.Session.SystemManifest);
                 if (!created.IsSuccess)
                     return KernelBootStageResult.Failure(created.Message ?? created.Error.ToString());
 
-                context.SystemProcess = new ProcessHandle(created.Value!.ProcessId, created.Value.Generation);
+                context.Session.SystemProcess = new ProcessHandle(created.Value!.ProcessId, created.Value.Generation);
                 return KernelBootStageResult.Success();
             }),
             new Stage("system process admission", () =>
             {
-                if (context.Runtime is null || context.SystemProcess is not { } systemProcess)
+                if (context.Session.Runtime is null || context.Session.SystemProcess is not { } systemProcess)
                     return KernelBootStageResult.Failure("Materialized system process is unavailable.");
 
-                var admitted = context.Runtime.AdmitProcess(systemProcess);
+                var admitted = context.Session.Runtime.AdmitProcess(systemProcess);
                 return admitted.IsSuccess
                     ? KernelBootStageResult.Success()
                     : KernelBootStageResult.Failure(admitted.Message ?? admitted.Error.ToString());
             }),
             new Stage("managed execution transition", () =>
             {
-                if (context.Runtime is null || context.SystemProcess is not { } systemProcess)
+                if (context.Session.Runtime is null || context.Session.SystemProcess is not { } systemProcess)
                     return KernelBootStageResult.Failure("Admitted system process is unavailable.");
 
-                var started = context.Runtime.StartProcess(systemProcess);
+                var started = context.Session.Runtime.StartProcess(systemProcess);
                 return started.IsSuccess
                     ? KernelBootStageResult.Success()
                     : KernelBootStageResult.Failure(started.Message ?? started.Error.ToString());
             })
         ];
 
-        for (var index = 0; index < context.DeferredSipStageCount; index++)
+        if (options.BudgetEnabled)
+        {
+            stages.Add(new Stage("system resource budget", context.Session.ConfigureBudgets));
+        }
+
+        for (var index = 0; index < options.SipPaths.Count; index++)
         {
             var capturedIndex = index;
             stages.Add(new Stage($"SIP component admission #{index + 1}",
@@ -89,19 +116,19 @@ public static class HostDebugBootPipeline
         stages.Add(
             new Stage("post-start invariants", () =>
             {
-                if (context.Runtime is null ||
-                    context.SystemProcess is not { } systemProcess)
+                if (context.Session.Runtime is null ||
+                    context.Session.SystemProcess is not { } systemProcess)
                 {
                     return KernelBootStageResult.Failure("Boot context is incomplete.");
                 }
 
-                var resolved = context.Runtime.Processes.Resolve(systemProcess);
+                var resolved = context.Session.Runtime.Processes.Resolve(systemProcess);
                 if (!resolved.IsSuccess || resolved.Value!.State != ProcessState.Running)
                     return KernelBootStageResult.Failure("System process did not reach Running state.");
-                var expected = checked(1 + context.SipImages.Count);
-                if (context.Runtime.Processes.Snapshot().Count != expected || context.Runtime.Domains.Snapshot().Count != expected)
+                var expected = checked(1 + context.Session.Sips.Count);
+                if (context.Session.Runtime.Processes.Snapshot().Count != expected || context.Session.Runtime.Domains.Snapshot().Count != expected)
                     return KernelBootStageResult.Failure("Runtime process/domain generations are ambiguous.");
-                if (context.SipComponents.Count != context.SipImages.Count ||
+                if (context.SipComponents.Count != context.Session.Sips.Count ||
                     context.SipComponents.Any(static component => component.State != ComponentLifecycleState.Running))
                 {
                     return KernelBootStageResult.Failure("One or more SIP components did not reach Running lifecycle state.");
@@ -110,36 +137,30 @@ public static class HostDebugBootPipeline
                 return KernelBootStageResult.Success();
             }));
 
-        return stages;
-    }
-
-    private static KernelBootStageResult ParseSipArguments(IReadOnlyList<string> arguments, Context context)
-    {
-        for (var index = 0; index < arguments.Count; index++)
+        if (options.TraceEnabled)
         {
-            if (!string.Equals(arguments[index], "--sip", StringComparison.Ordinal))
-                return KernelBootStageResult.Failure($"Unknown host-debug argument '{arguments[index]}'.");
-            if (++index >= arguments.Count || string.IsNullOrWhiteSpace(arguments[index]))
-                return KernelBootStageResult.Failure("--sip requires a managed assembly path.");
+            stages.Add(new Stage("system deterministic trace", () =>
+            {
+                if (context.Session.SystemProcess is not { } systemProcess)
+                    return KernelBootStageResult.Failure("System process is unavailable.");
 
-            string fullPath;
-            try { fullPath = Path.GetFullPath(arguments[index]); }
-            catch (Exception exception) when (exception is ArgumentException or NotSupportedException or PathTooLongException)
-            { return KernelBootStageResult.Failure($"Invalid SIP path: {exception.Message}"); }
-
-            if (!context.AddSipPath(fullPath))
-                return KernelBootStageResult.Failure($"SIP path '{fullPath}' was supplied more than once.");
+                var started = context.Session.StartTrace(systemProcess, options.TraceCapacity);
+                return started.IsSuccess
+                    ? KernelBootStageResult.Success()
+                    : KernelBootStageResult.Failure(started.Message ?? started.Error.ToString());
+            }));
         }
 
-        return KernelBootStageResult.Success();
+        return stages;
     }
 
     private static KernelBootStageResult AdmitSip(Context context, int index)
     {
-        if (context.Runtime is null)
+        var session = context.Session;
+        if (session.Runtime is null)
             return KernelBootStageResult.Failure("Runtime authority graph is unavailable.");
 
-        var path = context.SipPaths[index];
+        var path = session.Options.SipPaths[index];
         if (!File.Exists(path))
             return KernelBootStageResult.Failure($"SIP image '{path}' does not exist.");
 
@@ -166,8 +187,8 @@ public static class HostDebugBootPipeline
             return KernelBootStageResult.Failure("SIP image changed while it was being read.");
 
         var ordinal = checked((ulong)index + 1);
-        var processId = new ProcessId(checked(1000UL + ordinal));
-        var domainId = new DomainId(checked(10000UL + ordinal));
+        var processId = new ProcessId(checked(EmulatorSession.SipProcessIdBase + ordinal));
+        var domainId = new DomainId(checked(EmulatorSession.SipDomainIdBase + ordinal));
         var identity = assembly.Name ?? Path.GetFileNameWithoutExtension(path);
         if (string.IsNullOrWhiteSpace(identity))
             return KernelBootStageResult.Failure("SIP assembly identity is empty.");
@@ -179,37 +200,38 @@ public static class HostDebugBootPipeline
             entryIdentity: $"host-debug.sip.{identity}",
             executionRole: ExecutionRole.Sip,
             memoryProfile: MemoryProfile.SipRegion);
+        var componentIdentity = new ComponentIdentity($"host-debug.sip.{identity}");
+        var digest = Convert.ToHexString(SHA256.HashData(image)).ToLowerInvariant();
         var manifest = new ServiceManifestV1(
-            new ComponentIdentity($"host-debug.sip.{identity}"),
+            componentIdentity,
             new ComponentVersion(assembly.Version?.ToString() ?? "0.0.0.0"),
-            Convert.ToHexString(SHA256.HashData(image)).ToLowerInvariant(),
+            digest,
             process);
-        var admitted = context.Runtime.AdmitComponent(new ComponentAdmissionPlan(manifest, image));
+        var admitted = session.Runtime.AdmitComponent(new ComponentAdmissionPlan(manifest, image));
         if (!admitted.IsSuccess)
             return KernelBootStageResult.Failure(admitted.Message ?? admitted.Error.ToString());
 
-        context.SipImages.Add(path);
         context.SipComponents.Add(admitted.Value!);
+        if (session.IsBudgetConfigured)
+        {
+            session.BudgetAccounts[admitted.Value!.Process.ProcessId.Value] = new ProcessBudgetAdmission(
+                admitted.Value.Process,
+                admitted.Value.ServiceBudget,
+                admitted.Value.ProcessBudget);
+        }
+        session.Sips.Add(new SipAdmissionRecord(
+            path,
+            identity,
+            assembly.Version?.ToString() ?? "0.0.0.0",
+            digest,
+            componentIdentity));
         return KernelBootStageResult.Success();
     }
 
-    private sealed class Context
+    private sealed class Context(EmulatorSession session)
     {
-        internal RuntimeKernel? Runtime { get; set; }
-        internal SingProcessManifestV1? Manifest { get; set; }
-        internal ProcessHandle? SystemProcess { get; set; }
-        private readonly HashSet<string> _sipPathSet = new(StringComparer.OrdinalIgnoreCase);
-        internal List<string> SipPaths { get; } = [];
-        internal List<string> SipImages { get; } = [];
+        internal EmulatorSession Session { get; } = session;
         internal List<ComponentLifecycleSnapshot> SipComponents { get; } = [];
-        internal int DeferredSipStageCount => SipPaths.Count;
-
-        internal bool AddSipPath(string path)
-        {
-            if (!_sipPathSet.Add(path)) return false;
-            SipPaths.Add(path);
-            return true;
-        }
     }
 
     private sealed class Stage(string name, Func<KernelBootStageResult> execute) : IKernelBootStage

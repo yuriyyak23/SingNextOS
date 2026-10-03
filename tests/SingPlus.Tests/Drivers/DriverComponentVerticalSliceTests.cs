@@ -8,6 +8,77 @@ namespace SingPlus.Tests.Drivers;
 
 public sealed class DriverComponentVerticalSliceTests
 {
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void AdmissionRollbackRevokesLocalSourcesBeforeProviderCleanup(int closureMode)
+    {
+        var provider = new DriverProvider
+        {
+            DeviceRevokeStatus = closureMode == 1 ? PlatformAuthorityStatus.Faulted :
+                closureMode == 2 ? PlatformAuthorityStatus.NotAccepted : null,
+            ThrowDeviceRevoke = closureMode == 3,
+        };
+        var kernel = new RuntimeKernel(provider);
+        _ = TestFixtures.Create(kernel, 1870, 18700);
+        var setup = DriverSetup.Create(1880, 18800);
+        var process = new ProcessHandle(setup.Process.ProcessId, setup.Process.Generation);
+        var observed = 0;
+        provider.BeforeDeviceRevoke = () =>
+        {
+            var live = kernel.Processes.Resolve(process).Value!;
+            Assert.Equal(ProcessState.Exiting, live.State);
+            Assert.Empty(live.Capabilities.Items);
+            var capabilities = kernel.CapabilityAuthority.InspectionSnapshot()
+                .Where(item => item.Descriptor.SubjectDomainId == setup.Process.DomainId &&
+                    item.Descriptor.Generation == process.Generation)
+                .Select(item => item.Descriptor.CapabilityId).ToArray();
+            Assert.Equal(setup.Requirements.Length, capabilities.Length);
+            foreach (var capability in capabilities)
+                Assert.Equal(KernelError.CapabilityRevoked,
+                    kernel.ValidateCapability(process, capability, CapabilityRights.Read).Error);
+            observed++;
+        };
+
+        var result = kernel.AdmitComponent(setup.Plan(new DomainId(18700), missingDependency: true));
+
+        Assert.Equal(1, observed);
+        Assert.Equal(closureMode == 0 ? KernelError.ServiceNotFound : KernelError.PlatformFaulted, result.Error);
+        var snapshot = kernel.QueryComponent(setup.Identity).Value!;
+        Assert.Equal(closureMode == 0 ? ComponentLifecycleState.Reclaimable : ComponentLifecycleState.Faulted, snapshot.State);
+        if (closureMode != 0)
+        {
+            Assert.False(snapshot.Reclaimable);
+            Assert.True(snapshot.PlatformAuthorityLive);
+            Assert.NotNull(snapshot.DeviceResources);
+            Assert.True(kernel.Processes.Resolve(process).IsSuccess);
+            Assert.DoesNotContain("revoke-domain", provider.Log);
+            Assert.True(kernel.QueryBudget(snapshot.ProcessBudget).IsSuccess);
+            Assert.True(kernel.QueryProcessTeardown(process).Value!.LocalAuthorizationRevoked);
+            provider.DeviceRevokeStatus = null;
+            provider.ThrowDeviceRevoke = false;
+            var observedTeardown = kernel.ObserveComponentTeardown(setup.Identity);
+            Assert.True(observedTeardown.IsSuccess);
+            Assert.Equal(closureMode == 2, observedTeardown.Value!.Reclaimable);
+            Assert.Equal(closureMode == 2 ? 2 : 1, observed);
+            if (closureMode == 2)
+            {
+                Assert.Equal(KernelError.StaleHandle, kernel.Processes.Resolve(process).Error);
+                Assert.Null(observedTeardown.Value.DeviceResources);
+                Assert.False(observedTeardown.Value.PlatformAuthorityLive);
+                Assert.Contains("revoke-domain", provider.Log);
+            }
+            else
+            {
+                Assert.Equal(ComponentLifecycleState.Faulted, observedTeardown.Value.State);
+                Assert.True(kernel.QueryBudget(snapshot.ProcessBudget).IsSuccess);
+                Assert.DoesNotContain("revoke-domain", provider.Log);
+            }
+        }
+    }
+
     [Fact]
     public async Task AdmittedDriverOwnsBoundedResourcesAndServesInterruptWithoutDelegatingAuthority()
     {
@@ -241,7 +312,7 @@ public sealed class DriverComponentVerticalSliceTests
                 resources);
         }
 
-        public ComponentAdmissionPlan Plan(DomainId issuer)
+        public ComponentAdmissionPlan Plan(DomainId issuer, bool missingDependency = false)
         {
             var provided = new ProvidedServiceManifestV1("driver-interrupt", Contract);
             var manifest = new ServiceManifestV1(
@@ -250,6 +321,7 @@ public sealed class DriverComponentVerticalSliceTests
                 Digest(Image),
                 Process,
                 [provided],
+                missingDependency ? [new ServiceContractIdentity("missing-driver-dependency", "1", "missing-digest")] : [],
                 requiresPlatformDomain: true,
                 platformRequirements:
                 [
@@ -302,6 +374,9 @@ public sealed class DriverComponentVerticalSliceTests
         public int IrqBindCalls { get; private set; }
         public int DmaBindCalls { get; private set; }
         public PlatformAuthorityStatus? DmaRevokeStatus { get; set; }
+        public PlatformAuthorityStatus? DeviceRevokeStatus { get; set; }
+        public Action? BeforeDeviceRevoke { get; set; }
+        public bool ThrowDeviceRevoke { get; set; }
         public List<string> Log { get; } = [];
 
         public PlatformProviderDescriptor Descriptor { get; } = new(
@@ -352,6 +427,10 @@ public sealed class DriverComponentVerticalSliceTests
 
         public PlatformAuthorityResult RevokeDevice(PlatformProviderDeviceLease lease)
         {
+            BeforeDeviceRevoke?.Invoke();
+            if (ThrowDeviceRevoke) throw new InvalidOperationException("Device closure reply lost.");
+            if (DeviceRevokeStatus is { } failure)
+                return PlatformAuthorityResult.Fail(failure, "Device closure is ambiguous.");
             if (_mmio.Values.Any(item => item.DeviceLease == lease) || _irqs.Values.Any(item => item.DeviceLease == lease) || _grants.Values.Any(item => item.DeviceLease == lease))
                 return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Denied, "Child device resources remain live.");
             Log.Add("revoke-device");

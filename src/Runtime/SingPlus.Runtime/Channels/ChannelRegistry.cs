@@ -494,8 +494,12 @@ public sealed class ChannelRegistry
         CloseRecords(closing);
     }
 
-    internal KernelResult Close(ChannelEndpointHandle endpoint)
+    internal KernelResult Close(ChannelEndpointHandle endpoint, bool allowAlreadyClosed = false)
     {
+        if (allowAlreadyClosed && endpoint.Generation is not 0 and not ulong.MaxValue &&
+            endpoint.EndpointId.Value is 1 or 2 && _channels.TryGetValue(endpoint.ChannelId, out var closed) &&
+            closed.Closed && closed.Generation == endpoint.Generation + 1)
+            return KernelResult.Ok();
         var validation = Resolve(endpoint);
         if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
         CloseRecords([validation.Value!]);

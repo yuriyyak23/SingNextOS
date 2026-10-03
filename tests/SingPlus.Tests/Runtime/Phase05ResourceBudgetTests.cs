@@ -9,6 +9,262 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class Phase05ResourceBudgetTests
 {
+    [Fact]
+    public void HierarchyRetirementCannotRetireUnrelatedServiceOrSharedChild()
+    {
+        var kernel = new RuntimeKernel();
+        var first = kernel.Budgets.CreateProcessHierarchy(new(new(1007), 1), "first", "first-process", []).Value;
+        var second = kernel.Budgets.CreateProcessHierarchy(new(new(1008), 1), "second", "second-process", []).Value;
+        Assert.Equal(KernelError.StaleGeneration, kernel.Budgets.RetireProcessHierarchy(first.Process,
+            first.ProcessBudget, second.ServiceBudget).Error);
+        Assert.True(kernel.Budgets.HasProcessAccount(first.Process));
+        Assert.True(kernel.QueryBudget(first.ProcessBudget).IsSuccess);
+        Assert.True(kernel.QueryBudget(second.ServiceBudget).IsSuccess);
+        Assert.True(kernel.Budgets.AttachProcess(new(new(1009), 1), first.ProcessBudget).IsSuccess);
+        Assert.True(kernel.Budgets.HasProcessAccount(new(new(1009), 1)));
+        Assert.Equal(KernelError.ReplacementBlocked, kernel.Budgets.RetireProcessHierarchy(first.Process,
+            first.ProcessBudget, first.ServiceBudget).Error);
+        var sibling = kernel.Budgets.CreateChild(first.ServiceBudget, BudgetAccountLevel.ProcessDomain, "sibling", []);
+        Assert.True(sibling.IsSuccess);
+        Assert.Equal(KernelError.ReplacementBlocked, kernel.Budgets.RetireProcessHierarchy(first.Process,
+            first.ProcessBudget, first.ServiceBudget).Error);
+        Assert.True(kernel.Budgets.HasProcessAccount(first.Process));
+        Assert.True(kernel.QueryBudget(sibling.Value!.Account).IsSuccess);
+        Assert.True(kernel.Budgets.RetireProcessHierarchy(second.Process, second.ProcessBudget, second.ServiceBudget).IsSuccess);
+        Assert.False(kernel.Budgets.HasProcessAccount(second.Process));
+        Assert.True(kernel.QueryBudget(first.ServiceBudget).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void ReservationInputFaultOrOwnerAbaDoesNotChargeOldHierarchy(bool aba)
+    {
+        var kernel = new RuntimeKernel();
+        var (_, admin) = TestFixtures.Create(kernel, 1003, 2003);
+        var (_, target) = TestFixtures.Create(kernel, 1004, 2004);
+        var cap = kernel.MintCapability(new(2003), admin, ResourceKind.KernelService,
+            CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        var hierarchy = kernel.AdmitProcessBudget(admin, cap, target, "reserve-input", []).Value;
+        var input = new CallbackBudgetAmounts(() =>
+        {
+            if (!aba) throw new InvalidOperationException("reservation input fault");
+            Assert.True(kernel.TerminateProcess(target).IsSuccess);
+            TestFixtures.Create(kernel, 1004, 2004, 2);
+        });
+        var refused = kernel.ReserveBudget(target, input, BudgetReservationLifetime.LocalResource);
+        Assert.Equal(aba ? KernelError.StaleHandle : KernelError.PlatformFaulted, refused.Error);
+        Assert.Equal(0ul, Usage(kernel.QueryBudget(hierarchy.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.Equal(0ul, Usage(kernel.QueryBudget(kernel.Budgets.SystemBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        if (!aba)
+            Assert.True(kernel.ReserveBudget(target, [new(ServiceBudgetDimension.OwnedMemoryBytes, 7)], BudgetReservationLifetime.LocalResource).IsSuccess);
+    }
+
+    [Fact]
+    public async Task BlockedReservationInputAllowsConcurrentOwnerExitWithoutLateCharge()
+    {
+        var kernel = new RuntimeKernel();
+        var (_, admin) = TestFixtures.Create(kernel, 1005, 2005);
+        var (_, target) = TestFixtures.Create(kernel, 1006, 2006);
+        var cap = kernel.MintCapability(new(2005), admin, ResourceKind.KernelService,
+            CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        var hierarchy = kernel.AdmitProcessBudget(admin, cap, target, "blocked-reserve", []).Value;
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var input = new CallbackBudgetAmounts(() =>
+        {
+            entered.Set();
+            Assert.True(release.Wait(TimeSpan.FromSeconds(10)));
+        });
+        var pending = Task.Run(() => kernel.ReserveBudget(target, input, BudgetReservationLifetime.LocalResource));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.True((await Task.Run(() => kernel.TerminateProcess(target)).WaitAsync(TimeSpan.FromSeconds(5))).IsSuccess);
+        }
+        finally { release.Set(); }
+        Assert.Equal(KernelError.StaleHandle, (await pending.WaitAsync(TimeSpan.FromSeconds(10))).Error);
+        Assert.Equal(0ul, Usage(kernel.QueryBudget(hierarchy.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+    }
+
+    [Theory]
+    [InlineData(false, 0)] [InlineData(false, 1)] [InlineData(false, 2)] [InlineData(false, 3)]
+    [InlineData(true, 0)] [InlineData(true, 1)] [InlineData(true, 2)] [InlineData(true, 3)]
+    public void BudgetInputCallbackCannotCommitAfterSourceLossOrObservationFault(bool configure, int fault)
+    {
+        var kernel = new RuntimeKernel();
+        var (_, admin) = TestFixtures.Create(kernel, 997, 1997);
+        var (_, target) = TestFixtures.Create(kernel, 998, 1998);
+        var cap = kernel.MintCapability(new(1997), admin, ResourceKind.KernelService,
+            CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        var limits = new CallbackBudgetAmounts(() =>
+        {
+            if (fault == 0) Assert.True(kernel.CapabilityAuthority.Revoke(cap).IsSuccess);
+            else if (fault == 1) kernel.CapabilityAuthority.RevokeAllForDomain(new(1997));
+            else if (fault == 2) Assert.True(kernel.TerminateProcess(admin).IsSuccess);
+            else throw new InvalidOperationException("input observation fault");
+        });
+        var error = configure ? kernel.ConfigureSystemBudget(admin, cap, limits).Error
+            : kernel.AdmitProcessBudget(admin, cap, target, "callback", limits).Error;
+        Assert.Equal(fault switch { 2 => KernelError.StaleHandle, 3 => KernelError.PlatformFaulted,
+            _ => KernelError.CapabilityRevoked }, error);
+        Assert.Equal(1, AccountCount(kernel.Budgets));
+        Assert.False(kernel.Budgets.HasProcessAccount(target));
+        Assert.Equal(ulong.MaxValue, Usage(kernel.QueryBudget(kernel.Budgets.SystemBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Limit);
+        if (fault == 3)
+        {
+            BudgetAmount[] recovered = [new(ServiceBudgetDimension.OwnedMemoryBytes, 7)];
+            if (configure)
+            {
+                var configured = kernel.ConfigureSystemBudget(admin, cap, recovered);
+                Assert.True(configured.IsSuccess);
+                Assert.Equal(7ul, Usage(configured.Value!, ServiceBudgetDimension.OwnedMemoryBytes).Limit);
+            }
+            else
+            {
+                var admitted = kernel.AdmitProcessBudget(admin, cap, target, "recovered-input", recovered);
+                Assert.True(admitted.IsSuccess);
+                Assert.Equal(7ul, Usage(kernel.QueryBudget(admitted.Value.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Limit);
+                Assert.Equal(3, AccountCount(kernel.Budgets));
+            }
+        }
+    }
+
+    [Fact]
+    public void BudgetInputCallbackCannotAttachToReusedTargetProcessId()
+    {
+        var kernel = new RuntimeKernel();
+        var (_, admin) = TestFixtures.Create(kernel, 999, 1999);
+        var (_, target) = TestFixtures.Create(kernel, 1000, 2000);
+        var cap = kernel.MintCapability(new(1999), admin, ResourceKind.KernelService,
+            CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        var limits = new CallbackBudgetAmounts(() =>
+        {
+            Assert.True(kernel.TerminateProcess(target).IsSuccess);
+            TestFixtures.Create(kernel, 1000, 2000, 2);
+        });
+        Assert.Equal(KernelError.StaleHandle, kernel.AdmitProcessBudget(admin, cap, target, "stale-target", limits).Error);
+        Assert.Equal(1, AccountCount(kernel.Budgets));
+        Assert.False(kernel.Budgets.HasProcessAccount(target));
+        Assert.False(kernel.Budgets.HasProcessAccount(new(target.ProcessId, 2)));
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public async Task BlockedBudgetInputObservationHoldsNoBudgetOrCapabilityGate(bool configure)
+    {
+        var kernel = new RuntimeKernel();
+        var (_, admin) = TestFixtures.Create(kernel, 1001, 2001);
+        var (_, target) = TestFixtures.Create(kernel, 1002, 2002);
+        var cap = kernel.MintCapability(new(2001), admin, ResourceKind.KernelService,
+            CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var limits = new CallbackBudgetAmounts(() =>
+        {
+            entered.Set();
+            Assert.True(release.Wait(TimeSpan.FromSeconds(10)));
+        });
+        var pending = Task.Run(() => configure ? kernel.ConfigureSystemBudget(admin, cap, limits).Error
+            : kernel.AdmitProcessBudget(admin, cap, target, "blocked-input", limits).Error);
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.True((await Task.Run(() => kernel.QueryBudget(kernel.Budgets.SystemBudget)).WaitAsync(TimeSpan.FromSeconds(5))).IsSuccess);
+            Assert.True((await Task.Run(() => kernel.CapabilityAuthority.Revoke(cap)).WaitAsync(TimeSpan.FromSeconds(5))).IsSuccess);
+        }
+        finally { release.Set(); }
+        Assert.Equal(KernelError.CapabilityRevoked, await pending.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal(1, AccountCount(kernel.Budgets));
+    }
+
+    private sealed class CallbackBudgetAmounts(Action callback) : IReadOnlyList<BudgetAmount>
+    {
+        public int Count => 1;
+        public BudgetAmount this[int index] => index == 0 ? new(ServiceBudgetDimension.OwnedMemoryBytes, 7)
+            : throw new ArgumentOutOfRangeException(nameof(index));
+        public IEnumerator<BudgetAmount> GetEnumerator()
+        {
+            callback();
+            yield return this[0];
+        }
+        global::System.Collections.IEnumerator global::System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+    }
+
+    [Fact]
+    public void RefusedHierarchyLimitDoesNotAllocateAccountsOrChargeRoot()
+    {
+        var kernel = new RuntimeKernel();
+        Assert.True(kernel.Budgets.ConfigureSystem([new(ServiceBudgetDimension.OwnedMemoryBytes, 10)]).IsSuccess);
+        Assert.Equal(KernelError.BudgetExceeded, Admit(kernel, "excessive-hierarchy", 996, 1996,
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 11)]).Error);
+        Assert.Equal(1, AccountCount(kernel.Budgets));
+        Assert.Equal(2ul, typeof(ResourceBudgetAuthority).GetField("_nextAccountId", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel.Budgets));
+        Assert.Equal(0ul, Usage(kernel.QueryBudget(kernel.Budgets.SystemBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.False(kernel.Budgets.HasProcessAccount(new(new(996), 1)));
+    }
+
+    [Theory]
+    [InlineData(0ul)] [InlineData(ulong.MaxValue)]
+    public void ComponentHierarchyNeedsTwoIdsWithoutPartialAllocation(ulong next)
+    {
+        var kernel = new RuntimeKernel();
+        var field = typeof(ResourceBudgetAuthority).GetField("_nextAccountId", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        field.SetValue(kernel.Budgets, next);
+        var result = Admit(kernel, "pair-exhausted", 991, 1991, []);
+        Assert.Equal(KernelError.CapacityExhausted, result.Error);
+        Assert.Equal(1, AccountCount(kernel.Budgets));
+        Assert.Equal(next, field.GetValue(kernel.Budgets));
+        Assert.False(kernel.Budgets.HasProcessAccount(new(new(991), 1)));
+        Assert.Equal(KernelError.ComponentNotFound, kernel.QueryComponent(new("pair-exhausted")).Error);
+        Assert.Equal(KernelError.ProcessNotFound, kernel.Processes.Resolve(new(new(991), 1)).Error);
+    }
+
+    [Fact]
+    public void FinalHierarchyPairCommitsOnceAndDoesNotWrapToReusableIds()
+    {
+        var kernel = new RuntimeKernel();
+        var field = typeof(ResourceBudgetAuthority).GetField("_nextAccountId", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        field.SetValue(kernel.Budgets, ulong.MaxValue - 1);
+        var admitted = Admit(kernel, "last-pair", 992, 1992, []);
+        Assert.True(admitted.IsSuccess, admitted.Message);
+        Assert.Equal(ulong.MaxValue - 1, admitted.Value!.ServiceBudget.AccountId.Value);
+        Assert.Equal(ulong.MaxValue, admitted.Value.ProcessBudget.AccountId.Value);
+        Assert.Equal(0ul, field.GetValue(kernel.Budgets));
+        Assert.Equal(3, AccountCount(kernel.Budgets));
+        Assert.Equal(KernelError.CapacityExhausted, Admit(kernel, "after-last-pair", 993, 1993, []).Error);
+        Assert.Equal(3, AccountCount(kernel.Budgets));
+        Assert.True(kernel.QueryBudget(admitted.Value.ProcessBudget).IsSuccess);
+    }
+
+    [Fact]
+    public async Task OverlappingBudgetAdmissionHasOneHierarchyAndNoOrphanAccounts()
+    {
+        var kernel = new RuntimeKernel();
+        var (_, admin) = TestFixtures.Create(kernel, 994, 1994);
+        var (_, target) = TestFixtures.Create(kernel, 995, 1995);
+        var cap = kernel.MintCapability(new(1994), admin, ResourceKind.KernelService,
+            CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        using var start = new ManualResetEventSlim();
+        var workers = Enumerable.Range(0, 2).Select(i => Task.Run(() =>
+        {
+            Assert.True(start.Wait(TimeSpan.FromSeconds(10)));
+            return kernel.AdmitProcessBudget(admin, cap, target, $"overlap-{i}", []);
+        })).ToArray();
+        start.Set();
+        var results = await Task.WhenAll(workers).WaitAsync(TimeSpan.FromSeconds(10));
+        var committed = Assert.Single(results, result => result.IsSuccess);
+        Assert.Equal(KernelError.DuplicateIdentity, Assert.Single(results, result => !result.IsSuccess).Error);
+        Assert.Equal(3, AccountCount(kernel.Budgets));
+        var next = typeof(ResourceBudgetAuthority).GetField("_nextAccountId", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel.Budgets);
+        Assert.Equal(KernelError.DuplicateIdentity, kernel.AdmitProcessBudget(admin, cap, target, "duplicate", []).Error);
+        Assert.Equal(3, AccountCount(kernel.Budgets));
+        Assert.Equal(next, typeof(ResourceBudgetAuthority).GetField("_nextAccountId", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel.Budgets));
+        Assert.True(kernel.QueryBudget(committed.Value.ProcessBudget).IsSuccess);
+    }
+
+    private static int AccountCount(ResourceBudgetAuthority owner) =>
+        ((global::System.Collections.IDictionary)typeof(ResourceBudgetAuthority).GetField("_accounts", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(owner)!).Count;
+
     [Theory]
     [InlineData(0, 0)]
     [InlineData(0, 1)]

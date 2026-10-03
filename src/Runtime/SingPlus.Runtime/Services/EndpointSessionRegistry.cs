@@ -90,10 +90,14 @@ internal sealed class EndpointSessionRegistry
         }
     }
 
-    internal KernelResult<Record> Close(EndpointSessionHandle handle, ProcessHandle caller)
+    internal KernelResult<Record> Close(EndpointSessionHandle handle, ProcessHandle caller, bool allowAlreadyClosed = false)
     {
         lock (_gate)
         {
+            if (allowAlreadyClosed && _records.TryGetValue(handle.SessionId, out var closed) &&
+                closed.Handle == handle && closed.Caller == caller && closed.State == EndpointSessionState.Closed &&
+                closed.ActivePins == 0)
+                return KernelResult<Record>.Ok(closed);
             var resolved = Resolve(handle, caller);
             if (!resolved.IsSuccess) return resolved;
             if (resolved.Value!.ActivePins != 0)
@@ -105,6 +109,15 @@ internal sealed class EndpointSessionRegistry
             Transition(resolved.Value, EndpointSessionState.Closed, SessionLifecycleTraceCauseV1.ExplicitClose);
             return resolved;
         }
+    }
+
+    // Exact owner relationship capture for native cleanup routing. Includes
+    // closed transport records: transport closure cannot retire native work.
+    internal EndpointSessionHandle[] CaptureHandlesForProcess(ProcessHandle process)
+    {
+        lock (_gate)
+            return _records.Values.Where(record => record.Caller == process || record.Service == process)
+                .Select(record => record.Handle).ToArray();
     }
 
     internal Record[] CloseForProcess(ProcessHandle process)
@@ -182,6 +195,19 @@ internal sealed class EndpointSessionRegistry
                 : KernelResult.Fail(KernelError.SessionClosed, "Endpoint session pin is no longer current.");
     }
 
+    // Pure local consumptive admission only. Caller freezes process lifecycle;
+    // callback performs source commit, never clock/provider/lifecycle callbacks.
+    internal KernelResult<T> CommitPinnedEffectAdmission<T>(EndpointSessionPin pin, Func<KernelResult<T>> commit)
+    {
+        lock (_gate)
+        {
+            if (!pin.IsOwnedBy(this))
+                return KernelResult<T>.Fail(KernelError.SessionClosed, "Endpoint session pin is disposed or foreign.");
+            var current = RevalidatePin(pin);
+            return current.IsSuccess ? commit() : KernelResult<T>.Fail(current.Error, current.Message!);
+        }
+    }
+
     internal void ReleasePin(EndpointSessionPin pin)
     {
         lock (_gate)
@@ -239,5 +265,6 @@ internal sealed class EndpointSessionPin : IDisposable
     internal EndpointSessionHandle Handle { get; }
     internal ProcessHandle Caller { get; }
     internal ProcessHandle Service { get; }
+    internal bool IsOwnedBy(EndpointSessionRegistry owner) => ReferenceEquals(Volatile.Read(ref _owner), owner);
     public void Dispose() => Interlocked.Exchange(ref _owner, null)?.ReleasePin(this);
 }

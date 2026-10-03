@@ -6,6 +6,7 @@ using SingPlus.Runtime;
 using SingPlus.Sip;
 using SingPlus.Sip.FileSystem;
 using SingPlus.Sip.Networking;
+using SingPlus.Sip.Native;
 using SingPlus.Sip.Process;
 using SingPlus.Sip.Sdk;
 using SingPlus.System;
@@ -14,6 +15,1080 @@ namespace SingPlus.Tests.NativeServices;
 
 public sealed class NativeSystemServiceVerticalSliceTests
 {
+    [Theory]
+    [InlineData(0, 0)] [InlineData(1, 0)] [InlineData(2, 0)]
+    [InlineData(0, 1)] [InlineData(1, 1)] [InlineData(2, 1)]
+    [InlineData(0, 2)] [InlineData(1, 2)] [InlineData(2, 2)]
+    [InlineData(0, 3)] [InlineData(1, 3)] [InlineData(2, 3)]
+    [InlineData(0, 4)] [InlineData(1, 4)] [InlineData(2, 4)]
+    public async Task ObjectCandidatePrecedesActualMintAndCannotGrantClosure(int route, int fault)
+    {
+        RuntimeKernel kernel;
+        ProcessHandle service, caller;
+        EndpointSessionHandle session;
+        Func<KernelResult> processNext;
+        Func<Task> open;
+        global::System.Collections.IDictionary entries;
+        var prefix = route == 2 ? "socket-object:" : "file-object:";
+        if (route == 2)
+        {
+            var s = NetworkDrainScenario();
+            kernel = s.Kernel; service = s.Service; caller = s.Caller; session = s.Session;
+            var host = RuntimeNetworkServiceHost.CreateForSession(kernel, service, session).Value!;
+            var client = INetworkServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session));
+            entries = NetworkEntries(host); processNext = host.ProcessNext;
+            open = () => client.OpenAsync(new(s.Capability, "loopback:candidate")).AsTask();
+        }
+        else
+        {
+            var s = FileScenario();
+            kernel = s.Kernel; service = s.Service; caller = s.Caller; session = s.Session;
+            var host = RuntimeFileServiceHost.CreateForSession(kernel, service, session).Value!;
+            var client = IFileServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session));
+            var opaque = kernel.UpgradeCapabilityV1(caller, s.Capability).Value;
+            entries = (global::System.Collections.IDictionary)typeof(RuntimeFileServiceHost)
+                .GetField("_files", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(host)!;
+            processNext = host.ProcessNext;
+            open = () => route == 1 ? client.OpenV2Async(new(opaque, "/candidate", true)).AsTask()
+                : client.OpenAsync(new(s.Capability, "/candidate", true)).AsTask();
+        }
+        using var release = new ManualResetEventSlim();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        typeof(CapabilityAuthority).GetField("_nonceFactory", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(kernel.CapabilityAuthority, (Func<Guid>)(() =>
+            {
+                if (Interlocked.Increment(ref calls) != 1) return Guid.Empty;
+                var candidate = entries.Values.Cast<object>().Single();
+                Assert.Null(candidate.GetType().GetProperty("Capability")!.GetValue(candidate));
+                Assert.Null(candidate.GetType().GetProperty("Handle")!.GetValue(candidate));
+                Assert.False((bool)candidate.GetType().GetProperty("SealOutcomeKnown")!.GetValue(candidate)!);
+                Assert.DoesNotContain(kernel.CapabilityAuthority.InspectionSnapshot(), record =>
+                    record.Descriptor.ResourceId.StartsWith(prefix, StringComparison.Ordinal));
+                if (fault == 1) throw new InvalidOperationException("Actual issuance outcome unknown.");
+                if (fault is 2 or 3)
+                {
+                    entered.SetResult();
+                    Assert.True(release.Wait(TimeSpan.FromSeconds(10)));
+                }
+                if (fault == 4)
+                    kernel.CapabilityAuthority.RevokeAllForDomain(kernel.Processes.Resolve(caller).Value!.DomainId);
+                return fault is 2 or 4 ? Guid.NewGuid() : Guid.Empty;
+            }));
+        var opening = open();
+        if (fault == 1)
+        {
+            Assert.Throws<InvalidOperationException>(() => processNext());
+            Assert.Single(entries.Keys.Cast<object>());
+            Assert.Equal(KernelError.ExternalEffectUncontained, kernel.CloseSession(caller, session).Error);
+            Assert.Equal(KernelError.ExternalEffectUncontained, kernel.FaultProcess(service).Error);
+            Assert.False(kernel.QueryProcessTeardown(service).Value.LocalReclaimCompleted);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => opening.WaitAsync(TimeSpan.FromSeconds(10)));
+        }
+        else
+        {
+            var dispatch = Task.Run(processNext);
+            if (fault is 2 or 3)
+            {
+                try
+                {
+                    await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+                    Assert.Single(entries.Keys.Cast<object>());
+                    Assert.Equal(KernelError.SessionDraining, kernel.CloseSession(caller, session).Error);
+                    Assert.Equal(KernelError.SessionDraining, processNext().Error);
+                    Assert.False(dispatch.IsCompleted);
+                }
+                finally { release.Set(); }
+            }
+            var result = await dispatch.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(fault == 2 ? KernelError.SessionDraining : fault == 4 ? KernelError.CapabilityRevoked
+                : KernelError.CapacityExhausted, result.Error);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => opening.WaitAsync(TimeSpan.FromSeconds(10)));
+            var issued = kernel.CapabilityAuthority.InspectionSnapshot().Where(record =>
+                record.Descriptor.ResourceId.StartsWith(prefix, StringComparison.Ordinal)).ToArray();
+            if (fault == 2)
+            {
+                Assert.Single(issued);
+                Assert.Single(entries.Keys.Cast<object>());
+                Assert.Equal(CapabilityRights.Read | CapabilityRights.Write | CapabilityRights.Configure, issued[0].Descriptor.Rights);
+            }
+            else
+            {
+                Assert.Empty(issued);
+                Assert.Empty(entries.Keys.Cast<object>());
+            }
+            Assert.True(kernel.CloseSession(caller, session).IsSuccess);
+            Assert.Empty(entries.Keys.Cast<object>());
+            Assert.All(issued, record => Assert.Equal(KernelError.CapabilityRevoked,
+                kernel.ValidateCapability(caller, record.Descriptor.CapabilityId, CapabilityRights.Read).Error));
+        }
+        Assert.Equal(0, kernel.CapabilityAuthority.ActiveOperationLeaseCount);
+        Assert.Equal(0, kernel.EndpointSessions.ActivePinCount(session));
+    }
+
+    [Theory]
+    [InlineData(false, 0)] [InlineData(true, 0)]
+    [InlineData(false, 1)] [InlineData(true, 1)]
+    [InlineData(false, 2)] [InlineData(true, 2)]
+    [InlineData(false, 3)] [InlineData(true, 3)]
+    public async Task ObjectCloseRetainsAccountingUntilActualSourceAndSealCleanup(bool network, int fault)
+    {
+        RuntimeKernel kernel;
+        ProcessHandle service, caller;
+        EndpointSessionHandle session;
+        CapabilityId issued = default;
+        Guid sealToken = default;
+        Func<KernelResult> processNext, revokeSeal;
+        global::System.Collections.IDictionary entries;
+        Func<Task> close;
+        var armed = false;
+        RuntimeKernel? callbackKernel = null;
+        Func<KernelResult>? callbackRevoke = null;
+        var trace = new CallbackEventSink(point =>
+        {
+            if (!armed || point != NativeSipCompletedEvent.ImplementationEntered) return;
+            armed = false;
+            if (fault == 0)
+            {
+                var records = (global::System.Collections.IDictionary)typeof(CapabilityAuthority)
+                    .GetField("_records", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(callbackKernel!.CapabilityAuthority)!;
+                records.Remove(issued);
+            }
+            else if (fault == 1) Assert.True(callbackRevoke!().IsSuccess);
+            else if (fault == 2)
+            {
+                var records = (global::System.Collections.IDictionary)typeof(SealedObjectAuthority)
+                    .GetField("_records", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(callbackKernel!.SealedObjects)!;
+                records.Remove(sealToken);
+            }
+            else Assert.True(callbackKernel!.RevokeCapability(issued).IsSuccess);
+        });
+        if (network)
+        {
+            var s = NetworkDrainScenario();
+            kernel = s.Kernel; service = s.Service; caller = s.Caller; session = s.Session;
+            var host = RuntimeNetworkServiceHost.CreateForSession(kernel, service, session, trace, hook: null).Value!;
+            var client = INetworkServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session));
+            var opening = client.OpenAsync(new(s.Capability, "loopback:close")).AsTask();
+            Assert.True(host.ProcessNext().IsSuccess);
+            var control = (await opening).Authority;
+            issued = control.Capability; sealToken = control.Socket.Seal.OpaqueToken;
+            processNext = host.ProcessNext; entries = NetworkEntries(host);
+            revokeSeal = () => kernel.SealedObjects.Revoke(control.Socket.Seal);
+            close = () => client.CloseAsync(new(control.Socket, control.Capability)).AsTask();
+        }
+        else
+        {
+            var s = FileScenario();
+            kernel = s.Kernel; service = s.Service; caller = s.Caller; session = s.Session;
+            var host = RuntimeFileServiceHost.CreateForSession(kernel, service, session, trace).Value!;
+            var client = IFileServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session));
+            var opening = client.OpenAsync(new(s.Capability, "/close", true)).AsTask();
+            Assert.True(host.ProcessNext().IsSuccess);
+            var control = (await opening).Authority;
+            issued = control.Capability; sealToken = control.File.Seal.OpaqueToken;
+            processNext = host.ProcessNext;
+            entries = (global::System.Collections.IDictionary)typeof(RuntimeFileServiceHost)
+                .GetField("_files", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(host)!;
+            revokeSeal = () => kernel.SealedObjects.Revoke(control.File.Seal);
+            close = () => client.CloseAsync(new(control.File, control.Capability)).AsTask();
+        }
+        callbackKernel = kernel; callbackRevoke = revokeSeal; armed = true;
+        var closing = close();
+        var result = processNext();
+        Assert.False(armed);
+        Assert.Equal(0, kernel.CapabilityAuthority.ActiveOperationLeaseCount);
+        Assert.Equal(0, kernel.EndpointSessions.ActivePinCount(session));
+        if (fault == 3)
+        {
+            Assert.True(result.IsSuccess, result.Message);
+            await closing.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Empty(entries.Keys.Cast<object>());
+            Assert.True(kernel.CloseSession(caller, session).IsSuccess);
+        }
+        else
+        {
+            var expected = fault == 0 ? KernelError.CapabilityNotFound : KernelError.StaleHandle;
+            Assert.Equal(expected, result.Error);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => closing.WaitAsync(TimeSpan.FromSeconds(10)));
+            Assert.Single(entries.Keys.Cast<object>());
+            Assert.Equal(KernelError.SessionDraining, processNext().Error);
+            if (fault == 1)
+            {
+                // Existing real seal owner closes after the actual pin releases;
+                // existing native retry consumes the retained entry.
+                Assert.True(kernel.CloseSession(caller, session).IsSuccess);
+                Assert.Empty(entries.Keys.Cast<object>());
+            }
+            else
+            {
+                Assert.Equal(expected, kernel.CloseSession(caller, session).Error);
+                Assert.Equal(expected, kernel.CloseSession(caller, session).Error);
+                Assert.Equal(expected, kernel.FaultProcess(service).Error);
+                Assert.False(kernel.QueryProcessTeardown(service).Value.LocalReclaimCompleted);
+                Assert.Single(entries.Keys.Cast<object>());
+            }
+        }
+        if (fault != 0)
+            Assert.Equal(KernelError.CapabilityRevoked, kernel.ValidateCapability(caller, issued, CapabilityRights.Read).Error);
+    }
+
+    private sealed class CallbackEventSink(Action<NativeSipCompletedEvent> action) : INativeSipCompletedEventSink
+    {
+        public void Record(NativeSipCompletedEvent point) => action(point);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)]
+    public async Task SocketCreationTracksIssuedControlAcrossSealRefusalExceptionAndOverlap(int fault)
+    {
+        var (kernel, service, caller, capability, session) = NetworkDrainScenario();
+        var host = RuntimeNetworkServiceHost.CreateForSession(kernel, service, session).Value!;
+        var client = INetworkServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session));
+        var sockets = (global::System.Collections.IDictionary)typeof(RuntimeNetworkServiceHost)
+            .GetField("_sockets", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(host)!;
+        if (fault == 0)
+        {
+            var seed = client.OpenAsync(new(capability, "loopback:seed")).AsTask();
+            Assert.True(host.ProcessNext().IsSuccess);
+            await seed;
+            typeof(SealedObjectAuthority).GetField("_capacity", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .SetValue(kernel.SealedObjects, 1);
+        }
+        using var release = new ManualResetEventSlim();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        CapabilityId issued = default;
+        if (fault != 0)
+            typeof(SealedObjectAuthority).GetField("_tokenFactory", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .SetValue(kernel.SealedObjects, (Func<Guid>)(() =>
+                {
+                    if (Interlocked.Increment(ref calls) != 1) return Guid.Empty;
+                    var entry = sockets.Values.Cast<object>().Single();
+                    Assert.Null(entry.GetType().GetProperty("Handle")!.GetValue(entry));
+                    Assert.False((bool)entry.GetType().GetProperty("SealOutcomeKnown")!.GetValue(entry)!);
+                    issued = kernel.CapabilityAuthority.InspectionSnapshot().Single(record =>
+                        record.Descriptor.ResourceId.StartsWith("socket-object:", StringComparison.Ordinal)).Descriptor.CapabilityId;
+                    Assert.Equal(issued, (CapabilityId)entry.GetType().GetProperty("Capability")!.GetValue(entry)!);
+                    if (fault == 2)
+                    {
+                        var records = (global::System.Collections.IDictionary)typeof(CapabilityAuthority)
+                            .GetField("_records", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel.CapabilityAuthority)!;
+                        records.Remove(issued);
+                    }
+                    if (fault == 3) throw new InvalidOperationException("Seal owner outcome unknown.");
+                    if (fault == 4)
+                    {
+                        entered.SetResult();
+                        Assert.True(release.Wait(TimeSpan.FromSeconds(10)));
+                    }
+                    return Guid.Empty;
+                }));
+        var opening = client.OpenAsync(new(capability, "loopback:refused")).AsTask();
+        if (fault == 3)
+        {
+            Assert.Throws<InvalidOperationException>(() => host.ProcessNext());
+            Assert.Single(sockets.Keys.Cast<object>());
+            Assert.Equal(KernelError.ExternalEffectUncontained, kernel.CloseSession(caller, session).Error);
+            Assert.Equal(KernelError.ExternalEffectUncontained, kernel.FaultProcess(service).Error);
+            Assert.False(kernel.QueryProcessTeardown(service).Value.LocalReclaimCompleted);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => opening.WaitAsync(TimeSpan.FromSeconds(10)));
+        }
+        else
+        {
+            var dispatch = Task.Run(host.ProcessNext);
+            if (fault == 4)
+            {
+                try
+                {
+                    await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+                    Assert.Equal(KernelError.SessionDraining, kernel.CloseSession(caller, session).Error);
+                    Assert.Equal(KernelError.SessionDraining, host.ProcessNext().Error);
+                    Assert.Single(sockets.Keys.Cast<object>());
+                    Assert.False(dispatch.IsCompleted);
+                }
+                finally { release.Set(); }
+            }
+            var result = await dispatch.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(fault == 2 ? KernelError.CapabilityNotFound : KernelError.CapacityExhausted, result.Error);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => opening.WaitAsync(TimeSpan.FromSeconds(10)));
+            if (fault == 2)
+            {
+                Assert.Single(sockets.Keys.Cast<object>());
+                var entry = sockets.Values.Cast<object>().Single();
+                Assert.True((bool)entry.GetType().GetProperty("SealOutcomeKnown")!.GetValue(entry)!);
+                Assert.Null(entry.GetType().GetProperty("Handle")!.GetValue(entry));
+                Assert.Equal(KernelError.CapabilityNotFound, kernel.CloseSession(caller, session).Error);
+                Assert.Equal(KernelError.CapabilityNotFound, kernel.CloseSession(caller, session).Error);
+                Assert.Equal(KernelError.SessionDraining, host.ProcessNext().Error);
+                Assert.Equal(KernelError.CapabilityNotFound, kernel.FaultProcess(service).Error);
+                Assert.False(kernel.QueryProcessTeardown(service).Value.LocalReclaimCompleted);
+            }
+            else
+            {
+                Assert.True(kernel.CloseSession(caller, session).IsSuccess);
+                Assert.Empty(sockets.Keys.Cast<object>());
+                if (fault != 0)
+                    Assert.Equal(KernelError.CapabilityRevoked, kernel.ValidateCapability(caller, issued, CapabilityRights.Read).Error);
+            }
+        }
+        Assert.Equal(0, kernel.CapabilityAuthority.ActiveOperationLeaseCount);
+        Assert.Equal(0, kernel.EndpointSessions.ActivePinCount(session));
+    }
+
+    [Theory]
+    [InlineData(false, 0)] [InlineData(true, 0)]
+    [InlineData(false, 1)] [InlineData(true, 1)]
+    [InlineData(false, 2)] [InlineData(true, 2)]
+    [InlineData(false, 3)] [InlineData(true, 3)]
+    [InlineData(false, 4)] [InlineData(true, 4)]
+    public async Task FileCreationTracksIssuedControlAcrossSealRefusalExceptionAndOverlap(bool v2, int fault)
+    {
+        var (kernel, service, caller, capability, session, _) = FileScenario();
+        var host = RuntimeFileServiceHost.CreateForSession(kernel, service, session).Value!;
+        var client = IFileServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session));
+        var opaque = kernel.UpgradeCapabilityV1(caller, capability).Value;
+        var files = (global::System.Collections.IDictionary)typeof(RuntimeFileServiceHost)
+            .GetField("_files", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(host)!;
+        if (fault == 0)
+        {
+            var seed = client.OpenAsync(new(capability, "/seed", true)).AsTask();
+            Assert.True(host.ProcessNext().IsSuccess);
+            await seed;
+            typeof(SealedObjectAuthority).GetField("_capacity", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .SetValue(kernel.SealedObjects, 1);
+        }
+        using var release = new ManualResetEventSlim();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        CapabilityId issued = default;
+        if (fault != 0)
+            typeof(SealedObjectAuthority).GetField("_tokenFactory", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .SetValue(kernel.SealedObjects, (Func<Guid>)(() =>
+                {
+                    if (Interlocked.Increment(ref calls) != 1) return Guid.Empty;
+                    var entry = files.Values.Cast<object>().Single();
+                    Assert.Null(entry.GetType().GetProperty("Handle")!.GetValue(entry));
+                    Assert.False((bool)entry.GetType().GetProperty("SealOutcomeKnown")!.GetValue(entry)!);
+                    issued = kernel.CapabilityAuthority.InspectionSnapshot().Single(record =>
+                        record.Descriptor.ResourceId.StartsWith("file-object:", StringComparison.Ordinal)).Descriptor.CapabilityId;
+                    Assert.Equal(issued, (CapabilityId)entry.GetType().GetProperty("Capability")!.GetValue(entry)!);
+                    if (fault == 2)
+                    {
+                        var records = (global::System.Collections.IDictionary)typeof(CapabilityAuthority)
+                            .GetField("_records", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel.CapabilityAuthority)!;
+                        records.Remove(issued);
+                    }
+                    if (fault == 3) throw new InvalidOperationException("Seal owner outcome unknown.");
+                    if (fault == 4)
+                    {
+                        entered.SetResult();
+                        Assert.True(release.Wait(TimeSpan.FromSeconds(10)));
+                    }
+                    return Guid.Empty;
+                }));
+        var opening = v2 ? client.OpenV2Async(new(opaque, "/refused", true)).AsTask()
+            : client.OpenAsync(new(capability, "/refused", true)).AsTask();
+        if (fault == 3)
+        {
+            Assert.Throws<InvalidOperationException>(() => host.ProcessNext());
+            Assert.Single(files.Keys.Cast<object>());
+            Assert.Equal(KernelError.ExternalEffectUncontained, kernel.CloseSession(caller, session).Error);
+            Assert.Equal(KernelError.ExternalEffectUncontained, kernel.FaultProcess(service).Error);
+            Assert.False(kernel.QueryProcessTeardown(service).Value.LocalReclaimCompleted);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => opening.WaitAsync(TimeSpan.FromSeconds(10)));
+        }
+        else
+        {
+            var dispatch = Task.Run(host.ProcessNext);
+            if (fault == 4)
+            {
+                try
+                {
+                    await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+                    Assert.Equal(KernelError.SessionDraining, kernel.CloseSession(caller, session).Error);
+                    Assert.Equal(KernelError.SessionDraining, host.ProcessNext().Error);
+                    Assert.Single(files.Keys.Cast<object>());
+                    Assert.False(dispatch.IsCompleted);
+                }
+                finally { release.Set(); }
+            }
+            var result = await dispatch.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(fault == 2 ? KernelError.CapabilityNotFound : KernelError.CapacityExhausted, result.Error);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => opening.WaitAsync(TimeSpan.FromSeconds(10)));
+            if (fault == 2)
+            {
+                Assert.Single(files.Keys.Cast<object>());
+                var entry = files.Values.Cast<object>().Single();
+                Assert.True((bool)entry.GetType().GetProperty("SealOutcomeKnown")!.GetValue(entry)!);
+                Assert.Null(entry.GetType().GetProperty("Handle")!.GetValue(entry));
+                Assert.Equal(KernelError.CapabilityNotFound, kernel.CloseSession(caller, session).Error);
+                Assert.Equal(KernelError.CapabilityNotFound, kernel.CloseSession(caller, session).Error);
+                Assert.Equal(KernelError.SessionDraining, host.ProcessNext().Error);
+                Assert.Equal(KernelError.CapabilityNotFound, kernel.FaultProcess(service).Error);
+                Assert.False(kernel.QueryProcessTeardown(service).Value.LocalReclaimCompleted);
+            }
+            else
+            {
+                Assert.True(kernel.CloseSession(caller, session).IsSuccess);
+                Assert.Empty(files.Keys.Cast<object>());
+                if (fault != 0)
+                    Assert.Equal(KernelError.CapabilityRevoked, kernel.ValidateCapability(caller, issued, CapabilityRights.Read).Error);
+            }
+        }
+        Assert.Equal(0, kernel.CapabilityAuthority.ActiveOperationLeaseCount);
+        Assert.Equal(0, kernel.EndpointSessions.ActivePinCount(session));
+    }
+
+    [Theory]
+    [InlineData(false, 0)] [InlineData(true, 0)]
+    [InlineData(false, 1)] [InlineData(true, 1)]
+    [InlineData(false, 2)] [InlineData(true, 2)]
+    public async Task FileDrainRevokesEveryKnownSourceBeforeUncertainSealCleanup(bool v2, int fault)
+    {
+        var (kernel, service, caller, capability, session, _) = FileScenario();
+        var host = RuntimeFileServiceHost.CreateForSession(kernel, service, session).Value!;
+        var client = IFileServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session));
+        var opaque = kernel.UpgradeCapabilityV1(caller, capability).Value;
+        var controls = new List<FileObjectAuthority>();
+        for (var index = 0; index < 3; index++)
+        {
+            var pending = v2 ? client.OpenV2Async(new(opaque, $"/cleanup-{index}", true)).AsTask()
+                : client.OpenAsync(new(capability, $"/cleanup-{index}", true)).AsTask();
+            Assert.True(host.ProcessNext().IsSuccess);
+            controls.Add((await pending).Authority);
+        }
+        var files = (global::System.Collections.IDictionary)typeof(RuntimeFileServiceHost)
+            .GetField("_files", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(host)!;
+        if (fault == 0)
+        {
+            // Lose a real seal owner record; absence never becomes closure evidence.
+            var records = (global::System.Collections.IDictionary)typeof(SealedObjectAuthority)
+                .GetField("_records", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel.SealedObjects)!;
+            records.Remove(controls[1].File.Seal.OpaqueToken);
+        }
+        else if (fault == 1)
+        {
+            // Lose a real capability record. Remaining sources still must be revoked.
+            var records = (global::System.Collections.IDictionary)typeof(CapabilityAuthority)
+                .GetField("_records", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel.CapabilityAuthority)!;
+            records.Remove(controls[1].Capability);
+        }
+        else Assert.True(kernel.RevokeCapability(controls[1].Capability).IsSuccess);
+        var result = kernel.CloseSession(caller, session);
+        Assert.All(controls.Where((_, index) => fault != 1 || index != 1), control =>
+            Assert.Equal(KernelError.CapabilityRevoked, kernel.ValidateCapability(caller, control.Capability, CapabilityRights.Read).Error));
+        if (fault == 2)
+        {
+            Assert.True(result.IsSuccess, result.Message);
+            Assert.Empty(files.Keys.Cast<object>());
+        }
+        else
+        {
+            var expected = fault == 0 ? KernelError.StaleHandle : KernelError.CapabilityNotFound;
+            Assert.Equal(expected, result.Error);
+            Assert.Equal(expected, kernel.CloseSession(caller, session).Error);
+            var expectedIds = (fault == 0 ? controls.Skip(1) : controls).Select(control => control.File.ObjectId).ToArray();
+            Assert.Equal(expectedIds, files.Keys.Cast<FileObjectId>().OrderBy(id => id.Value));
+            Assert.True(kernel.EndpointSessions.Resolve(session, caller).IsSuccess);
+            Assert.Equal(expected, kernel.FaultProcess(service).Error);
+            Assert.False(kernel.QueryProcessTeardown(service).Value.LocalReclaimCompleted);
+            Assert.True(kernel.Processes.Resolve(service).IsSuccess);
+        }
+        Assert.Equal(KernelError.SessionDraining, host.ProcessNext().Error);
+        Assert.Equal(0, kernel.CapabilityAuthority.ActiveOperationLeaseCount);
+        Assert.Equal(0, kernel.EndpointSessions.ActivePinCount(session));
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)]
+    public async Task NetworkHostPendingDispatchRetainsLateSocketForRealClosureRetry(int boundary)
+    {
+        var (kernel, service, caller, capability, session) = NetworkDrainScenario();
+        var trace = new CompletedEventSink();
+        using var release = new ManualResetEventSlim();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var point = boundary switch { 0 => NativeSipDeterministicPoint.BeforeCapabilityCommit,
+            1 => NativeSipDeterministicPoint.BeforeImplementationEntry,
+            2 => NativeSipDeterministicPoint.AfterImplementationExit,
+            _ => NativeSipDeterministicPoint.BeforePublication };
+        var hook = new PointHook(point, () => { entered.SetResult(); Assert.True(release.Wait(TimeSpan.FromSeconds(10))); });
+        var host = RuntimeNetworkServiceHost.CreateForSession(kernel, service, session, trace, hook).Value!;
+        var client = INetworkServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session));
+        var opening = client.OpenAsync(new(capability, "loopback:pending")).AsTask();
+        var queued = client.OpenAsync(new(capability, "loopback:queued")).AsTask();
+        var dispatch = Task.Run(host.ProcessNext);
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(KernelError.SessionDraining, host.ProcessNext().Error);
+            Assert.Equal(KernelError.SessionDraining, kernel.CloseSession(caller, session).Error);
+            Assert.Equal(KernelError.SessionDraining, host.Drain().Error);
+            Assert.True(kernel.EndpointSessions.Resolve(session, caller).IsSuccess);
+            Assert.False(dispatch.IsCompleted);
+        }
+        finally { release.Set(); }
+        Assert.Equal(KernelError.SessionDraining, (await dispatch.WaitAsync(TimeSpan.FromSeconds(10))).Error);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => opening.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.DoesNotContain(NativeSipCompletedEvent.ResponsePublished, trace.Events);
+        if (boundary == 0)
+        {
+            Assert.DoesNotContain(NativeSipCompletedEvent.CapabilityAdmitted, trace.Events);
+            Assert.DoesNotContain(NativeSipCompletedEvent.ImplementationEntered, trace.Events);
+        }
+        var sockets = NetworkEntries(host);
+        Assert.Equal(boundary == 0 ? 0 : 1, sockets.Count);
+        var issued = kernel.CapabilityAuthority.InspectionSnapshot().Where(record =>
+            record.Descriptor.ResourceKind == ResourceKind.Network &&
+            record.Descriptor.ResourceId.StartsWith("socket-object:", StringComparison.Ordinal)).Select(record => record.Descriptor.CapabilityId).ToArray();
+        Assert.True(kernel.CloseSession(caller, session).IsSuccess);
+        Assert.Empty(sockets.Keys.Cast<object>());
+        Assert.All(issued, id => Assert.Equal(KernelError.CapabilityRevoked, kernel.ValidateCapability(caller, id, CapabilityRights.Read).Error));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => queued.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal(KernelError.SessionDraining, host.ProcessNext().Error);
+        Assert.Equal(0, kernel.CapabilityAuthority.ActiveOperationLeaseCount);
+        Assert.Equal(0, kernel.EndpointSessions.ActivePinCount(session));
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public async Task NetworkHostDispatchExceptionRetainsUnknownClosurePin(bool afterEffect)
+    {
+        var (kernel, service, caller, capability, session) = NetworkDrainScenario();
+        var hook = new PointHook(afterEffect ? NativeSipDeterministicPoint.BeforePublication
+            : NativeSipDeterministicPoint.AfterInvocationAccepted,
+            () => throw new InvalidOperationException("Network dispatch outcome unknown."));
+        var host = RuntimeNetworkServiceHost.CreateForSession(kernel, service, session, trace: null, hook).Value!;
+        var opening = INetworkServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session))
+            .OpenAsync(new(capability, "loopback:unknown")).AsTask();
+        Assert.Throws<InvalidOperationException>(() => host.ProcessNext());
+        Assert.Equal(KernelError.ExternalEffectUncontained, kernel.CloseSession(caller, session).Error);
+        Assert.Equal(KernelError.ExternalEffectUncontained, kernel.CloseSession(caller, session).Error);
+        Assert.Equal(KernelError.ExternalEffectUncontained, kernel.FaultProcess(service).Error);
+        Assert.False(kernel.QueryProcessTeardown(service).Value.LocalReclaimCompleted);
+        Assert.Equal(KernelError.SessionDraining, host.ProcessNext().Error);
+        Assert.Equal(afterEffect ? 1 : 0, NetworkEntries(host).Count);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => opening.WaitAsync(TimeSpan.FromSeconds(10)));
+    }
+
+    private static global::System.Collections.IDictionary NetworkEntries(RuntimeNetworkServiceHost host) =>
+        (global::System.Collections.IDictionary)typeof(RuntimeNetworkServiceHost)
+            .GetField("_sockets", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(host)!;
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public async Task NetworkPacketCommandKeepsDispatchPendingThroughLateEffect(bool receive)
+    {
+        var (kernel, service, caller, capability, session) = NetworkDrainScenario();
+        using var release = new ManualResetEventSlim();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var armed = false;
+        var hook = new PacketAdmissionHook(() =>
+        {
+            if (!armed) return;
+            entered.SetResult();
+            Assert.True(release.Wait(TimeSpan.FromSeconds(10)));
+        });
+        var host = RuntimeNetworkServiceHost.CreateForSession(kernel, service, session, trace: null, hook).Value!;
+        var client = INetworkServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session));
+        var opening = client.OpenAsync(new(capability, "loopback:packet")).AsTask();
+        Assert.True(host.ProcessNext().IsSuccess);
+        var authority = (await opening).Authority;
+        if (receive)
+        {
+            var seed = client.SendAsync(new(authority.Socket, authority.Capability, new BoundedBytes([1, 2]))).AsTask();
+            Assert.True(host.ProcessNext().IsSuccess);
+            await seed;
+        }
+        armed = true;
+        Task command = receive ? client.ReceiveAsync(new(authority.Socket, authority.Capability)).AsTask()
+            : client.SendAsync(new(authority.Socket, authority.Capability, new BoundedBytes([3, 4]))).AsTask();
+        var dispatch = Task.Run(host.ProcessNext);
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(KernelError.SessionDraining, kernel.CloseSession(caller, session).Error);
+            Assert.Equal(KernelError.SessionDraining, host.ProcessNext().Error);
+            Assert.False(dispatch.IsCompleted);
+        }
+        finally { release.Set(); }
+        Assert.Equal(KernelError.SessionDraining, (await dispatch.WaitAsync(TimeSpan.FromSeconds(10))).Error);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => command.WaitAsync(TimeSpan.FromSeconds(10)));
+        var sockets = NetworkEntries(host);
+        var entry = sockets.Values.Cast<object>().Single();
+        var packets = (Queue<byte[]>)entry.GetType().GetProperty("Packets")!.GetValue(entry)!;
+        Assert.Equal(receive ? 0 : 1, packets.Count);
+        Assert.True(kernel.CloseSession(caller, session).IsSuccess);
+        Assert.Empty(sockets.Keys.Cast<object>());
+        Assert.Equal(KernelError.CapabilityRevoked, kernel.ValidateCapability(caller, authority.Capability, CapabilityRights.Read).Error);
+        Assert.Equal(0, kernel.CapabilityAuthority.ActiveOperationLeaseCount);
+        Assert.Equal(0, kernel.EndpointSessions.ActivePinCount(session));
+    }
+
+    private sealed class PacketAdmissionHook(Action action) : INativeSipDeterministicHook
+    {
+        public void At(NativeSipDeterministicPoint point)
+        {
+            if (point == NativeSipDeterministicPoint.AfterCapabilityCommit) action();
+        }
+    }
+
+    [Fact]
+    public async Task NetworkDrainRetainsLostSealRecordAndConsumesEarlierSuccessfulSocketOnly()
+    {
+        var (kernel, service, caller, capability, session) = NetworkDrainScenario();
+        var host = RuntimeNetworkServiceHost.CreateForSession(kernel, service, session).Value!;
+        var client = INetworkServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session));
+        var firstRequest = client.OpenAsync(new(capability, "loopback:first")).AsTask();
+        Assert.True(host.ProcessNext().IsSuccess);
+        var first = (await firstRequest).Authority;
+        var secondRequest = client.OpenAsync(new(capability, "loopback:lost-seal")).AsTask();
+        Assert.True(host.ProcessNext().IsSuccess);
+        var second = (await secondRequest).Authority;
+        var thirdRequest = client.OpenAsync(new(capability, "loopback:later")).AsTask();
+        Assert.True(host.ProcessNext().IsSuccess);
+        var third = (await thirdRequest).Authority;
+        // Fault injection removes an existing real owner's record, never creates closure evidence.
+        var records = (global::System.Collections.IDictionary)typeof(SealedObjectAuthority)
+            .GetField("_records", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel.SealedObjects)!;
+        records.Remove(second.Socket.Seal.OpaqueToken);
+        Assert.Equal(KernelError.StaleHandle, kernel.CloseSession(caller, session).Error);
+        Assert.Equal(KernelError.CapabilityRevoked, kernel.ValidateCapability(caller, first.Capability, CapabilityRights.Read).Error);
+        Assert.Equal(KernelError.CapabilityRevoked, kernel.ValidateCapability(caller, second.Capability, CapabilityRights.Read).Error);
+        Assert.Equal(KernelError.CapabilityRevoked, kernel.ValidateCapability(caller, third.Capability, CapabilityRights.Read).Error);
+        Assert.Equal(2, NetworkEntries(host).Count);
+        Assert.Equal(KernelError.StaleHandle, kernel.CloseSession(caller, session).Error);
+        Assert.Equal(2, NetworkEntries(host).Count);
+        Assert.True(kernel.EndpointSessions.Resolve(session, caller).IsSuccess);
+        Assert.Equal(KernelError.SessionDraining, host.ProcessNext().Error);
+    }
+
+    private static (RuntimeKernel Kernel, ProcessHandle Service, ProcessHandle Caller, CapabilityId Capability,
+        EndpointSessionHandle Session) NetworkDrainScenario()
+    {
+        var kernel = new RuntimeKernel();
+        var protocol = INetworkServiceProtocol.CreateDefinition();
+        var service = AdmitNativeComponent(kernel, 2020, 20200, "network-drain", "network-drain-component",
+            protocol, INetworkServiceResponseProtocol.Definition, ResourceKind.Network,
+            CapabilityResourceIds.NetworkEndpoint, CapabilityRights.Configure).Process;
+        var caller = TestFixtures.Create(kernel, 2021, 20210).Handle;
+        var capability = kernel.MintCapability(new DomainId(20210), caller, ResourceKind.Network,
+            CapabilityResourceIds.NetworkEndpoint, CapabilityRights.Configure).Value!.CapabilityId;
+        var session = kernel.OpenSession(caller, kernel.ResolveByServiceName("network-drain").Value, [capability]).Value;
+        return (kernel, service, caller, capability, session);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public async Task DirectFileSentryUsesSamePendingDrainInterlock(bool afterEffect)
+    {
+        var (kernel, service, caller, capability, session, _) = FileScenario();
+        using var release = new ManualResetEventSlim();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var hook = new PointHook(afterEffect ? NativeSipDeterministicPoint.AfterImplementationExit
+            : NativeSipDeterministicPoint.BeforeCapabilityCommit, () =>
+        {
+            entered.SetResult();
+            Assert.True(release.Wait(TimeSpan.FromSeconds(10)));
+        });
+        var host = RuntimeFileServiceHost.CreateForSession(kernel, service, session, trace: null, hook).Value!;
+        var request = new OpenFileRequest(capability, "/direct-drain", true);
+        var begun = kernel.BeginInlineSessionInvocation(caller, service, session, IFileServiceProtocol.Message_OpenAsync, request);
+        Assert.True(begun.IsSuccess, begun.Message);
+        using var invocation = begun.Value!;
+        var sentry = Task.Run(() =>
+        {
+            var context = invocation.Context;
+            return IFileServiceGeneratedOperationSentries.InvokeRuntime_OpenAsync(host, in context, request);
+        });
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(KernelError.SessionDraining, kernel.CloseSession(caller, session).Error);
+            Assert.Equal(KernelError.SessionDraining, host.Drain().Error);
+            Assert.Equal(KernelError.SessionDraining, host.ProcessNext().Error);
+            Assert.False(sentry.IsCompleted);
+        }
+        finally { release.Set(); }
+        var returned = await sentry.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(afterEffect, returned.IsSuccess);
+        if (!afterEffect) Assert.Equal((int)KernelError.SessionDraining, returned.ErrorCode);
+        Assert.True(kernel.SettleInlineSessionInvocation(service, invocation, returned.IsSuccess).IsSuccess);
+        invocation.Dispose();
+        Assert.True(kernel.CloseSession(caller, session).IsSuccess);
+        if (afterEffect)
+            Assert.Equal(KernelError.CapabilityRevoked,
+                kernel.ValidateCapability(caller, returned.Value!.Authority.Capability, CapabilityRights.Read).Error);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public async Task FileHostPendingDispatchCannotCloseAndRealRetryConsumesLateFile(int boundary)
+    {
+        var (kernel, service, caller, capability, session, _) = FileScenario();
+        var trace = new CompletedEventSink();
+        using var release = new ManualResetEventSlim();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var hook = new PointHook(boundary == 0 ? NativeSipDeterministicPoint.BeforeCapabilityCommit
+            : boundary == 1 ? NativeSipDeterministicPoint.BeforeImplementationEntry
+            : NativeSipDeterministicPoint.BeforePublication, () =>
+        {
+            entered.SetResult();
+            Assert.True(release.Wait(TimeSpan.FromSeconds(10)));
+        });
+        var host = RuntimeFileServiceHost.CreateForSession(kernel, service, session, trace, hook).Value!;
+        var client = IFileServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session));
+        var opening = client.OpenAsync(new(capability, "/pending-file", true)).AsTask();
+        var dispatch = Task.Run(host.ProcessNext);
+        var queued = client.OpenAsync(new(capability, "/queued-file", true)).AsTask();
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(KernelError.SessionDraining, host.ProcessNext().Error);
+            Assert.Equal(KernelError.SessionDraining, kernel.CloseSession(caller, session).Error);
+            Assert.Equal(KernelError.SessionDraining, host.Drain().Error);
+            Assert.True(kernel.EndpointSessions.Resolve(session, caller).IsSuccess);
+            Assert.False(dispatch.IsCompleted);
+        }
+        finally { release.Set(); }
+        Assert.Equal(KernelError.SessionDraining, (await dispatch.WaitAsync(TimeSpan.FromSeconds(10))).Error);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => opening.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.DoesNotContain(NativeSipCompletedEvent.ResponsePublished, trace.Events);
+        if (boundary == 0)
+        {
+            Assert.DoesNotContain(NativeSipCompletedEvent.CapabilityAdmitted, trace.Events);
+            Assert.DoesNotContain(NativeSipCompletedEvent.ImplementationEntered, trace.Events);
+        }
+        var files = (global::System.Collections.IDictionary)typeof(RuntimeFileServiceHost)
+            .GetField("_files", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(host)!;
+        Assert.Equal(boundary == 0 ? 0 : 1, files.Count);
+        var issued = kernel.CapabilityAuthority.InspectionSnapshot().Where(record =>
+            record.Descriptor.ResourceKind == ResourceKind.File &&
+            record.Descriptor.ResourceId.StartsWith("file-object:", StringComparison.Ordinal)).Select(record => record.Descriptor.CapabilityId).ToArray();
+        Assert.True(kernel.CloseSession(caller, session).IsSuccess);
+        Assert.Empty(files.Keys.Cast<object>());
+        Assert.All(issued, id => Assert.Equal(KernelError.CapabilityRevoked, kernel.ValidateCapability(caller, id, CapabilityRights.Read).Error));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => queued.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal(KernelError.SessionDraining, host.ProcessNext().Error);
+        Assert.Equal(0, kernel.CapabilityAuthority.ActiveOperationLeaseCount);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public async Task FileHostDispatchExceptionKeepsNativeClosurePinnedBeforeAndAfterEffect(bool afterEffect)
+    {
+        var (kernel, service, caller, capability, session, _) = FileScenario();
+        var hook = new PointHook(afterEffect ? NativeSipDeterministicPoint.BeforePublication
+            : NativeSipDeterministicPoint.AfterInvocationAccepted,
+            () => throw new InvalidOperationException("File dispatch outcome unknown."));
+        var host = RuntimeFileServiceHost.CreateForSession(kernel, service, session, trace: null, hook).Value!;
+        var opening = IFileServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session))
+            .OpenAsync(new(capability, "/unknown-file", true)).AsTask();
+        Assert.Throws<InvalidOperationException>(() => host.ProcessNext());
+        Assert.Equal(KernelError.ExternalEffectUncontained, kernel.CloseSession(caller, session).Error);
+        Assert.Equal(KernelError.ExternalEffectUncontained, kernel.CloseSession(caller, session).Error);
+        Assert.Equal(KernelError.ExternalEffectUncontained, kernel.FaultProcess(service).Error);
+        Assert.False(kernel.QueryProcessTeardown(service).Value.LocalReclaimCompleted);
+        Assert.Equal(KernelError.SessionDraining, host.ProcessNext().Error);
+        var files = (global::System.Collections.IDictionary)typeof(RuntimeFileServiceHost)
+            .GetField("_files", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(host)!;
+        Assert.Equal(afterEffect ? 1 : 0, files.Count);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => opening.WaitAsync(TimeSpan.FromSeconds(10)));
+    }
+
+    [Theory]
+    [InlineData(0, 0)] [InlineData(0, 1)] [InlineData(0, 2)]
+    [InlineData(1, 0)] [InlineData(1, 1)] [InlineData(1, 2)]
+    [InlineData(2, 0)] [InlineData(2, 1)] [InlineData(2, 2)]
+    [InlineData(3, 0)] [InlineData(3, 1)] [InlineData(3, 2)]
+    public async Task NativeChildCreationRefusalTracksRealCompensationAndRetries(int contour, int closureOutcome)
+    {
+        var (kernel, host, caller, session, manager) = AttachedChildDrainScenario();
+        var child = new ProcessHandle(new ProcessId(2092), 1);
+        var relations = (global::System.Collections.IDictionary)typeof(RuntimeProcessServiceHost)
+            .GetField("_children", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(host)!;
+        var requirement = new CapabilityRequirementV1(ResourceKind.KernelService, "creation-required", CapabilityRights.Read);
+        CapabilityId delegatedSource = default;
+        if (contour == 1)
+        {
+            // Fill actual sealed owner capacity with a real earlier child.
+            typeof(SealedObjectAuthority).GetField("_capacity", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .SetValue(kernel.SealedObjects, 1);
+            var seeded = manager.CreateAsync(TestFixtures.Manifest(2094, 20940)).AsTask();
+            Assert.True(host.ProcessNext().IsSuccess);
+            await seeded;
+        }
+        if (contour == 2)
+            typeof(CapabilityAuthority).GetField("_nonceFactory", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .SetValue(kernel.CapabilityAuthority, (Func<Guid>)(() => Guid.Empty));
+        if (contour == 3)
+        {
+            // Real existing owner issuance with exhausted delegation depth;
+            // rights-only preflight passes, actual delegation refuses.
+            var minted = kernel.CapabilityAuthority.Mint(new DomainId(20910), new DomainId(20910),
+                ResourceKind.KernelService, requirement.ResourceId, CapabilityRights.Read | CapabilityRights.Delegate,
+                caller.Generation, 1, range: null, session: null, quota: ulong.MaxValue, delegationDepth: 0);
+            Assert.True(minted.IsSuccess);
+            delegatedSource = minted.Value!.CapabilityId;
+            kernel.Processes.Resolve(caller).Value!.AddCapability(delegatedSource);
+        }
+        var calls = 0;
+        var outcome = closureOutcome;
+        kernel.RegisterComposedWorkTeardownParticipant(new ChildDrainParticipant(process =>
+        {
+            if (process != child) return KernelResult.Ok();
+            calls++;
+            Assert.True(relations.Contains(child));
+            Assert.True(kernel.QueryProcessTeardown(child).Value.LocalAuthorizationRevoked);
+            if (contour != 2)
+            {
+                var control = Assert.Single(kernel.CapabilityAuthority.InspectionSnapshot(), record =>
+                    record.Descriptor.ResourceKind == ResourceKind.Process &&
+                    record.Descriptor.ResourceId == CapabilityResourceIds.Process(child)).Descriptor.CapabilityId;
+                Assert.Equal(KernelError.CapabilityRevoked, kernel.ValidateCapability(caller, control, CapabilityRights.Configure).Error);
+            }
+            if (outcome == 2) throw new InvalidOperationException("Child compensation outcome unknown.");
+            return outcome == 1 ? KernelResult.Fail(KernelError.ExternalEffectUncontained, "Child compensation refused.")
+                : KernelResult.Ok();
+        }));
+        var manifest = TestFixtures.Manifest(2092, 20920, capabilities: contour is 0 or 3 ? [requirement] : null);
+        var creating = (contour == 3 ? manager.CreateAsync(manifest, initialCapabilities: [new(delegatedSource, CapabilityRights.Read)])
+            : manager.CreateAsync(manifest)).AsTask();
+        var refused = host.ProcessNext();
+        var original = contour == 0 ? KernelError.MissingCapability : contour == 3 ? KernelError.DelegationDenied : KernelError.CapacityExhausted;
+        Assert.Equal(closureOutcome == 0 ? original : closureOutcome == 1 ? KernelError.ExternalEffectUncontained : KernelError.PlatformFaulted,
+            refused.Error);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => creating);
+        Assert.Equal(1, calls);
+        if (closureOutcome != 0)
+        {
+            Assert.True(relations.Contains(child));
+            Assert.False(kernel.QueryProcessTeardown(child).Value.LocalReclaimCompleted);
+            Assert.Equal(KernelError.SessionDraining, host.ProcessNext().Error);
+            Assert.Equal(closureOutcome == 1 ? KernelError.ExternalEffectUncontained : KernelError.PlatformFaulted,
+                kernel.CloseSession(caller, session).Error);
+            Assert.Equal(2, calls);
+            outcome = 0;
+        }
+        else Assert.False(relations.Contains(child));
+        Assert.True(kernel.CloseSession(caller, session).IsSuccess);
+        Assert.Equal(closureOutcome == 0 ? 1 : 3, calls);
+        Assert.Empty(relations.Keys.Cast<object>());
+        Assert.True(kernel.Processes.ResolveTerminalState(child).IsSuccess);
+    }
+
+    private static (RuntimeKernel Kernel, RuntimeProcessServiceHost Host, ProcessHandle Caller,
+        EndpointSessionHandle Session, ProcessManager Manager) AttachedChildDrainScenario(INativeSipDeterministicHook? hook = null)
+    {
+        var kernel = new RuntimeKernel();
+        var service = TestFixtures.Create(kernel, 2090, 20900).Handle;
+        var caller = TestFixtures.Create(kernel, 2091, 20910).Handle;
+        var create = kernel.MintCapability(new DomainId(20910), caller, ResourceKind.Process,
+            CapabilityResourceIds.ProcessCreate, CapabilityRights.Execute).Value!.CapabilityId;
+        var protocol = IProcessServiceProtocol.CreateDefinition();
+        var descriptor = kernel.RegisterService(service, "child-drain", Contract(protocol), protocol,
+            IProcessServiceResponseProtocol.Definition,
+            [new(ResourceKind.Process, CapabilityResourceIds.ProcessCreate, CapabilityRights.Execute)]).Value!;
+        var session = kernel.OpenSession(caller, descriptor, [create]).Value;
+        var host = RuntimeProcessServiceHost.CreateForSession(kernel, service, session, hook).Value!;
+        return (kernel, host, caller, session,
+            new ProcessManager(IProcessServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session)), create));
+    }
+
+    private sealed class ChildDrainParticipant(Func<ProcessHandle, KernelResult> close) : IComposedWorkTeardownParticipant
+    {
+        public KernelResult CloseComposedWorkForProcess(ProcessHandle process, RegionOwner owner) => close(process);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public async Task ProcessHostDrainWaitsForPendingDispatchAndRejectsQueuedNewEffect(bool afterEffect)
+    {
+        using var release = new ManualResetEventSlim();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var hook = new PointHook(afterEffect ? NativeSipDeterministicPoint.BeforePublication
+            : NativeSipDeterministicPoint.AfterSessionResolved, () =>
+        {
+            entered.SetResult();
+            Assert.True(release.Wait(TimeSpan.FromSeconds(10)));
+        });
+        var (kernel, host, caller, session, manager) = AttachedChildDrainScenario(hook);
+        var creating = manager.CreateAsync(TestFixtures.Manifest(2092, 20920)).AsTask();
+        var dispatch = Task.Run(host.ProcessNext);
+        var queued = manager.CreateAsync(TestFixtures.Manifest(2093, 20930)).AsTask();
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(KernelError.SessionDraining, host.ProcessNext().Error);
+            Assert.Equal(KernelError.SessionDraining, kernel.CloseSession(caller, session).Error);
+            Assert.Equal(KernelError.SessionDraining, host.Drain().Error);
+            Assert.Equal(KernelError.SessionDraining, host.ProcessNext().Error);
+            Assert.True(kernel.EndpointSessions.Resolve(session, caller).IsSuccess);
+            Assert.False(dispatch.IsCompleted);
+        }
+        finally { release.Set(); }
+        Assert.True((await dispatch.WaitAsync(TimeSpan.FromSeconds(10))).IsSuccess);
+        var child = await creating.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(KernelError.SessionDraining, host.ProcessNext().Error);
+        Assert.True(kernel.CloseSession(caller, session).IsSuccess);
+        Assert.True(kernel.Processes.ResolveTerminalState(child.Authority.Process).IsSuccess);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => queued.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal(KernelError.ProcessNotFound, kernel.Processes.Resolve(new(new ProcessId(2093), 1)).Error);
+    }
+
+    [Fact]
+    public async Task ProcessHostSourceRevokeBeforeEffectBalancesDispatchForActualDrainRetry()
+    {
+        RuntimeKernel? kernel = null;
+        CapabilityId source = default;
+        var hook = new PointHook(NativeSipDeterministicPoint.AfterSessionResolved,
+            () => Assert.True(kernel!.RevokeCapability(source).IsSuccess));
+        var scenario = AttachedChildDrainScenario(hook);
+        kernel = scenario.Kernel;
+        source = Assert.Single(kernel.EndpointSessions.Resolve(scenario.Session, scenario.Caller).Value!.Capabilities);
+        var creating = scenario.Manager.CreateAsync(TestFixtures.Manifest(2092, 20920)).AsTask();
+        Assert.Equal(KernelError.CapabilityRevoked, scenario.Host.ProcessNext().Error);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => creating);
+        Assert.Equal(KernelError.ProcessNotFound, kernel.Processes.Resolve(new(new ProcessId(2092), 1)).Error);
+        Assert.True(kernel.CloseSession(scenario.Caller, scenario.Session).IsSuccess);
+        Assert.Equal(KernelError.SessionDraining, scenario.Host.ProcessNext().Error);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public async Task ProcessHostDispatchExceptionPinsUnknownClosureBeforeAndAfterChildEffect(bool afterEffect)
+    {
+        var hook = new PointHook(afterEffect ? NativeSipDeterministicPoint.BeforePublication
+            : NativeSipDeterministicPoint.AfterInvocationAccepted,
+            () => throw new InvalidOperationException("Native dispatch outcome unknown."));
+        var (kernel, host, caller, session, manager) = AttachedChildDrainScenario(hook);
+        var provider = kernel.EndpointSessions.Resolve(session, caller).Value!.Service;
+        var creating = manager.CreateAsync(TestFixtures.Manifest(2092, 20920)).AsTask();
+        Assert.Throws<InvalidOperationException>(() => host.ProcessNext());
+        Assert.Equal(KernelError.ExternalEffectUncontained, kernel.CloseSession(caller, session).Error);
+        Assert.Equal(KernelError.ExternalEffectUncontained, kernel.CloseSession(caller, session).Error);
+        Assert.Equal(KernelError.SessionDraining, host.ProcessNext().Error);
+        Assert.Equal(KernelError.ExternalEffectUncontained, kernel.TerminateProcess(provider).Error);
+        Assert.False(kernel.QueryProcessTeardown(provider).Value.LocalReclaimCompleted);
+        Assert.Equal(afterEffect, kernel.Processes.Resolve(new(new ProcessId(2092), 1)).IsSuccess);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => creating.WaitAsync(TimeSpan.FromSeconds(10)));
+    }
+
+    [Fact]
+    public async Task ProcessHostDrainCallbackAllowsOwnerQueryAndRefusesOverlappingDrainAndDispatch()
+    {
+        var (kernel, host, caller, session, manager) = AttachedChildDrainScenario();
+        var creating = manager.CreateAsync(TestFixtures.Manifest(2092, 20920)).AsTask();
+        Assert.True(host.ProcessNext().IsSuccess);
+        var child = await creating;
+        using var release = new ManualResetEventSlim();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        kernel.RegisterComposedWorkTeardownParticipant(new ChildDrainParticipant(process =>
+        {
+            if (process != child.Authority.Process) return KernelResult.Ok();
+            entered.SetResult();
+            Assert.True(release.Wait(TimeSpan.FromSeconds(10)));
+            return KernelResult.Ok();
+        }));
+        var drain = Task.Run(() => kernel.CloseSession(caller, session));
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(KernelError.SessionDraining, host.Drain().Error);
+            Assert.Equal(KernelError.SessionDraining, host.ProcessNext().Error);
+            var pending = await Task.Run(() => kernel.QueryProcessTeardown(child.Authority.Process)).WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.True(pending.IsSuccess);
+            Assert.False(pending.Value.LocalReclaimCompleted);
+            Assert.False(drain.IsCompleted);
+        }
+        finally { release.Set(); }
+        Assert.True((await drain.WaitAsync(TimeSpan.FromSeconds(10))).IsSuccess);
+        Assert.True(kernel.Processes.ResolveTerminalState(child.Authority.Process).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public async Task AttachedChildDrainConsumesSuccessfulRelationBeforeLaterFailureAndRetries(bool throws)
+    {
+        var (kernel, host, caller, session, manager) = AttachedChildDrainScenario();
+        var creatingFirst = manager.CreateAsync(TestFixtures.Manifest(2092, 20920)).AsTask();
+        Assert.True(host.ProcessNext().IsSuccess);
+        var first = await creatingFirst;
+        var creatingSecond = manager.CreateAsync(TestFixtures.Manifest(2093, 20930)).AsTask();
+        Assert.True(host.ProcessNext().IsSuccess);
+        var second = await creatingSecond;
+        var refuse = true;
+        var firstCalls = 0;
+        var secondCalls = 0;
+        kernel.RegisterComposedWorkTeardownParticipant(new ChildDrainParticipant(process =>
+        {
+            if (process == first.Authority.Process) firstCalls++;
+            if (process != second.Authority.Process) return KernelResult.Ok();
+            secondCalls++;
+            if (!refuse) return KernelResult.Ok();
+            if (throws) throw new InvalidOperationException("Child closure receipt unavailable.");
+            return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Child drain refused.");
+        }));
+        var refused = kernel.CloseSession(caller, session);
+        Assert.Equal(throws ? KernelError.PlatformFaulted : KernelError.ExternalEffectUncontained, refused.Error);
+        Assert.Equal(1, firstCalls);
+        Assert.Equal(1, secondCalls);
+        Assert.True(kernel.Processes.ResolveTerminalState(first.Authority.Process).IsSuccess);
+        Assert.Equal(KernelError.CapabilityRevoked,
+            kernel.ValidateCapability(caller, first.Authority.ControlCapability, CapabilityRights.Configure).Error);
+        var relations = (global::System.Collections.IDictionary)typeof(RuntimeProcessServiceHost)
+            .GetField("_children", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(host)!;
+        Assert.Single(relations.Keys.Cast<object>());
+        Assert.True(relations.Contains(second.Authority.Process));
+        Assert.False(kernel.QueryProcessTeardown(second.Authority.Process).Value.LocalReclaimCompleted);
+        Assert.True(kernel.EndpointSessions.Resolve(session, caller).IsSuccess);
+        refuse = false;
+        Assert.True(kernel.CloseSession(caller, session).IsSuccess);
+        Assert.Equal(1, firstCalls);
+        Assert.Equal(2, secondCalls);
+        Assert.Empty(relations.Keys.Cast<object>());
+        Assert.True(kernel.Processes.ResolveTerminalState(second.Authority.Process).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public async Task AttachedChildDrainRequiresExactOwnerRetirementReceiptAcrossAba(int contour)
+    {
+        var (kernel, host, caller, session, manager) = AttachedChildDrainScenario();
+        var creating = manager.CreateAsync(TestFixtures.Manifest(2092, 20920)).AsTask();
+        Assert.True(host.ProcessNext().IsSuccess);
+        var child = await creating;
+        Assert.True((contour == 1 ? kernel.FaultProcess(child.Authority.Process)
+            : kernel.TerminateProcess(child.Authority.Process)).IsSuccess);
+        var fresh = TestFixtures.Create(kernel, 2092, 20920, 2).Handle;
+        Assert.True(kernel.AdmitProcess(fresh).IsSuccess);
+        if (contour == 2)
+        {
+            // Fault injection loses an existing real owner receipt. No fake
+            // receipt/closure is supplied to compensate for it.
+            var receipts = (global::System.Collections.IDictionary)typeof(ProcessRegistry)
+                .GetField("_terminalStates", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel.Processes)!;
+            receipts.Remove(child.Authority.Process);
+        }
+        var drained = kernel.CloseSession(caller, session);
+        var relations = (global::System.Collections.IDictionary)typeof(RuntimeProcessServiceHost)
+            .GetField("_children", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(host)!;
+        if (contour == 2)
+        {
+            Assert.Equal(KernelError.StaleHandle, drained.Error);
+            Assert.Single(relations.Keys.Cast<object>());
+            Assert.True(kernel.EndpointSessions.Resolve(session, caller).IsSuccess);
+            Assert.Equal(KernelError.StaleHandle, kernel.CloseSession(caller, session).Error);
+        }
+        else
+        {
+            Assert.True(drained.IsSuccess, drained.Message);
+            Assert.Empty(relations.Keys.Cast<object>());
+        }
+        Assert.True(kernel.Processes.Resolve(fresh).IsSuccess);
+        Assert.Equal(ProcessState.Admitted, kernel.Processes.Resolve(fresh).Value!.State);
+    }
+
     [Fact]
     public void GeneratedSentryAbiIsOpaqueOutsideFriendTcbAssemblies()
     {
@@ -144,18 +1219,19 @@ public sealed class NativeSystemServiceVerticalSliceTests
         var (kernel, service, caller, capability, session, _) = FileScenario();
         var trace = new CompletedEventSink();
         var hook = new PointHook(NativeSipDeterministicPoint.AfterSessionResolved, () =>
-            Assert.True(kernel.CloseSession(caller, session).IsSuccess));
+            Assert.Equal(KernelError.SessionDraining, kernel.CloseSession(caller, session).Error));
         var host = RuntimeFileServiceHost.CreateForSession(kernel, service, session, trace, hook).Value!;
         var pending = IFileServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session))
             .OpenAsync(new(capability, "/closed-after-resolution", true)).AsTask();
 
         var processed = host.ProcessNext();
         Assert.False(processed.IsSuccess);
-        Assert.Equal(KernelError.SessionClosed, processed.Error);
+        Assert.Equal(KernelError.SessionDraining, processed.Error);
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending);
         Assert.True(hook.Fired);
         Assert.DoesNotContain(NativeSipCompletedEvent.CapabilityAdmitted, trace.Events);
         Assert.DoesNotContain(NativeSipCompletedEvent.ImplementationEntered, trace.Events);
+        Assert.True(kernel.CloseSession(caller, session).IsSuccess);
     }
 
     [Fact]
@@ -164,18 +1240,20 @@ public sealed class NativeSystemServiceVerticalSliceTests
         var (kernel, service, caller, capability, session, _) = FileScenario();
         var trace = new CompletedEventSink();
         var hook = new PointHook(NativeSipDeterministicPoint.AfterSessionResolved, () =>
-            Assert.Equal(KernelError.PlatformBindingDraining, kernel.FaultProcess(service).Error));
+            Assert.Equal(KernelError.SessionDraining, kernel.FaultProcess(service).Error));
         var host = RuntimeFileServiceHost.CreateForSession(kernel, service, session, trace, hook).Value!;
         var pending = IFileServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session))
             .OpenAsync(new(capability, "/faulted-service", true)).AsTask();
 
         var processed = host.ProcessNext();
         Assert.False(processed.IsSuccess);
-        Assert.Equal(KernelError.SessionClosed, processed.Error);
+        Assert.Equal(KernelError.SessionDraining, processed.Error);
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending);
         Assert.True(hook.Fired);
         Assert.DoesNotContain(NativeSipCompletedEvent.CapabilityAdmitted, trace.Events);
         Assert.DoesNotContain(NativeSipCompletedEvent.ImplementationEntered, trace.Events);
+        Assert.Equal(KernelError.PlatformBindingDraining, kernel.FaultProcess(service).Error);
+        Assert.False(kernel.QueryProcessTeardown(service).Value.LocalReclaimCompleted);
     }
 
     [Fact]
@@ -222,19 +1300,19 @@ public sealed class NativeSystemServiceVerticalSliceTests
         var (kernel, service, caller, capability, session, _) = FileScenario();
         var trace = new CompletedEventSink();
         var hook = new PointHook(NativeSipDeterministicPoint.BeforePublication, () =>
-            Assert.True(kernel.CloseSession(caller, session).IsSuccess));
+            Assert.Equal(KernelError.SessionDraining, kernel.CloseSession(caller, session).Error));
         var host = RuntimeFileServiceHost.CreateForSession(kernel, service, session, trace, hook).Value!;
         var pending = IFileServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session))
             .OpenAsync(new(capability, "/closed-before-publication", true)).AsTask();
 
         var processed = host.ProcessNext();
         Assert.False(processed.IsSuccess);
-        Assert.Equal(KernelError.SessionClosed, processed.Error);
+        Assert.Equal(KernelError.SessionDraining, processed.Error);
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending);
         Assert.True(hook.Fired);
         Assert.Contains(NativeSipCompletedEvent.ImplementationExited, trace.Events);
         Assert.DoesNotContain(NativeSipCompletedEvent.ResponsePublished, trace.Events);
-        Assert.True(host.Drain().IsSuccess);
+        Assert.True(kernel.CloseSession(caller, session).IsSuccess);
     }
 
     [Fact]

@@ -125,7 +125,12 @@ public sealed partial class RuntimeKernel
         ServiceEndpointDescriptor descriptor,
         IReadOnlyCollection<CapabilityId>? admissionCapabilities = null,
         int capacity = 8,
-        TimeSpan? lifetime = null)
+        TimeSpan? lifetime = null) =>
+        OpenSessionCore(caller, descriptor, admissionCapabilities, capacity, lifetime, source: null);
+
+    private KernelResult<EndpointSessionHandle> OpenSessionCore(ProcessHandle caller,
+        ServiceEndpointDescriptor descriptor, IReadOnlyCollection<CapabilityId>? admissionCapabilities,
+        int capacity, TimeSpan? lifetime, (ProcessHandle Principal, CapabilityId Capability)? source)
     {
         lock (_platformMemoryUseGate)
         {
@@ -137,44 +142,114 @@ public sealed partial class RuntimeKernel
         if (!callerEffect.IsSuccess) return KernelResult<EndpointSessionHandle>.Fail(callerEffect.Error, callerEffect.Message!);
         var serviceResult = Services.Resolve(descriptor);
         if (!serviceResult.IsSuccess) return KernelResult<EndpointSessionHandle>.Fail(serviceResult.Error, serviceResult.Message!);
-        var service = serviceResult.Value!;
-        var providerResult = Processes.Resolve(service.Provider);
-        if (!providerResult.IsSuccess) return KernelResult<EndpointSessionHandle>.Fail(providerResult.Error, providerResult.Message!);
-        var providerEffect = EnsureProcessAcceptsNewEffects(providerResult.Value!);
-        if (!providerEffect.IsSuccess) return KernelResult<EndpointSessionHandle>.Fail(providerEffect.Error, providerEffect.Message!);
-
         var capabilityIds = admissionCapabilities?.ToArray() ?? [];
-        foreach (var requirement in service.RequiredCapabilities)
+        if (source is { } control)
+        {
+            if (lifetime is not null)
+                return KernelResult<EndpointSessionHandle>.Fail(KernelError.InvalidTransition, "Supervisor rebind requires lifetime-free local admission.");
+            var principal = Processes.Resolve(control.Principal);
+            if (!principal.IsSuccess) return KernelResult<EndpointSessionHandle>.Fail(KernelError.SupervisorDenied, principal.Message!);
+            var principalEffect = EnsureProcessAcceptsNewEffects(principal.Value!);
+            if (!principalEffect.IsSuccess) return KernelResult<EndpointSessionHandle>.Fail(KernelError.SupervisorDenied, principalEffect.Message!);
+            return Services.CommitSessionAdmission(descriptor, exact =>
+            {
+                var requirements = exact.RequiredCapabilities.ToArray();
+                return CapabilityAuthority.CommitSupervisorSessionAdmission(control.Capability,
+                    principal.Value!.DomainId, control.Principal.Generation, () => CreateSession(exact, requirements));
+            });
+        }
+        return CreateSession(serviceResult.Value!, serviceResult.Value!.RequiredCapabilities);
+
+        KernelResult<EndpointSessionHandle> CreateSession(ServiceRegistry.Record service, IReadOnlyList<CapabilityRequirementV1> requirements)
+        {
+        var admission = ValidateSessionPartiesAndRequirements(caller, service, requirements, capabilityIds);
+        if (!admission.IsSuccess) return KernelResult<EndpointSessionHandle>.Fail(admission.Error, admission.Message!);
+
+        var channel = service.ResponseProtocol is null
+            ? CreateChannel(caller, service.Provider, service.Protocol, capacity)
+            : CreateChannel(caller, service.Provider, service.Protocol, service.ResponseProtocol, capacity);
+        if (!channel.IsSuccess) return KernelResult<EndpointSessionHandle>.Fail(channel.Error, channel.Message!);
+        var session = EndpointSessions.Add(caller, service.Provider, capabilityIds, requirements, channel.Value!.Left, lifetime);
+        return session.IsSuccess
+            ? KernelResult<EndpointSessionHandle>.Ok(session.Value!.Handle)
+            : KernelResult<EndpointSessionHandle>.Fail(session.Error, session.Message!);
+        }
+        }
+    }
+
+    private KernelResult PreflightDependencySession(ProcessHandle caller, ServiceEndpointDescriptor descriptor,
+        IReadOnlyCollection<CapabilityId> capabilities)
+    {
+        lock (_platformMemoryUseGate)
+        {
+            var ids = capabilities.ToArray();
+            var checkedAdmission = Services.CommitSessionAdmission(descriptor, exact =>
+            {
+                var valid = ValidateSessionPartiesAndRequirements(caller, exact, exact.RequiredCapabilities, ids);
+                return valid.IsSuccess ? KernelResult<bool>.Ok(true) : KernelResult<bool>.Fail(valid.Error, valid.Message!);
+            });
+            return checkedAdmission.IsSuccess ? KernelResult.Ok()
+                : KernelResult.Fail(checkedAdmission.Error, checkedAdmission.Message!);
+        }
+    }
+
+    private KernelResult ValidateSessionPartiesAndRequirements(ProcessHandle caller, ServiceRegistry.Record service,
+        IReadOnlyList<CapabilityRequirementV1> requirements, CapabilityId[] capabilityIds)
+    {
+        var callerResult = Processes.Resolve(caller);
+        if (!callerResult.IsSuccess) return KernelResult.Fail(callerResult.Error, callerResult.Message!);
+        var callerEffect = EnsureProcessAcceptsNewEffects(callerResult.Value!);
+        if (!callerEffect.IsSuccess) return callerEffect;
+        var providerResult = Processes.Resolve(service.Provider);
+        if (!providerResult.IsSuccess) return KernelResult.Fail(providerResult.Error, providerResult.Message!);
+        var providerEffect = EnsureProcessAcceptsNewEffects(providerResult.Value!);
+        if (!providerEffect.IsSuccess) return providerEffect;
+        foreach (var requirement in requirements)
         {
             var found = capabilityIds.Any(id =>
             {
                 var validation = CapabilityAuthority.Validate(id, callerResult.Value!.DomainId, caller.Generation, requirement.Rights);
                 return validation.IsSuccess && validation.Value!.ResourceKind == requirement.ResourceKind && validation.Value.ResourceId == requirement.ResourceId;
             });
-            if (!found) return KernelResult<EndpointSessionHandle>.Fail(KernelError.MissingCapability, $"Session requires {requirement.ResourceKind}:{requirement.ResourceId} ({requirement.Rights}).");
+            if (!found) return KernelResult.Fail(KernelError.MissingCapability,
+                $"Session requires {requirement.ResourceKind}:{requirement.ResourceId} ({requirement.Rights}).");
         }
+        return KernelResult.Ok();
+    }
 
-        var channel = service.ResponseProtocol is null
-            ? CreateChannel(caller, service.Provider, service.Protocol, capacity)
-            : CreateChannel(caller, service.Provider, service.Protocol, service.ResponseProtocol, capacity);
-        if (!channel.IsSuccess) return KernelResult<EndpointSessionHandle>.Fail(channel.Error, channel.Message!);
-        var session = EndpointSessions.Add(caller, service.Provider, capabilityIds, service.RequiredCapabilities, channel.Value!.Left, lifetime);
-        return session.IsSuccess
-            ? KernelResult<EndpointSessionHandle>.Ok(session.Value!.Handle)
-            : KernelResult<EndpointSessionHandle>.Fail(session.Error, session.Message!);
+    private KernelResult ValidateSupervisorSessionSource(ProcessHandle principal, CapabilityId capability)
+    {
+        lock (_platformMemoryUseGate)
+        {
+            var exact = Processes.Resolve(principal);
+            if (!exact.IsSuccess) return KernelResult.Fail(KernelError.SupervisorDenied, exact.Message!);
+            var effect = EnsureProcessAcceptsNewEffects(exact.Value!);
+            return effect.IsSuccess ? CapabilityAuthority.CommitSupervisorTelemetryPublication(capability,
+                exact.Value!.DomainId, principal.Generation) : KernelResult.Fail(KernelError.SupervisorDenied, effect.Message!);
         }
     }
 
-    public KernelResult CloseSession(ProcessHandle caller, EndpointSessionHandle handle)
+    public KernelResult CloseSession(ProcessHandle caller, EndpointSessionHandle handle) =>
+        CloseSession(caller, handle, allowAlreadyClosed: false);
+
+    private KernelResult CloseSession(ProcessHandle caller, EndpointSessionHandle handle, bool allowAlreadyClosed)
     {
         var nativeDrain = DrainNativeServiceSession(handle);
         if (!nativeDrain.IsSuccess) return nativeDrain;
         lock (_requestResponseCorrelationGate)
         {
-            var session = EndpointSessions.Close(handle, caller);
+            if (allowAlreadyClosed && _endpointSessionInvocationRegistry is { } invocations &&
+                invocations.UnclosedPossibleEffectCount(handle) != 0)
+                return KernelResult.Fail(KernelError.SessionDraining, "Dependency invocation effect has not closed; routing accounting is retained.");
+            var session = EndpointSessions.Close(handle, caller, allowAlreadyClosed);
             if (!session.IsSuccess) return KernelResult.Fail(session.Error, session.Message!);
             CloseSessionResourceDonations(handle);
-            var close = Channels.Close(session.Value!.Channel);
+            // Cleanup removes unaccepted correlations under the invocation owner
+            // gate. Acceptance that won the race, or donation quarantine created
+            // by cleanup, must still retain dependency routing accounting.
+            if (allowAlreadyClosed && SessionInvocations.UnclosedPossibleEffectCount(handle) != 0)
+                return KernelResult.Fail(KernelError.SessionDraining, "Invocation cleanup retained a possible effect; dependency routing cannot be retired.");
+            var close = Channels.Close(session.Value!.Channel, allowAlreadyClosed);
             return close.IsSuccess ? KernelResult.Ok() : close;
         }
     }

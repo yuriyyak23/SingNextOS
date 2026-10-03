@@ -45,7 +45,7 @@ internal interface INativeSipDeterministicHook
 
 internal static class NativeServiceDispatch
 {
-    internal static KernelResult Dispatch(RuntimeKernel kernel, ProcessHandle service, EndpointSessionHandle session, Func<TrustedSipInvocationContext, ChannelEnvelope, KernelResult<object?>> operation, INativeSipCompletedEventSink? trace = null, INativeSipDeterministicHook? hook = null)
+    internal static KernelResult Dispatch(RuntimeKernel kernel, ProcessHandle service, EndpointSessionHandle session, Func<TrustedSipInvocationContext, ChannelEnvelope, KernelResult<object?>> operation, INativeSipCompletedEventSink? trace = null, INativeSipDeterministicHook? hook = null, Func<KernelResult>? beforePublication = null)
     {
         var received = kernel.ReceiveSessionRequest(service, session);
         if (!received.IsSuccess) return KernelResult.Fail(received.Error, received.Message!);
@@ -78,6 +78,16 @@ internal static class NativeServiceDispatch
             return KernelResult.Fail(result.Error, result.Message!);
         }
         hook?.At(NativeSipDeterministicPoint.BeforePublication);
+        if (beforePublication is not null)
+        {
+            var publication = beforePublication();
+            if (!publication.IsSuccess)
+            {
+                var cancelled = kernel.CancelSessionResponse(service, invocation);
+                if (cancelled.IsSuccess) trace?.Record(NativeSipCompletedEvent.ResponseCancelled);
+                return publication;
+            }
+        }
         var published = kernel.PublishSessionResponse(service, invocation, result.Value);
         if (published.IsSuccess)
         {
@@ -99,39 +109,134 @@ internal static class NativeServiceDispatch
 
 public sealed class RuntimeProcessServiceHost
 {
+    private sealed class ChildRelation(ProcessHandle parent, ChildProcessPolicy policy)
+    {
+        public ProcessHandle Parent { get; } = parent;
+        public ChildProcessPolicy Policy { get; } = policy;
+        public CapabilityId? ControlCapability { get; set; }
+        public ProcessControlObjectHandle? Control { get; set; }
+    }
+    private readonly object _dispatchDrainGate = new();
+    // Host admission/closure interlocks only. Permission and invocation effects
+    // remain owned by their existing kernel authorities.
+    private bool _dispatchInProgress;
+    private bool _drainRequested;
+    private bool _drainInProgress;
+    private bool _dispatchFaultPinned;
+    private readonly INativeSipDeterministicHook? _hook;
     private readonly RuntimeKernel _kernel;
     private readonly ProcessHandle _service;
     private readonly EndpointSessionHandle _session;
-    private readonly Dictionary<ProcessHandle, (ProcessHandle Parent, ChildProcessPolicy Policy, CapabilityId ControlCapability, ProcessControlObjectHandle Control)> _children = [];
+    private readonly Dictionary<ProcessHandle, ChildRelation> _children = [];
     private readonly ServiceEndpointDescriptor _serviceDescriptor;
 
-    private RuntimeProcessServiceHost(RuntimeKernel kernel, ProcessHandle service, EndpointSessionHandle session, ServiceEndpointDescriptor serviceDescriptor) { _kernel = kernel; _service = service; _session = session; _serviceDescriptor = serviceDescriptor; }
+    private RuntimeProcessServiceHost(RuntimeKernel kernel, ProcessHandle service, EndpointSessionHandle session, ServiceEndpointDescriptor serviceDescriptor, INativeSipDeterministicHook? hook) { _kernel = kernel; _service = service; _session = session; _serviceDescriptor = serviceDescriptor; _hook = hook; }
     public static KernelResult<RuntimeProcessServiceHost> CreateForSession(RuntimeKernel kernel, ProcessHandle service, EndpointSessionHandle session)
+        => CreateForSession(kernel, service, session, hook: null);
+    internal static KernelResult<RuntimeProcessServiceHost> CreateForSession(RuntimeKernel kernel, ProcessHandle service, EndpointSessionHandle session, INativeSipDeterministicHook? hook)
     {
         var resolved = kernel.EndpointSessions.ResolveForService(session, service);
         if (!resolved.IsSuccess) return KernelResult<RuntimeProcessServiceHost>.Fail(resolved.Error, resolved.Message!);
         var descriptor = kernel.Services.ResolveForProvider(service, IProcessServiceProtocol.CreateDefinition().ContractName);
         if (!descriptor.IsSuccess) return KernelResult<RuntimeProcessServiceHost>.Fail(descriptor.Error, descriptor.Message!);
-        var host = new RuntimeProcessServiceHost(kernel, service, session, descriptor.Value!);
+        var host = new RuntimeProcessServiceHost(kernel, service, session, descriptor.Value!, hook);
         kernel.RegisterNativeServiceDrain(service, session, host.Drain);
         return KernelResult<RuntimeProcessServiceHost>.Ok(host);
     }
-    public KernelResult ProcessNext() => NativeServiceDispatch.Dispatch(_kernel, _service, _session, Execute);
+    public KernelResult ProcessNext()
+    {
+        lock (_dispatchDrainGate)
+        {
+            if (_drainRequested || _dispatchInProgress)
+                return KernelResult.Fail(KernelError.SessionDraining, "Native process host dispatch is draining or already in progress.");
+            _dispatchInProgress = true;
+        }
+        var returned = false;
+        try
+        {
+            var result = NativeServiceDispatch.Dispatch(_kernel, _service, _session, Execute, hook: _hook);
+            returned = true;
+            return result;
+        }
+        finally
+        {
+            lock (_dispatchDrainGate)
+            {
+                _dispatchInProgress = false;
+                if (!returned)
+                {
+                    _dispatchFaultPinned = true;
+                    _drainRequested = true;
+                }
+            }
+        }
+    }
     public KernelResult Drain()
     {
-        foreach (var child in _children.Where(static pair => pair.Value.Policy == ChildProcessPolicy.Attached).Select(static pair => pair.Key).ToArray())
+        lock (_dispatchDrainGate)
         {
-            var closed = _kernel.TerminateProcess(child);
-            if (!closed.IsSuccess && closed.Error != KernelError.StaleHandle) return closed;
+            _drainRequested = true;
+            if (_dispatchFaultPinned)
+                return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Native process dispatch outcome is unknown; closure remains pinned.");
+            if (_dispatchInProgress || _drainInProgress)
+                return KernelResult.Fail(KernelError.SessionDraining, "Native process dispatch or drain callback has not settled.");
+            _drainInProgress = true;
         }
-        foreach (var relation in _children.Values)
+        try { return DrainChildren(); }
+        finally { lock (_dispatchDrainGate) _drainInProgress = false; }
+    }
+
+    private KernelResult DrainChildren()
+    {
+        foreach (var pair in _children.ToArray())
         {
-            _ = _kernel.SealedObjects.Revoke(relation.Control.Seal);
-            var revoked = _kernel.RevokeCapability(relation.ControlCapability);
+            var closed = CleanupChildRelation(pair.Key, pair.Value);
+            if (!closed.IsSuccess) return closed;
+        }
+        return KernelResult.Ok();
+    }
+
+    private KernelResult CleanupChildRelation(ProcessHandle child, ChildRelation relation)
+    {
+        // Revoke issued local controls before entering child closure callbacks.
+        if (relation.Control is { } control)
+        {
+            var sealRevoked = _kernel.SealedObjects.Revoke(control.Seal);
+            if (!sealRevoked.IsSuccess) return sealRevoked;
+        }
+        if (relation.ControlCapability is { } capability)
+        {
+            var revoked = _kernel.RevokeCapability(capability);
             if (!revoked.IsSuccess && revoked.Error != KernelError.CapabilityRevoked) return revoked;
         }
-        _children.Clear();
+        if (relation.Policy == ChildProcessPolicy.Attached)
+        {
+            // Only the existing exact owner retirement receipt permits
+            // skipping termination. Absence/stale identity proves nothing.
+            var retired = _kernel.Processes.ResolveTerminalState(child);
+            if (!retired.IsSuccess)
+            {
+                var closed = _kernel.TerminateProcess(child);
+                if (!closed.IsSuccess) return closed;
+            }
+        }
+        // Consume this successful relation independently. A later child
+        // refusal cannot replay its termination/control cleanup.
+        _children.Remove(child);
         return KernelResult.Ok();
+    }
+
+    private KernelResult<object?> RefuseCreatedChild(ProcessHandle child, ChildRelation relation,
+        KernelError error, string? message)
+    {
+        var cleanup = CleanupChildRelation(child, relation);
+        if (!cleanup.IsSuccess)
+        {
+            lock (_dispatchDrainGate) _drainRequested = true;
+            return KernelResult<object?>.Fail(cleanup.Error,
+                $"Child creation refused ({error}); exact child cleanup remains pending: {cleanup.Message}");
+        }
+        return KernelResult<object?>.Fail(error, message!);
     }
 
     private KernelResult<object?> Execute(TrustedSipInvocationContext context, ChannelEnvelope envelope)
@@ -166,26 +271,30 @@ public sealed class RuntimeProcessServiceHost
                 var created = _kernel.CreateProcess(manifest);
                 if (!created.IsSuccess) return KernelResult<object?>.Fail(created.Error, created.Message!);
                 var child = new ProcessHandle(created.Value!.ProcessId, created.Value.Generation);
+                // Track the real created child before any later refusal/callback.
+                // Existing host dispatch interlock prevents drain from passing
+                // this in-flight creation; no new permission owner is introduced.
+                var relation = new ChildRelation(caller, request.Policy);
+                _children.Add(child, relation);
                 var control = _kernel.MintCapability(created.Value.DomainId, caller, ResourceKind.Process, CapabilityResourceIds.Process(child), CapabilityRights.Configure | CapabilityRights.Execute | CapabilityRights.Delegate);
-                if (!control.IsSuccess) { _ = _kernel.TerminateProcess(child); return KernelResult<object?>.Fail(control.Error, control.Message!); }
+                if (!control.IsSuccess) return RefuseCreatedChild(child, relation, control.Error, control.Message);
                 var controlDescriptor = control.Value!;
+                relation.ControlCapability = controlDescriptor.CapabilityId;
                 var sealedControl = _kernel.SealedObjects.Seal<ProcessControlSeal>(_serviceDescriptor, _service,
                     caller, _session, child.Generation, child.ProcessId.Value, controlDescriptor.CapabilityId);
-                if (!sealedControl.IsSuccess) { _ = _kernel.RevokeCapability(controlDescriptor.CapabilityId); _ = _kernel.TerminateProcess(child); return KernelResult<object?>.Fail(sealedControl.Error, sealedControl.Message!); }
+                if (!sealedControl.IsSuccess) return RefuseCreatedChild(child, relation, sealedControl.Error, sealedControl.Message);
                 var controlHandle = new ProcessControlObjectHandle(child, child.Generation, sealedControl.Value);
+                relation.Control = controlHandle;
                 foreach (var requested in request.InitialCapabilities)
                 {
                     var initialDelegation = _kernel.DelegateCapability(caller, child, requested.SourceCapability, requested.Rights);
                     if (!initialDelegation.IsSuccess)
                     {
-                        _ = _kernel.RevokeCapability(controlDescriptor.CapabilityId);
-                        _ = _kernel.TerminateProcess(child);
-                        return KernelResult<object?>.Fail(initialDelegation.Error, initialDelegation.Message!);
+                        return RefuseCreatedChild(child, relation, initialDelegation.Error, initialDelegation.Message);
                     }
                 }
                 var admitted = _kernel.AdmitProcess(child);
-                if (!admitted.IsSuccess) { _ = _kernel.RevokeCapability(controlDescriptor.CapabilityId); _ = _kernel.TerminateProcess(child); return KernelResult<object?>.Fail(admitted.Error, admitted.Message!); }
-                _children[child] = (caller, request.Policy, controlDescriptor.CapabilityId, controlHandle);
+                if (!admitted.IsSuccess) return RefuseCreatedChild(child, relation, admitted.Error, admitted.Message);
                 return KernelResult<object?>.Ok(new ProcessAuthorityResponse(new ProcessAuthority(child, controlDescriptor.CapabilityId, controlHandle)));
             }
             case IProcessServiceProtocol.Message_DelegateAsync when envelope.Payload is DelegateProcessCapabilityRequest delegation:
@@ -253,7 +362,21 @@ public sealed class RuntimeProcessServiceHost
 
 public sealed class RuntimeFileServiceHost : IIFileServiceGeneratedSentryTarget_OpenAsync
 {
-    private sealed record Entry(ProcessHandle Owner, FileObjectHandle Handle, CapabilityId Capability, string Path) { public byte[] Data { get; set; } = []; }
+    private readonly object _dispatchDrainGate = new();
+    // Admission interlocks only; kernel permission/effect owners remain authoritative.
+    private bool _dispatchInProgress;
+    private bool _implementationInProgress;
+    private bool _drainRequested;
+    private bool _drainInProgress;
+    private bool _dispatchFaultPinned;
+    private sealed record Entry(ProcessHandle Owner, FileObjectId ObjectId, string Path)
+    {
+        public CapabilityId? Capability { get; set; }
+        public FileObjectHandle? Handle { get; set; }
+        // Set only after the actual local seal owner returns. Exception is unknown.
+        public bool SealOutcomeKnown { get; set; }
+        public byte[] Data { get; set; } = [];
+    }
     private readonly RuntimeKernel _kernel; private readonly ProcessHandle _service; private readonly EndpointSessionHandle _session; private readonly ServiceEndpointDescriptor _serviceDescriptor; private readonly INativeSipCompletedEventSink? _trace; private readonly INativeSipDeterministicHook? _hook; private readonly Dictionary<FileObjectId, Entry> _files = []; private ulong _nextId;
     private RuntimeFileServiceHost(RuntimeKernel kernel, ProcessHandle service, EndpointSessionHandle session, ServiceEndpointDescriptor serviceDescriptor, INativeSipCompletedEventSink? trace, INativeSipDeterministicHook? hook) { _kernel = kernel; _service = service; _session = session; _serviceDescriptor = serviceDescriptor; _trace = trace; _hook = hook; }
     public static KernelResult<RuntimeFileServiceHost> CreateForSession(RuntimeKernel kernel, ProcessHandle service, EndpointSessionHandle session)
@@ -270,21 +393,147 @@ public sealed class RuntimeFileServiceHost : IIFileServiceGeneratedSentryTarget_
         kernel.RegisterNativeServiceDrain(service, session, host.Drain);
         return KernelResult<RuntimeFileServiceHost>.Ok(host);
     }
-    public KernelResult ProcessNext() => NativeServiceDispatch.Dispatch(_kernel, _service, _session, Execute, _trace, _hook);
+    public KernelResult ProcessNext()
+    {
+        lock (_dispatchDrainGate)
+        {
+            if (_drainRequested || _dispatchInProgress || _implementationInProgress)
+                return KernelResult.Fail(KernelError.SessionDraining, "Native file host dispatch is draining or already in progress.");
+            _dispatchInProgress = true;
+        }
+        var returned = false;
+        try
+        {
+            var result = NativeServiceDispatch.Dispatch(_kernel, _service, _session, Execute, _trace, _hook,
+                beforePublication: RefuseDrainingDispatch);
+            returned = true;
+            return result;
+        }
+        finally
+        {
+            lock (_dispatchDrainGate)
+            {
+                _dispatchInProgress = false;
+                if (!returned) { _dispatchFaultPinned = true; _drainRequested = true; }
+            }
+        }
+    }
+
+    private KernelResult RefuseDrainingDispatch()
+    {
+        lock (_dispatchDrainGate)
+            return _drainRequested
+                ? KernelResult.Fail(KernelError.SessionDraining, "Native file host drain was requested; dispatch publication/admission is refused.")
+                : KernelResult.Ok();
+    }
+
     public KernelResult Drain()
     {
-        foreach (var entry in _files.Values) { _ = _kernel.SealedObjects.Revoke(entry.Handle.Seal); var revoked = _kernel.RevokeCapability(entry.Capability); if (!revoked.IsSuccess && revoked.Error != KernelError.CapabilityRevoked) return revoked; }
-        _files.Clear();
+        lock (_dispatchDrainGate)
+        {
+            _drainRequested = true;
+            if (_dispatchFaultPinned)
+                return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Native file dispatch outcome is unknown; closure remains pinned.");
+            if (_dispatchInProgress || _implementationInProgress || _drainInProgress)
+                return KernelResult.Fail(KernelError.SessionDraining, "Native file dispatch or drain callback has not settled.");
+            _drainInProgress = true;
+        }
+        try
+        {
+            var entries = _files.Values.ToArray();
+            // Local source revocation precedes uncertain seal cleanup for every
+            // known entry. A failed owner lookup is not closure evidence.
+            KernelResult? revokeFailure = null;
+            foreach (var entry in entries)
+            {
+                var revoked = RevokeFileControl(entry);
+                if (!revoked.IsSuccess && revoked.Error != KernelError.CapabilityRevoked)
+                    revokeFailure ??= revoked;
+            }
+            if (revokeFailure is { } failed) return failed;
+            foreach (var entry in entries)
+            {
+                var released = ReleaseFileEntry(entry);
+                if (!released.IsSuccess) return released;
+            }
+            return KernelResult.Ok();
+        }
+        finally { lock (_dispatchDrainGate) _drainInProgress = false; }
+    }
+
+    private KernelResult RevokeFileControl(Entry entry) => entry.Capability is { } capability
+        ? _kernel.RevokeCapability(capability)
+        : KernelResult.Fail(KernelError.ExternalEffectUncontained, "File control issuance outcome is unknown.");
+
+    private KernelResult ReleaseFileEntry(Entry entry)
+    {
+        if (!entry.SealOutcomeKnown)
+            return KernelResult.Fail(KernelError.ExternalEffectUncontained, "File seal outcome is unknown; accounting remains pinned.");
+        if (entry.Handle is { } handle)
+        {
+            var sealedControl = _kernel.SealedObjects.Revoke(handle.Seal);
+            if (!sealedControl.IsSuccess) return sealedControl;
+        }
+        _files.Remove(entry.ObjectId);
         return KernelResult.Ok();
+    }
+
+    private KernelResult<T> RefuseCreatedFile<T>(Entry entry, KernelError error, string message)
+    {
+        var revoked = RevokeFileControl(entry);
+        var cleanup = !revoked.IsSuccess && revoked.Error != KernelError.CapabilityRevoked
+            ? revoked : ReleaseFileEntry(entry);
+        if (!cleanup.IsSuccess)
+        {
+            lock (_dispatchDrainGate) _drainRequested = true;
+            return KernelResult<T>.Fail(cleanup.Error, $"{message} File control compensation remains pending: {cleanup.Message}");
+        }
+        return KernelResult<T>.Fail(error, message);
     }
     private KernelResult<object?> Execute(TrustedSipInvocationContext context, ChannelEnvelope envelope)
     {
         if (envelope.MessageId == IFileServiceProtocol.Message_OpenAsync && envelope.Payload is OpenFileRequest open)
             return FromGenerated(IFileServiceGeneratedOperationSentries.InvokeRuntime_OpenAsync(this, in context, open));
+        var admitted = BeginImplementation();
+        if (!admitted.IsSuccess) return KernelResult<object?>.Fail(admitted.Error, admitted.Message!);
+        var returned = false;
+        try
+        {
+            var result = ExecuteOrdinary(context, envelope);
+            returned = true;
+            return result;
+        }
+        finally { EndImplementation(returned); }
+    }
+
+    private KernelResult BeginImplementation()
+    {
+        lock (_dispatchDrainGate)
+        {
+            if (_drainRequested || _implementationInProgress)
+                return KernelResult.Fail(KernelError.SessionDraining, "Native file implementation is draining or already in progress.");
+            _implementationInProgress = true;
+            return KernelResult.Ok();
+        }
+    }
+
+    private void EndImplementation(bool returned)
+    {
+        lock (_dispatchDrainGate)
+        {
+            _implementationInProgress = false;
+            if (!returned) { _dispatchFaultPinned = true; _drainRequested = true; }
+        }
+    }
+
+    private KernelResult<object?> ExecuteOrdinary(TrustedSipInvocationContext context, ChannelEnvelope envelope)
+    {
         var caller = context.Caller;
         if (envelope.MessageId == IFileServiceProtocol.Message_OpenV2Async && envelope.Payload is OpenFileRequestV2 openV2)
         {
             if (string.IsNullOrWhiteSpace(openV2.Path) || openV2.Path.Length > 200) return KernelResult<object?>.Fail(KernelError.UnsupportedPayload, "File path is malformed for service-side namespace policy.");
+            var localAdmission = RefuseDrainingDispatch();
+            if (!localAdmission.IsSuccess) return KernelResult<object?>.Fail(localAdmission.Error, localAdmission.Message!);
             var admission = _kernel.AdmitSessionCapabilityEffect(caller, _service, _session,
                 openV2.NamespaceCapability, ResourceKind.File, CapabilityResourceIds.FileNamespace, 1,
                 openV2.Create ? CapabilityOperation.Write : CapabilityOperation.Read);
@@ -294,18 +543,28 @@ public sealed class RuntimeFileServiceHost : IIFileServiceGeneratedSentryTarget_
             _trace?.Record(NativeSipCompletedEvent.ImplementationEntered);
             if (_nextId == ulong.MaxValue) return KernelResult<object?>.Fail(KernelError.CapacityExhausted, "File object identity space is exhausted.");
             var objectId = new FileObjectId(++_nextId);
-            var capability = _kernel.MintCapabilityV2(_kernel.Processes.Resolve(_service).Value!.DomainId,
+            var entry = new Entry(caller, objectId, openV2.Path);
+            _files.Add(objectId, entry);
+            // Namespace admission remains V2. The response carries a V1 object
+            // control, so record its actual issuance without a lossy V2 projection.
+            var capability = _kernel.MintCapability(_kernel.Processes.Resolve(_service).Value!.DomainId,
                 caller, ResourceKind.File, CapabilityResourceIds.FileObject(_session, objectId.Value),
                 CapabilityRights.Read | CapabilityRights.Write | CapabilityRights.Configure);
-            if (!capability.IsSuccess) return KernelResult<object?>.Fail(capability.Error, capability.Message!);
-            var v1 = _kernel.CapabilityAuthority.ResolveCapabilityId(capability.Value);
-            if (!v1.IsSuccess) return KernelResult<object?>.Fail(v1.Error, v1.Message!);
-            var sealedObject = _kernel.SealedObjects.Seal<FileObjectSeal>(_serviceDescriptor, _service, caller, _session, 1, objectId.Value, v1.Value);
-            if (!sealedObject.IsSuccess) { _ = _kernel.RevokeCapability(v1.Value); return KernelResult<object?>.Fail(sealedObject.Error, sealedObject.Message!); }
+            if (!capability.IsSuccess)
+            {
+                // This inspected local V1 mint returns failure before issuance.
+                // Exceptions keep the candidate and existing host fault pin.
+                _files.Remove(objectId);
+                return KernelResult<object?>.Fail(capability.Error, capability.Message!);
+            }
+            entry.Capability = capability.Value!.CapabilityId;
+            var sealedObject = _kernel.SealedObjects.Seal<FileObjectSeal>(_serviceDescriptor, _service, caller, _session, 1, objectId.Value, capability.Value.CapabilityId);
+            entry.SealOutcomeKnown = true;
+            if (!sealedObject.IsSuccess) return RefuseCreatedFile<object?>(entry, sealedObject.Error, sealedObject.Message!);
             var handle = new FileObjectHandle(_session, objectId, new FileObjectGeneration(1), sealedObject.Value);
-            _files.Add(handle.ObjectId, new(caller, handle, v1.Value, openV2.Path));
+            entry.Handle = handle;
             _trace?.Record(NativeSipCompletedEvent.ImplementationExited);
-            return KernelResult<object?>.Ok(new FileObjectResponse(new FileObjectAuthority(handle, v1.Value)));
+            return KernelResult<object?>.Ok(new FileObjectResponse(new FileObjectAuthority(handle, capability.Value.CapabilityId)));
         }
         if (envelope.Payload is FileCommand command) return Command(caller, envelope.MessageId, command, null);
         if (envelope.Payload is FileWriteRequest write) return Command(caller, envelope.MessageId, new(write.File, write.Capability), write.Data);
@@ -316,10 +575,19 @@ public sealed class RuntimeFileServiceHost : IIFileServiceGeneratedSentryTarget_
         in TrustedSipInvocationContext context,
         OpenFileRequest request)
     {
-        var result = Open(context, request);
-        return result.IsSuccess
-            ? GeneratedSipSentryResult<FileObjectResponse>.Success(result.Value!)
-            : GeneratedSipSentryResult<FileObjectResponse>.Failure((int)result.Error, result.Message!);
+        var admission = BeginImplementation();
+        if (!admission.IsSuccess)
+            return GeneratedSipSentryResult<FileObjectResponse>.Failure((int)admission.Error, admission.Message!);
+        var returned = false;
+        try
+        {
+            var result = Open(context, request);
+            returned = true;
+            return result.IsSuccess
+                ? GeneratedSipSentryResult<FileObjectResponse>.Success(result.Value!)
+                : GeneratedSipSentryResult<FileObjectResponse>.Failure((int)result.Error, result.Message!);
+        }
+        finally { EndImplementation(returned); }
     }
 
     private KernelResult<FileObjectResponse> Open(TrustedSipInvocationContext context, OpenFileRequest open)
@@ -327,6 +595,8 @@ public sealed class RuntimeFileServiceHost : IIFileServiceGeneratedSentryTarget_
         if (string.IsNullOrWhiteSpace(open.Path) || open.Path.Length > 200)
             return KernelResult<FileObjectResponse>.Fail(KernelError.UnsupportedPayload, "File path is malformed for service-side namespace policy.");
         _hook?.At(NativeSipDeterministicPoint.BeforeCapabilityCommit);
+        var localAdmission = RefuseDrainingDispatch();
+        if (!localAdmission.IsSuccess) return KernelResult<FileObjectResponse>.Fail(localAdmission.Error, localAdmission.Message!);
         var admission = _kernel.AdmitSessionCapabilityEffect(context.Caller, context.Service, context.Session,
             open.NamespaceCapability, ResourceKind.File, CapabilityResourceIds.FileNamespace, 1,
             open.Create ? CapabilityOperation.Write : CapabilityOperation.Read);
@@ -339,19 +609,24 @@ public sealed class RuntimeFileServiceHost : IIFileServiceGeneratedSentryTarget_
         if (_nextId == ulong.MaxValue)
             return KernelResult<FileObjectResponse>.Fail(KernelError.CapacityExhausted, "File object identity space is exhausted.");
         var objectId = new FileObjectId(++_nextId);
+        var entry = new Entry(context.Caller, objectId, open.Path);
+        _files.Add(objectId, entry);
         var capability = _kernel.MintCapability(_kernel.Processes.Resolve(context.Service).Value!.DomainId, context.Caller,
             ResourceKind.File, CapabilityResourceIds.FileObject(context.Session, objectId.Value),
             CapabilityRights.Read | CapabilityRights.Write | CapabilityRights.Configure);
-        if (!capability.IsSuccess) return KernelResult<FileObjectResponse>.Fail(capability.Error, capability.Message!);
+        if (!capability.IsSuccess)
+        {
+            _files.Remove(objectId);
+            return KernelResult<FileObjectResponse>.Fail(capability.Error, capability.Message!);
+        }
+        entry.Capability = capability.Value!.CapabilityId;
         var sealedObject = _kernel.SealedObjects.Seal<FileObjectSeal>(_serviceDescriptor, context.Service, context.Caller,
             context.Session, 1, objectId.Value, capability.Value!.CapabilityId);
+        entry.SealOutcomeKnown = true;
         if (!sealedObject.IsSuccess)
-        {
-            _ = _kernel.RevokeCapability(capability.Value.CapabilityId);
-            return KernelResult<FileObjectResponse>.Fail(sealedObject.Error, sealedObject.Message!);
-        }
+            return RefuseCreatedFile<FileObjectResponse>(entry, sealedObject.Error, sealedObject.Message!);
         var handle = new FileObjectHandle(context.Session, objectId, new FileObjectGeneration(1), sealedObject.Value);
-        _files.Add(handle.ObjectId, new(context.Caller, handle, capability.Value!.CapabilityId, open.Path));
+        entry.Handle = handle;
         _trace?.Record(NativeSipCompletedEvent.ImplementationExited);
         _hook?.At(NativeSipDeterministicPoint.AfterImplementationExit);
         return KernelResult<FileObjectResponse>.Ok(new(new(handle, capability.Value.CapabilityId)));
@@ -370,6 +645,8 @@ public sealed class RuntimeFileServiceHost : IIFileServiceGeneratedSentryTarget_
         using var objectPin = pin.Value!;
         var objectId = new FileObjectId(objectPin.ObjectKey);
         if (!_files.TryGetValue(objectId, out var entry) || entry.Handle != command.File) return KernelResult<object?>.Fail(KernelError.StaleHandle, "File object generation is stale or closed.");
+        var localAdmission = RefuseDrainingDispatch();
+        if (!localAdmission.IsSuccess) return KernelResult<object?>.Fail(localAdmission.Error, localAdmission.Message!);
         var admission = _kernel.AdmitSessionCapabilityEffect(caller, _service, _session, command.Capability, ResourceKind.File,
             CapabilityResourceIds.FileObject(_session, objectId.Value), 1, operation);
         if (!admission.IsSuccess) return KernelResult<object?>.Fail(admission.Error, admission.Message!);
@@ -380,52 +657,173 @@ public sealed class RuntimeFileServiceHost : IIFileServiceGeneratedSentryTarget_
         _trace?.Record(NativeSipCompletedEvent.ImplementationEntered);
         if (message == IFileServiceProtocol.Message_WriteAsync) { entry.Data = bytes!.Value.ToArray(); _trace?.Record(NativeSipCompletedEvent.ImplementationExited); return KernelResult<object?>.Ok(null); }
         if (message == IFileServiceProtocol.Message_ReadAsync) { var response = new FileReadResponse(new BoundedBytes(entry.Data)); _trace?.Record(NativeSipCompletedEvent.ImplementationExited); return KernelResult<object?>.Ok(response); }
-        if (message == IFileServiceProtocol.Message_CloseAsync) { var closing = _kernel.SealedObjects.BeginClose(objectPin); if (!closing.IsSuccess) return KernelResult<object?>.Fail(closing.Error, closing.Message!); _files.Remove(objectId); _ = _kernel.RevokeCapability(entry.Capability); _trace?.Record(NativeSipCompletedEvent.ImplementationExited); return KernelResult<object?>.Ok(null); }
+        if (message == IFileServiceProtocol.Message_CloseAsync)
+        {
+            var revoked = RevokeFileControl(entry);
+            if (!revoked.IsSuccess && revoked.Error != KernelError.CapabilityRevoked) return RefuseFileClose(revoked);
+            var closing = _kernel.SealedObjects.BeginClose(objectPin);
+            if (!closing.IsSuccess) return RefuseFileClose(closing);
+            _files.Remove(objectId);
+            _trace?.Record(NativeSipCompletedEvent.ImplementationExited);
+            return KernelResult<object?>.Ok(null);
+        }
         return KernelResult<object?>.Fail(KernelError.UnsupportedPayload, "Unknown file operation.");
+    }
+
+    private KernelResult<object?> RefuseFileClose(KernelResult failure)
+    {
+        lock (_dispatchDrainGate) _drainRequested = true;
+        return KernelResult<object?>.Fail(failure.Error, failure.Message!);
     }
 }
 
 public sealed class RuntimeNetworkServiceHost
 {
-    private sealed record Entry(ProcessHandle Owner, SocketObjectHandle Handle, CapabilityId Capability, string Label) { public Queue<byte[]> Packets { get; } = new(); }
+    private readonly object _dispatchDrainGate = new();
+    // Admission interlocks only; capability/session owners grant permission.
+    private bool _dispatchInProgress;
+    private bool _drainRequested;
+    private bool _drainInProgress;
+    private bool _dispatchFaultPinned;
+    private readonly INativeSipCompletedEventSink? _trace;
+    private readonly INativeSipDeterministicHook? _hook;
+    private sealed record Entry(ProcessHandle Owner, SocketObjectId ObjectId, string Label)
+    {
+        public CapabilityId? Capability { get; set; }
+        public SocketObjectHandle? Handle { get; set; }
+        public bool SealOutcomeKnown { get; set; }
+        public Queue<byte[]> Packets { get; } = new();
+    }
     private readonly RuntimeKernel _kernel; private readonly ProcessHandle _service; private readonly EndpointSessionHandle _session; private readonly ServiceEndpointDescriptor _serviceDescriptor; private readonly Dictionary<SocketObjectId, Entry> _sockets = []; private readonly object _gate = new(); private ulong _nextId;
-    private RuntimeNetworkServiceHost(RuntimeKernel kernel, ProcessHandle service, EndpointSessionHandle session, ServiceEndpointDescriptor serviceDescriptor) { _kernel = kernel; _service = service; _session = session; _serviceDescriptor = serviceDescriptor; }
+    private RuntimeNetworkServiceHost(RuntimeKernel kernel, ProcessHandle service, EndpointSessionHandle session, ServiceEndpointDescriptor serviceDescriptor, INativeSipCompletedEventSink? trace, INativeSipDeterministicHook? hook) { _kernel = kernel; _service = service; _session = session; _serviceDescriptor = serviceDescriptor; _trace = trace; _hook = hook; }
     public static KernelResult<RuntimeNetworkServiceHost> CreateForSession(RuntimeKernel kernel, ProcessHandle service, EndpointSessionHandle session)
+        => CreateForSession(kernel, service, session, trace: null, hook: null);
+    internal static KernelResult<RuntimeNetworkServiceHost> CreateForSession(RuntimeKernel kernel, ProcessHandle service, EndpointSessionHandle session, INativeSipCompletedEventSink? trace, INativeSipDeterministicHook? hook)
     {
         var resolved = kernel.EndpointSessions.ResolveForService(session, service);
         if (!resolved.IsSuccess) return KernelResult<RuntimeNetworkServiceHost>.Fail(resolved.Error, resolved.Message!);
         var serviceDescriptor = kernel.Services.ResolveForProvider(service, INetworkServiceProtocol.CreateDefinition().ContractName);
         if (!serviceDescriptor.IsSuccess) return KernelResult<RuntimeNetworkServiceHost>.Fail(serviceDescriptor.Error, serviceDescriptor.Message!);
-        var host = new RuntimeNetworkServiceHost(kernel, service, session, serviceDescriptor.Value!);
+        var host = new RuntimeNetworkServiceHost(kernel, service, session, serviceDescriptor.Value!, trace, hook);
         kernel.RegisterNativeServiceDrain(service, session, host.Drain);
         return KernelResult<RuntimeNetworkServiceHost>.Ok(host);
     }
-    public KernelResult ProcessNext() => NativeServiceDispatch.Dispatch(_kernel, _service, _session, Execute);
+    public KernelResult ProcessNext()
+    {
+        lock (_dispatchDrainGate)
+        {
+            if (_drainRequested || _dispatchInProgress)
+                return KernelResult.Fail(KernelError.SessionDraining, "Native network host dispatch is draining or already in progress.");
+            _dispatchInProgress = true;
+        }
+        var returned = false;
+        try
+        {
+            var result = NativeServiceDispatch.Dispatch(_kernel, _service, _session, Execute, _trace, _hook,
+                beforePublication: RefuseDrainingDispatch);
+            returned = true;
+            return result;
+        }
+        finally
+        {
+            lock (_dispatchDrainGate)
+            {
+                _dispatchInProgress = false;
+                if (!returned) { _dispatchFaultPinned = true; _drainRequested = true; }
+            }
+        }
+    }
+
+    private KernelResult RefuseDrainingDispatch()
+    {
+        lock (_dispatchDrainGate)
+            return _drainRequested
+                ? KernelResult.Fail(KernelError.SessionDraining, "Native network drain was requested; dispatch admission/publication is refused.")
+                : KernelResult.Ok();
+    }
+
     public KernelResult Drain()
     {
-        lock (_gate)
+        lock (_dispatchDrainGate)
         {
-            foreach (var entry in _sockets.Values)
-            {
-                _ = _kernel.SealedObjects.Revoke(entry.Handle.Seal);
-                var revoked = _kernel.RevokeCapability(entry.Capability);
-                if (!revoked.IsSuccess && revoked.Error != KernelError.CapabilityRevoked) return revoked;
-            }
-            _sockets.Clear();
+            _drainRequested = true;
+            if (_dispatchFaultPinned)
+                return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Native network dispatch outcome is unknown; closure remains pinned.");
+            if (_dispatchInProgress || _drainInProgress)
+                return KernelResult.Fail(KernelError.SessionDraining, "Native network dispatch or drain callback has not settled.");
+            _drainInProgress = true;
         }
+        try
+        {
+            Entry[] entries;
+            lock (_gate) entries = _sockets.Values.ToArray();
+            // Stop every known local source before closure cleanup. A lost seal
+            // record cannot keep a later socket capability active.
+            KernelResult? revokeFailure = null;
+            foreach (var entry in entries)
+            {
+                var revoked = RevokeSocketControl(entry);
+                if (!revoked.IsSuccess && revoked.Error != KernelError.CapabilityRevoked)
+                    revokeFailure ??= revoked;
+            }
+            if (revokeFailure is { } failed) return failed;
+            foreach (var entry in entries)
+            {
+                var released = ReleaseSocketEntry(entry);
+                if (!released.IsSuccess) return released;
+            }
+            return KernelResult.Ok();
+        }
+        finally { lock (_dispatchDrainGate) _drainInProgress = false; }
+    }
+
+    private KernelResult ReleaseSocketEntry(Entry entry)
+    {
+        if (!entry.SealOutcomeKnown)
+            return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Socket seal outcome is unknown; accounting remains pinned.");
+        if (entry.Handle is { } handle)
+        {
+            var sealedControl = _kernel.SealedObjects.Revoke(handle.Seal);
+            if (!sealedControl.IsSuccess) return sealedControl;
+        }
+        lock (_gate) _sockets.Remove(entry.ObjectId);
         return KernelResult.Ok();
+    }
+
+    private KernelResult RevokeSocketControl(Entry entry) => entry.Capability is { } capability
+        ? _kernel.RevokeCapability(capability)
+        : KernelResult.Fail(KernelError.ExternalEffectUncontained, "Socket control issuance outcome is unknown.");
+
+    private KernelResult<object?> RefuseCreatedSocket(Entry entry, KernelError error, string message)
+    {
+        var revoked = RevokeSocketControl(entry);
+        var cleanup = !revoked.IsSuccess && revoked.Error != KernelError.CapabilityRevoked
+            ? revoked : ReleaseSocketEntry(entry);
+        if (!cleanup.IsSuccess)
+        {
+            lock (_dispatchDrainGate) _drainRequested = true;
+            return KernelResult<object?>.Fail(cleanup.Error, $"{message} Socket control compensation remains pending: {cleanup.Message}");
+        }
+        return KernelResult<object?>.Fail(error, message);
     }
     private KernelResult<object?> Execute(TrustedSipInvocationContext context, ChannelEnvelope envelope)
     {
         var caller = context.Caller;
         if (envelope.MessageId == INetworkServiceProtocol.Message_OpenAsync && envelope.Payload is OpenSocketRequest open)
         {
+            _hook?.At(NativeSipDeterministicPoint.BeforeCapabilityCommit);
+            var localAdmission = RefuseDrainingDispatch();
+            if (!localAdmission.IsSuccess) return KernelResult<object?>.Fail(localAdmission.Error, localAdmission.Message!);
             var openAdmission = _kernel.AdmitSessionCapabilityEffect(caller, _service, _session,
                 open.EndpointCapability, ResourceKind.Network, CapabilityResourceIds.NetworkEndpoint, 1,
                 CapabilityOperation.Configure);
             if (!openAdmission.IsSuccess) return KernelResult<object?>.Fail(openAdmission.Error, openAdmission.Message!);
             using var admittedOpen = openAdmission.Value!;
+            _trace?.Record(NativeSipCompletedEvent.CapabilityAdmitted);
+            _hook?.At(NativeSipDeterministicPoint.AfterCapabilityCommit);
             if (string.IsNullOrWhiteSpace(open.EndpointLabel) || open.EndpointLabel.Length > 200) return KernelResult<object?>.Fail(KernelError.UnsupportedPayload, "Endpoint label is malformed for service-side policy.");
+            _hook?.At(NativeSipDeterministicPoint.BeforeImplementationEntry);
+            _trace?.Record(NativeSipCompletedEvent.ImplementationEntered);
             SocketObjectId objectId;
             lock (_gate)
             {
@@ -433,17 +831,24 @@ public sealed class RuntimeNetworkServiceHost
                     return KernelResult<object?>.Fail(KernelError.CapacityExhausted, "Socket object identity space is exhausted.");
                 objectId = new(++_nextId);
             }
+            var created = new Entry(caller, objectId, open.EndpointLabel);
+            lock (_gate) _sockets.Add(objectId, created);
             var capability = _kernel.MintCapability(_kernel.Processes.Resolve(_service).Value!.DomainId, caller, ResourceKind.Network, CapabilityResourceIds.SocketObject(_session, objectId.Value), CapabilityRights.Read | CapabilityRights.Write | CapabilityRights.Configure);
-            if (!capability.IsSuccess) return KernelResult<object?>.Fail(capability.Error, capability.Message!);
+            if (!capability.IsSuccess)
+            {
+                lock (_gate) _sockets.Remove(objectId);
+                return KernelResult<object?>.Fail(capability.Error, capability.Message!);
+            }
+            created.Capability = capability.Value!.CapabilityId;
             var sealedObject = _kernel.SealedObjects.Seal<SocketObjectSeal>(_serviceDescriptor, _service,
                 caller, _session, 1, objectId.Value, capability.Value!.CapabilityId);
+            created.SealOutcomeKnown = true;
             if (!sealedObject.IsSuccess)
-            {
-                _ = _kernel.RevokeCapability(capability.Value.CapabilityId);
-                return KernelResult<object?>.Fail(sealedObject.Error, sealedObject.Message!);
-            }
+                return RefuseCreatedSocket(created, sealedObject.Error, sealedObject.Message!);
             var handle = new SocketObjectHandle(_session, objectId, new SocketObjectGeneration(1), sealedObject.Value);
-            lock (_gate) _sockets.Add(handle.ObjectId, new(caller, handle, capability.Value.CapabilityId, open.EndpointLabel));
+            created.Handle = handle;
+            _trace?.Record(NativeSipCompletedEvent.ImplementationExited);
+            _hook?.At(NativeSipDeterministicPoint.AfterImplementationExit);
             return KernelResult<object?>.Ok(new SocketObjectResponse(new SocketObjectAuthority(handle, capability.Value.CapabilityId)));
         }
         SocketCommand command; BoundedBytes? packet = null;
@@ -460,26 +865,39 @@ public sealed class RuntimeNetworkServiceHost
         Entry entry;
         lock (_gate)
         {
-            if (!_sockets.TryGetValue(objectIdFromSeal, out entry!) || entry.Handle.Seal != command.Socket.Seal)
+            if (!_sockets.TryGetValue(objectIdFromSeal, out entry!) || entry.Handle is not { } currentHandle || currentHandle.Seal != command.Socket.Seal)
                 return KernelResult<object?>.Fail(KernelError.StaleHandle, "Socket object is stale or closed.");
         }
+        _hook?.At(NativeSipDeterministicPoint.BeforeCapabilityCommit);
+        var localCommandAdmission = RefuseDrainingDispatch();
+        if (!localCommandAdmission.IsSuccess) return KernelResult<object?>.Fail(localCommandAdmission.Error, localCommandAdmission.Message!);
         var admission = _kernel.AdmitSessionCapabilityEffect(caller, _service, _session,
             command.Capability, ResourceKind.Network,
             CapabilityResourceIds.SocketObject(_session, objectIdFromSeal.Value), 1, operation);
         if (!admission.IsSuccess) return KernelResult<object?>.Fail(admission.Error, admission.Message!);
         using var admitted = admission.Value!;
+        _trace?.Record(NativeSipCompletedEvent.CapabilityAdmitted);
+        _hook?.At(NativeSipDeterministicPoint.AfterCapabilityCommit);
         var finalSeal = _kernel.SealedObjects.Revalidate(objectPin, _serviceDescriptor, _service);
         if (!finalSeal.IsSuccess) return KernelResult<object?>.Fail(finalSeal.Error, finalSeal.Message!);
         if (envelope.MessageId == INetworkServiceProtocol.Message_SendAsync) { lock (_gate) entry.Packets.Enqueue(packet!.Value.ToArray()); return KernelResult<object?>.Ok(null); }
         if (envelope.MessageId == INetworkServiceProtocol.Message_ReceiveAsync) { lock (_gate) return entry.Packets.Count == 0 ? KernelResult<object?>.Fail(KernelError.ResponseNotAvailable, "No committed packet is available.") : KernelResult<object?>.Ok(new ReceivePacketResponse(new BoundedBytes(entry.Packets.Dequeue()))); }
         if (envelope.MessageId == INetworkServiceProtocol.Message_CloseAsync)
         {
+            _trace?.Record(NativeSipCompletedEvent.ImplementationEntered);
+            var revoked = RevokeSocketControl(entry);
+            if (!revoked.IsSuccess && revoked.Error != KernelError.CapabilityRevoked) return RefuseSocketClose(revoked);
             var closing = _kernel.SealedObjects.BeginClose(objectPin);
-            if (!closing.IsSuccess) return KernelResult<object?>.Fail(closing.Error, closing.Message!);
+            if (!closing.IsSuccess) return RefuseSocketClose(closing);
             lock (_gate) _sockets.Remove(objectIdFromSeal);
-            _ = _kernel.RevokeCapability(entry.Capability);
             return KernelResult<object?>.Ok(null);
         }
         return KernelResult<object?>.Fail(KernelError.UnsupportedPayload, "Unknown network operation.");
+    }
+
+    private KernelResult<object?> RefuseSocketClose(KernelResult failure)
+    {
+        lock (_dispatchDrainGate) _drainRequested = true;
+        return KernelResult<object?>.Fail(failure.Error, failure.Message!);
     }
 }

@@ -11,14 +11,8 @@ public sealed partial class RuntimeKernel
     {
         ArgumentNullException.ThrowIfNull(plan);
         var manifest = plan.Manifest;
-        if (plan.ManifestV2 is { } v2)
-        {
-            var declared = v2.StaticCapabilityImports.ToArray();
-            var supplied = plan.Grants.Select(static grant => grant.Requirement)
-                .OrderBy(static item => item.ResourceKind).ThenBy(static item => item.ResourceId, StringComparer.Ordinal).ThenBy(static item => item.Rights).ToArray();
-            if (!declared.SequenceEqual(supplied))
-                return KernelResult<ComponentLifecycleSnapshot>.Fail(KernelError.InvalidManifest, "Runtime grants must exactly match the V2 static capability imports.");
-        }
+        var imports = ValidateComponentContractImports(plan);
+        if (!imports.IsSuccess) return KernelResult<ComponentLifecycleSnapshot>.Fail(imports.Error, imports.Message!);
         var evaluation = EvaluateComponentAdmissionCore(plan);
         // Dependency availability is evidence at preflight time. Preserve the
         // existing admission/rollback lifecycle so a hard dependency loss is
@@ -27,26 +21,17 @@ public sealed partial class RuntimeKernel
         if (evaluation.Error is { } evaluationError && evaluationError != KernelError.ServiceNotFound)
             return KernelResult<ComponentLifecycleSnapshot>.Fail(evaluationError, evaluation.Message!);
 
+        var processPreflight = Processes.ValidateCreation(manifest.Process);
+        if (!processPreflight.IsSuccess)
+            return KernelResult<ComponentLifecycleSnapshot>.Fail(processPreflight.Error, processPreflight.Message!);
+
         var processHandle = new ProcessHandle(manifest.Process.ProcessId, manifest.Process.Generation);
         var limits = manifest.BudgetRequests.Select(static request => new BudgetAmount(request.Dimension, request.Limit)).ToArray();
-        var serviceBudget = Budgets.CreateChild(
-            Budgets.SystemBudget,
-            BudgetAccountLevel.Service,
+        var hierarchy = Budgets.CreateProcessHierarchy(processHandle,
             $"service:{manifest.Identity.Name}:{manifest.Process.Generation}",
-            limits);
-        if (!serviceBudget.IsSuccess)
-            return KernelResult<ComponentLifecycleSnapshot>.Fail(serviceBudget.Error, serviceBudget.Message!);
-        var processBudget = Budgets.CreateChild(
-            serviceBudget.Value!.Account,
-            BudgetAccountLevel.ProcessDomain,
-            $"process:{processHandle.ProcessId.Value}:{processHandle.Generation}",
-            limits);
-        if (!processBudget.IsSuccess)
-            return KernelResult<ComponentLifecycleSnapshot>.Fail(processBudget.Error, processBudget.Message!);
-        var attached = Budgets.AttachProcess(processHandle, processBudget.Value!.Account);
-        if (!attached.IsSuccess)
-            return KernelResult<ComponentLifecycleSnapshot>.Fail(attached.Error, attached.Message!);
-
+            $"process:{processHandle.ProcessId.Value}:{processHandle.Generation}", limits);
+        if (!hierarchy.IsSuccess)
+            return KernelResult<ComponentLifecycleSnapshot>.Fail(hierarchy.Error, hierarchy.Message!);
         var admittedBudgetEvidence = evaluation.Result;
         foreach (var request in manifest.BudgetRequests)
             admittedBudgetEvidence = MarkRequirementGranted(
@@ -62,8 +47,8 @@ public sealed partial class RuntimeKernel
             Process = processHandle,
             Admission = admittedBudgetEvidence,
             State = ComponentLifecycleState.Admitting,
-            ServiceBudget = serviceBudget.Value.Account,
-            ProcessBudget = processBudget.Value.Account,
+            ServiceBudget = hierarchy.Value!.ServiceBudget,
+            ProcessBudget = hierarchy.Value!.ProcessBudget,
         };
         _components.Add(manifest.Identity, record);
 
@@ -221,13 +206,23 @@ public sealed partial class RuntimeKernel
     public KernelResult<ComponentLifecycleSnapshot> FaultComponent(ComponentIdentity identity) =>
         BeginComponentTeardown(identity, faulted: true);
 
+    internal KernelResult<ComponentLifecycleSnapshot> FaultComponent(ComponentIdentity identity, ProcessHandle expectedProcess) =>
+        BeginComponentTeardown(identity, faulted: true, expectedProcess);
+
     internal KernelResult<ComponentLifecycleSnapshot> DrainComponent(ComponentIdentity identity) =>
         BeginComponentTeardown(identity, faulted: false);
 
-    private KernelResult<ComponentLifecycleSnapshot> BeginComponentTeardown(ComponentIdentity identity, bool faulted)
+    internal KernelResult<ComponentLifecycleSnapshot> DrainComponent(ComponentIdentity identity, ProcessHandle expectedProcess) =>
+        BeginComponentTeardown(identity, faulted: false, expectedProcess);
+
+    private KernelResult<ComponentLifecycleSnapshot> BeginComponentTeardown(
+        ComponentIdentity identity, bool faulted, ProcessHandle? expectedProcess = null)
     {
         if (!_components.TryGetValue(identity, out var record))
             return KernelResult<ComponentLifecycleSnapshot>.Fail(KernelError.ComponentNotFound, $"Component '{identity.Name}' was not found.");
+        if (expectedProcess is { } expected && record.Process != expected)
+            return KernelResult<ComponentLifecycleSnapshot>.Fail(KernelError.StaleGeneration,
+                "Component teardown request targets a different process generation.");
         if (record.State == ComponentLifecycleState.Reclaimable)
             return KernelResult<ComponentLifecycleSnapshot>.Ok(record.Snapshot);
         if (record.State is not ComponentLifecycleState.Running and not ComponentLifecycleState.Draining and not ComponentLifecycleState.Faulted)
@@ -255,19 +250,36 @@ public sealed partial class RuntimeKernel
             return KernelResult<ComponentLifecycleSnapshot>.Fail(teardownResult.Error, teardownResult.Message!);
         }
 
-        return ObserveComponentTeardown(identity);
+        return ObserveComponentTeardownRecord(record);
     }
 
     public KernelResult<ComponentLifecycleSnapshot> ObserveComponentTeardown(ComponentIdentity identity)
     {
         if (!_components.TryGetValue(identity, out var record))
             return KernelResult<ComponentLifecycleSnapshot>.Fail(KernelError.ComponentNotFound, $"Component '{identity.Name}' was not found.");
+        return ObserveComponentTeardownRecord(record);
+    }
+
+    private KernelResult<ComponentLifecycleSnapshot> ObserveComponentTeardownRecord(ComponentAdmissionRecord record)
+    {
         if (record.State == ComponentLifecycleState.Reclaimable)
             return KernelResult<ComponentLifecycleSnapshot>.Ok(record.Snapshot);
         if (record.State is not ComponentLifecycleState.Draining and not ComponentLifecycleState.Faulted)
             return KernelResult<ComponentLifecycleSnapshot>.Fail(KernelError.InvalidTransition, "Component teardown has not started.");
 
-        var teardown = ObserveProcessTeardown(record.Process);
+        // Retry through the existing lifecycle consumer with its authoritative
+        // terminal target. Mere observation cannot rerun composed preparation.
+        var tracked = QueryProcessTeardown(record.Process);
+        if (!tracked.IsSuccess)
+            return KernelResult<ComponentLifecycleSnapshot>.Fail(tracked.Error, tracked.Message!);
+        var advanced = BeginOrAdvanceProcessTeardown(record.Process, tracked.Value!.TargetTerminalState);
+        if (advanced.IsSuccess)
+        {
+            FinalizeComponentReclaim(record);
+            return KernelResult<ComponentLifecycleSnapshot>.Ok(record.Snapshot);
+        }
+
+        var teardown = QueryProcessTeardown(record.Process);
         if (!teardown.IsSuccess)
             return KernelResult<ComponentLifecycleSnapshot>.Fail(teardown.Error, teardown.Message!);
         ApplyComponentTeardown(record, teardown.Value!);
@@ -290,26 +302,78 @@ public sealed partial class RuntimeKernel
 
     internal KernelResult<EndpointSessionHandle> RebindComponentDependency(
         ComponentIdentity identity,
-        ServiceEndpointDescriptor exactProvider)
+        ProcessHandle expectedProcess,
+        ServiceEndpointDescriptor exactProvider) =>
+        RebindComponentDependencyCore(identity, expectedProcess, exactProvider, source: null);
+
+    internal KernelResult<EndpointSessionHandle> RebindComponentDependency(ComponentIdentity identity,
+        ProcessHandle expectedProcess, ServiceEndpointDescriptor exactProvider, ProcessHandle principal, CapabilityId source) =>
+        RebindComponentDependencyCore(identity, expectedProcess, exactProvider, (principal, source));
+
+    private KernelResult<EndpointSessionHandle> RebindComponentDependencyCore(ComponentIdentity identity,
+        ProcessHandle expectedProcess, ServiceEndpointDescriptor exactProvider,
+        (ProcessHandle Principal, CapabilityId Capability)? source)
     {
         if (!_components.TryGetValue(identity, out var record) || record.State != ComponentLifecycleState.Running)
             return KernelResult<EndpointSessionHandle>.Fail(KernelError.ComponentNotFound, "Running dependent component was not found.");
+        if (record.Process != expectedProcess)
+            return KernelResult<EndpointSessionHandle>.Fail(KernelError.StaleGeneration, "Dependency rebind target process generation is stale.");
+        if (source is { } control)
+        {
+            var admitted = ValidateSupervisorSessionSource(control.Principal, control.Capability);
+            if (!admitted.IsSuccess) return KernelResult<EndpointSessionHandle>.Fail(admitted.Error, admitted.Message!);
+        }
         var dependency = record.Manifest.Dependencies.SingleOrDefault(candidate => candidate.Contract == exactProvider.Contract);
         if (dependency.Contract == default)
             return KernelResult<EndpointSessionHandle>.Fail(KernelError.InvalidManifest, "Dependency is not declared by the component manifest.");
+        var preflight = PreflightDependencySession(record.Process, exactProvider, record.Capabilities);
+        if (!preflight.IsSuccess)
+            return KernelResult<EndpointSessionHandle>.Fail(preflight.Error, preflight.Message!);
 
-        if (record.DependencySessions.Remove(exactProvider.Contract, out var previous))
+        bool hadPrevious;
+        EndpointSessionHandle previous;
+        lock (_platformMemoryUseGate)
+            hadPrevious = record.DependencySessions.TryGetValue(exactProvider.Contract, out previous);
+        if (hadPrevious)
         {
-            _ = CloseSession(record.Process, previous);
-            record.Sessions.Remove(previous);
+            KernelResult closed;
+            try { closed = CloseSession(record.Process, previous, allowAlreadyClosed: true); }
+            catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+            {
+                return KernelResult<EndpointSessionHandle>.Fail(KernelError.PlatformFaulted, "Dependency session closure outcome is unknown; accounting is retained.");
+            }
+            if (!closed.IsSuccess)
+                return KernelResult<EndpointSessionHandle>.Fail(closed.Error, closed.Message!);
         }
 
-        var session = OpenSession(record.Process, exactProvider, record.Capabilities);
-        if (!session.IsSuccess)
-            return KernelResult<EndpointSessionHandle>.Fail(session.Error, session.Message!);
-        record.DependencySessions.Add(exactProvider.Contract, session.Value);
-        record.Sessions.Add(session.Value);
-        return KernelResult<EndpointSessionHandle>.Ok(session.Value);
+        lock (_platformMemoryUseGate)
+        {
+            if (!_components.TryGetValue(identity, out var current) || !ReferenceEquals(current, record) ||
+                current.Process != expectedProcess || current.State != ComponentLifecycleState.Running)
+                return KernelResult<EndpointSessionHandle>.Fail(KernelError.StaleGeneration, "Dependency target changed before routing commit.");
+            if (hadPrevious)
+            {
+                if (!record.DependencySessions.TryGetValue(exactProvider.Contract, out var tracked) || tracked != previous)
+                    return KernelResult<EndpointSessionHandle>.Fail(KernelError.StaleGeneration, "Dependency routing changed during old session closure.");
+                record.DependencySessions.Remove(exactProvider.Contract);
+                record.Sessions.Remove(previous);
+            }
+            else if (record.DependencySessions.ContainsKey(exactProvider.Contract))
+                return KernelResult<EndpointSessionHandle>.Fail(KernelError.InvalidTransition, "Another admission already bound this dependency.");
+
+            // Lifetime-free local creation has no provider/clock callback. Keep
+            // process teardown outside until the actual session is accounted.
+            var session = OpenSessionCore(record.Process, exactProvider, record.Capabilities, 8, lifetime: null, source);
+            if (!session.IsSuccess)
+                return KernelResult<EndpointSessionHandle>.Fail(session.Error, session.Message!);
+            record.DependencySessions.Add(exactProvider.Contract, session.Value);
+            record.Sessions.Add(session.Value);
+            // A component drain request can precede its process-owner transition.
+            // Retain the admitted session but do not return a running receipt.
+            return record.State == ComponentLifecycleState.Running
+                ? KernelResult<EndpointSessionHandle>.Ok(session.Value)
+                : KernelResult<EndpointSessionHandle>.Fail(KernelError.InvalidTransition, "Component drain requested during local session admission.");
+        }
     }
 
     internal KernelResult<(ProcessHandle Process, PlatformDomainBinding Binding, CapabilityId ComputeCapability)> ResolveComputeComponentAuthority(ComponentIdentity identity)
@@ -348,40 +412,40 @@ public sealed partial class RuntimeKernel
     private KernelResult<ComponentLifecycleSnapshot> Rollback(ComponentAdmissionRecord record, KernelError error, string message)
     {
         record.State = ComponentLifecycleState.Draining;
-        foreach (var session in record.Sessions.AsEnumerable().Reverse()) _ = CloseSession(record.Process, session);
+        // Stop every admitted local source before cleanup can call a provider or
+        // return with an ambiguous effect. This owner transition proves no closure;
+        // the existing cascade and resource records remain responsible for cleanup.
+        foreach (var capability in record.Capabilities)
+            _ = CapabilityAuthority.Revoke(capability);
         Services.UnregisterForProvider(record.Process);
-        if (record.DeviceResources is not null)
-        {
-            var released = ReleaseDriverResources(record);
-            if (!released.IsSuccess)
-            {
-                record.State = ComponentLifecycleState.Faulted;
-                record.Failure = released.Error;
-                return KernelResult<ComponentLifecycleSnapshot>.Fail(released.Error, released.Message!);
-            }
-        }
-        if (record.PlatformBinding is { } binding)
-        {
-            var revoked = RevokePlatformDomain(record.Process, binding);
-            if (!revoked.IsSuccess)
-            {
-                record.State = ComponentLifecycleState.Faulted;
-                record.Failure = revoked.Error;
-                return KernelResult<ComponentLifecycleSnapshot>.Fail(revoked.Error, revoked.Message!);
-            }
-            record.PlatformBinding = null;
-        }
-        foreach (var capability in record.Capabilities.AsEnumerable().Reverse()) _ = RevokeCapability(capability);
+        // The existing process teardown owner stops admissions, tracks every provider
+        // resource and supplies the exact closure snapshot consumed by Observe.
+        // A failed cleanup is no longer stranded before teardown-record creation.
         var terminated = TerminateProcess(record.Process);
-        record.Failure = error;
-        record.State = terminated.IsSuccess ? ComponentLifecycleState.Reclaimable : ComponentLifecycleState.Faulted;
-        return KernelResult<ComponentLifecycleSnapshot>.Fail(error, message);
+        if (terminated.IsSuccess)
+            FinalizeComponentReclaim(record);
+        else
+        {
+            var teardown = QueryProcessTeardown(record.Process);
+            if (teardown.IsSuccess)
+                ApplyComponentTeardown(record, teardown.Value!);
+            else
+                record.State = ComponentLifecycleState.Faulted;
+        }
+
+        var failure = !terminated.IsSuccess && terminated.Error != KernelError.PlatformBindingDraining
+            ? terminated.Error : error;
+        record.Failure = failure;
+        return KernelResult<ComponentLifecycleSnapshot>.Fail(failure,
+            failure == error ? message : terminated.Message!);
     }
 
     private KernelResult<ComponentLifecycleSnapshot> FailAdmission(ComponentAdmissionRecord record, KernelError error, string message)
     {
         record.Failure = error;
-        record.State = ComponentLifecycleState.Reclaimable;
+        // This component did not create its process. A colliding live generation may
+        // own resources charged to the already attached hierarchy; refusal is not closure.
+        record.State = ComponentLifecycleState.Faulted;
         return KernelResult<ComponentLifecycleSnapshot>.Fail(error, message);
     }
 
@@ -424,34 +488,6 @@ public sealed partial class RuntimeKernel
             resources.AddIrq(new IrqResourceGrant(irq.CapabilityResourceId, capability.Value, bindingResult.Value!, endpoint.Value!));
         }
 
-        return KernelResult.Ok();
-    }
-
-    private KernelResult ReleaseDriverResources(ComponentAdmissionRecord record)
-    {
-        var resources = record.DeviceResources;
-        if (resources is null) return KernelResult.Ok();
-
-        foreach (var dma in resources.ActiveDmaGrants.Reverse().ToArray())
-        {
-            var revoked = RevokePlatformDma(record.Process, dma);
-            if (!revoked.IsSuccess) return revoked;
-        }
-        foreach (var irq in resources.Irqs.Reverse().ToArray())
-        {
-            var revoked = RevokePlatformInterrupt(record.Process, irq.Binding);
-            if (!revoked.IsSuccess) return revoked;
-            var closed = CloseKernelEventEndpoint(record.Process, irq.EventEndpoint);
-            if (!closed.IsSuccess) return closed;
-        }
-        foreach (var mmio in resources.Mmio.Reverse().ToArray())
-        {
-            var revoked = RevokePlatformMmio(record.Process, mmio.Lease);
-            if (!revoked.IsSuccess) return revoked;
-        }
-        var device = RevokePlatformDevice(record.Process, resources.DeviceLease);
-        if (!device.IsSuccess) return device;
-        record.DeviceResources = null;
         return KernelResult.Ok();
     }
 

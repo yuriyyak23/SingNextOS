@@ -93,10 +93,15 @@ public sealed partial class RuntimeKernel
     public KernelResult<SingProcess> CreateProcess(SingProcessManifestV1 manifest)
     {
         if (manifest is null) return KernelResult<SingProcess>.Fail(KernelError.InvalidManifest, "Manifest is required.");
-        var result = Processes.Create(manifest);
-        if (!result.IsSuccess) return result;
-        Domains.Add(result.Value!);
-        return result;
+        // Registry commits share the existing lifecycle scope with teardown and
+        // final issuance. Registry owner locks protect metadata readers only.
+        lock (_platformMemoryUseGate)
+        {
+            var result = Processes.Create(manifest);
+            if (!result.IsSuccess) return result;
+            Domains.Add(result.Value!);
+            return result;
+        }
     }
 
     public KernelResult AdmitProcess(ProcessHandle handle)
@@ -161,15 +166,36 @@ public sealed partial class RuntimeKernel
         if (!resolved.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(resolved.Error, resolved.Message!);
         var effect = EnsureProcessAcceptsNewEffects(resolved.Value!);
         if (!effect.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(effect.Error, effect.Message!);
-        if (!Domains.Contains(issuerDomain)) return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.DomainNotFound, $"Issuer domain {issuerDomain} is not active.");
-        var minted = CapabilityAuthority.Mint(issuerDomain, resolved.Value!.DomainId, resourceKind, resourceId, rights, subject.Generation, resourceGeneration);
+        var issuer = ValidateCapabilityIssuerPresence(issuerDomain);
+        if (!issuer.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(issuer.Error, issuer.Message!);
+        var minted = CapabilityAuthority.Mint(issuerDomain, resolved.Value!.DomainId, resourceKind, resourceId, rights,
+            subject.Generation, resourceGeneration, commitConsumer: commit =>
+            {
+                lock (_platformMemoryUseGate)
+                {
+                    var current = Processes.Resolve(subject);
+                    if (!current.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(current.Error, current.Message!);
+                    var accepts = EnsureProcessAcceptsNewEffects(current.Value!);
+                    if (!accepts.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(accepts.Error, accepts.Message!);
+                    if (current.Value!.DomainId != resolved.Value!.DomainId)
+                        return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.WrongCapabilitySubject, "Mint subject domain changed during preparation.");
+                    var issuerCurrent = ValidateCapabilityIssuerPresence(issuerDomain);
+                    if (!issuerCurrent.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(issuerCurrent.Error, issuerCurrent.Message!);
+                    var issued = commit();
+                    if (issued.IsSuccess) current.Value.AddCapability(issued.Value!.CapabilityId);
+                    return issued;
+                }
+            });
         if (!minted.IsSuccess) return minted;
         var descriptor = minted.Value!;
-        resolved.Value.AddCapability(descriptor.CapabilityId);
         RecordTrace(subject, TraceEventKind.CapabilityMinted, traceContext, "capability",
             descriptor.CapabilityId.Value.ToString(), "active", "minted");
         return KernelResult<CapabilityDescriptorV1>.Ok(descriptor);
     }
+
+    private KernelResult ValidateCapabilityIssuerPresence(DomainId issuerDomain) => Domains.Contains(issuerDomain)
+        ? KernelResult.Ok()
+        : KernelResult.Fail(KernelError.DomainNotFound, $"Issuer domain {issuerDomain} is not active.");
 
     public KernelResult<CapabilityHandleV2> MintCapabilityV2(
         DomainId issuerDomain, ProcessHandle subject, ResourceKind resourceKind,
@@ -209,12 +235,34 @@ public sealed partial class RuntimeKernel
         var targetEffect = EnsureProcessAcceptsNewEffects(targetProcess.Value!);
         if (!targetEffect.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(targetEffect.Error, targetEffect.Message!);
 
-        var delegated = CapabilityAuthority.Delegate(sourceCapability, sourceProcess.Value!.DomainId, targetProcess.Value!.DomainId, rights, target.Generation);
+        var delegated = CapabilityAuthority.Delegate(sourceCapability, sourceProcess.Value!.DomainId,
+            targetProcess.Value!.DomainId, rights, target.Generation, derive: null, commitConsumer: commit =>
+            {
+                lock (_platformMemoryUseGate)
+                {
+                    var sourceCurrent = Processes.Resolve(delegator);
+                    if (!sourceCurrent.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(sourceCurrent.Error, sourceCurrent.Message!);
+                    var sourceAccepts = EnsureProcessAcceptsNewEffects(sourceCurrent.Value!);
+                    if (!sourceAccepts.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(sourceAccepts.Error, sourceAccepts.Message!);
+                    var targetCurrent = Processes.Resolve(target);
+                    if (!targetCurrent.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(targetCurrent.Error, targetCurrent.Message!);
+                    var targetAccepts = EnsureProcessAcceptsNewEffects(targetCurrent.Value!);
+                    if (!targetAccepts.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(targetAccepts.Error, targetAccepts.Message!);
+                    if (sourceCurrent.Value!.DomainId != sourceProcess.Value!.DomainId || targetCurrent.Value!.DomainId != targetProcess.Value!.DomainId)
+                        return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.WrongCapabilitySubject, "Delegation process domain changed during preparation.");
+                    var exactSource = CapabilityAuthority.Validate(sourceCapability, sourceCurrent.Value.DomainId,
+                        delegator.Generation, CapabilityRights.Delegate);
+                    if (!exactSource.IsSuccess) return exactSource;
+                    var issued = commit();
+                    if (issued.IsSuccess) targetCurrent.Value.AddCapability(issued.Value!.CapabilityId);
+                    return issued;
+                }
+            });
         if (delegated.IsSuccess)
         {
-            targetProcess.Value!.AddCapability(delegated.Value!.CapabilityId);
+
             RecordTrace(target, TraceEventKind.CapabilityDelegated, traceContext, "capability",
-                delegated.Value.CapabilityId.Value.ToString(), "active", "delegated");
+                delegated.Value!.CapabilityId.Value.ToString(), "active", "delegated");
         }
         return delegated;
     }
@@ -361,3 +409,6 @@ public sealed partial class RuntimeKernel
 
     private static KernelResult InvalidTransition(ProcessState actual, ProcessState requested) => KernelResult.Fail(KernelError.InvalidTransition, $"Cannot transition from {actual} to {requested}.");
 }
+
+
+

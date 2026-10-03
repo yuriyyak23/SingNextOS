@@ -7,6 +7,146 @@ namespace SingPlus.Tests.Capabilities;
 
 public sealed class SingCapPhase04EffectAdmissionTests
 {
+    [Theory]
+    [InlineData(false, false)] [InlineData(false, true)]
+    [InlineData(true, false)] [InlineData(true, true)]
+    public void FinalCommitRejectsProcessStopAfterPreparedSession(bool caller, bool fault)
+    {
+        var s = SessionScenario(CapabilityRights.Execute, 1);
+        var target = caller ? s.Caller : s.Service;
+        s.Kernel.RegisterComposedWorkTeardownParticipant(new RefusingParticipant());
+        s.Kernel.EffectAdmissionQualificationHook = new AdmissionHook(point =>
+        {
+            if (point != EffectAdmissionQualificationPoint.AfterFinalSessionRevalidation) return;
+            var stopped = fault ? s.Kernel.FaultProcess(target) : s.Kernel.TerminateProcess(target);
+            Assert.False(stopped.IsSuccess);
+            Assert.False(s.Kernel.ObserveProcessTeardown(target).Value!.LocalReclaimCompleted);
+        });
+        var admitted = s.Kernel.AdmitSessionCapabilityEffect(s.Caller, s.Service, s.Session, s.Capability,
+            ResourceKind.File, "file:namespace", 1, CapabilityOperation.Execute, quotaAmount: 1, oneShot: true);
+        Assert.Equal(KernelError.InvalidTransition, admitted.Error);
+        Assert.Equal(1UL, s.Kernel.CapabilityAuthority.InspectConstraints(s.Capability)!.Value.SharedRemaining);
+        Assert.Equal(0UL, s.Kernel.CapabilityAuthority.InspectConstraints(s.Capability)!.Value.HandleConsumed);
+        Assert.Equal(0, s.Kernel.CapabilityAuthority.ActiveOperationLeaseCount);
+        Assert.Equal(0, s.Kernel.EndpointSessions.ActivePinCount(s.Session));
+    }
+
+    [Fact]
+    public void FinalCommitRejectsCloseAfterPreparedSessionWithoutConsumption()
+    {
+        var s = SessionScenario(CapabilityRights.Execute, 1);
+        s.Kernel.EffectAdmissionQualificationHook = new AdmissionHook(point =>
+        {
+            if (point == EffectAdmissionQualificationPoint.AfterFinalSessionRevalidation)
+                Assert.Equal(KernelError.SessionDraining, s.Kernel.EndpointSessions.Close(s.Session, s.Caller).Error);
+        });
+        var admitted = s.Kernel.AdmitSessionCapabilityEffect(s.Caller, s.Service, s.Session, s.Capability,
+            ResourceKind.File, "file:namespace", 1, CapabilityOperation.Execute, quotaAmount: 1, oneShot: true);
+        Assert.Equal(KernelError.SessionClosed, admitted.Error);
+        var process = s.Kernel.Processes.Resolve(s.Caller).Value!;
+        Assert.True(s.Kernel.CapabilityAuthority.Validate(s.Capability, process.DomainId,
+            s.Caller.Generation, CapabilityRights.Execute).IsSuccess);
+        Assert.Equal(1UL, s.Kernel.CapabilityAuthority.InspectConstraints(s.Capability)!.Value.SharedRemaining);
+        Assert.Equal(0, s.Kernel.CapabilityAuthority.ActiveOperationLeaseCount);
+        Assert.Equal(0, s.Kernel.EndpointSessions.ActivePinCount(s.Session));
+    }
+
+    [Fact]
+    public void DisposedPinCannotCommitUsingAnotherLivePin()
+    {
+        var s = SessionScenario();
+        var disposed = s.Kernel.EndpointSessions.AcquirePin(s.Session, s.Caller, s.Service).Value!;
+        using var live = s.Kernel.EndpointSessions.AcquirePin(s.Session, s.Caller, s.Service).Value!;
+        disposed.Dispose();
+        var called = false;
+        var result = s.Kernel.EndpointSessions.CommitPinnedEffectAdmission(disposed, () =>
+        {
+            called = true;
+            return KernelResult<int>.Ok(1);
+        });
+        Assert.Equal(KernelError.SessionClosed, result.Error);
+        Assert.False(called);
+        Assert.Equal(1, s.Kernel.EndpointSessions.ActivePinCount(s.Session));
+    }
+
+    private sealed class RefusingParticipant : IComposedWorkTeardownParticipant
+    {
+        public KernelResult CloseComposedWorkForProcess(ProcessHandle process, RegionOwner owner) =>
+            KernelResult.Fail(KernelError.ExternalEffectUncontained, "Exact provider closure remains unavailable.");
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void ExactProviderGenerationRejectsReplacementBeforeSourceConsumption(bool afterPreparation)
+    {
+        var s = SessionScenario(CapabilityRights.Execute, 1);
+        void Replace()
+        {
+            Assert.True(s.Kernel.TerminateProcess(s.Service).IsSuccess);
+            var (_, replacement) = TestFixtures.Create(s.Kernel, s.Service.ProcessId.Value, 20,
+                s.Service.Generation + 1);
+            Assert.True(s.Kernel.Processes.Resolve(replacement).IsSuccess);
+        }
+        if (afterPreparation)
+            s.Kernel.EffectAdmissionQualificationHook = new AdmissionHook(point =>
+            {
+                if (point == EffectAdmissionQualificationPoint.AfterFinalSessionRevalidation) Replace();
+            });
+        else Replace();
+        var admitted = s.Kernel.AdmitSessionCapabilityEffect(s.Caller, s.Service, s.Session, s.Capability,
+            ResourceKind.File, "file:namespace", 1, CapabilityOperation.Execute, quotaAmount: 1, oneShot: true);
+        Assert.Equal(KernelError.StaleHandle, admitted.Error);
+        Assert.Equal(1UL, s.Kernel.CapabilityAuthority.InspectConstraints(s.Capability)!.Value.SharedRemaining);
+        Assert.Equal(0, s.Kernel.CapabilityAuthority.ActiveOperationLeaseCount);
+        Assert.Equal(0, s.Kernel.EndpointSessions.ActivePinCount(s.Session));
+    }
+
+    [Fact]
+    public async Task SourceCommitFreezesProviderStopUntilItsLocalLinearization()
+    {
+        var s = SessionScenario(CapabilityRights.Execute, 1);
+        var capGate = typeof(CapabilityAuthority).GetField("_gate", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(s.Kernel.CapabilityAuthority)!;
+        var sessionGate = typeof(EndpointSessionRegistry).GetField("_gate", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(s.Kernel.EndpointSessions)!;
+        using var locked = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        Task? holder = null;
+        s.Kernel.EffectAdmissionQualificationHook = new AdmissionHook(point =>
+        {
+            if (point != EffectAdmissionQualificationPoint.AfterFinalSessionRevalidation) return;
+            holder = Task.Run(() => { lock (capGate) { locked.Set(); Assert.True(release.Wait(TimeSpan.FromSeconds(10))); } });
+            Assert.True(locked.Wait(TimeSpan.FromSeconds(10)));
+        });
+        var admission = Task.Run(() => s.Kernel.AdmitSessionCapabilityEffect(s.Caller, s.Service, s.Session,
+            s.Capability, ResourceKind.File, "file:namespace", 1, CapabilityOperation.Execute, quotaAmount: 1, oneShot: true));
+        Task<KernelResult>? stopping = null;
+        try
+        {
+            Assert.True(locked.Wait(TimeSpan.FromSeconds(10)));
+            Assert.True(SpinWait.SpinUntil(() =>
+            {
+                if (!Monitor.TryEnter(sessionGate)) return true;
+                Monitor.Exit(sessionGate);
+                return false;
+            }, TimeSpan.FromSeconds(10)));
+            var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            stopping = Task.Run(() => { started.SetResult(); return s.Kernel.TerminateProcess(s.Service); });
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.False(stopping.IsCompleted);
+            Assert.False(admission.IsCompleted);
+        }
+        finally { release.Set(); }
+        var admitted = await admission.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.True(admitted.IsSuccess, admitted.Message);
+        admitted.Value!.Dispose();
+        await holder!.WaitAsync(TimeSpan.FromSeconds(10));
+        await stopping!.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(0UL, s.Kernel.CapabilityAuthority.InspectConstraints(s.Capability)!.Value.SharedRemaining);
+        Assert.Equal(0, s.Kernel.CapabilityAuthority.ActiveOperationLeaseCount);
+        Assert.Equal(0, s.Kernel.EndpointSessions.ActivePinCount(s.Session));
+    }
+
     [Fact]
     public void QualificationHookFollowsActualFinalSessionRevalidationAndClockObservation()
     {

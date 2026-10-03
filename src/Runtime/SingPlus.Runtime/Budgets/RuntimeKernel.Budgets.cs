@@ -50,7 +50,17 @@ public sealed partial class RuntimeKernel
         if (capability.Value!.ResourceKind != ResourceKind.KernelService ||
             capability.Value.ResourceId != CapabilityResourceIds.BudgetAdministration)
             return KernelResult<BudgetAccountSnapshot>.Fail(KernelError.SupervisorDenied, "Budget administration requires the exact kernel budget capability.");
-        return Budgets.ConfigureSystem(limits);
+        var staged = StageBudgetAmounts(limits);
+        if (!staged.IsSuccess) return KernelResult<BudgetAccountSnapshot>.Fail(staged.Error, staged.Message!);
+        lock (_platformMemoryUseGate)
+        {
+            var exact = Processes.Resolve(principal);
+            if (!exact.IsSuccess) return KernelResult<BudgetAccountSnapshot>.Fail(exact.Error, exact.Message!);
+            var effect = EnsureProcessAcceptsNewEffects(exact.Value!);
+            if (!effect.IsSuccess) return KernelResult<BudgetAccountSnapshot>.Fail(effect.Error, effect.Message!);
+            return CapabilityAuthority.CommitBudgetAdministration(administrationCapability, exact.Value!.DomainId,
+                principal.Generation, () => Budgets.ConfigureSystem(staged.Value!));
+        }
     }
 
     public KernelResult<BudgetReservationSnapshot> ReserveBudget(
@@ -63,7 +73,16 @@ public sealed partial class RuntimeKernel
         if (!process.IsSuccess) return KernelResult<BudgetReservationSnapshot>.Fail(process.Error, process.Message!);
         var effect = EnsureProcessAcceptsNewEffects(process.Value!);
         if (!effect.IsSuccess) return KernelResult<BudgetReservationSnapshot>.Fail(effect.Error, effect.Message!);
-        return Budgets.Reserve(owner, amounts, lifetime, qosHint);
+        var staged = StageBudgetAmounts(amounts);
+        if (!staged.IsSuccess) return KernelResult<BudgetReservationSnapshot>.Fail(staged.Error, staged.Message!);
+        lock (_platformMemoryUseGate)
+        {
+            process = Processes.Resolve(owner);
+            if (!process.IsSuccess) return KernelResult<BudgetReservationSnapshot>.Fail(process.Error, process.Message!);
+            effect = EnsureProcessAcceptsNewEffects(process.Value!);
+            if (!effect.IsSuccess) return KernelResult<BudgetReservationSnapshot>.Fail(effect.Error, effect.Message!);
+            return Budgets.Reserve(owner, staged.Value!, lifetime, qosHint);
+        }
     }
 
     public KernelResult<ProcessBudgetAdmission> AdmitProcessBudget(
@@ -80,17 +99,32 @@ public sealed partial class RuntimeKernel
             return KernelResult<ProcessBudgetAdmission>.Fail(KernelError.SupervisorDenied, "Budget admission requires the exact kernel budget capability.");
         var target = Processes.Resolve(process);
         if (!target.IsSuccess) return KernelResult<ProcessBudgetAdmission>.Fail(target.Error, target.Message!);
-        var service = Budgets.CreateChild(Budgets.SystemBudget, BudgetAccountLevel.Service, serviceCorrelation, limits);
-        if (!service.IsSuccess) return KernelResult<ProcessBudgetAdmission>.Fail(service.Error, service.Message!);
-        var child = Budgets.CreateChild(service.Value!.Account, BudgetAccountLevel.ProcessDomain,
-            $"process:{process.ProcessId.Value}:{process.Generation}", limits);
-        if (!child.IsSuccess) return KernelResult<ProcessBudgetAdmission>.Fail(child.Error, child.Message!);
-        var attached = Budgets.AttachProcess(process, child.Value!.Account);
-        return attached.IsSuccess
-            ? KernelResult<ProcessBudgetAdmission>.Ok(new(process, service.Value.Account, child.Value.Account))
-            : KernelResult<ProcessBudgetAdmission>.Fail(attached.Error, attached.Message!);
+        var staged = StageBudgetAmounts(limits);
+        if (!staged.IsSuccess) return KernelResult<ProcessBudgetAdmission>.Fail(staged.Error, staged.Message!);
+        lock (_platformMemoryUseGate)
+        {
+            var exact = Processes.Resolve(principal);
+            if (!exact.IsSuccess) return KernelResult<ProcessBudgetAdmission>.Fail(exact.Error, exact.Message!);
+            var effect = EnsureProcessAcceptsNewEffects(exact.Value!);
+            if (!effect.IsSuccess) return KernelResult<ProcessBudgetAdmission>.Fail(effect.Error, effect.Message!);
+            target = Processes.Resolve(process);
+            if (!target.IsSuccess) return KernelResult<ProcessBudgetAdmission>.Fail(target.Error, target.Message!);
+            effect = EnsureProcessAcceptsNewEffects(target.Value!);
+            if (!effect.IsSuccess) return KernelResult<ProcessBudgetAdmission>.Fail(effect.Error, effect.Message!);
+            return CapabilityAuthority.CommitBudgetAdministration(administrationCapability, exact.Value!.DomainId,
+                principal.Generation, () => Budgets.CreateProcessHierarchy(process, serviceCorrelation,
+                    $"process:{process.ProcessId.Value}:{process.Generation}", staged.Value!));
+        }
     }
 
+    private static KernelResult<BudgetAmount[]> StageBudgetAmounts(IReadOnlyList<BudgetAmount> amounts)
+    {
+        try { return KernelResult<BudgetAmount[]>.Ok(amounts.ToArray()); }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        {
+            return KernelResult<BudgetAmount[]>.Fail(KernelError.PlatformFaulted, "Budget input observation failed before owner commit.");
+        }
+    }
     public KernelResult<BudgetReservationSnapshot> ReleaseBudget(
         ProcessHandle owner,
         BudgetReservationHandle reservation) => Budgets.ReleaseExplicit(owner, reservation);
