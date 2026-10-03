@@ -106,39 +106,40 @@ public sealed partial class RuntimeKernel
 
     public KernelResult AdmitProcess(ProcessHandle handle)
     {
-        var resolved = Processes.Resolve(handle);
-        if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
-        var process = resolved.Value!;
-        if (process.State != ProcessState.Created) return InvalidTransition(process.State, ProcessState.Admitted);
-        foreach (var requirement in process.Manifest.RequiredCapabilities)
+        SingProcess process;
+        lock (_platformMemoryUseGate)
         {
-            var satisfied = CapabilityAuthority.SnapshotForDomain(process.DomainId).Any(c => c.Generation == process.Generation && c.ResourceKind == requirement.ResourceKind && string.Equals(c.ResourceId, requirement.ResourceId, StringComparison.Ordinal) && (c.Rights & requirement.Rights) == requirement.Rights);
-            if (!satisfied) return KernelResult.Fail(KernelError.MissingCapability, $"Missing capability {requirement.ResourceKind}:{requirement.ResourceId} ({requirement.Rights}).");
+            var resolved = Processes.Resolve(handle);
+            if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+            process = resolved.Value!;
+            if (process.State != ProcessState.Created) return InvalidTransition(process.State, ProcessState.Admitted);
         }
-        process.SetState(ProcessState.Admitted);
-        return KernelResult.Ok();
+        // Capture caller-visible manifest requirements outside authority gates.
+        // This private sequence is an input, never permission or a live view.
+        var requirements = process.Manifest.RequiredCapabilities.ToArray();
+        lock (_platformMemoryUseGate)
+        {
+            var current = Processes.Resolve(handle);
+            if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
+            if (!ReferenceEquals(current.Value, process))
+                return KernelResult.Fail(KernelError.StaleHandle, "Admission process changed during requirement capture.");
+            if (process.State != ProcessState.Created) return InvalidTransition(process.State, ProcessState.Admitted);
+            return CapabilityAuthority.CommitProcessAdmission(process.DomainId, process.Generation, requirements, () =>
+            {
+                process.SetState(ProcessState.Admitted);
+                return KernelResult.Ok();
+            });
+        }
     }
-
     public KernelResult StartProcess(ProcessHandle handle)
     {
-        var resolved = Processes.Resolve(handle);
-        if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
-        var process = resolved.Value!;
-        if (process.State != ProcessState.Admitted) return InvalidTransition(process.State, ProcessState.Runnable);
-
-        var platform = TransitionPlatformExecutionIfBound(
-            handle,
-            process,
-            PlatformDomainExecutionTransition.Start);
-        if (!platform.IsSuccess) return platform;
-
-        process.SetState(ProcessState.Runnable);
-        process.SetState(ProcessState.Running);
-        RecordTrace(handle, TraceEventKind.ProcessLifecycle, null, "process",
-            $"{handle.ProcessId.Value}:{handle.Generation}", "running", "started");
-        return KernelResult.Ok();
+        var result = TransitionProcessExecution(handle, ProcessState.Admitted,
+            ProcessState.Running, PlatformDomainExecutionTransition.Start);
+        if (result.IsSuccess)
+            RecordTrace(handle, TraceEventKind.ProcessLifecycle, null, "process",
+                $"{handle.ProcessId.Value}:{handle.Generation}", "running", "started");
+        return result;
     }
-
     public KernelResult ParkProcess(ProcessHandle handle) =>
         TransitionProcessExecution(
             handle,
@@ -161,6 +162,11 @@ public sealed partial class RuntimeKernel
 
     public KernelResult<CapabilityDescriptorV1> MintCapability(DomainId issuerDomain, ProcessHandle subject, ResourceKind resourceKind, string resourceId, CapabilityRights rights,
         TraceCausalContext? traceContext = null, ulong resourceGeneration = 1)
+        => MintCapabilityCore(issuerDomain, subject, resourceKind, resourceId, rights, traceContext, resourceGeneration);
+
+    private KernelResult<CapabilityDescriptorV1> MintCapabilityCore(DomainId issuerDomain, ProcessHandle subject, ResourceKind resourceKind, string resourceId, CapabilityRights rights,
+        TraceCausalContext? traceContext = null, ulong resourceGeneration = 1,
+        Func<Func<KernelResult<CapabilityDescriptorV1>>, KernelResult<CapabilityDescriptorV1>>? sourceCommitConsumer = null)
     {
         var resolved = Processes.Resolve(subject);
         if (!resolved.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(resolved.Error, resolved.Message!);
@@ -181,7 +187,7 @@ public sealed partial class RuntimeKernel
                         return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.WrongCapabilitySubject, "Mint subject domain changed during preparation.");
                     var issuerCurrent = ValidateCapabilityIssuerPresence(issuerDomain);
                     if (!issuerCurrent.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(issuerCurrent.Error, issuerCurrent.Message!);
-                    var issued = commit();
+                    var issued = sourceCommitConsumer is null ? commit() : sourceCommitConsumer(commit);
                     if (issued.IsSuccess) current.Value.AddCapability(issued.Value!.CapabilityId);
                     return issued;
                 }
@@ -350,39 +356,78 @@ public sealed partial class RuntimeKernel
         return mappingCascade.IsSuccess ? result : mappingCascade;
     }
 
+    // Admission interlock only; ProcessRegistry and SingProcess remain identity/state owners.
+    private readonly HashSet<ProcessHandle> _executionTransactions = [];
+
     private KernelResult TransitionProcessExecution(
         ProcessHandle handle,
         ProcessState from,
         ProcessState to,
         PlatformDomainExecutionTransition platformTransition)
     {
-        var resolved = Processes.Resolve(handle);
-        if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
-        var process = resolved.Value!;
-        if (process.State != from) return InvalidTransition(process.State, to);
+        SingProcess process;
+        PlatformDomainBinding binding;
+        lock (_platformMemoryUseGate)
+        {
+            var resolved = Processes.Resolve(handle);
+            if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+            process = resolved.Value!;
+            if (_executionTransactions.Contains(handle) || _pendingPlatformDomainBinds.Contains(handle))
+                return KernelResult.Fail(KernelError.PlatformBindingActive, "An execution transaction is pending for this process.");
+            if (process.State != from) return InvalidTransition(process.State, to);
+            if (!_platformExecutionAttachments.Contains(handle) || !_processPlatformBindings.TryGetValue(handle, out binding))
+            {
+                KernelResult CommitFallback()
+                {
+                    CommitState();
+                    return KernelResult.Ok();
+                }
+                // An authority-only/cleanup root is still a declared dependency.
+                // Its quarantine cannot silently become an unbound execution fallback.
+                if (_processPlatformBindings.TryGetValue(handle, out var authorityBinding))
+                    return PlatformAuthority.CommitActiveDomainConsumer(authorityBinding, PlatformIdentity(process), CommitFallback);
+                return CommitFallback();
+            }
+            _executionTransactions.Add(handle);
+        }
 
-        var platform = TransitionPlatformExecutionIfBound(
-            handle,
-            process,
-            platformTransition);
-        if (!platform.IsSuccess) return platform;
+        KernelResult WithCurrentProcess(Func<KernelResult> ownerCommit)
+        {
+            lock (_platformMemoryUseGate)
+            {
+                var current = Processes.Resolve(handle);
+                if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
+                if (!ReferenceEquals(current.Value, process) || process.State != from)
+                    return InvalidTransition(process.State, to);
+                if (!_platformExecutionAttachments.Contains(handle) ||
+                    !_processPlatformBindings.TryGetValue(handle, out var currentBinding) || currentBinding != binding)
+                    return KernelResult.Fail(KernelError.StaleGeneration, "Execution attachment changed during the transaction.");
+                return ownerCommit();
+            }
+        }
 
-        process.SetState(to);
-        return KernelResult.Ok();
+        void CommitState()
+        {
+            if (platformTransition == PlatformDomainExecutionTransition.Start)
+                process.SetState(ProcessState.Runnable);
+            process.SetState(to);
+        }
+
+        try
+        {
+            return PlatformAuthority.TransitionDomainExecution(binding, PlatformIdentity(process), platformTransition,
+                admissionConsumer: WithCurrentProcess,
+                completionConsumer: commit => WithCurrentProcess(() => commit(() =>
+                {
+                    CommitState();
+                    return KernelResult.Ok();
+                })));
+        }
+        finally
+        {
+            lock (_platformMemoryUseGate) _executionTransactions.Remove(handle);
+        }
     }
-
-    private KernelResult TransitionPlatformExecutionIfBound(
-        ProcessHandle handle,
-        SingProcess process,
-        PlatformDomainExecutionTransition transition)
-    {
-        if (!_platformExecutionAttachments.Contains(handle) || !_processPlatformBindings.TryGetValue(handle, out var binding))
-            return KernelResult.Ok();
-
-        var identity = PlatformIdentity(process);
-        return PlatformAuthority.TransitionDomainExecution(binding, identity, transition);
-    }
-
     private static PlatformDomainIdentity PlatformIdentity(SingProcess process) =>
         new(
             process.DomainId,
@@ -409,6 +454,7 @@ public sealed partial class RuntimeKernel
 
     private static KernelResult InvalidTransition(ProcessState actual, ProcessState requested) => KernelResult.Fail(KernelError.InvalidTransition, $"Cannot transition from {actual} to {requested}.");
 }
+
 
 
 

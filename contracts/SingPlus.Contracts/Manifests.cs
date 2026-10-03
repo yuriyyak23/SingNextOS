@@ -11,6 +11,9 @@ public sealed class SingProcessManifestV1
 
     private readonly CapabilityRequirementV1[] _requiredCapabilities;
     private readonly string[] _requiredContracts;
+    // Non-authoritative read-only views over the sole private canonical arrays.
+    private readonly IReadOnlyList<CapabilityRequirementV1> _requiredCapabilitiesView;
+    private readonly IReadOnlyList<string> _requiredContractsView;
 
     public SingProcessManifestV1(
         ProcessId processId,
@@ -64,6 +67,9 @@ public sealed class SingProcessManifestV1
             if (!contractSet.Add(contract)) throw new ArgumentException($"Duplicate contract '{contract}'.", nameof(requiredContracts));
         }
 
+        _requiredCapabilitiesView = Array.AsReadOnly(_requiredCapabilities);
+        _requiredContractsView = Array.AsReadOnly(_requiredContracts);
+
         SchemaId = schemaId;
         SchemaVersion = schemaVersion;
         ProcessId = processId;
@@ -84,8 +90,8 @@ public sealed class SingProcessManifestV1
     public string EntryIdentity { get; }
     public ExecutionRole ExecutionRole { get; }
     public MemoryProfile MemoryProfile { get; }
-    public IReadOnlyList<CapabilityRequirementV1> RequiredCapabilities => _requiredCapabilities;
-    public IReadOnlyList<string> RequiredContracts => _requiredContracts;
+    public IReadOnlyList<CapabilityRequirementV1> RequiredCapabilities => _requiredCapabilitiesView;
+    public IReadOnlyList<string> RequiredContracts => _requiredContractsView;
     public ResourceLimitsV1 ResourceLimits { get; }
     public string ContractDigest { get; }
 
@@ -138,3 +144,4 @@ public sealed class SingProcessManifestV1
 
     public static string Digest(ReadOnlySpan<byte> bytes) => Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
 }
+

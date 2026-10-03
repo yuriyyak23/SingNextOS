@@ -1,0 +1,6 @@
+# Requires --platform host-model; add --budget and --trace for accounting/diagnostics.
+platform
+demo compute
+status
+regions
+exit

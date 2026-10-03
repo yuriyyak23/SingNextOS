@@ -78,7 +78,7 @@ public sealed partial class RuntimeKernel
     private KernelResult<SecureExecutionContext> ResolveComposition(ProcessHandle owner,
         VirtualDomainHandle virtualDomain, CapabilityId virtualCapability, SecureDomainHandle secureDomain, CapabilityId secureCapability)
     {
-        var virtualRecord = _virtualDomains.Resolve(owner, virtualDomain);
+        var virtualRecord = _virtualDomains.ResolveAdmission(owner, virtualDomain);
         if (!virtualRecord.IsSuccess) return KernelResult<SecureExecutionContext>.Fail(virtualRecord.Error, virtualRecord.Message!);
         var vc = ValidateCapability(owner, virtualCapability, CapabilityRights.Configure);
         var sc = ValidateCapability(owner, secureCapability, CapabilityRights.Configure);

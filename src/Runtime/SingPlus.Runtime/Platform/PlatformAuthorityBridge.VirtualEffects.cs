@@ -20,6 +20,8 @@ public sealed partial class PlatformAuthorityBridge
         PlatformBackendEpoch backendEpoch;
         lock (_secureDomainLifecycleGate)
         {
+            var lineage = ValidateActiveChildLineage(record);
+            if (!lineage.IsSuccess) return KernelResult<PlatformVirtualEventReceipt>.Fail(lineage.Error, lineage.Message!);
             if (record.TransitionInFlight || !PlatformVirtualEventContract.ValidateRequest(request, record.State).IsSuccess)
                 return KernelResult<PlatformVirtualEventReceipt>.Fail(KernelError.PlatformBindingActive,
                     "Child lifecycle changed before virtual-event injection.");
@@ -58,13 +60,18 @@ public sealed partial class PlatformAuthorityBridge
                         validation.IsSuccess ? "Virtual-event evidence sequence is stale or replayed." : validation.Message!);
                 }
                 record.LastEventSequence = evidence.Sequence;
+                var lineage = ValidateActiveChildLineage(record);
+                if (!lineage.IsSuccess) return KernelResult<PlatformVirtualEventReceipt>.Fail(lineage.Error, lineage.Message!);
                 return KernelResult<PlatformVirtualEventReceipt>.Ok(evidence);
             }
         }
         finally { lock (_secureDomainLifecycleGate) record.PendingChildEffects--; }
     }
 
-    internal KernelResult<PlatformVirtualTrapEvidence> ObserveChildTrap(PlatformChildBinding child)
+    internal KernelResult<PlatformVirtualTrapEvidence> ObserveChildTrap(PlatformChildBinding child,
+        Func<Func<KernelResult>, KernelResult>? admissionConsumer = null,
+        Func<Func<KernelResult>, KernelResult>? sourceCommitConsumer = null,
+        Func<Func<Func<KernelResult>, KernelResult>, KernelResult>? completionConsumer = null)
     {
         var resolved = ResolveChild(child);
         if (!resolved.IsSuccess) return KernelResult<PlatformVirtualTrapEvidence>.Fail(resolved.Error, resolved.Message!);
@@ -75,18 +82,31 @@ public sealed partial class PlatformAuthorityBridge
         var requestValidation = PlatformVirtualTrapContract.ValidateObservationRequest(record.ProviderLease, record.State);
         if (!requestValidation.IsSuccess)
             return FromProviderFailure<PlatformVirtualTrapEvidence>(requestValidation.Status, requestValidation.Message);
-        PlatformBackendEpoch backendEpoch;
-        lock (_secureDomainLifecycleGate)
+        PlatformBackendEpoch backendEpoch = default;
+        KernelResult Begin()
         {
-            if (record.TransitionInFlight ||
-                !PlatformVirtualTrapContract.ValidateObservationRequest(record.ProviderLease, record.State).IsSuccess)
-                return KernelResult<PlatformVirtualTrapEvidence>.Fail(KernelError.PlatformBindingActive,
-                    "Child lifecycle changed before trap observation.");
-            record.PendingChildEffects++;
-            backendEpoch = BackendEpoch;
+            lock (_secureDomainLifecycleGate)
+            {
+                var lineage = ValidateActiveChildLineage(record);
+                if (!lineage.IsSuccess) return lineage;
+                if (record.TransitionInFlight ||
+                    !PlatformVirtualTrapContract.ValidateObservationRequest(record.ProviderLease, record.State).IsSuccess)
+                    return KernelResult.Fail(KernelError.PlatformBindingActive,
+                        "Child lifecycle changed before trap observation.");
+                KernelResult CommitAdmission()
+                {
+                    record.PendingChildEffects++;
+                    backendEpoch = BackendEpoch;
+                    return KernelResult.Ok();
+                }
+                return sourceCommitConsumer is null ? CommitAdmission() : sourceCommitConsumer(CommitAdmission);
+            }
         }
+        var admitted = admissionConsumer is null ? Begin() : admissionConsumer(Begin);
+        if (!admitted.IsSuccess) return KernelResult<PlatformVirtualTrapEvidence>.Fail(admitted.Error, admitted.Message!);
         try
         {
+            PlatformVirtualTrapEvidence evidence;
             PlatformAuthorityResult<PlatformVirtualTrapEvidence> result;
             try { result = provider.ObserveVirtualTrap(record.ProviderLease); }
             catch (Exception exception) when (exception is not StackOverflowException)
@@ -108,7 +128,7 @@ public sealed partial class PlatformAuthorityBridge
                     record.State = PlatformChildDomainState.Faulted;
                     return FromProviderFailure<PlatformVirtualTrapEvidence>(result.Status, result.Message);
                 }
-                var evidence = result.Value!;
+                evidence = result.Value!;
                 var validation = PlatformVirtualTrapContract.ValidateEvidence(record.ProviderLease, evidence);
                 if (!validation.IsSuccess || evidence.Sequence <= record.LastTrapSequence)
                 {
@@ -117,9 +137,28 @@ public sealed partial class PlatformAuthorityBridge
                         validation.IsSuccess ? "Trap evidence sequence is stale or replayed." : validation.Message!);
                 }
                 record.LastTrapSequence = evidence.Sequence;
-                return KernelResult<PlatformVirtualTrapEvidence>.Ok(evidence);
+                var lineage = ValidateActiveChildLineage(record);
+                if (!lineage.IsSuccess) return KernelResult<PlatformVirtualTrapEvidence>.Fail(lineage.Error, lineage.Message!);
             }
+            KernelResult CommitCurrent(Func<KernelResult> commit)
+            {
+                lock (_secureDomainLifecycleGate)
+                {
+                    var current = ValidateActiveChildLineage(record);
+                    if (!current.IsSuccess) return current;
+                    if (BackendEpoch != backendEpoch || record.TransitionInFlight ||
+                        !PlatformVirtualTrapContract.ValidateObservationRequest(record.ProviderLease, record.State).IsSuccess)
+                        return KernelResult.Fail(KernelError.PlatformFaulted, "Trap owner changed before local publication.");
+                    return commit();
+                }
+            }
+            var published = completionConsumer is null ? CommitCurrent(() => KernelResult.Ok()) : completionConsumer(CommitCurrent);
+            return published.IsSuccess ? KernelResult<PlatformVirtualTrapEvidence>.Ok(evidence) :
+                KernelResult<PlatformVirtualTrapEvidence>.Fail(published.Error, published.Message!);
         }
         finally { lock (_secureDomainLifecycleGate) record.PendingChildEffects--; }
     }
 }
+
+
+

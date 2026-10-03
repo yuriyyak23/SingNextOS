@@ -1,0 +1,17 @@
+# Fresh session; --budget recommended.
+spawn cancellable
+alloc 5000 64
+cancel-scope 5000 --after-ms 60000
+cancel-scope 5000 1
+external-prepare 5000 1
+external-admit 5000 1 2
+cancel-request 5000 1
+cancel-show 5000 2
+external 5000 1
+external-cancel 5000 1 2
+region-uses 1
+external-release 5000 1
+cancel-show 5000 2
+free 1
+stop 5000
+exit

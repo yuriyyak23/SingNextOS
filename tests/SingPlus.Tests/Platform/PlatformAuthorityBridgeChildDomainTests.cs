@@ -281,21 +281,315 @@ public sealed class PlatformAuthorityBridgeChildDomainTests
         Assert.Equal(1, provider.RevokeDomainCalls);
     }
 
-    [Fact]
-    public void ProcessExitInsideRootBindCallbackRevokesPublishedBindingBeforeReclaim()
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void ProcessExitInsideRootBindCallbackRetainsCleanupWithoutPublishingAttachment(bool executionAttached)
     {
         var provider = new ChildProvider();
         var kernel = new RuntimeKernel(provider);
-        var owner = TestFixtures.Create(kernel, 7, 70).Handle;
+        var (process, owner) = TestFixtures.Create(kernel, 7, 70);
         provider.BeforeDomainBindReturn = () =>
             Assert.Equal(KernelError.PlatformFaulted, kernel.TerminateProcess(owner).Error);
 
-        Assert.True(kernel.BindPlatformDomain(owner).IsSuccess);
-        Assert.True(kernel.Processes.Resolve(owner).IsSuccess);
+        var bind = executionAttached ? kernel.BindPlatformDomain(owner) : kernel.BindPlatformAuthorityDomain(owner);
+        Assert.Equal(KernelError.InvalidTransition, bind.Error);
+        Assert.Equal(ProcessState.Exiting, process.State);
+        Assert.False(kernel.QueryProcessTeardown(owner).Value!.LocalReclaimCompleted);
+        Assert.True(kernel.PlatformAuthority.TryGetQuarantinedDomainBinding(new(process.DomainId, owner), out _));
+        var attachments = (HashSet<ProcessHandle>)typeof(RuntimeKernel).GetField("_platformExecutionAttachments",
+            global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.GetValue(kernel)!;
+        Assert.DoesNotContain(owner, attachments);
         Assert.Equal(0, provider.RevokeDomainCalls);
         Assert.True(kernel.TerminateProcess(owner).IsSuccess);
         Assert.Equal(1, provider.RevokeDomainCalls);
         Assert.False(kernel.Processes.Resolve(owner).IsSuccess);
+        provider.BeforeDomainBindReturn = null;
+        var replacement = TestFixtures.Create(kernel, 7, 70, generation: 2).Handle;
+        Assert.True(kernel.BindPlatformDomain(replacement).IsSuccess);
+        Assert.Equal(KernelError.StaleHandle, kernel.BindPlatformDomain(owner).Error);
+    }
+
+    [Fact]
+    public async Task RootBindResolvesProcessUnderLifecycleGateBeforePendingAdmission()
+    {
+        var provider = new ChildProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 81, 810);
+        var gate = typeof(RuntimeKernel).GetField("_platformMemoryUseGate",
+            global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.GetValue(kernel)!;
+        Task<KernelResult<PlatformDomainBinding>> work;
+        using var entered = new ManualResetEventSlim();
+        lock (gate)
+        {
+            work = Task.Run(() => { entered.Set(); return kernel.BindPlatformDomain(owner); });
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(15)));
+            Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+            TestFixtures.Create(kernel, 81, 810, generation: 2);
+        }
+        Assert.Equal(KernelError.StaleHandle, (await work.WaitAsync(TimeSpan.FromSeconds(15))).Error);
+        Assert.Equal(ProcessState.Exited, process.State);
+        Assert.Equal(0, provider.DomainBindCalls);
+        Assert.Equal(0, provider.RevokeDomainCalls);
+    }
+
+    [Fact]
+    public void RootBindFreshAdmissionRefusesProcessStoppedDuringProviderPreflight()
+    {
+        var provider = new ChildProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 82, 820);
+        provider.BeforeDescriptorRead = () =>
+        {
+            provider.BeforeDescriptorRead = null;
+            Assert.Equal(KernelError.PlatformFaulted, kernel.TerminateProcess(owner).Error);
+        };
+        Assert.Equal(KernelError.InvalidTransition, kernel.BindPlatformDomain(owner).Error);
+        Assert.Equal(ProcessState.Exiting, process.State);
+        Assert.Equal(0, provider.DomainBindCalls);
+        Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.Equal(0, provider.RevokeDomainCalls);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void RootBindCompletionRefusalKeepsExactCleanupOrResetPin(int fault)
+    {
+        var provider = new ChildProvider();
+        var bridge = new PlatformAuthorityBridge(provider);
+        var owner = Subject(83, 830);
+        var committed = false;
+        var bind = bridge.BindDomain(owner, completionConsumer: (published, commit) =>
+        {
+            Assert.True(bridge.HasUnresolvedDomainBindEffect(owner));
+            if (fault == 0) return KernelResult.Fail(KernelError.InvalidTransition, "local subject stopped");
+            if (fault == 1) throw new InvalidOperationException("controlled local attachment failure");
+            Assert.True(bridge.ObserveBackendReset().IsSuccess);
+            return commit(() => { committed = true; return KernelResult.Ok(); });
+        });
+        Assert.Equal(fault == 0 ? KernelError.InvalidTransition : KernelError.PlatformFaulted, bind.Error);
+        Assert.False(committed);
+        Assert.Equal(1, provider.DomainBindCalls);
+        Assert.Equal(0, provider.RevokeDomainCalls);
+        Assert.Equal(fault == 2, bridge.HasUnresolvedDomainBindEffect(owner));
+        Assert.True(bridge.TryGetQuarantinedDomainBinding(owner, out var cleanup));
+        Assert.False(bridge.BindDomain(owner).IsSuccess);
+        if (fault < 2) Assert.True(bridge.RevokeDomain(cleanup, owner).IsSuccess);
+        // Reset tuple is quarantined; standalone current binding lookup is not a
+        // demonstrated real kernel reconciliation consumer for its old attachment.
+    }
+
+    [Fact]
+    public void RootBindAdmissionRefusalLeavesNoProviderEffectOrPendingPin()
+    {
+        var provider = new ChildProvider();
+        var bridge = new PlatformAuthorityBridge(provider);
+        var owner = Subject(84, 840);
+        Assert.Equal(KernelError.InvalidTransition,
+            bridge.BindDomain(owner, admissionConsumer: _ =>
+                KernelResult.Fail(KernelError.InvalidTransition, "fresh owner refuses")).Error);
+        Assert.Equal(0, provider.DomainBindCalls);
+        Assert.False(bridge.HasUnresolvedDomainBindEffect(owner));
+        Assert.True(bridge.BindDomain(owner).IsSuccess);
+    }
+
+    [Fact]
+    public void PendingAuthorityBindCannotBypassAdmissionButActiveRootKeepsV1LocalFallback()
+    {
+        var provider = new ChildProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 85, 850);
+        Assert.True(kernel.AdmitProcess(owner).IsSuccess);
+        provider.BeforeDomainBindReturn = () =>
+        {
+            Assert.Equal(KernelError.PlatformBindingActive, kernel.StartProcess(owner).Error);
+            Assert.Equal(ProcessState.Admitted, process.State);
+        };
+        Assert.True(kernel.BindPlatformAuthorityDomain(owner).IsSuccess);
+        Assert.True(kernel.StartProcess(owner).IsSuccess);
+        Assert.True(kernel.ParkProcess(owner).IsSuccess);
+        Assert.True(kernel.ResumeProcess(owner).IsSuccess);
+        Assert.Equal(ProcessState.Running, process.State);
+        Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.Equal(1, provider.RevokeDomainCalls);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)]
+    [InlineData(5)] [InlineData(6)] [InlineData(7)] [InlineData(8)]
+    public void VirtualCreationRetainsActualCleanupAcrossSourceStopAndFaults(int fault)
+    {
+        var provider = new ChildProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 86, 860);
+        var source = kernel.MintCapability(process.DomainId, owner, ResourceKind.Virtualization,
+            VirtualizationResourceIds.Create, CapabilityRights.Configure).Value!.CapabilityId;
+        void Revoke() => Assert.True(kernel.RevokeCapability(source).IsSuccess);
+        if (fault == 0) provider.BeforeDescriptorRead = () => { provider.BeforeDescriptorRead = null; Revoke(); };
+        if (fault == 1) provider.BeforeDomainBindReturn = Revoke;
+        if (fault == 2) provider.BeforeChildCreateReturn = Revoke;
+        if (fault == 3) provider.BeforeChildCreateReturn = () =>
+        {
+            Assert.Equal(KernelError.PlatformFaulted, kernel.TerminateProcess(owner).Error);
+            Assert.Equal(ProcessState.Exiting, process.State);
+            Assert.False(kernel.QueryProcessTeardown(owner).Value!.LocalReclaimCompleted);
+            Assert.Equal(0, provider.CloseCalls);
+            Assert.Equal(0, provider.RevokeDomainCalls);
+        };
+        if (fault == 4) { provider.ChildCreateStatus = PlatformAuthorityStatus.NotAccepted; provider.RootRevokeStatus = PlatformAuthorityStatus.Faulted; }
+        if (fault == 5) provider.ChildCreateStatus = PlatformAuthorityStatus.Faulted;
+        if (fault is 7 or 8)
+            typeof(CapabilityAuthority).GetField("_nonceFactory", global::System.Reflection.BindingFlags.Instance |
+                global::System.Reflection.BindingFlags.NonPublic)!.SetValue(kernel.CapabilityAuthority, (Func<Guid>)(() =>
+                {
+                    if (fault == 8) throw new InvalidOperationException("controlled derived nonce loss");
+                    Revoke();
+                    return Guid.NewGuid();
+                }));
+        var created = kernel.CreateVirtualDomain(owner, source, new(1, 4096));
+        if (fault == 6)
+        {
+            Assert.True(created.IsSuccess, created.Message);
+            provider.RootRevokeStatus = PlatformAuthorityStatus.Faulted;
+            Assert.False(kernel.TerminateProcess(owner).IsSuccess);
+            Assert.Equal(1, provider.CloseCalls);
+            Assert.False(kernel.QueryProcessTeardown(owner).Value!.LocalReclaimCompleted);
+        }
+        else Assert.False(created.IsSuccess);
+        Assert.Equal(fault == 0 ? 0 : 1, provider.DomainBindCalls);
+        Assert.Equal(fault < 2 ? 0 : 1, provider.ChildCreateCalls);
+        if (fault != 6) Assert.Equal(0, provider.CloseCalls);
+        if (fault is 0 or 1 or 2 or 7)
+            Assert.Equal(KernelError.CapabilityRevoked, created.Error);
+        if (fault is 2 or 7) Assert.Empty(process.Capabilities.Items);
+        if (fault == 8) Assert.Single(process.Capabilities.Items);
+        provider.BeforeDescriptorRead = null;
+        provider.BeforeDomainBindReturn = null;
+        provider.BeforeChildCreateReturn = null;
+        provider.RootRevokeStatus = null;
+        if (fault == 5)
+        {
+            Assert.False(kernel.TerminateProcess(owner).IsSuccess);
+            Assert.False(kernel.TerminateProcess(owner).IsSuccess);
+            Assert.False(kernel.QueryProcessTeardown(owner).Value!.LocalReclaimCompleted);
+            Assert.Equal(0, provider.RevokeDomainCalls);
+            Assert.Equal(0, provider.CloseCalls);
+        }
+        else
+        {
+            Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+            Assert.Equal(ProcessState.Exited, process.State);
+            Assert.Equal(KernelError.StaleHandle, kernel.QueryProcessTeardown(owner).Error);
+            Assert.Equal(fault >= 2 && fault != 4 ? 1 : 0, provider.CloseCalls);
+            Assert.Equal(fault == 0 ? 0 : fault is 4 or 6 ? 2 : 1, provider.RevokeDomainCalls);
+            Assert.Equal(KernelError.StaleHandle, kernel.CreateVirtualDomain(owner, source, new(1, 4096)).Error);
+        }
+    }
+
+    [Fact]
+    public void VirtualCreationRejectsOverlapWithoutSecondRootEffect()
+    {
+        var provider = new ChildProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 87, 870);
+        var source = kernel.MintCapability(process.DomainId, owner, ResourceKind.Virtualization,
+            VirtualizationResourceIds.Create, CapabilityRights.Configure).Value!.CapabilityId;
+        provider.BeforeDomainBindReturn = () =>
+            Assert.Equal(KernelError.PlatformBindingActive, kernel.CreateVirtualDomain(owner, source, new(1, 4096)).Error);
+        var created = kernel.CreateVirtualDomain(owner, source, new(1, 4096));
+        Assert.True(created.IsSuccess, created.Message);
+        Assert.Equal(1, provider.DomainBindCalls);
+        Assert.Equal(1, provider.ChildCreateCalls);
+        Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.Equal(1, provider.CloseCalls);
+        Assert.Equal(1, provider.RevokeDomainCalls);
+    }
+
+    [Fact]
+    public void VirtualCreationCannotReuseRetiredSourceGenerationForReplacement()
+    {
+        var provider = new ChildProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 88, 880);
+        var source = kernel.MintCapability(process.DomainId, owner, ResourceKind.Virtualization,
+            VirtualizationResourceIds.Create, CapabilityRights.Configure).Value!.CapabilityId;
+        Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+        var (_, replacement) = TestFixtures.Create(kernel, 88, 880, generation: 2);
+        Assert.False(kernel.CreateVirtualDomain(replacement, source, new(1, 4096)).IsSuccess);
+        Assert.Equal(0, provider.DomainBindCalls);
+        Assert.Equal(0, provider.ChildCreateCalls);
+    }
+
+    [Fact]
+    public async Task ConcurrentStopDuringRootCallbackPinsUntilKnownReceiptAndNeverCreatesChild()
+    {
+        var provider = new ChildProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 89, 890);
+        var source = kernel.MintCapability(process.DomainId, owner, ResourceKind.Virtualization,
+            VirtualizationResourceIds.Create, CapabilityRights.Configure).Value!.CapabilityId;
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        provider.BeforeDomainBindReturn = () =>
+        {
+            foreach (var pair in new (object Owner, string Gate)[]
+            {
+                (kernel, "_platformMemoryUseGate"), (kernel.PlatformAuthority, "_secureDomainLifecycleGate"),
+                (kernel.CapabilityAuthority, "_gate")
+            })
+            {
+                var gate = pair.Owner.GetType().GetField(pair.Gate,
+                    global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.GetValue(pair.Owner)!;
+                Assert.False(Monitor.IsEntered(gate));
+            }
+            entered.Set();
+            Assert.True(release.Wait(TimeSpan.FromSeconds(15)));
+        };
+        var work = Task.Run(() => kernel.CreateVirtualDomain(owner, source, new(1, 4096)));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(15)));
+            Assert.True(kernel.RevokeCapability(source).IsSuccess);
+            Assert.Equal(KernelError.PlatformFaulted, kernel.TerminateProcess(owner).Error);
+            Assert.Equal(ProcessState.Exiting, process.State);
+            Assert.False(kernel.QueryProcessTeardown(owner).Value!.LocalReclaimCompleted);
+            Assert.Equal(0, provider.RevokeDomainCalls);
+        }
+        finally { release.Set(); }
+        Assert.False((await work.WaitAsync(TimeSpan.FromSeconds(15))).IsSuccess);
+        Assert.Equal(0, provider.ChildCreateCalls);
+        Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.Equal(1, provider.RevokeDomainCalls);
+        Assert.Equal(0, provider.CloseCalls);
+    }
+
+    [Fact]
+    public void PartialDerivedIssuanceRemainsOwnedAndCannotPublishCompleteAuthoritySet()
+    {
+        var provider = new ChildProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 90, 900);
+        var source = kernel.MintCapability(process.DomainId, owner, ResourceKind.Virtualization,
+            VirtualizationResourceIds.Create, CapabilityRights.Configure).Value!.CapabilityId;
+        var nonceCalls = 0;
+        typeof(CapabilityAuthority).GetField("_nonceFactory", global::System.Reflection.BindingFlags.Instance |
+            global::System.Reflection.BindingFlags.NonPublic)!.SetValue(kernel.CapabilityAuthority, (Func<Guid>)(() =>
+            {
+                if (++nonceCalls == 3) Assert.True(kernel.RevokeCapability(source).IsSuccess);
+                return Guid.NewGuid();
+            }));
+        Assert.Equal(KernelError.CapabilityRevoked, kernel.CreateVirtualDomain(owner, source, new(1, 4096)).Error);
+        var domains = (VirtualDomainAuthority)typeof(RuntimeKernel).GetField("_virtualDomains",
+            global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.GetValue(kernel)!;
+        var cleanup = Assert.Single(domains.ForOwner(owner));
+        Assert.Equal(VirtualDomainState.Quarantined, cleanup.State);
+        Assert.Equal(2, cleanup.Capabilities.Length);
+        Assert.Equal(2, process.Capabilities.Items.Count);
+        Assert.False(kernel.ConfigureVirtualDomain(owner, cleanup.Handle, cleanup.Capabilities[0]).IsSuccess);
+        Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.Equal(1, provider.CloseCalls);
+        Assert.Equal(1, provider.RevokeDomainCalls);
+        foreach (var id in cleanup.Capabilities)
+            Assert.False(kernel.CapabilityAuthority.Validate(id, process.DomainId, owner.Generation, CapabilityRights.None).IsSuccess);
     }
 
     [Theory]
@@ -1401,6 +1695,142 @@ public sealed class PlatformAuthorityBridgeChildDomainTests
                 PlatformChildAuthorityClass.GuestMemory | PlatformChildAuthorityClass.Events |
                 PlatformChildAuthorityClass.Traps | PlatformChildAuthorityClass.Io));
 
+    [Theory]
+    [InlineData(0, false)] [InlineData(1, false)] [InlineData(2, false)]
+    [InlineData(0, true)] [InlineData(1, true)] [InlineData(2, true)]
+    public async Task KernelChildTransitionRetainsPendingThroughFreshCommit(int step, bool stop)
+    {
+        var provider = new ChildProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 975, 9750);
+        var source = kernel.MintCapability(process.DomainId, owner, ResourceKind.Virtualization,
+            VirtualizationResourceIds.Create, CapabilityRights.Configure).Value!.CapabilityId;
+        var created = kernel.CreateVirtualDomain(owner, source, new(1, 4096)).Value!;
+        Assert.True(kernel.ConfigureVirtualDomain(owner, created.Domain, created.ConfigureCapability).IsSuccess);
+        if (step > 0) Assert.True(kernel.StartVirtualDomain(owner, created.Domain, created.ExecuteCapability).IsSuccess);
+        if (step > 1) Assert.True(kernel.ParkVirtualDomain(owner, created.Domain, created.ExecuteCapability).IsSuccess);
+        KernelResult Run() => step switch
+        {
+            0 => kernel.StartVirtualDomain(owner, created.Domain, created.ExecuteCapability),
+            1 => kernel.ParkVirtualDomain(owner, created.Domain, created.ExecuteCapability),
+            _ => kernel.ResumeVirtualDomain(owner, created.Domain, created.ExecuteCapability),
+        };
+        var local = (VirtualDomainAuthority)typeof(RuntimeKernel).GetField("_virtualDomains",
+            global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.GetValue(kernel)!;
+        var record = Assert.Single(local.ForOwner(owner));
+        var child = record.ChildBinding!.Value;
+        int before = provider.TransitionCalls;
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        provider.BeforeChildTransition = () => { entered.Set(); Assert.True(release.Wait(TimeSpan.FromSeconds(15))); };
+        var work = Task.Run(Run);
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.Equal(KernelError.PlatformBindingActive, Run().Error);
+            Assert.Equal(KernelError.PlatformBindingActive, kernel.PlatformAuthority.CloseChildDomain(child).Error);
+            Assert.Equal(KernelError.PlatformBindingActive,
+                kernel.PlatformAuthority.TransitionChildDomain(child, PlatformChildDomainTransition.BeginDrain).Error);
+            if (stop)
+            {
+                Assert.False(kernel.TerminateProcess(owner).IsSuccess);
+                Assert.False(kernel.QueryProcessTeardown(owner).Value!.LocalReclaimCompleted);
+            }
+            else Assert.True(kernel.RevokeCapability(created.ExecuteCapability).IsSuccess);
+            Assert.Equal(0, provider.CloseCalls);
+        }
+        finally { release.Set(); }
+        var result = await work.WaitAsync(TimeSpan.FromSeconds(15));
+        Assert.False(result.IsSuccess);
+        if (!stop) Assert.Equal(KernelError.CapabilityRevoked, result.Error);
+        Assert.NotEqual(step == 1 ? VirtualDomainState.Parked : VirtualDomainState.Running, record.State);
+        Assert.False(Run().IsSuccess);
+        Assert.Equal(before + 1, provider.TransitionCalls);
+        provider.BeforeChildTransition = null;
+        Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.Equal(VirtualDomainState.Closed, record.State);
+        Assert.Equal(1, provider.CloseCalls);
+        Assert.Equal(before + 2, provider.TransitionCalls);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void KernelChildUnknownTransitionPinsExistingOwnerAndBalancesPending(int fault)
+    {
+        var provider = new ChildProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 976, 9760);
+        var source = kernel.MintCapability(process.DomainId, owner, ResourceKind.Virtualization,
+            VirtualizationResourceIds.Create, CapabilityRights.Configure).Value!.CapabilityId;
+        var created = kernel.CreateVirtualDomain(owner, source, new(1, 4096)).Value!;
+        Assert.True(kernel.ConfigureVirtualDomain(owner, created.Domain, created.ConfigureCapability).IsSuccess);
+        if (fault == 0) provider.BeforeChildTransition = () => throw new InvalidOperationException("lost child transition result");
+        if (fault == 1) provider.BeforeChildTransition = () => Assert.True(kernel.ObservePlatformBackendReset().IsSuccess);
+        if (fault == 2) provider.ChildTransitionStatus = PlatformAuthorityStatus.Denied;
+        Assert.False(kernel.StartVirtualDomain(owner, created.Domain, created.ExecuteCapability).IsSuccess);
+        provider.BeforeChildTransition = null;
+        provider.ChildTransitionStatus = null;
+        var records = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_childBindings",
+            global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.GetValue(kernel.PlatformAuthority)!;
+        foreach (var value in records.Values)
+        {
+            Assert.False((bool)value!.GetType().GetProperty("TransitionInFlight")!.GetValue(value)!);
+            Assert.Equal(PlatformChildDomainState.Faulted, value.GetType().GetProperty("State")!.GetValue(value));
+        }
+        Assert.False(kernel.StartVirtualDomain(owner, created.Domain, created.ExecuteCapability).IsSuccess);
+        Assert.False(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.False(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.False(kernel.QueryProcessTeardown(owner).Value!.LocalReclaimCompleted);
+        Assert.Equal(1, provider.TransitionCalls);
+        Assert.Equal(0, provider.CloseCalls);
+    }
+
+    [Fact]
+    public void ChildConfigureAndStartRequireFreshSourceAndActiveParent()
+    {
+        var provider = new ChildProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 977, 9770);
+        var source = kernel.MintCapability(process.DomainId, owner, ResourceKind.Virtualization,
+            VirtualizationResourceIds.Create, CapabilityRights.Configure).Value!.CapabilityId;
+        var created = kernel.CreateVirtualDomain(owner, source, new(1, 4096)).Value!;
+        Assert.True(kernel.RevokeCapability(created.ConfigureCapability).IsSuccess);
+        Assert.Equal(KernelError.CapabilityRevoked,
+            kernel.ConfigureVirtualDomain(owner, created.Domain, created.ConfigureCapability).Error);
+        Assert.Equal(VirtualDomainState.Created, kernel.QueryVirtualDomain(owner, created.Domain).Value);
+        Assert.Equal(0, provider.TransitionCalls);
+        Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+
+        var bridge = new PlatformAuthorityBridge(provider);
+        var subject = Subject(978, 9780);
+        var parent = bridge.BindDomain(subject).Value!;
+        var child = bridge.CreateChildDomain(parent, subject, Intent()).Value!;
+        int before = provider.TransitionCalls;
+        Assert.False(bridge.TransitionChildDomain(child, (PlatformChildDomainTransition)999).IsSuccess);
+        Assert.Equal(before, provider.TransitionCalls);
+    }
+
+    [Fact]
+    public void ChildCompletionInterlockCannotCloseBetweenProviderAndLocalCommit()
+    {
+        var provider = new ChildProvider();
+        var bridge = new PlatformAuthorityBridge(provider);
+        var subject = Subject(979, 9790);
+        var parent = bridge.BindDomain(subject).Value!;
+        var child = bridge.CreateChildDomain(parent, subject, Intent()).Value!;
+        Assert.True(bridge.TransitionChildDomain(child, PlatformChildDomainTransition.Start,
+            completionConsumer: commit =>
+            {
+                Assert.Equal(KernelError.PlatformBindingActive, bridge.CloseChildDomain(child).Error);
+                Assert.Equal(KernelError.PlatformBindingActive,
+                    bridge.TransitionChildDomain(child, PlatformChildDomainTransition.Park).Error);
+                return commit(() => KernelResult.Ok());
+            }).IsSuccess);
+        Assert.True(bridge.TransitionChildDomain(child, PlatformChildDomainTransition.BeginDrain).IsSuccess);
+        Assert.True(bridge.CloseChildDomain(child).IsSuccess);
+        Assert.Equal(1, provider.CloseCalls);
+    }
+
     private sealed class ChildProvider : IPlatformAuthorityProvider, IPlatformFeatureProvider,
         IPlatformChildDomainProvider, IPlatformGuestMemoryProvider, IPlatformVirtualEventProvider,
         IPlatformVirtualTrapProvider, IPlatformVirtualIoProvider, IPlatformDeviceLeaseProvider,
@@ -1422,6 +1852,7 @@ public sealed class PlatformAuthorityBridgeChildDomainTests
         public Action? BeforeDomainBindReturn { get; set; }
         public int ChildCreateCalls { get; private set; }
         public Action? BeforeDomainRevoke { get; set; }
+        public PlatformAuthorityStatus? RootRevokeStatus { get; set; }
         public int EventCalls { get; private set; }
         public int GuestMapCalls { get; private set; }
         public int TrapCalls { get; private set; }
@@ -1433,6 +1864,7 @@ public sealed class PlatformAuthorityBridgeChildDomainTests
         public Action? BeforeChildClose { get; set; }
         public Action? BeforeChildCreateReturn { get; set; }
         public Action? BeforeChildTransition { get; set; }
+        public PlatformAuthorityStatus? ChildTransitionStatus { get; set; }
         public PlatformAuthorityStatus? ChildCreateStatus { get; set; }
         public bool MalformedCreateParent { get; set; }
         public PlatformAuthorityStatus? ChildCreateCleanupStatus { get; set; }
@@ -1449,8 +1881,13 @@ public sealed class PlatformAuthorityBridgeChildDomainTests
         public List<string> CallLog { get; } = [];
         public PlatformProviderChildDomainLease LastChildLease { get; private set; }
         public PlatformProviderIncarnation CurrentIncarnation { get; set; } = new(1);
-        public PlatformProviderDescriptor Descriptor { get; } = new(new("test.child"), 2,
+        public Action? BeforeDescriptorRead { get; set; }
+        private readonly PlatformProviderDescriptor _descriptor = new(new("test.child"), 2,
             PlatformAuthorityFeatures.NeutralDomainBinding | PlatformAuthorityFeatures.DirectOwnedRegionMapping);
+        public PlatformProviderDescriptor Descriptor
+        {
+            get { BeforeDescriptorRead?.Invoke(); return _descriptor; }
+        }
         public PlatformFeatureManifest QueryFeatures() => new(Enum.GetValues<PlatformFeatureFamily>()
             .Where(f => f is PlatformFeatureFamily.NeutralDomains or PlatformFeatureFamily.OwnedRegionMapping or
                 PlatformFeatureFamily.ChildDomainLifecycle or
@@ -1474,6 +1911,7 @@ public sealed class PlatformAuthorityBridgeChildDomainTests
             RevokeDomainCalls++;
             CallLog.Add("parent-close");
             BeforeDomainRevoke?.Invoke();
+            if (RootRevokeStatus is { } status) return PlatformAuthorityResult.Fail(status, "controlled root closure refusal");
             return PlatformAuthorityResult.Ok();
         }
         public PlatformAuthorityResult<PlatformProviderRegionMappingLease> MapOwnedRegion(
@@ -1524,6 +1962,7 @@ public sealed class PlatformAuthorityBridgeChildDomainTests
             TransitionCalls++;
             BeforeChildTransition?.Invoke();
             if (transition == PlatformChildDomainTransition.BeginDrain) CallLog.Add("child-drain");
+            if (ChildTransitionStatus is { } status) return PlatformAuthorityResult.Fail(status, "controlled transition outcome");
             return PlatformAuthorityResult.Ok();
         }
         public PlatformAuthorityResult<PlatformChildDomainClosureReceipt> CloseChildDomain(PlatformProviderChildDomainLease lease)

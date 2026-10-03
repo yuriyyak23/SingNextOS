@@ -9,7 +9,7 @@ namespace SingPlus.Boot.Demos;
 /// and fails the boot stage (or shell command) when the authority graph misbehaves,
 /// so they double as smoke tests of the emulated kernel.
 /// </summary>
-public static class DemoWorkloads
+public static partial class DemoWorkloads
 {
     public static KernelBootStageResult Run(EmulatorDemo demo, EmulatorSession session) => demo switch
     {
@@ -17,6 +17,20 @@ public static class DemoWorkloads
         EmulatorDemo.Regions => RunRegions(session),
         EmulatorDemo.Capabilities => RunCapabilities(session),
         EmulatorDemo.Lifecycle => RunLifecycle(session),
+        EmulatorDemo.Borrows => RunBorrows(session),
+        EmulatorDemo.Platform => RunPlatform(session),
+        EmulatorDemo.Compute => RunCompute(session),
+        EmulatorDemo.ComputeCancel => RunCompute(session, cancel: true),
+        EmulatorDemo.ComputeFault => RunCompute(session, fault: true),
+        EmulatorDemo.PlatformRegions => RunPlatformRegions(session),
+        EmulatorDemo.External => RunExternal(session),
+        EmulatorDemo.Sessions => RunSessions(session),
+        EmulatorDemo.ChildExecute => RunChildDomain(session, execute: true),
+        EmulatorDemo.ChildDomain => RunChildDomain(session),
+        EmulatorDemo.Backing => RunBacking(session),
+        EmulatorDemo.GeneratedSip => RunGeneratedSip(session),
+        EmulatorDemo.ServiceRestart => RunServiceRestart(session),
+        EmulatorDemo.SupervisedRestart => RunSupervisedRestart(session),
         _ => KernelBootStageResult.Failure($"Unknown demo workload '{demo}'."),
     };
 
@@ -24,7 +38,7 @@ public static class DemoWorkloads
     public static KernelBootStageResult RunIpc(EmulatorSession session)
     {
         if (session.Runtime is null) return KernelBootStageResult.Failure("Runtime authority graph is unavailable.");
-        var runtime = session.Runtime;
+        RuntimeKernel runtime = session.Runtime;
 
         var client = session.SpawnProcess("singplus.emulator.ipc.client", ExecutionRole.User, MemoryProfile.ManagedGc);
         if (!client.IsSuccess) return Failure("spawn client", client.Error, client.Message);

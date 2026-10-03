@@ -8,8 +8,15 @@
     <SingPlusMemoryProfile>ManagedGc</SingPlusMemoryProfile>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Remove="Samples/**/*.cs" />
+    <Content Include="Samples/VerifiedRoot/guest.hce" Link="guest.hce" CopyToOutputDirectory="PreserveNewest" />
+    <ProjectReference Include="Samples/ManagedCap/ManagedCap.csproj" />
+    <ProjectReference Include="../../../../tools/HybridCpu_ExecutableAdapter/HybridCpu_ExecutableAdapter.csproj" />
     <ProjectReference Include="../../SingPlus.Kernel/SingPlus.Kernel.csproj" />
     <ProjectReference Include="../../Hal/SingPlus.Kernel.Hal.Host/SingPlus.Kernel.Hal.Host.csproj" />
     <ProjectReference Include="../../../Runtime/SingPlus.Runtime/SingPlus.Runtime.csproj" />
+    <ProjectReference Include="../../../Platform/SingPlus.Platform.Host/SingPlus.Platform.Host.csproj" />
+    <ProjectReference Include="../../../Platform/SingPlus.Platform.HybridCpu/SingPlus.Platform.HybridCpu.csproj" />
+    <ProjectReference Include="../../../Admission/SingPlus.StaticAdmission/SingPlus.StaticAdmission.csproj" />
   </ItemGroup>
 </Project>

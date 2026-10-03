@@ -12,7 +12,7 @@ internal sealed record VirtualDomainInspectionRecord(
 
 internal sealed class VirtualDomainAuthority
 {
-    internal sealed class Record
+    internal sealed class Record(object stateGate)
     {
         public required VirtualDomainHandle Handle { get; init; }
         public required VirtualAddressSpaceHandle AddressSpace { get; init; }
@@ -24,7 +24,13 @@ internal sealed class VirtualDomainAuthority
         public required PlatformChildAuthorityClass Authority { get; init; }
         public required VirtualDomainProfile Profile { get; init; }
         public required CapabilityId[] Capabilities { get; set; }
-        public VirtualDomainState State { get; set; }
+        public bool AuthorityPublished { get; set; } = true;
+        private VirtualDomainState _state;
+        public VirtualDomainState State
+        {
+            get { lock (stateGate) return _state; }
+            set { lock (stateGate) _state = value; }
+        }
         public Dictionary<GuestRegionMappingId, GuestRegionMapping> Mappings { get; } = [];
         public Dictionary<GuestRegionMappingId, (PlatformGuestMapping Guest, PlatformRegionMapping Parent)> PlatformMappings { get; } = [];
         public PlatformExecutableArtifactBinding? ExecutableArtifact { get; set; }
@@ -36,31 +42,115 @@ internal sealed class VirtualDomainAuthority
     private ulong _nextAddressSpaceId = 1;
     private ulong _nextMappingId = 1;
 
-    internal Record AddModel(ProcessHandle owner, PlatformAuthorityBridge.VirtualDomainBinding binding, VirtualDomainProfile profile, CapabilityId[] capabilities) =>
-        Add(owner, profile, capabilities, binding, null, null, null, PlatformChildAuthorityClass.None);
+    internal Record AddModel(ProcessHandle owner, PlatformAuthorityBridge.VirtualDomainBinding binding,
+        VirtualDomainProfile profile, CapabilityId[] capabilities, bool authorityPublished = true) =>
+        Add(owner, profile, capabilities, binding, null, null, null, PlatformChildAuthorityClass.None, authorityPublished);
 
     internal Record AddChild(ProcessHandle owner, PlatformDomainBinding parent, PlatformChildBinding child,
-        VirtualDomainProfile profile, CapabilityId[] capabilities, PlatformChildAuthorityClass authority) =>
-        Add(owner, profile, capabilities, null, parent, child, null, authority);
+        VirtualDomainProfile profile, CapabilityId[] capabilities, PlatformChildAuthorityClass authority,
+        bool authorityPublished = true) =>
+        Add(owner, profile, capabilities, null, parent, child, null, authority, authorityPublished);
 
     internal Record AddNested(ProcessHandle owner, Record parentRecord, PlatformChildBinding child,
-        VirtualDomainProfile profile, CapabilityId[] capabilities, PlatformChildAuthorityClass authority) =>
-        Add(owner, profile, capabilities, null, parentRecord.ParentBinding, child, parentRecord.Handle, authority);
+        VirtualDomainProfile profile, CapabilityId[] capabilities, PlatformChildAuthorityClass authority, bool authorityPublished = true) =>
+        Add(owner, profile, capabilities, null, parentRecord.ParentBinding, child, parentRecord.Handle, authority, authorityPublished);
 
     private Record Add(ProcessHandle owner, VirtualDomainProfile profile, CapabilityId[] capabilities,
         PlatformAuthorityBridge.VirtualDomainBinding? model, PlatformDomainBinding? parent, PlatformChildBinding? child,
-        VirtualDomainHandle? parentDomain, PlatformChildAuthorityClass authority)
+        VirtualDomainHandle? parentDomain, PlatformChildAuthorityClass authority, bool authorityPublished = true)
     {
         lock (_gate)
         {
             var domain = new VirtualDomainHandle(new VirtualDomainId(_nextDomainId++), new VirtualDomainGeneration(1));
             var addressSpace = new VirtualAddressSpaceHandle(new VirtualAddressSpaceId(_nextAddressSpaceId++), new VirtualAddressSpaceGeneration(1));
-            var record = new Record { Handle = domain, AddressSpace = addressSpace, Owner = owner,
+            var record = new Record(_gate) { Handle = domain, AddressSpace = addressSpace, Owner = owner,
                 ModelBinding = model, ParentBinding = parent, ChildBinding = child,
                 ParentDomain = parentDomain, Authority = authority,
-                Profile = profile, Capabilities = capabilities, State = VirtualDomainState.Created };
+                Profile = profile, Capabilities = capabilities, State = VirtualDomainState.Created, AuthorityPublished = authorityPublished };
             _records.Add(domain.DomainId, record);
             return record;
+        }
+    }
+
+    internal KernelResult RetainExecutableArtifact(Record record, PlatformExecutableArtifactBinding binding)
+    {
+        lock (_gate)
+        {
+            if (!_records.TryGetValue(record.Handle.DomainId, out var current) || !ReferenceEquals(current, record) ||
+                record.ChildBinding != binding.Child || record.ExecutableArtifact is not null)
+                return KernelResult.Fail(KernelError.StaleGeneration, "Exact virtual artifact cleanup owner changed.");
+            record.ExecutableArtifact = binding; // known receipt retention only; fresh source admission still required
+            return KernelResult.Ok();
+        }
+    }
+
+    internal KernelResult CommitStateTransition(Record record, VirtualDomainState from, VirtualDomainState to)
+    {
+        lock (_gate)
+        {
+            if (!_records.TryGetValue(record.Handle.DomainId, out var current) || !ReferenceEquals(current, record))
+                return KernelResult.Fail(KernelError.StaleGeneration, "Virtual state owner record changed.");
+            if (!record.AuthorityPublished || record.State != from)
+                return KernelResult.Fail(KernelError.InvalidTransition, "Virtual state changed before publication.");
+            record.State = to;
+            return KernelResult.Ok();
+        }
+    }
+
+    internal KernelResult CommitAuthorityPublication(Record record)
+    {
+        lock (_gate)
+        {
+            if (!_records.TryGetValue(record.Handle.DomainId, out var current) || !ReferenceEquals(current, record))
+                return KernelResult.Fail(KernelError.StaleGeneration, "Virtual publication record is no longer current.");
+            record.AuthorityPublished = true;
+            return KernelResult.Ok();
+        }
+    }
+
+    internal KernelResult CommitEffectAdmission(Record record, VirtualDomainState expected, Func<KernelResult> commit)
+    {
+        lock (_gate)
+        {
+            var lineage = ValidateActiveAncestors(record);
+            if (!lineage.IsSuccess) return lineage;
+            if (!record.AuthorityPublished || record.State != expected)
+                return KernelResult.Fail(KernelError.InvalidTransition, "Virtual effect source state/publication changed.");
+            return commit(); // Trusted pure admission/state mutation; no caller/provider callback.
+        }
+    }
+
+    internal KernelResult ValidateActiveAncestors(Record record)
+    {
+        lock (_gate)
+        {
+            if (!_records.TryGetValue(record.Handle.DomainId, out var current) || !ReferenceEquals(current, record))
+                return KernelResult.Fail(KernelError.StaleGeneration, "Exact virtual lineage owner changed.");
+            var ancestor = record;
+            var visited = new HashSet<VirtualDomainId> { record.Handle.DomainId };
+            while (ancestor.ParentDomain is { } parent)
+            {
+                if (!visited.Add(parent.DomainId))
+                    return KernelResult.Fail(KernelError.PlatformFaulted, "Virtual lineage is cyclic.");
+                var exact = Resolve(record.Owner, parent);
+                if (!exact.IsSuccess) return KernelResult.Fail(exact.Error, exact.Message!);
+                if (!exact.Value!.AuthorityPublished || exact.Value.State is not
+                    (VirtualDomainState.Configured or VirtualDomainState.Running or VirtualDomainState.Parked))
+                    return KernelResult.Fail(KernelError.PlatformFaulted, "Virtual ancestor cannot admit a new effect/publication.");
+                ancestor = exact.Value;
+            }
+            return KernelResult.Ok();
+        }
+    }
+
+    internal KernelResult<Record> ResolveAdmission(ProcessHandle owner, VirtualDomainHandle handle)
+    {
+        lock (_gate)
+        {
+            var current = Resolve(owner, handle);
+            if (!current.IsSuccess) return current;
+            return current.Value!.AuthorityPublished ? current :
+                KernelResult<Record>.Fail(KernelError.PlatformBindingActive, "Virtual authority publication has not committed.");
         }
     }
 

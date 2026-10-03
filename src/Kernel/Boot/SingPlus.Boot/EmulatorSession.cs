@@ -32,15 +32,25 @@ public sealed class EmulatorSession
     }
 
     public EmulatorOptions Options { get; }
+    internal TimeProvider RuntimeClock { get; } = TimeProvider.System;
     public Stopwatch Uptime { get; }
     public RuntimeKernel? Runtime { get; set; }
+    internal SingPlus.Platform.Host.HostPlatformAuthorityProvider? HostModelProvider { get; set; }
     public SingProcessManifestV1? SystemManifest { get; set; }
     public ProcessHandle? SystemProcess { get; set; }
 
     public List<SipAdmissionRecord> Sips { get; } = [];
+    public Dictionary<string, ServiceEndpointDescriptor> ShellServices { get; } = new(StringComparer.Ordinal);
+    public Dictionary<ulong, EndpointSessionHandle> ShellSessions { get; } = [];
     public List<ChannelRecord> Channels { get; } = [];
+    public Dictionary<ulong, (ProcessHandle Owner, ExternalOperationHandle Operation)> ExternalOperations { get; } = [];
+    public Dictionary<ulong, CancellationScopeHandle> CancellationScopes { get; } = [];
+    public Dictionary<ulong, PlatformDomainBinding> PlatformBindings { get; } = [];
     public Dictionary<ulong, BufferRecord> Buffers { get; } = [];
+    public Dictionary<ulong, BorrowRecord> Borrows { get; } = [];
     public Dictionary<ulong, TraceSessionAdmission> TraceSessions { get; } = [];
+    public Dictionary<ulong, TraceSnapshot> CompletedTraces { get; } = [];
+    public Dictionary<ulong, BudgetReservationSnapshot> BudgetReservations { get; } = [];
     public Dictionary<ulong, ProcessBudgetAdmission> BudgetAccounts { get; } = [];
     public HashSet<ulong> EmulatorSpawnedPids { get; } = [];
     public List<string> EnvironmentFacts { get; } = [];
@@ -69,7 +79,7 @@ public sealed class EmulatorSession
     }
 
     /// <summary>Creates, admits and starts a new emulator-owned process.</summary>
-    public KernelResult<ProcessHandle> SpawnProcess(string entryIdentity, ExecutionRole role, MemoryProfile memory)
+    public KernelResult<ProcessHandle> SpawnProcess(string entryIdentity, ExecutionRole role, MemoryProfile memory, bool start = true)
     {
         if (Runtime is null)
             return KernelResult<ProcessHandle>.Fail(KernelError.PlatformUnavailable, "Runtime authority graph is unavailable.");
@@ -89,12 +99,21 @@ public sealed class EmulatorSession
         if (!created.IsSuccess) return KernelResult<ProcessHandle>.Fail(created.Error, created.Message!);
 
         var handle = new ProcessHandle(created.Value!.ProcessId, created.Value.Generation);
+        // Track immediately so shutdown can reclaim a partially admitted process.
+        EmulatorSpawnedPids.Add(processId.Value);
         var admitted = Runtime.AdmitProcess(handle);
         if (!admitted.IsSuccess) return KernelResult<ProcessHandle>.Fail(admitted.Error, admitted.Message!);
-        var started = Runtime.StartProcess(handle);
-        if (!started.IsSuccess) return KernelResult<ProcessHandle>.Fail(started.Error, started.Message!);
+        if (IsBudgetConfigured)
+        {
+            var budget = AdmitBudgetFor(handle, $"emulator:{processId.Value}");
+            if (!budget.IsSuccess) return KernelResult<ProcessHandle>.Fail(budget.Error, budget.Message!);
+        }
+        if (start)
+        {
+            var started = Runtime.StartProcess(handle);
+            if (!started.IsSuccess) return KernelResult<ProcessHandle>.Fail(started.Error, started.Message!);
+        }
 
-        EmulatorSpawnedPids.Add(processId.Value);
         return KernelResult<ProcessHandle>.Ok(handle);
     }
 
@@ -103,6 +122,12 @@ public sealed class EmulatorSession
     {
         if (Runtime is null)
             return KernelResult.Fail(KernelError.PlatformUnavailable, "Runtime authority graph is unavailable.");
+
+        if (TraceSessions.ContainsKey(handle.ProcessId.Value))
+        {
+            var stopped = StopTrace(handle.ProcessId.Value);
+            if (!stopped.IsSuccess) return KernelResult.Fail(stopped.Error, stopped.Message!);
+        }
 
         var begun = fault ? Runtime.FaultProcess(handle) : Runtime.TerminateProcess(handle);
         if (!begun.IsSuccess && begun.Error != KernelError.PlatformBindingDraining) return begun;
@@ -147,6 +172,9 @@ public sealed class EmulatorSession
         {
             Buffers.Remove(regionId);
         }
+        foreach (var id in ExternalOperations.Where(pair => pair.Value.Owner == handle).Select(static pair => pair.Key).ToArray())
+            ExternalOperations.Remove(id);
+        PlatformBindings.Remove(handle.ProcessId.Value);
         EmulatorSpawnedPids.Remove(handle.ProcessId.Value);
         return KernelResult.Ok();
     }
@@ -162,6 +190,7 @@ public sealed class EmulatorSession
         var started = Runtime.StartTraceSession(owner, producerCapacity, TraceOverflowPolicy.DropWithMarker);
         if (!started.IsSuccess) return started;
         TraceSessions[owner.ProcessId.Value] = started.Value!;
+        CompletedTraces.Remove(owner.ProcessId.Value);
         return started;
     }
 
@@ -175,7 +204,13 @@ public sealed class EmulatorSession
         var owner = ResolvePid(processIdValue);
         if (!owner.IsSuccess) return KernelResult<TraceSessionAdmission>.Fail(owner.Error, owner.Message!);
         var stopped = Runtime.StopTraceSession(owner.Value, admission.Session);
-        if (stopped.IsSuccess) TraceSessions.Remove(processIdValue);
+        if (!stopped.IsSuccess) return stopped;
+        TraceSessions[processIdValue] = stopped.Value!;
+        var snapshot = Runtime.InspectTrace(owner.Value, admission.Session);
+        if (!snapshot.IsSuccess)
+            return KernelResult<TraceSessionAdmission>.Fail(snapshot.Error, snapshot.Message!);
+        CompletedTraces[processIdValue] = snapshot.Value!;
+        TraceSessions.Remove(processIdValue);
         return stopped;
     }
 
@@ -258,7 +293,26 @@ public sealed class EmulatorSession
             new ProtocolTransitionV1(3, "open", "closed"),
         ]);
 
-    /// <summary>Best-effort emulator shutdown: stop traces, reclaim emulator-spawned processes.</summary>
+    /// <summary>A read-only borrow protocol; lease admission is performed by runtime Send.</summary>
+    public static ProtocolDefinitionV1 CreateBorrowProtocol() => new(
+        contractName: "singplus.emulator.borrow-read",
+        contractDigest: Convert.ToHexString(SHA256.HashData("singplus.emulator.borrow-read.v1"u8)).ToLowerInvariant(),
+        initialState: "open",
+        terminalStates: ["closed"],
+        messages:
+        [
+            new ProtocolMessageDescriptorV1(1, "Borrow", borrows: ["buffer"],
+                requestPayload: new RequestPayloadDescriptorV1(
+                    RequestPayloadKind.Ownership, "buffer", "SingPlus.Sip.OwnedBuffer", ownershipPayloadKind: OwnershipPayloadKind.OwnedBuffer)),
+            new ProtocolMessageDescriptorV1(3, "Close"),
+        ],
+        transitions:
+        [
+            new ProtocolTransitionV1(1, "open", "open"),
+            new ProtocolTransitionV1(3, "open", "closed"),
+        ]);
+
+    /// <summary>Best-effort emulator shutdown: stop traces, revoke delivered borrows, reclaim emulator-spawned processes.</summary>
     public void Shutdown(Action<string>? report = null)
     {
         if (Runtime is null) return;
@@ -276,6 +330,44 @@ public sealed class EmulatorSession
             TraceSessions.Remove(pid);
         }
 
+        foreach (var record in Borrows.Values.Where(static record => record.Lease.IsValid).ToArray())
+        {
+            var revoked = Runtime.RevokeBorrow(record.Owner, record.Lease.Handle);
+            report?.Invoke(revoked.IsSuccess
+                ? $"borrow for region {record.Lease.Handle.Region.RegionId.Value} revoked"
+                : $"borrow shutdown incomplete: {revoked.Error}: {revoked.Message}");
+        }
+
+        foreach (var tracked in ExternalOperations.Values.ToArray())
+        {
+            // Only pre-submit operations can be created by this shell surface.
+            var queried = Runtime.QueryExternalOperation(tracked.Owner, tracked.Operation);
+            if (!queried.IsSuccess)
+            {
+                report?.Invoke($"external operation {tracked.Operation.OperationId.Value} shutdown query: {queried.Error}: {queried.Message}");
+                continue;
+            }
+            if (queried.Value!.State == ExternalOperationState.Released) continue;
+            var cancelled = Runtime.CancelExternalOperation(tracked.Owner, tracked.Operation, false);
+            if (!cancelled.IsSuccess)
+            {
+                report?.Invoke($"external operation {tracked.Operation.OperationId.Value} cancellation incomplete: {cancelled.Error}: {cancelled.Message}");
+                continue;
+            }
+            var released = Runtime.ReleaseExternalOperation(tracked.Owner, tracked.Operation, default);
+            report?.Invoke(released.IsSuccess
+                ? $"external operation {tracked.Operation.OperationId.Value} cancelled and released before submission"
+                : $"external operation shutdown incomplete: {released.Error}: {released.Message}");
+        }
+
+        foreach (var reservation in BudgetReservations.Values.ToArray())
+        {
+            var released = Runtime.ReleaseBudget(reservation.Owner, reservation.Reservation);
+            report?.Invoke(released.IsSuccess && released.Value!.State == BudgetReservationState.Released
+                ? $"budget reservation {reservation.Reservation.ReservationId.Value} released"
+                : $"budget reservation shutdown incomplete: {released.Error}: {released.Message ?? released.Value?.State.ToString()}");
+        }
+
         var spawned = EmulatorSpawnedPids.ToArray();
         Array.Sort(spawned);
         foreach (var pid in spawned)
@@ -286,6 +378,28 @@ public sealed class EmulatorSession
             report?.Invoke(reclaimed.IsSuccess
                 ? $"process {pid} terminated and reclaimed"
                 : $"process {pid} shutdown incomplete: {reclaimed.Message}");
+            if (!reclaimed.IsSuccess && report is not null)
+            {
+                var inspector = Runtime.CreateAuthorityInspector(handle.Value);
+                if (!inspector.IsSuccess)
+                {
+                    report($"process {pid} reclaim explanation unavailable: {inspector.Error}: {inspector.Message}");
+                    continue;
+                }
+                var explained = inspector.Value!.WhyReclaimBlocked(handle.Value);
+                if (!explained.IsSuccess)
+                {
+                    report($"process {pid} reclaim explanation unavailable: {explained.Error}: {explained.Message}");
+                    continue;
+                }
+                var observation = explained.Value!;
+                report($"process {pid} reclaim observation: blocked={observation.IsBlocked}, reasons={observation.Reasons.Count}, consistency={observation.Snapshot.Consistency}; grants no reclaim authority");
+                foreach (var reason in observation.Reasons.Take(100))
+                    report($"process {pid} reclaim blocker {reason.Kind}: node={reason.BlockingNode?.Value ?? "none"}, redacted={reason.Redacted}: {reason.Detail}");
+                if (observation.Reasons.Count > 100)
+                    report($"process {pid}: {observation.Reasons.Count - 100} further reclaim reasons omitted");
+            }
+
         }
     }
 
@@ -320,7 +434,8 @@ public sealed record SipAdmissionRecord(
     string AssemblyName,
     string AssemblyVersion,
     string ImageDigest,
-    ComponentIdentity Identity);
+    ComponentIdentity Identity,
+    string? StaticVerificationProof = null);
 
 public sealed record ChannelRecord(
     ulong ChannelId,
@@ -338,3 +453,5 @@ public sealed record ChannelRecord(
 }
 
 public sealed record BufferRecord(RegionHandle Handle, ProcessHandle Owner, int Length, OwnedBuffer<byte> Buffer);
+
+public sealed record BorrowRecord(ProcessHandle Owner, ProcessHandle Borrower, BorrowLease<byte> Lease);

@@ -1,4 +1,7 @@
 <Solution>
+  <Folder Name="/src/Admission/">
+    <Project Path="src/Admission/SingPlus.StaticAdmission/SingPlus.StaticAdmission.csproj" />
+  </Folder>
   <Folder Name="/contracts/">
     <Project Path="contracts/SingPlus.Contracts/SingPlus.Contracts.csproj" />
   </Folder>
@@ -15,6 +18,10 @@
     <Project Path="tools/SingPlus.HybridCpuQualification/SingPlus.HybridCpuQualification.csproj" />
     <Project Path="tools/SingPlus.LoweringEvidenceEmitter/SingPlus.LoweringEvidenceEmitter.csproj" />
     <Project Path="tools/SingPlus.SingCapQualification/SingPlus.SingCapQualification.csproj" />
+  </Folder>
+  <Folder Name="/Samples/" />
+  <Folder Name="/Samples/ManagedCap/">
+    <Project Path="src/Kernel/Boot/SingPlus.Boot/Samples/ManagedCap/ManagedCap.csproj" />
   </Folder>
   <Folder Name="/sdk/">
     <Project Path="sdk/SingPlus.Analyzers/SingPlus.Analyzers.csproj" />
@@ -54,4 +61,9 @@
     <Project Path="tests/SingPlus.Platform.HybridCpu.Tests/SingPlus.Platform.HybridCpu.Tests.csproj" />
     <Project Path="tests/SingPlus.Tests/SingPlus.Tests.csproj" />
   </Folder>
+  <Folder Name="/tests/fixtures/" />
+  <Folder Name="/tests/fixtures/SingCap.ManagedCap.NativeAotFixture/">
+    <Project Path="tests/fixtures/SingCap.ManagedCap.NativeAotFixture/SingCap.ManagedCap.NativeAotFixture.csproj" />
+  </Folder>
 </Solution>
+

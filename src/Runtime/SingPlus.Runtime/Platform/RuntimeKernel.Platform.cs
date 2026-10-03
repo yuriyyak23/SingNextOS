@@ -43,42 +43,75 @@ public sealed partial class RuntimeKernel
 
     private KernelResult<PlatformDomainBinding> BindPlatformDomainCore(ProcessHandle subject, bool executionAttached)
     {
-        var resolved = Processes.Resolve(subject);
-        if (!resolved.IsSuccess)
-            return KernelResult<PlatformDomainBinding>.Fail(resolved.Error, resolved.Message!);
-
-        var process = resolved.Value!;
+        SingPlus.Sip.SingProcess process;
         lock (_platformMemoryUseGate)
         {
+            var resolved = Processes.Resolve(subject);
+            if (!resolved.IsSuccess)
+                return KernelResult<PlatformDomainBinding>.Fail(resolved.Error, resolved.Message!);
+            process = resolved.Value!;
+            var ready = ValidateAttachmentSubject();
+            if (!ready.IsSuccess)
+                return KernelResult<PlatformDomainBinding>.Fail(ready.Error, ready.Message!);
+            if (_executionTransactions.Contains(subject) || !_pendingPlatformDomainBinds.Add(subject))
+                return KernelResult<PlatformDomainBinding>.Fail(
+                    KernelError.PlatformBindingActive, "A root bind or execution transaction is already in flight for this exact process.");
+        }
+
+        KernelResult ValidateAttachmentSubject()
+        {
+            var current = Processes.Resolve(subject);
+            if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
+            if (!ReferenceEquals(current.Value, process))
+                return KernelResult.Fail(KernelError.StaleHandle, "Root bind subject identity changed.");
             var effect = EnsureProcessAcceptsNewEffects(process);
-            if (!effect.IsSuccess)
-                return KernelResult<PlatformDomainBinding>.Fail(effect.Error, effect.Message!);
-            if (!CanChangePlatformExecutionAttachment(process.State))
-                return KernelResult<PlatformDomainBinding>.Fail(
-                    KernelError.InvalidTransition,
+            if (!effect.IsSuccess) return effect;
+            return CanChangePlatformExecutionAttachment(process.State) ? KernelResult.Ok() :
+                KernelResult.Fail(KernelError.InvalidTransition,
                     $"A platform execution domain cannot be attached while the process is {process.State}; bind before execution starts.");
-            if (!_pendingPlatformDomainBinds.Add(subject))
-                return KernelResult<PlatformDomainBinding>.Fail(
-                    KernelError.PlatformBindingActive,
-                    "A root domain bind is already in flight for this process generation.");
         }
 
         var identity = PlatformIdentity(process);
         try
         {
-            var binding = PlatformAuthority.BindDomain(identity);
-            if (binding.IsSuccess)
-                TrackPlatformBinding(subject, binding.Value!, executionAttached);
-            else if (PlatformAuthority.TryGetQuarantinedDomainBinding(
-                         identity,
-                         out var quarantinedBinding))
-                TrackPlatformBinding(subject, quarantinedBinding, executionAttached);
+            var binding = PlatformAuthority.BindDomain(identity,
+                admissionConsumer: begin =>
+                {
+                    lock (_platformMemoryUseGate)
+                    {
+                        var ready = ValidateAttachmentSubject();
+                        return ready.IsSuccess ? begin() : ready;
+                    }
+                },
+                completionConsumer: (published, commit) =>
+                {
+                    lock (_platformMemoryUseGate)
+                    {
+                        var ready = ValidateAttachmentSubject();
+                        if (!ready.IsSuccess)
+                        {
+                            // Known provider lease remains reachable by the actual teardown
+                            // consumer, but grants no execution attachment to a stopped subject.
+                            TrackPlatformBinding(subject, published, executionAttached: false);
+                            return ready;
+                        }
+                        var attached = commit(() =>
+                        {
+                            TrackPlatformBinding(subject, published, executionAttached);
+                            return KernelResult.Ok();
+                        });
+                        if (!attached.IsSuccess)
+                            TrackPlatformBinding(subject, published, executionAttached: false);
+                        return attached;
+                    }
+                });
+            if (!binding.IsSuccess && PlatformAuthority.TryGetQuarantinedDomainBinding(identity, out var quarantinedBinding))
+                TrackPlatformBinding(subject, quarantinedBinding, executionAttached: false);
             return binding;
         }
         finally
         {
-            lock (_platformMemoryUseGate)
-                _pendingPlatformDomainBinds.Remove(subject);
+            lock (_platformMemoryUseGate) _pendingPlatformDomainBinds.Remove(subject);
         }
     }
 

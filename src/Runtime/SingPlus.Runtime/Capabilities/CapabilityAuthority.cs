@@ -567,6 +567,32 @@ public sealed class CapabilityAuthority
         }
     }
 
+    internal KernelResult CommitProcessAdmission(DomainId subject, ulong generation,
+        CapabilityRequirementV1[] requirements, Func<KernelResult> commit)
+    {
+        lock (_gate)
+        {
+            // The real kernel consumer supplies a private requirement array and
+            // holds lifecycle scope. Descriptors/snapshots grant no admission.
+            foreach (var requirement in requirements)
+            {
+                if (!Enum.IsDefined(requirement.ResourceKind) || string.IsNullOrWhiteSpace(requirement.ResourceId) ||
+                    requirement.Rights == CapabilityRights.None)
+                    return KernelResult.Fail(KernelError.MissingCapability, "Captured mandatory capability requirement is invalid.");
+                var satisfied = _records.Values.Any(record =>
+                    record.SubjectDomainId == subject && record.SubjectGeneration == generation &&
+                    record.ResourceKind == requirement.ResourceKind &&
+                    string.Equals(record.ResourceId, requirement.ResourceId, StringComparison.Ordinal) &&
+                    ValidateRecord(record, subject, generation, requirement.Rights, null).IsSuccess);
+                if (!satisfied)
+                    return KernelResult.Fail(KernelError.MissingCapability,
+                        $"Missing capability {requirement.ResourceKind}:{requirement.ResourceId} ({requirement.Rights}).");
+            }
+            // Trusted local state mutation only: no provider, clock, collection,
+            // trace or caller callback may enter this owner commit.
+            return commit();
+        }
+    }
     internal KernelResult CommitSupervisorRecordPublication(CapabilityId id, DomainId subject,
         ulong generation, Func<KernelResult> publish)
     {
@@ -616,6 +642,49 @@ public sealed class CapabilityAuthority
                 valid.Value.ResourceId != CapabilityResourceIds.TelemetryInspection)
                 return KernelResult.Fail(KernelError.ProjectionDenied, "The capability does not authorize telemetry inspection.");
             // Trusted local publication only: no clock, provider, trace or budget callbacks here.
+            return commit();
+        }
+    }
+
+    internal KernelResult CommitVirtualDomainEffect(CapabilityId id, DomainId subject,
+        ulong generation, CapabilityRights rights, string resourceId, Func<KernelResult> commit)
+    {
+        lock (_gate)
+        {
+            var valid = Validate(id, subject, generation, rights);
+            if (!valid.IsSuccess) return KernelResult.Fail(valid.Error, valid.Message!);
+            if (valid.Value!.ResourceKind != ResourceKind.Virtualization || valid.Value.ResourceId != resourceId)
+                return KernelResult.Fail(KernelError.WrongCapabilityResource, "Virtual effect source changed.");
+            return commit(); // Trusted pure local owner mutation only.
+        }
+    }
+
+    internal KernelResult CommitVirtualDomainCreation(CapabilityId id, DomainId subject,
+        ulong generation, Func<KernelResult> commit)
+    {
+        lock (_gate)
+        {
+            var valid = Validate(id, subject, generation, CapabilityRights.Configure);
+            if (!valid.IsSuccess) return KernelResult.Fail(valid.Error, valid.Message!);
+            if (valid.Value!.ResourceKind != ResourceKind.Virtualization ||
+                valid.Value.ResourceId != VirtualizationResourceIds.Create)
+                return KernelResult.Fail(KernelError.WrongCapabilityResource, "Virtual-domain creation source changed.");
+            // Trusted local admission/publication only; never provider or caller callbacks.
+            return commit();
+        }
+    }
+
+    internal KernelResult<T> CommitVirtualDomainCreation<T>(CapabilityId id, DomainId subject,
+        ulong generation, Func<KernelResult<T>> commit)
+    {
+        lock (_gate)
+        {
+            var valid = Validate(id, subject, generation, CapabilityRights.Configure);
+            if (!valid.IsSuccess) return KernelResult<T>.Fail(valid.Error, valid.Message!);
+            if (valid.Value!.ResourceKind != ResourceKind.Virtualization ||
+                valid.Value.ResourceId != VirtualizationResourceIds.Create)
+                return KernelResult<T>.Fail(KernelError.WrongCapabilityResource, "Virtual-domain creation source changed.");
+            // Trusted local admission/publication only; never provider or caller callbacks.
             return commit();
         }
     }
@@ -991,6 +1060,8 @@ public sealed class CapabilityAuthority
         if ((rights & CapabilityRights.Execute) != 0) yield return CapabilityOperation.Execute;
     }
 }
+
+
 
 
 

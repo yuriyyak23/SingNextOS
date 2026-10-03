@@ -1,0 +1,24 @@
+# Fresh boot: read-only IPC borrow, return, revoke and MOVE.
+spawn owner
+spawn reader
+alloc 5000 32
+fill 1 0x5A
+borrow-channel 5000 5001
+borrow 5000 1 1
+regions
+recv 5001 1
+borrows
+dump 5001 1 0 32
+borrow-return 5001 1
+borrow 5000 1 1
+recv 5001 1
+borrow-revoke 5000 1
+transfer 1 5001
+dump 5001 1 0 32
+free 1
+stop 5001
+stop 5000
+# Automated checks of expected runtime refusals.
+demo borrows
+status
+exit

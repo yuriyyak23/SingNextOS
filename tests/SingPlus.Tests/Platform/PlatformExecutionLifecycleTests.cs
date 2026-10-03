@@ -48,7 +48,7 @@ public sealed class PlatformExecutionLifecycleTests
     }
 
     [Fact]
-    public void ProviderDenialLeavesRunningAndParkedStatesUnchanged()
+    public void ProviderDenialRetainsStateAndRequiresExplicitClosureBeforeTransitionRetry()
     {
         var provider = new LifecycleProvider(LifecycleBehavior.Success);
         var kernel = new RuntimeKernel(provider);
@@ -64,14 +64,21 @@ public sealed class PlatformExecutionLifecycleTests
         Assert.Equal(ProcessState.Running, process.State);
 
         provider.Behavior = LifecycleBehavior.Success;
-        Assert.True(kernel.ParkProcess(handle).IsSuccess);
+        Assert.Equal(KernelError.PlatformFaulted, kernel.ParkProcess(handle).Error);
+        Assert.True(kernel.TerminateProcess(handle).IsSuccess);
+        Assert.Equal(1, provider.RevokeCalls);
+
+        var (parked, parkedHandle) = CreateAdmittedProcess(kernel, 825, 925, 1);
+        Assert.True(kernel.BindPlatformDomain(parkedHandle).IsSuccess);
+        Assert.True(kernel.StartProcess(parkedHandle).IsSuccess);
+        Assert.True(kernel.ParkProcess(parkedHandle).IsSuccess);
         provider.Behavior = LifecycleBehavior.Deny;
-
-        var deniedResume = kernel.ResumeProcess(handle);
-
+        var deniedResume = kernel.ResumeProcess(parkedHandle);
         Assert.False(deniedResume.IsSuccess);
         Assert.Equal(KernelError.PlatformDenied, deniedResume.Error);
-        Assert.Equal(ProcessState.Parked, process.State);
+        Assert.Equal(ProcessState.Parked, parked.State);
+        Assert.Equal(KernelError.PlatformFaulted, kernel.ResumeProcess(parkedHandle).Error);
+        Assert.True(kernel.TerminateProcess(parkedHandle).IsSuccess);
     }
 
     [Fact]
@@ -661,6 +668,239 @@ public sealed class PlatformExecutionLifecycleTests
                 correct with { State = PlatformDomainExecutionState.Parked }).Status);
     }
 
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public async Task PendingExecutionPreventsClosureAndLateLocalPublication(int step)
+    {
+        var provider = new LifecycleProvider(LifecycleBehavior.Success);
+        var kernel = new RuntimeKernel(provider);
+        var (process, handle) = CreateAdmittedProcess(kernel, 830, 930, 1);
+        var binding = kernel.BindPlatformDomain(handle).Value!;
+        if (step > 0) Assert.True(kernel.StartProcess(handle).IsSuccess);
+        if (step > 1) Assert.True(kernel.ParkProcess(handle).IsSuccess);
+        var before = provider.Transitions.Count;
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        provider.TransitionCallback = () => { entered.Set(); Assert.True(release.Wait(TimeSpan.FromSeconds(15))); };
+        var work = Task.Run(() => step == 0 ? kernel.StartProcess(handle) : step == 1 ? kernel.ParkProcess(handle) : kernel.ResumeProcess(handle));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(15)));
+            await Task.Run(() =>
+            {
+                Assert.Equal(KernelError.PlatformBindingActive,
+                    kernel.PlatformAuthority.TransitionDomainExecution(binding, binding.Subject, PlatformDomainExecutionTransition.Start).Error);
+                Assert.Equal(KernelError.PlatformBindingActive, kernel.TerminateProcess(handle).Error);
+                Assert.Equal(ProcessState.Exiting, process.State);
+                var teardown = kernel.ObserveProcessTeardown(handle).Value!;
+                Assert.False(teardown.LocalReclaimCompleted);
+                Assert.Equal(0, provider.RevokeCalls);
+                Assert.True(ReadPending(kernel.PlatformAuthority, binding.BindingId));
+            }).WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally { release.Set(); }
+        Assert.Equal(KernelError.PlatformFaulted, (await work).Error);
+        Assert.Equal(ProcessState.Exiting, process.State);
+        Assert.False(ReadPending(kernel.PlatformAuthority, binding.BindingId));
+        provider.TransitionCallback = null;
+        Assert.True(kernel.TerminateProcess(handle).IsSuccess);
+        Assert.Equal(ProcessState.Exited, process.State);
+        Assert.Equal(1, provider.RevokeCalls);
+        Assert.Equal(before + 1, provider.Transitions.Count);
+        Assert.Equal(KernelError.StaleHandle, kernel.Processes.Resolve(handle).Error);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)]
+    public void ExecutionUnknownOutcomeRetainsRootUntilActualClosureOrPinsMissingConsumer(int fault)
+    {
+        var provider = new LifecycleProvider(LifecycleBehavior.Success);
+        var kernel = new RuntimeKernel(provider);
+        var (process, handle) = CreateAdmittedProcess(kernel, 831, 931, 1);
+        var binding = kernel.BindPlatformDomain(handle).Value!;
+        provider.TransitionCallback = () =>
+        {
+            Assert.True(ReadPending(kernel.PlatformAuthority, binding.BindingId));
+            if (fault == 0) throw new InvalidOperationException("controlled lost execution receipt");
+            if (fault == 1) provider.Behavior = LifecycleBehavior.Deny;
+            if (fault == 2) provider.Behavior = LifecycleBehavior.WrongLeaseResult;
+            if (fault == 3)
+            {
+                Assert.True(kernel.ObservePlatformBackendReset().IsSuccess);
+                Assert.True(ReadPending(kernel.PlatformAuthority, binding.BindingId));
+                var current = ReadBinding(kernel.PlatformAuthority, binding.BindingId);
+                Assert.Equal(KernelError.PlatformBindingActive, kernel.PlatformAuthority.RevokeDomain(current, current.Subject).Error);
+            }
+            if (fault == 4) DomainRecords(kernel.PlatformAuthority).Remove(binding.BindingId);
+        };
+        var start = kernel.StartProcess(handle);
+        Assert.Equal(fault == 1 ? KernelError.PlatformDenied : KernelError.PlatformFaulted, start.Error);
+        Assert.Equal(ProcessState.Admitted, process.State);
+        if (fault != 4) Assert.False(ReadPending(kernel.PlatformAuthority, binding.BindingId));
+        provider.TransitionCallback = null;
+        Assert.False(kernel.StartProcess(handle).IsSuccess);
+        Assert.Single(provider.Transitions);
+        var close = kernel.TerminateProcess(handle);
+        if (fault < 3)
+        {
+            Assert.True(close.IsSuccess, close.Message);
+            Assert.Equal(1, provider.RevokeCalls);
+            Assert.Equal(ProcessState.Exited, process.State);
+        }
+        else
+        {
+            Assert.Equal(fault == 3 ? KernelError.StaleGeneration : KernelError.PlatformBindingNotFound, close.Error);
+            Assert.Equal(ProcessState.Exiting, process.State);
+            Assert.False(kernel.ObserveProcessTeardown(handle).Value!.LocalReclaimCompleted);
+            Assert.Equal(0, provider.RevokeCalls);
+            Assert.False(kernel.TerminateProcess(handle).IsSuccess);
+        }
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public async Task KernelExecutionTransactionRejectsOverlapAndCommitAfterTeardown(int step)
+    {
+        var provider = new LifecycleProvider(LifecycleBehavior.Success);
+        var kernel = new RuntimeKernel(provider);
+        var (process, handle) = CreateAdmittedProcess(kernel, 840, 940, 1);
+        var binding = kernel.BindPlatformDomain(handle).Value!;
+        if (step > 0) Assert.True(kernel.StartProcess(handle).IsSuccess);
+        if (step > 1) Assert.True(kernel.ParkProcess(handle).IsSuccess);
+        var before = provider.Transitions.Count;
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        provider.TransitionCallback = () => { entered.Set(); Assert.True(release.Wait(TimeSpan.FromSeconds(15))); };
+        KernelResult Transition() => step == 0 ? kernel.StartProcess(handle) :
+            step == 1 ? kernel.ParkProcess(handle) : kernel.ResumeProcess(handle);
+        var work = Task.Run(Transition);
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(15)));
+            var gate = PrivateGate(kernel, "_platformMemoryUseGate");
+            lock (gate)
+            {
+                // Exercise actual advancing teardown while callback remains pending.
+                Assert.Equal(KernelError.PlatformBindingActive, Transition().Error);
+                Assert.Equal(KernelError.PlatformBindingActive, kernel.TerminateProcess(handle).Error);
+                Assert.Equal(ProcessState.Exiting, process.State);
+                Assert.False(kernel.ObserveProcessTeardown(handle).Value!.LocalReclaimCompleted);
+                Assert.True(ReadPending(kernel.PlatformAuthority, binding.BindingId));
+                Assert.Equal(0, provider.RevokeCalls);
+                release.Set();
+            }
+        }
+        finally { release.Set(); }
+        Assert.False((await work.WaitAsync(TimeSpan.FromSeconds(15))).IsSuccess);
+        Assert.Equal(ProcessState.Exiting, process.State);
+        Assert.False(ReadPending(kernel.PlatformAuthority, binding.BindingId));
+        provider.TransitionCallback = null;
+        Assert.True(kernel.TerminateProcess(handle).IsSuccess);
+        Assert.Equal(ProcessState.Exited, process.State);
+        Assert.Equal(before + 1, provider.Transitions.Count);
+        var (_, replacement) = CreateAdmittedProcess(kernel, 840, 940, 2);
+        Assert.Equal(KernelError.StaleHandle, Transition().Error);
+        Assert.True(kernel.StartProcess(replacement).IsSuccess);
+    }
+
+    [Fact]
+    public async Task TeardownBeforeBridgeAdmissionPreventsEffectAndOldGenerationPublication()
+    {
+        var provider = new LifecycleProvider(LifecycleBehavior.Success);
+        var kernel = new RuntimeKernel(provider);
+        var (process, handle) = CreateAdmittedProcess(kernel, 841, 941, 1);
+        Assert.True(kernel.BindPlatformDomain(handle).IsSuccess);
+        var bridgeGate = PrivateGate(kernel.PlatformAuthority, "_secureDomainLifecycleGate");
+        Task<KernelResult> work;
+        lock (bridgeGate)
+        {
+            work = Task.Run(() => kernel.StartProcess(handle));
+            Assert.True(SpinWait.SpinUntil(() =>
+            {
+                lock (PrivateGate(kernel, "_platformMemoryUseGate"))
+                {
+                    var pending = (HashSet<ProcessHandle>)typeof(RuntimeKernel).GetField("_executionTransactions",
+                        global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.GetValue(kernel)!;
+                    return pending.Contains(handle);
+                }
+            }, TimeSpan.FromSeconds(15)));
+            Assert.True(kernel.TerminateProcess(handle).IsSuccess);
+            Assert.Equal(ProcessState.Exited, process.State);
+            CreateAdmittedProcess(kernel, 841, 941, 2);
+        }
+        Assert.False((await work.WaitAsync(TimeSpan.FromSeconds(15))).IsSuccess);
+        Assert.Empty(provider.Transitions);
+        Assert.Equal(1, provider.RevokeCalls);
+        Assert.Equal(ProcessState.Exited, process.State);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void FinalExecutionConsumerRequiresFreshRootReceiptAndBalancesAdmission(int fault)
+    {
+        var provider = new LifecycleProvider(LifecycleBehavior.Success);
+        var kernel = new RuntimeKernel(provider);
+        var (_, handle) = CreateAdmittedProcess(kernel, 842, 942, 1);
+        var binding = kernel.BindPlatformDomain(handle).Value!;
+        var committed = false;
+        var result = kernel.PlatformAuthority.TransitionDomainExecution(binding, binding.Subject,
+            PlatformDomainExecutionTransition.Start,
+            completionConsumer: commit =>
+            {
+                Assert.True(ReadPending(kernel.PlatformAuthority, binding.BindingId));
+                if (fault == 0)
+                    Assert.Equal(KernelError.PlatformBindingActive, kernel.TerminateProcess(handle).Error);
+                if (fault == 1) Assert.True(kernel.ObservePlatformBackendReset().IsSuccess);
+                if (fault == 2) DomainRecords(kernel.PlatformAuthority).Remove(binding.BindingId);
+                return commit(() => { committed = true; return KernelResult.Ok(); });
+            });
+        Assert.False(result.IsSuccess);
+        Assert.False(committed);
+        Assert.Single(provider.Transitions);
+        if (fault != 2) Assert.False(ReadPending(kernel.PlatformAuthority, binding.BindingId));
+        if (fault == 0) Assert.True(kernel.TerminateProcess(handle).IsSuccess);
+        else
+        {
+            Assert.False(kernel.TerminateProcess(handle).IsSuccess);
+            Assert.False(kernel.ObserveProcessTeardown(handle).Value!.LocalReclaimCompleted);
+            Assert.Equal(0, provider.RevokeCalls);
+        }
+    }
+
+    [Fact]
+    public void AdmissionConsumerRefusalDoesNotCallProviderOrSetPending()
+    {
+        var provider = new LifecycleProvider(LifecycleBehavior.Success);
+        var kernel = new RuntimeKernel(provider);
+        var (_, handle) = CreateAdmittedProcess(kernel, 843, 943, 1);
+        var binding = kernel.BindPlatformDomain(handle).Value!;
+        var denied = kernel.PlatformAuthority.TransitionDomainExecution(binding, binding.Subject,
+            PlatformDomainExecutionTransition.Start,
+            admissionConsumer: _ => KernelResult.Fail(KernelError.InvalidTransition, "fresh local owner refuses"));
+        Assert.Equal(KernelError.InvalidTransition, denied.Error);
+        Assert.Empty(provider.Transitions);
+        Assert.False(ReadPending(kernel.PlatformAuthority, binding.BindingId));
+        Assert.True(kernel.StartProcess(handle).IsSuccess);
+        Assert.True(kernel.TerminateProcess(handle).IsSuccess);
+    }
+
+    private static object PrivateGate(object owner, string field) =>
+        owner.GetType().GetField(field, global::System.Reflection.BindingFlags.Instance |
+            global::System.Reflection.BindingFlags.NonPublic)!.GetValue(owner)!;
+
+    private static global::System.Collections.IDictionary DomainRecords(PlatformAuthorityBridge bridge) =>
+        (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_domains",
+            global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.GetValue(bridge)!;
+    private static bool ReadPending(PlatformAuthorityBridge bridge, PlatformDomainBindingId id)
+    {
+        var record = DomainRecords(bridge)[id]!;
+        return (bool)record.GetType().GetProperty("ExecutionTransitionInFlight")!.GetValue(record)!;
+    }
+    private static PlatformDomainBinding ReadBinding(PlatformAuthorityBridge bridge, PlatformDomainBindingId id)
+    {
+        var record = DomainRecords(bridge)[id]!;
+        return (PlatformDomainBinding)record.GetType().GetProperty("Binding")!.GetValue(record)!;
+    }
     private static (SingPlus.Sip.SingProcess Process, ProcessHandle Handle) CreateAdmittedProcess(
         RuntimeKernel kernel,
         ulong processId,
@@ -701,6 +941,7 @@ public sealed class PlatformExecutionLifecycleTests
             PlatformProviderDomainLease> _leases = [];
         private ulong _nextLeaseId = 1;
 
+        public Action? TransitionCallback { get; set; }
         public LifecycleBehavior Behavior { get; set; } = behavior;
         public PlatformAuthorityStatus? RevokeStatus { get; set; }
         public PlatformFeatureAvailability FeatureAvailability { get; init; } =
@@ -738,6 +979,7 @@ public sealed class PlatformExecutionLifecycleTests
             PlatformDomainExecutionTransition transition)
         {
             Transitions.Add(transition);
+            TransitionCallback?.Invoke();
             if (!_leases.TryGetValue(domainLease.LeaseId, out var lease) ||
                 domainLease != lease)
             {
@@ -876,3 +1118,6 @@ public sealed class PlatformExecutionLifecycleTests
             availability),
     });
 }
+
+
+

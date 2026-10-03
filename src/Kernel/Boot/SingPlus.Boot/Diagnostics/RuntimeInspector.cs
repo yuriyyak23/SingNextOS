@@ -21,13 +21,16 @@ public static class RuntimeInspector
         var processes = runtime.Processes.Snapshot();
         var rows = new List<IReadOnlyList<string>>
         {
+            new[] { "platform profile", session.Options.PlatformProfile },
             new[] { "uptime", session.Uptime.Elapsed.ToString(@"hh\:mm\:ss\.fff") },
             new[] { "processes (live)", processes.Count.ToString() },
             new[] { "domains", runtime.Domains.Snapshot().Count.ToString() },
             new[] { "sip components", session.Sips.Count.ToString() },
             new[] { "regions", runtime.Regions.Snapshot().Count.ToString() },
             new[] { "channels (tracked)", session.Channels.Count.ToString() },
-            new[] { "trace sessions", session.TraceSessions.Count.ToString() },
+            new[] { "borrows (delivered, valid)", session.Borrows.Values.Count(static record => record.Lease.IsValid).ToString() },
+            new[] { "trace sessions (tracked)", session.TraceSessions.Count.ToString() },
+            new[] { "completed trace snapshots", session.CompletedTraces.Count.ToString() },
             new[] { "budget", session.IsBudgetConfigured ? "configured" : "not configured (boot with --budget)" },
         };
         EmulatorConsole.Table(["property", "value"], rows);
@@ -156,6 +159,7 @@ public static class RuntimeInspector
                 [
                     sip.Identity.Name,
                     sip.AssemblyVersion,
+                    sip.StaticVerificationProof is null ? "not verified" : "ManagedCap static pass",
                     fresh.Value!.State.ToString(),
                     fresh.Value.Process.ProcessId.Value.ToString(),
                     fresh.Value.Domain.Value.ToString(),
@@ -166,12 +170,13 @@ public static class RuntimeInspector
                 [
                     sip.Identity.Name,
                     sip.AssemblyVersion,
+                    sip.StaticVerificationProof is null ? "not verified" : "ManagedCap static pass",
                     $"query failed: {fresh.Error}",
                     "-", "-", "-",
                     sip.ImagePath,
                 ]);
         }
-        EmulatorConsole.Table(["component", "version", "state", "pid", "domain", "sha256", "image"], rows);
+        EmulatorConsole.Table(["component", "version", "static verification", "state", "pid", "domain", "sha256", "image"], rows);
     }
 
     public static void WriteRegions(EmulatorSession session)
@@ -189,7 +194,7 @@ public static class RuntimeInspector
         var rows = regions.Select(static region => (IReadOnlyList<string>)new[]
         {
             region.Handle.RegionId.Value.ToString(),
-            region.Handle.Generation.ToString()!,
+            region.Handle.Generation.Value.ToString(),
             region.Owner.DomainId.Value.ToString(),
             region.Owner.ProcessGeneration.ToString(),
             region.ByteLength.ToString(),
@@ -315,14 +320,17 @@ public static class RuntimeInspector
 
     public static void WriteTraceSessions(EmulatorSession session)
     {
-        if (session.TraceSessions.Count == 0)
+        if (session.TraceSessions.Count == 0 && session.CompletedTraces.Count == 0)
         {
-            EmulatorConsole.Info("[emulator] no tracked trace sessions (use 'trace start <pid>' or boot with --trace)\r\n");
+            EmulatorConsole.Info("[emulator] no tracked trace sessions (use 'trace-start <pid>' or boot with --trace)\r\n");
             return;
         }
 
         EmulatorConsole.Table(["pid", "session", "producer", "state", "capacity"],
-            session.TraceSessions.OrderBy(static pair => pair.Key).Select(static pair =>
+            session.TraceSessions
+                .Concat(session.CompletedTraces.Select(static pair =>
+                    new KeyValuePair<ulong, TraceSessionAdmission>(pair.Key, pair.Value.Session)))
+                .OrderBy(static pair => pair.Key).Select(static pair =>
             {
                 var admission = pair.Value;
                 return (IReadOnlyList<string>)new[]
@@ -336,28 +344,41 @@ public static class RuntimeInspector
             }).ToArray());
     }
 
-    public static void WriteTraceEvents(EmulatorSession session, ulong processIdValue, int count)
+    public static bool WriteTraceEvents(EmulatorSession session, ulong processIdValue, int count)
     {
-        var runtime = session.Runtime;
-        if (runtime is null) { EmulatorConsole.Error("[emulator] runtime is unavailable\r\n"); return; }
-        if (!session.TraceSessions.TryGetValue(processIdValue, out var admission))
+        TraceSnapshot value;
+        if (session.CompletedTraces.TryGetValue(processIdValue, out var completed))
         {
-            EmulatorConsole.Error($"[emulator] no tracked trace session for process {processIdValue}\r\n");
-            return;
+            value = completed;
+        }
+        else
+        {
+            var runtime = session.Runtime;
+            if (runtime is null)
+            {
+                EmulatorConsole.Error("[emulator] runtime is unavailable\r\n");
+                return false;
+            }
+            if (!session.TraceSessions.TryGetValue(processIdValue, out var admission))
+            {
+                EmulatorConsole.Error($"[emulator] no tracked trace session for process {processIdValue}\r\n");
+                return false;
+            }
+
+            var snapshot = runtime.InspectTrace(admission.Owner, admission.Session);
+            if (!snapshot.IsSuccess)
+            {
+                EmulatorConsole.Error($"[kernel] trace inspection failed ({snapshot.Error}): {snapshot.Message}\r\n");
+                return false;
+            }
+            value = snapshot.Value!;
         }
 
-        var snapshot = runtime.InspectTrace(admission.Owner, admission.Session);
-        if (!snapshot.IsSuccess)
-        {
-            EmulatorConsole.Error($"[emulator] trace inspection failed ({snapshot.Error}): {snapshot.Message}\r\n");
-            return;
-        }
-
-        var events = snapshot.Value!.Events;
+        var events = value.Events;
         EmulatorConsole.Info(
-            $"trace session {admission.Session.SessionId.Value}: {events.Count} events, " +
-            $"{snapshot.Value.DroppedEventCount} dropped, complete={snapshot.Value.Complete}\r\n");
-        if (events.Count == 0) return;
+            $"trace session {value.Session.Session.SessionId.Value} ({value.Session.State}): {events.Count} events, " +
+            $"{value.DroppedEventCount} dropped, complete={value.Complete}\r\n");
+        if (events.Count == 0) return true;
 
         var skip = Math.Max(0, events.Count - Math.Max(1, count));
         var rows = events.Skip(skip).Select(static traceEvent => (IReadOnlyList<string>)new[]
@@ -372,6 +393,7 @@ public static class RuntimeInspector
         }).ToArray();
         EmulatorConsole.Table(["seq", "kind", "resource", "correlation-id", "state", "outcome", "causality"], rows);
         if (skip > 0) EmulatorConsole.Detail($"  ({skip} earlier events omitted; pass a larger count)\r\n");
+        return true;
     }
 
     public static void WritePlatform(EmulatorSession session)
@@ -379,6 +401,12 @@ public static class RuntimeInspector
         var runtime = session.Runtime;
         if (runtime is null) { EmulatorConsole.Error("[emulator] runtime is unavailable\r\n"); return; }
 
+        if (session.Options.HostModelPlatform)
+            EmulatorConsole.Info("[platform] Host model provider: availability is the provider contract classification, not physical hardware evidence\r\n");
+        if (session.Options.HybridCpuChildPlatform)
+            EmulatorConsole.Info("[platform] HybridCPU model parent plus existing executable child adapter; advertised features do not prove guest execution\r\n");
+        if (session.Options.HybridCpuModelPlatform)
+            EmulatorConsole.Info("[platform] Existing HybridCPU neutral model adapter; RuntimeAdmission features do not qualify physical execution\r\n");
         var manifest = runtime.QueryPlatformFeatures();
         if (manifest.Features.Count == 0)
         {

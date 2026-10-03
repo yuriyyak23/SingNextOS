@@ -65,6 +65,7 @@ public sealed partial class PlatformAuthorityBridge
         var previous = BackendEpoch;
         if (!exhausted) _backendEpoch++;
         var current = BackendEpoch;
+        foreach (var subject in _pendingVirtualDomainCreates) _unresolvedVirtualDomainCreates.TryAdd(subject, previous);
         foreach (var subject in _pendingDomainBinds)
             _unresolvedDomainBinds.Add(subject);
 
@@ -163,6 +164,7 @@ public sealed partial class PlatformAuthorityBridge
                 ChildCreateMayHaveEffect = record.ChildCreateMayHaveEffect || record.PendingChildCreates != 0,
                 PendingSecureCreates = record.PendingSecureCreates,
                 ParentRevokeMayHaveEffect = record.ParentRevokeMayHaveEffect,
+                ExecutionTransitionInFlight = record.ExecutionTransitionInFlight,
                 ExecutionPolicy = record.ExecutionPolicy,
             };
         }
@@ -177,7 +179,7 @@ public sealed partial class PlatformAuthorityBridge
                     record.Binding.Generation.Value == ulong.MaxValue
                         ? ulong.MaxValue : record.Binding.Generation.Value + 1),
             };
-            _virtualDomainBindings[bindingId] = record with { Binding = staleBinding };
+            _virtualDomainBindings[bindingId] = record with { Binding = staleBinding, Quarantined = true };
         }
 
         if (exhausted)
@@ -194,3 +196,4 @@ public sealed partial class PlatformAuthorityBridge
             virtualBindingIds.Length + faultPinnedChildDomains));
     }
 }
+

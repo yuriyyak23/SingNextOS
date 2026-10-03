@@ -11,6 +11,7 @@ public sealed class RepositoryArchitecturePolicyTests
     public enum Layer
     {
         Contracts,
+        StaticAdmission,
         Sip,
         PrivilegedMechanism,
         PlatformAbstractions,
@@ -53,7 +54,7 @@ public sealed class RepositoryArchitecturePolicyTests
                 var target = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(project)!, include!));
                 var targetLayer = Classify(target);
                 Assert.True(
-                    IsProjectReferenceAllowed(sourceLayer, targetLayer),
+                    IsProjectReferenceAllowed(sourceLayer, targetLayer) || IsHostModelCompositionReference(project, target),
                     $"Forbidden architecture edge: {Path.GetRelativePath(Root, project)} [{sourceLayer}] -> {Path.GetRelativePath(Root, target)} [{targetLayer}]");
             }
         }
@@ -184,6 +185,71 @@ public sealed class RepositoryArchitecturePolicyTests
         Assert.Contains(references, static value => value?.Contains("SingPlus.Kernel.Hal.Host", StringComparison.Ordinal) == true);
     }
 
+    [Fact]
+    public void ManagedCapabilitySampleUsesSipRestrictionsDespiteBootDirectory()
+    {
+        Assert.Equal(Layer.Sip, Classify(Path.Combine(Root, "src/Kernel/Boot/SingPlus.Boot/Samples/ManagedCap/ManagedCap.csproj")));
+        Assert.True(IsProjectReferenceAllowed(Layer.Sip, Layer.NativeSdk));
+        Assert.True(IsProjectReferenceAllowed(Layer.Sip, Layer.Tooling));
+        Assert.False(IsProjectReferenceAllowed(Layer.Sip, Layer.PrivilegedMechanism));
+        Assert.False(IsProjectReferenceAllowed(Layer.Sip, Layer.ProviderAdapter));
+        Assert.Equal(Layer.PrivilegedMechanism, Classify(Path.Combine(Root, "src/Kernel/Boot/SingPlus.Boot/SingPlus.Boot.csproj")));
+    }
+
+    [Fact]
+    public void StaticVerifierLibraryHasOneImplementationOwnerAndNoRuntimePermission()
+    {
+        var library = typeof(SingPlus.Admission.AdmissionVerifier).Assembly;
+        Assert.Equal("SingPlus.StaticAdmission", library.GetName().Name);
+        Assert.DoesNotContain(library.GetReferencedAssemblies(), reference =>
+            reference.Name!.StartsWith("SingPlus.", StringComparison.Ordinal) || reference.Name.StartsWith("HybridCPU", StringComparison.OrdinalIgnoreCase));
+        var cli = Assembly.Load("SingPlus.Admission");
+        Assert.Contains(typeof(SingPlus.Admission.AdmissionVerifier), cli.GetForwardedTypes());
+        Assert.Contains(typeof(SingPlus.Admission.SingPlusAdmissionProofV1), cli.GetForwardedTypes());
+        Assert.DoesNotContain(cli.GetTypes(), type => type.FullName == typeof(SingPlus.Admission.AdmissionVerifier).FullName);
+        Assert.Same(library, cli.GetType(typeof(SingPlus.Admission.AdmissionVerifier).FullName!)!.Assembly);
+        Assert.True(IsProjectReferenceAllowed(Layer.PrivilegedMechanism, Layer.StaticAdmission));
+        Assert.False(IsProjectReferenceAllowed(Layer.PrivilegedMechanism, Layer.Tooling));
+        Assert.False(IsProjectReferenceAllowed(Layer.StaticAdmission, Layer.PrivilegedMechanism));
+        Assert.False(IsProjectReferenceAllowed(Layer.StaticAdmission, Layer.ProviderAdapter));
+        Assert.False(IsProjectReferenceAllowed(Layer.StaticAdmission, Layer.Tooling));
+        var proof = new SingPlus.Admission.SingPlusAdmissionProofV1
+        {
+            Root = "test", Profile = "ManagedCap", AssemblyDigest = "test", ReachableMethodCount = 0,
+            ForbiddenOperationCount = 0, DependencyDigest = "test", RulesetDigest = "test", ProofDigest = "test"
+        };
+        Assert.False(proof.AuthorizesExecution);
+        Assert.False(proof.MaterializesCapability);
+        Assert.False(proof.IsRuntimeAuthority);
+        var boot = XDocument.Load(Path.Combine(Root, "src/Kernel/Boot/SingPlus.Boot/SingPlus.Boot.csproj"));
+        Assert.DoesNotContain(boot.Descendants("ProjectReference"), element => ((string?)element.Attribute("Include"))!.Contains("tools/SingPlus.Admission", StringComparison.Ordinal));
+        Assert.Contains(boot.Descendants("ProjectReference"), element => ((string?)element.Attribute("Include"))!.Contains("Admission/SingPlus.StaticAdmission", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void HostDebugCompositionReferenceIsExactAndCannotAdmitOtherProviders()
+    {
+        var boot = Path.Combine(Root, "src/Kernel/Boot/SingPlus.Boot/SingPlus.Boot.csproj");
+        var host = Path.Combine(Root, "src/Platform/SingPlus.Platform.Host/SingPlus.Platform.Host.csproj");
+        Assert.True(IsHostModelCompositionReference(boot, host));
+        Assert.False(IsHostModelCompositionReference(Path.Combine(Root, "src/Runtime/SingPlus.Runtime/SingPlus.Runtime.csproj"), host));
+        Assert.False(IsHostModelCompositionReference(boot, Path.Combine(Root, "src/Platform/SingPlus.Platform.HybridCpu/SingPlus.Platform.HybridCpu.csproj")));
+        Assert.False(IsHostModelCompositionReference(Path.Combine(Root, "src/Kernel/Boot/SingNext.Boot.Capsule/SingNext.Boot.Capsule.csproj"), host));
+        Assert.False(IsProjectReferenceAllowed(Layer.PrivilegedMechanism, Layer.ProviderAdapter));
+        Assert.False(IsProjectReferenceAllowed(Layer.PrivilegedMechanism, Layer.Tooling));
+    }
+
+    // ADR-009: host-debug composition root only; no runtime/provider or capsule-wide exemption.
+    private static bool IsHostModelCompositionReference(string source, string target)
+    {
+        if (Path.GetRelativePath(Root, source).Replace('\\', '/') != "src/Kernel/Boot/SingPlus.Boot/SingPlus.Boot.csproj" ||
+            Path.GetRelativePath(Root, target).Replace('\\', '/') != "src/Platform/SingPlus.Platform.Host/SingPlus.Platform.Host.csproj") return false;
+        var project = XDocument.Load(source);
+        return project.Descendants("OutputType").Any(element => element.Value == "Exe") &&
+            project.Descendants("SingPlusProfile").Any(element => element.Value == "User") &&
+            project.Descendants("SingPlusMemoryProfile").Any(element => element.Value == "ManagedGc");
+    }
+
     private static IEnumerable<string> EnumerateProjects() =>
         Directory.EnumerateFiles(Root, "*.csproj", SearchOption.AllDirectories)
             .Where(static path => !IsBuildOutputPath(path));
@@ -196,7 +262,7 @@ public sealed class RepositoryArchitecturePolicyTests
 
     private static bool IsProjectReferenceAllowed(Layer source, Layer target) => source switch
     {
-        Layer.Contracts or Layer.BootContracts or Layer.NeutralContracts => false,
+        Layer.Contracts or Layer.BootContracts or Layer.NeutralContracts or Layer.StaticAdmission => false,
         Layer.BootCore => target is Layer.BootContracts,
         Layer.BootPlatformAdapter => target is Layer.BootCore or Layer.BootContracts,
         Layer.BootCapsule => target is Layer.BootCore or Layer.BootPlatformAdapter or Layer.BootContracts,
@@ -204,7 +270,7 @@ public sealed class RepositoryArchitecturePolicyTests
         Layer.PlatformAbstractions => target is Layer.Contracts,
         Layer.DriversServices => target is Layer.Contracts,
         Layer.NativeSdk => target is Layer.Contracts or Layer.Sip,
-        Layer.PrivilegedMechanism => target is Layer.Contracts or Layer.BootContracts or Layer.Sip or Layer.PlatformAbstractions or Layer.PrivilegedMechanism,
+        Layer.PrivilegedMechanism => target is Layer.StaticAdmission or Layer.Contracts or Layer.BootContracts or Layer.Sip or Layer.PlatformAbstractions or Layer.PrivilegedMechanism,
         Layer.ProviderAdapter => target is Layer.PlatformAbstractions or Layer.NeutralContracts or Layer.NeutralAuthority or Layer.NeutralModel,
         Layer.ExecutableAdapter => target is Layer.Contracts or Layer.BootContracts or Layer.NeutralContracts or Layer.NeutralAuthority,
         Layer.Compatibility => target is Layer.NeutralContracts or Layer.NeutralModel,
@@ -263,6 +329,8 @@ public sealed class RepositoryArchitecturePolicyTests
         if (relative == "src/Kernel/Boot/SingNext.Boot.Capsule/SingNext.Boot.Capsule.csproj") return Layer.BootCapsule;
         if (relative == "contracts/SingPlus.Contracts/SingPlus.Contracts.csproj") return Layer.Contracts;
         if (relative == "src/Sip/SingPlus.Sip/SingPlus.Sip.csproj") return Layer.Sip;
+        if (relative == "src/Admission/SingPlus.StaticAdmission/SingPlus.StaticAdmission.csproj") return Layer.StaticAdmission;
+        if (relative == "src/Kernel/Boot/SingPlus.Boot/Samples/ManagedCap/ManagedCap.csproj") return Layer.Sip;
         if (relative == "src/Platform/SingPlus.Platform.Abstractions/SingPlus.Platform.Abstractions.csproj") return Layer.PlatformAbstractions;
         if (relative.StartsWith("src/Platform/SingPlus.Platform.", StringComparison.OrdinalIgnoreCase)) return Layer.ProviderAdapter;
         if (relative.StartsWith("src/Drivers/", StringComparison.OrdinalIgnoreCase)) return Layer.DriversServices;
@@ -307,3 +375,7 @@ public sealed class RepositoryArchitecturePolicyTests
         return directory?.FullName ?? throw new DirectoryNotFoundException();
     }
 }
+
+
+
+

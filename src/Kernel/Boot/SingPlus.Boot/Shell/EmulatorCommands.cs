@@ -3,6 +3,7 @@ using SingPlus.Boot.Demos;
 using SingPlus.Boot.Diagnostics;
 using SingPlus.Contracts;
 using SingPlus.Runtime;
+using SingPlus.Sip;
 
 namespace SingPlus.Boot.Shell;
 
@@ -10,7 +11,7 @@ namespace SingPlus.Boot.Shell;
 /// Interactive/scriptable command surface of the emulator. Every handler reports
 /// kernel errors verbatim so authority-graph refusals stay observable.
 /// </summary>
-public static class EmulatorCommands
+public static partial class EmulatorCommands
 {
     public sealed record Entry(string Name, string Usage, string Description, Func<EmulatorSession, string[], bool> Handler);
 
@@ -42,11 +43,26 @@ public static class EmulatorCommands
             (session, _) => Inspect(session, RuntimeInspector.WriteDomains)),
         new("components", "components", "Admitted SIP components with live lifecycle state.",
             (session, _) => Inspect(session, RuntimeInspector.WriteComponents)),
-        new("platform", "platform", "Platform feature manifest (empty in the host-debug profile).",
+        new("verify-guest", "verify-guest <HCEXE path>", "Inspect bounded HCEXE compatibility with the bundled runtime package; grants no authority.", VerifyGuestArtifact),
+        new("verify-sip", "verify-sip <imagePath> <Type::Method>", "Run ManagedCap static verification without admission or execution.", VerifySip),
+        new("watch", "watch <pid> [samples] [intervalMs] [inspectionCapabilityId]", "Capture bounded read-only authority summaries (defaults: 5 samples, 250 ms).", WatchAuthority),
+        new("why-pinned", "why-pinned <pid> <operationId> [inspectionCapabilityId]", "Explain visible runtime external-operation pins.", ExplainExternalAuthority),
+        new("why-move", "why-move <pid> <regionId> [inspectionCapabilityId]", "Explain visible runtime Region MOVE blockers.",
+            (session, args) => ExplainRegionAuthority(session, args, move: true)),
+        new("why-free", "why-free <pid> <regionId> [inspectionCapabilityId]", "Explain visible runtime Region reclaim blockers.",
+            (session, args) => ExplainRegionAuthority(session, args, move: false)),
+        new("why-reclaim", "why-reclaim <pid> [inspectionCapabilityId]", "Explain visible runtime process reclaim blockers; grants no mutation authority.",
+            (session, args) => InspectAuthority(session, args, explainReclaim: true)),
+        new("authority", "authority <pid> [inspectionCapabilityId]", "Capture the real authority graph; optional dedicated capability permits system scope.", (session, args) => InspectAuthority(session, args)),
+        new("platform", "platform", "Actual platform feature manifest for the selected profile.",
             (session, _) => Inspect(session, RuntimeInspector.WritePlatform)),
 
-        new("spawn", "spawn <identity> [--role user|sip|driver|kernel] [--memory gc|sipregion|noheap]",
+        new("spawn", "spawn <identity> [--admitted] [--role user|sip|driver|kernel] [--memory gc|sipregion|noheap]",
             "Create, admit and start a new emulator-owned process.", Spawn),
+        new("start", "start <pid>", "Start an admitted process through runtime execution checks.",
+            (session, args) => Lifecycle(session, args, static (runtime, handle) => runtime.StartProcess(handle), "started")),
+        new("platform-bind", "platform-bind <pid>", "Bind an admitted process to the installed provider; must precede start.", BindPlatform),
+        new("platform-policy", "platform-policy <pid>", "Configure a model background execution policy before start.", ConfigurePlatformPolicy),
         new("park", "park <pid>", "Park a running process (new effects are refused while parked).",
             (session, args) => Lifecycle(session, args, static (runtime, handle) => runtime.ParkProcess(handle), "parked")),
         new("resume", "resume <pid>", "Resume a parked process.",
@@ -56,11 +72,42 @@ public static class EmulatorCommands
         new("fault", "fault <pid>", "Fault a process and observe teardown to completion.",
             (session, args) => Terminate(session, args, fault: true)),
 
-        new("channel", "channel <leftPid> <rightPid> [capacity]", "Create a ping-pong protocol channel between two live processes.", CreateChannel),
+        new("channel", "channel <leftPid> <rightPid> [capacity]", "Create a ping-pong protocol channel between two live processes.", (session, args) => CreateChannel(session, args)),
+        new("service-register", "service-register <pid> <name>", "Register the Boot ping-pong contract with exact Read admission authority.", RegisterShellService),
+        new("service", "service <name>", "Discover the current runtime service descriptor.", (session, args) => ShowShellService(session, args, false)),
+        new("service-state", "service-state <name> <accepting|draining|unavailable>", "Set runtime service availability through the host control plane.", (session, args) => ShowShellService(session, args, true)),
+        new("session-open", "session-open <pid> <serviceName> [capabilityId ...] [--lifetime-ms N]", "Open a real capability-gated EndpointSession.", OpenShellSession),
+        new("session-close", "session-close <pid> <sessionId>", "Close an exact tracked session; runtime checks the supplied owner.", CloseShellSession),
         new("channels", "channels", "List tracked channels with protocol state.", 
             (session, _) => Inspect(session, RuntimeInspector.WriteChannels)),
         new("send", "send <fromPid> <channelId> ping | tick <n> | close", "Send a protocol message on a tracked channel.", Send),
         new("recv", "recv <pid> <channelId>", "Receive the next envelope for a process on a tracked channel.", Receive),
+
+        new("borrow-channel", "borrow-channel <leftPid> <rightPid> [capacity]", "Create a read-only buffer borrow protocol channel.",
+            (session, args) => CreateChannel(session, args, borrow: true)),
+        new("borrow", "borrow <ownerPid> <channelId> <regionId>", "Queue a read-only borrow; recv delivers the lease.", SendBorrow),
+        new("borrows", "borrows", "Show delivered borrow leases and their current validity.", ShowBorrows),
+        new("borrow-return", "borrow-return <borrowerPid> <regionId>", "Return a delivered borrow lease.",
+            (session, args) => CompleteBorrow(session, args, revoke: false)),
+        new("borrow-revoke", "borrow-revoke <ownerPid> <regionId>", "Revoke a delivered borrow lease.",
+            (session, args) => CompleteBorrow(session, args, revoke: true)),
+        new("dump", "dump <pid> <regionId> [offset] [count]", "Read up to 256 bytes through the owner's or borrower's token.", DumpBuffer),
+
+        new("cancel-scope", "cancel-scope <pid> [parentScopeId] [--after-ms milliseconds]", "Create a real cancellation scope, optionally inheriting a parent.", CreateCancelScope),
+        new("cancel-request", "cancel-request <pid> <scopeId>", "Request cancellation; does not release resources.",
+            (session, args) => ObserveCancelScope(session, args, request: true)),
+        new("cancel-show", "cancel-show <pid> <scopeId>", "Observe cancellation coordination state from runtime.",
+            (session, args) => ObserveCancelScope(session, args, request: false)),
+        new("external-prepare", "external-prepare <pid> <regionId>", "Prepare a pre-submit staged operation over an entire tracked buffer.", PrepareExternal),
+        new("external-admit", "external-admit <pid> <operationId> [scopeId]", "Acquire the operation's exclusive Region use and attached budget.",
+            (session, args) => ExternalAction(session, args, "admit")),
+        new("external-cancel", "external-cancel <pid> <operationId> [scopeId]", "Cancel before provider submission; release remains separate.",
+            (session, args) => ExternalAction(session, args, "cancel")),
+        new("external-release", "external-release <pid> <operationId>", "Release a cancelled local operation's Region use and budget.",
+            (session, args) => ExternalAction(session, args, "release")),
+        new("external", "external <pid> <operationId>", "Query exact operation state and runtime transition history.",
+            (session, args) => ExternalAction(session, args, "query")),
+        new("region-uses", "region-uses [regionId]", "Read current runtime Region use descriptors.", ShowRegionUses),
 
         new("regions", "regions", "Live memory region table.",
             (session, _) => Inspect(session, RuntimeInspector.WriteRegions)),
@@ -76,15 +123,18 @@ public static class EmulatorCommands
 
         new("budget", "budget", "Show the system budget account and all admitted process budgets.",
             (session, _) => Inspect(session, RuntimeInspector.WriteBudgets)),
+        new("budget-reserve", "budget-reserve <pid> <dimension> <amount>", "Reserve a real local-resource budget; does not grant effect authority.", ReserveLocalBudget),
+        new("budget-release", "budget-release <pid> <reservationId>", "Release an explicit tracked local reservation.", ReleaseLocalBudget),
+        new("budget-reservations", "budget-reservations", "Query current runtime state of explicit emulator reservations.", ShowBudgetReservations),
         new("budget-admit", "budget-admit <pid>", "Admit a process budget for a live process (requires --budget boot).", BudgetAdmit),
 
-        new("trace", "trace", "List tracked deterministic trace sessions.",
+        new("trace", "trace", "List active and last completed trace sessions per process.",
             (session, _) => Inspect(session, RuntimeInspector.WriteTraceSessions)),
         new("trace-start", "trace-start <pid> [capacity]", "Start a trace session for a live process.", TraceStart),
         new("trace-stop", "trace-stop <pid>", "Stop the trace session of a process.", TraceStop),
-        new("trace-show", "trace-show <pid> [count]", "Show the newest trace events of a session.", TraceShow),
+        new("trace-show", "trace-show <pid> [count]", "Show active or last completed trace events (also after process exit).", TraceShow),
 
-        new("demo", "demo <ipc|regions|caps|lifecycle|all>", "Run a built-in runtime workload now.", RunDemo),
+        new("demo", "demo <ipc|regions|caps|lifecycle|borrows|platform|compute|compute-cancel|compute-fault|platform-regions|external|sessions|child-execute|child-domain|backing|generated-sip|service-restart|supervised-restart|all>", "Run a built-in runtime workload now.", RunDemo),
     ];
 
     private static bool Inspect(EmulatorSession session, Action<EmulatorSession> view)
@@ -109,6 +159,7 @@ public static class EmulatorCommands
         }
 
         var identity = args[0];
+        var start = true;
         var role = ExecutionRole.User;
         var memory = MemoryProfile.ManagedGc;
         for (var index = 1; index < args.Length; index++)
@@ -121,6 +172,10 @@ public static class EmulatorCommands
             {
                 if (!TryParseMemory(args[++index], out memory)) return false;
             }
+            else if (string.Equals(args[index], "--admitted", StringComparison.Ordinal) && start)
+            {
+                start = false;
+            }
             else
             {
                 EmulatorConsole.Error($"[emulator] unrecognized spawn argument '{args[index]}'\r\n");
@@ -128,14 +183,14 @@ public static class EmulatorCommands
             }
         }
 
-        var spawned = session.SpawnProcess(identity, role, memory);
+        var spawned = session.SpawnProcess(identity, role, memory, start);
         if (!spawned.IsSuccess)
         {
             EmulatorConsole.Error($"[kernel] spawn failed ({spawned.Error}): {spawned.Message}\r\n");
             return false;
         }
 
-        EmulatorConsole.Ok($"[kernel] process {spawned.Value.ProcessId.Value} (generation {spawned.Value.Generation}) running as '{identity}'\r\n");
+        EmulatorConsole.Ok($"[kernel] process {spawned.Value.ProcessId.Value} (generation {spawned.Value.Generation}) {(start ? "running" : "admitted")} as '{identity}'\r\n");
         return true;
     }
 
@@ -167,8 +222,13 @@ public static class EmulatorCommands
         return true;
     }
 
-    private static bool CreateChannel(EmulatorSession session, string[] args)
+    private static bool CreateChannel(EmulatorSession session, string[] args, bool borrow = false)
     {
+        if (borrow && args.Length is < 2 or > 3)
+        {
+            EmulatorConsole.Error("[emulator] usage: borrow-channel <leftPid> <rightPid> [capacity]\r\n");
+            return false;
+        }
         if (session.Runtime is null) return false;
         if (!TryReadPid(args, 0, out var leftPid) || !TryReadPid(args, 1, out var rightPid)) return false;
 
@@ -186,7 +246,7 @@ public static class EmulatorCommands
         var right = session.ResolvePid(rightPid);
         if (!right.IsSuccess) return Fail(right.Error, right.Message);
 
-        var created = session.Runtime.CreateChannel(left.Value, right.Value, EmulatorSession.CreatePingPongProtocol(), capacity);
+        var created = session.Runtime.CreateChannel(left.Value, right.Value, borrow ? EmulatorSession.CreateBorrowProtocol() : EmulatorSession.CreatePingPongProtocol(), capacity);
         if (!created.IsSuccess) return Fail(created.Error, created.Message);
 
         session.Channels.Add(new ChannelRecord(
@@ -266,6 +326,12 @@ public static class EmulatorCommands
         if (!received.IsSuccess) return Fail(received.Error, received.Message);
 
         var envelope = received.Value!;
+        if (envelope.Payload is BorrowLease<byte> lease)
+        {
+            session.Borrows[lease.Handle.Region.RegionId.Value] = new BorrowRecord(channel.PeerOf(handle.Value), handle.Value, lease);
+            EmulatorConsole.Ok($"[kernel] read-only borrow delivered: region {lease.Handle.Region.RegionId.Value}, lease generation {lease.Handle.Generation.Value}, borrower {pid}\r\n");
+            return true;
+        }
         var payload = envelope.Payload switch
         {
             null => string.Empty,
@@ -458,22 +524,21 @@ public static class EmulatorCommands
             return false;
         }
 
-        RuntimeInspector.WriteTraceEvents(session, pid, count);
-        return true;
+        return RuntimeInspector.WriteTraceEvents(session, pid, count);
     }
 
     private static bool RunDemo(EmulatorSession session, string[] args)
     {
         if (args.Length < 1)
         {
-            EmulatorConsole.Error("[emulator] usage: demo <ipc|regions|caps|lifecycle|all>\r\n");
+            EmulatorConsole.Error("[emulator] usage: demo <ipc|regions|caps|lifecycle|borrows|platform|compute|compute-cancel|compute-fault|platform-regions|external|sessions|child-execute|child-domain|backing|generated-sip|service-restart|supervised-restart|all>\r\n");
             return false;
         }
 
         if (string.Equals(args[0], "all", StringComparison.OrdinalIgnoreCase))
         {
             foreach (var demo in Enum.GetValues<EmulatorDemo>())
-                if (!RunSingleDemo(session, demo)) return false;
+                if (demo is not EmulatorDemo.ChildExecute and not EmulatorDemo.ChildDomain and not EmulatorDemo.PlatformRegions and not EmulatorDemo.SupervisedRestart and not EmulatorDemo.Platform and not EmulatorDemo.Compute and not EmulatorDemo.ComputeCancel and not EmulatorDemo.ComputeFault && !RunSingleDemo(session, demo)) return false;
             return true;
         }
 

@@ -701,6 +701,651 @@ public sealed class Phase8ResidualVirtualizationTests
         await task.WaitAsync(TimeSpan.FromSeconds(2));
     }
 
+    private static (Scenario Scenario, VirtualDomainAuthoritySet Domain, GuestRegionMapping Mapping) ArtifactScenario()
+    {
+        var s = CreateScenario(executableArtifact: true);
+        var domain = CreateConfiguredRoot(s);
+        var region = s.Kernel.AllocateRegion(s.Owner, 4096).Value!;
+        var capability = s.Kernel.MintCapability(new DomainId(5001), s.Owner, ResourceKind.MemoryRegion,
+            CapabilityResourceIds.MemoryRegion(region.Handle.RegionId), CapabilityRights.Map | CapabilityRights.Read | CapabilityRights.Execute).Value!.CapabilityId;
+        var mapping = s.Kernel.MapGuestRegion(s.Owner, domain.Domain, domain.MemoryCapability, capability,
+            region.Handle, new(0, 4096), GuestMemoryAccess.Read | GuestMemoryAccess.Execute).Value!;
+        return (s, domain, mapping);
+    }
+
+    private static object ArtifactField(object owner, string name) => owner.GetType().GetField(name,
+        global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.GetValue(owner)!;
+
+    [Theory]
+    [InlineData(false, false)] [InlineData(false, true)] [InlineData(true, false)] [InlineData(true, true)]
+    public async Task KernelArtifactPendingRevokeOrStopRetainsReceiptWithoutLateState(bool start, bool stop)
+    {
+        var (s, domain, mapping) = ArtifactScenario();
+        KernelResult Bind() => s.Kernel.BindVirtualDomainExecutable(s.Owner, domain.Domain,
+            domain.ExecuteCapability, mapping.Mapping, new byte[] { 0x56, 0x33 }, 1);
+        if (start) Assert.True(Bind().IsSuccess);
+        KernelResult Run() => start ? s.Kernel.StartVirtualDomain(s.Owner, domain.Domain, domain.ExecuteCapability) : Bind();
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        Action hold = () => { entered.Set(); Assert.True(release.Wait(TimeSpan.FromSeconds(15))); };
+        if (start) s.Provider.AfterArtifactStart = hold; else s.Provider.AfterArtifactBind = hold;
+        var work = Task.Run(Run);
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.Equal(KernelError.PlatformBindingActive, Run().Error);
+            var activeRecord = Assert.Single(((VirtualDomainAuthority)ArtifactField(s.Kernel, "_virtualDomains")).ForOwner(s.Owner));
+            Assert.False(s.Kernel.PlatformAuthority.UnmapChildGuestRegion(activeRecord.PlatformMappings[mapping.Mapping.MappingId].Guest).IsSuccess);
+            if (stop) Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+            else Assert.True(s.Kernel.RevokeCapability(domain.ExecuteCapability).IsSuccess);
+            Assert.Equal(0, s.Provider.GuestUnmapCalls);
+        }
+        finally { release.Set(); }
+        var result = await work.WaitAsync(TimeSpan.FromSeconds(15));
+        Assert.False(result.IsSuccess);
+        if (!stop) Assert.Equal(KernelError.CapabilityRevoked, result.Error);
+        s.Provider.AfterArtifactStart = null;
+        s.Provider.AfterArtifactBind = null;
+        var record = Assert.Single(((VirtualDomainAuthority)ArtifactField(s.Kernel, "_virtualDomains")).ForOwner(s.Owner));
+        if (start)
+        {
+            var table = (global::System.Collections.IDictionary)ArtifactField(s.Kernel.PlatformAuthority, "_executableArtifacts");
+            var receiptOwner = Assert.Single(table.Values.Cast<object>());
+            Assert.NotNull(receiptOwner.GetType().GetProperty("ExecutionReceipt")!.GetValue(receiptOwner));
+        }
+        Assert.NotNull(record.ExecutableArtifact); // known binding retained by real cleanup owner
+        Assert.NotEqual(VirtualDomainState.Running, record.State);
+        Assert.False(Run().IsSuccess);
+        Assert.Equal(1, s.Provider.ArtifactBindCalls);
+        Assert.Equal(start ? 1 : 0, s.Provider.ArtifactStartCalls);
+        Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.False(s.Kernel.QueryProcessTeardown(s.Owner).Value!.LocalReclaimCompleted);
+        Assert.Equal(0, s.Provider.GuestUnmapCalls); // no artifact release consumer/evidence exists
+    }
+
+    [Theory]
+    [InlineData(false, 0)] [InlineData(false, 1)] [InlineData(false, 2)] [InlineData(false, 3)] [InlineData(false, 4)]
+    [InlineData(true, 0)] [InlineData(true, 1)] [InlineData(true, 2)] [InlineData(true, 3)] [InlineData(true, 4)]
+    public void KernelArtifactFaultsPreserveExactDependencyPinsAndBalancedCounters(bool start, int fault)
+    {
+        var (s, domain, mapping) = ArtifactScenario();
+        KernelResult Bind() => s.Kernel.BindVirtualDomainExecutable(s.Owner, domain.Domain,
+            domain.ExecuteCapability, mapping.Mapping, new byte[] { 0x56, 0x33 }, 1);
+        if (start) Assert.True(Bind().IsSuccess);
+        if (fault == 0) { s.Provider.ThrowAfterArtifactBind = !start; s.Provider.ThrowAfterArtifactStart = start; }
+        if (fault == 1)
+        {
+            Action reset = () => Assert.True(s.Kernel.ObservePlatformBackendReset().IsSuccess);
+            if (start) s.Provider.AfterArtifactStart = reset; else s.Provider.AfterArtifactBind = reset;
+        }
+        if (fault == 2) s.Provider.ArtifactStatus = PlatformAuthorityStatus.Denied;
+        if (fault == 3) s.Provider.MalformedArtifactEvidence = true;
+        if (fault == 4) s.Provider.ArtifactStatus = PlatformAuthorityStatus.NotAccepted;
+        Assert.False((start ? s.Kernel.StartVirtualDomain(s.Owner, domain.Domain, domain.ExecuteCapability) : Bind()).IsSuccess);
+        s.Provider.ThrowAfterArtifactBind = s.Provider.ThrowAfterArtifactStart = false;
+        s.Provider.AfterArtifactBind = s.Provider.AfterArtifactStart = null;
+        s.Provider.ArtifactStatus = null; s.Provider.MalformedArtifactEvidence = false;
+        foreach (var name in new[] { "_childBindings", "_guestBindings", "_executableArtifacts" })
+        {
+            var table = (global::System.Collections.IDictionary)ArtifactField(s.Kernel.PlatformAuthority, name);
+            foreach (var value in table.Values)
+            {
+                var count = value!.GetType().GetProperty(name == "_childBindings" ? "PendingChildEffects" : "PendingExecutableEffects");
+                if (count is not null) Assert.Equal(0, count.GetValue(value));
+                var pending = value.GetType().GetProperty("StartInFlight");
+                if (pending is not null) Assert.False((bool)pending.GetValue(value)!);
+            }
+        }
+        if (fault == 4 && !start)
+        {
+            Assert.True(Bind().IsSuccess); // explicit no-admission response permits fresh admission
+            return;
+        }
+        Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.False(s.Kernel.QueryProcessTeardown(s.Owner).Value!.LocalReclaimCompleted);
+    }
+
+    [Fact]
+    public void KernelArtifactCapturesCallerPackageAndRejectsDuplicateBind()
+    {
+        var (s, domain, mapping) = ArtifactScenario();
+        byte[] package = [0x56, 0x33];
+        s.Provider.AfterArtifactBind = () => package[0] = 0xff;
+        Assert.True(s.Kernel.BindVirtualDomainExecutable(s.Owner, domain.Domain, domain.ExecuteCapability,
+            mapping.Mapping, package, 1).IsSuccess);
+        Assert.Equal(new byte[] { 0x56, 0x33 }, s.Provider.LastArtifactPackage.ToArray());
+        Assert.False(s.Kernel.BindVirtualDomainExecutable(s.Owner, domain.Domain, domain.ExecuteCapability,
+            mapping.Mapping, package, 1).IsSuccess);
+        Assert.Equal(1, s.Provider.ArtifactBindCalls);
+        Assert.True(s.Kernel.StartVirtualDomain(s.Owner, domain.Domain, domain.ExecuteCapability).IsSuccess);
+        Assert.Equal(VirtualDomainState.Running, s.Kernel.QueryVirtualDomain(s.Owner, domain.Domain).Value);
+        Assert.Equal(1, s.Provider.ArtifactStartCalls);
+    }
+
+    [Fact]
+    public void KernelArtifactSourceAndBoundsRefuseWithoutProviderOrIdentityMutation()
+    {
+        var (s, domain, mapping) = ArtifactScenario();
+        var bridge = s.Kernel.PlatformAuthority;
+        var before = ArtifactField(bridge, "_nextExecutableArtifactBindingId");
+        Assert.False(s.Kernel.BindVirtualDomainExecutable(s.Owner, domain.Domain, domain.ExecuteCapability,
+            mapping.Mapping, ReadOnlyMemory<byte>.Empty, 1).IsSuccess);
+        Assert.False(s.Kernel.BindVirtualDomainExecutable(s.Owner, domain.Domain, domain.ExecuteCapability,
+            mapping.Mapping, new byte[] { 1 }, 0).IsSuccess);
+        Assert.True(s.Kernel.RevokeCapability(domain.ExecuteCapability).IsSuccess);
+        Assert.Equal(KernelError.CapabilityRevoked, s.Kernel.BindVirtualDomainExecutable(s.Owner, domain.Domain,
+            domain.ExecuteCapability, mapping.Mapping, new byte[] { 1 }, 1).Error);
+        Assert.Equal(before, ArtifactField(bridge, "_nextExecutableArtifactBindingId"));
+        Assert.Equal(0, s.Provider.ArtifactBindCalls);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void ArtifactCompletionConsumerRemainsInsideDeliveryInterlock(bool start)
+    {
+        var (s, domain, mapping) = ArtifactScenario();
+        var record = Assert.Single(((VirtualDomainAuthority)ArtifactField(s.Kernel, "_virtualDomains")).ForOwner(s.Owner));
+        var child = record.ChildBinding!.Value;
+        var guest = record.PlatformMappings[mapping.Mapping.MappingId].Guest;
+        var bridge = s.Kernel.PlatformAuthority;
+        KernelResult Probe(Func<KernelResult> commit)
+        {
+            Assert.False(bridge.UnmapChildGuestRegion(guest).IsSuccess);
+            Assert.Equal(KernelError.PlatformBindingActive, bridge.TransitionChildDomain(child, PlatformChildDomainTransition.BeginDrain).Error);
+            return commit();
+        }
+        if (!start)
+            Assert.True(bridge.BindChildExecutableArtifact(child, guest, new byte[] { 0x56, 0x33 }, 1,
+                completionConsumer: (_, commit) => Probe(() => commit(() => KernelResult.Ok()))).IsSuccess);
+        else
+        {
+            var bound = bridge.BindChildExecutableArtifact(child, guest, new byte[] { 0x56, 0x33 }, 1).Value!;
+            Assert.True(bridge.StartChildExecutableArtifact(bound,
+                completionConsumer: commit => Probe(() => commit(() => KernelResult.Ok()))).IsSuccess);
+        }
+    }
+
+    [Fact]
+    public void ArtifactStaleGenerationOrWrongTupleCannotConsumeStartIdentity()
+    {
+        var (s, domain, mapping) = ArtifactScenario();
+        Assert.True(s.Kernel.BindVirtualDomainExecutable(s.Owner, domain.Domain, domain.ExecuteCapability,
+            mapping.Mapping, new byte[] { 0x56, 0x33 }, 1).IsSuccess);
+        var record = Assert.Single(((VirtualDomainAuthority)ArtifactField(s.Kernel, "_virtualDomains")).ForOwner(s.Owner));
+        var exact = record.ExecutableArtifact!.Value;
+        var before = ArtifactField(s.Kernel.PlatformAuthority, "_nextChildStartOperationId");
+        Assert.Equal(KernelError.StaleGeneration, s.Kernel.PlatformAuthority.StartChildExecutableArtifact(
+            exact with { Generation = new(exact.Generation.Value + 1) }).Error);
+        Assert.False(s.Kernel.PlatformAuthority.StartChildExecutableArtifact(exact with
+        {
+            Child = exact.Child with { Owner = new(new ProcessId(9999), 2) },
+        }).IsSuccess);
+        Assert.Equal(before, ArtifactField(s.Kernel.PlatformAuthority, "_nextChildStartOperationId"));
+        Assert.Equal(0, s.Provider.ArtifactStartCalls);
+        Assert.True(s.Kernel.StartVirtualDomain(s.Owner, domain.Domain, domain.ExecuteCapability).IsSuccess);
+        Assert.Equal(1, s.Provider.ArtifactStartCalls);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)] [InlineData(5)] [InlineData(6)]
+    public void NestedSourceStopAndUnknownEffectsUseRealOwnersAndCleanup(int fault)
+    {
+        var s = CreateScenario(nestedFailure: fault == 6 ? PlatformAuthorityStatus.Denied : null);
+        var parent = CreateConfiguredRoot(s);
+        var request = new NestedVirtualDomainRequestProfile(new(1, 4096),
+            VirtualDomainAuthorityClass.Lifecycle | VirtualDomainAuthorityClass.GuestMemory | VirtualDomainAuthorityClass.Execution);
+        if (fault == 0) s.Provider.AfterNestedMaterialize = () => Assert.True(s.Kernel.RevokeCapability(parent.ConfigureCapability).IsSuccess);
+        if (fault == 1) s.Provider.AfterNestedMaterialize = () => Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        if (fault == 2) s.Provider.ThrowAfterNestedMaterialize = true;
+        if (fault == 3) s.Provider.AfterNestedMaterialize = () => Assert.True(s.Kernel.ObservePlatformBackendReset().IsSuccess);
+        if (fault is 4 or 5)
+        {
+            int nonce = 0;
+            s.Kernel.CapabilityAuthority.GetType().GetField("_nonceFactory",
+                global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.SetValue(
+                s.Kernel.CapabilityAuthority, (Func<Guid>)(() =>
+                {
+                    if (++nonce == 2)
+                    {
+                        if (fault == 4) Assert.True(s.Kernel.RevokeCapability(parent.ConfigureCapability).IsSuccess);
+                        else Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+                    }
+                    return Guid.NewGuid();
+                }));
+        }
+        Assert.False(s.Kernel.CreateNestedVirtualDomain(s.Owner, parent.Domain, parent.ConfigureCapability, request).IsSuccess);
+        s.Provider.AfterNestedMaterialize = null; s.Provider.ThrowAfterNestedMaterialize = false;
+        var records = ((VirtualDomainAuthority)ArtifactField(s.Kernel, "_virtualDomains")).ForOwner(s.Owner);
+        if (fault is 0 or 1 or 4 or 5)
+        {
+            var nested = Assert.Single(records, x => x.ParentDomain == parent.Domain);
+            Assert.False(nested.AuthorityPublished);
+            Assert.Equal(fault is 4 or 5 ? 1 : 0, nested.Capabilities.Length);
+            if (nested.Capabilities.Length != 0)
+                Assert.False(s.Kernel.ConfigureVirtualDomain(s.Owner, nested.Handle, nested.Capabilities[0]).IsSuccess);
+            Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+            Assert.Equal(1, s.Provider.NestedCloseCalls);
+        }
+        else
+        {
+            Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+            Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+            Assert.False(s.Kernel.QueryProcessTeardown(s.Owner).Value!.LocalReclaimCompleted);
+            Assert.Equal(0, s.Provider.NestedCloseCalls);
+        }
+        Assert.Equal(1, s.Provider.NestedCreateCalls);
+        var table = (global::System.Collections.IDictionary)ArtifactField(s.Kernel.PlatformAuthority, "_childBindings");
+        foreach (var record in table.Values)
+            Assert.Equal(0, record!.GetType().GetProperty("PendingChildEffects")!.GetValue(record));
+    }
+
+    [Fact]
+    public void NestedPartialGrantIsNotPublishedAndSubsetCapabilitiesStayExact()
+    {
+        var s = CreateScenario();
+        var parent = CreateConfiguredRoot(s);
+        int nonce = 0;
+        s.Kernel.CapabilityAuthority.GetType().GetField("_nonceFactory",
+            global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.SetValue(
+            s.Kernel.CapabilityAuthority, (Func<Guid>)(() =>
+            {
+                if (++nonce == 2)
+                {
+                    var nested = Assert.Single(((VirtualDomainAuthority)ArtifactField(s.Kernel, "_virtualDomains")).ForOwner(s.Owner), x => x.ParentDomain == parent.Domain);
+                    Assert.False(nested.AuthorityPublished);
+                    Assert.Equal(KernelError.PlatformBindingActive,
+                        s.Kernel.ConfigureVirtualDomain(s.Owner, nested.Handle, nested.Capabilities[0]).Error);
+                }
+                return Guid.NewGuid();
+            }));
+        var result = s.Kernel.CreateNestedVirtualDomain(s.Owner, parent.Domain, parent.ConfigureCapability,
+            new(new(1, 4096), VirtualDomainAuthorityClass.Lifecycle | VirtualDomainAuthorityClass.GuestMemory));
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.NotEqual(default, result.Value!.ConfigureCapability);
+        Assert.NotEqual(default, result.Value.MemoryCapability);
+        Assert.Equal(default, result.Value.ExecuteCapability);
+        Assert.Equal(default, result.Value.EventCapability);
+        Assert.Equal(default, result.Value.TrapCapability);
+        Assert.True(s.Kernel.ConfigureVirtualDomain(s.Owner, result.Value.Domain, result.Value.ConfigureCapability).IsSuccess);
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+    }
+
+    [Fact]
+    public async Task ConcurrentNestedCallbackStopsBeforeLatePublicationAndPreservesCleanup()
+    {
+        var s = CreateScenario();
+        var parent = CreateConfiguredRoot(s);
+        var request = new NestedVirtualDomainRequestProfile(new(1, 4096), VirtualDomainAuthorityClass.Lifecycle);
+        using var entered = new ManualResetEventSlim(); using var release = new ManualResetEventSlim();
+        s.Provider.AfterNestedMaterialize = () => { entered.Set(); Assert.True(release.Wait(TimeSpan.FromSeconds(15))); };
+        var work = Task.Run(() => s.Kernel.CreateNestedVirtualDomain(s.Owner, parent.Domain, parent.ConfigureCapability, request));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.Equal(KernelError.PlatformBindingActive,
+                s.Kernel.CreateNestedVirtualDomain(s.Owner, parent.Domain, parent.ConfigureCapability, request).Error);
+            Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+            Assert.False(s.Kernel.QueryProcessTeardown(s.Owner).Value!.LocalReclaimCompleted);
+        }
+        finally { release.Set(); }
+        Assert.False((await work.WaitAsync(TimeSpan.FromSeconds(15))).IsSuccess);
+        s.Provider.AfterNestedMaterialize = null;
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(1, s.Provider.NestedCreateCalls);
+        Assert.Equal(1, s.Provider.NestedCloseCalls);
+    }
+
+    [Fact]
+    public void NestedAncestorDrainDeniesNewAdmissionAndPublicationButKeepsRealCleanup()
+    {
+        var s = CreateScenario();
+        var parent = CreateConfiguredRoot(s);
+        var first = s.Kernel.CreateNestedVirtualDomain(s.Owner, parent.Domain, parent.ConfigureCapability,
+            new(new(1, 4096), VirtualDomainAuthorityClass.Lifecycle)).Value!;
+        Assert.True(s.Kernel.ConfigureVirtualDomain(s.Owner, first.Domain, first.ConfigureCapability).IsSuccess);
+        var second = s.Kernel.CreateNestedVirtualDomain(s.Owner, first.Domain, first.ConfigureCapability,
+            new(new(1, 4096), VirtualDomainAuthorityClass.Lifecycle)).Value!;
+        var records = ((VirtualDomainAuthority)ArtifactField(s.Kernel, "_virtualDomains")).ForOwner(s.Owner);
+        var rootRecord = Assert.Single(records, x => x.Handle == parent.Domain);
+        Assert.True(s.Kernel.PlatformAuthority.TransitionChildDomain(rootRecord.ChildBinding!.Value,
+            PlatformChildDomainTransition.BeginDrain).IsSuccess);
+        Assert.False(s.Kernel.CreateNestedVirtualDomain(s.Owner, first.Domain, first.ConfigureCapability,
+            new(new(1, 4096), VirtualDomainAuthorityClass.Lifecycle)).IsSuccess);
+        Assert.Equal(2, s.Provider.NestedCreateCalls);
+        Assert.False(s.Kernel.ConfigureVirtualDomain(s.Owner, second.Domain, second.ConfigureCapability).IsSuccess);
+        Assert.Equal(VirtualDomainState.Created, s.Kernel.QueryVirtualDomain(s.Owner, second.Domain).Value);
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(2, s.Provider.NestedCloseCalls);
+    }
+
+    [Fact]
+    public void NestedUnknownAuthorityAndRevokedSourceRefuseBeforeMutation()
+    {
+        var s = CreateScenario();
+        var parent = CreateConfiguredRoot(s);
+        int before = s.Kernel.Processes.Resolve(s.Owner).Value!.Capabilities.Items.Count;
+        Assert.Equal(KernelError.PlatformDenied, s.Kernel.CreateNestedVirtualDomain(s.Owner, parent.Domain,
+            parent.ConfigureCapability, new(new(1, 4096), VirtualDomainAuthorityClass.Lifecycle | (VirtualDomainAuthorityClass)0x4000)).Error);
+        Assert.Equal(before, s.Kernel.Processes.Resolve(s.Owner).Value!.Capabilities.Items.Count);
+        Assert.True(s.Kernel.RevokeCapability(parent.ConfigureCapability).IsSuccess);
+        int afterRevoke = s.Kernel.Processes.Resolve(s.Owner).Value!.Capabilities.Items.Count;
+        Assert.Equal(KernelError.CapabilityRevoked, s.Kernel.CreateNestedVirtualDomain(s.Owner, parent.Domain,
+            parent.ConfigureCapability, new(new(1, 4096), VirtualDomainAuthorityClass.Lifecycle)).Error);
+        Assert.Equal(afterRevoke, s.Kernel.Processes.Resolve(s.Owner).Value!.Capabilities.Items.Count);
+        Assert.Equal(0, s.Provider.NestedCreateCalls);
+        Assert.Single(((VirtualDomainAuthority)ArtifactField(s.Kernel, "_virtualDomains")).ForOwner(s.Owner));
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(0, false)] [InlineData(1, false)] [InlineData(2, false)]
+    [InlineData(0, true)] [InlineData(1, true)] [InlineData(2, true)]
+    public void NestedLifecycleAncestorDrainRefusesAdmissionOrLatePublication(int step, bool during)
+    {
+        var s = CreateScenario();
+        var root = CreateConfiguredRoot(s);
+        var nested = s.Kernel.CreateNestedVirtualDomain(s.Owner, root.Domain, root.ConfigureCapability,
+            new(new(1, 4096), VirtualDomainAuthorityClass.Lifecycle | VirtualDomainAuthorityClass.Execution)).Value!;
+        Assert.True(s.Kernel.ConfigureVirtualDomain(s.Owner, nested.Domain, nested.ConfigureCapability).IsSuccess);
+        if (step > 0) Assert.True(s.Kernel.StartVirtualDomain(s.Owner, nested.Domain, nested.ExecuteCapability).IsSuccess);
+        if (step > 1) Assert.True(s.Kernel.ParkVirtualDomain(s.Owner, nested.Domain, nested.ExecuteCapability).IsSuccess);
+        var records = ((VirtualDomainAuthority)ArtifactField(s.Kernel, "_virtualDomains")).ForOwner(s.Owner);
+        var parentRecord = Assert.Single(records, x => x.Handle == root.Domain);
+        var local = Assert.Single(records, x => x.Handle == nested.Domain);
+        var initial = local.State;
+        int effects = 0;
+        s.Provider.BeforeChildTransition = () =>
+        {
+            if (!during) { effects++; return; }
+            effects++;
+            s.Provider.BeforeChildTransition = null;
+            Assert.True(s.Kernel.PlatformAuthority.TransitionChildDomain(parentRecord.ChildBinding!.Value,
+                PlatformChildDomainTransition.BeginDrain).IsSuccess);
+            Assert.False(s.Kernel.PlatformAuthority.CloseChildDomain(parentRecord.ChildBinding.Value).IsSuccess);
+        };
+        if (!during) Assert.True(s.Kernel.PlatformAuthority.TransitionChildDomain(parentRecord.ChildBinding!.Value,
+            PlatformChildDomainTransition.BeginDrain).IsSuccess);
+        effects = 0;
+        KernelResult Run() => step switch
+        {
+            0 => s.Kernel.StartVirtualDomain(s.Owner, nested.Domain, nested.ExecuteCapability),
+            1 => s.Kernel.ParkVirtualDomain(s.Owner, nested.Domain, nested.ExecuteCapability),
+            _ => s.Kernel.ResumeVirtualDomain(s.Owner, nested.Domain, nested.ExecuteCapability),
+        };
+        Assert.False(Run().IsSuccess);
+        Assert.Equal(initial, local.State);
+        Assert.Equal(during ? 1 : 0, effects);
+        Assert.False(Run().IsSuccess);
+        Assert.Equal(during ? 1 : 0, effects);
+        s.Provider.BeforeChildTransition = null;
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(1, s.Provider.NestedCloseCalls);
+    }
+
+    [Fact]
+    public void NestedLifecycleLocalAncestorQuarantineCannotBeBypassedByActiveBridgeIdentity()
+    {
+        var (s, root, mapping) = ArtifactScenario();
+        var nested = s.Kernel.CreateNestedVirtualDomain(s.Owner, root.Domain, root.ConfigureCapability,
+            new(new(1, 4096), VirtualDomainAuthorityClass.Lifecycle | VirtualDomainAuthorityClass.Execution)).Value!;
+
+        Assert.True(s.Kernel.BindVirtualDomainExecutable(s.Owner, root.Domain, root.ExecuteCapability,
+            mapping.Mapping, new byte[] { 0x56, 0x33 }, 1).IsSuccess);
+        Assert.False(s.Kernel.CloseGuestRegionMapping(s.Owner, root.Domain, root.MemoryCapability, mapping.Mapping).IsSuccess);
+        Assert.Equal(VirtualDomainState.Quarantined, s.Kernel.QueryVirtualDomain(s.Owner, root.Domain).Value);
+        int effects = 0; s.Provider.BeforeChildTransition = () => effects++;
+        var local = Assert.Single(((VirtualDomainAuthority)ArtifactField(s.Kernel, "_virtualDomains")).ForOwner(s.Owner), x => x.Handle == nested.Domain);
+        Assert.Equal(KernelError.PlatformFaulted,
+            ((VirtualDomainAuthority)ArtifactField(s.Kernel, "_virtualDomains")).ValidateActiveAncestors(local).Error);
+        Assert.True(s.Kernel.PlatformAuthority.CommitActiveChildDomainConsumer(local.ChildBinding!.Value, () => KernelResult.Ok()).IsSuccess);
+        Assert.Equal(KernelError.PlatformFaulted, s.Kernel.ConfigureVirtualDomain(s.Owner, nested.Domain, nested.ConfigureCapability).Error);
+        Assert.Equal(0, effects);
+        Assert.Equal(VirtualDomainState.Created, local.State);
+        s.Provider.BeforeChildTransition = null;
+        Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess); // exact root artifact release still Missing
+        Assert.False(s.Kernel.QueryProcessTeardown(s.Owner).Value!.LocalReclaimCompleted);
+    }
+
+    [Fact]
+    public async Task ConcurrentNestedLifecycleDeliveryPinsClosureAfterAncestorDrainAndStop()
+    {
+        var s = CreateScenario();
+        var root = CreateConfiguredRoot(s);
+        var nested = s.Kernel.CreateNestedVirtualDomain(s.Owner, root.Domain, root.ConfigureCapability,
+            new(new(1, 4096), VirtualDomainAuthorityClass.Lifecycle | VirtualDomainAuthorityClass.Execution)).Value!;
+        Assert.True(s.Kernel.ConfigureVirtualDomain(s.Owner, nested.Domain, nested.ConfigureCapability).IsSuccess);
+        var records = ((VirtualDomainAuthority)ArtifactField(s.Kernel, "_virtualDomains")).ForOwner(s.Owner);
+        var parent = Assert.Single(records, x => x.Handle == root.Domain);
+        var local = Assert.Single(records, x => x.Handle == nested.Domain);
+        using var entered = new ManualResetEventSlim(); using var release = new ManualResetEventSlim();
+        s.Provider.BeforeChildTransition = () =>
+        {
+            s.Provider.BeforeChildTransition = null;
+            entered.Set(); Assert.True(release.Wait(TimeSpan.FromSeconds(15)));
+        };
+        var work = Task.Run(() => s.Kernel.StartVirtualDomain(s.Owner, nested.Domain, nested.ExecuteCapability));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.True(s.Kernel.PlatformAuthority.TransitionChildDomain(parent.ChildBinding!.Value,
+                PlatformChildDomainTransition.BeginDrain).IsSuccess);
+            Assert.False(s.Kernel.PlatformAuthority.CloseChildDomain(parent.ChildBinding.Value).IsSuccess);
+            Assert.False(s.Kernel.PlatformAuthority.CloseChildDomain(local.ChildBinding!.Value).IsSuccess);
+            Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+            Assert.False(s.Kernel.QueryProcessTeardown(s.Owner).Value!.LocalReclaimCompleted);
+            Assert.Equal(0, s.Provider.NestedCloseCalls);
+            Assert.DoesNotContain("root-close", s.Provider.CallLog);
+        }
+        finally { release.Set(); }
+        Assert.False((await work.WaitAsync(TimeSpan.FromSeconds(15))).IsSuccess);
+        Assert.NotEqual(VirtualDomainState.Running, local.State);
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(VirtualDomainState.Closed, local.State);
+        Assert.Equal(1, s.Provider.NestedCloseCalls);
+    }
+
+    [Fact]
+    public void NestedSourceCommitRechecksLocalAncestorAfterEarlierAdmissionSnapshot()
+    {
+        var s = CreateScenario();
+        var root = CreateConfiguredRoot(s);
+        var nested = s.Kernel.CreateNestedVirtualDomain(s.Owner, root.Domain, root.ConfigureCapability,
+            new(new(1, 4096), VirtualDomainAuthorityClass.Lifecycle | VirtualDomainAuthorityClass.Execution)).Value!;
+        Assert.True(s.Kernel.ConfigureVirtualDomain(s.Owner, nested.Domain, nested.ConfigureCapability).IsSuccess);
+        var authority = (VirtualDomainAuthority)ArtifactField(s.Kernel, "_virtualDomains");
+        var records = authority.ForOwner(s.Owner);
+        var parent = Assert.Single(records, x => x.Handle == root.Domain);
+        var leaf = Assert.Single(records, x => x.Handle == nested.Domain);
+        int effects = 0; s.Provider.BeforeChildTransition = () => effects++;
+        Assert.True(authority.ValidateActiveAncestors(leaf).IsSuccess);
+        var result = s.Kernel.PlatformAuthority.TransitionChildDomain(leaf.ChildBinding!.Value, PlatformChildDomainTransition.Start,
+            admissionConsumer: commit => { parent.State = VirtualDomainState.Quarantined; return commit(); },
+            sourceCommitConsumer: commit => s.Kernel.CapabilityAuthority.CommitVirtualDomainEffect(nested.ExecuteCapability,
+                new DomainId(5001), s.Owner.Generation, CapabilityRights.Execute,
+                VirtualizationResourceIds.Domain(nested.Domain.DomainId),
+                () => authority.CommitEffectAdmission(leaf, VirtualDomainState.Configured, commit)));
+        Assert.False(result.IsSuccess);
+        Assert.Equal(0, effects);
+        Assert.Equal(VirtualDomainState.Configured, leaf.State);
+        s.Provider.BeforeChildTransition = null;
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+    }
+
+    [Fact]
+    public async Task VirtualStateSetterSharesActualOwnerCommitGate()
+    {
+        var s = CreateScenario();
+        var root = CreateConfiguredRoot(s);
+        var nested = s.Kernel.CreateNestedVirtualDomain(s.Owner, root.Domain, root.ConfigureCapability,
+            new(new(1, 4096), VirtualDomainAuthorityClass.Lifecycle)).Value!;
+        Assert.True(s.Kernel.ConfigureVirtualDomain(s.Owner, nested.Domain, nested.ConfigureCapability).IsSuccess);
+        var authority = (VirtualDomainAuthority)ArtifactField(s.Kernel, "_virtualDomains");
+        var records = authority.ForOwner(s.Owner);
+        var parent = Assert.Single(records, x => x.Handle == root.Domain);
+        var leaf = Assert.Single(records, x => x.Handle == nested.Domain);
+        using var entered = new ManualResetEventSlim(); using var release = new ManualResetEventSlim();
+        using var mutationEntered = new ManualResetEventSlim();
+        var work = Task.Run(() => authority.CommitEffectAdmission(leaf, VirtualDomainState.Configured, () =>
+        {
+            entered.Set(); Assert.True(release.Wait(TimeSpan.FromSeconds(15))); return KernelResult.Ok();
+        }));
+        Task mutation = Task.CompletedTask;
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            var gate = ArtifactField(authority, "_gate");
+            bool acquired = Monitor.TryEnter(gate);
+            if (acquired) Monitor.Exit(gate);
+            Assert.False(acquired);
+            mutation = Task.Run(() => { mutationEntered.Set(); parent.State = VirtualDomainState.Quarantined; });
+            Assert.True(mutationEntered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.False(mutation.IsCompleted);
+        }
+        finally { release.Set(); }
+        Assert.True((await work.WaitAsync(TimeSpan.FromSeconds(15))).IsSuccess);
+        await mutation.WaitAsync(TimeSpan.FromSeconds(15));
+        Assert.Equal(VirtualDomainState.Quarantined, parent.State);
+        Assert.False(authority.CommitEffectAdmission(leaf, VirtualDomainState.Configured, () => KernelResult.Ok()).IsSuccess);
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void TrapSourceRevokeRefusesCallbackOrLateObservation(bool during)
+    {
+        var (s, root, leaf) = NestedDeliveryScenario();
+        Action revoke = () => Assert.True(s.Kernel.RevokeCapability(leaf.TrapCapability).IsSuccess);
+        if (during) s.Provider.AfterChildTrap = revoke; else revoke();
+        var result = s.Kernel.ObserveVirtualTrap(s.Owner, leaf.Domain, leaf.TrapCapability);
+        Assert.Equal(KernelError.CapabilityRevoked, result.Error);
+        Assert.Equal(during ? 1 : 0, s.Provider.TrapCalls);
+        Assert.Equal(KernelError.CapabilityRevoked, s.Kernel.ObserveVirtualTrap(s.Owner, leaf.Domain, leaf.TrapCapability).Error);
+        Assert.Equal(during ? 1 : 0, s.Provider.TrapCalls);
+        var record = Assert.Single(((VirtualDomainAuthority)ArtifactField(s.Kernel, "_virtualDomains")).ForOwner(s.Owner), x => x.Handle == leaf.Domain);
+        var table = (global::System.Collections.IDictionary)ArtifactField(s.Kernel.PlatformAuthority, "_childBindings");
+        var bridgeRecord = table[record.ChildBinding!.Value.BindingId]!;
+        Assert.Equal(during ? 1UL : 0UL, (ulong)bridgeRecord.GetType().GetProperty("LastTrapSequence")!.GetValue(bridgeRecord)!);
+        Assert.Equal(0, (int)bridgeRecord.GetType().GetProperty("PendingChildEffects")!.GetValue(bridgeRecord)!);
+        s.Provider.AfterChildTrap = null;
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(1, s.Provider.NestedCloseCalls);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public async Task ConcurrentTrapSourceRevokeOrStopKeepsPendingUntilLatePublication(bool stop)
+    {
+        var (s, root, leaf) = NestedDeliveryScenario();
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        s.Provider.AfterChildTrap = () => { entered.Set(); Assert.True(release.Wait(TimeSpan.FromSeconds(15))); };
+        var work = Task.Run(() => s.Kernel.ObserveVirtualTrap(s.Owner, leaf.Domain, leaf.TrapCapability));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.ObserveVirtualTrap(s.Owner, leaf.Domain, leaf.TrapCapability).Error);
+            if (stop) Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+            else Assert.True(s.Kernel.RevokeCapability(leaf.TrapCapability).IsSuccess);
+            Assert.Equal(0, s.Provider.NestedCloseCalls);
+        }
+        finally { release.Set(); }
+        var result = await work.WaitAsync(TimeSpan.FromSeconds(15));
+        Assert.False(result.IsSuccess);
+        if (!stop) Assert.Equal(KernelError.CapabilityRevoked, result.Error);
+        Assert.Equal(1, s.Provider.TrapCalls);
+        s.Provider.AfterChildTrap = null;
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(1, s.Provider.NestedCloseCalls);
+    }
+
+    [Fact]
+    public void TrapPublicationRechecksActualLocalAncestorDespiteActiveBridgeIdentity()
+    {
+        var (s, root, leaf) = NestedDeliveryScenario();
+        var parent = Assert.Single(((VirtualDomainAuthority)ArtifactField(s.Kernel, "_virtualDomains")).ForOwner(s.Owner), x => x.Handle == root.Domain);
+        s.Provider.AfterChildTrap = () => parent.State = VirtualDomainState.Quarantined;
+        var result = s.Kernel.ObserveVirtualTrap(s.Owner, leaf.Domain, leaf.TrapCapability);
+        Assert.False(result.IsSuccess);
+        Assert.Equal(1, s.Provider.TrapCalls);
+        Assert.False(s.Kernel.ObserveVirtualTrap(s.Owner, leaf.Domain, leaf.TrapCapability).IsSuccess);
+        Assert.Equal(1, s.Provider.TrapCalls);
+        s.Provider.AfterChildTrap = null;
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(1, s.Provider.NestedCloseCalls);
+    }
+
+    private static (Scenario Scenario, VirtualDomainAuthoritySet Root, VirtualDomainAuthoritySet Leaf) NestedDeliveryScenario()
+    {
+        var s = CreateScenario();
+        var root = CreateConfiguredRoot(s);
+        var leaf = s.Kernel.CreateNestedVirtualDomain(s.Owner, root.Domain, root.ConfigureCapability,
+            new(new(1, 4096), VirtualDomainAuthorityClass.Lifecycle | VirtualDomainAuthorityClass.Execution |
+                VirtualDomainAuthorityClass.Events | VirtualDomainAuthorityClass.Traps)).Value!;
+        Assert.True(s.Kernel.ConfigureVirtualDomain(s.Owner, leaf.Domain, leaf.ConfigureCapability).IsSuccess);
+        Assert.True(s.Kernel.StartVirtualDomain(s.Owner, leaf.Domain, leaf.ExecuteCapability).IsSuccess);
+        return (s, root, leaf);
+    }
+
+    [Theory]
+    [InlineData(false, false)] [InlineData(false, true)] [InlineData(true, false)] [InlineData(true, true)]
+    public void NestedBridgeDeliveryAncestorDrainRefusesBeforeCallbackOrReceiptPublication(bool trap, bool during)
+    {
+        var (s, root, leaf) = NestedDeliveryScenario();
+        var records = ((VirtualDomainAuthority)ArtifactField(s.Kernel, "_virtualDomains")).ForOwner(s.Owner);
+        var parent = Assert.Single(records, x => x.Handle == root.Domain);
+        var local = Assert.Single(records, x => x.Handle == leaf.Domain);
+        var bridge = s.Kernel.PlatformAuthority;
+        Action drain = () => Assert.True(bridge.TransitionChildDomain(parent.ChildBinding!.Value, PlatformChildDomainTransition.BeginDrain).IsSuccess);
+        if (!during) drain();
+        else if (trap) s.Provider.AfterChildTrap = drain; else s.Provider.AfterChildEvent = drain;
+        bool Run() => trap ? bridge.ObserveChildTrap(local.ChildBinding!.Value).IsSuccess :
+            bridge.InjectChildEvent(local.ChildBinding!.Value, PlatformVirtualEventClass.ExternalSignal,
+                VirtualizationResourceIds.Events(leaf.Domain.DomainId)).IsSuccess;
+        Assert.False(Run());
+        Assert.Equal(during ? 1 : 0, trap ? s.Provider.TrapCalls : s.Provider.EventCalls);
+        Assert.False(Run());
+        Assert.Equal(during ? 1 : 0, trap ? s.Provider.TrapCalls : s.Provider.EventCalls);
+        var table = (global::System.Collections.IDictionary)ArtifactField(bridge, "_childBindings");
+        var ownerRecord = table[local.ChildBinding!.Value.BindingId]!;
+        Assert.Equal(during ? 1UL : 0UL, ownerRecord.GetType().GetProperty(trap ? "LastTrapSequence" : "LastEventSequence")!.GetValue(ownerRecord));
+        Assert.Equal(0, ownerRecord.GetType().GetProperty("PendingChildEffects")!.GetValue(ownerRecord));
+        s.Provider.AfterChildTrap = s.Provider.AfterChildEvent = null;
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess); // exact known model effect has real cleanup
+        Assert.Equal(1, s.Provider.NestedCloseCalls);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public async Task ConcurrentNestedBridgeDeliveryKeepsClosurePinnedUntilCallbackEnds(bool trap)
+    {
+        var (s, root, leaf) = NestedDeliveryScenario();
+        var records = ((VirtualDomainAuthority)ArtifactField(s.Kernel, "_virtualDomains")).ForOwner(s.Owner);
+        var parent = Assert.Single(records, x => x.Handle == root.Domain);
+        var local = Assert.Single(records, x => x.Handle == leaf.Domain);
+        var bridge = s.Kernel.PlatformAuthority;
+        using var entered = new ManualResetEventSlim(); using var release = new ManualResetEventSlim();
+        Action hold = () => { entered.Set(); Assert.True(release.Wait(TimeSpan.FromSeconds(15))); };
+        if (trap) s.Provider.AfterChildTrap = hold; else s.Provider.AfterChildEvent = hold;
+        var work = Task.Run(() => trap ? bridge.ObserveChildTrap(local.ChildBinding!.Value).IsSuccess :
+            bridge.InjectChildEvent(local.ChildBinding!.Value, PlatformVirtualEventClass.ExternalSignal,
+                VirtualizationResourceIds.Events(leaf.Domain.DomainId)).IsSuccess);
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.True(bridge.TransitionChildDomain(parent.ChildBinding!.Value, PlatformChildDomainTransition.BeginDrain).IsSuccess);
+            Assert.Equal(KernelError.PlatformBindingActive, bridge.CloseChildDomain(parent.ChildBinding.Value).Error);
+            Assert.Equal(KernelError.PlatformBindingActive, bridge.CloseChildDomain(local.ChildBinding!.Value).Error);
+            Assert.Equal(0, s.Provider.NestedCloseCalls);
+        }
+        finally { release.Set(); }
+        Assert.False(await work.WaitAsync(TimeSpan.FromSeconds(15)));
+        s.Provider.AfterChildTrap = s.Provider.AfterChildEvent = null;
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(1, s.Provider.NestedCloseCalls);
+    }
+
     private static Scenario CreateScenario(
         PlatformAuthorityStatus? nestedFailure = null,
         bool malformedNestedLease = false,
@@ -771,6 +1416,10 @@ public sealed class Phase8ResidualVirtualizationTests
         public Action? AfterArtifactBind { get; set; }
         public Action? AfterArtifactStart { get; set; }
         public int ArtifactStartCalls { get; private set; }
+        public int ArtifactBindCalls { get; private set; }
+        public ReadOnlyMemory<byte> LastArtifactPackage { get; private set; }
+        public PlatformAuthorityStatus? ArtifactStatus { get; set; }
+        public bool MalformedArtifactEvidence { get; set; }
         public int TrapCalls { get; private set; }
         public int GuestUnmapCalls { get; private set; }
         public int NestedCloseCalls { get; private set; }
@@ -890,10 +1539,18 @@ public sealed class Phase8ResidualVirtualizationTests
                 lease.ChildLease.ParentDomainLease.LeaseId, lease.ChildLease.ParentDomainLease.Generation, true));
         }
 
-        public PlatformAuthorityResult<PlatformVirtualEventReceipt> InjectVirtualEvent(PlatformVirtualEventRequest request) =>
-            PlatformAuthorityResult<PlatformVirtualEventReceipt>.Ok(new(request.ChildLease.LeaseId,
+        public int EventCalls { get; private set; }
+        public Action? AfterChildEvent { get; set; }
+        public Action? AfterChildTrap { get; set; }
+        public PlatformAuthorityResult<PlatformVirtualEventReceipt> InjectVirtualEvent(PlatformVirtualEventRequest request)
+        {
+            EventCalls++;
+            var receipt = new PlatformVirtualEventReceipt(request.ChildLease.LeaseId,
                 request.ChildLease.Generation, request.ChildLease.ParentDomainLease.LeaseId,
-                request.ChildLease.ParentDomainLease.Generation, 1, request.EventClass, request.SourceResourceId));
+                request.ChildLease.ParentDomainLease.Generation, 1, request.EventClass, request.SourceResourceId);
+            AfterChildEvent?.Invoke();
+            return PlatformAuthorityResult<PlatformVirtualEventReceipt>.Ok(receipt);
+        }
 
         public PlatformAuthorityResult<PlatformVirtualTrapEvidence> ObserveVirtualTrap(
             PlatformProviderChildDomainLease lease)
@@ -901,6 +1558,7 @@ public sealed class Phase8ResidualVirtualizationTests
             TrapCalls++;
             var sequence = _trapSequences.GetValueOrDefault(lease.LeaseId) + 1;
             _trapSequences[lease.LeaseId] = sequence;
+            AfterChildTrap?.Invoke();
             return PlatformAuthorityResult<PlatformVirtualTrapEvidence>.Ok(new(lease.LeaseId,
                 _malformedTrap ? new(lease.Generation.Value + 1) : lease.Generation,
                 lease.ParentDomainLease.LeaseId, lease.ParentDomainLease.Generation,
@@ -910,11 +1568,14 @@ public sealed class Phase8ResidualVirtualizationTests
         public PlatformAuthorityResult<PlatformExecutableArtifactReceipt> BindExecutableArtifact(
             PlatformExecutableArtifactRequest request)
         {
+            ArtifactBindCalls++;
+            if (ArtifactStatus is { } status) return PlatformAuthorityResult<PlatformExecutableArtifactReceipt>.Fail(status, "controlled admission disposition");
+            LastArtifactPackage = request.ImmutablePackage;
             var receipt = new PlatformExecutableArtifactReceipt(new(1), new(1),
                 request.ChildLease.LeaseId, request.ChildLease.Generation,
                 request.GuestMapping.LeaseId, request.GuestMapping.Generation,
                 request.ChildLease.ParentDomainLease.LeaseId, request.ChildLease.ParentDomainLease.Generation,
-                new string('a', 64), request.MaximumExecutionSteps);
+                MalformedArtifactEvidence ? new string('a', 64) : Convert.ToHexStringLower(global::System.Security.Cryptography.SHA256.HashData(request.ImmutablePackage.Span)), request.MaximumExecutionSteps);
             if (ThrowAfterArtifactBind)
                 throw new InvalidOperationException("Artifact binding receipt lost.");
             AfterArtifactBind?.Invoke();
@@ -925,10 +1586,12 @@ public sealed class Phase8ResidualVirtualizationTests
             PlatformChildExecutionStartRequest request)
         {
             ArtifactStartCalls++;
+            if (ArtifactStatus is { } status) return PlatformAuthorityResult<PlatformChildExecutionReceipt>.Fail(status, "controlled start disposition");
             LastExecutionReceipt = new(request.Artifact.ArtifactId, request.Artifact.ArtifactGeneration,
                 request.Artifact.ChildLeaseId, request.Artifact.ChildGeneration, request.Artifact.MappingLeaseId,
                 request.Artifact.MappingGeneration, request.Artifact.ParentLeaseId, request.Artifact.ParentGeneration,
                 request.Artifact.ContentDigest, request.OperationId, request.OperationGeneration, new(1), 1, 1, 0, true);
+            if (MalformedArtifactEvidence) LastExecutionReceipt = LastExecutionReceipt.Value with { IsTerminal = false };
             if (ThrowAfterArtifactStart)
                 throw new InvalidOperationException("Artifact start receipt lost.");
             AfterArtifactStart?.Invoke();
@@ -936,3 +1599,5 @@ public sealed class Phase8ResidualVirtualizationTests
         }
     }
 }
+
+

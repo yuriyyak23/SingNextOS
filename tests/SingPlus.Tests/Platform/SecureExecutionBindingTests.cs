@@ -118,7 +118,9 @@ public sealed class SecureExecutionBindingTests
             Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
             Assert.Equal(0, s.Provider.CloseCalls);
         };
-        Assert.True(s.Kernel.StartVirtualDomain(s.Owner, s.Virtual.Domain, s.Virtual.ExecuteCapability).IsSuccess);
+        Assert.False(s.Kernel.StartVirtualDomain(s.Owner, s.Virtual.Domain, s.Virtual.ExecuteCapability).IsSuccess);
+        Assert.NotEqual(VirtualDomainState.Running, s.Kernel.QueryVirtualDomain(s.Owner, s.Virtual.Domain).Value);
+        Assert.Equal(1, s.Provider.ChildEffects);
         Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
     }
 

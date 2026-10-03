@@ -1,0 +1,6 @@
+# Launch with --platform host-model. Feature availability is not physical evidence.
+platform
+env
+status
+authority 1
+exit

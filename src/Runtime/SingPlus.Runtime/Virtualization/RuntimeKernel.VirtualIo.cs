@@ -27,7 +27,7 @@ public sealed partial class RuntimeKernel
     internal KernelResult<VirtualIoBinding> BindVirtualIo(ProcessHandle owner, VirtualDomainHandle domain,
         PlatformDeviceLease device, PlatformVirtualIoProfile profile, SecureExecutionBinding? secureExecution = null)
     {
-        var virtualRecord = _virtualDomains.Resolve(owner, domain);
+        var virtualRecord = _virtualDomains.ResolveAdmission(owner, domain);
         if (!virtualRecord.IsSuccess) return KernelResult<VirtualIoBinding>.Fail(virtualRecord.Error, virtualRecord.Message!);
         if (virtualRecord.Value!.ChildBinding is not { } child ||
             !virtualRecord.Value.Authority.HasFlag(PlatformChildAuthorityClass.Io))

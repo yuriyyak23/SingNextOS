@@ -1,0 +1,5 @@
+# Requires a single statically verified --sip image and --sip-root.
+demo supervised-restart
+ps
+status
+exit

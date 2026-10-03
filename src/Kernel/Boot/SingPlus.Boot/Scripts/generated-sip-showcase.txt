@@ -1,0 +1,5 @@
+# Trusted copied-value generated client/dispatcher over runtime EndpointSession.
+demo generated-sip
+ps
+status
+exit

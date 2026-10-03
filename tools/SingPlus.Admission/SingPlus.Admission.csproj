@@ -8,6 +8,9 @@
     <PublishAot Condition="'$(SingPlusNativeAotQualification)' == 'true'">true</PublishAot>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Remove="AdmissionVerifier.cs;AdmissionProof.cs;IlReader.cs;ManagedAsyncPeQualification.cs;ManagedAsyncFrontendContract.cs" />
+    <ProjectReference Include="../../src/Admission/SingPlus.StaticAdmission/SingPlus.StaticAdmission.csproj" />
     <ProjectReference Include="../../contracts/SingPlus.Contracts/SingPlus.Contracts.csproj" />
   </ItemGroup>
 </Project>
+

@@ -63,6 +63,8 @@ public sealed partial class PlatformAuthorityBridge
         public int PendingChildCreates { get; set; }
         public int PendingSecureCreates { get; set; }
         public bool ParentRevokeMayHaveEffect { get; set; }
+        // Admission-only interlock; quarantine/closure remain owned by this record.
+        public bool ExecutionTransitionInFlight { get; set; }
         public PlatformExecutionPolicyRegistration? ExecutionPolicy { get; set; }
     }
 
@@ -131,7 +133,10 @@ public sealed partial class PlatformAuthorityBridge
 
     public bool IsAvailable => _provider is not null;
 
-    internal KernelResult<PlatformDomainBinding> BindDomain(PlatformDomainIdentity subject)
+    internal KernelResult<PlatformDomainBinding> BindDomain(PlatformDomainIdentity subject,
+        Func<Func<KernelResult>, KernelResult>? admissionConsumer = null,
+        Func<PlatformDomainBinding, Func<Func<KernelResult>, KernelResult>, KernelResult>? completionConsumer = null,
+        Func<Func<KernelResult>, KernelResult>? sourceCommitConsumer = null)
     {
         if (_backendEpochExhausted)
             return KernelResult<PlatformDomainBinding>.Fail(KernelError.CapacityExhausted,
@@ -160,21 +165,32 @@ public sealed partial class PlatformAuthorityBridge
                 $"The platform provider does not admit neutral domain contract v{PlatformDomainContract.ContractVersion} authority.");
         }
 
-        PlatformBackendEpoch backendEpoch;
+        PlatformBackendEpoch backendEpoch = default;
+        KernelResult Begin()
+        {
         lock (_secureDomainLifecycleGate)
         {
             if (_activeSubjects.ContainsKey(subject))
-                return KernelResult<PlatformDomainBinding>.Fail(KernelError.PlatformDenied,
+                return KernelResult.Fail(KernelError.PlatformDenied,
                     "The local subject already has an active platform binding.");
             if (_pendingDomainBinds.Contains(subject))
-                return KernelResult<PlatformDomainBinding>.Fail(KernelError.PlatformBindingActive,
+                return KernelResult.Fail(KernelError.PlatformBindingActive,
                     "The local subject already has platform binding admission in flight.");
             if (_unresolvedDomainBinds.Contains(subject))
-                return KernelResult<PlatformDomainBinding>.Fail(KernelError.PlatformFaulted,
+                return KernelResult.Fail(KernelError.PlatformFaulted,
                     "The local subject has an unresolved possible provider domain binding.");
-            _pendingDomainBinds.Add(subject);
-            backendEpoch = BackendEpoch;
+            if (_backendEpochExhausted) return KernelResult.Fail(KernelError.CapacityExhausted, "Backend epoch exhausted before root admission.");
+            KernelResult CommitAdmission()
+            {
+                _pendingDomainBinds.Add(subject);
+                backendEpoch = BackendEpoch;
+                return KernelResult.Ok();
+            }
+            return sourceCommitConsumer is null ? CommitAdmission() : sourceCommitConsumer(CommitAdmission);
         }
+        }
+        var admitted = admissionConsumer is null ? Begin() : admissionConsumer(Begin);
+        if (!admitted.IsSuccess) return KernelResult<PlatformDomainBinding>.Fail(admitted.Error, admitted.Message!);
         try
         {
         PlatformAuthorityResult<PlatformProviderDomainLease> providerResult;
@@ -228,6 +244,7 @@ public sealed partial class PlatformAuthorityBridge
                     : $"{leaseMessage} Cleanup returned {cleanup.Status}; the provider lease remains quarantined for teardown.");
         }
 
+        PlatformDomainBinding published;
         lock (_secureDomainLifecycleGate)
         {
             if (BackendEpoch != backendEpoch || _backendEpochExhausted ||
@@ -237,11 +254,49 @@ public sealed partial class PlatformAuthorityBridge
                 return KernelResult<PlatformDomainBinding>.Fail(KernelError.PlatformFaulted,
                     "Backend continuity changed before platform domain binding publication.");
             }
-            var binding = AddDomainRecord(subject, providerLease, DomainAuthorityState.Active);
-            return KernelResult<PlatformDomainBinding>.Ok(binding);
+            published = AddDomainRecord(subject, providerLease, DomainAuthorityState.Active);
+
         }
+        KernelResult CommitAttachment(Func<KernelResult> commit)
+        {
+            lock (_secureDomainLifecycleGate)
+            {
+                if (BackendEpoch != backendEpoch || _backendEpochExhausted)
+                    return KernelResult.Fail(KernelError.PlatformFaulted, "Root binding backend changed before local attachment.");
+                var current = ValidateDomain(published, subject);
+                return current.IsSuccess ? commit() : current;
+            }
+        }
+        if (completionConsumer is null) return KernelResult<PlatformDomainBinding>.Ok(published);
+        KernelResult completed;
+        try { completed = completionConsumer(published, CommitAttachment); }
+        catch (Exception exception) when (exception is not StackOverflowException)
+        {
+            completed = KernelResult.Fail(KernelError.PlatformFaulted,
+                $"Known provider binding could not be attached locally: {exception.Message}");
+        }
+        if (!completed.IsSuccess)
+        {
+            lock (_secureDomainLifecycleGate)
+            {
+                if (_domains.TryGetValue(published.BindingId, out var record)) QuarantineDomain(record);
+            }
+            return KernelResult<PlatformDomainBinding>.Fail(completed.Error, completed.Message!);
+        }
+        return KernelResult<PlatformDomainBinding>.Ok(published);
         }
         finally { lock (_secureDomainLifecycleGate) _pendingDomainBinds.Remove(subject); }
+    }
+
+    // Trusted pure local consumer only; root state remains owned by DomainRecord.
+    internal KernelResult CommitActiveDomainConsumer(
+        PlatformDomainBinding binding, PlatformDomainIdentity subject, Func<KernelResult> commit)
+    {
+        lock (_secureDomainLifecycleGate)
+        {
+            var current = ValidateDomain(binding, subject);
+            return current.IsSuccess ? commit() : current;
+        }
     }
 
     internal bool HasUnresolvedDomainBindEffect(PlatformDomainIdentity subject)
@@ -254,6 +309,8 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDomainIdentity subject,
         out PlatformDomainBinding binding)
     {
+        lock (_secureDomainLifecycleGate)
+        {
         if (_activeSubjects.TryGetValue(subject, out var bindingId) &&
             _domains.TryGetValue(bindingId, out var record) &&
             record.AuthorityState == DomainAuthorityState.Quarantined)
@@ -264,6 +321,7 @@ public sealed partial class PlatformAuthorityBridge
 
         binding = default;
         return false;
+        }
     }
 
     internal KernelResult RevokeDomain(
@@ -276,6 +334,14 @@ public sealed partial class PlatformAuthorityBridge
         {
             var validation = ValidateDomainIdentity(binding, expectedSubject);
             if (!validation.IsSuccess) return validation;
+
+            var executionRecord = _domains[binding.BindingId];
+            if (executionRecord.ExecutionTransitionInFlight)
+            {
+                QuarantineDomain(executionRecord);
+                return KernelResult.Fail(KernelError.PlatformBindingActive,
+                    "Pending execution transition may still take effect; exact domain closure must wait.");
+            }
 
             if (HasActiveDsc1Operations(binding))
                 return KernelResult.Fail(KernelError.PlatformBindingActive,
@@ -403,59 +469,115 @@ public sealed partial class PlatformAuthorityBridge
     internal KernelResult TransitionDomainExecution(
         PlatformDomainBinding binding,
         PlatformDomainIdentity expectedSubject,
-        PlatformDomainExecutionTransition transition)
+        PlatformDomainExecutionTransition transition,
+        Func<Func<KernelResult>, KernelResult>? admissionConsumer = null,
+        Func<Func<Func<KernelResult>, KernelResult>, KernelResult>? completionConsumer = null)
     {
-        var bindingValidation = ValidateDomain(binding, expectedSubject);
-        if (!bindingValidation.IsSuccess) return bindingValidation;
-
+        lock (_secureDomainLifecycleGate)
+        {
+            var bindingValidation = ValidateDomain(binding, expectedSubject);
+            if (!bindingValidation.IsSuccess) return bindingValidation;
+        }
         var transitionValidation = PlatformDomainExecutionContract.ValidateTransition(transition);
         if (!transitionValidation.IsSuccess)
             return FromProviderFailure(transitionValidation.Status, transitionValidation.Message);
-
-        if (!_featureManifest.Supports(
-                PlatformFeatureFamily.NeutralDomains,
-                PlatformDomainContract.ContractVersion,
-                PlatformFeatureAvailability.Executable))
-        {
-            return KernelResult.Fail(
-                KernelError.PlatformUnsupported,
+        if (!_featureManifest.Supports(PlatformFeatureFamily.NeutralDomains,
+                PlatformDomainContract.ContractVersion, PlatformFeatureAvailability.Executable))
+            return KernelResult.Fail(KernelError.PlatformUnsupported,
                 "The bound platform provider does not classify neutral execution transitions as executable.");
-        }
-
         if (_provider is not IPlatformDomainExecutionProvider executionProvider)
-        {
-            return KernelResult.Fail(
-                KernelError.PlatformUnsupported,
+            return KernelResult.Fail(KernelError.PlatformUnsupported,
                 "The bound platform provider does not expose neutral execution lifecycle transitions.");
-        }
-
-        var record = _domains[binding.BindingId];
-        var providerResult = executionProvider.TransitionDomainExecution(
-            record.ProviderLease,
-            transition);
-        if (!providerResult.IsSuccess)
+        DomainRecord record = null!;
+        PlatformBackendEpoch backendEpoch = default;
+        KernelResult Begin()
         {
-            if (RequiresDomainQuarantine(providerResult.Status))
-                QuarantineDomain(record);
-
-            return FromProviderFailure(providerResult.Status, providerResult.Message);
+            lock (_secureDomainLifecycleGate)
+            {
+                var validation = ValidateDomain(binding, expectedSubject);
+                if (!validation.IsSuccess) return validation;
+                record = _domains[binding.BindingId];
+                if (record.ExecutionTransitionInFlight)
+                    return KernelResult.Fail(KernelError.PlatformBindingActive,
+                        "An execution transition is already pending for this exact domain.");
+                record.ExecutionTransitionInFlight = true;
+                backendEpoch = BackendEpoch;
+                return KernelResult.Ok();
+            }
         }
-
-        var resultValidation = PlatformDomainExecutionContract.ValidateResult(
-            record.ProviderLease,
-            transition,
-            providerResult.Value!);
-        if (!resultValidation.IsSuccess)
+        var admitted = admissionConsumer is null ? Begin() : admissionConsumer(Begin);
+        if (!admitted.IsSuccess) return admitted;
+        try
         {
-            QuarantineDomain(record);
-            return KernelResult.Fail(
-                KernelError.PlatformFaulted,
-                resultValidation.Message ?? "The platform provider returned malformed execution transition evidence.");
+            // Provider callback runs outside the record owner gate. Its returned
+            // failure/exception never establishes no-effect or closure.
+            var providerResult = executionProvider.TransitionDomainExecution(record.ProviderLease, transition);
+            lock (_secureDomainLifecycleGate)
+            {
+                if (!_domains.TryGetValue(binding.BindingId, out var current) || current != record ||
+                    current.Binding != binding || BackendEpoch != backendEpoch)
+                {
+                    QuarantineDomain(record);
+                    if (current is not null) QuarantineDomain(current);
+                    return KernelResult.Fail(KernelError.PlatformFaulted,
+                        "Execution callback lost exact domain/backend continuity; closure remains uncertain.");
+                }
+                if (!providerResult.IsSuccess)
+                {
+                    QuarantineDomain(record);
+                    return FromProviderFailure(providerResult.Status, providerResult.Message);
+                }
+                var resultValidation = PlatformDomainExecutionContract.ValidateResult(record.ProviderLease,
+                    transition, providerResult.Value!);
+                if (!resultValidation.IsSuccess)
+                {
+                    QuarantineDomain(record);
+                    return KernelResult.Fail(KernelError.PlatformFaulted,
+                        resultValidation.Message ?? "Malformed execution transition evidence.");
+                }
+                var currentValidation = ValidateDomain(binding, expectedSubject);
+                if (!currentValidation.IsSuccess) return currentValidation;
+            }
+            KernelResult CommitLocal(Func<KernelResult> commit)
+            {
+                lock (_secureDomainLifecycleGate)
+                {
+                    if (!_domains.TryGetValue(binding.BindingId, out var current) || current != record ||
+                        current.Binding != binding || BackendEpoch != backendEpoch)
+                        return KernelResult.Fail(KernelError.PlatformFaulted, "Execution receipt lost exact owner continuity before local commit.");
+                    var validation = ValidateDomain(binding, expectedSubject);
+                    if (!validation.IsSuccess) return validation;
+                    return commit();
+                }
+            }
+            if (completionConsumer is null) return KernelResult.Ok();
+            var completed = completionConsumer(CommitLocal);
+            if (!completed.IsSuccess)
+            {
+                lock (_secureDomainLifecycleGate) QuarantineDomain(record);
+            }
+            return completed;
         }
-
-        return KernelResult.Ok();
+        catch (Exception exception) when (exception is not StackOverflowException)
+        {
+            lock (_secureDomainLifecycleGate) QuarantineDomain(record);
+            return KernelResult.Fail(KernelError.PlatformFaulted,
+                $"Execution callback may have taken effect without an exact receipt: {exception.Message}");
+        }
+        finally
+        {
+            lock (_secureDomainLifecycleGate)
+            {
+                record.ExecutionTransitionInFlight = false;
+                // Reset can replace the root record while retaining its exact
+                // provider lease. Callback return balances only admission; the
+                // replacement remains quarantined and grants no closure proof.
+                if (_domains.TryGetValue(binding.BindingId, out var current) &&
+                    current.ProviderLease == record.ProviderLease && current.Binding.Subject == record.Binding.Subject)
+                    current.ExecutionTransitionInFlight = false;
+            }
+        }
     }
-
     internal KernelResult<PlatformRegionMapping> MapOwnedRegion(
         PlatformDomainBinding binding,
         PlatformDomainIdentity expectedSubject,
@@ -1125,3 +1247,5 @@ public sealed partial class PlatformAuthorityBridge
             _ => KernelError.PlatformFaulted
         };
 }
+
+

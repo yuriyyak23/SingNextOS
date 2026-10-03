@@ -4,6 +4,7 @@ using System.Security.Cryptography;
 using SingPlus.Contracts;
 using SingPlus.Kernel;
 using SingPlus.Runtime;
+using SingPlus.Platform.Host;
 
 namespace SingPlus.Boot;
 
@@ -42,19 +43,30 @@ public static class HostDebugBootPipeline
             }),
             new Stage("runtime authority graph", () =>
             {
-                // No platform provider is installed in this profile. CXL and HybridCPU
-                // discovery/admission therefore remain unavailable rather than mocked.
-                context.Session.Runtime = new RuntimeKernel();
+                var initialized = RecoveryBootstrap.Initialize(context.Session);
+                if (!initialized.IsSuccess) return initialized;
+                if (options.DeferComputeCompletion)
+                    context.Session.EnvironmentFacts.Add("DSC1 completion: deferred by existing Host provider debug knob.");
+                context.Session.EnvironmentFacts.Add(options.HostModelPlatform
+                    ? "Platform: Host model provider (host-test); semantic model only, no physical hardware evidence."
+                    : options.HybridCpuChildPlatform
+                        ? "Platform: HybridCPU model parent with existing ExternalRuntime V3 executable child adapter; feature evidence remains family-specific."
+                    : options.HybridCpuModelPlatform
+                        ? "Platform: existing HybridCPU neutral model adapter; ModelOnly, no physical execution evidence."
+                        : "Platform: none; external execution/discovery unavailable.");
                 return KernelBootStageResult.Success();
             }),
-            new Stage("external platform backend exclusion", () =>
+            new Stage("platform profile invariants", () =>
             {
                 if (context.Session.Runtime is null)
                     return KernelBootStageResult.Failure("Runtime authority graph is unavailable.");
 
-                return context.Session.Runtime.QueryPlatformFeatures().Features.Count == 0
-                    ? KernelBootStageResult.Success()
-                    : KernelBootStageResult.Failure("A platform backend was unexpectedly installed in host-debug mode.");
+                var hasFeatures = context.Session.Runtime.QueryPlatformFeatures().Features.Count > 0;
+                if (hasFeatures != (options.HostModelPlatform || options.HybridCpuModelPlatform || options.HybridCpuChildPlatform))
+                    return KernelBootStageResult.Failure("Installed platform features do not match the requested profile.");
+                if (options.HostModelPlatform)
+                    EmulatorConsole.StageDetail("existing Host model provider installed; model semantics are not hardware evidence");
+                return KernelBootStageResult.Success();
             }),
             new Stage("system process manifest", () =>
             {
@@ -202,6 +214,13 @@ public static class HostDebugBootPipeline
             memoryProfile: MemoryProfile.SipRegion);
         var componentIdentity = new ComponentIdentity($"host-debug.sip.{identity}");
         var digest = Convert.ToHexString(SHA256.HashData(image)).ToLowerInvariant();
+        string? staticProof = null;
+        if (session.Options.SipRoot is { } root)
+        {
+            var verified = SipStaticVerifier.Verify(path, root, digest, out var result);
+            if (!verified.IsSuccess) return verified;
+            staticProof = result!.Proof.ProofDigest;
+        }
         var manifest = new ServiceManifestV1(
             componentIdentity,
             new ComponentVersion(assembly.Version?.ToString() ?? "0.0.0.0"),
@@ -224,7 +243,8 @@ public static class HostDebugBootPipeline
             identity,
             assembly.Version?.ToString() ?? "0.0.0.0",
             digest,
-            componentIdentity));
+            componentIdentity,
+            staticProof));
         return KernelBootStageResult.Success();
     }
 

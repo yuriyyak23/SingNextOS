@@ -163,6 +163,11 @@ public sealed partial class RuntimeKernel
         bool prepare;
         lock (_platformMemoryUseGate)
         {
+            // Local revoke already committed above. Root/virtual creation may still
+            // publish a known cleanup record, so composed closure cannot freeze yet.
+            if (_pendingPlatformDomainBinds.Contains(handle))
+                return KernelResult.Fail(KernelError.PlatformFaulted,
+                    "Root/virtual-domain creation must settle before composed teardown can advance.");
             if (_pendingPlatformMappingAdmissions.ContainsKey(handle) || record.ComposedPreparationInFlight)
                 return KernelResult.Fail(KernelError.PlatformBindingDraining,
                     "Mapping admission or composed preparation must settle before teardown can advance.");
@@ -258,6 +263,8 @@ public sealed partial class RuntimeKernel
         if (!sessions.IsSuccess) return sessions;
         var process = Processes.Resolve(handle);
         if (!process.IsSuccess) return KernelResult.Fail(process.Error, process.Message!);
+        if (PlatformAuthority.HasUnresolvedVirtualDomainCreate(PlatformIdentity(process.Value!)))
+            return KernelResult.Fail(KernelError.PlatformFaulted, "Model creation lacks exact receipt/reconciliation; process remains pinned.");
         var owner = new RegionOwner(process.Value!.DomainId, process.Value.Generation);
 
         var work = CloseComposedWorkForProcess(handle, owner);
