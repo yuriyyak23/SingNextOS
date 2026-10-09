@@ -15,6 +15,139 @@ public interface ISipJobRegionBorrowQualificationService
 public sealed class Phase143InlineRegionBorrowTests
 {
     [Fact]
+    public void FinalRevalidationHookInvalidatingExactUseRefusesTargetAndSettlesOriginalLease()
+    {
+        var scenario = CreateGeneratedSessionScenario();
+        var buffer = scenario.Kernel.AllocateBuffer<byte>(scenario.Caller, 4).Value!;
+        var binding = new GeneratedBorrowBinding(
+            scenario.Kernel, scenario.Caller, scenario.Service, scenario.Session, scenario.Host);
+        scenario.Kernel.InlineBorrowQualificationHook = new PointHook(
+            InlineBorrowQualificationPoint.AfterFinalRevalidation, () =>
+            {
+                var use = Assert.Single(scenario.Kernel.Regions.SnapshotUses());
+                Assert.True(scenario.Kernel.InvalidateRegionUse(scenario.Service, use.Handle).IsSuccess);
+            });
+
+        var result = binding.Invoke(buffer);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(KernelError.StaleGeneration, result.Error);
+        Assert.Equal(0, scenario.Host.TargetCalls);
+        Assert.Equal(RegionUseState.Released, Assert.Single(scenario.Kernel.Regions.SnapshotUses()).State);
+        Assert.Equal(RegionState.Owned, Assert.Single(scenario.Kernel.Regions.Snapshot()).State);
+        Assert.Equal(0, scenario.Kernel.EndpointSessions.ActivePinCount(scenario.Session));
+        Assert.True(scenario.Kernel.ReleaseRegion(scenario.Caller, buffer).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData((int)InlineBorrowQualificationPoint.BeforeRegionUseRelease)]
+    [InlineData((int)InlineBorrowQualificationPoint.AfterRegionUseRelease)]
+    [InlineData((int)InlineBorrowQualificationPoint.BeforeBorrowReturn)]
+    [InlineData((int)InlineBorrowQualificationPoint.AfterBorrowReturn)]
+    [InlineData((int)InlineBorrowQualificationPoint.BeforeInvocationSettlement)]
+    [InlineData((int)InlineBorrowQualificationPoint.AfterInvocationSettlement)]
+    public void SettlementHookFaultConsumesRemainingExactCleanupWithoutReplay(int pointValue)
+    {
+        var scenario = CreateSessionScenario();
+        var buffer = scenario.Kernel.AllocateBuffer<byte>(scenario.Caller, 4).Value!;
+        var lease = scenario.Kernel.BeginInlineBorrowSessionInvocation(
+            scenario.Caller, scenario.Service, scenario.Session, 1, buffer).Value!;
+        var invocation = lease.Context.Invocation;
+        scenario.Kernel.InlineBorrowQualificationHook = new PointHook((InlineBorrowQualificationPoint)pointValue,
+            () => throw new InvalidOperationException("settlement interrupted"));
+        Assert.Throws<InvalidOperationException>(() => scenario.Kernel.SettleInlineBorrowSessionInvocation(scenario.Service, lease, true));
+        Assert.Equal(RegionState.Owned, Assert.Single(scenario.Kernel.Regions.Snapshot()).State);
+        Assert.Equal(RegionUseState.Released, Assert.Single(scenario.Kernel.Regions.SnapshotUses()).State);
+        Assert.Equal(0, scenario.Kernel.EndpointSessions.ActivePinCount(scenario.Session));
+        Assert.Equal(pointValue == (int)InlineBorrowQualificationPoint.AfterInvocationSettlement
+            ? ResponsePublicationStatus.Published : ResponsePublicationStatus.Cancelled,
+            scenario.Kernel.SnapshotSessionInvocationConsequence(invocation)!.Value.TerminalStatus);
+        Assert.Throws<ObjectDisposedException>(() => scenario.Kernel.SettleInlineBorrowSessionInvocation(scenario.Service, lease, true));
+        Assert.True(scenario.Kernel.CloseSession(scenario.Caller, scenario.Session).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData((int)InlineBorrowQualificationPoint.AfterInvocationAccepted, false)]
+    [InlineData((int)InlineBorrowQualificationPoint.BeforeRegionUseAcquisition, false)]
+    [InlineData((int)InlineBorrowQualificationPoint.AfterRegionUseAcquisition, false)]
+    [InlineData((int)InlineBorrowQualificationPoint.AfterRegionUseAcquisition, true)]
+    public void PreparationFaultSettlesExactLoanUseAndOriginalSessionPin(int pointValue, bool close)
+    {
+        var point = (InlineBorrowQualificationPoint)pointValue;
+        var scenario = CreateSessionScenario();
+        var buffer = scenario.Kernel.AllocateBuffer<byte>(scenario.Caller, 4).Value!;
+        scenario.Kernel.InlineBorrowQualificationHook = new PointHook(point, () =>
+        {
+            if (close) Assert.Equal(KernelError.SessionDraining, scenario.Kernel.CloseSession(scenario.Caller, scenario.Session).Error);
+            throw new InvalidOperationException("accepted borrow preparation fault");
+        });
+        Assert.Throws<InvalidOperationException>(() => scenario.Kernel.BeginInlineBorrowSessionInvocation(
+            scenario.Caller, scenario.Service, scenario.Session, 1, buffer));
+        Assert.Equal(0, scenario.Kernel.EndpointSessions.ActivePinCount(scenario.Session));
+        Assert.Equal(RegionState.Owned, Assert.Single(scenario.Kernel.Regions.Snapshot()).State);
+        Assert.All(scenario.Kernel.Regions.SnapshotUses(), use => Assert.Equal(RegionUseState.Released, use.State));
+        if (point == InlineBorrowQualificationPoint.AfterRegionUseAcquisition)
+            Assert.Single(scenario.Kernel.Regions.SnapshotUses());
+        if (close) Assert.True(scenario.Kernel.Channels.SnapshotClosure(scenario.CallerEndpoint)!.Value.Closed);
+        else Assert.True(scenario.Kernel.CloseSession(scenario.Caller, scenario.Session).IsSuccess);
+    }
+
+    [Fact]
+    public void RevocationAfterPinPreventsBorrowAndInvocationPublication()
+    {
+        var scenario = CreateSessionScenario(requireCapability: true);
+        var capability = Assert.Single(scenario.Kernel.EndpointSessions.Resolve(scenario.Session, scenario.Caller).Value!.Capabilities);
+        var buffer = scenario.Kernel.AllocateBuffer<byte>(scenario.Caller, 4).Value!;
+        var original = buffer.Handle;
+        var before = scenario.Kernel.Channels.GetEndpoint(scenario.CallerEndpoint).Value!;
+        scenario.Kernel.InlineBorrowQualificationHook = new PointHook(
+            InlineBorrowQualificationPoint.BeforeSessionRevalidation,
+            () => Assert.True(Task.Run(() => scenario.Kernel.RevokeCapability(capability)).GetAwaiter().GetResult().IsSuccess));
+        var begun = scenario.Kernel.BeginInlineBorrowSessionInvocation(
+            scenario.Caller, scenario.Service, scenario.Session, 1, buffer);
+        Assert.Equal(KernelError.MissingCapability, begun.Error);
+        Assert.Equal(before, scenario.Kernel.Channels.GetEndpoint(scenario.CallerEndpoint).Value);
+        Assert.Equal(original, buffer.Handle);
+        Assert.True(buffer.IsValid);
+        Assert.Equal(RegionState.Owned, Assert.Single(scenario.Kernel.Regions.Snapshot()).State);
+        Assert.Empty(scenario.Kernel.Regions.SnapshotUses());
+        Assert.Equal(0, scenario.Kernel.EndpointSessions.ActivePinCount(scenario.Session));
+        Assert.Null(scenario.Kernel.SnapshotSessionInvocationConsequence(new(scenario.Session, new(1), new(1))));
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void ThrowAfterSessionPinBalancesOriginalPinWithoutLoanOrUse(bool close)
+    {
+        var scenario = CreateSessionScenario();
+        var buffer = scenario.Kernel.AllocateBuffer<byte>(scenario.Caller, 4).Value!;
+        var original = buffer.Handle;
+        var before = scenario.Kernel.Channels.GetEndpoint(scenario.CallerEndpoint).Value!;
+        scenario.Kernel.InlineBorrowQualificationHook = new PointHook(
+            InlineBorrowQualificationPoint.AfterSessionPin, () =>
+            {
+                if (close)
+                    Assert.Equal(KernelError.SessionDraining,
+                        scenario.Kernel.CloseSession(scenario.Caller, scenario.Session).Error);
+                throw new InvalidOperationException("Borrow preparation interrupted.");
+            });
+        Assert.Throws<InvalidOperationException>(() => scenario.Kernel.BeginInlineBorrowSessionInvocation(
+            scenario.Caller, scenario.Service, scenario.Session, 1, buffer));
+        Assert.Equal(0, scenario.Kernel.EndpointSessions.ActivePinCount(scenario.Session));
+        Assert.True(buffer.IsValid);
+        Assert.Equal(original, buffer.Handle);
+        Assert.Equal(RegionState.Owned, Assert.Single(scenario.Kernel.Regions.Snapshot()).State);
+        Assert.Empty(scenario.Kernel.Regions.SnapshotUses());
+        Assert.Null(scenario.Kernel.SnapshotSessionInvocationConsequence(new(scenario.Session, new(1), new(1))));
+        if (close)
+            Assert.True(scenario.Kernel.Channels.SnapshotClosure(scenario.CallerEndpoint)!.Value.Closed);
+        else
+        {
+            Assert.Equal(before, scenario.Kernel.Channels.GetEndpoint(scenario.CallerEndpoint).Value);
+            Assert.True(scenario.Kernel.CloseSession(scenario.Caller, scenario.Session).IsSuccess);
+        }
+    }
+    [Fact]
     public void CloseBetweenPinAndRevalidationFailsClosedAndClaimsDeferredCleanup()
     {
         var scenario = CreateSessionScenario();
@@ -371,7 +504,7 @@ public sealed class Phase143InlineRegionBorrowTests
             kernel.Processes.Resolve(borrower).Value!, endpoints);
     }
 
-    private static SessionScenario CreateSessionScenario()
+    private static SessionScenario CreateSessionScenario(bool requireCapability = false)
     {
         var kernel = new RuntimeKernel();
         var caller = TestFixtures.Create(kernel, 8121, 812_100).Handle;
@@ -387,8 +520,12 @@ public sealed class Phase143InlineRegionBorrowTests
             "SipJobBorrowSessionQualification", "1", "Ready", ["Borrowed"],
             [message], [new ProtocolTransitionV1(1, "Ready", "Borrowed")]);
         var descriptor = kernel.RegisterService(
-            service, "p14-region-borrow", new(protocol.ContractName, "1", protocol.ContractDigest), protocol).Value!;
-        var session = kernel.OpenSession(caller, descriptor).Value;
+            service, "p14-region-borrow", new(protocol.ContractName, "1", protocol.ContractDigest), protocol,
+            requiredCapabilities: requireCapability ? [new(ResourceKind.Device, "borrow:admission", CapabilityRights.Read)] : []).Value!;
+        var capabilities = requireCapability
+            ? new[] { kernel.MintCapability(new(812_100), caller, ResourceKind.Device, "borrow:admission", CapabilityRights.Read).Value!.CapabilityId }
+            : [];
+        var session = kernel.OpenSession(caller, descriptor, capabilities).Value;
         var endpoint = kernel.EndpointSessions.Resolve(session, caller).Value!.Channel;
         return new(kernel, caller, service, session, endpoint);
     }
@@ -454,6 +591,7 @@ public sealed class Phase143InlineRegionBorrowTests
         EndpointSessionHandle session) :
         IISipJobRegionBorrowQualificationServiceGeneratedSentryTarget_InspectAsync
     {
+        internal int TargetCalls { get; private set; }
         internal KernelResult ProcessNext() => NativeServiceDispatch.Dispatch(
             kernel,
             service,
@@ -489,9 +627,12 @@ public sealed class Phase143InlineRegionBorrowTests
         GeneratedSipSentryResult<SipJobClosedInt>
             IISipJobRegionBorrowQualificationServiceGeneratedSentryTarget_InspectAsync.Sentry_InspectAsync(
                 in TrustedSipInvocationContext context,
-                BorrowLease<byte> payload) =>
-            GeneratedSipSentryResult<SipJobClosedInt>.Success(
+                BorrowLease<byte> payload)
+        {
+            TargetCalls++;
+            return GeneratedSipSentryResult<SipJobClosedInt>.Success(
                 new SipJobClosedInt(payload.Span.ToArray().Sum(static value => value)));
+        }
     }
 
     private sealed record Scenario(

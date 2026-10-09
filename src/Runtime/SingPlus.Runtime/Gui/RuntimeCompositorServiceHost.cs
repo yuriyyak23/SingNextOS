@@ -23,15 +23,24 @@ public sealed class RuntimeCompositorServiceHost
         PresentTransferMode Mode,
         object Payload,
         RegionGeneration PresentedGeneration,
-        PresentOperationIdentity Operation);
+        PresentOperationIdentity Operation)
+    {
+        // Correlates this exact successful RegionAuthority return, never permission
+        // or proof that the independent response publication has completed.
+        public bool BorrowReturned { get; set; }
+    }
 
     private readonly RuntimeKernel _kernel;
+    private readonly object _dispatchDrainGate = new();
+    // Host interlocks only; existing kernel owners retain permission and effects.
+    private bool _operationInProgress;
+    private bool _operationFaultPinned;
     private readonly ProcessHandle _service;
     private readonly EndpointSessionHandle _session;
     private readonly ProcessHandle _caller;
     private readonly Dictionary<RegionId, SurfaceRecord> _surfaces = [];
     private AcceptedPresent? _accepted;
-    private (SurfaceRecord Surface, PresentTransferMode Mode)? _prepared;
+    private (SurfaceRecord Surface, PresentTransferMode Mode, PresentOperationIdentity Operation)? _prepared;
     private ulong _nextSurface = 1;
     private ulong _nextOperation = 1;
     private bool _draining;
@@ -53,13 +62,15 @@ public sealed class RuntimeCompositorServiceHost
         return KernelResult<RuntimeCompositorServiceHost>.Ok(host);
     }
 
-    public KernelResult ProcessNext()
+    public KernelResult ProcessNext() => RunOperation(() =>
     {
-        var accepted = AcceptNext();
-        return accepted.IsSuccess && _accepted is not null ? CompleteAccepted() : accepted;
-    }
+        var accepted = AcceptNextCore();
+        return accepted.IsSuccess && _accepted is not null ? CompleteAcceptedCore() : accepted;
+    }, acceptNewWork: true);
 
-    public KernelResult AcceptNext()
+    public KernelResult AcceptNext() => RunOperation(AcceptNextCore, acceptNewWork: true);
+
+    private KernelResult AcceptNextCore()
     {
         if (_draining) return KernelResult.Fail(KernelError.SessionDraining, "Compositor session is draining.");
         if (_accepted is not null) return KernelResult.Fail(KernelError.PlatformBindingActive, "A present is already accepted.");
@@ -72,6 +83,11 @@ public sealed class RuntimeCompositorServiceHost
             _ = _kernel.CancelSessionResponse(_service, invocation);
             return KernelResult.Fail(KernelError.SessionClosed, "Cancelled before compositor acceptance.");
         }
+        // Host operations are serialized. Refuse exhausted allocation before
+        // service acceptance so cancellation is an exact pre-effect outcome.
+        if (received.Value.Request.MessageId == ICompositorServiceProtocol.Message_RegisterSurfaceAsync && _nextSurface == 0 ||
+            received.Value.Request.MessageId == ICompositorServiceProtocol.Message_PreparePresentAsync && _nextOperation == 0)
+            return Reject(invocation, KernelError.CapacityExhausted, "Compositor identity space is exhausted.");
         var serviceAccepted = _kernel.AcceptSessionInvocation(_service, invocation, allowInFlightCancellation: true);
         if (!serviceAccepted.IsSuccess) return serviceAccepted;
 
@@ -114,29 +130,41 @@ public sealed class RuntimeCompositorServiceHost
         if (presented.Generation.Value != expected)
             return Reject(invocation, KernelError.StaleGeneration, "Presented buffer generation does not match the registered surface generation.");
 
-        surface.State = SurfaceLifecycleState.Presented;
-        _prepared = null;
-        _accepted = new AcceptedPresent(invocation, surface, mode, payload, presented.Generation, new PresentOperationIdentity(_nextOperation++));
+        lock (_dispatchDrainGate)
+        {
+            surface.State = SurfaceLifecycleState.Presented;
+            _prepared = null;
+            _accepted = new AcceptedPresent(invocation, surface, mode, payload, presented.Generation, prepared.Operation);
+        }
         return KernelResult.Ok();
     }
 
-    public KernelResult CompleteAccepted()
+    public KernelResult CompleteAccepted() => RunOperation(CompleteAcceptedCore, acceptNewWork: false);
+
+    private KernelResult CompleteAcceptedCore()
     {
         if (_accepted is not { } work) return KernelResult.Fail(KernelError.PlatformBindingNotFound, "No present is accepted.");
         // The CPU/model provider consumes a bounded snapshot. This is intentionally a copy, never scanout.
-        var bytes = work.Payload switch
+        if (work.Mode != PresentTransferMode.ReadLease || !work.BorrowReturned)
         {
-            OwnedBuffer<byte> moved => moved.Span.ToArray(),
-            BorrowLease<byte> borrowed => borrowed.Span.ToArray(),
-            _ => throw new InvalidOperationException(),
-        };
-        if (bytes.Length != work.Surface.Metadata.Stride * work.Surface.Metadata.Height)
-            return Quarantine(work, "Surface byte extent changed after registration.");
+            var bytes = work.Payload switch
+            {
+                OwnedBuffer<byte> moved => moved.Span.ToArray(),
+                BorrowLease<byte> borrowed => borrowed.Span.ToArray(),
+                _ => throw new InvalidOperationException(),
+            };
+            if (bytes.Length != work.Surface.Metadata.Stride * work.Surface.Metadata.Height)
+                return Quarantine(work, "Surface byte extent changed after registration.");
+        }
 
         if (work.Mode == PresentTransferMode.ReadLease)
         {
-            var returned = _kernel.ReturnBorrow(_service, ((BorrowLease<byte>)work.Payload).Handle);
-            if (!returned.IsSuccess) return Quarantine(work, returned.Message ?? "Borrow release was ambiguous.");
+            if (!work.BorrowReturned)
+            {
+                var returned = _kernel.ReturnBorrow(_service, ((BorrowLease<byte>)work.Payload).Handle);
+                if (!returned.IsSuccess) return Quarantine(work, returned.Message ?? "Borrow release was ambiguous.");
+                lock (_dispatchDrainGate) work.BorrowReturned = true;
+            }
             var fence = new ReleaseFence(work.Operation, work.Surface.Handle, work.PresentedGeneration, true);
             var published = _kernel.PublishSessionResponse(_service, work.Invocation, new ReleaseFenceResponse(fence));
             if (!published.IsSuccess) return Quarantine(work, published.Message ?? "Release publication failed.");
@@ -147,25 +175,67 @@ public sealed class RuntimeCompositorServiceHost
             if (!published.IsSuccess) return Quarantine(work, published.Message ?? "Ownership return failed.");
             work.Surface.RegisteredRegionGeneration = new RegionGeneration(work.PresentedGeneration.Value + 1);
         }
-        work.Surface.State = SurfaceLifecycleState.Writable;
-        _accepted = null;
+        lock (_dispatchDrainGate)
+        {
+            work.Surface.State = SurfaceLifecycleState.Writable;
+            _accepted = null;
+        }
         return KernelResult.Ok();
     }
 
     public KernelResult Drain()
     {
-        _draining = true;
-        if (_accepted is { } accepted)
+        lock (_dispatchDrainGate)
         {
-            accepted.Surface.State = SurfaceLifecycleState.Quarantined;
-            return KernelResult.Fail(KernelError.PlatformFaulted, "Accepted compositor work has ambiguous consumption and remains pinned.");
+            _draining = true;
+            if (_operationInProgress)
+                return KernelResult.Fail(KernelError.SessionDraining, "Compositor dispatch or completion has not settled.");
+            if (_operationFaultPinned)
+                return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Compositor operation outcome is unknown; closure remains pinned.");
+            if (_accepted is { } accepted)
+            {
+                accepted.Surface.State = SurfaceLifecycleState.Quarantined;
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Accepted compositor work has ambiguous consumption and remains pinned.");
+            }
+            foreach (var surface in _surfaces.Values) surface.State = SurfaceLifecycleState.Closed;
+            return KernelResult.Ok();
         }
-        foreach (var surface in _surfaces.Values) surface.State = SurfaceLifecycleState.Closed;
-        return KernelResult.Ok();
     }
 
-    public SurfaceLifecycleState GetSurfaceState(SurfaceHandle handle) =>
-        _surfaces.Values.FirstOrDefault(record => record.Handle == handle)?.State ?? SurfaceLifecycleState.Closed;
+    private KernelResult RunOperation(Func<KernelResult> operation, bool acceptNewWork)
+    {
+        lock (_dispatchDrainGate)
+        {
+            if (_operationInProgress)
+                return KernelResult.Fail(KernelError.SessionDraining, "Compositor operation is already in progress.");
+            if (_operationFaultPinned)
+                return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Compositor operation outcome is unknown; do not repeat it.");
+            if (acceptNewWork && _draining)
+                return KernelResult.Fail(KernelError.SessionDraining, "Compositor session is draining.");
+            _operationInProgress = true;
+        }
+        var returned = false;
+        try
+        {
+            var result = operation();
+            returned = true;
+            return result;
+        }
+        finally
+        {
+            lock (_dispatchDrainGate)
+            {
+                _operationInProgress = false;
+                if (!returned) { _operationFaultPinned = true; _draining = true; }
+            }
+        }
+    }
+
+    public SurfaceLifecycleState GetSurfaceState(SurfaceHandle handle)
+    {
+        lock (_dispatchDrainGate)
+            return _surfaces.Values.FirstOrDefault(record => record.Handle == handle)?.State ?? SurfaceLifecycleState.Closed;
+    }
 
     private KernelResult Register(EndpointSessionInvocationHandle invocation, object? payload)
     {
@@ -181,15 +251,21 @@ public sealed class RuntimeCompositorServiceHost
         if (!metadata.IsSuccess) return Reject(invocation, metadata.Error, metadata.Message!);
         if (_surfaces.ContainsKey(request.Buffer.RegionId))
             return Reject(invocation, KernelError.DuplicateIdentity, "The exact region is already registered in this compositor session.");
-        var handle = new SurfaceHandle(_session, new SurfaceIdentity(_nextSurface++), new SurfaceGeneration(1));
-        _surfaces.Add(request.Buffer.RegionId, new SurfaceRecord
+        var handle = new SurfaceHandle(_session, new SurfaceIdentity(_nextSurface), new SurfaceGeneration(1));
+        var record = new SurfaceRecord
         {
             Handle = handle,
             Owner = _caller,
             Region = request.Buffer.RegionId,
             RegisteredRegionGeneration = request.Buffer.Generation,
             Metadata = metadata.Value!,
-        });
+        };
+        lock (_dispatchDrainGate)
+        {
+            _surfaces.EnsureCapacity(_surfaces.Count + 1);
+            _nextSurface = _nextSurface == ulong.MaxValue ? 0 : _nextSurface + 1;
+            _surfaces.Add(request.Buffer.RegionId, record);
+        }
         var published = _kernel.PublishSessionResponse(_service, invocation, new SurfaceAuthorityResponse(new SurfaceAuthority(handle, request.PresentCapability)));
         return published.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(published.Error, published.Message!);
     }
@@ -205,7 +281,12 @@ public sealed class RuntimeCompositorServiceHost
             return Reject(invocation, KernelError.StaleHandle, "Surface identity/generation/session is unknown or stale.");
         if (surface.Owner != _caller || surface.Handle.Session != _session || surface.State != SurfaceLifecycleState.Writable)
             return Reject(invocation, KernelError.WrongSessionOwner, "Surface is not writable authority of this caller/session.");
-        _prepared = (surface, request.Mode);
+        lock (_dispatchDrainGate)
+        {
+            var operation = new PresentOperationIdentity(_nextOperation);
+            _nextOperation = _nextOperation == ulong.MaxValue ? 0 : _nextOperation + 1;
+            _prepared = (surface, request.Mode, operation);
+        }
         var published = _kernel.PublishSessionResponse(_service, invocation);
         return published.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(published.Error, published.Message!);
     }
@@ -229,7 +310,7 @@ public sealed class RuntimeCompositorServiceHost
 
     private KernelResult Quarantine(AcceptedPresent work, string message)
     {
-        work.Surface.State = SurfaceLifecycleState.Quarantined;
+        lock (_dispatchDrainGate) work.Surface.State = SurfaceLifecycleState.Quarantined;
         return KernelResult.Fail(KernelError.PlatformFaulted, message);
     }
 }

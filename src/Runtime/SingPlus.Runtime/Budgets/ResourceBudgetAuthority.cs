@@ -14,12 +14,19 @@ public sealed class ResourceBudgetAuthority
         public required Dictionary<ServiceBudgetDimension, ulong> Limits { get; init; }
         public Dictionary<ServiceBudgetDimension, ulong> Used { get; } = AllDimensions.ToDictionary(static dimension => dimension, static _ => 0UL);
         public bool Retired { get; set; }
+        public AccountRecord? OriginalParent { get; init; }
+        public List<AccountRecord> Children { get; } = [];
+        // Original live attachment facts; _processAccounts only routes them.
+        public HashSet<ProcessHandle> AttachedProcesses { get; } = [];
+        // Same reservation owner records; routing must not replace quantitative truth.
+        public List<ReservationRecord> Reservations { get; } = [];
     }
 
     private sealed class ReservationRecord
     {
         public required BudgetReservationHandle Handle { get; init; }
         public required BudgetAccountHandle Account { get; init; }
+        public required AccountRecord[] OriginalAccounts { get; init; }
         public required ProcessHandle Owner { get; init; }
         public required BudgetAmount[] Amounts { get; set; }
         public required BudgetReservationLifetime Lifetime { get; init; }
@@ -27,6 +34,18 @@ public sealed class ResourceBudgetAuthority
         // Release provenance belongs to this quantitative owner. Observation of
         // the reservation handle does not detach a live runtime resource charge.
         public bool RuntimeAttached { get; init; }
+        public object? OriginalMappingOwner { get; set; }
+        public ExternalOperationHandle? OriginalExternalOperation { get; set; }
+        public object? OriginalExternalOperationOwner { get; set; }
+        // Exact local ownership lifetime, with the same RegionAuthority record.
+        public RegionHandle? OriginalRegion { get; set; }
+        public DomainId OriginalRegionDomain { get; set; }
+        public object? OriginalRegionOwner { get; set; }
+        public bool RegionLifetimeBound { get; set; }
+        public ChannelId? OriginalIpcChannel { get; set; }
+        public ulong OriginalIpcSequence { get; set; }
+        public ProcessHandle OriginalIpcReceiver { get; set; }
+        public object? OriginalQueuedLifetime { get; set; }
         public BudgetReservationState State { get; set; }
         public BudgetAmount[] ChargedAmounts { get; set; } = [];
         public bool SettlementTerminal { get; set; }
@@ -40,6 +59,7 @@ public sealed class ResourceBudgetAuthority
     private readonly Dictionary<BudgetAccountId, AccountRecord> _accounts = [];
     private readonly Dictionary<BudgetReservationId, ReservationRecord> _reservations = [];
     private readonly Dictionary<ProcessHandle, BudgetAccountHandle> _processAccounts = [];
+    private readonly AccountRecord _systemAccount;
     private ulong _nextAccountId = 2;
     private ulong _nextReservationId = 1;
     private BudgetAmount[] _stagedRecoveryCharges = [];
@@ -50,14 +70,15 @@ public sealed class ResourceBudgetAuthority
         if (initialReservationId == 0) throw new ArgumentOutOfRangeException(nameof(initialReservationId));
         _nextReservationId = initialReservationId;
         SystemBudget = new(new(1), new(1));
-        _accounts.Add(SystemBudget.AccountId, new AccountRecord
+        _systemAccount = new AccountRecord
         {
             Handle = SystemBudget,
             Level = BudgetAccountLevel.System,
             Parent = null,
             OwnerCorrelation = "system",
             Limits = AllDimensions.ToDictionary(static dimension => dimension, static _ => ulong.MaxValue),
-        });
+        };
+        _accounts.Add(SystemBudget.AccountId, _systemAccount);
     }
 
     public BudgetAccountHandle SystemBudget { get; }
@@ -90,7 +111,7 @@ public sealed class ResourceBudgetAuthority
 
     internal bool HasProcessAccount(ProcessHandle process)
     {
-        lock (_gate) return _processAccounts.ContainsKey(process);
+        lock (_gate) return _processAccounts.ContainsKey(process) || HasOriginalProcessAttachment(process);
     }
 
     internal KernelResult<BudgetAccountSnapshot> ConfigureSystem(IReadOnlyList<BudgetAmount> limits)
@@ -99,9 +120,11 @@ public sealed class ResourceBudgetAuthority
         {
             var validation = ValidateAmounts(limits);
             if (!validation.IsSuccess) return KernelResult<BudgetAccountSnapshot>.Fail(validation.Error, validation.Message!);
-            if (_accounts.Count != 1 || _reservations.Values.Any(static reservation => IsCapacityHeld(reservation.State)))
+            if (_accounts.Count != 1 || OriginalReservations().Any(static reservation => IsCapacityHeld(reservation.State)))
                 return KernelResult<BudgetAccountSnapshot>.Fail(KernelError.InvalidTransition, "System budget can be configured only before child allocation or reservations.");
-            var root = _accounts[SystemBudget.AccountId];
+            var resolved = ResolveAccount(SystemBudget);
+            if (!resolved.IsSuccess) return KernelResult<BudgetAccountSnapshot>.Fail(resolved.Error, resolved.Message!);
+            var root = resolved.Value!;
             var configured = new Dictionary<ServiceBudgetDimension, ulong>(root.Limits);
             foreach (var amount in limits) configured[amount.Dimension] = amount.Amount;
             foreach (var charge in _stagedRecoveryCharges)
@@ -140,6 +163,7 @@ public sealed class ResourceBudgetAuthority
         return KernelResult<AccountRecord>.Ok(new AccountRecord
         {
             Handle = handle, Level = level, Parent = parent, OwnerCorrelation = correlation, Limits = selected,
+            OriginalParent = parentRecord,
         });
     }
 
@@ -156,7 +180,10 @@ public sealed class ResourceBudgetAuthority
             if (!prepared.IsSuccess) return KernelResult<BudgetAccountSnapshot>.Fail(prepared.Error, prepared.Message!);
             if (_nextAccountId == 0)
                 return KernelResult<BudgetAccountSnapshot>.Fail(KernelError.CapacityExhausted, "Budget account identity space is exhausted.");
+            var capacity = PrepareAccountOwnerCapacity(parentResult.Value!, 1);
+            if (!capacity.IsSuccess) return KernelResult<BudgetAccountSnapshot>.Fail(capacity.Error, capacity.Message!);
             _accounts.Add(handle.AccountId, prepared.Value!);
+            parentResult.Value!.Children.Add(prepared.Value!);
             _nextAccountId++;
             return KernelResult<BudgetAccountSnapshot>.Ok(Snapshot(prepared.Value!));
         }
@@ -169,7 +196,7 @@ public sealed class ResourceBudgetAuthority
         ArgumentException.ThrowIfNullOrWhiteSpace(processCorrelation);
         lock (_gate)
         {
-            if (_processAccounts.ContainsKey(process))
+            if (_processAccounts.ContainsKey(process) || HasOriginalProcessAttachment(process))
                 return KernelResult<ProcessBudgetAdmission>.Fail(KernelError.DuplicateIdentity, "Process generation already has a budget account.");
             var root = ResolveAccount(SystemBudget);
             if (!root.IsSuccess) return KernelResult<ProcessBudgetAdmission>.Fail(root.Error, root.Message!);
@@ -185,8 +212,16 @@ public sealed class ResourceBudgetAuthority
             var child = PrepareChildRecord(serviceHandle, BudgetAccountLevel.ProcessDomain, processCorrelation,
                 limits, processHandle, service.Value!);
             if (!child.IsSuccess) return KernelResult<ProcessBudgetAdmission>.Fail(child.Error, child.Message!);
+            var capacity = PrepareAccountOwnerCapacity(root.Value!, 2);
+            if (!capacity.IsSuccess) return KernelResult<ProcessBudgetAdmission>.Fail(capacity.Error, capacity.Message!);
+            service.Value!.Children.EnsureCapacity(1);
+            child.Value!.AttachedProcesses.EnsureCapacity(1);
+            _processAccounts.EnsureCapacity(checked(_processAccounts.Count + 1));
             _accounts.Add(serviceHandle.AccountId, service.Value!);
             _accounts.Add(processHandle.AccountId, child.Value!);
+            root.Value!.Children.Add(service.Value!);
+            service.Value!.Children.Add(child.Value!);
+            child.Value!.AttachedProcesses.Add(process);
             _processAccounts.Add(process, processHandle);
             _nextAccountId = unchecked(_nextAccountId + 2);
             return KernelResult<ProcessBudgetAdmission>.Ok(new(process, serviceHandle, processHandle));
@@ -201,10 +236,17 @@ public sealed class ResourceBudgetAuthority
             if (resolved.Value!.Level != BudgetAccountLevel.ProcessDomain)
                 return KernelResult.Fail(KernelError.InvalidTransition, "Only a ProcessDomain budget can attach to a process generation.");
             if (_processAccounts.TryGetValue(process, out var existing))
-                return existing == account
+                return existing == account && resolved.Value.AttachedProcesses.Contains(process)
                     ? KernelResult.Ok()
                     : KernelResult.Fail(KernelError.DuplicateIdentity, "Process generation already has a different budget account.");
+            if (HasOriginalProcessAttachment(process))
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Original process budget attachment lost its route.");
+            if (resolved.Value.AttachedProcesses.Count == int.MaxValue || _processAccounts.Count == int.MaxValue)
+                return KernelResult.Fail(KernelError.CapacityExhausted, "Process budget attachment capacity is exhausted.");
+            resolved.Value.AttachedProcesses.EnsureCapacity(resolved.Value.AttachedProcesses.Count + 1);
+            _processAccounts.EnsureCapacity(_processAccounts.Count + 1);
             _processAccounts.Add(process, account);
+            resolved.Value.AttachedProcesses.Add(process);
             return KernelResult.Ok();
         }
     }
@@ -217,9 +259,9 @@ public sealed class ResourceBudgetAuthority
     {
         lock (_gate)
         {
-            if (!_processAccounts.TryGetValue(owner, out var account))
-                return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.BudgetNotConfigured, "Process generation has no admitted budget hierarchy.");
-            return ReserveCore(owner, account, amounts, lifetime, qosHint);
+            var attached = ResolveProcessAttachment(owner);
+            if (!attached.IsSuccess) return KernelResult<BudgetReservationSnapshot>.Fail(attached.Error, attached.Message!);
+            return ReserveCore(owner, attached.Value!.Handle, amounts, lifetime, qosHint);
         }
     }
 
@@ -229,11 +271,9 @@ public sealed class ResourceBudgetAuthority
     {
         lock (_gate)
         {
-            if (!_processAccounts.TryGetValue(owner, out var account))
-                return KernelResult<BudgetReservationSnapshot>.Fail(
-                    KernelError.BudgetNotConfigured,
-                    "Checkpoint source generation has no admitted budget hierarchy.");
-            return ReserveCore(owner, account,
+            var attached = ResolveProcessAttachment(owner);
+            if (!attached.IsSuccess) return KernelResult<BudgetReservationSnapshot>.Fail(attached.Error, attached.Message!);
+            return ReserveCore(owner, attached.Value!.Handle,
                 [new(ServiceBudgetDimension.CheckpointStorageBytes, bytes)],
                 BudgetReservationLifetime.CheckpointImage,
                 AdmissionQosHint.Background,
@@ -249,13 +289,224 @@ public sealed class ResourceBudgetAuthority
     {
         lock (_gate)
         {
-            if (!_processAccounts.TryGetValue(owner, out var account))
+            if (!_processAccounts.ContainsKey(owner) && !HasOriginalProcessAttachment(owner))
                 return KernelResult<BudgetReservationSnapshot?>.Ok(null);
-            var reserved = ReserveCore(owner, account, amounts, lifetime, qosHint, runtimeAttached: true);
+            var attached = ResolveProcessAttachment(owner);
+            if (!attached.IsSuccess) return KernelResult<BudgetReservationSnapshot?>.Fail(attached.Error, attached.Message!);
+            var reserved = ReserveCore(owner, attached.Value!.Handle, amounts, lifetime, qosHint, runtimeAttached: true);
             return reserved.IsSuccess
                 ? KernelResult<BudgetReservationSnapshot?>.Ok(reserved.Value)
                 : KernelResult<BudgetReservationSnapshot?>.Fail(reserved.Error, reserved.Message!);
         }
+    }
+
+    // Only local final mapping publication uses this existing quantitative gate.
+    // Provider/source/trace callbacks must complete before entering it.
+    internal object MappingReservationPublicationGate => _gate;
+
+    internal KernelResult BindOriginalExternalOperationCharge(ProcessHandle owner, BudgetReservationHandle reservation,
+        ExternalOperationHandle operation, object operationOwner)
+    {
+        lock (_gate)
+        {
+            var resolved = ResolveReservation(owner, reservation);
+            if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+            var record = resolved.Value!;
+            if (!record.RuntimeAttached || record.Lifetime != BudgetReservationLifetime.ExternalEffect ||
+                record.OriginalExternalOperation is { } prior &&
+                (prior != operation || !ReferenceEquals(record.OriginalExternalOperationOwner, operationOwner)))
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Original operation charge cannot be replaced.");
+            record.OriginalExternalOperation = operation;
+            record.OriginalExternalOperationOwner = operationOwner;
+            return KernelResult.Ok();
+        }
+    }
+
+    internal (ExternalOperationHandle Operation, object OperationOwner, ProcessHandle Owner, BudgetReservationHandle Reservation)[]
+        OriginalExternalOperationCharges(ProcessHandle owner)
+    {
+        lock (_gate)
+            return OriginalReservations().Where(record => record.Owner == owner && record.RuntimeAttached &&
+                    record.OriginalExternalOperation is not null && record.OriginalExternalOperationOwner is not null)
+                .Select(record => (record.OriginalExternalOperation!.Value, record.OriginalExternalOperationOwner!, record.Owner, record.Handle))
+                .ToArray();
+    }
+
+    internal KernelResult BindOriginalRegionCharge(ProcessHandle owner, BudgetReservationHandle reservation,
+        RegionHandle region, DomainId domain, object regionOwner)
+    {
+        lock (_gate)
+        {
+            var resolved = ResolveReservation(owner, reservation);
+            if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+            var record = resolved.Value!;
+            if (!record.RuntimeAttached || record.Lifetime != BudgetReservationLifetime.LocalResource ||
+                record.OriginalRegion is { } prior && (prior != region ||
+                    !ReferenceEquals(record.OriginalRegionOwner, regionOwner)))
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Original Region charge lifetime cannot be replaced.");
+            record.OriginalRegion = region;
+            record.OriginalRegionDomain = domain;
+            record.OriginalRegionOwner = regionOwner;
+            record.RegionLifetimeBound = true;
+            return KernelResult.Ok();
+        }
+    }
+
+    internal (RegionHandle? Region, object? RegionOwner, ProcessHandle Owner, BudgetReservationHandle Reservation)[]
+        OriginalRegionChargesForCleanup(ProcessHandle process, DomainId domain)
+    {
+        lock (_gate)
+            return OriginalReservations().Where(record => IsCapacityHeld(record.State) && record.RuntimeAttached &&
+                    record.Lifetime == BudgetReservationLifetime.LocalResource &&
+                    record.Amounts.Any(amount => amount.Dimension == ServiceBudgetDimension.OwnedMemoryBytes) &&
+                    (record.RegionLifetimeBound || record.OriginalRegion is not null || record.OriginalRegionOwner is not null) &&
+                    (record.Owner == process || record.OriginalRegionDomain == domain))
+                .Select(record => (record.OriginalRegion, record.OriginalRegionOwner, record.Owner, record.Handle))
+                .ToArray();
+    }
+
+    internal object? CaptureOriginalMappingReservationOwner(ProcessHandle owner, BudgetReservationHandle? reservation)
+    {
+        lock (_gate)
+            return reservation is { } exact
+                ? OriginalReservations().SingleOrDefault(record => record.Owner == owner && record.Handle == exact &&
+                    record.RuntimeAttached && record.Lifetime == BudgetReservationLifetime.PlatformMapping)
+                : null;
+    }
+
+    internal (object Fact, object? RegionOwner, ProcessHandle Owner, BudgetReservationHandle Reservation)[]
+        OriginalRegionCharges(RegionHandle region)
+    {
+        lock (_gate)
+            return OriginalReservations().Where(record => record.RuntimeAttached &&
+                    record.Lifetime == BudgetReservationLifetime.LocalResource && record.OriginalRegion == region)
+                .Select(record => ((object)record, record.OriginalRegionOwner, record.Owner, record.Handle)).ToArray();
+    }
+
+    internal KernelResult ValidateOriginalRegionCharge(object original, ProcessHandle owner, BudgetReservationHandle reservation)
+    {
+        lock (_gate)
+        {
+            if (original is not ReservationRecord record || record.Owner != owner || record.Handle != reservation ||
+                !OwnsOriginalReservation(record))
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Original Region quantitative fact was replaced.");
+            if (record.State == BudgetReservationState.Released) return KernelResult.Ok();
+            var resolved = ResolveReservation(owner, reservation);
+            return resolved.IsSuccess && ReferenceEquals(resolved.Value, record)
+                ? KernelResult.Ok()
+                : KernelResult.Fail(KernelError.PlatformFaulted, "Original Region quantitative route was lost.");
+        }
+    }
+
+    internal KernelResult<BudgetReservationSnapshot> ReleaseOriginalRegionCharge(object original,
+        ProcessHandle owner, BudgetReservationHandle reservation)
+    {
+        lock (_gate)
+        {
+            var continuity = ValidateOriginalRegionCharge(original, owner, reservation);
+            if (!continuity.IsSuccess)
+                return KernelResult<BudgetReservationSnapshot>.Fail(continuity.Error, continuity.Message!);
+            if (((ReservationRecord)original).State == BudgetReservationState.Released)
+                return KernelResult<BudgetReservationSnapshot>.Ok(Snapshot((ReservationRecord)original));
+            return Release(owner, reservation);
+        }
+    }
+
+    internal KernelResult<object> BindOriginalQueuedCharge(ProcessHandle sender, ProcessHandle receiver,
+        BudgetReservationHandle reservation, ChannelId channel, ulong sequence, object lifetime)
+    {
+        lock (_gate)
+        {
+            var result = ResolveReservation(sender, reservation);
+            if (!result.IsSuccess) return KernelResult<object>.Fail(result.Error, result.Message!);
+            var record = result.Value!;
+            if (!record.RuntimeAttached || record.Lifetime != BudgetReservationLifetime.IpcQueued ||
+                record.OriginalQueuedLifetime is { } prior && !ReferenceEquals(prior, lifetime))
+                return KernelResult<object>.Fail(KernelError.PlatformFaulted, "Original queued charge cannot be replaced.");
+            record.OriginalIpcChannel = channel;
+            record.OriginalIpcSequence = sequence;
+            record.OriginalIpcReceiver = receiver;
+            record.OriginalQueuedLifetime = lifetime;
+            return KernelResult<object>.Ok(record);
+        }
+    }
+
+    internal (object Fact, object? Lifetime, ChannelId Channel, ulong Sequence, ProcessHandle Sender,
+        ProcessHandle Receiver, BudgetReservationHandle Reservation)[] OriginalQueuedCharges()
+    {
+        lock (_gate)
+            return OriginalReservations().Where(record => record.RuntimeAttached &&
+                    record.Lifetime == BudgetReservationLifetime.IpcQueued && record.OriginalIpcChannel is not null)
+                .Select(record => ((object)record, record.OriginalQueuedLifetime, record.OriginalIpcChannel!.Value,
+                    record.OriginalIpcSequence, record.Owner, record.OriginalIpcReceiver, record.Handle)).ToArray();
+    }
+
+    internal KernelResult ValidateOriginalMappingChargeLocked(
+        object? original, object mappingOwner, ProcessHandle owner, BudgetReservationHandle reservation)
+    {
+        if (!Monitor.IsEntered(_gate))
+            throw new InvalidOperationException("Original charge consumption requires the quantitative owner gate.");
+        if (original is ReservationRecord owned && owned.Owner != owner)
+            return KernelResult.Fail(KernelError.WrongRegionOwner, "Budget lease belongs to another process generation.");
+        if (original is not ReservationRecord record || record.Handle != reservation ||
+            !record.RuntimeAttached || record.Lifetime != BudgetReservationLifetime.PlatformMapping ||
+            !ReferenceEquals(record.OriginalMappingOwner, mappingOwner))
+            return KernelResult.Fail(KernelError.PlatformFaulted, "Mapping charge route replaced its original quantitative fact.");
+        if (IsOriginalMappingChargeConsumedLocked(original, mappingOwner)) return KernelResult.Ok();
+        var resolved = ResolveReservation(owner, reservation);
+        return resolved.IsSuccess && ReferenceEquals(resolved.Value, record)
+            ? KernelResult.Ok()
+            : KernelResult.Fail(KernelError.PlatformFaulted, "Original mapping charge owner continuity was lost.");
+    }
+
+    internal KernelResult BindOriginalMappingChargeOwnerLocked(object? original, object mappingOwner)
+    {
+        if (!Monitor.IsEntered(_gate)) throw new InvalidOperationException("Original charge binding requires its owner gate.");
+        if (original is not ReservationRecord record || !OwnsOriginalReservation(record) ||
+            !record.RuntimeAttached || record.Lifetime != BudgetReservationLifetime.PlatformMapping ||
+            record.OriginalMappingOwner is { } bound && !ReferenceEquals(bound, mappingOwner))
+            return KernelResult.Fail(KernelError.PlatformFaulted, "Original mapping charge binding cannot be replaced.");
+        record.OriginalMappingOwner = mappingOwner;
+        return KernelResult.Ok();
+    }
+
+    internal bool IsOriginalMappingChargeConsumedLocked(object? original, object mappingOwner)
+    {
+        if (!Monitor.IsEntered(_gate)) throw new InvalidOperationException("Consumed charge observation requires its owner gate.");
+        return original is ReservationRecord record && record.State == BudgetReservationState.Released &&
+            record.RuntimeAttached && record.Lifetime == BudgetReservationLifetime.PlatformMapping &&
+            ReferenceEquals(record.OriginalMappingOwner, mappingOwner) && OwnsOriginalReservation(record);
+    }
+
+    private bool OwnsOriginalReservation(ReservationRecord record)
+    {
+        var chain = record.OriginalAccounts;
+        if (chain.Length is < 1 or > 3 || chain[0].Handle != record.Account ||
+            !chain[0].Reservations.Any(owned => ReferenceEquals(owned, record))) return false;
+        for (var index = 0; index + 1 < chain.Length; index++)
+            if (!ReferenceEquals(chain[index].OriginalParent, chain[index + 1]) || chain[index].Parent != chain[index + 1].Handle ||
+                !chain[index + 1].Children.Any(owned => ReferenceEquals(owned, chain[index]))) return false;
+        return ReferenceEquals(chain[^1], _systemAccount) && chain[^1].OriginalParent is null && chain[^1].Parent is null;
+    }
+
+    internal KernelResult ValidateMappingReservationPublicationLocked(
+        ProcessHandle owner, BudgetReservationHandle? reservation)
+    {
+        if (!Monitor.IsEntered(_gate))
+            throw new InvalidOperationException("Mapping publication requires the quantitative owner gate.");
+        if (reservation is not { } exact)
+            return !_processAccounts.ContainsKey(owner) && !HasOriginalProcessAttachment(owner)
+                ? KernelResult.Ok()
+                : KernelResult.Fail(KernelError.PlatformFaulted, "Mapping publication lost its configured quantitative admission.");
+        var resolved = ResolveReservation(owner, exact);
+        if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+        var record = resolved.Value!;
+        if (!record.RuntimeAttached || record.Lifetime != BudgetReservationLifetime.PlatformMapping ||
+            record.State != BudgetReservationState.Active || record.OriginalAccounts.Any(account => account.Retired) ||
+            !record.OriginalAccounts[0].AttachedProcesses.Contains(owner) ||
+            !_processAccounts.TryGetValue(owner, out var attached) || attached != record.Account)
+            return KernelResult.Fail(KernelError.PlatformFaulted, "Original live mapping charge is unavailable for publication.");
+        return KernelResult.Ok();
     }
 
     internal KernelResult<BudgetReservationSnapshot> Release(
@@ -277,6 +528,9 @@ public sealed class ResourceBudgetAuthority
                 return KernelResult<BudgetReservationSnapshot>.Ok(Stale(reservation, owner));
             if (record.Owner != owner)
                 return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.WrongRegionOwner, "Budget reservation belongs to another process generation.");
+            var continuity = ValidateReservationContinuity(record);
+            if (!continuity.IsSuccess)
+                return KernelResult<BudgetReservationSnapshot>.Fail(continuity.Error, continuity.Message!);
             if (record.State == BudgetReservationState.Released)
                 return KernelResult<BudgetReservationSnapshot>.Ok(Snapshot(record));
             if (record.State == BudgetReservationState.CancelledPreSubmit)
@@ -352,6 +606,37 @@ public sealed class ResourceBudgetAuthority
                 return KernelResult.Fail(KernelError.InvalidTransition,
                     "Only the exact idle provisional temporal composition can commit.");
             record.TemporalCompositionCommitted = true;
+            return KernelResult.Ok();
+        }
+    }
+
+    internal KernelResult CommitReservedDonation(ProcessHandle owner, BudgetReservationHandle reservation,
+        Func<KernelResult> publish)
+    {
+        lock (_gate)
+        {
+            var resolved = ResolveReservation(owner, reservation);
+            if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+            if (resolved.Value!.State != BudgetReservationState.Reserved)
+                return KernelResult.Fail(KernelError.InvalidTransition, "Donation reservation is no longer Reserved.");
+            return publish();
+        }
+    }
+
+    // Trusted invocation activation only; refusal leaves the exact lease untouched.
+    internal KernelResult CommitDonationConsumption(ProcessHandle owner, BudgetReservationHandle reservation,
+        Func<KernelResult> activate)
+    {
+        lock (_gate)
+        {
+            var resolved = ResolveReservation(owner, reservation);
+            if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+            var record = resolved.Value!;
+            if (record.State != BudgetReservationState.Reserved || !MatchesTemporalConsumer(record, null))
+                return KernelResult.Fail(KernelError.InvalidTransition, "Donation lease is not an idle uncomposed reservation.");
+            var active = activate();
+            if (!active.IsSuccess) return active;
+            record.State = BudgetReservationState.Consuming;
             return KernelResult.Ok();
         }
     }
@@ -432,6 +717,9 @@ public sealed class ResourceBudgetAuthority
         ProcessHandle owner, BudgetReservationHandle reservation, IReadOnlyList<BudgetAmount> actualUsage,
         Guid? temporalComposition = null)
     {
+        // Caller enumeration can reenter or change between reads. Capture outside
+        // the owner lock, then validate and commit one quantitative fact.
+        actualUsage = actualUsage.ToArray();
         lock (_gate)
         {
             var resolved = ResolveReservation(owner, reservation);
@@ -472,9 +760,10 @@ public sealed class ResourceBudgetAuthority
             var record = resolved.Value!;
             return record.Lifetime == BudgetReservationLifetime.ExternalEffect &&
                    record.State == BudgetReservationState.Released && record.SettlementTerminal &&
-                   record.ChargedAmounts.Length == 1 &&
-                   record.ChargedAmounts[0] == new BudgetAmount(
-                       ServiceBudgetDimension.ComputeTimeNanoseconds, chargedAmount);
+                   (chargedAmount == 0 ? record.ChargedAmounts.Length == 0 :
+                    record.ChargedAmounts.Length == 1 &&
+                    record.ChargedAmounts[0] == new BudgetAmount(
+                        ServiceBudgetDimension.ComputeTimeNanoseconds, chargedAmount));
         }
     }
 
@@ -519,6 +808,7 @@ public sealed class ResourceBudgetAuthority
     internal KernelResult<BudgetReservationSnapshot> SplitLease(
         ProcessHandle owner, BudgetReservationHandle reservation, IReadOnlyList<BudgetAmount> childAmounts)
     {
+        childAmounts = childAmounts.ToArray(); // No caller callbacks after parent debit.
         lock (_gate)
         {
             var resolved = ResolveReservation(owner, reservation);
@@ -534,17 +824,54 @@ public sealed class ResourceBudgetAuthority
                 return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.BudgetExceeded, "Split must be a strict positive subset and leave parent capacity.");
             if (_nextReservationId == 0)
                 return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.CapacityExhausted, "Budget reservation identity space is exhausted.");
-            parent.Amounts = parent.Amounts.Select(amount => new BudgetAmount(amount.Dimension,
+            var capacity = PrepareReservationOwnerCapacity(parent.OriginalAccounts[0]);
+            if (!capacity.IsSuccess) return KernelResult<BudgetReservationSnapshot>.Fail(capacity.Error, capacity.Message!);
+            var remainingAmounts = parent.Amounts.Select(amount => new BudgetAmount(amount.Dimension,
                 amount.Amount - requested.GetValueOrDefault(amount.Dimension))).ToArray();
             var handle = AllocateReservationHandle();
             var child = new ReservationRecord
             {
-                Handle = handle, Account = parent.Account, Owner = owner,
+                Handle = handle, Account = parent.Account, OriginalAccounts = parent.OriginalAccounts, Owner = owner,
                 Amounts = childAmounts.OrderBy(static amount => amount.Dimension).ToArray(),
                 Lifetime = parent.Lifetime, QosHint = parent.QosHint, State = BudgetReservationState.Reserved,
             };
+            parent.Amounts = remainingAmounts;
             _reservations.Add(handle.ReservationId, child);
+            parent.OriginalAccounts[0].Reservations.Add(child);
             return KernelResult<BudgetReservationSnapshot>.Ok(Snapshot(child));
+        }
+    }
+
+    // Trusted local invocation publication only. Failed publication returns the
+    // split to its exact parent atomically, without releasing or re-reserving capacity.
+    internal KernelResult<ResourceDonationBinding> SplitDonationAndPublish(ProcessHandle owner,
+        BudgetReservationHandle reservation, IReadOnlyList<BudgetAmount> childAmounts,
+        Func<BudgetReservationHandle, KernelResult<ResourceDonationBinding>> publish)
+    {
+        childAmounts = childAmounts.ToArray();
+        lock (_gate)
+        {
+            var resolved = ResolveReservation(owner, reservation);
+            if (!resolved.IsSuccess) return KernelResult<ResourceDonationBinding>.Fail(resolved.Error, resolved.Message!);
+            var parent = resolved.Value!;
+            var original = parent.Amounts;
+            var split = SplitLease(owner, reservation, childAmounts);
+            if (!split.IsSuccess) return KernelResult<ResourceDonationBinding>.Fail(split.Error, split.Message!);
+            var committed = false;
+            try
+            {
+                var result = publish(split.Value!.Reservation);
+                committed = result.IsSuccess;
+                return result;
+            }
+            finally
+            {
+                if (!committed)
+                {
+                    parent.Amounts = original;
+                    _reservations[split.Value!.Reservation.ReservationId].State = BudgetReservationState.CancelledPreSubmit;
+                }
+            }
         }
     }
 
@@ -562,7 +889,7 @@ public sealed class ResourceBudgetAuthority
     internal KernelResult<BudgetReservationSnapshot> Query(BudgetReservationHandle reservation)
     {
         lock (_gate)
-            return _reservations.TryGetValue(reservation.ReservationId, out var record) && record.Handle == reservation
+            return _reservations.TryGetValue(reservation.ReservationId, out var record) && record.Handle == reservation && ValidateReservationContinuity(record).IsSuccess
                 ? KernelResult<BudgetReservationSnapshot>.Ok(Snapshot(record))
                 : KernelResult<BudgetReservationSnapshot>.Fail(KernelError.BudgetReservationNotFound, "Budget reservation was not found or is stale.");
     }
@@ -570,7 +897,7 @@ public sealed class ResourceBudgetAuthority
     internal BudgetReservationSnapshot[] InspectionSnapshot()
     {
         lock (_gate)
-            return _reservations.Values
+            return OriginalReservations()
                 .Where(static reservation => IsCapacityHeld(reservation.State))
                 .Select(Snapshot)
                 .OrderBy(static reservation => reservation.Reservation.ReservationId.Value)
@@ -584,9 +911,10 @@ public sealed class ResourceBudgetAuthority
     {
         lock (_gate)
         {
-            if (!_processAccounts.TryGetValue(process, out var attached) || attached != processAccount)
+            var attached = ResolveProcessAttachment(process);
+            if (!attached.IsSuccess || attached.Value!.Handle != processAccount)
                 return KernelResult.Fail(KernelError.StaleGeneration, "Process budget attachment is stale.");
-            if (_reservations.Values.Any(record => IsCapacityHeld(record.State) &&
+            if (OriginalReservations().Any(record => IsCapacityHeld(record.State) &&
                                                    record.Account == processAccount &&
                                                    record.Lifetime != BudgetReservationLifetime.CheckpointImage))
                 return KernelResult.Fail(KernelError.ReplacementBlocked, "Active live-resource reservations keep the process budget charged.");
@@ -598,10 +926,11 @@ public sealed class ResourceBudgetAuthority
                 serviceResolved.Value!.Level != BudgetAccountLevel.Service ||
                 processResolved.Value.Parent != serviceAccount || serviceResolved.Value.Parent != SystemBudget)
                 return KernelResult.Fail(KernelError.StaleGeneration, "Budget retirement requires the exact process/service parent hierarchy.");
-            if (_processAccounts.Any(item => item.Key != process && item.Value == processAccount) ||
-                _accounts.Values.Any(item => !item.Retired && item.Parent == serviceAccount && item.Handle != processAccount))
+            if (processResolved.Value.AttachedProcesses.Any(owner => owner != process) ||
+                serviceResolved.Value.Children.Any(item => !item.Retired && item.Handle != processAccount))
                 return KernelResult.Fail(KernelError.ReplacementBlocked, "Other live process attachments or children keep the service hierarchy live.");
             _processAccounts.Remove(process);
+            processResolved.Value.AttachedProcesses.Remove(process);
             processResolved.Value!.Retired = true;
             serviceResolved.Value!.Retired = true;
             return KernelResult.Ok();
@@ -633,14 +962,14 @@ public sealed class ResourceBudgetAuthority
         }
         if (_nextReservationId == 0)
             return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.CapacityExhausted, "Budget reservation identity space is exhausted.");
-        foreach (var ancestor in chain)
-        foreach (var amount in amounts)
-            ancestor.Used[amount.Dimension] += amount.Amount;
+        var capacity = PrepareReservationOwnerCapacity(chain[0]);
+        if (!capacity.IsSuccess) return KernelResult<BudgetReservationSnapshot>.Fail(capacity.Error, capacity.Message!);
         var handle = AllocateReservationHandle();
         var record = new ReservationRecord
         {
             Handle = handle,
             Account = account,
+            OriginalAccounts = chain,
             Owner = owner,
             Amounts = amounts.OrderBy(static amount => amount.Dimension).ToArray(),
             Lifetime = lifetime,
@@ -648,8 +977,92 @@ public sealed class ResourceBudgetAuthority
             RuntimeAttached = runtimeAttached,
             State = BudgetReservationState.Active,
         };
+        foreach (var ancestor in chain)
+        foreach (var amount in amounts)
+            ancestor.Used[amount.Dimension] += amount.Amount;
         _reservations.Add(handle.ReservationId, record);
+        chain[0].Reservations.Add(record);
         return KernelResult<BudgetReservationSnapshot>.Ok(Snapshot(record));
+    }
+
+    private KernelResult PrepareReservationOwnerCapacity(AccountRecord account)
+    {
+        if (account.Reservations.Count == int.MaxValue || _reservations.Count == int.MaxValue)
+            return KernelResult.Fail(KernelError.CapacityExhausted, "Reservation owner capacity is exhausted.");
+        account.Reservations.EnsureCapacity(account.Reservations.Count + 1);
+        _reservations.EnsureCapacity(_reservations.Count + 1);
+        return KernelResult.Ok();
+    }
+
+    private KernelResult ValidateReservationContinuity(ReservationRecord record)
+    {
+        var chain = record.OriginalAccounts;
+        if (chain.Length == 0 || chain[0].Handle != record.Account ||
+            !chain[0].Reservations.Any(original => ReferenceEquals(original, record)))
+            return KernelResult.Fail(KernelError.PlatformFaulted, "Original quantitative reservation owner was lost.");
+        var continuity = ValidateAccountContinuity(chain[0]);
+        if (!continuity.IsSuccess) return continuity;
+        for (var index = 0; index < chain.Length; index++)
+            if (!_accounts.TryGetValue(chain[index].Handle.AccountId, out var current) || !ReferenceEquals(current, chain[index]) ||
+                chain[index].Parent != (index + 1 < chain.Length ? chain[index + 1].Handle : (BudgetAccountHandle?)null))
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Original quantitative account ancestry was lost.");
+        return KernelResult.Ok();
+    }
+
+    private IEnumerable<ReservationRecord> OriginalReservations() =>
+        OriginalAccounts().SelectMany(account => account.Reservations);
+
+    private IEnumerable<AccountRecord> OriginalAccounts()
+    {
+        yield return _systemAccount;
+        foreach (var service in _systemAccount.Children)
+        {
+            yield return service;
+            foreach (var process in service.Children) yield return process;
+        }
+    }
+
+    private bool HasOriginalProcessAttachment(ProcessHandle process) =>
+        OriginalAccounts().Any(account => account.AttachedProcesses.Contains(process));
+
+    private KernelResult<AccountRecord> ResolveProcessAttachment(ProcessHandle process)
+    {
+        if (!_processAccounts.TryGetValue(process, out var handle))
+            return KernelResult<AccountRecord>.Fail(HasOriginalProcessAttachment(process) ? KernelError.PlatformFaulted : KernelError.BudgetNotConfigured,
+                "Process budget attachment is absent or lost its original route.");
+        var resolved = ResolveAccount(handle);
+        if (!resolved.IsSuccess) return resolved;
+        return resolved.Value!.AttachedProcesses.Contains(process)
+            ? resolved
+            : KernelResult<AccountRecord>.Fail(KernelError.PlatformFaulted, "Process budget route does not refer to its original attachment owner.");
+    }
+
+    private KernelResult PrepareAccountOwnerCapacity(AccountRecord parent, int routeCount)
+    {
+        if (parent.Children.Count == int.MaxValue || _accounts.Count > int.MaxValue - routeCount)
+            return KernelResult.Fail(KernelError.CapacityExhausted, "Budget account owner capacity is exhausted.");
+        parent.Children.EnsureCapacity(parent.Children.Count + 1);
+        _accounts.EnsureCapacity(_accounts.Count + routeCount);
+        return KernelResult.Ok();
+    }
+
+    private KernelResult ValidateAccountContinuity(AccountRecord account)
+    {
+        var current = account;
+        for (var remaining = 3; remaining > 0; remaining--)
+        {
+            if (!_accounts.TryGetValue(current.Handle.AccountId, out var routed) || !ReferenceEquals(routed, current))
+                break;
+            if (current.OriginalParent is not { } parent)
+                return ReferenceEquals(current, _systemAccount) && current.Parent is null && current.Level == BudgetAccountLevel.System
+                    ? KernelResult.Ok()
+                    : KernelResult.Fail(KernelError.PlatformFaulted, "Original quantitative system owner was lost.");
+            if (current.Parent != parent.Handle || (int)current.Level != (int)parent.Level + 1 ||
+                !parent.Children.Any(child => ReferenceEquals(child, current)))
+                break;
+            current = parent;
+        }
+        return KernelResult.Fail(KernelError.PlatformFaulted, "Original quantitative account hierarchy was lost.");
     }
 
     private IEnumerable<AccountRecord> Ancestors(BudgetAccountHandle leaf)
@@ -680,6 +1093,8 @@ public sealed class ResourceBudgetAuthority
             return KernelResult<ReservationRecord>.Fail(KernelError.StaleGeneration, "Budget lease generation is stale.");
         if (record.Owner != owner)
             return KernelResult<ReservationRecord>.Fail(KernelError.WrongRegionOwner, "Budget lease belongs to another process generation.");
+        var continuity = ValidateReservationContinuity(record);
+        if (!continuity.IsSuccess) return KernelResult<ReservationRecord>.Fail(continuity.Error, continuity.Message!);
         return KernelResult<ReservationRecord>.Ok(record);
     }
 
@@ -716,6 +1131,8 @@ public sealed class ResourceBudgetAuthority
     {
         if (!_accounts.TryGetValue(handle.AccountId, out var account) || account.Handle != handle || account.Retired)
             return KernelResult<AccountRecord>.Fail(KernelError.StaleGeneration, "Budget account generation is stale.");
+        var continuity = ValidateAccountContinuity(account);
+        if (!continuity.IsSuccess) return KernelResult<AccountRecord>.Fail(continuity.Error, continuity.Message!);
         return KernelResult<AccountRecord>.Ok(account);
     }
 
@@ -732,8 +1149,8 @@ public sealed class ResourceBudgetAuthority
     private BudgetAccountSnapshot Snapshot(AccountRecord record)
     {
         var usage = AllDimensions.Select(dimension => new BudgetUsage(dimension, record.Limits[dimension], record.Used[dimension])).ToArray();
-        var pinned = _reservations.Values.Any(reservation => IsCapacityHeld(reservation.State) &&
-            reservation.Lifetime == BudgetReservationLifetime.ExternalEffect && Ancestors(reservation.Account).Any(account => account.Handle == record.Handle));
+        var pinned = OriginalReservations().Any(reservation => IsCapacityHeld(reservation.State) &&
+            reservation.Lifetime == BudgetReservationLifetime.ExternalEffect && reservation.OriginalAccounts.Any(account => ReferenceEquals(account, record)));
         var pressure = pinned
             ? BudgetPressureState.PinnedByExternalEffect
             : usage.Any(static item => item.Used == item.Limit && item.Limit != 0)

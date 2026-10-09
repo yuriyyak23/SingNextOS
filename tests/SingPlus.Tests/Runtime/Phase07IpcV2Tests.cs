@@ -8,6 +8,74 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class Phase07IpcV2Tests(ITestOutputHelper output)
 {
+    [Theory]
+    [InlineData(0, false)] [InlineData(0, true)]
+    [InlineData(1, false)] [InlineData(1, true)]
+    [InlineData(2, false)] [InlineData(2, true)]
+    [InlineData(3, false)] [InlineData(3, true)]
+    public void CompletionClockReentryOrThrowPreservesExactCommittedReceipt(int mode, bool throws)
+    {
+        var clock = new CompletionClock();
+        var s = Create(mode is 0 or 3 ? RequestPayloadKind.Bounded : RequestPayloadKind.Ownership,
+            maxBytes: mode == 3 ? IpcV2Contract.MaximumScatterGatherBytes : 64,
+            disposition: mode == 1 ? OwnershipRequestDisposition.Consume : OwnershipRequestDisposition.Borrow,
+            timeProvider: clock);
+        var source = s.Kernel.AllocateBuffer<byte>(s.Left, 8).Value!;
+        var old = source.Handle;
+        var scope = s.Kernel.CreateCancellationScope(s.Left, new(200)).Value!.Scope;
+        ChannelEnvelope? received = null;
+        clock.Remaining = 2;
+        clock.Callback = () =>
+        {
+            var worker = Task.Run(() => s.Kernel.Receive(s.Right, s.Endpoints.Right));
+            Assert.True(worker.Wait(TimeSpan.FromSeconds(5)), "Completion clock ran under IPC commit lock.");
+            Assert.True(worker.Result.IsSuccess);
+            received = worker.Result.Value!;
+            if (throws) throw new InvalidOperationException("late completion clock fault");
+        };
+        var sent = mode switch
+        {
+            0 => s.Kernel.SendCopyV2(s.Left, s.Right, s.Endpoints.Left, 1, new IpcCopyPayload(new byte[] { 1 }, 64), cancellationScope: scope),
+            1 => s.Kernel.SendMoveV2(s.Left, s.Right, s.Endpoints.Left, 1, source, cancellationScope: scope),
+            2 => s.Kernel.SendBorrowReadV2(s.Left, s.Right, s.Endpoints.Left, 1, source, cancellationScope: scope),
+            _ => s.Kernel.SendScatterGatherCopyV2(s.Left, s.Right, s.Endpoints.Left, 1, [new(source, 0, 8)], cancellationScope: scope),
+        };
+        Assert.True(sent.IsSuccess, sent.Message);
+        Assert.Same(received, sent.Value!.Envelope);
+        Assert.Equal(1UL, sent.Value.Envelope.Sequence);
+        Assert.False(s.Kernel.Receive(s.Right, s.Endpoints.Right).IsSuccess);
+        var observed = s.Kernel.ObserveCancellation(s.Left, scope).Value!;
+        Assert.Equal(throws ? CancellationDisposition.TooLateEffectMayExist : CancellationDisposition.CompletedBeforeCancellation, observed.Disposition);
+        Assert.False(observed.AuthorizesReclaim);
+        Assert.False(observed.AuthorizesEffect);
+        if (mode == 1)
+        {
+            Assert.False(source.IsValid);
+            var moved = Assert.IsType<OwnedBuffer<byte>>(received!.Payload);
+            Assert.Equal(old.Generation.Value + 1, moved.Handle.Generation.Value);
+            Assert.True(moved.IsValid);
+        }
+        else if (mode == 2)
+        {
+            var borrowed = Assert.IsType<BorrowLease<byte>>(received!.Payload);
+            Assert.False(s.Kernel.ReleaseRegion(s.Left, source).IsSuccess);
+            Assert.True(s.Kernel.ReturnBorrow(s.Right, borrowed.Handle).IsSuccess);
+            Assert.True(s.Kernel.ReleaseRegion(s.Left, source).IsSuccess);
+        }
+        else Assert.True(source.IsValid);
+    }
+
+    private sealed class CompletionClock : TimeProvider
+    {
+        public int Remaining;
+        public Action? Callback;
+        public override long GetTimestamp()
+        {
+            if (--Remaining == 0) Interlocked.Exchange(ref Callback, null)?.Invoke();
+            return 100;
+        }
+    }
+
     [Fact]
     public void CopyIsValueIndependentAndReceiptNeverPromisesZeroCopy()
     {
@@ -165,9 +233,9 @@ public sealed class Phase07IpcV2Tests(ITestOutputHelper output)
         int capacity = 4,
         int maxBytes = 0,
         OwnershipRequestDisposition disposition = OwnershipRequestDisposition.None,
-        CapabilityRequirementV1? requirement = null)
+        CapabilityRequirementV1? requirement = null, TimeProvider? timeProvider = null)
     {
-        var kernel = new RuntimeKernel();
+        var kernel = new RuntimeKernel(null, timeProvider);
         var left = TestFixtures.Create(kernel, 701, 7001).Handle;
         var right = TestFixtures.Create(kernel, 702, 7002).Handle;
         RequestPayloadDescriptorV1 payload;

@@ -5,23 +5,48 @@ namespace SingPlus.Platform.HybridCpu;
 public sealed partial class HybridCpuPlatformAuthorityProvider :
     IPlatformAuthorityProvider,
     IPlatformFeatureProvider,
-    IPlatformDomainExecutionProvider
+    IPlatformDomainExecutionProvider,
+    IPlatformChildCreateDispositionProvider
 {
+    private sealed record RootTransitionFact(PlatformDomainExecutionTransition Transition, NeutralExecutionTransitionResult? Observation);
     private sealed class DomainRecord(
         PlatformProviderDomainLease lease,
         NeutralDomainBindingLease hybridCpuLease)
     {
         public PlatformProviderDomainLease Lease { get; } = lease;
         public NeutralDomainBindingLease HybridCpuLease { get; } = hybridCpuLease;
+        public RootBindRecord? BindSource { get; init; }
         public bool ExternalRevocationObserved { get; set; }
         public bool Revoked { get; set; }
+        public bool ChildCreateInFlight { get; set; }
+        public ChildCreateFailure? FailedChildCreate { get; set; }
+        public bool RootCloseInFlight { get; set; }
+        public bool RootCloseUncertain { get; set; }
+        public NeutralDomainCloseResult? RootCloseObservation { get; set; }
+        public bool DeviceBindInFlight { get; set; }
+        public DeviceBindFailure? FailedDeviceBind { get; set; }
+        public bool OwnedMapInFlight { get; set; }
+        public OwnedMapFailure? FailedOwnedMap { get; set; }
+        public bool RootTransitionInFlight { get; set; }
+        public bool RootTransitionUncertain { get; set; }
+        public RootTransitionFact? RootTransition { get; set; }
     }
 
     private readonly INeutralDomainRuntime _runtime;
     private readonly INeutralChildDomainProvider? _childRuntime;
     private readonly INeutralRuntimeFeatureProvider? _childFeatureSource;
     private readonly Dictionary<PlatformProviderDomainLeaseId, DomainRecord> _domains = [];
-    private readonly Dictionary<PlatformDomainIdentity, PlatformProviderDomainLeaseId> _activeSubjects = [];
+    private readonly Dictionary<PlatformDomainIdentity, DomainRecord> _activeSubjects = [];
+    private sealed class RootBindRecord(PlatformProviderDomainLease lease)
+    {
+        public PlatformProviderDomainLease Lease { get; } = lease;
+        public bool InFlight { get; set; } = true;
+        public NeutralDomainBindResult? Observation { get; set; }
+        public DomainRecord? PublishedDomain { get; set; }
+    }
+    private readonly Dictionary<PlatformDomainIdentity, RootBindRecord> _rootBinds = [];
+    // Original invocation and published owner references, not a second binding ledger.
+    private readonly Dictionary<PlatformProviderDomainLeaseId, RootBindRecord> _originalRootBinds = [];
     private readonly PlatformFeatureManifest _featureManifest;
     private ulong _nextProviderDomainId = 1;
 
@@ -125,38 +150,67 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                 subjectValidation.Status,
                 subjectValidation.Message!);
 
-        if (_activeSubjects.ContainsKey(subject))
+        RootBindRecord invocation;
+        lock (_childCreateCommitGate)
         {
-            return PlatformAuthorityResult<PlatformProviderDomainLease>.Fail(
-                PlatformAuthorityStatus.Denied,
-                "The platform subject already has an active HybridCPU binding.");
+            if (_activeSubjects.ContainsKey(subject))
+                return PlatformAuthorityResult<PlatformProviderDomainLease>.Fail(PlatformAuthorityStatus.Denied,
+                    "The platform subject already has an active HybridCPU binding.");
+            if (_originalRootBinds.Values.Any(original => original.Lease.Subject == subject &&
+                (original.PublishedDomain is not { Revoked: true, RootCloseObservation: { Decision: NeutralDomainCloseDecision.Closed or NeutralDomainCloseDecision.Revoked } })))
+                return PlatformAuthorityResult<PlatformProviderDomainLease>.Fail(PlatformAuthorityStatus.Faulted,
+                    "Original subject binding is live or unresolved; routing loss does not admit a second owner.");
+            if (_rootBinds.ContainsKey(subject))
+                return PlatformAuthorityResult<PlatformProviderDomainLease>.Fail(PlatformAuthorityStatus.Faulted,
+                    "Original root binding is pending or unresolved; repeat effect refused.");
+            if (_nextProviderDomainId is 0 or ulong.MaxValue)
+                return PlatformAuthorityResult<PlatformProviderDomainLease>.Fail(PlatformAuthorityStatus.Faulted,
+                    "Provider root identity capacity exhausted before neutral binding.");
+            invocation = new(new(new(_nextProviderDomainId++), new(1), subject));
+            var capacity = checked(_originalRootBinds.Count + 1);
+            _originalRootBinds.EnsureCapacity(capacity);
+            _rootBinds.EnsureCapacity(checked(_rootBinds.Count + 1));
+            _domains.EnsureCapacity(capacity);
+            _activeSubjects.EnsureCapacity(capacity);
+            _originalRootBinds.Add(invocation.Lease.LeaseId, invocation);
+            _rootBinds.Add(subject, invocation);
         }
-
-        var external = _runtime.Bind(NeutralDomainProfile.OrdinaryService);
-        if (!external.IsBound)
-            return FromBindFailure(external);
-
-        var lease = new PlatformProviderDomainLease(
-            new PlatformProviderDomainLeaseId(NextNonZero(ref _nextProviderDomainId)),
-            new PlatformProviderLeaseGeneration(1),
-            subject);
-        _domains.Add(lease.LeaseId, new DomainRecord(lease, external.Lease));
-        _activeSubjects.Add(subject, lease.LeaseId);
-        return PlatformAuthorityResult<PlatformProviderDomainLease>.Ok(lease);
+        try
+        {
+            var external = _runtime.Bind(NeutralDomainProfile.OrdinaryService);
+            lock (_childCreateCommitGate)
+            {
+                invocation.Observation = external;
+                if (!external.IsBound && external.Decision == NeutralDomainBindDecision.UnsupportedProfile && external.Lease == default)
+                {
+                    if (!_originalRootBinds.TryGetValue(invocation.Lease.LeaseId, out var original) || !ReferenceEquals(original, invocation))
+                        return PlatformAuthorityResult<PlatformProviderDomainLease>.Fail(PlatformAuthorityStatus.Faulted,
+                            "Original no-effect root binding owner changed; consumption refused.");
+                    _originalRootBinds.Remove(invocation.Lease.LeaseId);
+                    if (_rootBinds.TryGetValue(subject, out var pending) && ReferenceEquals(pending, invocation)) _rootBinds.Remove(subject);
+                    return FromBindFailure(external);
+                }
+                if (!external.IsBound || external.Decision != NeutralDomainBindDecision.Bound || external.Lease.Handle.Value == 0 ||
+                    external.Lease.Epoch.Value == 0 || !_originalRootBinds.TryGetValue(invocation.Lease.LeaseId, out var originalOwner) || !ReferenceEquals(originalOwner, invocation) ||
+                    !_rootBinds.TryGetValue(subject, out var current) || !ReferenceEquals(current, invocation) ||
+                    _activeSubjects.ContainsKey(subject) || _domains.ContainsKey(invocation.Lease.LeaseId))
+                    return PlatformAuthorityResult<PlatformProviderDomainLease>.Fail(PlatformAuthorityStatus.Faulted,
+                        "Original root outcome retained without exact binding publication or closure.");
+                var record = new DomainRecord(invocation.Lease, external.Lease) { BindSource = invocation };
+                invocation.PublishedDomain = record;
+                _domains.Add(invocation.Lease.LeaseId, record);
+                _activeSubjects.Add(subject, record);
+                _rootBinds.Remove(subject);
+                return PlatformAuthorityResult<PlatformProviderDomainLease>.Ok(invocation.Lease);
+            }
+        }
+        finally { lock (_childCreateCommitGate) invocation.InFlight = false; }
     }
 
     public PlatformAuthorityResult<PlatformDomainExecutionTransitionResult> TransitionDomainExecution(
         PlatformProviderDomainLease domainLease,
         PlatformDomainExecutionTransition transition)
     {
-        var validation = ValidateDomain(domainLease);
-        if (!validation.IsSuccess)
-        {
-            return PlatformAuthorityResult<PlatformDomainExecutionTransitionResult>.Fail(
-                validation.Status,
-                validation.Message ?? "The provider domain lease is not live.");
-        }
-
         var transitionValidation = PlatformDomainExecutionContract.ValidateTransition(transition);
         if (!transitionValidation.IsSuccess)
         {
@@ -165,56 +219,87 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                 transitionValidation.Message ?? "The platform execution transition is invalid.");
         }
 
-        var record = _domains[domainLease.LeaseId];
+        DomainRecord record;
         var neutralTransition = ToNeutralTransition(transition);
-        var external = _runtime.TransitionExecution(record.HybridCpuLease, neutralTransition);
-        if (!external.IsTransitioned)
+        lock (_childCreateCommitGate)
         {
-            if (external.Decision == NeutralExecutionTransitionDecision.Revoked)
-                record.ExternalRevocationObserved = true;
-
-            var status = external.Decision switch
+            var validation = ValidateDomain(domainLease, allowRetainedTransition: true);
+            if (!validation.IsSuccess)
+                return PlatformAuthorityResult<PlatformDomainExecutionTransitionResult>.Fail(validation.Status, validation.Message!);
+            record = _domains[domainLease.LeaseId];
+            if (record.RootTransitionInFlight || record.RootTransitionUncertain ||
+                record.RootTransition is { } original && original.Transition != transition)
+                return PlatformAuthorityResult<PlatformDomainExecutionTransitionResult>.Fail(PlatformAuthorityStatus.Faulted,
+                    "Original root transition is pending, unknown or belongs to a different request.");
+            record.RootTransition ??= new(transition, null);
+            record.RootTransitionInFlight = true;
+        }
+        try
+        {
+            NeutralExecutionTransitionResult external;
+            try { external = record.RootTransition!.Observation ?? _runtime.TransitionExecution(record.HybridCpuLease, neutralTransition); }
+            catch { lock (_childCreateCommitGate) record.RootTransitionUncertain = true; throw; }
+            lock (_childCreateCommitGate)
             {
-                NeutralExecutionTransitionDecision.InvalidTransition => PlatformAuthorityStatus.Denied,
-                NeutralExecutionTransitionDecision.Revoked => PlatformAuthorityStatus.Revoked,
-                NeutralExecutionTransitionDecision.Stale => PlatformAuthorityStatus.Faulted,
-                NeutralExecutionTransitionDecision.NotFound => PlatformAuthorityStatus.Faulted,
-                NeutralExecutionTransitionDecision.Faulted => PlatformAuthorityStatus.Faulted,
-                _ => PlatformAuthorityStatus.Faulted,
-            };
-
-            return PlatformAuthorityResult<PlatformDomainExecutionTransitionResult>.Fail(
-                status,
-                external.Reason);
+                record.RootTransition = new(transition, external);
+                var exactTuple = external.Lease == record.HybridCpuLease && external.Transition == neutralTransition;
+                var success = exactTuple && external.IsTransitioned && external.Decision == NeutralExecutionTransitionDecision.Transitioned &&
+                    external.State == ToNeutralState(PlatformDomainExecutionContract.ExpectedState(transition));
+                var denied = exactTuple && !external.IsTransitioned && external.Decision == NeutralExecutionTransitionDecision.InvalidTransition && external.State == default;
+                if (!success && !denied)
+                {
+                    record.RootTransitionUncertain = true;
+                    if (!external.IsTransitioned && external.Decision == NeutralExecutionTransitionDecision.Revoked)
+                        record.ExternalRevocationObserved = true;
+                    return PlatformAuthorityResult<PlatformDomainExecutionTransitionResult>.Fail(
+                        external.Decision == NeutralExecutionTransitionDecision.Revoked ? PlatformAuthorityStatus.Revoked : PlatformAuthorityStatus.Faulted,
+                        "Original root transition outcome retained without publication or closure.");
+                }
+                if (!_domains.TryGetValue(domainLease.LeaseId, out var current) || !ReferenceEquals(current, record) ||
+                    current.Lease != domainLease || !ValidateDomain(domainLease, allowRetainedTransition: true).IsSuccess)
+                    return PlatformAuthorityResult<PlatformDomainExecutionTransitionResult>.Fail(PlatformAuthorityStatus.Faulted,
+                        "Exact original transition retained without current owner publication.");
+                record.RootTransition = null;
+                if (denied)
+                    return PlatformAuthorityResult<PlatformDomainExecutionTransitionResult>.Fail(PlatformAuthorityStatus.Denied, external.Reason);
+                return PlatformAuthorityResult<PlatformDomainExecutionTransitionResult>.Ok(new(record.Lease, transition, FromNeutralState(external.State)));
+            }
         }
-
-        if (external.Lease != record.HybridCpuLease ||
-            external.Transition != neutralTransition ||
-            external.State != ToNeutralState(PlatformDomainExecutionContract.ExpectedState(transition)))
-        {
-            return PlatformAuthorityResult<PlatformDomainExecutionTransitionResult>.Fail(
-                PlatformAuthorityStatus.Faulted,
-                "HybridCPU returned execution evidence that does not match the provider-owned transition.");
-        }
-
-        return PlatformAuthorityResult<PlatformDomainExecutionTransitionResult>.Ok(
-            new PlatformDomainExecutionTransitionResult(
-                record.Lease,
-                transition,
-                FromNeutralState(external.State)));
+        finally { lock (_childCreateCommitGate) record.RootTransitionInFlight = false; }
     }
 
     public PlatformAuthorityResult RevokeDomain(PlatformProviderDomainLease lease)
     {
+        DomainRecord record;
+        lock (_childCreateCommitGate)
+        {
         var validation = ValidateDomainIdentity(lease);
         if (!validation.IsSuccess) return validation;
 
-        var record = _domains[lease.LeaseId];
+        record = _domains[lease.LeaseId];
         if (record.Revoked)
         {
             return PlatformAuthorityResult.Fail(
                 PlatformAuthorityStatus.Revoked,
                 "The provider domain lease has already been revoked.");
+        }
+
+        if (record.ChildCreateInFlight || record.FailedChildCreate is not null ||
+            record.OwnedMapInFlight || record.FailedOwnedMap is not null ||
+            record.DeviceBindInFlight || record.FailedDeviceBind is not null)
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Denied,
+                "Original child create invocation remains in flight or pinned.");
+        if (record.RootCloseInFlight || record.RootCloseUncertain || record.RootTransitionInFlight)
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Denied,
+                "Original root close is in flight or has an unknown outcome.");
+        if (_originalProviderChildren.Values.Any(child => child.Lease.ParentDomainLease == lease &&
+                (!HasPublishedChildClosure(child) || child.GuestMapInFlight || child.UnclosedGuestMap is not null)) ||
+            _originalProviderGuestMappings.Values.Where(mapping => !mapping.ClosurePublished).Any(mapping => mapping.Lease.ChildLease.ParentDomainLease == lease) ||
+            _originalProviderArtifacts.Values.Any(artifact => artifact.Receipt.ParentLeaseId == lease.LeaseId &&
+                artifact.Receipt.ParentGeneration == lease.Generation))
+        {
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Denied,
+                "Original child guest mapping invocations or exact mapping facts must close before the provider domain lease.");
         }
 
         if (HasActiveProviderDeviceLeases(lease))
@@ -234,35 +319,74 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
         // A transition-time Revoked observation never substitutes for this exact
         // close call. The neutral runtime must still confirm Closed or that this
         // exact lease was already Revoked before provider closure is published.
-        var external = _runtime.Close(record.HybridCpuLease);
+        record.RootCloseInFlight = true;
+        }
+        try
+        {
+        NeutralDomainCloseResult external;
+        try { external = record.RootCloseObservation ?? _runtime.Close(record.HybridCpuLease); }
+        catch
+        {
+            lock (_childCreateCommitGate) record.RootCloseUncertain = true;
+            throw;
+        }
+        lock (_childCreateCommitGate)
+        {
+        if (external is null)
+        {
+            record.RootCloseUncertain = true;
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted,
+                "Original root close returned no observation; dependencies remain pinned.");
+        }
+        record.RootCloseObservation = external;
+        if (!_domains.TryGetValue(lease.LeaseId, out var current) || !ReferenceEquals(current, record) ||
+            current.Lease != lease || !ValidateDomainIdentity(lease).IsSuccess || record.ChildCreateInFlight || record.FailedChildCreate is not null ||
+            record.OwnedMapInFlight || record.FailedOwnedMap is not null ||
+            record.DeviceBindInFlight || record.FailedDeviceBind is not null || record.RootTransitionInFlight)
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted,
+                "Original root close observation retained without current owner continuity.");
         switch (external.Decision)
         {
             case NeutralDomainCloseDecision.Closed:
             case NeutralDomainCloseDecision.Revoked:
+                if (_originalProviderChildren.Values.Any(child => child.Lease.ParentDomainLease == lease && !HasPublishedChildClosure(child)) ||
+                    _originalProviderGuestMappings.Values.Where(mapping => !mapping.ClosurePublished).Any(mapping => mapping.Lease.ChildLease.ParentDomainLease == lease) ||
+                    _originalProviderArtifacts.Values.Any(artifact => artifact.Receipt.ParentLeaseId == lease.LeaseId &&
+                        artifact.Receipt.ParentGeneration == lease.Generation) || HasActiveProviderDeviceLeases(lease) ||
+                    HasActiveProviderMappings(lease))
+                    return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted,
+                        "Root close observation retained while local dependencies changed; publication refused.");
                 MarkRevoked(record);
                 return PlatformAuthorityResult.Ok();
 
             case NeutralDomainCloseDecision.ActiveDependents:
+                record.RootCloseObservation = null;
                 return PlatformAuthorityResult.Fail(
                     PlatformAuthorityStatus.Denied,
                     external.Reason);
 
             case NeutralDomainCloseDecision.Stale:
+                record.RootCloseUncertain = true;
                 return PlatformAuthorityResult.Fail(
                     PlatformAuthorityStatus.Faulted,
                     "HybridCPU rejected the provider-owned domain lease as stale; closure is not proven.");
 
             case NeutralDomainCloseDecision.NotFound:
+                record.RootCloseUncertain = true;
                 return PlatformAuthorityResult.Fail(
                     PlatformAuthorityStatus.Faulted,
                     "HybridCPU no longer recognizes the provider-owned domain lease; closure is not proven.");
 
             case NeutralDomainCloseDecision.Faulted:
             default:
+                record.RootCloseUncertain = true;
                 return PlatformAuthorityResult.Fail(
                     PlatformAuthorityStatus.Faulted,
                     external.Reason);
         }
+        }
+        }
+        finally { lock (_childCreateCommitGate) record.RootCloseInFlight = false; }
     }
 
     public PlatformAuthorityResult<PlatformProviderRegionMappingLease> MapOwnedRegion(
@@ -294,7 +418,7 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
         return CloseProviderRegionMapping(mapping);
     }
 
-    private PlatformAuthorityResult ValidateDomain(PlatformProviderDomainLease lease)
+    private PlatformAuthorityResult ValidateDomain(PlatformProviderDomainLease lease, bool allowRetainedTransition = false)
     {
         var identityValidation = ValidateDomainIdentity(lease);
         if (!identityValidation.IsSuccess) return identityValidation;
@@ -306,6 +430,14 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                 PlatformAuthorityStatus.Revoked,
                 "The provider domain lease has already been revoked.");
         }
+
+        if (record.RootCloseInFlight || record.RootCloseUncertain || record.RootCloseObservation is not null)
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Denied,
+                "Original root close is in flight or retained; new provider admission is refused.");
+
+        if (!allowRetainedTransition && (record.RootTransitionInFlight || record.RootTransitionUncertain || record.RootTransition is not null))
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted,
+                "Original root transition is pending or retained; new provider admission is refused.");
 
         return PlatformAuthorityResult.Ok();
     }
@@ -332,6 +464,14 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                 PlatformAuthorityStatus.WrongDomain,
                 "The provider domain lease belongs to a different Sing platform subject.");
         }
+        if (!_originalRootBinds.TryGetValue(lease.LeaseId, out var source) || !ReferenceEquals(record.BindSource, source) ||
+            source.Lease != record.Lease || !ReferenceEquals(source.PublishedDomain, record))
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted,
+                "Provider domain route is not the captured original binding owner.");
+
+        if (!record.Revoked && (!_activeSubjects.TryGetValue(lease.Subject, out var original) || !ReferenceEquals(original, record)))
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted,
+                "Active subject index does not identify the original domain owner.");
 
         return PlatformAuthorityResult.Ok();
     }
@@ -385,12 +525,4 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
             _ => throw new ArgumentOutOfRangeException(nameof(state)),
         };
 
-    private static ulong NextNonZero(ref ulong next)
-    {
-        var value = next;
-        unchecked { next++; }
-        if (value == 0)
-            throw new InvalidOperationException("Provider domain identity space is exhausted.");
-        return value;
-    }
 }

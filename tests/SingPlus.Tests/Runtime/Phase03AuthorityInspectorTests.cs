@@ -8,6 +8,83 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class Phase03AuthorityInspectorTests
 {
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)]
+    [InlineData(4)] [InlineData(5)] [InlineData(6)] [InlineData(7)]
+    public void InspectionClockRevokeDeniesActualSnapshotAndExplanationPublication(int mode)
+    {
+        var kernel = new RuntimeKernel();
+        var caller = TestFixtures.Create(kernel, 330, 3030).Handle;
+        var other = TestFixtures.Create(kernel, 331, 3031).Handle;
+        var buffer = kernel.AllocateBuffer<byte>(other, 8).Value!;
+        var capability = kernel.MintCapability(new DomainId(3030), caller, ResourceKind.KernelService,
+            CapabilityResourceIds.AuthorityInspector, CapabilityRights.Read).Value!.CapabilityId;
+        var clock = new InspectionClock();
+        var inspector = kernel.CreateAuthorityInspector(caller, capability, clock).Value!;
+        clock.Callback = () =>
+        {
+            var worker = Task.Run(() => kernel.RevokeCapability(capability));
+            Assert.True(worker.Wait(TimeSpan.FromSeconds(5)), "Inspection clock ran under permission/publication lock.");
+            Assert.True(worker.Result.IsSuccess);
+        };
+        var error = mode switch
+        {
+            0 => inspector.Capture().Error,
+            1 => inspector.Capture(AuthorityInspectionConsistency.HistoricalReference).Error,
+            2 => inspector.Capture(AuthorityInspectionConsistency.AuthorityLockedSnapshot).Error,
+            3 => inspector.InspectOwner(buffer.Handle).Error,
+            4 => inspector.InspectDependents(buffer.Handle).Error,
+            5 => inspector.InspectCapabilityProvenance(capability).Error,
+            6 => inspector.WhyMoveBlocked(buffer.Handle).Error,
+            _ => inspector.WhyReclaimBlocked(buffer.Handle).Error,
+        };
+        Assert.Equal(KernelError.ProjectionDenied, error);
+        Assert.Equal(KernelError.ProjectionDenied, inspector.Capture().Error);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void InspectionClockFailureOrSourceDriftDoesNotPublishLockedCut(bool throws)
+    {
+        var kernel = new RuntimeKernel();
+        var caller = TestFixtures.Create(kernel, 332, 3032).Handle;
+        var clock = new InspectionClock();
+        var inspector = kernel.CreateAuthorityInspector(caller, timeProvider: clock).Value!;
+        clock.Callback = () =>
+        {
+            if (throws) throw new InvalidOperationException("inspection clock fault");
+            Assert.True(kernel.AllocateBuffer<byte>(caller, 8).IsSuccess);
+        };
+        Assert.Equal(throws ? KernelError.PlatformFaulted : KernelError.SnapshotUnstable,
+            inspector.Capture(AuthorityInspectionConsistency.AuthorityLockedSnapshot).Error);
+        var fresh = inspector.Capture(AuthorityInspectionConsistency.AuthorityLockedSnapshot).Value!;
+        Assert.Equal(1UL, fresh.CaptureSequence);
+        Assert.False(fresh.AuthorizesMutation);
+    }
+
+    [Fact]
+    public void CapturePublishesFinalUniqueSequenceThenRefusesWithoutWrap()
+    {
+        var kernel = new RuntimeKernel();
+        var caller = TestFixtures.Create(kernel, 333, 3033).Handle;
+        var inspector = kernel.CreateAuthorityInspector(caller).Value!;
+        var sequence = typeof(AuthorityInspector).GetField("_captureSequence", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        sequence.SetValue(inspector, ulong.MaxValue - 1);
+        Assert.Equal(ulong.MaxValue, inspector.Capture().Value!.CaptureSequence);
+        Assert.Equal(KernelError.CapacityExhausted, inspector.Capture().Error);
+        Assert.Equal(ulong.MaxValue, (ulong)sequence.GetValue(inspector)!);
+    }
+
+    private sealed class InspectionClock : TimeProvider
+    {
+        public Action? Callback;
+        public override long GetTimestamp()
+        {
+            Interlocked.Exchange(ref Callback, null)?.Invoke();
+            return 100;
+        }
+    }
+
     private static readonly byte[] ComponentImage = [3, 0, 3, 1];
 
     [Fact]

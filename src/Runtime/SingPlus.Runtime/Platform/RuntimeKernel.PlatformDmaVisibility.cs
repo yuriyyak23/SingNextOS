@@ -10,14 +10,10 @@ public sealed partial class RuntimeKernel
         ProcessHandle subject,
         PlatformDmaGrant grant)
     {
+        SingProcess process;
+        PlatformDomainIdentity identity;
         lock (_platformMemoryUseGate)
-            return PreparePlatformDmaForDeviceLocked(subject, grant);
-    }
-
-    private KernelResult<PlatformDmaPrepareEvidence> PreparePlatformDmaForDeviceLocked(
-        ProcessHandle subject,
-        PlatformDmaGrant grant)
-    {
+        {
         var resolved = Processes.Resolve(subject);
         if (!resolved.IsSuccess)
         {
@@ -26,7 +22,7 @@ public sealed partial class RuntimeKernel
                 resolved.Message!);
         }
 
-        var process = resolved.Value!;
+        process = resolved.Value!;
         var effect = EnsureProcessAcceptsNewEffects(process);
         if (!effect.IsSuccess)
         {
@@ -35,25 +31,41 @@ public sealed partial class RuntimeKernel
                 effect.Message!);
         }
 
-        var identity = PlatformIdentity(process);
+        identity = PlatformIdentity(process);
         var usable = ValidateDmaGrantRegionUsability(grant, identity);
         if (!usable.IsSuccess)
             return KernelResult<PlatformDmaPrepareEvidence>.Fail(usable.Error, usable.Message!);
-        return PlatformAuthority.PrepareDmaGrantVisibility(grant, identity);
+        }
+        return PlatformAuthority.PrepareDmaGrantVisibility(grant, identity, commit =>
+        {
+            lock (_platformMemoryUseGate)
+            {
+                var current = Processes.Resolve(subject);
+                if (!current.IsSuccess) return KernelResult<PlatformDmaPrepareEvidence>.Fail(current.Error, current.Message!);
+                if (!ReferenceEquals(current.Value, process))
+                    return KernelResult<PlatformDmaPrepareEvidence>.Fail(KernelError.StaleGeneration, "DMA prepare process incarnation changed.");
+                var ready = EnsureProcessAcceptsNewEffects(process);
+                if (!ready.IsSuccess) return KernelResult<PlatformDmaPrepareEvidence>.Fail(ready.Error, ready.Message!);
+                var owner = new RegionOwner(identity.DomainId, subject.Generation);
+                var gate = Regions.GetPlatformMappingCompletionGate(grant.Mapping.Region, owner);
+                if (!gate.IsSuccess) return KernelResult<PlatformDmaPrepareEvidence>.Fail(gate.Error, gate.Message!);
+                lock (gate.Value!)
+                {
+                    var usable = Regions.ValidatePlatformMappingRegionUsabilityLocked(grant.Mapping.Region, owner);
+                    return usable.IsSuccess ? commit() : KernelResult<PlatformDmaPrepareEvidence>.Fail(usable.Error, usable.Message!);
+                }
+            }
+        });
     }
 
     public KernelResult<PlatformDmaAcquireEvidence> AcquirePlatformDmaForCpu(
         ProcessHandle subject,
         PlatformDmaGrant grant)
     {
+        SingProcess process;
+        PlatformDomainIdentity identity;
         lock (_platformMemoryUseGate)
-            return AcquirePlatformDmaForCpuLocked(subject, grant);
-    }
-
-    private KernelResult<PlatformDmaAcquireEvidence> AcquirePlatformDmaForCpuLocked(
-        ProcessHandle subject,
-        PlatformDmaGrant grant)
-    {
+        {
         var resolved = Processes.Resolve(subject);
         if (!resolved.IsSuccess)
         {
@@ -62,8 +74,32 @@ public sealed partial class RuntimeKernel
                 resolved.Message!);
         }
 
-        var process = resolved.Value!;
-        var identity = PlatformIdentity(process);
-        return PlatformAuthority.AcquireDmaGrantVisibility(grant, identity);
+        process = resolved.Value!;
+        identity = PlatformIdentity(process);
+        var ready = EnsureProcessAcceptsNewEffects(process);
+        if (!ready.IsSuccess) return KernelResult<PlatformDmaAcquireEvidence>.Fail(ready.Error, ready.Message!);
+        var usable = ValidateDmaGrantRegionUsability(grant, identity);
+        if (!usable.IsSuccess) return KernelResult<PlatformDmaAcquireEvidence>.Fail(usable.Error, usable.Message!);
+        }
+        return PlatformAuthority.AcquireDmaGrantVisibility(grant, identity, commit =>
+        {
+            lock (_platformMemoryUseGate)
+            {
+                var current = Processes.Resolve(subject);
+                if (!current.IsSuccess) return KernelResult<PlatformDmaAcquireEvidence>.Fail(current.Error, current.Message!);
+                if (!ReferenceEquals(current.Value, process))
+                    return KernelResult<PlatformDmaAcquireEvidence>.Fail(KernelError.StaleGeneration, "Acquire process incarnation changed.");
+                var ready = EnsureProcessAcceptsNewEffects(process);
+                if (!ready.IsSuccess) return KernelResult<PlatformDmaAcquireEvidence>.Fail(ready.Error, ready.Message!);
+                var owner = new RegionOwner(identity.DomainId, subject.Generation);
+                var gate = Regions.GetPlatformMappingCompletionGate(grant.Mapping.Region, owner);
+                if (!gate.IsSuccess) return KernelResult<PlatformDmaAcquireEvidence>.Fail(gate.Error, gate.Message!);
+                lock (gate.Value!)
+                {
+                    var usable = Regions.ValidatePlatformMappingRegionUsabilityLocked(grant.Mapping.Region, owner);
+                    return usable.IsSuccess ? commit() : KernelResult<PlatformDmaAcquireEvidence>.Fail(usable.Error, usable.Message!);
+                }
+            }
+        });
     }
 }

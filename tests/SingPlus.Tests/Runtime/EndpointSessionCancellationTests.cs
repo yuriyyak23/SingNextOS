@@ -5,6 +5,116 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class EndpointSessionCancellationTests
 {
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void InvocationScopeClockReentryUsesFreshBindingAndAcceptance(bool request)
+    {
+        var clock = new InvocationScopeClock();
+        var scopes = new CancellationScopeAuthority(clock);
+        var registry = new EndpointSessionInvocationRegistry(scopes);
+        var caller = new ProcessHandle(new ProcessId(810), 1);
+        var service = new ProcessHandle(new ProcessId(811), 1);
+        var session = new EndpointSessionHandle(new EndpointSessionId(12), new EndpointSessionGeneration(1));
+        var invocation = registry.Register(session, caller, service, 1, 1);
+        var scope = scopes.Create(caller, new(200), null).Value!.Scope;
+        var alternative = scopes.Create(caller, null, null).Value!.Scope;
+        if (request)
+        {
+            Assert.True(registry.BindCancellationScope(invocation, caller, scope).IsSuccess);
+            Assert.True(registry.MarkDelivered(session, service, 1).IsSuccess);
+        }
+        clock.Callback = () =>
+        {
+            var worker = Task.Run(() => request
+                ? registry.AcceptInvocation(invocation, service, false)
+                : registry.BindCancellationScope(invocation, caller, alternative));
+            Assert.True(worker.Wait(TimeSpan.FromSeconds(5)), "Scope clock ran under invocation lock.");
+            Assert.True(worker.Result.IsSuccess);
+        };
+        if (request)
+        {
+            var result = registry.RequestCancellation(invocation, caller, scope);
+            Assert.True(result.IsSuccess);
+            Assert.Equal(CancellationDisposition.TooLateEffectMayExist, result.Value!.Disposition);
+            Assert.True(registry.SnapshotConsequence(invocation)!.Value.ServiceAccepted);
+        }
+        else
+        {
+            Assert.Equal(KernelError.StaleGeneration, registry.BindCancellationScope(invocation, caller, scope).Error);
+            var second = registry.Register(session, caller, service, 2, 1);
+            Assert.True(registry.BindCancellationScope(second, caller, scope).IsSuccess);
+        }
+    }
+
+    [Theory]
+    [InlineData(0, false)] [InlineData(0, true)]
+    [InlineData(1, false)] [InlineData(1, true)]
+    [InlineData(2, false)] [InlineData(2, true)]
+    [InlineData(3, false)] [InlineData(3, true)]
+    public void SettlementClockRunsAfterTerminalCommitWithoutInventingUnknownEffect(int mode, bool throws)
+    {
+        var clock = new InvocationScopeClock();
+        var scopes = new CancellationScopeAuthority(clock);
+        var registry = new EndpointSessionInvocationRegistry(scopes);
+        var caller = new ProcessHandle(new ProcessId(810), 1);
+        var service = new ProcessHandle(new ProcessId(811), 1);
+        var session = new EndpointSessionHandle(new EndpointSessionId(12), new EndpointSessionGeneration(1));
+        var invocation = registry.Register(session, caller, service, 1, 1);
+        var scope = scopes.Create(caller, new(200), null).Value!.Scope;
+        Assert.True(registry.BindCancellationScope(invocation, caller, scope).IsSuccess);
+        Assert.True(registry.MarkDelivered(session, service, 1).IsSuccess);
+        Assert.True(registry.RequestCancellation(invocation, caller, scope).IsSuccess);
+        var status = mode is 0 or 2 ? ResponsePublicationStatus.Cancelled : ResponsePublicationStatus.Published;
+        clock.Callback = () =>
+        {
+            var worker = Task.Run(() => registry.SnapshotConsequence(invocation));
+            Assert.True(worker.Wait(TimeSpan.FromSeconds(5)), "Settlement scope clock ran under invocation lock.");
+            Assert.Equal(status, worker.Result!.Value.TerminalStatus);
+            Assert.Null(worker.Result.Value.SettlementInProgress);
+            if (throws) throw new InvalidOperationException("late scope clock fault");
+        };
+        var effects = 0;
+        KernelResult<ResponseEnvelope> Effect()
+        {
+            effects++;
+            return KernelResult<ResponseEnvelope>.Ok(new ResponseEnvelope(1, 1, status, null));
+        }
+        void Settle()
+        {
+            if (mode == 0) Assert.True(registry.Cancel(invocation, service, Effect).IsSuccess);
+            else if (mode == 1) Assert.True(registry.Publish(invocation, service, Effect).IsSuccess);
+            else Assert.True(registry.CompleteInline(invocation, service, mode == 3).IsSuccess);
+        }
+        if (throws) Assert.Throws<InvalidOperationException>(Settle);
+        else Settle();
+        var original = registry.SnapshotConsequence(invocation)!.Value;
+        Assert.Equal(status, original.TerminalStatus);
+        Assert.Null(original.SettlementInProgress);
+        Assert.False(original.UnclosedPossibleEffect);
+        Assert.Equal(0, registry.PendingCount(session));
+        Assert.Equal(0, registry.UnclosedPossibleEffectCount(session));
+        Assert.Equal(KernelError.ResponseNotPending, registry.Publish(invocation, service, Effect).Error);
+        Assert.Equal(mode < 2 ? 1 : 0, effects);
+        var observed = registry.RequestCancellation(invocation, caller, scope).Value!;
+        Assert.Equal(status == ResponsePublicationStatus.Published
+            ? CancellationDisposition.CompletedBeforeCancellation : CancellationDisposition.CancelledBeforeEffect,
+            observed.Disposition);
+        Assert.False(observed.AuthorizesEffect);
+        Assert.False(observed.AuthorizesReclaim);
+    }
+
+    private sealed class InvocationScopeClock : TimeProvider
+    {
+        public Action? Callback { get; set; }
+        public override long GetTimestamp()
+        {
+            var callback = Callback;
+            Callback = null;
+            callback?.Invoke();
+            return 100;
+        }
+    }
+
     [Fact]
     public async Task SettlementAdmissionWaitsForCorrelationGateAndCallbackReleasesIt()
     {
@@ -464,15 +574,15 @@ public sealed class EndpointSessionCancellationTests
         Assert.Equal(CancellationDisposition.TooLateEffectMayExist,
             registry.RequestCancellation(invocation, caller, scope).Value!.Disposition);
 
-        // A later successful response or cancellation does not close the earlier ambiguity.
+        // Unknown original outcome denies a new action; it cannot be replaced by a later receipt.
         var terminal = throws ? ResponsePublicationStatus.Cancelled : ResponsePublicationStatus.Published;
         var settled = throws
             ? registry.Cancel(invocation, service, () => KernelResult<ResponseEnvelope>.Ok(
                 new ResponseEnvelope(1, 1, terminal, null)))
             : registry.Publish(invocation, service, () => KernelResult<ResponseEnvelope>.Ok(
                 new ResponseEnvelope(1, 1, terminal, null)));
-        Assert.True(settled.IsSuccess);
-        Assert.Equal(terminal, registry.SnapshotConsequence(invocation)!.Value.TerminalStatus);
+        Assert.Equal(KernelError.ResponseNotPending, settled.Error);
+        Assert.Null(registry.SnapshotConsequence(invocation)!.Value.TerminalStatus);
         Assert.Equal(CancellationDisposition.TooLateEffectMayExist,
             registry.RequestCancellation(invocation, caller, scope).Value!.Disposition);
         registry.CloseSession(session);

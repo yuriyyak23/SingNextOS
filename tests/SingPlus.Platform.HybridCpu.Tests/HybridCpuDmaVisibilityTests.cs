@@ -6,6 +6,43 @@ namespace SingPlus.Platform.HybridCpu.Tests;
 
 public sealed class HybridCpuDmaVisibilityTests
 {
+    [Theory]
+    [InlineData(false, false)][InlineData(true, false)]
+    [InlineData(false, true)][InlineData(true, true)]
+    public void ForeignOrAbsentCycleRouteCannotConsumeOriginalKernelVisibility(bool absent, bool acquire)
+    {
+        var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, ChildClosureTupleTests.RootCloseRuntimeProxy>();
+        var proxy = (ChildClosureTupleTests.RootCloseRuntimeProxy)(object)runtime;
+        var provider = new HybridCpuPlatformAuthorityProvider(runtime);
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = HybridCpuPlatformAuthorityProviderTests.CreateProcess(kernel, 91, 910, 1);
+        var (device, mapping) = CreateAuthorities(kernel, subject);
+        var grant = kernel.BindPlatformDma(subject, device, mapping, 0, 64, PlatformDmaDirection.Bidirectional).Value!;
+        Assert.True(kernel.PreparePlatformDmaForDevice(subject, grant).IsSuccess);
+        var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var states = (global::System.Collections.IDictionary)provider.GetType().GetField("_dmaVisibilityStates", flags)!.GetValue(provider)!;
+        var key = states.Keys.Cast<object>().Single();
+        var original = states[key]!;
+        if (absent) states.Remove(key);
+        else states[key] = typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+        Assert.False(acquire ? kernel.AcquirePlatformDmaForCpu(subject, grant).IsSuccess : kernel.PreparePlatformDmaForDevice(subject, grant).IsSuccess);
+        Assert.Equal(1, proxy.DmaPrepareCalls);
+        Assert.Equal(0, proxy.DmaAcquireCalls);
+        Assert.False((bool)original.GetType().GetProperty("Acquired")!.GetValue(original)!);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
+        states[key] = original;
+        var grants = (global::System.Collections.IDictionary)provider.GetType().GetField("_dmaGrants", flags)!.GetValue(provider)!;
+        var owner = grants.Values.Cast<object>().Single();
+        var providerGrant = (PlatformProviderDmaGrant)owner.GetType().GetProperty("Grant")!.GetValue(owner)!;
+        Assert.True(provider.AcquireDmaGrantVisibility(providerGrant).IsSuccess);
+        Assert.True((bool)original.GetType().GetProperty("Acquired")!.GetValue(original)!);
+        Assert.Equal(1, proxy.DmaAcquireCalls);
+        Assert.False(provider.AcquireDmaGrantVisibility(providerGrant).IsSuccess);
+        Assert.Equal(1, proxy.DmaAcquireCalls);
+        Assert.True(provider.RevokeDmaGrant(providerGrant).IsSuccess);
+        Assert.Equal(0, proxy.Runtime.ActiveDmaGrantCount);
+    }
+
     [Fact]
     public void RealProviderPreparesAndAcquiresExactNonCoherentDmaCycle()
     {

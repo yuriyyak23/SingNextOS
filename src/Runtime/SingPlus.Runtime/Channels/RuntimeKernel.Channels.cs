@@ -1,4 +1,5 @@
 using SingPlus.Contracts;
+using SingPlus.Sip;
 
 namespace SingPlus.Runtime;
 
@@ -106,6 +107,9 @@ public sealed partial class RuntimeKernel
         TraceCausalContext? traceContext = null) =>
         SendCore(sender, receiver, endpoint, messageId, firstOwnershipPayload, secondOwnershipPayload, capabilities, qosHint, traceContext);
 
+    private sealed record SessionSendPublication(EndpointSessionHandle Session,
+        EndpointSessionPin Pin, CapabilityRequirementV1[] Requirements, CancellationScopeHandle? Scope = null);
+
     private KernelResult<ChannelEnvelope> SendCore(
         ProcessHandle sender,
         ProcessHandle receiver,
@@ -115,8 +119,25 @@ public sealed partial class RuntimeKernel
         object? secondaryPayload,
         IReadOnlyCollection<CapabilityId>? capabilities,
         AdmissionQosHint qosHint,
-        TraceCausalContext? traceContext)
+        TraceCausalContext? traceContext,
+        SessionSendPublication? sessionPublication = null)
     {
+        var capabilitySnapshot = capabilities?.ToArray();
+        var boundedSnapshot = Channels.CaptureInlineCopiedPayload(endpoint, messageId, payload);
+        var estimatedBytes = boundedSnapshot is { } bounded && secondaryPayload is null
+            ? checked(32UL + (ulong)Math.Max(0, bounded.Size))
+            : EstimateIpcBytes(payload, secondaryPayload);
+        List<BudgetTraceObservation> observations = [];
+        KernelResult<ChannelEnvelope> committed;
+        try { committed = Commit(); }
+        finally { EmitBudgetObservations(observations); }
+        if (!committed.IsSuccess) return committed;
+        RecordTrace(sender, TraceEventKind.IpcSent, traceContext, "ipc",
+            $"{endpoint.ChannelId.Value}:{committed.Value!.Sequence}", "queued", "admitted");
+        return committed;
+
+        KernelResult<ChannelEnvelope> Commit()
+        {
         lock (_platformMemoryUseGate)
         {
         var senderProcess = Processes.Resolve(sender);
@@ -134,17 +155,32 @@ public sealed partial class RuntimeKernel
 
         lock (_requestResponseCorrelationGate)
         {
+            if (sessionPublication is { } pendingSession)
+            {
+                var pin = EndpointSessions.RevalidatePin(pendingSession.Pin);
+                if (!pin.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(pin.Error, pin.Message!);
+            }
             var responsePreflight = Responses.CanRegisterRequest(endpoint, messageId, sender, receiver);
             if (!responsePreflight.IsSuccess)
                 return KernelResult<ChannelEnvelope>.Fail(responsePreflight.Error, responsePreflight.Message!);
 
+            // Ownership implementations are sealed TCB-local buffer/region operations;
+            // their transfer observations are deferred past this owner commit.
+            if (sessionPublication is { } copiedSession)
+                return CapabilityAuthority.CommitSessionPublication(senderProcess.Value!.DomainId,
+                    sender.Generation, capabilitySnapshot ?? [], copiedSession.Requirements, SendAndPublish);
+            return SendAndPublish();
+
+            KernelResult<ChannelEnvelope> SendAndPublish()
+            {
+
             var budget = ReserveAttachedBudget(sender,
                 [
                     new(ServiceBudgetDimension.IpcMessages, 1),
-                    new(ServiceBudgetDimension.IpcBytes, EstimateIpcBytes(payload, secondaryPayload)),
+                    new(ServiceBudgetDimension.IpcBytes, estimatedBytes),
                 ],
                 BudgetReservationLifetime.IpcQueued,
-                qosHint);
+                qosHint, observations);
             if (!budget.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(budget.Error, budget.Message!);
 
             var send = secondaryPayload is null
@@ -154,7 +190,9 @@ public sealed partial class RuntimeKernel
                     endpoint,
                     messageId,
                     payload,
-                    capabilities)
+                    capabilitySnapshot,
+                    boundedSnapshot,
+                    (source, target, region, admission) => TransferRegionForIpcCore(source, target, region, admission, observations))
                 : Channels.SendOwnershipPair(
                     senderProcess.Value!,
                     receiverProcess.Value!,
@@ -162,10 +200,11 @@ public sealed partial class RuntimeKernel
                     messageId,
                     payload!,
                     secondaryPayload,
-                    capabilities);
+                    capabilitySnapshot,
+                    (source, target, region, admission) => TransferRegionForIpcCore(source, target, region, admission, observations));
             if (!send.IsSuccess)
             {
-                _ = ReleaseAttachedBudget(sender, budget.Value);
+                _ = ReleaseAttachedBudget(sender, budget.Value, observations);
                 return send;
             }
 
@@ -173,16 +212,43 @@ public sealed partial class RuntimeKernel
             // until its exact response correlation is registered. Receive uses the
             // same gate, so enqueue + correlation publication are one visibility step.
             Responses.RegisterRequest(endpoint, send.Value!, sender, receiver);
+            if (sessionPublication is { } publication)
+                SessionInvocations.Register(publication.Session, sender, receiver,
+                    send.Value!.Sequence, messageId, publication.Scope);
             if (budget.Value is { } reservation)
+            {
                 _ipcBudgetReservations.Add((endpoint.ChannelId, send.Value!.Sequence), (sender, receiver, reservation));
-            RecordTrace(sender, TraceEventKind.IpcSent, traceContext, "ipc",
-                $"{endpoint.ChannelId.Value}:{send.Value!.Sequence}", "queued", "admitted");
+                var lifetime = Channels.CaptureQueuedLifetime(endpoint.ChannelId, send.Value.Sequence);
+                if (lifetime is null) return KernelResult<ChannelEnvelope>.Fail(KernelError.PlatformFaulted, "Original queued lifetime is missing after enqueue.");
+                var bound = Budgets.BindOriginalQueuedCharge(sender, receiver, reservation, endpoint.ChannelId, send.Value.Sequence, lifetime);
+                if (!bound.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(bound.Error, bound.Message!);
+                if (!Channels.BindOriginalQueuedBudgetOwner(lifetime, bound.Value!))
+                    return KernelResult<ChannelEnvelope>.Fail(KernelError.PlatformFaulted, "Original queued budget owner continuity was lost after enqueue.");
+            }
             return send;
+            }
+        }
         }
         }
     }
 
     public KernelResult<ChannelEnvelope> Receive(ProcessHandle receiver, ChannelEndpointHandle endpoint)
+    {
+        var committed = ReceiveCommitted(receiver, endpoint);
+        if (!committed.IsSuccess) return committed;
+        ObserveReceived(receiver, endpoint, committed.Value!);
+        return committed;
+    }
+
+    private void ObserveReceived(ProcessHandle receiver, ChannelEndpointHandle endpoint, ChannelEnvelope envelope)
+    {
+        ReleaseIpcBudget((endpoint.ChannelId, envelope.Sequence));
+        RecordTrace(receiver, TraceEventKind.IpcReceived, null, "ipc",
+            $"{endpoint.ChannelId.Value}:{envelope.Sequence}", "received", "delivered");
+    }
+
+    // Trusted local transport/delivery commit only; callers emit observations after all outer locks.
+    private KernelResult<ChannelEnvelope> ReceiveCommitted(ProcessHandle receiver, ChannelEndpointHandle endpoint)
     {
         lock (_platformMemoryUseGate)
         {
@@ -192,13 +258,14 @@ public sealed partial class RuntimeKernel
 
         lock (_requestResponseCorrelationGate)
         {
+            var next = Channels.Peek(process.Value!, endpoint);
+            if (!next.IsSuccess) return next;
+            var delivery = Responses.CanMarkDelivered(endpoint, next.Value!, receiver);
+            if (!delivery.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(delivery.Error, delivery.Message!);
             var receive = Channels.Receive(process.Value!, endpoint);
             if (!receive.IsSuccess) return receive;
 
             Responses.MarkDelivered(endpoint, receive.Value!, receiver);
-            ReleaseIpcBudget((endpoint.ChannelId, receive.Value!.Sequence));
-            RecordTrace(receiver, TraceEventKind.IpcReceived, null, "ipc",
-                $"{endpoint.ChannelId.Value}:{receive.Value.Sequence}", "received", "delivered");
             return receive;
         }
         }

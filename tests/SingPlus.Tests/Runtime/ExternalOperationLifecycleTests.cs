@@ -7,6 +7,334 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class ExternalOperationLifecycleTests
 {
+    [Theory]
+    [InlineData(false, false, false)] [InlineData(false, true, false)]
+    [InlineData(true, false, false)] [InlineData(true, true, false)]
+    [InlineData(true, false, true)] [InlineData(true, true, true)]
+    [InlineData(true, false, false, true)] [InlineData(true, true, false, true)]
+    public void PublicationRouteLossRetainsOriginalDecisionAndActualEffect(bool afterAction, bool copied, bool actionThrows, bool directOwner = false)
+    {
+        var s = CreateScenario();
+        var admin = TestFixtures.Create(s.Kernel, 3, 30).Handle;
+        var capability = s.Kernel.MintCapability(new(30), admin, ResourceKind.KernelService,
+            CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        var account = s.Kernel.AdmitProcessBudget(admin, capability, s.Owner, "publication-route-loss",
+            [new(ServiceBudgetDimension.ExternalOperations, 1)]).Value!.ProcessBudget;
+        var prepared = Prepare(s, ExternalPublicationPolicy.Staged);
+        Assert.True(s.Kernel.AdmitExternalOperation(s.Owner, prepared.Operation, Dependencies).IsSuccess);
+        var binding = s.Kernel.RecordExternalOperationSubmission(s.Owner, prepared.Operation, Dependencies).Value!;
+        Assert.True(s.Kernel.RecordExternalOperationCompletion(s.Owner, new(binding, ExternalOperationCompletionDisposition.Completed)).IsSuccess);
+        Assert.True(s.Kernel.RecordExternalOperationVisibility(s.Owner, new(binding, ExternalVisibilityRequirement.PublicationFence, true)).IsSuccess);
+        var routes = (global::System.Collections.IDictionary)typeof(ExternalOperationAuthority)
+            .GetField("_operations", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(s.Kernel.ExternalOperations)!;
+        var original = routes[prepared.Operation.OperationId]!;
+        void LoseRoute()
+        {
+            if (copied) routes[prepared.Operation.OperationId] = typeof(object)
+                .GetMethod("MemberwiseClone", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(original, null)!;
+            else routes.Remove(prepared.Operation.OperationId);
+        }
+        var actions = 0;
+        Action<ExternalPublicationDecisionV1> action = _ =>
+            {
+                actions++; s.Output.Span.Fill(0x5A);
+                if (directOwner) LoseRoute();
+                if (actionThrows) { LoseRoute(); throw new InvalidOperationException("Lost route after output."); }
+            };
+        var result = directOwner
+            ? s.Kernel.ExternalOperations.Publish(prepared.Operation, Dependencies, new(ExternalPublicationPolicy.Staged), action)
+            : s.Kernel.PublishExternalOperation(s.Owner, prepared.Operation, Dependencies,
+            new(ExternalPublicationPolicy.Staged), action,
+            sourceCommit: commit => { if (afterAction) LoseRoute(); return commit(); },
+            sourceAdmission: admit => { var admitted = admit(); if (!afterAction) LoseRoute(); return admitted; });
+        Assert.False(result.IsSuccess);
+        Assert.Equal(afterAction ? 1 : 0, actions);
+        routes[prepared.Operation.OperationId] = original;
+        Assert.False((bool)original.GetType().GetProperty("PublicationInFlight")!.GetValue(original)!);
+        if (afterAction)
+        {
+            Assert.All(s.Output.Span.ToArray(), value => Assert.Equal(0x5A, value));
+            Assert.Equal(ExternalEffectBoundaryState.PossiblyExternallyVisible,
+                s.Kernel.QueryExternalOperation(s.Owner, prepared.Operation).Value!.EffectBoundary);
+            Assert.False(s.Kernel.ReleaseExternalOperation(s.Owner, prepared.Operation, new(true, true)).IsSuccess);
+            Assert.Contains(s.Kernel.QueryBudget(account).Value!.Usage,
+                usage => usage.Dimension == ServiceBudgetDimension.ExternalOperations && usage.Used == 1);
+        }
+        else
+        {
+            Assert.All(s.Output.Span.ToArray(), value => Assert.Equal(0, value));
+            Assert.True(s.Kernel.PublishExternalOperation(s.Owner, prepared.Operation, Dependencies,
+                new(ExternalPublicationPolicy.Staged), () => actions++).IsSuccess);
+            Assert.Equal(1, actions);
+            Assert.True(s.Kernel.ReleaseExternalOperation(s.Owner, prepared.Operation, new(true, true)).IsSuccess);
+            Assert.Contains(s.Kernel.QueryBudget(account).Value!.Usage,
+                usage => usage.Dimension == ServiceBudgetDimension.ExternalOperations && usage.Used == 0);
+        }
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void LostExternalChargeRouteCannotLoseExactReleasedOperationDebit(int fault)
+    {
+        var s = CreateScenario();
+        var admin = TestFixtures.Create(s.Kernel, 3, 30).Handle;
+        var capability = s.Kernel.MintCapability(new(30), admin, ResourceKind.KernelService,
+            CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        var account = s.Kernel.AdmitProcessBudget(admin, capability, s.Owner, "lost-operation-route",
+            [new(ServiceBudgetDimension.ExternalOperations, 1)]).Value!.ProcessBudget;
+        var prepared = Prepare(s, ExternalPublicationPolicy.Staged);
+        Assert.True(s.Kernel.AdmitExternalOperation(s.Owner, prepared.Operation, Dependencies).IsSuccess);
+        var associations = (Dictionary<ExternalOperationHandle, (ProcessHandle Owner, BudgetReservationHandle Reservation)>)
+            typeof(RuntimeKernel).GetField("_externalOperationBudgetReservations", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .GetValue(s.Kernel)!;
+        var original = associations[prepared.Operation];
+        if (fault == 1)
+        {
+            var routes = (global::System.Collections.IDictionary)typeof(ExternalOperationAuthority)
+                .GetField("_operations", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(s.Kernel.ExternalOperations)!;
+            var record = routes[prepared.Operation.OperationId]!;
+            routes[prepared.Operation.OperationId] = record.GetType()
+                .GetMethod("MemberwiseClone", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(record, null)!;
+            Assert.False(s.Kernel.CancelExternalOperation(s.Owner, prepared.Operation, false).IsSuccess);
+            Assert.False(s.Kernel.ReleaseExternalOperation(s.Owner, prepared.Operation, new(false, false)).IsSuccess);
+            Assert.Equal(BudgetReservationState.Active, s.Kernel.QueryBudget(original.Reservation).Value!.State);
+            routes[prepared.Operation.OperationId] = record;
+        }
+        if (fault == 2) associations[prepared.Operation] = (admin, original.Reservation);
+        else associations.Remove(prepared.Operation);
+        Assert.True(s.Kernel.CancelExternalOperation(s.Owner, prepared.Operation, false).IsSuccess);
+        Assert.True(s.Kernel.ReleaseExternalOperation(s.Owner, prepared.Operation, new(false, false)).IsSuccess);
+        Assert.Equal(ExternalOperationState.Released, s.Kernel.ExternalOperations.Query(prepared.Operation).Value!.State);
+        if (fault == 2)
+        {
+            Assert.Equal(BudgetReservationState.Active, s.Kernel.QueryBudget(original.Reservation).Value!.State);
+            associations.Remove(prepared.Operation);
+            Assert.True(s.Kernel.ReleaseExternalOperation(s.Owner, prepared.Operation, new(false, false)).IsSuccess);
+        }
+        Assert.Equal(BudgetReservationState.Released, s.Kernel.QueryBudget(original.Reservation).Value!.State);
+        Assert.Contains(s.Kernel.QueryBudget(account).Value!.Usage,
+            u => u.Dimension == ServiceBudgetDimension.ExternalOperations && u.Used == 0);
+        Assert.True(s.Kernel.ReleaseExternalOperation(s.Owner, prepared.Operation, new(false, false)).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task ProviderLossDuringPublicationRetainsPossibleEffectAndRefusesCommit(bool sourceHook, bool actionThrows)
+    {
+        var s = CreateScenario();
+        var prepared = Prepare(s, ExternalPublicationPolicy.Staged);
+        Assert.True(s.Kernel.AdmitExternalOperation(s.Owner, prepared.Operation, Dependencies).IsSuccess);
+        var binding = s.Kernel.RecordExternalOperationSubmission(s.Owner, prepared.Operation, Dependencies).Value!;
+        Assert.True(s.Kernel.RecordExternalOperationCompletion(s.Owner, new(binding, ExternalOperationCompletionDisposition.Completed)).IsSuccess);
+        Assert.True(s.Kernel.RecordExternalOperationVisibility(s.Owner, new(binding, ExternalVisibilityRequirement.PublicationFence, true)).IsSuccess);
+        using var entered = new ManualResetEventSlim();
+        using var resume = new ManualResetEventSlim();
+        Action<ExternalPublicationDecisionV1> action = _ =>
+        {
+            s.Output.Span.Fill(0x5A);
+            entered.Set();
+            Assert.True(resume.Wait(TimeSpan.FromSeconds(10)));
+            if (actionThrows) throw new InvalidOperationException("Injected loss after possible output.");
+        };
+        var publication = Task.Run(() => sourceHook
+            ? s.Kernel.PublishExternalOperation(s.Owner, prepared.Operation, Dependencies,
+                new(ExternalPublicationPolicy.Staged), action, commit => commit())
+            : s.Kernel.PublishExternalOperation(s.Owner, prepared.Operation, Dependencies,
+                new(ExternalPublicationPolicy.Staged), action));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.True(s.Kernel.RecordExternalOperationProviderLoss(s.Owner, prepared.Operation).IsSuccess);
+            Assert.True(s.Kernel.RecordExternalOperationProviderLoss(s.Owner, prepared.Operation).IsSuccess);
+            Assert.False(s.Kernel.ReleaseExternalOperation(s.Owner, prepared.Operation, new(true, true)).IsSuccess);
+        }
+        finally { resume.Set(); }
+        Assert.Equal(KernelError.ExternalEffectUncontained, (await publication).Error);
+        var snapshot = s.Kernel.QueryExternalOperation(s.Owner, prepared.Operation).Value!;
+        Assert.Equal(ExternalOperationState.Visible, snapshot.State);
+        Assert.Equal(ExternalEffectBoundaryState.PossiblyExternallyVisible, snapshot.EffectBoundary);
+        Assert.Single(snapshot.Transitions, transition => transition.Event == "ProviderLost");
+        Assert.Single(snapshot.Transitions, transition => transition.Event == "PublicationEffectAmbiguous");
+        Assert.DoesNotContain(snapshot.Transitions, transition => transition.Event == "Published");
+        Assert.False(s.Kernel.ReleaseExternalOperation(s.Owner, prepared.Operation, new(true, true)).IsSuccess);
+        var called = false;
+        Assert.False(s.Kernel.PublishExternalOperation(s.Owner, prepared.Operation, Dependencies,
+            new(ExternalPublicationPolicy.Staged), () => called = true).IsSuccess);
+        Assert.False(called);
+        // The callback did write. Refusal does not prove rollback or provider closure.
+        Assert.All(s.Output.Span.ToArray(), value => Assert.Equal(0x5A, value));
+        var trace = V6ExternalOperationTraceProjection.ProjectPublishedPrefix(snapshot, new string('a', 64));
+        Assert.True(SemanticTraceValidatorV1.Validate(trace).IsValid);
+        Assert.DoesNotContain(trace, item => item.Kind is SemanticTraceEventKindV1.Published or
+            SemanticTraceEventKindV1.Released or SemanticTraceEventKindV1.EffectClosedWithoutPublication);
+    }
+
+    [Theory]
+    [InlineData(ExternalPublicationPolicy.Staged)]
+    [InlineData(ExternalPublicationPolicy.DirectCoherent)]
+    public async Task CompletionLossRaceCannotEraseLossOrAuthorizePublication(ExternalPublicationPolicy policy)
+    {
+        for (var sample = 0; sample < 16; sample++)
+        {
+            var s = CreateScenario();
+            var prepared = Prepare(s, policy);
+            Assert.True(s.Kernel.AdmitExternalOperation(s.Owner, prepared.Operation, Dependencies).IsSuccess);
+            var binding = s.Kernel.RecordExternalOperationSubmission(s.Owner, prepared.Operation, Dependencies).Value!;
+            using var start = new ManualResetEventSlim();
+            var completion = Task.Run(() => { start.Wait(); return s.Kernel.RecordExternalOperationCompletion(s.Owner,
+                new(binding, ExternalOperationCompletionDisposition.Completed)); });
+            var loss = Task.Run(() => { start.Wait(); return s.Kernel.RecordExternalOperationProviderLoss(s.Owner, prepared.Operation); });
+            start.Set();
+            var completed = await completion;
+            Assert.True((await loss).IsSuccess);
+            if (!completed.IsSuccess) Assert.Equal(KernelError.InvalidTransition, completed.Error);
+            var snapshot = s.Kernel.QueryExternalOperation(s.Owner, prepared.Operation).Value!;
+            Assert.Equal(policy == ExternalPublicationPolicy.Staged ? ExternalOperationDisposition.ProviderLost : ExternalOperationDisposition.Faulted, snapshot.Disposition);
+            Assert.Single(snapshot.Transitions, transition => transition.Event == "ProviderLost");
+            Assert.False(s.Kernel.RecordExternalOperationVisibility(s.Owner,
+                new(binding, ExternalVisibilityRequirement.PublicationFence, true)).IsSuccess);
+            var action = false;
+            Assert.False(s.Kernel.PublishExternalOperation(s.Owner, prepared.Operation, Dependencies,
+                new(policy), () => action = true).IsSuccess);
+            Assert.False(action);
+            var trace = V6ExternalOperationTraceProjection.ProjectPublishedPrefix(snapshot, new string('a', 64));
+            Assert.True(SemanticTraceValidatorV1.Validate(trace).IsValid);
+        }
+    }
+
+    [Theory]
+    [InlineData(ExternalPublicationPolicy.Staged)]
+    [InlineData(ExternalPublicationPolicy.DirectCoherent)]
+    public async Task ConcurrentProviderLossCommitsOneOwnerFactWithoutClosure(ExternalPublicationPolicy policy)
+    {
+        var s = CreateScenario();
+        var prepared = Prepare(s, policy);
+        Assert.True(s.Kernel.AdmitExternalOperation(s.Owner, prepared.Operation, Dependencies).IsSuccess);
+        Assert.True(s.Kernel.RecordExternalOperationSubmission(s.Owner, prepared.Operation, Dependencies).IsSuccess);
+        var losses = await Task.WhenAll(Enumerable.Range(0, 32).Select(_ => Task.Run(() =>
+            s.Kernel.RecordExternalOperationProviderLoss(s.Owner, prepared.Operation))));
+        Assert.All(losses, loss => Assert.True(loss.IsSuccess, loss.Message));
+        var snapshot = s.Kernel.QueryExternalOperation(s.Owner, prepared.Operation).Value!;
+        Assert.Single(snapshot.Transitions, transition => transition.Event == "ProviderLost");
+        Assert.Equal(policy == ExternalPublicationPolicy.Staged ? ExternalOperationDisposition.ProviderLost : ExternalOperationDisposition.Faulted, snapshot.Disposition);
+        var last = snapshot.Transitions.Last();
+        var duplicateLoss = snapshot with
+        {
+            Transitions = snapshot.Transitions.Append(last with { Sequence = last.Sequence + 1 }).ToArray()
+        };
+        Assert.Throws<NotSupportedException>(() =>
+            V6ExternalOperationTraceProjection.ProjectPublishedPrefix(duplicateLoss, new string('a', 64)));
+        var count = snapshot.Transitions.Count;
+        Assert.True(s.Kernel.RecordExternalOperationProviderLoss(s.Owner, prepared.Operation).IsSuccess);
+        Assert.Equal(count, s.Kernel.QueryExternalOperation(s.Owner, prepared.Operation).Value!.Transitions.Count);
+        Assert.False(s.Kernel.ReleaseExternalOperation(s.Owner, prepared.Operation, new(false, true)).IsSuccess);
+        var trace = V6ExternalOperationTraceProjection.ProjectPublishedPrefix(snapshot, new string('a', 64));
+        Assert.Single(trace, item => item.Kind == SemanticTraceEventKindV1.Quarantined);
+        Assert.DoesNotContain(trace, item => item.Kind is SemanticTraceEventKindV1.Released or SemanticTraceEventKindV1.EffectClosedWithoutPublication);
+        Assert.True(SemanticTraceValidatorV1.Validate(trace).IsValid);
+    }
+
+    [Theory]
+    [InlineData(ExternalPublicationPolicy.Staged, ExternalOperationCompletionDisposition.Completed)]
+    [InlineData(ExternalPublicationPolicy.Staged, ExternalOperationCompletionDisposition.Cancelled)]
+    [InlineData(ExternalPublicationPolicy.Staged, ExternalOperationCompletionDisposition.Faulted)]
+    [InlineData(ExternalPublicationPolicy.DirectCoherent, ExternalOperationCompletionDisposition.Completed)]
+    [InlineData(ExternalPublicationPolicy.DirectCoherent, ExternalOperationCompletionDisposition.Cancelled)]
+    [InlineData(ExternalPublicationPolicy.DirectCoherent, ExternalOperationCompletionDisposition.Faulted)]
+    public void LateTerminalResponseCannotReplaceProviderLoss(ExternalPublicationPolicy policy,
+        ExternalOperationCompletionDisposition disposition)
+    {
+        var s = CreateScenario();
+        var prepared = Prepare(s, policy);
+        Assert.True(s.Kernel.AdmitExternalOperation(s.Owner, prepared.Operation, Dependencies).IsSuccess);
+        var binding = s.Kernel.RecordExternalOperationSubmission(s.Owner, prepared.Operation, Dependencies).Value!;
+        var lost = s.Kernel.RecordExternalOperationProviderLoss(s.Owner, prepared.Operation).Value!;
+        var late = s.Kernel.RecordExternalOperationCompletion(s.Owner, new(binding, disposition));
+        Assert.Equal(KernelError.InvalidTransition, late.Error);
+        var forged = lost with
+        {
+            State = ExternalOperationState.DeviceComplete,
+            Disposition = disposition switch
+            {
+                ExternalOperationCompletionDisposition.Completed => ExternalOperationDisposition.Completed,
+                ExternalOperationCompletionDisposition.Cancelled => ExternalOperationDisposition.Cancelled,
+                _ => ExternalOperationDisposition.Faulted
+            },
+            Transitions = [.. lost.Transitions, new(lost.Transitions[^1].Sequence + 1,
+                ExternalOperationState.Submitted, ExternalOperationState.DeviceComplete,
+                disposition == ExternalOperationCompletionDisposition.Completed ? "DeviceComplete" : $"DeviceComplete:{disposition}")]
+        };
+        Assert.Throws<InvalidOperationException>(() =>
+            V6ExternalOperationTraceProjection.ProjectPublishedPrefix(forged, new string('a', 64)));
+        var current = s.Kernel.QueryExternalOperation(s.Owner, prepared.Operation).Value!;
+        Assert.Equal(lost.Disposition, current.Disposition);
+        Assert.Equal(lost.Transitions, current.Transitions);
+        Assert.False(s.Kernel.RecordExternalOperationVisibility(s.Owner,
+            new(binding, ExternalVisibilityRequirement.PublicationFence, true)).IsSuccess);
+        var action = false;
+        Assert.False(s.Kernel.PublishExternalOperation(s.Owner, prepared.Operation, Dependencies,
+            new(policy), () => action = true).IsSuccess);
+        Assert.False(action);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)] [InlineData(5)] [InlineData(6)]
+    public void PublicationSourceHookReplyCannotCreateOrUndoOwnerFact(int fault)
+    {
+        var s = CreateScenario();
+        var provider = new MockExternalProvider(s.Kernel, s.Owner);
+        var prepared = Prepare(s, ExternalPublicationPolicy.Staged);
+        Assert.True(s.Kernel.AdmitExternalOperation(s.Owner, prepared.Operation, Dependencies).IsSuccess);
+        var binding = provider.Submit(prepared.Operation, Dependencies).Value!;
+        Assert.True(provider.Complete(binding, ExternalOperationCompletionDisposition.Completed).IsSuccess);
+        var visible = provider.MakeVisible(binding, ExternalVisibilityRequirement.PublicationFence, true).Value!;
+        Func<KernelResult<ExternalOperationSnapshot>>? delayed = null;
+        var result = s.Kernel.PublishExternalOperation(s.Owner, prepared.Operation, Dependencies,
+            new(ExternalPublicationPolicy.Staged), _ => s.Output.Span.Fill(0x5A), commit =>
+            {
+                delayed = commit;
+                var gate = s.Kernel.ExternalOperations.GetType().GetField("_gate",
+                    BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(s.Kernel.ExternalOperations)!;
+                Assert.False(Monitor.IsEntered(gate));
+                if (fault == 0) return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.CapabilityRevoked, "Injected refusal.");
+                if (fault == 1) throw new InvalidOperationException("Injected source hook failure.");
+                if (fault == 2) return KernelResult<ExternalOperationSnapshot>.Ok(visible);
+                if (fault == 6)
+                {
+                    KernelResult<ExternalOperationSnapshot> crossThread = default;
+                    var thread = new Thread(() => crossThread = commit());
+                    thread.Start();
+                    Assert.True(thread.Join(TimeSpan.FromSeconds(5)));
+                    Assert.False(crossThread.IsSuccess);
+                    return KernelResult<ExternalOperationSnapshot>.Ok(visible);
+                }
+                var committed = commit();
+                Assert.True(committed.IsSuccess);
+                if (fault == 3) return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.PlatformFaulted, "Reply lost after commit.");
+                if (fault == 5) throw new InvalidOperationException("Reply threw after commit.");
+                Assert.False(commit().IsSuccess);
+                return KernelResult<ExternalOperationSnapshot>.Ok(visible);
+            });
+        Assert.Equal(fault is 3 or 4 or 5, result.IsSuccess);
+        Assert.False(delayed!().IsSuccess);
+        var current = s.Kernel.QueryExternalOperation(s.Owner, prepared.Operation).Value!;
+        Assert.Equal(0x5A, s.Output.Span[0]);
+        if (fault is 3 or 4 or 5)
+        {
+            Assert.Equal(ExternalOperationState.Published, current.State);
+            Assert.Equal(ExternalOperationState.Published, result.Value!.State);
+        }
+        else
+        {
+            Assert.Equal(ExternalOperationDisposition.Faulted, current.Disposition);
+            Assert.Equal(KernelError.ExternalEffectUncontained, result.Error);
+            Assert.False(s.Kernel.ReleaseExternalOperation(s.Owner, prepared.Operation, new(false, false)).IsSuccess);
+        }
+    }
+
     private static readonly OperationDependencySnapshot Dependencies = new(7, 11);
 
     [Theory]

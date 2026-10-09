@@ -8,6 +8,38 @@ namespace SingPlus.Tests.Capabilities;
 
 public sealed class SingCapPhase06SoftwareSealingTests
 {
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void OriginalPinCannotConsumeCopiedRouteAndReleasesOriginalFact(bool absent)
+    {
+        var fixture = Fixture();
+        var handle = Seal(fixture);
+        var pin = fixture.Seals.AcquirePin(handle, fixture.Descriptor, fixture.Service,
+            fixture.Owner, fixture.Session, 1, fixture.Capability).Value!;
+        var routes = (global::System.Collections.IDictionary)typeof(SealedObjectAuthority)
+            .GetField("_records", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(fixture.Seals)!;
+        var original = routes[handle.OpaqueToken]!;
+        var copy = original.GetType().GetMethod("MemberwiseClone", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(original, null)!;
+        var state = original.GetType().GetProperty("State")!;
+        var pins = original.GetType().GetProperty("ActivePins")!;
+        if (absent) routes.Remove(handle.OpaqueToken); else routes[handle.OpaqueToken] = copy;
+        Assert.Equal(KernelError.StaleHandle, fixture.Seals.Revalidate(pin, fixture.Descriptor, fixture.Service).Error);
+        Assert.Equal(KernelError.StaleHandle, fixture.Seals.BeginClose(pin).Error);
+        Assert.False(fixture.Seals.AcquirePin(handle, fixture.Descriptor, fixture.Service,
+            fixture.Owner, fixture.Session, 1, fixture.Capability).IsSuccess);
+        routes[handle.OpaqueToken] = original;
+        Assert.True(fixture.Seals.BeginClose(pin).IsSuccess);
+        if (absent) routes.Remove(handle.OpaqueToken); else routes[handle.OpaqueToken] = copy;
+        Parallel.Invoke(pin.Dispose, pin.Dispose);
+        Assert.Equal(0, (int)pins.GetValue(original)!);
+        Assert.Equal(SealedObjectState.Closed, (SealedObjectState)state.GetValue(original)!);
+        Assert.Equal(1, (int)pins.GetValue(copy)!);
+        Assert.Equal(SealedObjectState.Active, (SealedObjectState)state.GetValue(copy)!);
+        routes[handle.OpaqueToken] = original;
+        Assert.False(fixture.Seals.AcquirePin(handle, fixture.Descriptor, fixture.Service,
+            fixture.Owner, fixture.Session, 1, fixture.Capability).IsSuccess);
+    }
+
     private readonly struct UnknownSeal : ISealedContractMarker;
 
     [Fact]

@@ -180,3 +180,90 @@ child-execute (explicit, excluded from all) uses real executable guest mapping, 
 child-execute now uses the public bundled HybridCpuRestrictedImageBuilderV1 inspector before creating guest memory/mapping. This is the same package implementation used by ExternalRuntime; it checks package compatibility and startup contract and grants no authority. Provider/runtime bind and start still run for accepted packages. Both available local compiler binaries produce the same rejected schema; no header downgrade or runtime acceptance change was made.
 
 verify-guest <HCEXE path> inspects 1..65536 bytes under FileShare.Read with the bundled HCEXE startup inspector, prints status, exact input SHA-256 and bounded diagnostic codes/messages, and fails scripts on rejection. It needs no platform profile and creates no process, guest mapping or execution authority. Current sample reports VersionSkew/HCSTART2004. No compatible compiler package was found in the local NuGet cache/feed; guest execution remains unverified.
+
+## Cooperative hosted application
+
+Run a persistent generated Counter service from the shell:
+counter-start <name>, counter-call <name> <Int32>, counters, counter-stop <name>.
+Each application owns two runtime processes, a capability-gated service and one
+EndpointSession. Repeated calls use the same session. The result and successful
+call count update only after runtime response publication. Duplicate names,
+unknown applications, Int32 overflow and revoked authority are refused.
+The service identity is unique to the server process; restarting a stopped name
+creates fresh processes and a fresh session. counters prints exact process/session
+handles and the admission capability is printed at startup for revoke diagnostics.
+With --trace both application processes get runtime traces; use trace-show <pid>
+after stopping to inspect the captured snapshots. IPC events are runtime evidence;
+there are no dedicated generated-dispatch trace events.
+
+From the repository root:
+
+    dotnet run --project src/Kernel/Boot/SingPlus.Boot -- --demo hosted-service --budget --trace --no-shell
+    dotnet run --project src/Kernel/Boot/SingPlus.Boot -- --script src/Kernel/Boot/SingPlus.Boot/Scripts/hosted-counter.txt --no-shell
+    pwsh -File src/Kernel/Boot/SingPlus.Boot/Scripts/Test-HostedCounter.ps1
+
+hosted-service checks repeated calls, overflow and revoked-capability refusal,
+then closes the session and reclaims both processes. counter-stop retains partial
+cleanup progress for retries; shutdown also stops applications left open by a
+script or the interactive shell. Failed setup attempts reclaim known processes;
+incomplete cleanup is reported and remains tracked for shutdown.
+
+This is the existing generated copied-value contract running cooperatively on the
+trusted host CLR through RuntimeSipClientTransport, runtime acceptance and response
+publication. It does not execute arbitrary admitted SIP images or emulate hardware.
+## Current runtime integration (2026-10-08)
+
+--platform host-model --demo virtual-domain --budget --trace --no-shell
+exercises real runtime virtual-domain admission, a capability-authorized guest
+mapping, premature Region release refusal, start/park/resume, cancellation of an
+event wait without domain cancellation, exact-source virtual event delivery,
+destroyed-domain refusal and endpoint/Region/process cleanup. This is ModelOnly
+lifecycle and event evidence; no guest instructions or hardware isolation claimed.
+The demo is explicit, excluded from generic --demo all, and also available as
+shell demo virtual-domain or Scripts/virtual-domain-showcase.txt.
+
+PowerShell launchers resolve all paths relative to themselves and work from any
+directory. Run-Demo.ps1 supports Boot, Hosted, Memory, Compute, ComputeCancel,
+VirtualDomain, HybridCpu, Services and All. Each scenario runs in a fresh process,
+suppresses the interactive shell, checks exit code and required evidence, and
+refuses incomplete shutdown. All selects these supported positive scenarios;
+it is distinct from the CLI's historical --demo all. Negative provider-fault and
+incompatible guest-artifact probes remain in the existing verification runners.
+
+    pwsh -File Scripts/Run-HostDemo.ps1
+    pwsh -File Scripts/Run-MemoryShowcase.ps1
+    pwsh -File Scripts/Run-ComputeShowcase.ps1
+    pwsh -File Scripts/Run-VirtualDomainShowcase.ps1
+    pwsh -File Scripts/Run-ServiceShowcase.ps1
+    pwsh -File Scripts/Run-AllDemos.ps1
+    pwsh -File Scripts/Run-Demo.ps1 -Scenario ComputeCancel
+    pwsh -File Scripts/Run-Demo.ps1 -Scenario HybridCpu
+
+Each accepts -Configuration Debug|Release and -NoBuild. NoBuild requires an
+existing output for that configuration. These commands assume the Boot directory;
+absolute script paths can be used from anywhere. No additional backend or package
+dependency is introduced. Current modernization status lives in
+docs/SingNextOS-v6-modernize; older Boot backlog entries are historical and need
+source revalidation before being treated as current runtime defects.
+## ASCII snake
+
+Play-Snake.ps1 launches a 16x10 ASCII snake game:
+
+    pwsh -File Scripts/Play-Snake.ps1
+    pwsh -File Scripts/Play-Snake.ps1 -Demo
+
+Direct CLI: --game snake --budget --no-shell. From the interactive shell: snake.
+Interactive movement runs every 500 ms. Use WASD or arrow keys without Enter.
+R restarts, Q or Escape quits. Food is deterministic; eating grows the snake and increases
+the score; wall/body collisions end the round. Reversing directly keeps the
+current heading. The screen uses ASCII @, o, * and borders. Interactive frames redraw the terminal; scripted frames print sequentially. Interactive play requires terminal input and output. Script mode accepts snake <WASDRQ moves> (maximum 4096 characters);
+Scripts/snake-showcase.txt exercises growth, collision, restart and cleanup.
+
+The game owns a generated ISnakeService contract. Inputs and responses contain
+bounded primitive values; the board is a fixed three-word bitset. Each step
+passes through generated client, RuntimeSipClientTransport, real runtime session
+acceptance, generated dispatcher and runtime response publication. State belongs
+to the service instance. The trusted implementation runs cooperatively on host
+CLR; this does not execute an arbitrary admitted DLL or SipJob. Console input and
+rendering belong to Boot. --budget and --trace use the existing runtime paths.
+Q, EOF and invocation errors close the session and reclaim game processes.

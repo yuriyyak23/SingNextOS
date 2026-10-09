@@ -1,0 +1,4 @@
+platform
+demo virtual-domain
+status
+exit

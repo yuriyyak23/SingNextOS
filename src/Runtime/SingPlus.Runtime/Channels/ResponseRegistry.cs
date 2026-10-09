@@ -30,10 +30,12 @@ internal sealed class ResponseRegistry
 
     private sealed class CompletionRecord(
         ProcessHandle requester,
-        EndpointId requesterEndpoint)
+        EndpointId requesterEndpoint,
+        PendingRecord originalPending)
     {
         public ProcessHandle Requester { get; } = requester;
         public EndpointId RequesterEndpoint { get; } = requesterEndpoint;
+        public PendingRecord OriginalPending { get; } = originalPending;
         public TaskCompletionSource<ResponseEnvelope> Source { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool Waiting { get; set; }
@@ -51,6 +53,7 @@ internal sealed class ResponseRegistry
         public int Capacity { get; } = capacity;
         public Dictionary<ulong, PendingRecord> Pending { get; } = [];
         public Dictionary<ulong, CompletionRecord> Completions { get; } = [];
+        public Dictionary<ulong, CompletionRecord> OwnedCompletions { get; } = [];
         public Queue<ResponseEnvelope> LeftResponses { get; } = new();
         public Queue<ResponseEnvelope> RightResponses { get; } = new();
     }
@@ -59,6 +62,8 @@ internal sealed class ResponseRegistry
     private readonly Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>> _transferRegion;
     private readonly ChannelRegistry _requestChannels;
     private readonly Dictionary<ChannelId, ChannelRecord> _channels = [];
+    // Same authoritative records retained independently from the response routing index.
+    private readonly Dictionary<ChannelId, ChannelRecord> _ownedChannels = [];
 
     internal ResponseRegistry(RegionAuthority regions, ChannelRegistry channels,
         Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>> transferRegion)
@@ -110,7 +115,11 @@ internal sealed class ResponseRegistry
     {
         if (left.ChannelId != right.ChannelId)
             throw new InvalidOperationException("Response channel endpoints must belong to the same channel.");
-        _channels.Add(left.ChannelId, new ChannelRecord(protocol, leftOwner, rightOwner, capacity));
+        _ownedChannels.EnsureCapacity(_ownedChannels.Count + 1);
+        _channels.EnsureCapacity(_channels.Count + 1);
+        var record = new ChannelRecord(protocol, leftOwner, rightOwner, capacity);
+        _ownedChannels.Add(left.ChannelId, record);
+        _channels.Add(left.ChannelId, record);
     }
 
     internal KernelResult CanRegisterRequest(
@@ -119,7 +128,10 @@ internal sealed class ResponseRegistry
         ProcessHandle requester,
         ProcessHandle responder)
     {
-        if (!_channels.TryGetValue(endpoint.ChannelId, out var channel)) return KernelResult.Ok();
+        if (!TryResolveChannel(endpoint.ChannelId, out var channel))
+            return _ownedChannels.ContainsKey(endpoint.ChannelId) || _channels.ContainsKey(endpoint.ChannelId)
+                ? KernelResult.Fail(KernelError.PlatformFaulted, "Original response owner continuity was lost.")
+                : KernelResult.Ok();
         if (!channel.Protocol.TryGetMessage(messageId, out _))
             return KernelResult.Fail(KernelError.ResponseProtocolMismatch, $"Response protocol does not define message {messageId}.");
 
@@ -128,7 +140,7 @@ internal sealed class ResponseRegistry
         if (requester != expectedRequester || responder != expectedResponder)
             return KernelResult.Fail(KernelError.WrongEndpointOwner, "Response correlation owners do not match the channel endpoints.");
 
-        var outstanding = channel.Pending.Count + channel.LeftResponses.Count + channel.RightResponses.Count;
+        var outstanding = channel.OwnedCompletions.Count;
         return outstanding >= channel.Capacity
             ? KernelResult.Fail(KernelError.CapacityExhausted, "Response transport capacity is exhausted by outstanding calls or unread responses.")
             : KernelResult.Ok();
@@ -140,18 +152,34 @@ internal sealed class ResponseRegistry
         ProcessHandle requester,
         ProcessHandle responder)
     {
-        if (!_channels.TryGetValue(endpoint.ChannelId, out var channel)) return;
+        if (!TryResolveChannel(endpoint.ChannelId, out var channel)) return;
         if (!channel.Protocol.TryGetMessage(request.MessageId, out var response))
             throw new InvalidOperationException("Validated response metadata disappeared before request registration.");
 
         var requesterEndpoint = endpoint.EndpointId;
         var responderEndpoint = new EndpointId(endpoint.EndpointId.Value == 1 ? 2UL : 1UL);
-        channel.Pending.Add(
-            request.Sequence,
-            new PendingRecord(request.Sequence, response, requester, requesterEndpoint, responder, responderEndpoint));
-        channel.Completions.Add(
-            request.Sequence,
-            new CompletionRecord(requester, requesterEndpoint));
+        channel.OwnedCompletions.EnsureCapacity(channel.OwnedCompletions.Count + 1);
+        channel.Pending.EnsureCapacity(channel.Pending.Count + 1);
+        channel.Completions.EnsureCapacity(channel.Completions.Count + 1);
+        var pending = new PendingRecord(request.Sequence, response, requester, requesterEndpoint, responder, responderEndpoint);
+        var completion = new CompletionRecord(requester, requesterEndpoint, pending);
+        channel.OwnedCompletions.Add(request.Sequence, completion);
+        channel.Pending.Add(request.Sequence, pending);
+        channel.Completions.Add(request.Sequence, completion);
+    }
+
+    internal KernelResult CanMarkDelivered(ChannelEndpointHandle endpoint, ChannelEnvelope request, ProcessHandle receiver)
+    {
+        if (!TryResolveChannel(endpoint.ChannelId, out var channel))
+            return _ownedChannels.ContainsKey(endpoint.ChannelId) || _channels.ContainsKey(endpoint.ChannelId)
+                ? KernelResult.Fail(KernelError.PlatformFaulted, "Original response owner continuity was lost.")
+                : KernelResult.Ok();
+        if (!TryResolvePending(channel, request.Sequence, out var pending) ||
+            pending.Response.MessageId != request.MessageId || pending.State != PendingState.Queued)
+            return KernelResult.Fail(KernelError.ResponseNotPending, "Original request correlation is not available for delivery.");
+        return pending.Responder == receiver && pending.ResponderEndpoint == endpoint.EndpointId
+            ? KernelResult.Ok()
+            : KernelResult.Fail(KernelError.WrongEndpointOwner, "Delivered request does not match its original responder.");
     }
 
     internal void MarkDelivered(
@@ -159,8 +187,8 @@ internal sealed class ResponseRegistry
         ChannelEnvelope request,
         ProcessHandle receiver)
     {
-        if (!_channels.TryGetValue(endpoint.ChannelId, out var channel)) return;
-        if (!channel.Pending.TryGetValue(request.Sequence, out var pending))
+        if (!TryResolveChannel(endpoint.ChannelId, out var channel)) return;
+        if (!TryResolvePending(channel, request.Sequence, out var pending))
             throw new InvalidOperationException("Delivered request has no pending response correlation.");
         if (pending.Responder != receiver || pending.ResponderEndpoint != endpoint.EndpointId)
             throw new InvalidOperationException("Delivered request does not match the pending response responder.");
@@ -172,9 +200,9 @@ internal sealed class ResponseRegistry
         ulong requestSequence,
         ProcessHandle responder)
     {
-        if (!_channels.TryGetValue(endpoint.ChannelId, out var channel))
+        if (!TryResolveChannel(endpoint.ChannelId, out var channel))
             return KernelResult<ProcessHandle>.Fail(KernelError.ResponseProtocolUnavailable, "The channel was not created with response protocol metadata.");
-        if (!channel.Pending.TryGetValue(requestSequence, out var pending))
+        if (!TryResolvePending(channel, requestSequence, out var pending))
             return KernelResult<ProcessHandle>.Fail(KernelError.ResponseNotPending, "No pending response exists for the request sequence.");
         if (pending.Responder != responder || pending.ResponderEndpoint != endpoint.EndpointId)
             return KernelResult<ProcessHandle>.Fail(KernelError.WrongEndpointOwner, "The endpoint does not own this pending response.");
@@ -186,11 +214,12 @@ internal sealed class ResponseRegistry
         SingProcess requester,
         ChannelEndpointHandle endpoint,
         ulong requestSequence,
-        object? payload)
+        object? payload,
+        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>>? transferRegion = null)
     {
-        if (!_channels.TryGetValue(endpoint.ChannelId, out var channel))
+        if (!TryResolveChannel(endpoint.ChannelId, out var channel))
             return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseProtocolUnavailable, "The channel was not created with response protocol metadata.");
-        if (!channel.Pending.TryGetValue(requestSequence, out var pending))
+        if (!TryResolvePending(channel, requestSequence, out var pending))
             return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseNotPending, "No pending response exists for the request sequence.");
 
         var responderHandle = new ProcessHandle(responder.ProcessId, responder.Generation);
@@ -209,7 +238,7 @@ internal sealed class ResponseRegistry
         object? publishedPayload = payload;
         if (pending.Response.Payload.Kind == ResponsePayloadKind.Ownership)
         {
-            var transferred = TransferOwnership(responder, requester, (ITransferableOwnedPayload)payload!);
+            var transferred = TransferOwnership(responder, requester, (ITransferableOwnedPayload)payload!, transferRegion: transferRegion);
             if (!transferred.IsSuccess)
                 return KernelResult<ResponseEnvelope>.Fail(transferred.Error, transferred.Message!);
             publishedPayload = transferred.Value;
@@ -232,10 +261,12 @@ internal sealed class ResponseRegistry
         SingProcess requester,
         ChannelEndpointHandle endpoint,
         uint messageId,
-        OwnedBuffer<T> payload) where T : unmanaged
+        OwnedBuffer<T> payload,
+        Func<KernelResult>? finalAdmission = null,
+        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>>? transferRegion = null) where T : unmanaged
     {
         ArgumentNullException.ThrowIfNull(payload);
-        if (!_channels.TryGetValue(endpoint.ChannelId, out var channel))
+        if (!TryResolveChannel(endpoint.ChannelId, out var channel))
             return KernelResult<OwnedBuffer<T>>.Fail(KernelError.ResponseProtocolUnavailable, "Inline ownership response requires registered response metadata.");
         if (!channel.Protocol.TryGetMessage(messageId, out var response))
             return KernelResult<OwnedBuffer<T>>.Fail(KernelError.ResponseProtocolMismatch, $"Response metadata for message {messageId} is missing.");
@@ -250,7 +281,7 @@ internal sealed class ResponseRegistry
             return KernelResult<OwnedBuffer<T>>.Fail(shape.Error, shape.Message!);
         if (response.Payload.Kind != ResponsePayloadKind.Ownership)
             return KernelResult<OwnedBuffer<T>>.Fail(KernelError.UnsupportedPayload, "Operation does not declare an ownership response.");
-        var transferred = TransferOwnership(responder, requester, payload);
+        var transferred = TransferOwnership(responder, requester, payload, finalAdmission, transferRegion);
         return transferred.IsSuccess
             ? KernelResult<OwnedBuffer<T>>.Ok((OwnedBuffer<T>)transferred.Value!)
             : KernelResult<OwnedBuffer<T>>.Fail(transferred.Error, transferred.Message!);
@@ -259,7 +290,9 @@ internal sealed class ResponseRegistry
     private KernelResult<object> TransferOwnership(
         SingProcess responder,
         SingProcess requester,
-        ITransferableOwnedPayload owned)
+        ITransferableOwnedPayload owned,
+        Func<KernelResult>? finalAdmission = null,
+        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>>? transferRegion = null)
     {
         if (!owned.IsValidForRuntime)
             return KernelResult<object>.Fail(KernelError.InvalidRegionState, "Ownership response requires a valid owned payload.");
@@ -269,7 +302,7 @@ internal sealed class ResponseRegistry
         var regionValidation = _regions.Validate(oldHandle, source);
         if (!regionValidation.IsSuccess)
             return KernelResult<object>.Fail(regionValidation.Error, regionValidation.Message!);
-        var transfer = _transferRegion(responder, requester, oldHandle, null);
+        var transfer = (transferRegion ?? _transferRegion)(responder, requester, oldHandle, finalAdmission);
         if (!transfer.IsSuccess)
             return KernelResult<object>.Fail(transfer.Error, transfer.Message!);
         var moved = owned.TransferForRuntime(transfer.Value);
@@ -284,9 +317,9 @@ internal sealed class ResponseRegistry
         ChannelEndpointHandle endpoint,
         ulong requestSequence)
     {
-        if (!_channels.TryGetValue(endpoint.ChannelId, out var channel))
+        if (!TryResolveChannel(endpoint.ChannelId, out var channel))
             return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseProtocolUnavailable, "The channel was not created with response protocol metadata.");
-        if (!channel.Pending.TryGetValue(requestSequence, out var pending))
+        if (!TryResolvePending(channel, requestSequence, out var pending))
             return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseNotPending, "No pending response exists for the request sequence.");
         if (pending.Responder != responder || pending.ResponderEndpoint != endpoint.EndpointId)
             return KernelResult<ResponseEnvelope>.Fail(KernelError.WrongEndpointOwner, "The endpoint does not own this pending response.");
@@ -309,7 +342,7 @@ internal sealed class ResponseRegistry
         ProcessHandle requester,
         ChannelEndpointHandle endpoint)
     {
-        if (!_channels.TryGetValue(endpoint.ChannelId, out var channel))
+        if (!TryResolveChannel(endpoint.ChannelId, out var channel))
             return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseProtocolUnavailable, "The channel was not created with response protocol metadata.");
 
         var expectedOwner = endpoint.EndpointId.Value == 1 ? channel.LeftOwner : channel.RightOwner;
@@ -321,26 +354,31 @@ internal sealed class ResponseRegistry
             return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseNotAvailable, "No published or cancelled response is available.");
 
         var next = queue.Peek();
-        if (channel.Completions.TryGetValue(next.RequestSequence, out var completion) && completion.Waiting)
+        if (!TryResolveCompletion(channel, next.RequestSequence, out var completion) ||
+            !completion.Source.Task.IsCompletedSuccessfully || !ReferenceEquals(completion.Source.Task.Result, next))
+            return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseNotAvailable, "Original response completion continuity was lost.");
+        if (completion.Waiting)
             return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseNotAvailable, "The next response is reserved by a correlated runtime waiter.");
 
         var envelope = queue.Dequeue();
         channel.Completions.Remove(envelope.RequestSequence);
+        channel.OwnedCompletions.Remove(envelope.RequestSequence);
         return KernelResult<ResponseEnvelope>.Ok(envelope);
     }
 
     internal async ValueTask<KernelResult<ResponseEnvelope>> WaitAsync(
         ProcessHandle requester,
         ChannelEndpointHandle endpoint,
-        ulong requestSequence)
+        ulong requestSequence,
+        object correlationGate)
     {
-        if (!_channels.TryGetValue(endpoint.ChannelId, out var channel))
+        if (!TryResolveChannel(endpoint.ChannelId, out var channel))
             return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseProtocolUnavailable, "The channel was not created with response protocol metadata.");
 
         var expectedOwner = endpoint.EndpointId.Value == 1 ? channel.LeftOwner : channel.RightOwner;
         if (expectedOwner != requester)
             return KernelResult<ResponseEnvelope>.Fail(KernelError.WrongEndpointOwner, "Endpoint is not owned by the response waiter.");
-        if (!channel.Completions.TryGetValue(requestSequence, out var completion))
+        if (!TryResolveCompletion(channel, requestSequence, out var completion))
             return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseNotAvailable, "The correlated response is no longer pending or available.");
         if (completion.Requester != requester || completion.RequesterEndpoint != endpoint.EndpointId)
             return KernelResult<ResponseEnvelope>.Fail(KernelError.WrongEndpointOwner, "The correlated response does not belong to this endpoint.");
@@ -350,13 +388,19 @@ internal sealed class ResponseRegistry
         completion.Waiting = true;
         var envelope = await completion.Source.Task.ConfigureAwait(false);
 
-        if (_channels.TryGetValue(endpoint.ChannelId, out var activeChannel) &&
-            ReferenceEquals(activeChannel, channel) &&
-            channel.Completions.TryGetValue(requestSequence, out var activeCompletion) &&
-            ReferenceEquals(activeCompletion, completion))
+        // Registration and terminal publication use this existing owner interlock.
+        // The continuation must consume the exact record under the same gate.
+        lock (correlationGate)
         {
-            RemoveQueuedResponse(ResponseQueue(channel, endpoint.EndpointId), requestSequence);
-            channel.Completions.Remove(requestSequence);
+            if (_ownedChannels.TryGetValue(endpoint.ChannelId, out var activeChannel) &&
+                ReferenceEquals(activeChannel, channel) &&
+                channel.OwnedCompletions.TryGetValue(requestSequence, out var activeCompletion) &&
+                ReferenceEquals(activeCompletion, completion))
+            {
+                RemoveQueuedResponse(ResponseQueue(channel, endpoint.EndpointId), requestSequence);
+                channel.Completions.Remove(requestSequence);
+                channel.OwnedCompletions.Remove(requestSequence);
+            }
         }
 
         return KernelResult<ResponseEnvelope>.Ok(envelope);
@@ -367,7 +411,9 @@ internal sealed class ResponseRegistry
         PendingRecord pending,
         ResponseEnvelope envelope)
     {
-        if (!channel.Completions.TryGetValue(pending.RequestSequence, out var completion))
+        if (!TryResolvePending(channel, pending.RequestSequence, out var originalPending) ||
+            !ReferenceEquals(originalPending, pending) ||
+            !TryResolveCompletion(channel, pending.RequestSequence, out var completion))
             throw new InvalidOperationException("Pending response completion state disappeared before publication.");
 
         if (!completion.Waiting)
@@ -380,11 +426,13 @@ internal sealed class ResponseRegistry
 
     private void CloseChannel(ChannelId channelId)
     {
-        if (!_channels.Remove(channelId, out var channel)) return;
+        if (!_ownedChannels.Remove(channelId, out var channel)) return;
+        if (_channels.TryGetValue(channelId, out var routed) && ReferenceEquals(routed, channel))
+            _channels.Remove(channelId);
 
-        foreach (var pending in channel.Pending.Values.OrderBy(static pending => pending.RequestSequence))
+        foreach (var completion in channel.OwnedCompletions.Values.OrderBy(static completion => completion.OriginalPending.RequestSequence))
         {
-            if (!channel.Completions.TryGetValue(pending.RequestSequence, out var completion)) continue;
+            var pending = completion.OriginalPending;
             _ = completion.Source.TrySetResult(new ResponseEnvelope(
                 pending.RequestSequence,
                 pending.Response.MessageId,
@@ -396,8 +444,44 @@ internal sealed class ResponseRegistry
         channel.LeftResponses.Clear();
         channel.RightResponses.Clear();
         channel.Completions.Clear();
+        channel.OwnedCompletions.Clear();
     }
 
+    private static bool TryResolveCompletion(ChannelRecord channel, ulong sequence, out CompletionRecord completion)
+    {
+        if (channel.Completions.TryGetValue(sequence, out var routed) &&
+            channel.OwnedCompletions.TryGetValue(sequence, out var original) && ReferenceEquals(routed, original))
+        {
+            completion = original;
+            return true;
+        }
+        completion = null!;
+        return false;
+    }
+
+    private static bool TryResolvePending(ChannelRecord channel, ulong sequence, out PendingRecord pending)
+    {
+        if (TryResolveCompletion(channel, sequence, out var completion) && !completion.Source.Task.IsCompleted &&
+            channel.Pending.TryGetValue(sequence, out var routed) && ReferenceEquals(routed, completion.OriginalPending))
+        {
+            pending = routed;
+            return true;
+        }
+        pending = null!;
+        return false;
+    }
+
+    private bool TryResolveChannel(ChannelId id, out ChannelRecord channel)
+    {
+        if (_channels.TryGetValue(id, out var routed) && _ownedChannels.TryGetValue(id, out var original) &&
+            ReferenceEquals(routed, original))
+        {
+            channel = original;
+            return true;
+        }
+        channel = null!;
+        return false;
+    }
     private static Queue<ResponseEnvelope> ResponseQueue(ChannelRecord channel, EndpointId endpoint) =>
         endpoint.Value == 1 ? channel.LeftResponses : channel.RightResponses;
 

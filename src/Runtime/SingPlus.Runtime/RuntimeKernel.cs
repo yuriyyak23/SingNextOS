@@ -90,21 +90,66 @@ public sealed partial class RuntimeKernel
     internal ResourceBudgetRecoverySnapshot? ResourceBudgetRecovery =>
         _resourceBudgetRecoveryJournal?.Replay();
 
-    public KernelResult<SingProcess> CreateProcess(SingProcessManifestV1 manifest)
+    public KernelResult<SingProcess> CreateProcess(SingProcessManifestV1 manifest) => CreateProcessCore(manifest, null, out _);
+
+    internal KernelResult<SingProcess> CreateProcess(SingProcessManifestV1 manifest, ProcessHandle principal, CapabilityId control,
+        out bool invoked) => CreateProcessCore(manifest, (principal, control), out invoked);
+
+    private KernelResult<SingProcess> CreateProcessCore(SingProcessManifestV1 manifest,
+        (ProcessHandle Principal, CapabilityId Capability)? source, out bool invoked,
+        Func<Func<KernelResult>, KernelResult>? sourceCommit = null)
     {
+        invoked = false;
         if (manifest is null) return KernelResult<SingProcess>.Fail(KernelError.InvalidManifest, "Manifest is required.");
         // Registry commits share the existing lifecycle scope with teardown and
         // final issuance. Registry owner locks protect metadata readers only.
         lock (_platformMemoryUseGate)
         {
-            var result = Processes.Create(manifest);
-            if (!result.IsSuccess) return result;
-            Domains.Add(result.Value!);
+            foreach (var teardown in _processTeardowns.Values)
+            {
+                if (teardown.DomainReclaimPending == manifest.DomainId)
+                    return KernelResult<SingProcess>.Fail(KernelError.PlatformBindingDraining,
+                        "Domain local reclaim is pending; a new membership requires completed cleanup.");
+            }
+            var attempted = false;
+            KernelResult<SingProcess> Create()
+            {
+                attempted = true;
+                var created = Processes.Create(manifest);
+                if (created.IsSuccess) Domains.Add(created.Value!);
+                return created;
+            }
+            KernelResult<SingProcess> result;
+            if (sourceCommit is not null)
+            {
+                result = KernelResult<SingProcess>.Fail(KernelError.InvalidTransition, "Process creation was not invoked.");
+                var committed = sourceCommit(() =>
+                {
+                    result = Create();
+                    return result.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(result.Error, result.Message!);
+                });
+                if (!committed.IsSuccess) result = KernelResult<SingProcess>.Fail(committed.Error, committed.Message!);
+            }
+            else if (source is { } controller)
+            {
+                var principal = Processes.Resolve(controller.Principal);
+                if (!principal.IsSuccess) return KernelResult<SingProcess>.Fail(KernelError.SupervisorDenied, principal.Message!);
+                var effect = EnsureProcessAcceptsNewEffects(principal.Value!);
+                if (!effect.IsSuccess) return KernelResult<SingProcess>.Fail(KernelError.SupervisorDenied, effect.Message!);
+                result = CapabilityAuthority.CommitSupervisorProcessCreation(controller.Capability,
+                    principal.Value!.DomainId, controller.Principal.Generation, Create);
+            }
+            else result = Create();
+            invoked = attempted;
             return result;
         }
     }
 
-    public KernelResult AdmitProcess(ProcessHandle handle)
+    public KernelResult AdmitProcess(ProcessHandle handle) => AdmitProcessCore(handle, null);
+
+    private KernelResult AdmitProcessCore(ProcessHandle handle,
+        (ProcessHandle Principal, CapabilityId Capability)? source,
+        Func<Func<KernelResult>, KernelResult>? sourceCommit = null)
     {
         SingProcess process;
         lock (_platformMemoryUseGate)
@@ -124,17 +169,28 @@ public sealed partial class RuntimeKernel
             if (!ReferenceEquals(current.Value, process))
                 return KernelResult.Fail(KernelError.StaleHandle, "Admission process changed during requirement capture.");
             if (process.State != ProcessState.Created) return InvalidTransition(process.State, ProcessState.Admitted);
-            return CapabilityAuthority.CommitProcessAdmission(process.DomainId, process.Generation, requirements, () =>
+            KernelResult Admit() => CapabilityAuthority.CommitProcessAdmission(process.DomainId, process.Generation, requirements, () =>
             {
                 process.SetState(ProcessState.Admitted);
                 return KernelResult.Ok();
             });
+            if (sourceCommit is not null) return sourceCommit(Admit);
+            if (source is not { } controller) return Admit();
+            var principal = Processes.Resolve(controller.Principal);
+            if (!principal.IsSuccess) return KernelResult.Fail(KernelError.SupervisorDenied, principal.Message!);
+            var effect = EnsureProcessAcceptsNewEffects(principal.Value!);
+            if (!effect.IsSuccess) return KernelResult.Fail(KernelError.SupervisorDenied, effect.Message!);
+            return CapabilityAuthority.CommitSupervisorProcessAdmission(controller.Capability,
+                principal.Value!.DomainId, controller.Principal.Generation, Admit);
         }
     }
-    public KernelResult StartProcess(ProcessHandle handle)
+    public KernelResult StartProcess(ProcessHandle handle) => StartProcessCore(handle, null);
+
+    private KernelResult StartProcessCore(ProcessHandle handle, (ProcessHandle Principal, CapabilityId Capability)? source,
+        Func<Func<KernelResult>, KernelResult>? sourceCommit = null)
     {
         var result = TransitionProcessExecution(handle, ProcessState.Admitted,
-            ProcessState.Running, PlatformDomainExecutionTransition.Start);
+            ProcessState.Running, PlatformDomainExecutionTransition.Start, source, sourceCommit);
         if (result.IsSuccess)
             RecordTrace(handle, TraceEventKind.ProcessLifecycle, null, "process",
                 $"{handle.ProcessId.Value}:{handle.Generation}", "running", "started");
@@ -166,7 +222,8 @@ public sealed partial class RuntimeKernel
 
     private KernelResult<CapabilityDescriptorV1> MintCapabilityCore(DomainId issuerDomain, ProcessHandle subject, ResourceKind resourceKind, string resourceId, CapabilityRights rights,
         TraceCausalContext? traceContext = null, ulong resourceGeneration = 1,
-        Func<Func<KernelResult<CapabilityDescriptorV1>>, KernelResult<CapabilityDescriptorV1>>? sourceCommitConsumer = null)
+        Func<Func<KernelResult<CapabilityDescriptorV1>>, KernelResult<CapabilityDescriptorV1>>? sourceCommitConsumer = null,
+        List<CapabilityDescriptorV1>? mintObservations = null)
     {
         var resolved = Processes.Resolve(subject);
         if (!resolved.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(resolved.Error, resolved.Message!);
@@ -194,9 +251,21 @@ public sealed partial class RuntimeKernel
             });
         if (!minted.IsSuccess) return minted;
         var descriptor = minted.Value!;
-        RecordTrace(subject, TraceEventKind.CapabilityMinted, traceContext, "capability",
+        if (mintObservations is not null) mintObservations.Add(descriptor);
+        else RecordTrace(subject, TraceEventKind.CapabilityMinted, traceContext, "capability",
             descriptor.CapabilityId.Value.ToString(), "active", "minted");
         return KernelResult<CapabilityDescriptorV1>.Ok(descriptor);
+    }
+
+    private KernelResult<CapabilityDescriptorV1> CommitSupervisorGrantMint(ProcessHandle principal, CapabilityId control,
+        Func<KernelResult<CapabilityDescriptorV1>> mint)
+    {
+        // MintCapabilityCore already holds the existing lifecycle scope.
+        var current = Processes.Resolve(principal);
+        if (!current.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.SupervisorDenied, current.Message!);
+        var effect = EnsureProcessAcceptsNewEffects(current.Value!);
+        if (!effect.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.SupervisorDenied, effect.Message!);
+        return CapabilityAuthority.CommitSupervisorGrantMint(control, current.Value!.DomainId, principal.Generation, mint);
     }
 
     private KernelResult ValidateCapabilityIssuerPresence(DomainId issuerDomain) => Domains.Contains(issuerDomain)
@@ -317,11 +386,21 @@ public sealed partial class RuntimeKernel
 
     public KernelResult RevokeCapability(CapabilityId capabilityId)
     {
+        List<ProcessHandle> revokedSubjects = [];
+        try
+        {
         lock (_platformMemoryUseGate)
-            return RevokeCapabilityLocked(capabilityId);
+            return RevokeCapabilityLocked(capabilityId, revokedSubjects);
+        }
+        finally
+        {
+            foreach (var subject in revokedSubjects)
+                RecordTrace(subject, TraceEventKind.CapabilityRevoked, null, "capability",
+                    capabilityId.Value.ToString(), "revoked", "revoked");
+        }
     }
 
-    private KernelResult RevokeCapabilityLocked(CapabilityId capabilityId)
+    private KernelResult RevokeCapabilityLocked(CapabilityId capabilityId, List<ProcessHandle> revokedSubjects)
     {
         var traceSubjects = CapabilityAuthority.InspectionSnapshot()
             .Where(record => record.Descriptor.CapabilityId == capabilityId)
@@ -332,6 +411,7 @@ public sealed partial class RuntimeKernel
             .ToArray();
         var result = CapabilityAuthority.Revoke(capabilityId);
         if (!result.IsSuccess) return result;
+        revokedSubjects.AddRange(traceSubjects);
 
         // Revoke local mapping permission before any cascade can enter a provider
         // callback. Closure is still performed later and may remain draining/faulted.
@@ -340,15 +420,24 @@ public sealed partial class RuntimeKernel
         _ = PlatformAuthority.BeginMmioCapabilityRevocation(capabilityId, id => CapabilityAuthority.DependsOnCapability(id, capabilityId));
         foreach (var process in Processes.Snapshot())
             process.RemoveCapability(capabilityId);
-        foreach (var subject in traceSubjects)
-            RecordTrace(subject, TraceEventKind.CapabilityRevoked, null, "capability",
-                capabilityId.Value.ToString(), "revoked", "revoked");
 
         var computeCascade = CascadePlatformDsc1CapabilityRevocation(capabilityId);
-        var irqCascade = CascadePlatformIrqCapabilityRevocation(capabilityId);
-        var mmioCascade = CascadePlatformMmioCapabilityRevocation(capabilityId);
-        var deviceCascade = CascadePlatformDeviceCapabilityRevocation(capabilityId);
-        var mappingCascade = CascadePlatformCapabilityRevocation(capabilityId);
+        KernelResult irqCascade;
+        Monitor.Exit(_platformMemoryUseGate);
+        try { irqCascade = CascadePlatformIrqCapabilityRevocation(capabilityId); }
+        finally { Monitor.Enter(_platformMemoryUseGate); }
+        KernelResult mmioCascade;
+        Monitor.Exit(_platformMemoryUseGate);
+        try { mmioCascade = CascadePlatformMmioCapabilityRevocation(capabilityId); }
+        finally { Monitor.Enter(_platformMemoryUseGate); }
+        KernelResult deviceCascade;
+        Monitor.Exit(_platformMemoryUseGate);
+        try { deviceCascade = CascadePlatformDeviceCapabilityRevocation(capabilityId); }
+        finally { Monitor.Enter(_platformMemoryUseGate); }
+        KernelResult mappingCascade;
+        Monitor.Exit(_platformMemoryUseGate);
+        try { mappingCascade = CascadePlatformCapabilityRevocation(capabilityId); }
+        finally { Monitor.Enter(_platformMemoryUseGate); }
         if (!computeCascade.IsSuccess) return computeCascade;
         if (!irqCascade.IsSuccess) return irqCascade;
         if (!mmioCascade.IsSuccess) return mmioCascade;
@@ -363,15 +452,31 @@ public sealed partial class RuntimeKernel
         ProcessHandle handle,
         ProcessState from,
         ProcessState to,
-        PlatformDomainExecutionTransition platformTransition)
+        PlatformDomainExecutionTransition platformTransition,
+        (ProcessHandle Principal, CapabilityId Capability)? source = null,
+        Func<Func<KernelResult>, KernelResult>? sourceCommit = null)
     {
+        PlatformDomainBinding? fallbackSource = null;
+        lock (_platformMemoryUseGate)
+        {
+            if (!_platformExecutionAttachments.Contains(handle) &&
+                _processPlatformBindings.TryGetValue(handle, out var capturedRoot))
+                fallbackSource = capturedRoot;
+        }
+        // Provider getters are external callbacks; local owner/capability commits stay pure.
+        var fallbackAdmission = fallbackSource is { } root
+            ? PlatformAuthority.ValidateRootAttachmentSource(root) : KernelResult.Ok();
         SingProcess process;
         PlatformDomainBinding binding;
+        CapabilityRequirementV1[] requirements;
+        KernelResult CommitSource(Func<KernelResult> commit) => sourceCommit is null
+            ? CommitControllerExecution(source, commit) : sourceCommit(commit);
         lock (_platformMemoryUseGate)
         {
             var resolved = Processes.Resolve(handle);
             if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
             process = resolved.Value!;
+            requirements = to == ProcessState.Running ? process.Manifest.RequiredCapabilities.ToArray() : [];
             if (_executionTransactions.Contains(handle) || _pendingPlatformDomainBinds.Contains(handle))
                 return KernelResult.Fail(KernelError.PlatformBindingActive, "An execution transaction is pending for this process.");
             if (process.State != from) return InvalidTransition(process.State, to);
@@ -385,10 +490,25 @@ public sealed partial class RuntimeKernel
                 // An authority-only/cleanup root is still a declared dependency.
                 // Its quarantine cannot silently become an unbound execution fallback.
                 if (_processPlatformBindings.TryGetValue(handle, out var authorityBinding))
-                    return PlatformAuthority.CommitActiveDomainConsumer(authorityBinding, PlatformIdentity(process), CommitFallback);
-                return CommitFallback();
+                {
+                    if (fallbackSource != authorityBinding)
+                        return KernelResult.Fail(KernelError.StaleGeneration, "Root routing changed during fallback source admission.");
+                    if (!fallbackAdmission.IsSuccess) return fallbackAdmission;
+                    return CommitSource(() => CapabilityAuthority.CommitProcessAdmission(process.DomainId, process.Generation, requirements,
+                        () => PlatformAuthority.CommitActiveDomainConsumer(authorityBinding, PlatformIdentity(process), CommitFallback)));
+                }
+                if (PlatformAuthority.HasActiveAuthority(PlatformIdentity(process)) ||
+                    PlatformAuthority.HasUnresolvedDomainBindEffect(PlatformIdentity(process)))
+                    return KernelResult.Fail(KernelError.PlatformFaulted,
+                        "Missing kernel root routing cannot authorize unbound execution while original authority/effect remains live.");
+                return CommitSource(() => CapabilityAuthority.CommitProcessAdmission(process.DomainId, process.Generation, requirements, CommitFallback));
             }
-            _executionTransactions.Add(handle);
+            var pending = CommitSource(() =>
+            {
+                _executionTransactions.Add(handle);
+                return KernelResult.Ok();
+            });
+            if (!pending.IsSuccess) return pending;
         }
 
         KernelResult WithCurrentProcess(Func<KernelResult> ownerCommit)
@@ -402,7 +522,7 @@ public sealed partial class RuntimeKernel
                 if (!_platformExecutionAttachments.Contains(handle) ||
                     !_processPlatformBindings.TryGetValue(handle, out var currentBinding) || currentBinding != binding)
                     return KernelResult.Fail(KernelError.StaleGeneration, "Execution attachment changed during the transaction.");
-                return ownerCommit();
+                return CommitSource(() => CapabilityAuthority.CommitProcessAdmission(process.DomainId, process.Generation, requirements, ownerCommit));
             }
         }
 
@@ -428,6 +548,18 @@ public sealed partial class RuntimeKernel
             lock (_platformMemoryUseGate) _executionTransactions.Remove(handle);
         }
     }
+    private KernelResult CommitControllerExecution((ProcessHandle Principal, CapabilityId Capability)? source, Func<KernelResult> commit)
+    {
+        // Caller holds the existing lifecycle scope; only trusted local commits enter.
+        if (source is not { } controller) return commit();
+        var principal = Processes.Resolve(controller.Principal);
+        if (!principal.IsSuccess) return KernelResult.Fail(KernelError.SupervisorDenied, principal.Message!);
+        var effect = EnsureProcessAcceptsNewEffects(principal.Value!);
+        if (!effect.IsSuccess) return KernelResult.Fail(KernelError.SupervisorDenied, effect.Message!);
+        return CapabilityAuthority.CommitSupervisorExecution(controller.Capability, principal.Value!.DomainId,
+            controller.Principal.Generation, commit);
+    }
+
     private static PlatformDomainIdentity PlatformIdentity(SingProcess process) =>
         new(
             process.DomainId,

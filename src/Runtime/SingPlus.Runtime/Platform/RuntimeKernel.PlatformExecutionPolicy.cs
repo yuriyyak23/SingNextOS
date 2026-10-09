@@ -37,6 +37,20 @@ public sealed partial class RuntimeKernel
         return PlatformAuthority.ConfigureExecutionPolicy(
             binding,
             PlatformIdentity(process),
-            policy);
+            policy, commit =>
+            {
+                lock (_platformMemoryUseGate)
+                {
+                    var current = Processes.Resolve(subject);
+                    if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
+                    if (!ReferenceEquals(current.Value, process))
+                        return KernelResult.Fail(KernelError.StaleGeneration, "Exact execution-policy process changed.");
+                    var accepting = EnsureProcessAcceptsNewEffects(current.Value!);
+                    if (!accepting.IsSuccess) return accepting;
+                    if (!CanChangePlatformExecutionAttachment(current.Value!.State))
+                        return KernelResult.Fail(KernelError.InvalidTransition, "Execution-policy attachment is no longer mutable.");
+                    return commit();
+                }
+            });
     }
 }

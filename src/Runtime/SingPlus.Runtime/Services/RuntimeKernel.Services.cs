@@ -96,19 +96,38 @@ public sealed partial class RuntimeKernel
         ProtocolDefinitionV1 protocol,
         ResponseProtocolDefinitionV1? responseProtocol = null,
         IReadOnlyList<CapabilityRequirementV1>? requiredCapabilities = null)
+        => RegisterServiceCore(provider, name, contract, protocol, responseProtocol, requiredCapabilities, null);
+
+    private KernelResult<ServiceEndpointDescriptor> RegisterServiceCore(ProcessHandle provider, string name,
+        ServiceContractIdentity contract, ProtocolDefinitionV1 protocol, ResponseProtocolDefinitionV1? responseProtocol,
+        IReadOnlyList<CapabilityRequirementV1>? requiredCapabilities,
+        (ProcessHandle Principal, CapabilityId Capability)? source,
+        Func<Func<KernelResult>, KernelResult>? sourceCommit = null)
     {
+        var requirements = requiredCapabilities?.ToArray() ?? [];
+        KernelResult<ServiceEndpointDescriptor> registered;
         lock (_platformMemoryUseGate)
         {
         var process = Processes.Resolve(provider);
         if (!process.IsSuccess) return KernelResult<ServiceEndpointDescriptor>.Fail(process.Error, process.Message!);
         var effect = EnsureProcessAcceptsNewEffects(process.Value!);
         if (!effect.IsSuccess) return KernelResult<ServiceEndpointDescriptor>.Fail(effect.Error, effect.Message!);
-        var registered = Services.Register(provider, name, contract, protocol, responseProtocol, requiredCapabilities ?? []);
+        registered = Services.Register(provider, name, contract, protocol, responseProtocol, requirements,
+            sourceCommit is not null ? commit => CommitRestoreValue(sourceCommit, commit)
+            : source is { } controller ? commit =>
+            {
+                var principal = Processes.Resolve(controller.Principal);
+                if (!principal.IsSuccess) return KernelResult<ServiceEndpointDescriptor>.Fail(KernelError.SupervisorDenied, principal.Message!);
+                var accepts = EnsureProcessAcceptsNewEffects(principal.Value!);
+                if (!accepts.IsSuccess) return KernelResult<ServiceEndpointDescriptor>.Fail(KernelError.SupervisorDenied, accepts.Message!);
+                return CapabilityAuthority.CommitSupervisorServiceRegistration(controller.Capability,
+                    principal.Value!.DomainId, controller.Principal.Generation, commit);
+            } : null);
+        }
         if (registered.IsSuccess)
             RecordTrace(provider, TraceEventKind.ServiceLifecycle, null, "service",
                 registered.Value!.Service.Id.Value.ToString(), registered.Value.Availability.ToString(), "registered");
         return registered;
-        }
     }
 
     public KernelResult<ServiceEndpointDescriptor[]> ResolveByContract(ServiceContractIdentity contract) =>
@@ -130,8 +149,19 @@ public sealed partial class RuntimeKernel
 
     private KernelResult<EndpointSessionHandle> OpenSessionCore(ProcessHandle caller,
         ServiceEndpointDescriptor descriptor, IReadOnlyCollection<CapabilityId>? admissionCapabilities,
-        int capacity, TimeSpan? lifetime, (ProcessHandle Principal, CapabilityId Capability)? source)
+        int capacity, TimeSpan? lifetime, (ProcessHandle Principal, CapabilityId Capability)? source,
+        Func<Func<KernelResult>, KernelResult>? sourceCommit = null)
     {
+        if (sourceCommit is not null && lifetime is not null)
+            return KernelResult<EndpointSessionHandle>.Fail(KernelError.InvalidTransition, "Restore dependency admission requires a lifetime-free local commit.");
+        if (source is not null && lifetime is not null)
+            return KernelResult<EndpointSessionHandle>.Fail(KernelError.InvalidTransition, "Supervisor rebind requires lifetime-free local admission.");
+        CapabilityId[] capabilityIds;
+        try { capabilityIds = admissionCapabilities?.ToArray() ?? []; }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        { return KernelResult<EndpointSessionHandle>.Fail(KernelError.PlatformFaulted, $"Session admission capture failed: {exception.Message}"); }
+        var deadline = EndpointSessions.PrepareDeadline(lifetime);
+        if (!deadline.IsSuccess) return KernelResult<EndpointSessionHandle>.Fail(deadline.Error, deadline.Message!);
         lock (_platformMemoryUseGate)
         {
         if (lifetime is { } requestedLifetime && requestedLifetime <= TimeSpan.Zero)
@@ -142,7 +172,9 @@ public sealed partial class RuntimeKernel
         if (!callerEffect.IsSuccess) return KernelResult<EndpointSessionHandle>.Fail(callerEffect.Error, callerEffect.Message!);
         var serviceResult = Services.Resolve(descriptor);
         if (!serviceResult.IsSuccess) return KernelResult<EndpointSessionHandle>.Fail(serviceResult.Error, serviceResult.Message!);
-        var capabilityIds = admissionCapabilities?.ToArray() ?? [];
+        if (sourceCommit is not null)
+            return CommitRestoreValue(sourceCommit, () => Services.CommitSessionAdmission(descriptor,
+                exact => CreateSession(exact, exact.RequiredCapabilities.ToArray())));
         if (source is { } control)
         {
             if (lifetime is not null)
@@ -158,21 +190,26 @@ public sealed partial class RuntimeKernel
                     principal.Value!.DomainId, control.Principal.Generation, () => CreateSession(exact, requirements));
             });
         }
-        return CreateSession(serviceResult.Value!, serviceResult.Value!.RequiredCapabilities);
+        return Services.CommitSessionAdmission(descriptor, exact => CreateSession(exact, exact.RequiredCapabilities.ToArray()));
 
-        KernelResult<EndpointSessionHandle> CreateSession(ServiceRegistry.Record service, IReadOnlyList<CapabilityRequirementV1> requirements)
+        KernelResult<EndpointSessionHandle> CreateSession(ServiceRegistry.Record service, CapabilityRequirementV1[] requirements)
         {
         var admission = ValidateSessionPartiesAndRequirements(caller, service, requirements, capabilityIds);
         if (!admission.IsSuccess) return KernelResult<EndpointSessionHandle>.Fail(admission.Error, admission.Message!);
+        return CapabilityAuthority.CommitSessionPublication(callerResult.Value!.DomainId, caller.Generation,
+            capabilityIds, requirements, () => EndpointSessions.CommitOpeningCapacity(AllocateSession));
 
+        KernelResult<EndpointSessionHandle> AllocateSession()
+        {
         var channel = service.ResponseProtocol is null
             ? CreateChannel(caller, service.Provider, service.Protocol, capacity)
             : CreateChannel(caller, service.Provider, service.Protocol, service.ResponseProtocol, capacity);
         if (!channel.IsSuccess) return KernelResult<EndpointSessionHandle>.Fail(channel.Error, channel.Message!);
-        var session = EndpointSessions.Add(caller, service.Provider, capabilityIds, requirements, channel.Value!.Left, lifetime);
+        var session = EndpointSessions.AddPrepared(caller, service.Provider, capabilityIds, requirements, channel.Value!.Left, deadline.Value);
         return session.IsSuccess
             ? KernelResult<EndpointSessionHandle>.Ok(session.Value!.Handle)
             : KernelResult<EndpointSessionHandle>.Fail(session.Error, session.Message!);
+        }
         }
         }
     }
@@ -234,6 +271,8 @@ public sealed partial class RuntimeKernel
 
     private KernelResult CloseSession(ProcessHandle caller, EndpointSessionHandle handle, bool allowAlreadyClosed)
     {
+        var admission = EndpointSessions.PrepareClose(handle, caller, allowAlreadyClosed);
+        if (!admission.IsSuccess) return KernelResult.Fail(admission.Error, admission.Message!);
         var nativeDrain = DrainNativeServiceSession(handle);
         if (!nativeDrain.IsSuccess) return nativeDrain;
         lock (_requestResponseCorrelationGate)
@@ -266,6 +305,16 @@ public sealed partial class RuntimeKernel
         ProcessHandle service,
         EndpointSessionHandle handle)
     {
+        ChannelEnvelope? deliveredFact = null;
+        ChannelEndpointHandle endpoint = default;
+        try { return Commit(); }
+        finally
+        {
+            if (deliveredFact is { } exact) ObserveReceived(service, endpoint, exact);
+        }
+
+        KernelResult<EndpointSessionRequestEnvelope> Commit()
+        {
         lock (_platformMemoryUseGate)
         {
         lock (_requestResponseCorrelationGate)
@@ -274,16 +323,25 @@ public sealed partial class RuntimeKernel
         if (!session.IsSuccess)
             return KernelResult<EndpointSessionRequestEnvelope>.Fail(session.Error, session.Message!);
 
-        var received = Receive(service, session.Value!.ServiceEndpoint);
+        endpoint = session.Value!.ServiceEndpoint;
+        var process = Processes.Resolve(service);
+        if (!process.IsSuccess)
+            return KernelResult<EndpointSessionRequestEnvelope>.Fail(process.Error, process.Message!);
+        var next = Channels.Peek(process.Value!, endpoint);
+        if (!next.IsSuccess)
+            return KernelResult<EndpointSessionRequestEnvelope>.Fail(next.Error, next.Message!);
+        // Preserve a published invocation, or admit V1 public Send's first invocation
+        // from this actual queued request before the dequeue effect.
+        var original = SessionInvocations.PrepareOriginalRequestDelivery(handle, session.Value.Caller,
+            service, next.Value!.Sequence, next.Value.MessageId);
+        if (!original.IsSuccess)
+            return KernelResult<EndpointSessionRequestEnvelope>.Fail(original.Error, original.Message!);
+        var received = ReceiveCommitted(service, endpoint);
         if (!received.IsSuccess)
             return KernelResult<EndpointSessionRequestEnvelope>.Fail(received.Error, received.Message!);
+        deliveredFact = received.Value!;
 
-        var correlation = SessionInvocations.Register(
-            handle,
-            session.Value.Caller,
-            service,
-            received.Value!.Sequence,
-            received.Value.MessageId);
+        var correlation = original.Value;
         var invocation = SessionInvocations.MarkDelivered(handle, service, received.Value.Sequence);
         if (!invocation.IsSuccess)
             return KernelResult<EndpointSessionRequestEnvelope>.Fail(invocation.Error, invocation.Message!);
@@ -294,6 +352,7 @@ public sealed partial class RuntimeKernel
 
         return KernelResult<EndpointSessionRequestEnvelope>.Ok(
             new EndpointSessionRequestEnvelope(correlation, received.Value, cancellation.Value));
+        }
         }
         }
     }
@@ -316,12 +375,17 @@ public sealed partial class RuntimeKernel
         EndpointSessionInvocationHandle invocation,
         object? payload = null)
     {
+        List<BudgetTraceObservation> observations = [];
+        try
+        {
         var session = EndpointSessions.ResolveForService(invocation.Session, service);
         if (!session.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(session.Error, session.Message!);
         return SessionInvocations.Publish(
             invocation,
             service,
-            () => PublishResponse(service, session.Value!.ServiceEndpoint, invocation.InvocationId.Value, payload));
+            () => PublishResponseCore(service, session.Value!.ServiceEndpoint, invocation.InvocationId.Value, payload, observations));
+        }
+        finally { EmitBudgetObservations(observations); }
     }
 
     public KernelResult<ResponseEnvelope> CancelSessionResponse(
@@ -361,13 +425,35 @@ public sealed partial class RuntimeKernel
 
         try
         {
+            var requirements = session.Value.Requirements.ToArray();
+            var capabilities = session.Value.Capabilities.ToArray();
+            var boundedSnapshot = Channels.CaptureInlineCopiedPayload(session.Value.Channel, messageId, copiedPayload);
+            lock (_platformMemoryUseGate)
+            {
+            callerProcess = Processes.Resolve(caller);
+            if (!callerProcess.IsSuccess)
+                return KernelResult<InlineSipInvocationLease>.Fail(callerProcess.Error, callerProcess.Message!);
+            var callerEffect = EnsureProcessAcceptsNewEffects(callerProcess.Value!);
+            if (!callerEffect.IsSuccess)
+                return KernelResult<InlineSipInvocationLease>.Fail(callerEffect.Error, callerEffect.Message!);
+            serviceProcess = Processes.Resolve(service);
+            if (!serviceProcess.IsSuccess)
+                return KernelResult<InlineSipInvocationLease>.Fail(serviceProcess.Error, serviceProcess.Message!);
+            var serviceEffect = EnsureProcessAcceptsNewEffects(serviceProcess.Value!);
+            if (!serviceEffect.IsSuccess)
+                return KernelResult<InlineSipInvocationLease>.Fail(serviceEffect.Error, serviceEffect.Message!);
             lock (_requestResponseCorrelationGate)
             {
                 var currentPin = EndpointSessions.RevalidatePin(pinned.Value!);
                 if (!currentPin.IsSuccess)
                     return KernelResult<InlineSipInvocationLease>.Fail(currentPin.Error, currentPin.Message!);
+                return CapabilityAuthority.CommitSessionPublication(callerProcess.Value!.DomainId,
+                    caller.Generation, capabilities, requirements, PublishCopied);
+
+                KernelResult<InlineSipInvocationLease> PublishCopied()
+                {
                 var begun = Channels.BeginInlineCopiedInvocation(
-                    callerProcess.Value!, serviceProcess.Value!, session.Value.Channel, messageId, copiedPayload);
+                    callerProcess.Value!, serviceProcess.Value!, session.Value.Channel, messageId, copiedPayload, boundedSnapshot);
                 if (!begun.IsSuccess)
                     return KernelResult<InlineSipInvocationLease>.Fail(begun.Error, begun.Message!);
                 var invocation = SessionInvocations.Register(
@@ -382,6 +468,8 @@ public sealed partial class RuntimeKernel
                 var lease = new InlineSipInvocationLease(context, pinned.Value!, messageId);
                 pinned = default;
                 return KernelResult<InlineSipInvocationLease>.Ok(lease);
+                }
+            }
             }
         }
         finally
@@ -420,33 +508,64 @@ public sealed partial class RuntimeKernel
         var pinned = EndpointSessions.AcquirePin(sessionHandle, caller, service);
         if (!pinned.IsSuccess)
             return KernelResult<InlineBorrowSipInvocationLease<T>>.Fail(pinned.Error, pinned.Message!);
-        InlineBorrowQualificationHook?.At(InlineBorrowQualificationPoint.AfterSessionPin);
         InlineSipInvocationLease? invocationLease = null;
         BorrowLease<T>? borrow = null;
+        RegionUseDescriptor? acquiredUse = null;
         try
         {
+            InlineBorrowQualificationHook?.At(InlineBorrowQualificationPoint.AfterSessionPin);
             InlineBorrowQualificationHook?.At(InlineBorrowQualificationPoint.BeforeSessionRevalidation);
+            var requirements = session.Value.Requirements.ToArray();
+            var capabilities = session.Value.Capabilities.ToArray();
+            KernelResult<InlineSipInvocationLease> admission;
+            lock (_platformMemoryUseGate)
+            {
+            callerProcess = Processes.Resolve(caller);
+            if (!callerProcess.IsSuccess)
+                return KernelResult<InlineBorrowSipInvocationLease<T>>.Fail(callerProcess.Error, callerProcess.Message!);
+            var callerEffect = EnsureProcessAcceptsNewEffects(callerProcess.Value!);
+            if (!callerEffect.IsSuccess)
+                return KernelResult<InlineBorrowSipInvocationLease<T>>.Fail(callerEffect.Error, callerEffect.Message!);
+            serviceProcess = Processes.Resolve(service);
+            if (!serviceProcess.IsSuccess)
+                return KernelResult<InlineBorrowSipInvocationLease<T>>.Fail(serviceProcess.Error, serviceProcess.Message!);
+            var serviceEffect = EnsureProcessAcceptsNewEffects(serviceProcess.Value!);
+            if (!serviceEffect.IsSuccess)
+                return KernelResult<InlineBorrowSipInvocationLease<T>>.Fail(serviceEffect.Error, serviceEffect.Message!);
             lock (_requestResponseCorrelationGate)
             {
                 var currentPin = EndpointSessions.RevalidatePin(pinned.Value!);
                 if (!currentPin.IsSuccess)
                     return KernelResult<InlineBorrowSipInvocationLease<T>>.Fail(currentPin.Error, currentPin.Message!);
+                admission = CapabilityAuthority.CommitSessionPublication(callerProcess.Value!.DomainId,
+                    caller.Generation, capabilities, requirements, PublishBorrow);
+
+                KernelResult<InlineSipInvocationLease> PublishBorrow()
+                {
                 var begun = Channels.BeginInlineBorrowInvocation(
                     callerProcess.Value!, serviceProcess.Value!, session.Value.Channel, messageId, payload);
                 if (!begun.IsSuccess)
-                    return KernelResult<InlineBorrowSipInvocationLease<T>>.Fail(begun.Error, begun.Message!);
+                    return KernelResult<InlineSipInvocationLease>.Fail(begun.Error, begun.Message!);
                 borrow = begun.Value.Lease;
                 var invocation = SessionInvocations.Register(sessionHandle, caller, service, begun.Value.Sequence, messageId);
                 var delivered = SessionInvocations.MarkDelivered(sessionHandle, service, begun.Value.Sequence);
                 if (!delivered.IsSuccess)
-                    return FailAfterInlineBorrow(delivered.Error, delivered.Message!, service, borrow, invocationLease);
+                    return KernelResult<InlineSipInvocationLease>.Fail(delivered.Error, delivered.Message!);
                 var accepted = SessionInvocations.AcceptInvocation(invocation, service, allowInFlightCancellation: false);
                 if (!accepted.IsSuccess)
-                    return FailAfterInlineBorrow(accepted.Error, accepted.Message!, service, borrow, invocationLease);
-                invocationLease = new InlineSipInvocationLease(
-                    new TrustedSipInvocationContext(caller, service, sessionHandle, invocation), pinned.Value!, messageId);
-                pinned = default;
+                    return KernelResult<InlineSipInvocationLease>.Fail(accepted.Error, accepted.Message!);
+                return KernelResult<InlineSipInvocationLease>.Ok(new InlineSipInvocationLease(
+                    new TrustedSipInvocationContext(caller, service, sessionHandle, invocation), pinned.Value!, messageId));
+                }
             }
+            }
+            if (!admission.IsSuccess)
+            {
+                if (borrow is not null) _ = ReturnBorrow(service, borrow.Handle);
+                return KernelResult<InlineBorrowSipInvocationLease<T>>.Fail(admission.Error, admission.Message!);
+            }
+            invocationLease = admission.Value!;
+            pinned = default;
             InlineBorrowQualificationHook?.At(InlineBorrowQualificationPoint.AfterInvocationAccepted);
 
             InlineBorrowQualificationHook?.At(InlineBorrowQualificationPoint.BeforeRegionUseAcquisition);
@@ -455,12 +574,9 @@ public sealed partial class RuntimeKernel
                 new RegionUseRange(0, checked((long)borrow.Length * System.Runtime.CompilerServices.Unsafe.SizeOf<T>())));
             if (!use.IsSuccess)
             {
-                _ = SessionInvocations.CompleteInline(invocationLease.Context.Invocation, service, succeeded: false);
-                _ = ReturnBorrow(service, borrow.Handle);
-                FinalizeInlineInvocationPin(invocationLease);
-                invocationLease = null;
                 return KernelResult<InlineBorrowSipInvocationLease<T>>.Fail(use.Error, use.Message!);
             }
+            acquiredUse = use.Value!;
             InlineBorrowQualificationHook?.At(InlineBorrowQualificationPoint.AfterRegionUseAcquisition);
 
             var result = new InlineBorrowSipInvocationLease<T>(invocationLease, borrow, use.Value!);
@@ -469,7 +585,22 @@ public sealed partial class RuntimeKernel
         }
         finally
         {
-            invocationLease?.Dispose();
+            if (invocationLease is not null)
+            {
+                try
+                {
+                    // Preparation never handed the accepted invocation to its consumer.
+                    // Cleanup uses the exact local facts; a refusal leaves owner facts intact.
+                    if (acquiredUse is not null) _ = ReleaseRegionUse(service, acquiredUse.Handle);
+                    if (borrow is not null) _ = ReturnBorrow(service, borrow.Handle);
+                    _ = SessionInvocations.CompleteInline(invocationLease.Context.Invocation, service, succeeded: false);
+                }
+                finally
+                {
+                    CloseResourceDonationForInvocationTerminal(service, invocationLease.Context.Invocation);
+                    FinalizeInlineInvocationPin(invocationLease);
+                }
+            }
             if (pinned.Value is { } remainingPin)
                 FinalizeSessionPin(remainingPin, sessionHandle);
         }
@@ -497,16 +628,22 @@ public sealed partial class RuntimeKernel
             return KernelResult.Fail(KernelError.WrongSessionOwner, "Inline BORROW context does not match the live session parties.");
         var invocation = lease.TakeInvocation();
         var context = invocation.Context;
+        var releaseAttempted = false;
+        var returnAttempted = false;
+        var settlementAttempted = false;
         try
         {
             InlineBorrowQualificationHook?.At(InlineBorrowQualificationPoint.BeforeRegionUseRelease);
+            releaseAttempted = true;
             var released = ReleaseRegionUse(service, lease.Use.Handle);
             InlineBorrowQualificationHook?.At(InlineBorrowQualificationPoint.AfterRegionUseRelease);
             InlineBorrowQualificationHook?.At(InlineBorrowQualificationPoint.BeforeBorrowReturn);
+            returnAttempted = true;
             var returned = ReturnBorrow(service, lease.Borrow.Handle);
             InlineBorrowQualificationHook?.At(InlineBorrowQualificationPoint.AfterBorrowReturn);
             InlineBorrowQualificationHook?.At(InlineBorrowQualificationPoint.BeforeInvocationSettlement);
             var cleanupSucceeded = released.IsSuccess && returned.IsSuccess;
+            settlementAttempted = true;
             var settled = SessionInvocations.CompleteInline(
                 context.Invocation,
                 service,
@@ -518,8 +655,19 @@ public sealed partial class RuntimeKernel
         }
         finally
         {
-            CloseResourceDonationForInvocationTerminal(service, invocation.Context.Invocation);
-            FinalizeInlineInvocationPin(invocation);
+            try
+            {
+                // Only remaining exact steps are attempted; completed or refused steps
+                // are never replayed after a callback fault.
+                if (!releaseAttempted) _ = ReleaseRegionUse(service, lease.Use.Handle);
+                if (!returnAttempted) _ = ReturnBorrow(service, lease.Borrow.Handle);
+                if (!settlementAttempted) _ = SessionInvocations.CompleteInline(context.Invocation, service, succeeded: false);
+            }
+            finally
+            {
+                CloseResourceDonationForInvocationTerminal(service, context.Invocation);
+                FinalizeInlineInvocationPin(invocation);
+            }
         }
     }
 
@@ -535,7 +683,12 @@ public sealed partial class RuntimeKernel
         var use = ValidateRegionUse(lease.Context.Service, lease.Use.Handle);
         if (!use.IsSuccess) return KernelResult.Fail(use.Error, use.Message!);
         InlineBorrowQualificationHook?.At(InlineBorrowQualificationPoint.AfterFinalRevalidation);
-        return KernelResult.Ok();
+        session = EndpointSessions.RevalidatePin(lease.Invocation.SessionPin);
+        if (!session.IsSuccess) return session;
+        if (!lease.Borrow.IsValid)
+            return KernelResult.Fail(KernelError.InvalidRegionState, "Inline BORROW lease is no longer live.");
+        use = ValidateRegionUse(lease.Context.Service, lease.Use.Handle);
+        return use.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(use.Error, use.Message!);
     }
 
     internal KernelResult<OwnedBuffer<T>> TransferInlineOwnershipResponse<T>(
@@ -543,32 +696,51 @@ public sealed partial class RuntimeKernel
         InlineSipInvocationLease invocation,
         OwnedBuffer<T> payload) where T : unmanaged
     {
+        List<BudgetTraceObservation> observations = [];
+        try
+        {
         ArgumentNullException.ThrowIfNull(invocation);
         ArgumentNullException.ThrowIfNull(payload);
         var context = invocation.Context;
         if (context.Service != service)
             return KernelResult<OwnedBuffer<T>>.Fail(KernelError.WrongSessionOwner, "Inline ownership response does not match the live service principal.");
+        var publication = SessionInvocations.Publish(context.Invocation, service, CommitOwnership);
+        if (!publication.IsSuccess)
+            return KernelResult<OwnedBuffer<T>>.Fail(publication.Error, publication.Message!);
+        CloseResourceDonationForInvocationTerminal(service, context.Invocation);
+        FinalizeInlineInvocationPin(invocation);
+        return KernelResult<OwnedBuffer<T>>.Ok((OwnedBuffer<T>)publication.Value!.Payload!);
+
+        KernelResult<ResponseEnvelope> CommitOwnership()
+        {
+        lock (_platformMemoryUseGate)
+        lock (_requestResponseCorrelationGate)
+        {
         var current = RevalidateInlineSessionInvocation(invocation);
         if (!current.IsSuccess)
-            return KernelResult<OwnedBuffer<T>>.Fail(current.Error, current.Message!);
+            return KernelResult<ResponseEnvelope>.Fail(current.Error, current.Message!);
         var serviceProcess = Processes.Resolve(service);
         if (!serviceProcess.IsSuccess)
-            return KernelResult<OwnedBuffer<T>>.Fail(serviceProcess.Error, serviceProcess.Message!);
+            return KernelResult<ResponseEnvelope>.Fail(serviceProcess.Error, serviceProcess.Message!);
         var callerProcess = Processes.Resolve(context.Caller);
         if (!callerProcess.IsSuccess)
-            return KernelResult<OwnedBuffer<T>>.Fail(callerProcess.Error, callerProcess.Message!);
+            return KernelResult<ResponseEnvelope>.Fail(callerProcess.Error, callerProcess.Message!);
 
         var session = EndpointSessions.ResolveForService(context.Session, service);
         if (!session.IsSuccess)
-            return KernelResult<OwnedBuffer<T>>.Fail(session.Error, session.Message!);
+            return KernelResult<ResponseEnvelope>.Fail(session.Error, session.Message!);
         var moved = Responses.TransferInlineOwnership(
-            serviceProcess.Value!, callerProcess.Value!, session.Value!.ServiceEndpoint, invocation.MessageId, payload);
+            serviceProcess.Value!, callerProcess.Value!, session.Value!.ServiceEndpoint, invocation.MessageId, payload,
+            () => RevalidateInlineSessionInvocation(invocation),
+            (source, target, region, admission) => TransferRegionForIpcCore(source, target, region, admission, observations));
         if (!moved.IsSuccess)
-            return KernelResult<OwnedBuffer<T>>.Fail(moved.Error, moved.Message!);
-        var settled = SettleInlineSessionInvocation(service, invocation, succeeded: true);
-        return settled.IsSuccess
-            ? moved
-            : KernelResult<OwnedBuffer<T>>.Fail(settled.Error, settled.Message!);
+            return KernelResult<ResponseEnvelope>.Fail(moved.Error, moved.Message!);
+        return KernelResult<ResponseEnvelope>.Ok(new(context.Invocation.InvocationId.Value,
+            invocation.MessageId, ResponsePublicationStatus.Published, moved.Value));
+        }
+        }
+        }
+        finally { EmitBudgetObservations(observations); }
     }
 
     internal KernelResult<InlineMoveSipInvocationLease<T>> BeginInlineMoveSessionInvocation<T>(
@@ -578,6 +750,9 @@ public sealed partial class RuntimeKernel
         uint messageId,
         OwnedBuffer<T> payload) where T : unmanaged
     {
+        List<BudgetTraceObservation> observations = [];
+        try
+        {
         lock (_platformMemoryUseGate)
         {
         ArgumentNullException.ThrowIfNull(payload);
@@ -609,8 +784,14 @@ public sealed partial class RuntimeKernel
                 var currentPin = EndpointSessions.RevalidatePin(pinned.Value!);
                 if (!currentPin.IsSuccess)
                     return KernelResult<InlineMoveSipInvocationLease<T>>.Fail(currentPin.Error, currentPin.Message!);
+                return CapabilityAuthority.CommitSessionPublication(callerProcess.Value!.DomainId,
+                    caller.Generation, session.Value.Capabilities.ToArray(), session.Value.Requirements.ToArray(), PublishMove);
+
+                KernelResult<InlineMoveSipInvocationLease<T>> PublishMove()
+                {
                 var begun = Channels.BeginInlineMoveInvocation(
-                    callerProcess.Value!, serviceProcess.Value!, session.Value.Channel, messageId, payload);
+                    callerProcess.Value!, serviceProcess.Value!, session.Value.Channel, messageId, payload,
+                    (source, target, region, admission) => TransferRegionForIpcCore(source, target, region, admission, observations));
                 if (!begun.IsSuccess)
                     return KernelResult<InlineMoveSipInvocationLease<T>>.Fail(begun.Error, begun.Message!);
                 var invocation = SessionInvocations.Register(
@@ -625,6 +806,7 @@ public sealed partial class RuntimeKernel
                     new TrustedSipInvocationContext(caller, service, sessionHandle, invocation), pinned.Value!, messageId);
                 pinned = default;
                 return KernelResult<InlineMoveSipInvocationLease<T>>.Ok(new(inline, begun.Value.Payload));
+                }
             }
         }
         finally
@@ -633,6 +815,8 @@ public sealed partial class RuntimeKernel
                 FinalizeSessionPin(remainingPin, sessionHandle);
         }
         }
+        }
+        finally { EmitBudgetObservations(observations); }
     }
 
     internal KernelResult RevalidateInlineMoveSessionInvocation<T>(
@@ -678,17 +862,13 @@ public sealed partial class RuntimeKernel
     {
         ArgumentNullException.ThrowIfNull(lease);
         var context = lease.Context;
-        try
-        {
-            if (context.Service != service)
-                return KernelResult.Fail(KernelError.WrongSessionOwner, "Inline invocation context does not match the live session parties.");
-            return SessionInvocations.CompleteInline(context.Invocation, service, succeeded);
-        }
-        finally
-        {
-            CloseResourceDonationForInvocationTerminal(service, context.Invocation);
-            FinalizeInlineInvocationPin(lease);
-        }
+        if (context.Service != service)
+            return KernelResult.Fail(KernelError.WrongSessionOwner, "Inline invocation context does not match the live session parties.");
+        var settled = SessionInvocations.CompleteInline(context.Invocation, service, succeeded);
+        if (!settled.IsSuccess) return settled;
+        try { CloseResourceDonationForInvocationTerminal(service, context.Invocation); }
+        finally { FinalizeInlineInvocationPin(lease); }
+        return settled;
     }
 
     private void FinalizeInlineInvocationPin(InlineSipInvocationLease invocation)
@@ -729,9 +909,10 @@ public sealed partial class RuntimeKernel
         EndpointSessionInvocationHandle invocation,
         CancellationScopeHandle scope)
     {
+        var timestamp = CancellationScopes.CaptureTimestamp(scope);
         var session = ResolveSession(caller, invocation.Session);
         if (!session.IsSuccess) return KernelResult.Fail(session.Error, session.Message!);
-        return SessionInvocations.BindCancellationScope(invocation, caller, scope);
+        return SessionInvocations.BindCancellationScope(invocation, caller, scope, timestamp);
     }
 
     public KernelResult<CancellationObservation> RequestSessionCancellation(
@@ -739,9 +920,10 @@ public sealed partial class RuntimeKernel
         EndpointSessionInvocationHandle invocation,
         CancellationScopeHandle scope)
     {
+        var timestamp = CancellationScopes.CaptureTimestamp(scope);
         var session = ResolveSession(caller, invocation.Session);
         if (!session.IsSuccess) return KernelResult<CancellationObservation>.Fail(session.Error, session.Message!);
-        return SessionInvocations.RequestCancellation(invocation, caller, scope);
+        return SessionInvocations.RequestCancellation(invocation, caller, scope, timestamp);
     }
 
     public KernelResult<bool> QuerySessionCancellation(
@@ -755,9 +937,12 @@ public sealed partial class RuntimeKernel
 
     internal KernelResult<EndpointSessionRegistry.Record> ResolveSession(ProcessHandle caller, EndpointSessionHandle handle)
     {
+        var observation = EndpointSessions.ReadExpiryObservation(handle, caller);
+        if (!observation.IsSuccess)
+            return KernelResult<EndpointSessionRegistry.Record>.Fail(observation.Error, observation.Message!);
         lock (_requestResponseCorrelationGate)
         {
-        if (EndpointSessions.ExpireIfDue(handle, caller) is { } expired)
+        if (EndpointSessions.ExpireIfDue(observation.Value) is { } expired)
         {
             if (expired.State == EndpointSessionState.Closed)
             {
@@ -826,17 +1011,22 @@ public sealed partial class RuntimeKernel
         var current = session.Value!;
         var pinned = EndpointSessions.AcquirePin(handle, caller, current.Service);
         if (!pinned.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(pinned.Error, pinned.Message!);
-        using var sessionPin = pinned.Value!;
+        var sessionPin = pinned.Value!;
+        try
+        {
         var currentPin = EndpointSessions.RevalidatePin(sessionPin);
         if (!currentPin.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(currentPin.Error, currentPin.Message!);
-        var send = Send(caller, current.Service, current.Channel, messageId, payload, current.Capabilities);
+        var send = SendCore(caller, current.Service, current.Channel, messageId, payload, null,
+            current.Capabilities, AdmissionQosHint.None, null, new(handle, sessionPin, current.Requirements.ToArray()));
         if (!send.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(send.Error, send.Message!);
         var invocation = SessionInvocations.Register(handle, caller, current.Service, send.Value!.Sequence, messageId);
-        sessionPin.Dispose();
+        FinalizeSessionPin(sessionPin, handle);
         using var cancellation = cancellationToken.CanBeCanceled
             ? cancellationToken.Register(() => _ = RequestSessionCancellation(caller, invocation))
             : default;
         return await WaitForResponseAsync(caller, current.Channel, send.Value.Sequence).ConfigureAwait(false);
+        }
+        finally { FinalizeSessionPin(sessionPin, handle); }
     }
 
     public async ValueTask<KernelResult<ResponseEnvelope>> InvokeSessionUntilCancellationAsync(
@@ -868,14 +1058,17 @@ public sealed partial class RuntimeKernel
         var current = session.Value!;
         var pinned = EndpointSessions.AcquirePin(handle, caller, current.Service);
         if (!pinned.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(pinned.Error, pinned.Message!);
-        using var sessionPin = pinned.Value!;
+        var sessionPin = pinned.Value!;
+        try
+        {
         var currentPin = EndpointSessions.RevalidatePin(sessionPin);
         if (!currentPin.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(currentPin.Error, currentPin.Message!);
-        var send = Send(caller, current.Service, current.Channel, messageId, payload, current.Capabilities);
+        var send = SendCore(caller, current.Service, current.Channel, messageId, payload, null,
+            current.Capabilities, AdmissionQosHint.None, null, new(handle, sessionPin, current.Requirements.ToArray(), scope));
         if (!send.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(send.Error, send.Message!);
         var invocation = SessionInvocations.Register(
             handle, caller, current.Service, send.Value!.Sequence, messageId, scope);
-        sessionPin.Dispose();
+        FinalizeSessionPin(sessionPin, handle);
         var response = WaitForResponseAsync(caller, current.Channel, send.Value.Sequence).AsTask();
         if (!stopWaiting.CanBeCanceled)
             return await response.ConfigureAwait(false);
@@ -890,6 +1083,8 @@ public sealed partial class RuntimeKernel
         return KernelResult<ResponseEnvelope>.Fail(
             KernelError.CancellationPending,
             $"Caller wait stopped with {cancellation.Value!.Disposition}; callee or provider work may still require exact settlement.");
+        }
+        finally { FinalizeSessionPin(sessionPin, handle); }
     }
 
     internal ValueTask<KernelResult<ResponseEnvelope>> InvokeSessionOwnershipPairAsync(
@@ -913,16 +1108,21 @@ public sealed partial class RuntimeKernel
         var current = session.Value!;
         var pinned = EndpointSessions.AcquirePin(handle, caller, current.Service);
         if (!pinned.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(pinned.Error, pinned.Message!);
-        using var sessionPin = pinned.Value!;
+        var sessionPin = pinned.Value!;
+        try
+        {
         var currentPin = EndpointSessions.RevalidatePin(sessionPin);
         if (!currentPin.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(currentPin.Error, currentPin.Message!);
-        var send = SendOwnershipPair(caller, current.Service, current.Channel, messageId, first, second, current.Capabilities);
+        var send = SendCore(caller, current.Service, current.Channel, messageId, first, second,
+            current.Capabilities, AdmissionQosHint.None, null, new(handle, sessionPin, current.Requirements.ToArray()));
         if (!send.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(send.Error, send.Message!);
         var invocation = SessionInvocations.Register(handle, caller, current.Service, send.Value!.Sequence, messageId);
-        sessionPin.Dispose();
+        FinalizeSessionPin(sessionPin, handle);
         using var cancellation = cancellationToken.CanBeCanceled
             ? cancellationToken.Register(() => _ = RequestSessionCancellation(caller, invocation))
             : default;
         return await WaitForResponseAsync(caller, current.Channel, send.Value.Sequence).ConfigureAwait(false);
+        }
+        finally { FinalizeSessionPin(sessionPin, handle); }
     }
 }

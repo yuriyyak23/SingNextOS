@@ -16,6 +16,223 @@ namespace SingPlus.Tests.NativeServices;
 public sealed class NativeSystemServiceVerticalSliceTests
 {
     [Theory]
+    [InlineData(false, 0)] [InlineData(true, 0)] [InlineData(false, 1)]
+    [InlineData(false, 2)] [InlineData(false, 3)]
+    public async Task CopiedSealRouteAfterAdmissionCannotAuthorizeActualNativeWrite(bool network, int fault)
+    {
+        var (kernel, service, caller, capability, session, _) = FileScenario();
+        var routes = (global::System.Collections.IDictionary)typeof(SealedObjectAuthority)
+            .GetField("_records", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel.SealedObjects)!;
+        Guid token = default;
+        object? copy = null;
+        var armed = false;
+        Func<KernelResult>? drain = null;
+        Func<KernelResult>? revoke = null;
+        var trace = new CallbackEventSink(point =>
+        {
+            if (!armed || point != (fault != 0 ? NativeSipCompletedEvent.ImplementationEntered : NativeSipCompletedEvent.CapabilityAdmitted)) return;
+            armed = false;
+            if (fault == 2) { Assert.Equal(KernelError.SessionDraining, drain!().Error); return; }
+            if (fault == 3) { Assert.True(revoke!().IsSuccess); return; }
+            var original = routes[token]!;
+            copy = original.GetType().GetMethod("MemberwiseClone", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(original, null)!;
+            routes[token] = copy;
+        });
+        Func<KernelResult> dispatch;
+        Func<Task> write;
+        Func<object> getContents;
+        if (network)
+        {
+            var s = NetworkDrainScenario();
+            kernel = s.Kernel; service = s.Service; caller = s.Caller; session = s.Session;
+            routes = (global::System.Collections.IDictionary)typeof(SealedObjectAuthority)
+                .GetField("_records", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel.SealedObjects)!;
+            var host = RuntimeNetworkServiceHost.CreateForSession(kernel, service, session, trace, hook: null).Value!;
+            var client = INetworkServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session));
+            var opening = client.OpenAsync(new(s.Capability, "original-pin")).AsTask();
+            Assert.True(host.ProcessNext().IsSuccess);
+            var control = (await opening).Authority;
+            token = control.Socket.Seal.OpaqueToken;
+            dispatch = host.ProcessNext;
+            write = () => client.SendAsync(new(control.Socket, control.Capability, new([7, 8]))).AsTask();
+            getContents = () => Assert.Single(NetworkEntries(host).Values.Cast<object>()).GetType()
+                .GetProperty("Packets")!.GetValue(Assert.Single(NetworkEntries(host).Values.Cast<object>()))!;
+        }
+        else
+        {
+            var host = RuntimeFileServiceHost.CreateForSession(kernel, service, session, trace).Value!;
+            var client = IFileServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session));
+            var opening = client.OpenAsync(new(capability, "/original-pin", true)).AsTask();
+            Assert.True(host.ProcessNext().IsSuccess);
+            var control = (await opening).Authority;
+            token = control.File.Seal.OpaqueToken;
+            drain = host.Drain;
+            revoke = () => kernel.SealedObjects.Revoke(control.File.Seal);
+            dispatch = host.ProcessNext;
+            write = () => client.WriteAsync(new(control.File, control.Capability, new([7, 8]))).AsTask();
+            getContents = () =>
+            {
+                var files = (global::System.Collections.IDictionary)typeof(RuntimeFileServiceHost)
+                    .GetField("_files", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(host)!;
+                var entry = Assert.Single(files.Values.Cast<object>());
+                return entry.GetType().GetProperty("Data")!.GetValue(entry)!;
+            };
+        }
+        var originalRecord = routes[token]!;
+        armed = true;
+        var writing = write();
+        Assert.Equal(fault == 2 ? KernelError.SessionDraining : KernelError.StaleHandle, dispatch().Error);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => writing.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Empty((global::System.Collections.IEnumerable)getContents());
+        var pins = originalRecord.GetType().GetProperty("ActivePins")!;
+        Assert.Equal(0, (int)pins.GetValue(originalRecord)!);
+        if (copy is not null) Assert.Equal(1, (int)pins.GetValue(copy)!);
+        Assert.Equal(0, kernel.CapabilityAuthority.ActiveOperationLeaseCount);
+        Assert.Equal(0, kernel.EndpointSessions.ActivePinCount(session));
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public async Task NativeObjectCapacityRefusalBeforeAcceptanceDoesNotPinCallerBacking(int route)
+    {
+        RuntimeKernel kernel;
+        ProcessHandle caller;
+        EndpointSessionHandle session;
+        object host;
+        Func<KernelResult> dispatch;
+        Task opening;
+        if (route == 2)
+        {
+            var s = NetworkDrainScenario();
+            kernel = s.Kernel; caller = s.Caller; session = s.Session;
+            var networkHost = RuntimeNetworkServiceHost.CreateForSession(kernel, s.Service, session).Value!;
+            host = networkHost; dispatch = networkHost.ProcessNext;
+            host.GetType().GetField("_nextId", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(host, ulong.MaxValue);
+            var client = INetworkServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session));
+            opening = client.OpenAsync(new(s.Capability, "capacity")).AsTask();
+        }
+        else
+        {
+            var s = FileScenario();
+            kernel = s.Kernel; caller = s.Caller; session = s.Session;
+            var fileHost = RuntimeFileServiceHost.CreateForSession(kernel, s.Service, session).Value!;
+            host = fileHost; dispatch = fileHost.ProcessNext;
+            host.GetType().GetField("_nextId", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(host, ulong.MaxValue);
+            var client = IFileServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session));
+            opening = route == 0 ? client.OpenAsync(new(s.Capability, "/capacity", true)).AsTask()
+                : client.OpenV2Async(new(kernel.UpgradeCapabilityV1(caller, s.Capability).Value, "/capacity", true)).AsTask();
+        }
+        _ = kernel.AllocateBuffer<byte>(caller, 4).Value!;
+        Assert.Equal(KernelError.CapacityExhausted, dispatch().Error);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => opening.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.True(kernel.CloseSession(caller, session).IsSuccess);
+        Assert.True(kernel.TerminateProcess(caller).IsSuccess);
+        Assert.True(kernel.Processes.ResolveTerminalState(caller).IsSuccess);
+        Assert.All(kernel.Regions.Snapshot(), region => Assert.Equal(RegionState.Released, region.State));
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)]
+    public async Task InvalidSessionCloseCannotDrainOriginalAttachedChild(int fault)
+    {
+        var (kernel, host, caller, session, manager) = AttachedChildDrainScenario();
+        var creating = manager.CreateAsync(TestFixtures.Manifest(2092, 20920)).AsTask();
+        Assert.True(host.ProcessNext().IsSuccess);
+        var child = await creating.WaitAsync(TimeSpan.FromSeconds(10));
+        _ = kernel.AllocateBuffer<byte>(child.Authority.Process, 4).Value!;
+        var calls = 0;
+        kernel.RegisterComposedWorkTeardownParticipant(new ChildDrainParticipant(process =>
+        {
+            if (process == child.Authority.Process) calls++;
+            return KernelResult.Ok();
+        }));
+        var records = (global::System.Collections.IDictionary)kernel.EndpointSessions.GetType()
+            .GetField("_records", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel.EndpointSessions)!;
+        var original = records[session.SessionId]!;
+        var requestedCaller = caller;
+        var requestedSession = session;
+        if (fault == 0) requestedCaller = TestFixtures.Create(kernel, 2094, 20940).Handle;
+        if (fault == 1) requestedSession = session with { Generation = new EndpointSessionGeneration(2) };
+        if (fault == 2) records.Remove(session.SessionId);
+        if (fault == 3) records[session.SessionId] = original.GetType()
+            .GetMethod("MemberwiseClone", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(original, null);
+        if (fault == 4) requestedCaller = new ProcessHandle(caller.ProcessId, caller.Generation + 1);
+        Assert.False(kernel.CloseSession(requestedCaller, requestedSession).IsSuccess);
+        Assert.Equal(0, calls);
+        Assert.False(kernel.Processes.ResolveTerminalState(child.Authority.Process).IsSuccess);
+        Assert.NotEqual(RegionState.Released, Assert.Single(kernel.Regions.Snapshot()).State);
+        records[session.SessionId] = original;
+        Assert.True(kernel.CloseSession(caller, session).IsSuccess);
+        Assert.Equal(1, calls);
+        Assert.True(kernel.Processes.ResolveTerminalState(child.Authority.Process).IsSuccess);
+        Assert.Equal(RegionState.Released, Assert.Single(kernel.Regions.Snapshot()).State);
+    }
+
+    [Fact]
+    public async Task ExactNativeHostDrainConsumesOriginalRegistrationAfterLateSessionRouteLoss()
+    {
+        var (kernel, host, caller, session, manager) = AttachedChildDrainScenario();
+        var creating = manager.CreateAsync(TestFixtures.Manifest(2092, 20920)).AsTask();
+        Assert.True(host.ProcessNext().IsSuccess);
+        var child = await creating.WaitAsync(TimeSpan.FromSeconds(10));
+        var backing = kernel.AllocateBuffer<byte>(child.Authority.Process, 4).Value!;
+        var index = (global::System.Collections.IDictionary)typeof(RuntimeKernel)
+            .GetField("_nativeSessionDrains", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel)!;
+        var calls = 0;
+        kernel.RegisterComposedWorkTeardownParticipant(new ChildDrainParticipant(process =>
+        {
+            if (process == child.Authority.Process) { calls++; index.Remove(session); }
+            return KernelResult.Ok();
+        }));
+        Assert.True(kernel.CloseSession(caller, session).IsSuccess);
+        Assert.True(kernel.Processes.ResolveTerminalState(child.Authority.Process).IsSuccess);
+        Assert.Equal(RegionState.Released, Assert.Single(kernel.Regions.Snapshot()).State);
+        var originals = (global::System.Collections.IDictionary)typeof(RuntimeKernel)
+            .GetField("_nativeServiceDrains", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel)!;
+        Assert.Empty(originals.Keys.Cast<object>());
+        Assert.True(kernel.TerminateProcess(caller).IsSuccess);
+        Assert.Equal(1, calls);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public async Task OriginalNativeHostDrainCannotDisappearBeforeChildAndBackingCleanup(int fault)
+    {
+        var (kernel, host, caller, session, manager) = AttachedChildDrainScenario();
+        var creating = manager.CreateAsync(TestFixtures.Manifest(2092, 20920)).AsTask();
+        Assert.True(host.ProcessNext().IsSuccess);
+        var child = await creating.WaitAsync(TimeSpan.FromSeconds(10));
+        var backing = kernel.AllocateBuffer<byte>(child.Authority.Process, 4).Value!;
+        var refuse = true;
+        kernel.RegisterComposedWorkTeardownParticipant(new ChildDrainParticipant(process =>
+            process == child.Authority.Process && refuse
+                ? KernelResult.Fail(KernelError.ExternalEffectUncontained, "Original child closure refused.")
+                : KernelResult.Ok()));
+        var foreign = AttachedChildDrainScenario();
+        var index = (global::System.Collections.IDictionary)typeof(RuntimeKernel)
+            .GetField("_nativeSessionDrains", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel)!;
+        var foreignIndex = (global::System.Collections.IDictionary)typeof(RuntimeKernel)
+            .GetField("_nativeSessionDrains", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(foreign.Kernel)!;
+        var registration = index[session]!;
+        if (fault == 0) index.Remove(session);
+        else index[session] = fault == 1 ? foreignIndex[foreign.Session]
+            : registration.GetType().GetMethod("MemberwiseClone", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(registration, null);
+        Assert.False(kernel.CloseSession(caller, session).IsSuccess);
+        Assert.False(kernel.TerminateProcess(caller).IsSuccess);
+        Assert.False(kernel.QueryProcessTeardown(caller).Value.LocalReclaimCompleted);
+        Assert.NotEqual(RegionState.Released, Assert.Single(kernel.Regions.Snapshot()).State);
+        Assert.False(kernel.Processes.ResolveTerminalState(child.Authority.Process).IsSuccess);
+        Assert.True(foreign.Kernel.EndpointSessions.Resolve(foreign.Session, foreign.Caller).IsSuccess);
+        index[session] = registration;
+        refuse = false;
+        Assert.True(kernel.TerminateProcess(caller).IsSuccess);
+        Assert.True(kernel.Processes.ResolveTerminalState(child.Authority.Process).IsSuccess);
+        Assert.Equal(RegionState.Released, Assert.Single(kernel.Regions.Snapshot()).State);
+        Assert.False(index.Contains(session));
+        Assert.True(foreign.Kernel.CloseSession(foreign.Caller, foreign.Session).IsSuccess);
+    }
+
+    [Theory]
     [InlineData(0, 0)] [InlineData(1, 0)] [InlineData(2, 0)]
     [InlineData(0, 1)] [InlineData(1, 1)] [InlineData(2, 1)]
     [InlineData(0, 2)] [InlineData(1, 2)] [InlineData(2, 2)]
@@ -1064,11 +1281,14 @@ public sealed class NativeSystemServiceVerticalSliceTests
         Assert.True(kernel.AdmitProcess(fresh).IsSuccess);
         if (contour == 2)
         {
-            // Fault injection loses an existing real owner receipt. No fake
-            // receipt/closure is supplied to compensate for it.
+            // Lose the authoritative receipt as well as its route: routing
+            // loss alone must not erase the completed original lifetime fact.
             var receipts = (global::System.Collections.IDictionary)typeof(ProcessRegistry)
                 .GetField("_terminalStates", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel.Processes)!;
             receipts.Remove(child.Authority.Process);
+            var ownedReceipts = (global::System.Collections.IDictionary)typeof(ProcessRegistry)
+                .GetField("_ownedTerminalStates", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel.Processes)!;
+            ownedReceipts.Remove(child.Authority.Process);
         }
         var drained = kernel.CloseSession(caller, session);
         var relations = (global::System.Collections.IDictionary)typeof(RuntimeProcessServiceHost)

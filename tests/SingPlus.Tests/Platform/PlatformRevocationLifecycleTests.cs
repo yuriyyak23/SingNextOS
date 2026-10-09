@@ -7,6 +7,47 @@ namespace SingPlus.Tests.Platform;
 
 public sealed class PlatformRevocationLifecycleTests
 {
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)]
+    public void LegacyOriginalRevokeCannotRepeatOrReleaseBacking(int outcome)
+    {
+        var provider = new LegacySynchronousProvider { Outcome = outcome };
+        var kernel = new RuntimeKernel(provider);
+        var (_, owner) = TestFixtures.Create(kernel, 101, 1010);
+        var region = kernel.AllocateRegion(owner, 4096).Value!;
+        var binding = kernel.BindPlatformDomain(owner).Value!;
+        var capability = MintRegionCapability(kernel, owner, region.Handle, CapabilityRights.Map | CapabilityRights.Read);
+        var mapping = kernel.MapPlatformOwnedRegion(owner, binding, capability, region.Handle, PlatformMemoryAccess.Read).Value!;
+        provider.DuringRevoke = () =>
+        {
+            Assert.False(kernel.RevokePlatformRegionMapping(owner, mapping).IsSuccess);
+            if (outcome == 4)
+            {
+                var reflection = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+                var gate = typeof(PlatformAuthorityBridge).GetField("_secureDomainLifecycleGate", reflection)!.GetValue(kernel.PlatformAuthority)!;
+                lock (gate)
+                    ((global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_activeSubjects", reflection)!
+                        .GetValue(kernel.PlatformAuthority)!).Remove(binding.Subject);
+            }
+        };
+
+        Assert.False(kernel.RevokePlatformRegionMapping(owner, mapping).IsSuccess);
+        Assert.False(kernel.RevokePlatformRegionMapping(owner, mapping).IsSuccess);
+        Assert.False(kernel.ObservePlatformRegionMappingRevocation(owner, mapping).IsSuccess);
+        Assert.False(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.Equal(1, provider.RevokeCalls);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
+        Assert.True(kernel.Regions.HasPlatformMappingReservation(mapping.Region,
+            new RegionOwner(new DomainId(1010), owner.Generation)));
+        var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_mappings", flags)!.GetValue(kernel.PlatformAuthority)!;
+        var original = routes[mapping.MappingId]!;
+        Assert.False((bool)original.GetType().GetProperty("ClosureTransitionInFlight")!.GetValue(original)!);
+        Assert.True((bool)original.GetType().GetProperty("LegacyRevokeMayHaveEffect")!.GetValue(original)!);
+        var observation = (PlatformAuthorityResult?)original.GetType().GetProperty("LegacyRevokeObservation")!.GetValue(original);
+        if (outcome == 3) Assert.Null(observation);
+        else Assert.Equal(outcome is 0 or 4, observation!.Value.IsSuccess);
+    }
     [Fact]
     [Trait("Category", "Runtime")]
     public void CapabilityRevocationStaysPinnedUntilVerifiedClosedReceipt()
@@ -407,6 +448,9 @@ public sealed class PlatformRevocationLifecycleTests
         IPlatformFeatureProvider
     {
         private readonly HostPlatformAuthorityProvider _inner = new();
+        public int Outcome { get; init; }
+        public int RevokeCalls { get; private set; }
+        public Action? DuringRevoke { get; set; }
 
         public PlatformProviderDescriptor Descriptor => _inner.Descriptor;
         public PlatformFeatureManifest QueryFeatures() => _inner.QueryFeatures();
@@ -425,7 +469,18 @@ public sealed class PlatformRevocationLifecycleTests
 
         public PlatformAuthorityResult RevokeRegionMapping(
             PlatformProviderRegionMappingLease mapping,
-            PlatformRegionRevocationPolicy policy) =>
-            _inner.RevokeRegionMapping(mapping, policy);
+            PlatformRegionRevocationPolicy policy)
+        {
+            RevokeCalls++;
+            var result = _inner.RevokeRegionMapping(mapping, policy);
+            DuringRevoke?.Invoke();
+            return Outcome switch
+            {
+                1 => PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Denied, "Original effect may already exist."),
+                2 => PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Original effect may already exist."),
+                3 => throw new InvalidOperationException("Original response lost after effect."),
+                _ => result
+            };
+        }
     }
 }

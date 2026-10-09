@@ -21,7 +21,7 @@ internal static class SealTypeRegistry
 
 internal sealed class SealedObjectAuthority
 {
-    private sealed class Record
+    internal sealed class Record
     {
         public required Guid Token { get; init; }
         public required Guid SealTypeId { get; init; }
@@ -40,6 +40,8 @@ internal sealed class SealedObjectAuthority
     private const int CollisionRetryLimit = 8;
     private readonly object _gate = new();
     private readonly Dictionary<Guid, Record> _records = [];
+    // Existing owner retains the same fact; _records is its routing index.
+    private readonly Dictionary<Guid, Record> _originalRecords = [];
     private readonly AuthorityRealmId _realm;
     private readonly int _capacity;
     private readonly Func<Guid> _tokenFactory;
@@ -64,7 +66,7 @@ internal sealed class SealedObjectAuthority
         {
             if (!SealTypeRegistry.TryTypeId<TSeal>(out var sealTypeId))
                 return KernelResult<SealedHandle<TSeal>>.Fail(KernelError.InvalidMessage, "Unknown sealed contract marker.");
-            if (_records.Count >= _capacity)
+            if (_originalRecords.Count >= _capacity)
                 return KernelResult<SealedHandle<TSeal>>.Fail(KernelError.CapacityExhausted, "Sealed-object table is exhausted.");
             if (objectGeneration == 0 || objectKey == 0 || capability.Value == 0)
                 return KernelResult<SealedHandle<TSeal>>.Fail(KernelError.InvalidMessage, "Sealed-object identity is incomplete.");
@@ -72,7 +74,7 @@ internal sealed class SealedObjectAuthority
             for (var attempt = 0; attempt < CollisionRetryLimit; attempt++)
             {
                 token = _tokenFactory();
-                if (token != Guid.Empty && !_records.ContainsKey(token)) break;
+                if (token != Guid.Empty && !_originalRecords.ContainsKey(token) && !_records.ContainsKey(token)) break;
                 token = default;
             }
             if (token == Guid.Empty)
@@ -90,6 +92,9 @@ internal sealed class SealedObjectAuthority
                 ObjectKey = objectKey,
                 Capability = capability,
             };
+            _originalRecords.EnsureCapacity(_originalRecords.Count + 1);
+            _records.EnsureCapacity(_records.Count + 1);
+            _originalRecords.Add(token, record);
             _records.Add(token, record);
             return KernelResult<SealedHandle<TSeal>>.Ok(new(SealedHandleContract.Version, _realm, token));
         }
@@ -109,8 +114,7 @@ internal sealed class SealedObjectAuthority
             if (!resolved.IsSuccess)
                 return KernelResult<SealedObjectPin<TSeal>>.Fail(resolved.Error, resolved.Message!);
             checked { resolved.Value!.ActivePins++; }
-            return KernelResult<SealedObjectPin<TSeal>>.Ok(new(this, handle, resolved.Value.ObjectKey,
-                resolved.Value.ObjectGeneration, resolved.Value.Capability));
+            return KernelResult<SealedObjectPin<TSeal>>.Ok(new(this, handle, resolved.Value));
         }
     }
 
@@ -124,6 +128,7 @@ internal sealed class SealedObjectAuthority
                 return KernelResult.Fail(KernelError.InvalidMessage, "Unknown sealed contract marker.");
             return pin.IsOwnedBy(this) &&
                    _records.TryGetValue(pin.Handle.OpaqueToken, out var record) &&
+                   ReferenceEquals(record, pin.OriginalRecord) && IsOriginalRecord(record) &&
                    record.State == SealedObjectState.Active && record.ActivePins > 0 &&
                    record.Service == service.Service && record.ServiceGeneration == service.Generation &&
                    record.ServiceProcess == serviceProcess && record.SealTypeId == typeId
@@ -141,6 +146,7 @@ internal sealed class SealedObjectAuthority
                 return KernelResult.Fail(KernelError.InvalidMessage, "Unknown sealed contract marker.");
             if (!pin.IsOwnedBy(this) ||
                 !_records.TryGetValue(pin.Handle.OpaqueToken, out var record) ||
+                !ReferenceEquals(record, pin.OriginalRecord) || !IsOriginalRecord(record) ||
                 record.SealTypeId != typeId || record.ActivePins == 0 ||
                 record.State != SealedObjectState.Active)
                 return KernelResult.Fail(KernelError.StaleHandle, "Sealed object is stale or already closed.");
@@ -155,7 +161,7 @@ internal sealed class SealedObjectAuthority
         {
             if (!SealTypeRegistry.TryTypeId<TSeal>(out var typeId))
                 return KernelResult.Fail(KernelError.InvalidMessage, "Unknown sealed contract marker.");
-            if (!_records.TryGetValue(handle.OpaqueToken, out var record) || handle.RealmId != _realm ||
+            if (!_records.TryGetValue(handle.OpaqueToken, out var record) || !IsOriginalRecord(record) || handle.RealmId != _realm ||
                 handle.Version != SealedHandleContract.Version || record.SealTypeId != typeId)
                 return KernelResult.Fail(KernelError.StaleHandle, "Sealed object is stale or forged.");
             record.State = record.ActivePins == 0 ? SealedObjectState.Closed : SealedObjectState.Draining;
@@ -167,12 +173,16 @@ internal sealed class SealedObjectAuthority
     {
         lock (_gate)
         {
-            if (!_records.TryGetValue(pin.Handle.OpaqueToken, out var record) || record.ActivePins == 0) return;
+            var record = pin.OriginalRecord;
+            if (!IsOriginalRecord(record) || record.ActivePins == 0) return;
             record.ActivePins--;
             if (record.ActivePins == 0 && record.State == SealedObjectState.Draining)
                 record.State = SealedObjectState.Closed;
         }
     }
+
+    private bool IsOriginalRecord(Record record) =>
+        _originalRecords.TryGetValue(record.Token, out var original) && ReferenceEquals(original, record);
 
     internal SealedObjectState? InspectState<TSeal>(SealedHandle<TSeal> handle)
         where TSeal : ISealedContractMarker
@@ -192,6 +202,8 @@ internal sealed class SealedObjectAuthority
             return KernelResult<Record>.Fail(KernelError.WrongAuthorityRealm, "Sealed handle belongs to another runtime realm.");
         if (handle.OpaqueToken == Guid.Empty || !_records.TryGetValue(handle.OpaqueToken, out var record))
             return KernelResult<Record>.Fail(KernelError.ForgedCapability, "Sealed handle token is invalid.");
+        if (!IsOriginalRecord(record))
+            return KernelResult<Record>.Fail(KernelError.StaleHandle, "Sealed route is not the original owner record.");
         if (!SealTypeRegistry.TryTypeId<TSeal>(out var typeId) || record.SealTypeId != typeId)
             return KernelResult<Record>.Fail(KernelError.StaleHandle, "Sealed handle type does not match the object.");
         if (record.Service != service.Service || record.ServiceGeneration != service.Generation || record.ServiceProcess != serviceProcess)
@@ -214,13 +226,13 @@ internal sealed class SealedObjectPin<TSeal> : IDisposable where TSeal : ISealed
 {
     private SealedObjectAuthority? _owner;
     internal SealedObjectPin(SealedObjectAuthority owner, SealedHandle<TSeal> handle,
-        ulong objectKey, ulong objectGeneration, CapabilityId capability) =>
-        (_owner, Handle, ObjectKey, ObjectGeneration, Capability) =
-        (owner, handle, objectKey, objectGeneration, capability);
+        SealedObjectAuthority.Record originalRecord) =>
+        (_owner, Handle, OriginalRecord) = (owner, handle, originalRecord);
+    internal SealedObjectAuthority.Record OriginalRecord { get; }
     internal SealedHandle<TSeal> Handle { get; }
-    internal ulong ObjectKey { get; }
-    internal ulong ObjectGeneration { get; }
-    internal CapabilityId Capability { get; }
+    internal ulong ObjectKey => OriginalRecord.ObjectKey;
+    internal ulong ObjectGeneration => OriginalRecord.ObjectGeneration;
+    internal CapabilityId Capability => OriginalRecord.Capability;
     internal bool IsOwnedBy(SealedObjectAuthority owner) =>
         ReferenceEquals(Volatile.Read(ref _owner), owner);
     public void Dispose() => Interlocked.Exchange(ref _owner, null)?.Release(this);

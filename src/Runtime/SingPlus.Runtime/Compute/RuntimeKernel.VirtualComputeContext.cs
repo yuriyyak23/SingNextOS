@@ -51,6 +51,74 @@ public sealed partial class RuntimeKernel
             : KernelResult<VirtualComputeContext>.Fail(validation.Error, validation.Message!);
     }
 
+    // Prepare external queries first. Returned delegate is kernel-private pure owner commit only.
+    internal KernelResult<Func<Func<KernelResult>, KernelResult>> PrepareVirtualComputePublication(
+        ProcessHandle owner, VirtualComputeContext context, ComputePlan plan)
+    {
+        var valid = RevalidateVirtualComputeContext(owner, context, plan);
+        if (!valid.IsSuccess) return KernelResult<Func<Func<KernelResult>, KernelResult>>.Fail(valid.Error, valid.Message!);
+        var domain = _virtualDomains.ResolveAdmission(owner, context.VirtualDomain);
+        if (!domain.IsSuccess) return KernelResult<Func<Func<KernelResult>, KernelResult>>.Fail(domain.Error, domain.Message!);
+        var record = domain.Value!;
+        var expected = record.State;
+        var input = _virtualDomains.ResolveMapping(record, context.Input);
+        var output = _virtualDomains.ResolveMapping(record, context.Output);
+        var inputSource = _virtualDomains.ResolveMappingSource(record, context.Input);
+        var outputSource = _virtualDomains.ResolveMappingSource(record, context.Output);
+        if (!input.IsSuccess || !output.IsSuccess || !inputSource.IsSuccess || !outputSource.IsSuccess)
+            return KernelResult<Func<Func<KernelResult>, KernelResult>>.Fail(KernelError.StaleGeneration, "Virtual publication mapping/source tuple changed.");
+        VirtualIoRecord io;
+        lock (_virtualIoGate)
+        {
+            if (!_virtualIo.TryGetValue(context.VirtualIo.Id, out io!) || io.Binding != context.VirtualIo ||
+                io.Owner != owner || io.Domain != context.VirtualDomain || io.State != VirtualIoState.Active)
+                return KernelResult<Func<Func<KernelResult>, KernelResult>>.Fail(KernelError.StaleGeneration, "Virtual publication I/O tuple changed.");
+        }
+        var deviceSource = PlatformAuthority.DeviceEffectSource(io.Platform.ParentDevice, io.Platform.ParentDevice.DomainBinding.Subject);
+        if (!deviceSource.IsSuccess) return KernelResult<Func<Func<KernelResult>, KernelResult>>.Fail(deviceSource.Error, deviceSource.Message!);
+        var subject = io.Platform.ParentDevice.DomainBinding.Subject.DomainId;
+        var backings = PrepareSecureGuestBackings(new(subject, owner.Generation),
+            [(plan.Intent.Input.Region, plan.Intent.Input.Range), (plan.Intent.Output.Region, plan.Intent.Output.Range)]);
+        if (!backings.IsSuccess) return KernelResult<Func<Func<KernelResult>, KernelResult>>.Fail(backings.Error, backings.Message!);
+        CapabilityRights RegionRights(GuestRegionMapping mapping) => CapabilityRights.Map | CapabilityRights.Read |
+            ((mapping.Access & GuestMemoryAccess.Write) != 0 ? CapabilityRights.Write : CapabilityRights.None) |
+            ((mapping.Access & GuestMemoryAccess.Execute) != 0 ? CapabilityRights.Execute : CapabilityRights.None);
+        KernelResult Commit(Func<KernelResult> commit) => CommitCxlBackingPublication(owner, new(subject, owner.Generation), () =>
+            CapabilityAuthority.CommitDeviceLeaseAdmission(deviceSource.Value, subject, owner.Generation,
+                ToDeviceCapabilityRights(io.Rights), io.Platform.ParentDevice.Device.ResourceId, () =>
+            CapabilityAuthority.CommitVirtualDomainEffect(inputSource.Value.Memory, subject, owner.Generation, CapabilityRights.Map,
+                VirtualizationResourceIds.Memory(context.VirtualDomain.DomainId), () =>
+            CapabilityAuthority.CommitVirtualDomainEffect(outputSource.Value.Memory, subject, owner.Generation, CapabilityRights.Map,
+                VirtualizationResourceIds.Memory(context.VirtualDomain.DomainId), () =>
+            CapabilityAuthority.CommitGuestRegionSource(inputSource.Value.Region, subject, owner.Generation, RegionRights(input.Value!),
+                CapabilityResourceIds.MemoryRegion(input.Value!.Region.RegionId), () =>
+            CapabilityAuthority.CommitGuestRegionSource(outputSource.Value.Region, subject, owner.Generation, RegionRights(output.Value!),
+                CapabilityResourceIds.MemoryRegion(output.Value!.Region.RegionId), () =>
+            _virtualDomains.CommitEffectAdmission(record, expected, () =>
+            {
+                var currentInput = _virtualDomains.ResolveMapping(record, context.Input);
+                var currentOutput = _virtualDomains.ResolveMapping(record, context.Output);
+                var currentInputSource = _virtualDomains.ResolveMappingSource(record, context.Input);
+                var currentOutputSource = _virtualDomains.ResolveMappingSource(record, context.Output);
+                if (!currentInput.IsSuccess || !currentOutput.IsSuccess || currentInput.Value != input.Value || currentOutput.Value != output.Value ||
+                    !currentInputSource.IsSuccess || !currentOutputSource.IsSuccess ||
+                    currentInputSource.Value != inputSource.Value || currentOutputSource.Value != outputSource.Value ||
+                    currentInput.Value!.Region != plan.Intent.Input.Region || currentOutput.Value!.Region != plan.Intent.Output.Region)
+                    return KernelResult.Fail(KernelError.StaleGeneration, "Virtual publication exact operand/source tuple changed.");
+                return backings.Value!(commit);
+            })))))));
+        return KernelResult<Func<Func<KernelResult>, KernelResult>>.Ok(Commit);
+    }
+
+    // Called after domain and bridge admission locks, immediately around the pure owner transition.
+    internal KernelResult CommitVirtualComputeIo(ProcessHandle owner, VirtualComputeContext context, Func<KernelResult> commit)
+    {
+        lock (_virtualIoGate)
+            return _virtualIo.TryGetValue(context.VirtualIo.Id, out var io) && io.Binding == context.VirtualIo &&
+                io.Owner == owner && io.Domain == context.VirtualDomain && io.State == VirtualIoState.Active
+                ? commit() : KernelResult.Fail(KernelError.PlatformBindingDraining, "Virtual publication I/O stopped.");
+    }
+
     internal KernelResult RevalidateVirtualComputeContext(ProcessHandle owner, VirtualComputeContext context, ComputePlan? plan)
     {
         var domain = _virtualDomains.Resolve(owner, context.VirtualDomain);
@@ -59,7 +127,7 @@ public sealed partial class RuntimeKernel
         var output = _virtualDomains.ResolveMapping(domain.Value!, context.Output);
         if (!input.IsSuccess) return KernelResult.Fail(input.Error, input.Message!);
         if (!output.IsSuccess) return KernelResult.Fail(output.Error, output.Message!);
-        var io = RevalidateVirtualIo(owner, context.VirtualIo);
+        var io = RevalidateVirtualIo(owner, context.VirtualIo, context.VirtualDomain);
         if (!io.IsSuccess) return io;
         if (plan is not null && (plan.Intent.Input.Region != input.Value!.Region || plan.Intent.Output.Region != output.Value!.Region))
             return KernelResult.Fail(KernelError.WrongRegionOwner, "Compute plan operands do not match the exact guest mappings.");

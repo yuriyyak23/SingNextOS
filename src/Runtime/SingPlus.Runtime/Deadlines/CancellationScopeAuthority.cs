@@ -27,11 +27,23 @@ public sealed class CancellationScopeAuthority
 
     internal CancellationScopeAuthority(TimeProvider timeProvider) => _timeProvider = timeProvider;
 
+    internal long CaptureTimestamp(CancellationScopeHandle scope)
+    {
+        bool hasDeadline;
+        lock (_gate) hasDeadline = ResolveExact(scope) is { IsSuccess: true, Value.EffectiveDeadline: not null };
+        return hasDeadline ? _timeProvider.GetTimestamp() : 0;
+    }
+
+    internal long CaptureTimestamp(MonotonicDeadline? deadline, CancellationScopeHandle? parent) =>
+        deadline is not null ? _timeProvider.GetTimestamp()
+            : parent is { } exact ? CaptureTimestamp(exact) : 0;
+
     internal KernelResult<CancellationObservation> Create(
         ProcessHandle owner,
         MonotonicDeadline? deadline,
-        CancellationScopeHandle? parent)
+        CancellationScopeHandle? parent, long? observedTimestamp = null)
     {
+        var timestamp = observedTimestamp ?? CaptureTimestamp(deadline, parent);
         lock (_gate)
         {
             if (_nextId == 0)
@@ -44,7 +56,7 @@ public sealed class CancellationScopeAuthority
                 if (!resolved.IsSuccess)
                     return KernelResult<CancellationObservation>.Fail(resolved.Error, resolved.Message!);
                 parentRecord = resolved.Value!;
-                RefreshDeadline(parentRecord);
+                RefreshDeadline(parentRecord, timestamp);
                 if (parentRecord.Owner != owner)
                     return KernelResult<CancellationObservation>.Fail(KernelError.WrongSessionOwner, "Child cancellation scope must have the exact same process-generation owner as its parent.");
             }
@@ -69,19 +81,20 @@ public sealed class CancellationScopeAuthority
                     : CancellationDisposition.Active,
             };
             _records.Add(handle.ScopeId, record);
-            RefreshDeadline(record);
-            return KernelResult<CancellationObservation>.Ok(Snapshot(record));
+            RefreshDeadline(record, timestamp);
+            return KernelResult<CancellationObservation>.Ok(Snapshot(record, timestamp));
         }
     }
 
-    internal KernelResult<CancellationObservation> Request(ProcessHandle owner, CancellationScopeHandle scope)
+    internal KernelResult<CancellationObservation> Request(ProcessHandle owner, CancellationScopeHandle scope, long? observedTimestamp = null)
     {
+        var timestamp = observedTimestamp ?? CaptureTimestamp(scope);
         lock (_gate)
         {
             var resolved = ResolveForOwner(scope, owner);
             if (!resolved.IsSuccess) return StaleOrFailure(scope, owner, resolved);
             var record = resolved.Value!;
-            RefreshDeadline(record);
+            RefreshDeadline(record, timestamp);
             if (!IsTerminal(record.Disposition))
             {
                 record.Requested = true;
@@ -89,26 +102,28 @@ public sealed class CancellationScopeAuthority
                     SetDisposition(record, CancellationDisposition.CancellationRequested);
                 PropagateRequest(record.Handle);
             }
-            return KernelResult<CancellationObservation>.Ok(Snapshot(record));
+            return KernelResult<CancellationObservation>.Ok(Snapshot(record, timestamp));
         }
     }
 
-    internal KernelResult<CancellationObservation> Observe(ProcessHandle owner, CancellationScopeHandle scope)
+    internal KernelResult<CancellationObservation> Observe(ProcessHandle owner, CancellationScopeHandle scope, long? observedTimestamp = null)
     {
+        var timestamp = observedTimestamp ?? CaptureTimestamp(scope);
         lock (_gate)
         {
             var resolved = ResolveForOwner(scope, owner);
             if (!resolved.IsSuccess) return StaleOrFailure(scope, owner, resolved);
-            RefreshAncestors(resolved.Value!);
-            return KernelResult<CancellationObservation>.Ok(Snapshot(resolved.Value!));
+            RefreshAncestors(resolved.Value!, timestamp);
+            return KernelResult<CancellationObservation>.Ok(Snapshot(resolved.Value!, timestamp));
         }
     }
 
     internal KernelResult<CancellationObservation> RecordDisposition(
         ProcessHandle owner,
         CancellationScopeHandle scope,
-        CancellationDisposition disposition)
+        CancellationDisposition disposition, long? observedTimestamp = null)
     {
+        var timestamp = observedTimestamp ?? CaptureTimestamp(scope);
         lock (_gate)
         {
             if (!Enum.IsDefined(disposition) || disposition is CancellationDisposition.Active or CancellationDisposition.Stale)
@@ -116,16 +131,16 @@ public sealed class CancellationScopeAuthority
             var resolved = ResolveForOwner(scope, owner);
             if (!resolved.IsSuccess) return StaleOrFailure(scope, owner, resolved);
             var record = resolved.Value!;
-            RefreshAncestors(record);
+            RefreshAncestors(record, timestamp);
 
             if (IsTerminal(record.Disposition))
             {
                 if (record.Disposition != disposition)
                     return KernelResult<CancellationObservation>.Fail(KernelError.InvalidTransition, $"Cancellation scope is terminal as {record.Disposition}.");
-                return KernelResult<CancellationObservation>.Ok(Snapshot(record));
+                return KernelResult<CancellationObservation>.Ok(Snapshot(record, timestamp));
             }
             SetDisposition(record, disposition);
-            return KernelResult<CancellationObservation>.Ok(Snapshot(record));
+            return KernelResult<CancellationObservation>.Ok(Snapshot(record, timestamp));
         }
     }
 
@@ -171,33 +186,36 @@ public sealed class CancellationScopeAuthority
         }
     }
 
-    internal CancellationObservation[] InspectionSnapshot(ProcessHandle owner)
+    internal CancellationObservation[] InspectionSnapshot(ProcessHandle owner, long? observedTimestamp = null)
     {
+        bool hasDeadline;
+        lock (_gate) hasDeadline = _records.Values.Any(record => record.Owner == owner && record.EffectiveDeadline is not null);
+        var timestamp = observedTimestamp ?? (hasDeadline ? _timeProvider.GetTimestamp() : 0);
         lock (_gate)
         {
             var records = _records.Values.Where(record => record.Owner == owner).ToArray();
-            foreach (var record in records) RefreshAncestors(record);
-            return records.OrderBy(static record => record.Handle.ScopeId.Value).Select(Snapshot).ToArray();
+            foreach (var record in records) RefreshAncestors(record, timestamp);
+            return records.OrderBy(static record => record.Handle.ScopeId.Value).Select(record => Snapshot(record, timestamp)).ToArray();
         }
     }
 
-    private void RefreshAncestors(Record record)
+    private void RefreshAncestors(Record record, long timestamp)
     {
         if (record.Parent is { } parentHandle && ResolveExact(parentHandle) is { IsSuccess: true, Value: { } parent })
         {
-            RefreshAncestors(parent);
+            RefreshAncestors(parent, timestamp);
             if (parent.Requested && !record.Requested && !IsTerminal(record.Disposition))
             {
                 record.Requested = true;
                 SetDisposition(record, CancellationDisposition.CancellationRequested);
             }
         }
-        RefreshDeadline(record);
+        RefreshDeadline(record, timestamp);
     }
 
-    private void RefreshDeadline(Record record)
+    private void RefreshDeadline(Record record, long timestamp)
     {
-        if (record.EffectiveDeadline is not { } deadline || _timeProvider.GetTimestamp() < deadline.Timestamp || IsTerminal(record.Disposition))
+        if (record.EffectiveDeadline is not { } deadline || timestamp < deadline.Timestamp || IsTerminal(record.Disposition))
             return;
         if (!record.Requested)
         {
@@ -247,13 +265,13 @@ public sealed class CancellationScopeAuthority
                 CancellationDisposition.Stale, 0))
             : KernelResult<CancellationObservation>.Fail(failure.Error, failure.Message!);
 
-    private CancellationObservation Snapshot(Record record) => new(
+    private static CancellationObservation Snapshot(Record record, long timestamp) => new(
         record.Handle,
         record.Owner,
         record.Parent,
         record.EffectiveDeadline,
         record.Requested,
-        record.EffectiveDeadline is { } deadline && _timeProvider.GetTimestamp() >= deadline.Timestamp
+        record.EffectiveDeadline is { } deadline && timestamp >= deadline.Timestamp
             ? TimeoutDisposition.ExpiredWaitingMayStop
             : TimeoutDisposition.NotExpired,
         record.Disposition,

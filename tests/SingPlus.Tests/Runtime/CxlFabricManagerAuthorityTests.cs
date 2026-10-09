@@ -7,6 +7,529 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class CxlFabricManagerAuthorityTests
 {
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void LateUnavailableSourceRefusesActualFmReconfigurationEffectAndPreservesPendingFacts(bool completion)
+    {
+        CompletionHook? hook = null;
+        var s = CreateScenario(providerFactory: model => hook = new(model));
+        if (completion) Assert.True(s.Manager.BeginReconfiguration(s.Binding).IsSuccess);
+        var before = s.Model.QueryResource(s.Binding.BindingId).Value!;
+        const global::System.Reflection.BindingFlags flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var type = typeof(CxlType3ModelProvider);
+        var tickets = (global::System.Collections.IDictionary)type.GetField("_reconfigurations", flags)!.GetValue(s.Model)!;
+        var saved = tickets.Values.Cast<CxlFabricReconfigurationTicket>().ToArray();
+        var counter = type.GetField("_nextReconfiguration", flags)!;
+        var sequence = (ulong)counter.GetValue(s.Model)!;
+        var gate = typeof(CxlFabricManagerAuthority).GetField("_gate", flags)!.GetValue(s.Manager)!;
+        var observed = false;
+        void LoseSource()
+        {
+            Assert.False(Monitor.IsEntered(gate));
+            var endpoints = (global::System.Collections.IDictionary)type.GetField("_endpoints", flags)!.GetValue(s.Model)!;
+            var endpoint = endpoints[s.Endpoint.EndpointId]!;
+            endpoint.GetType().GetProperty("DeviceGeneration")!.SetValue(endpoint, ulong.MaxValue);
+            Assert.Equal(PlatformAuthorityStatus.Faulted, s.Model.HotRemove(s.Endpoint.EndpointId).Status);
+            observed = true;
+        }
+        if (completion) hook!.BeforeComplete = LoseSource;
+        else hook!.BeforeBegin = LoseSource;
+        var result = completion ? s.Manager.CompleteReconfiguration(s.Binding.BindingId) : s.Manager.BeginReconfiguration(s.Binding);
+        Assert.True(observed);
+        Assert.False(result.IsSuccess);
+        Assert.Equal(before with { State = CxlFabricResourceState.Faulted }, s.Model.QueryResource(s.Binding.BindingId).Value!);
+        Assert.Equal(saved, tickets.Values.Cast<CxlFabricReconfigurationTicket>().ToArray());
+        Assert.Equal(sequence, (ulong)counter.GetValue(s.Model)!);
+        Assert.False(s.Manager.ValidateAdmission(s.Binding).IsSuccess);
+        hook!.BeforeBegin = null;
+        hook.BeforeComplete = null;
+        Assert.False((completion ? s.Manager.CompleteReconfiguration(s.Binding.BindingId) : s.Manager.BeginReconfiguration(s.Binding)).IsSuccess);
+        Assert.Equal(completion ? 1 : 0, hook.Calls);
+        Assert.Equal(saved, tickets.Values.Cast<CxlFabricReconfigurationTicket>().ToArray());
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)]
+    public void ReconfigurationCapacityRefusalPreservesProviderSourceAndFmAdmission(int fault)
+    {
+        var s = CreateScenario();
+        const global::System.Reflection.BindingFlags flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var type = typeof(CxlType3ModelProvider);
+        var counter = type.GetField("_nextReconfiguration", flags)!;
+        counter.SetValue(s.Model, fault == 0 ? 0UL : fault == 1 ? ulong.MaxValue : fault == 4 ? ulong.MaxValue - 1 : 1UL);
+        var binding = fault == 2 ? s.Binding with { Generation = new(ulong.MaxValue) } : s.Binding;
+        var fabric = (global::System.Collections.IDictionary)type.GetField("_fabric", flags)!.GetValue(s.Model)!;
+        var fabricRecordType = fabric[s.Binding.BindingId]!.GetType();
+        fabric[s.Binding.BindingId] = Activator.CreateInstance(fabricRecordType, binding, 128L)!;
+        var memory = (global::System.Collections.IDictionary)type.GetField("_memory", flags)!.GetValue(s.Model)!;
+        var memoryType = type.GetNestedType("MemoryRecord", global::System.Reflection.BindingFlags.NonPublic)!;
+        var first = new CxlMemoryBinding(new(900), new(1), binding, default);
+        var second = new CxlMemoryBinding(new(901), new(fault == 3 ? ulong.MaxValue : 1UL), binding, default);
+        memory[first.BindingId] = Activator.CreateInstance(memoryType, first)!;
+        memory[second.BindingId] = Activator.CreateInstance(memoryType, second)!;
+        var manager = new CxlFabricManagerAuthority(s.Kernel, s.Model);
+        Assert.True(manager.Register(binding).IsSuccess);
+        var before = s.Model.QueryResource(binding.BindingId).Value!;
+        var result = manager.BeginReconfiguration(binding);
+        CxlMemoryBinding ReadMemory(CxlMemoryBindingId id) => (CxlMemoryBinding)memory[id]!.GetType().GetProperty("Binding")!.GetValue(memory[id])!;
+        if (fault == 4)
+        {
+            Assert.True(result.IsSuccess, result.Message);
+            Assert.Equal(ulong.MaxValue - 1, result.Value!.ActiveReconfiguration!.Value.Value);
+            var replacement = manager.CompleteReconfiguration(binding.BindingId).Value!.Binding;
+            Assert.Equal(KernelError.PlatformUnavailable, manager.BeginReconfiguration(replacement).Error);
+            Assert.True(manager.ValidateAdmission(replacement).IsSuccess);
+            Assert.Equal(2UL, ReadMemory(first.BindingId).Generation.Value);
+        }
+        else
+        {
+            Assert.Equal(KernelError.PlatformUnavailable, result.Error);
+            Assert.True(manager.ValidateAdmission(binding).IsSuccess);
+            Assert.Equal(before, s.Model.QueryResource(binding.BindingId).Value);
+            Assert.Equal(first, ReadMemory(first.BindingId));
+            Assert.Equal(second, ReadMemory(second.BindingId));
+            Assert.Equal(PlatformAuthorityStatus.NotAccepted, s.Model.BeginReconfiguration(binding).Status);
+        }
+    }
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)] [InlineData(5)]
+    public void CompletionRefusalRetriesOnlyExactDrainingOriginalSource(int fault)
+    {
+        CompletionHook? hook = null;
+        var s = CreateScenario(providerFactory: model => hook = new(model));
+        var begun = s.Manager.BeginReconfiguration(s.Binding);
+        Assert.True(begun.IsSuccess);
+        hook!.CompletionFailure = fault == 5 ? PlatformAuthorityStatus.Unavailable : PlatformAuthorityStatus.NotAccepted;
+        hook.QueryTransform = result => fault switch
+        {
+            1 => PlatformAuthorityResult<CxlFabricResourceSnapshot>.Ok(result.Value! with
+                { Binding = result.Value.Binding with { Generation = new(result.Value.Binding.Generation.Value + 1) } }),
+            2 => PlatformAuthorityResult<CxlFabricResourceSnapshot>.Ok(result.Value! with { State = CxlFabricResourceState.Bound }),
+            3 => PlatformAuthorityResult<CxlFabricResourceSnapshot>.Fail(PlatformAuthorityStatus.Unavailable, "source lost"),
+            4 => throw new InvalidOperationException("source query failed"),
+            _ => result
+        };
+        hook.BeforeComplete = () => Assert.Equal(KernelError.PlatformBindingDraining,
+            s.Manager.CompleteReconfiguration(s.Binding.BindingId).Error);
+        Assert.False(s.Manager.CompleteReconfiguration(s.Binding.BindingId).IsSuccess);
+        Assert.Equal(1, hook.Calls);
+        Assert.Equal(KernelError.PlatformBindingDraining, s.Manager.ValidateAdmission(s.Binding).Error);
+        Assert.Equal(s.Binding, s.Model.QueryResource(s.Binding.BindingId).Value!.Binding);
+        Assert.Equal(CxlFabricResourceState.Draining, s.Model.QueryResource(s.Binding.BindingId).Value!.State);
+        hook.CompletionFailure = null;
+        hook.QueryTransform = null;
+        hook.BeforeComplete = null;
+        var retry = s.Manager.CompleteReconfiguration(s.Binding.BindingId);
+        if (fault == 0)
+        {
+            Assert.True(retry.IsSuccess, retry.Message);
+            Assert.Equal(2, hook.Calls);
+            Assert.Null(retry.Value!.ActiveReconfiguration);
+            Assert.Equal(s.Binding.Generation.Value + 1, retry.Value.Binding.Generation.Value);
+            Assert.True(s.Manager.ValidateAdmission(retry.Value.Binding).IsSuccess);
+            Assert.Equal(KernelError.StaleGeneration, s.Manager.ValidateAdmission(s.Binding).Error);
+        }
+        else
+        {
+            Assert.Equal(KernelError.InvalidTransition, retry.Error);
+            Assert.Equal(1, hook.Calls);
+        }
+    }
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)] [InlineData(5)]
+    public void UntrackingCannotForgetLiveOperationBeforeActualDrain(int stage)
+    {
+        var s = CreateScenario();
+        var operation = PrepareOperation(s).Operation;
+        var generations = new OperationDependencySnapshot(1, 1, s.Binding.Generation.Value);
+        if (stage >= 1) Assert.True(s.Kernel.AdmitExternalOperation(s.Handle, operation, generations).IsSuccess);
+        OperationBinding? submitted = null;
+        if (stage >= 2) submitted = s.Kernel.RecordExternalOperationSubmission(s.Handle, operation, generations).Value!;
+        if (stage >= 3) Assert.True(s.Kernel.RecordExternalOperationCompletion(s.Handle,
+            new(submitted!.Value, ExternalOperationCompletionDisposition.Completed)).IsSuccess);
+        if (stage >= 4) Assert.True(s.Kernel.RecordExternalOperationVisibility(s.Handle,
+            new(submitted!.Value, ExternalVisibilityRequirement.PublicationFence, true)).IsSuccess);
+        if (stage >= 5) Assert.True(s.Kernel.PublishExternalOperation(s.Handle, operation,
+            generations, new(ExternalPublicationPolicy.Staged), () => { }).IsSuccess);
+        var closures = 0;
+        Assert.True(s.Manager.TrackOperation(s.Binding, s.Handle, operation,
+            () => { closures++; return KernelResult.Ok(); }).IsSuccess);
+        var before = s.Kernel.QueryExternalOperation(s.Handle, operation).Value!;
+        var resourceBefore = s.Kernel.ExternalOperations.QueryResourceBinding(operation);
+        var usesBefore = s.Kernel.Regions.SnapshotUses().ToArray();
+        Assert.Equal(KernelError.ExternalEffectUncontained, s.Manager.UntrackOperation(s.Binding, s.Handle, operation).Error);
+        AssertOperationFactsEqual(before, s.Kernel.QueryExternalOperation(s.Handle, operation).Value!);
+        var resourceAfter = s.Kernel.ExternalOperations.QueryResourceBinding(operation);
+        Assert.Equal(resourceBefore.IsSuccess, resourceAfter.IsSuccess);
+        Assert.Equal(resourceBefore.Error, resourceAfter.Error);
+        Assert.Equal(resourceBefore.Value, resourceAfter.Value);
+        Assert.Equal(usesBefore, s.Kernel.Regions.SnapshotUses().ToArray());
+        Assert.Equal(0, closures);
+        Assert.True(s.Manager.BeginReconfiguration(s.Binding).IsSuccess);
+        Assert.Equal(1, closures);
+        Assert.Equal(ExternalOperationState.Released, s.Kernel.QueryExternalOperation(s.Handle, operation).Value!.State);
+        Assert.True(s.Manager.UntrackOperation(s.Binding, s.Handle, operation).IsSuccess);
+        Assert.True(s.Manager.UntrackOperation(s.Binding, s.Handle, operation).IsSuccess);
+        Assert.True(s.Manager.CompleteReconfiguration(s.Binding.BindingId).IsSuccess);
+        Assert.Equal(1, closures);
+    }
+    [Fact]
+    public async Task UntrackingDuringProviderClosureRetainsLiveCorrelationAndExcludesOverlappingDrain()
+    {
+        var s = CreateScenario();
+        var operation = PrepareOperation(s).Operation;
+        var dependencies = new OperationDependencySnapshot(1, 1, s.Binding.Generation.Value);
+        Assert.True(s.Kernel.AdmitExternalOperation(s.Handle, operation, dependencies).IsSuccess);
+        Assert.True(s.Kernel.RecordExternalOperationSubmission(s.Handle, operation, dependencies).IsSuccess);
+        using var entered = new ManualResetEventSlim();
+        using var resume = new ManualResetEventSlim();
+        var closures = 0;
+        Assert.True(s.Manager.TrackOperation(s.Binding, s.Handle, operation, () =>
+        {
+            Interlocked.Increment(ref closures);
+            entered.Set();
+            if (!resume.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException("closure pause");
+            return KernelResult.Ok();
+        }).IsSuccess);
+        var drain = Task.Run(() => s.Manager.BeginReconfiguration(s.Binding));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+            var before = s.Kernel.QueryExternalOperation(s.Handle, operation).Value!;
+            Assert.Equal(KernelError.ExternalEffectUncontained,
+                s.Manager.UntrackOperation(s.Binding, s.Handle, operation).Error);
+            AssertOperationFactsEqual(before, s.Kernel.QueryExternalOperation(s.Handle, operation).Value!);
+            Assert.Equal(KernelError.PlatformBindingDraining, s.Manager.BeginReconfiguration(s.Binding).Error);
+            Assert.Equal(1, Volatile.Read(ref closures));
+        }
+        finally { resume.Set(); }
+        var result = await drain;
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.Equal(ExternalOperationState.Released, s.Kernel.QueryExternalOperation(s.Handle, operation).Value!.State);
+        Assert.True(s.Manager.UntrackOperation(s.Binding, s.Handle, operation).IsSuccess);
+        Assert.True(s.Manager.CompleteReconfiguration(s.Binding.BindingId).IsSuccess);
+        Assert.Equal(1, closures);
+    }
+
+    [Fact]
+    public void UntrackingRejectsWrongOwnerAndStaleOperationOrFabricGenerationWithoutForgettingCorrelation()
+    {
+        var s = CreateScenario();
+        var operation = PrepareOperation(s).Operation;
+        var closures = 0;
+        Assert.True(s.Manager.TrackOperation(s.Binding, s.Handle, operation,
+            () => { closures++; return KernelResult.Ok(); }).IsSuccess);
+        Assert.True(s.Kernel.CancelExternalOperation(s.Handle, operation, false).IsSuccess);
+        Assert.True(s.Kernel.ReleaseExternalOperation(s.Handle, operation, new(false, false)).IsSuccess);
+        var (_, other) = TestFixtures.Create(s.Kernel, 993, 994);
+        var before = s.Kernel.QueryExternalOperation(s.Handle, operation).Value!;
+        Assert.Equal(KernelError.WrongRegionOwner, s.Manager.UntrackOperation(s.Binding, other, operation).Error);
+        Assert.False(s.Manager.UntrackOperation(s.Binding, s.Handle,
+            operation with { Generation = new(operation.Generation.Value + 1) }).IsSuccess);
+        Assert.Equal(KernelError.StaleGeneration, s.Manager.UntrackOperation(
+            s.Binding with { Generation = new(s.Binding.Generation.Value + 1) }, s.Handle, operation).Error);
+        AssertOperationFactsEqual(before, s.Kernel.QueryExternalOperation(s.Handle, operation).Value!);
+        Assert.Equal(0, closures);
+        Assert.True(s.Manager.BeginReconfiguration(s.Binding).IsSuccess);
+        Assert.Equal(1, closures); // Invalid identities did not remove the retained callback.
+        Assert.True(s.Manager.UntrackOperation(s.Binding, s.Handle, operation).IsSuccess);
+        Assert.True(s.Manager.CompleteReconfiguration(s.Binding.BindingId).IsSuccess);
+        Assert.Equal(KernelError.StaleGeneration, s.Manager.UntrackOperation(s.Binding, s.Handle, operation).Error);
+    }
+
+    private static void AssertOperationFactsEqual(ExternalOperationSnapshot expected, ExternalOperationSnapshot actual)
+    {
+        // Record equality covers every scalar, policy, generation and binding; lists
+        // are compared by ordered content before normalizing their references.
+        Assert.Equal(expected.Transitions.ToArray(), actual.Transitions.ToArray());
+        Assert.Equal(expected.Admission is null, actual.Admission is null);
+        if (expected.Admission is { } admission)
+        {
+            Assert.Equal(admission.RegionUses.ToArray(), actual.Admission!.RegionUses.ToArray());
+            Assert.Equal(admission, actual.Admission with { RegionUses = admission.RegionUses });
+        }
+        Assert.Equal(expected, actual with { Admission = expected.Admission, Transitions = expected.Transitions });
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void DamagedCallbackRefusesPublicationAndSeparatesPoolClosureFromRegionReclaim(bool replaceBeforeCleanup)
+    {
+        CompletionHook? hook = null;
+        var s = CreateScenario(providerFactory: model => hook = new(model));
+        Assert.True(s.Model.RegisterPool(new("damage-pool"), 256).IsSuccess);
+        var budget = s.Kernel.Budgets.CreateProcessHierarchy(s.Handle, "pool-damage", "pool-process",
+            [new BudgetAmount(ServiceBudgetDimension.OwnedMemoryBytes, 128)]).Value;
+        var buffer = s.Kernel.AllocateBuffer<byte>(s.Handle, 64).Value!;
+        RegionDamageDescriptorV1? damage = null;
+        hook!.AfterAssign = () => damage = s.Kernel.Regions.QuarantineSubrange(buffer.Handle, s.Owner,
+            new ProviderHealthEvidenceV1(1, new("pool-provider", "pool-bank", 1, 1), 1,
+                ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(8, 8))).Value!;
+        var result = s.Manager.AssignPool(new("damage-pool"), s.Endpoint.EndpointId, buffer.Handle, s.Owner);
+        Assert.Equal(KernelError.StaleGeneration, result.Error);
+        Assert.NotNull(damage);
+        var records = (global::System.Collections.IDictionary)typeof(CxlFabricManagerAuthority)
+            .GetField("_poolAllocations", global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.GetValue(s.Manager)!;
+        var record = records[buffer.Handle]!;
+        Assert.Equal(false, record.GetType().GetProperty("Published")!.GetValue(record));
+        Assert.Equal(true, record.GetType().GetProperty("ReceiptValidated")!.GetValue(record));
+        var retained = (CxlOwnedPoolAllocation)record.GetType().GetProperty("Allocation")!.GetValue(record)!;
+        var replacement = new RegionBackingReplacementEvidenceV1(1, damage!.Handle,
+            damage.FailureDomain with { ProviderGeneration = 2, FailureDomainGeneration = 2 },
+            damage.EvidenceObservationSequence + 1, 2, damage.Range, new('a', 64), new('b', 64));
+        if (replaceBeforeCleanup)
+            Assert.Equal(KernelError.ExternalEffectUncontained,
+                s.Kernel.Regions.RecordAuthoritativeBackingReplacement(s.Owner, replacement).Error);
+        Assert.True(s.Manager.ReleasePool(retained).IsSuccess);
+        Assert.Equal(1, hook.ReleaseCalls);
+        Assert.Contains(s.Kernel.QueryBudget(budget.ProcessBudget).Value!.Usage,
+            amount => amount.Dimension == ServiceBudgetDimension.OwnedMemoryBytes && amount.Used == 64);
+        if (!replaceBeforeCleanup)
+        {
+            Assert.Equal(damage, Assert.Single(s.Kernel.Regions.SnapshotDamage()));
+            for (var retry = 0; retry < 2; retry++)
+            {
+                Assert.Equal(KernelError.Quarantined, s.Kernel.TerminateProcess(s.Handle).Error);
+                Assert.False(s.Kernel.QueryProcessTeardown(s.Handle).Value.LocalReclaimCompleted);
+                Assert.Contains(s.Kernel.QueryBudget(budget.ProcessBudget).Value!.Usage,
+                    amount => amount.Dimension == ServiceBudgetDimension.OwnedMemoryBytes && amount.Used == 64);
+            }
+        }
+        Assert.True(s.Kernel.Regions.RecordAuthoritativeBackingReplacement(s.Owner, replacement).IsSuccess);
+        Assert.True(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.All(s.Kernel.QueryBudget(budget.ProcessBudget).Value!.Usage, amount => Assert.Equal(0UL, amount.Used));
+        Assert.Equal(1, hook.AssignCalls);
+        Assert.Equal(1, hook.ReleaseCalls);
+        Assert.Equal(256, s.Model.QueryPool(new("damage-pool")).Value!.AvailableCapacityBytes);
+    }
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void PoolPublicationRequiresActiveUseAndRetainsKnownReceiptForCleanup(bool releaseUse)
+    {
+        CompletionHook? hook = null;
+        var s = CreateScenario(providerFactory: model => hook = new(model));
+        Assert.True(s.Model.RegisterPool(new("publication-pool"), 256).IsSuccess);
+        var buffer = s.Kernel.AllocateBuffer<byte>(s.Handle, 64).Value!;
+        hook!.AfterAssign = () =>
+        {
+            if (releaseUse)
+            {
+                var active = Assert.Single(s.Kernel.Regions.SnapshotUses(), use => use.Region == buffer.Handle && use.State == RegionUseState.Active);
+                Assert.True(s.Kernel.Regions.ReleaseUse(active.Handle, s.Owner).IsSuccess);
+            }
+        };
+        var result = s.Manager.AssignPool(new("publication-pool"), s.Endpoint.EndpointId, buffer.Handle, s.Owner);
+        Assert.Equal(!releaseUse, result.IsSuccess);
+        if (releaseUse) Assert.Equal(KernelError.InvalidRegionState, result.Error);
+        var records = (global::System.Collections.IDictionary)typeof(CxlFabricManagerAuthority)
+            .GetField("_poolAllocations", global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.GetValue(s.Manager)!;
+        var record = records[buffer.Handle]!;
+        Assert.Equal(!releaseUse, record.GetType().GetProperty("Published")!.GetValue(record));
+        Assert.Equal(true, record.GetType().GetProperty("ReceiptValidated")!.GetValue(record));
+        Assert.Equal(1, hook.AssignCalls);
+        Assert.Equal(0, hook.ReleaseCalls);
+        var retained = (CxlOwnedPoolAllocation)record.GetType().GetProperty("Allocation")!.GetValue(record)!;
+        Assert.True(s.Manager.ReleasePool(retained).IsSuccess);
+        Assert.Equal(1, hook.ReleaseCalls);
+        Assert.True(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.Equal(256, s.Model.QueryPool(new("publication-pool")).Value!.AvailableCapacityBytes);
+    }
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)] [InlineData(5)]
+    public void MalformedPoolReceiptIsRetainedWithoutPublicationOrOwnerOverwrite(int fault)
+    {
+        CompletionHook? hook = null;
+        var s = CreateScenario(providerFactory: model => hook = new(model));
+        Assert.True(s.Model.RegisterPool(new("receipt-pool"), 256).IsSuccess);
+        var first = s.Kernel.AllocateBuffer<byte>(s.Handle, 64).Value!;
+        var original = s.Manager.AssignPool(new("receipt-pool"), s.Endpoint.EndpointId, first.Handle, s.Owner).Value!;
+        var second = s.Kernel.AllocateBuffer<byte>(s.Handle, 64).Value!;
+        CxlPoolAssignment? returned = null;
+        hook!.AssignmentTransform = receipt => returned = fault switch
+        {
+            0 => receipt with { AssignmentId = new(0) },
+            1 => receipt with { Generation = 0 },
+            2 => receipt with { PoolId = new("wrong-pool") },
+            3 => receipt with { EndpointId = new("wrong-endpoint") },
+            4 => receipt with { CapacityBytes = 63 },
+            _ => receipt with { AssignmentId = original.Assignment.AssignmentId },
+        };
+        var result = s.Manager.AssignPool(new("receipt-pool"), s.Endpoint.EndpointId, second.Handle, s.Owner);
+        Assert.Equal(KernelError.ExternalEffectUncontained, result.Error);
+        var records = (global::System.Collections.IDictionary)typeof(CxlFabricManagerAuthority)
+            .GetField("_poolAllocations", global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.GetValue(s.Manager)!;
+        var firstRecord = records[first.Handle]!;
+        var badRecord = records[second.Handle]!;
+        Assert.Equal(original, firstRecord.GetType().GetProperty("Allocation")!.GetValue(firstRecord));
+        var retained = (CxlOwnedPoolAllocation)badRecord.GetType().GetProperty("Allocation")!.GetValue(badRecord)!;
+        Assert.Equal(returned, retained.Assignment);
+        Assert.Equal(false, badRecord.GetType().GetProperty("ReceiptValidated")!.GetValue(badRecord));
+        Assert.Equal(KernelError.ExternalEffectUncontained, s.Manager.ReleasePool(retained).Error);
+        Assert.Equal(0, hook.ReleaseCalls);
+        Assert.True(s.Kernel.Regions.ValidateUse(retained.RegionUse, s.Owner).IsSuccess);
+        Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.Equal(0, hook.ReleaseCalls);
+        Assert.True(s.Kernel.Regions.Validate(second.Handle, s.Owner).IsSuccess);
+        Assert.True(s.Manager.ReleasePool(original).IsSuccess);
+        Assert.Equal(1, hook.ReleaseCalls);
+        Assert.Equal(192, s.Model.QueryPool(new("receipt-pool")).Value!.AvailableCapacityBytes);
+    }
+    [Fact]
+    public async Task ExactPoolReleaseCannotOverlapProviderCallback()
+    {
+        CompletionHook? hook = null;
+        var s = CreateScenario(providerFactory: model => hook = new(model));
+        Assert.True(s.Model.RegisterPool(new("release-pool"), 256).IsSuccess);
+        var buffer = s.Kernel.AllocateBuffer<byte>(s.Handle, 64).Value!;
+        var allocation = s.Manager.AssignPool(new("release-pool"), s.Endpoint.EndpointId, buffer.Handle, s.Owner).Value!;
+        using var entered = new ManualResetEventSlim();
+        using var resume = new ManualResetEventSlim();
+        hook!.AfterRelease = () => { entered.Set(); if (!resume.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException(); };
+        var task = Task.Run(() => s.Manager.ReleasePool(allocation));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+            var overlap = await Task.Run(() => s.Manager.ReleasePool(allocation)).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(KernelError.PlatformBindingDraining, overlap.Error);
+            var close = await Task.Run(() => ((ICxlTeardownParticipant)s.Manager).CloseForProcess(s.Handle, s.Owner)).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(KernelError.PlatformBindingDraining, close.Error);
+            Assert.Equal(1, hook.ReleaseCalls);
+            Assert.True(s.Kernel.Regions.ValidateUse(allocation.RegionUse, s.Owner).IsSuccess);
+        }
+        finally { resume.Set(); }
+        Assert.True((await task.WaitAsync(TimeSpan.FromSeconds(10))).IsSuccess);
+        Assert.True(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.Equal(1, hook.ReleaseCalls);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void PoolReleaseRetryRequiresReturnedClosureBeforeSkippingProvider(bool lostReply)
+    {
+        CompletionHook? hook = null;
+        var s = CreateScenario(providerFactory: model => hook = new(model));
+        Assert.True(s.Model.RegisterPool(new("retry-pool"), 256).IsSuccess);
+        var buffer = s.Kernel.AllocateBuffer<byte>(s.Handle, 64).Value!;
+        var allocation = s.Manager.AssignPool(new("retry-pool"), s.Endpoint.EndpointId, buffer.Handle, s.Owner).Value!;
+        if (lostReply) hook!.AfterRelease = () => throw new IOException("lost release reply");
+        else s.Manager.BeforePoolUseRelease = () => throw new IOException("local cleanup interrupted");
+        Assert.Equal(KernelError.ExternalEffectUncontained, s.Manager.ReleasePool(allocation).Error);
+        Assert.True(s.Kernel.Regions.ValidateUse(allocation.RegionUse, s.Owner).IsSuccess);
+        hook!.AfterRelease = null;
+        s.Manager.BeforePoolUseRelease = null;
+        var retry = s.Manager.ReleasePool(allocation);
+        Assert.Equal(!lostReply, retry.IsSuccess);
+        Assert.Equal(lostReply ? 2 : 1, hook.ReleaseCalls);
+        Assert.Equal(!lostReply, s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        if (lostReply) Assert.True(s.Kernel.Regions.Validate(buffer.Handle, s.Owner).IsSuccess);
+    }
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public async Task PoolAssignmentPendingSpansCallbackAndReceiptTracking(bool throwAfterEffect)
+    {
+        CompletionHook? hook = null;
+        var s = CreateScenario(providerFactory: model => hook = new(model));
+        Assert.True(s.Model.RegisterPool(new("pending-pool"), 256).IsSuccess);
+        var buffer = s.Kernel.AllocateBuffer<byte>(s.Handle, 64).Value!;
+        using var entered = new ManualResetEventSlim();
+        using var resume = new ManualResetEventSlim();
+        hook!.AfterAssign = () =>
+        {
+            entered.Set();
+            if (!resume.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException();
+            if (throwAfterEffect) throw new IOException("receipt lost after assignment");
+        };
+        var task = Task.Run(() => s.Manager.AssignPool(new("pending-pool"), s.Endpoint.EndpointId, buffer.Handle, s.Owner));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+            var overlap = await Task.Run(() => s.Manager.AssignPool(new("pending-pool"), s.Endpoint.EndpointId, buffer.Handle, s.Owner)).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(KernelError.PlatformBindingActive, overlap.Error);
+            var close = await Task.Run(() => ((ICxlTeardownParticipant)s.Manager).CloseForProcess(s.Handle, s.Owner)).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(KernelError.PlatformBindingDraining, close.Error);
+            Assert.Equal(1, hook.AssignCalls);
+            Assert.Equal(0, hook.ReleaseCalls);
+        }
+        finally { resume.Set(); }
+        var result = await task.WaitAsync(TimeSpan.FromSeconds(10));
+        hook.AfterAssign = null;
+        if (throwAfterEffect)
+        {
+            Assert.Equal(KernelError.ExternalEffectUncontained, result.Error);
+            Assert.Equal(KernelError.ExternalEffectUncontained, ((ICxlTeardownParticipant)s.Manager).CloseForProcess(s.Handle, s.Owner).Error);
+            Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+            Assert.Equal(0, hook.ReleaseCalls);
+        }
+        else
+        {
+            Assert.True(result.IsSuccess);
+            Assert.True(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+            Assert.Equal(1, hook.ReleaseCalls);
+        }
+    }
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)]
+    public void NotAcceptedBeginReopensOnlyExactObservedSource(int fault)
+    {
+        CompletionHook? hook = null;
+        var s = CreateScenario(providerFactory: model => hook = new(model));
+        hook!.RejectBegin = true;
+        hook.RejectedQueryFault = fault;
+        var begin = s.Manager.BeginReconfiguration(s.Binding);
+        Assert.Equal(fault == 0 ? KernelError.PlatformUnavailable : KernelError.ExternalEffectUncontained, begin.Error);
+        Assert.Equal(fault == 0 ? CxlFabricResourceState.Bound : CxlFabricResourceState.Faulted,
+            BindingFact(s.Manager, s.Binding.BindingId, "State"));
+        Assert.Null(BindingFact(s.Manager, s.Binding.BindingId, "Ticket"));
+        Assert.Equal(s.Binding, BindingFact(s.Manager, s.Binding.BindingId, "Binding"));
+        hook.RejectedQueryFault = 0;
+        Assert.Equal(fault == 0, s.Manager.ValidateAdmission(s.Binding).IsSuccess);
+        Assert.Equal(0, hook.Calls);
+    }
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)]
+    public void MalformedBeginTicketCannotPermitCompletionOrReopenAdmission(int fault)
+    {
+        CompletionHook? hook = null;
+        var s = CreateScenario(providerFactory: model => hook = new(model));
+        hook!.BeginTransform = ticket => fault switch
+        {
+            0 => ticket with { ReconfigurationId = new(0) },
+            1 => ticket with { PreviousBinding = ticket.PreviousBinding with { EndpointId = new("wrong") } },
+            2 => ticket with { ReplacementGeneration = ticket.PreviousBinding.Generation },
+            _ => ticket with { ReplacementGeneration = new(0) },
+        };
+        var begin = s.Manager.BeginReconfiguration(s.Binding);
+        Assert.Equal(KernelError.ExternalEffectUncontained, begin.Error);
+        Assert.Equal(KernelError.PlatformBindingDraining, s.Manager.ValidateAdmission(s.Binding).Error);
+        Assert.Equal(KernelError.InvalidTransition, s.Manager.CompleteReconfiguration(s.Binding.BindingId).Error);
+        Assert.Equal(0, hook.Calls);
+        Assert.NotNull(BindingFact(s.Manager, s.Binding.BindingId, "Ticket"));
+        Assert.Equal(CxlFabricResourceState.Faulted, BindingFact(s.Manager, s.Binding.BindingId, "State"));
+    }
+
+    [Fact]
+    public void ReturnedCompletionReceiptSurvivesFailedQueryWithoutPublicationPermission()
+    {
+        CompletionHook? hook = null;
+        var s = CreateScenario(providerFactory: model => hook = new(model));
+        Assert.True(s.Manager.BeginReconfiguration(s.Binding).IsSuccess);
+        hook!.AfterQuery = () => throw new IOException("lost observation after returned completion");
+        Assert.Equal(KernelError.ExternalEffectUncontained, s.Manager.CompleteReconfiguration(s.Binding.BindingId).Error);
+        hook.AfterQuery = null;
+        var receipt = s.Model.QueryResource(s.Binding.BindingId).Value!.Binding;
+        Assert.Equal(receipt, BindingFact(s.Manager, s.Binding.BindingId, "LastCompletionReceipt"));
+        Assert.Equal(s.Binding, BindingFact(s.Manager, s.Binding.BindingId, "Binding"));
+        Assert.Equal(KernelError.PlatformBindingDraining, s.Manager.ValidateAdmission(receipt).Error);
+        Assert.Equal(KernelError.InvalidTransition, s.Manager.CompleteReconfiguration(s.Binding.BindingId).Error);
+        Assert.Equal(1, hook.Calls);
+    }
+
+    private static object? BindingFact(CxlFabricManagerAuthority manager, CxlFabricBindingId id, string name)
+    {
+        var records = (global::System.Collections.IDictionary)typeof(CxlFabricManagerAuthority)
+            .GetField("_bindings", global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.GetValue(manager)!;
+        return records[id]!.GetType().GetProperty(name)!.GetValue(records[id]);
+    }
     [Fact]
     public async Task ConcurrentRegisterHasOneOwnerAndDoesNotHoldGateDuringQuery()
     {
@@ -332,15 +855,29 @@ public sealed class CxlFabricManagerAuthorityTests
 
     private sealed class CompletionHook(ICxlFabricManagementProvider inner) : ICxlFabricManagementProvider
     {
+        public PlatformAuthorityStatus? CompletionFailure { get; set; }
+        public Func<PlatformAuthorityResult<CxlFabricResourceSnapshot>, PlatformAuthorityResult<CxlFabricResourceSnapshot>>? QueryTransform { get; set; }
         public Action? BeforeComplete { get; set; }
+        public Action? BeforeBegin { get; set; }
         public Action? AfterComplete { get; set; }
         public Action? AfterQuery { get; set; }
+        public Action? AfterAssign { get; set; }
+        public Action? AfterRelease { get; set; }
+        public Func<CxlPoolAssignment, CxlPoolAssignment>? AssignmentTransform { get; set; }
+        public int AssignCalls { get; private set; }
+        public int ReleaseCalls { get; private set; }
         public bool ReplaceEndpoint { get; set; }
+        public bool RejectBegin { get; set; }
+        public int RejectedQueryFault { get; set; }
+        private bool _beginRejected;
+        public Func<CxlFabricReconfigurationTicket, CxlFabricReconfigurationTicket>? BeginTransform { get; set; }
         public int Calls { get; private set; }
         public PlatformAuthorityResult<CxlFabricBinding> CompleteReconfiguration(CxlFabricReconfigurationTicket ticket)
         {
             Calls++;
             BeforeComplete?.Invoke();
+            if (CompletionFailure is { } failure)
+                return PlatformAuthorityResult<CxlFabricBinding>.Fail(failure, "completion refused");
             var result = inner.CompleteReconfiguration(ticket);
             AfterComplete?.Invoke();
             return ReplaceEndpoint && result.IsSuccess
@@ -350,12 +887,45 @@ public sealed class CxlFabricManagerAuthorityTests
         {
             var result = inner.QueryResource(id);
             AfterQuery?.Invoke();
+            if (QueryTransform is { } transform) return transform(result);
+            if (_beginRejected && RejectedQueryFault != 0)
+                return RejectedQueryFault switch
+                {
+                    1 => PlatformAuthorityResult<CxlFabricResourceSnapshot>.Ok(result.Value! with { Binding = result.Value!.Binding with { Generation = new(result.Value.Binding.Generation.Value + 1) } }),
+                    2 => PlatformAuthorityResult<CxlFabricResourceSnapshot>.Ok(result.Value! with { State = CxlFabricResourceState.Draining }),
+                    3 => PlatformAuthorityResult<CxlFabricResourceSnapshot>.Fail(PlatformAuthorityStatus.Unavailable, "source lost"),
+                    _ => throw new IOException("query failed"),
+                };
             return result;
         }
-        public PlatformAuthorityResult<CxlFabricReconfigurationTicket> BeginReconfiguration(CxlFabricBinding binding) => inner.BeginReconfiguration(binding);
+        public PlatformAuthorityResult<CxlFabricReconfigurationTicket> BeginReconfiguration(CxlFabricBinding binding)
+        {
+            BeforeBegin?.Invoke();
+            if (RejectBegin)
+            {
+                _beginRejected = true;
+                return PlatformAuthorityResult<CxlFabricReconfigurationTicket>.Fail(PlatformAuthorityStatus.NotAccepted, "zero effect rejection");
+            }
+            var result = inner.BeginReconfiguration(binding);
+            return result.IsSuccess && BeginTransform is not null
+                ? PlatformAuthorityResult<CxlFabricReconfigurationTicket>.Ok(BeginTransform(result.Value!)) : result;
+        }
         public PlatformAuthorityResult<CxlFabricPoolSnapshot> QueryPool(CxlFabricPoolId id) => inner.QueryPool(id);
-        public PlatformAuthorityResult<CxlPoolAssignment> AssignPoolCapacity(CxlFabricPoolId pool, CxlEndpointId endpoint, long bytes) => inner.AssignPoolCapacity(pool, endpoint, bytes);
-        public PlatformAuthorityResult ReleasePoolCapacity(CxlPoolAssignment assignment) => inner.ReleasePoolCapacity(assignment);
+        public PlatformAuthorityResult<CxlPoolAssignment> AssignPoolCapacity(CxlFabricPoolId pool, CxlEndpointId endpoint, long bytes)
+        {
+            AssignCalls++;
+            var result = inner.AssignPoolCapacity(pool, endpoint, bytes);
+            AfterAssign?.Invoke();
+            return result.IsSuccess && AssignmentTransform is not null
+                ? PlatformAuthorityResult<CxlPoolAssignment>.Ok(AssignmentTransform(result.Value!)) : result;
+        }
+        public PlatformAuthorityResult ReleasePoolCapacity(CxlPoolAssignment assignment)
+        {
+            ReleaseCalls++;
+            var result = inner.ReleasePoolCapacity(assignment);
+            AfterRelease?.Invoke();
+            return result;
+        }
         public PlatformAuthorityResult<CxlPeerAccessEvidence> QueryPeerAccess(CxlPeerAccessRequest request) => inner.QueryPeerAccess(request);
     }
 

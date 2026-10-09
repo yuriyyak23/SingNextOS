@@ -13,6 +13,18 @@ public sealed partial class RuntimeKernel
         ulong requestSequence,
         object? payload = null)
     {
+        List<BudgetTraceObservation> observations = [];
+        try { return PublishResponseCore(responder, endpoint, requestSequence, payload, observations); }
+        finally { EmitBudgetObservations(observations); }
+    }
+
+    private KernelResult<ResponseEnvelope> PublishResponseCore(
+        ProcessHandle responder,
+        ChannelEndpointHandle endpoint,
+        ulong requestSequence,
+        object? payload,
+        List<BudgetTraceObservation> observations)
+    {
         lock (_platformMemoryUseGate)
         {
         var responderProcess = Processes.Resolve(responder);
@@ -44,7 +56,8 @@ public sealed partial class RuntimeKernel
                 requesterProcess.Value!,
                 endpoint,
                 requestSequence,
-                payload);
+                payload,
+                (source, target, region, admission) => TransferRegionForIpcCore(source, target, region, admission, observations));
         }
         }
     }
@@ -111,7 +124,7 @@ public sealed partial class RuntimeKernel
             // ResponseRegistry.WaitAsync records the exact correlated waiter before its
             // first incomplete await. Holding the same gate used by publish/cancel makes
             // waiter registration and terminal completion a single ordered lifecycle.
-            return Responses.WaitAsync(requester, endpoint, requestSequence);
+            return Responses.WaitAsync(requester, endpoint, requestSequence, _requestResponseCorrelationGate);
         }
     }
 }

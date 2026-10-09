@@ -24,6 +24,7 @@ public sealed partial class ExternalOperationAuthority
     private readonly object _gate = new();
     private readonly RegionAuthority _regions;
     private readonly Dictionary<ExternalOperationId, Record> _operations = [];
+    private readonly Dictionary<ExternalOperationId, Record> _ownedOperations = [];
     private ulong _nextOperationId = 1;
     private ulong _nextBindingId = 1;
 
@@ -37,11 +38,12 @@ public sealed partial class ExternalOperationAuthority
         ExternalEffectPolicy? effectPolicy = null)
     {
         ArgumentNullException.ThrowIfNull(regionUses);
+        var requests = Array.AsReadOnly(regionUses.ToArray());
         lock (_gate)
         {
             if (principal.DomainId.Value == 0 || principal.ProcessGeneration == 0)
                 return KernelResult<OperationPreparation>.Fail(KernelError.WrongRegionOwner, "External operation principal is invalid.");
-            if (regionUses.Count == 0)
+            if (requests.Count == 0)
                 return KernelResult<OperationPreparation>.Fail(KernelError.InvalidRegionState, "External operations require at least one region-use request.");
             if (!Enum.IsDefined(visibilityRequirement) || !Enum.IsDefined(publicationPolicy))
                 return KernelResult<OperationPreparation>.Fail(KernelError.InvalidTransition, "External operation visibility or publication policy is invalid.");
@@ -55,7 +57,6 @@ public sealed partial class ExternalOperationAuthority
             if (_nextOperationId == 0)
                 return KernelResult<OperationPreparation>.Fail(KernelError.CapacityExhausted, "External operation identity space is exhausted.");
 
-            var requests = Array.AsReadOnly(regionUses.ToArray());
             var handle = new ExternalOperationHandle(new ExternalOperationId(_nextOperationId++), new OperationGeneration(1));
             var preparation = new OperationPreparation(handle, principal, requests, visibilityRequirement, publicationPolicy, selectedEffect);
             var record = new Record
@@ -65,6 +66,9 @@ public sealed partial class ExternalOperationAuthority
                 Disposition = ExternalOperationDisposition.Active
             };
             AddTransition(record, ExternalOperationState.Prepared, "Prepared");
+            _ownedOperations.EnsureCapacity(_ownedOperations.Count + 1);
+            _operations.EnsureCapacity(_operations.Count + 1);
+            _ownedOperations.Add(handle.OperationId, record);
             _operations.Add(handle.OperationId, record);
             return KernelResult<OperationPreparation>.Ok(preparation);
         }
@@ -200,6 +204,9 @@ public sealed partial class ExternalOperationAuthority
                 return InvalidTransition<ExternalOperationSnapshot>(record, "Completion does not match the exact active Submitted binding.");
             if (!Enum.IsDefined(completion.Disposition))
                 return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.PlatformFaulted, "Provider completion disposition is invalid.");
+            if (HasProviderLoss(record))
+                return InvalidTransition<ExternalOperationSnapshot>(record,
+                    "A terminal response cannot erase the recorded provider-loss consequence.");
 
             record.Disposition = completion.Disposition switch
             {
@@ -248,11 +255,31 @@ public sealed partial class ExternalOperationAuthority
         OperationDependencySnapshot currentDependencies,
         PublicationPlan plan,
         Action<ExternalPublicationDecisionV1> publicationAction)
+        => Publish(operation, currentDependencies, plan, publicationAction, null);
+
+    internal KernelResult<ExternalOperationSnapshot> Publish(
+        ExternalOperationHandle operation, OperationDependencySnapshot currentDependencies, PublicationPlan plan,
+        Action<ExternalPublicationDecisionV1> publicationAction,
+        Func<Func<KernelResult<ExternalOperationSnapshot>>, KernelResult<ExternalOperationSnapshot>>? sourceCommit,
+        Func<Func<KernelResult<ExternalOperationSnapshot>>, KernelResult<ExternalOperationSnapshot>>? sourceAdmission = null)
     {
         ArgumentNullException.ThrowIfNull(publicationAction);
-        ExternalPublicationDecisionV1 decision;
-        lock (_gate)
+        if (sourceAdmission is not null && plan.Policy == ExternalPublicationPolicy.DirectCoherent)
+            return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.PlatformUnsupported,
+                "The source admission hook requires a staged action contour.");
+        ExternalPublicationDecisionV1 decision = default;
+        KernelResult<ExternalOperationSnapshot>? ownerAdmission = null;
+        Record? admittedOwner = null;
+        ExternalOperationSnapshot? directPublication = null;
+        var admissionScopeOpen = true;
+        var admissionThread = Environment.CurrentManagedThreadId;
+        KernelResult<ExternalOperationSnapshot> AdmitPublication()
         {
+          lock (_gate)
+          {
+            if (!admissionScopeOpen || Environment.CurrentManagedThreadId != admissionThread || ownerAdmission is not null)
+                return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.InvalidTransition,
+                    "The exact publication admission scope is unavailable.");
             var resolved = Resolve(operation);
             if (!resolved.IsSuccess) return KernelResult<ExternalOperationSnapshot>.Fail(resolved.Error, resolved.Message!);
             var record = resolved.Value!;
@@ -278,9 +305,14 @@ public sealed partial class ExternalOperationAuthority
             // Published is bookkeeping for that contour; no fictitious withheld-action gate exists.
             if (record.Preparation.PublicationPolicy == ExternalPublicationPolicy.DirectCoherent)
             {
+                if (sourceCommit is not null)
+                    return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.PlatformUnsupported,
+                        "The source publication commit hook requires a staged action contour.");
                 record.Disposition = ExternalOperationDisposition.Published;
                 Move(record, ExternalOperationState.Published, "DirectPublicationObserved");
-                return KernelResult<ExternalOperationSnapshot>.Ok(Snapshot(record));
+                directPublication = Snapshot(record);
+                ownerAdmission = KernelResult<ExternalOperationSnapshot>.Ok(directPublication);
+                return ownerAdmission.Value;
             }
 
             if (record.Binding is not { } binding || record.NextTransitionSequence == 0)
@@ -290,6 +322,54 @@ public sealed partial class ExternalOperationAuthority
                 currentDependencies, plan.Policy, record.NextTransitionSequence);
             record.PublicationDecision = decision;
             record.PublicationInFlight = true;
+            admittedOwner = record;
+            ownerAdmission = KernelResult<ExternalOperationSnapshot>.Ok(Snapshot(record));
+            return ownerAdmission.Value;
+          }
+        }
+        KernelResult<ExternalOperationSnapshot> admission;
+        try { admission = sourceAdmission is null ? AdmitPublication() : sourceAdmission(AdmitPublication); }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        {
+            admission = KernelResult<ExternalOperationSnapshot>.Fail(KernelError.PlatformDenied,
+                $"Publication source admission failed before action: {exception.Message}");
+        }
+        lock (_gate)
+        {
+            admissionScopeOpen = false;
+            if (directPublication is not null) return KernelResult<ExternalOperationSnapshot>.Ok(directPublication);
+            if (!admission.IsSuccess || ownerAdmission is null)
+            {
+                // No publication action has run. Clear only this exact decision's
+                // interlock; source replies cannot synthesize owner admission.
+                if (admittedOwner is { } record &&
+                    record.PublicationInFlight && record.PublicationDecision == decision)
+                {
+                    record.PublicationInFlight = false;
+                    record.PublicationDecision = null;
+                }
+                return admission.IsSuccess
+                    ? KernelResult<ExternalOperationSnapshot>.Fail(KernelError.InvalidTransition,
+                        "Publication source reply has no owner admission fact.") : admission;
+            }
+            // A source callback can change routing after owner admission. Refuse
+            // before action and balance only the captured original decision.
+            var current = Resolve(operation);
+            var ready = current.IsSuccess && ReferenceEquals(current.Value, admittedOwner) &&
+                admittedOwner!.PublicationInFlight && admittedOwner.PublicationDecision == decision &&
+                admittedOwner.State == ExternalOperationState.Visible &&
+                admittedOwner.Disposition == ExternalOperationDisposition.Completed;
+            var uses = ready ? ValidateUses(admittedOwner!) :
+                KernelResult.Fail(KernelError.StaleGeneration, "Original publication owner changed before action.");
+            if (!uses.IsSuccess)
+            {
+                if (admittedOwner is { } original && original.PublicationInFlight && original.PublicationDecision == decision)
+                {
+                    original.PublicationInFlight = false;
+                    original.PublicationDecision = null;
+                }
+                return KernelResult<ExternalOperationSnapshot>.Fail(uses.Error, uses.Message!);
+            }
         }
 
         try
@@ -300,10 +380,9 @@ public sealed partial class ExternalOperationAuthority
         {
             lock (_gate)
             {
-                var resolved = Resolve(operation);
-                if (!resolved.IsSuccess)
-                    return KernelResult<ExternalOperationSnapshot>.Fail(resolved.Error, resolved.Message!);
-                var record = resolved.Value!;
+                // Possible effect belongs to the captured owner even if its
+                // discovery route disappeared during the action.
+                var record = admittedOwner!;
                 if (!record.PublicationInFlight || record.PublicationDecision != decision)
                     return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.StaleGeneration,
                         "Publication decision changed while provider action was in flight.");
@@ -317,12 +396,32 @@ public sealed partial class ExternalOperationAuthority
             }
         }
 
-        lock (_gate)
+        KernelResult<ExternalOperationSnapshot>? ownerPublication = null;
+        var sourceScopeOpen = true;
+        var sourceThread = Environment.CurrentManagedThreadId;
+        KernelResult<ExternalOperationSnapshot> CommitPublication()
         {
+          lock (_gate)
+          {
+            if (!sourceScopeOpen || Environment.CurrentManagedThreadId != sourceThread)
+                return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.InvalidTransition,
+                    "The exact publication source commit scope has ended.");
             var resolved = Resolve(operation);
             if (!resolved.IsSuccess)
                 return KernelResult<ExternalOperationSnapshot>.Fail(resolved.Error, resolved.Message!);
             var record = resolved.Value!;
+            if (record.PublicationInFlight && record.PublicationDecision == decision && HasProviderLoss(record))
+            {
+                // Loss may arrive while the action is outside the owner lock. Its
+                // possible effect cannot be forgotten or committed as Published.
+                record.PublicationInFlight = false;
+                record.PublicationEffectAmbiguous = true;
+                record.Disposition = ExternalOperationDisposition.Faulted;
+                record.EffectBoundary = ExternalEffectBoundaryState.PossiblyExternallyVisible;
+                AddTransition(record, record.State, "PublicationEffectAmbiguous");
+                return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.ExternalEffectUncontained,
+                    "Provider loss crossed the publication action; exact effect closure remains required.");
+            }
             if (!record.PublicationInFlight || record.PublicationDecision != decision ||
                 record.State != ExternalOperationState.Visible || record.Disposition != ExternalOperationDisposition.Completed)
                 return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.StaleGeneration,
@@ -345,8 +444,34 @@ public sealed partial class ExternalOperationAuthority
             if (record.EffectBoundary == ExternalEffectBoundaryState.StagedPending)
                 record.EffectBoundary = ExternalEffectBoundaryState.ExternallyVisible;
             Move(record, ExternalOperationState.Published, "Published");
-            return KernelResult<ExternalOperationSnapshot>.Ok(Snapshot(record));
+            ownerPublication = KernelResult<ExternalOperationSnapshot>.Ok(Snapshot(record));
+            return ownerPublication.Value;
+          }
         }
+        KernelResult<ExternalOperationSnapshot> committed;
+        try { committed = sourceCommit is null ? CommitPublication() : sourceCommit(CommitPublication); }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        {
+            committed = KernelResult<ExternalOperationSnapshot>.Fail(KernelError.ExternalEffectUncontained,
+                $"Publication source commit threw after possible effect: {exception.Message}");
+        }
+        lock (_gate)
+        {
+            sourceScopeOpen = false;
+            // Only this owner's linearized transition is a publication fact. A hook
+            // reply cannot manufacture success or undo an already committed fact.
+            if (ownerPublication is { } published) return published;
+            if (admittedOwner is { } record && record.PublicationInFlight && record.PublicationDecision == decision)
+            {
+                record.PublicationInFlight = false;
+                record.PublicationEffectAmbiguous = true;
+                record.Disposition = ExternalOperationDisposition.Faulted;
+                record.EffectBoundary = ExternalEffectBoundaryState.PossiblyExternallyVisible;
+                AddTransition(record, record.State, "PublicationEffectAmbiguous");
+            }
+        }
+        return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.ExternalEffectUncontained,
+            $"Publication source refused after possible effect; exact closure remains required: {committed.Message}");
     }
 
     public KernelResult<ExternalOperationSnapshot> Cancel(
@@ -407,11 +532,13 @@ public sealed partial class ExternalOperationAuthority
             var resolved = Resolve(operation);
             if (!resolved.IsSuccess) return KernelResult<ExternalOperationSnapshot>.Fail(resolved.Error, resolved.Message!);
             var record = resolved.Value!;
-            if (record.PublicationInFlight)
-                return InvalidTransition<ExternalOperationSnapshot>(record,
-                    "Provider loss requires reconciliation after the in-flight publication decision returns.");
             if (record.State is not (ExternalOperationState.Submitted or ExternalOperationState.DeviceComplete or ExternalOperationState.Visible))
                 return InvalidTransition<ExternalOperationSnapshot>(record, "Provider loss is relevant only after submission and before publication.");
+            if (HasProviderLoss(record))
+                return record.RegionInvalidationUnproven
+                    ? KernelResult<ExternalOperationSnapshot>.Fail(KernelError.ExternalEffectUncontained,
+                        "Provider loss remains recorded with unproven Region use invalidation.")
+                    : KernelResult<ExternalOperationSnapshot>.Ok(Snapshot(record));
 
             if (record.Preparation.PublicationPolicy == ExternalPublicationPolicy.Staged)
             {
@@ -440,6 +567,10 @@ public sealed partial class ExternalOperationAuthority
             return KernelResult<ExternalOperationSnapshot>.Ok(Snapshot(record));
         }
     }
+
+    // Only the existing owner history, under _gate, decides whether loss was committed.
+    private static bool HasProviderLoss(Record record) =>
+        record.Transitions.Any(transition => transition.Event == "ProviderLost");
 
     public KernelResult<ExternalOperationSnapshot> Release(
         ExternalOperationHandle operation,
@@ -559,7 +690,7 @@ public sealed partial class ExternalOperationAuthority
     internal ExternalOperationSnapshot[] InspectionSnapshot()
     {
         lock (_gate)
-            return _operations.Values
+            return _ownedOperations.Values
                 .Select(Snapshot)
                 .OrderBy(static operation => operation.Operation.OperationId.Value)
                 .ToArray();
@@ -569,8 +700,11 @@ public sealed partial class ExternalOperationAuthority
     {
         lock (_gate)
         {
-            foreach (var record in _operations.Values.Where(record => record.Preparation.Principal == principal && record.State != ExternalOperationState.Released))
+            foreach (var record in _ownedOperations.Values.Where(record => record.Preparation.Principal == principal && record.State != ExternalOperationState.Released))
             {
+                if (record.PublicationInFlight)
+                    return KernelResult.Fail(KernelError.PlatformBindingDraining,
+                        "An exact publication action is still in flight; local lifetime cannot advance before it returns.");
                 if (record.PublicationEffectAmbiguous)
                     return KernelResult.Fail(KernelError.ExternalEffectUncontained,
                         "Ambiguous staged publication requires exact effect closure before teardown.");
@@ -635,11 +769,30 @@ public sealed partial class ExternalOperationAuthority
     {
         if (!_operations.TryGetValue(operation.OperationId, out var record))
             return KernelResult<Record>.Fail(KernelError.ExternalOperationNotFound, "External operation was not found.");
+        if (!_ownedOperations.TryGetValue(operation.OperationId, out var original) || !ReferenceEquals(original, record))
+            return KernelResult<Record>.Fail(KernelError.ExternalOperationNotFound, "External operation route is not the original owner.");
         if (record.Preparation.Operation.Generation != operation.Generation)
             return KernelResult<Record>.Fail(KernelError.StaleGeneration, "External operation generation is stale.");
         if (record.Preparation.Operation != operation)
             return KernelResult<Record>.Fail(KernelError.InvalidMessage, "External operation handle is forged.");
         return KernelResult<Record>.Ok(record);
+    }
+
+    internal object? CaptureOriginalAccountingLifetime(ExternalOperationHandle operation)
+    {
+        lock (_gate)
+        {
+            var resolved = Resolve(operation);
+            return resolved.IsSuccess ? resolved.Value : null;
+        }
+    }
+
+    internal bool HasEndedOriginalAccountingLifetime(object owner, ExternalOperationHandle operation)
+    {
+        lock (_gate)
+            return _ownedOperations.TryGetValue(operation.OperationId, out var original) &&
+                ReferenceEquals(original, owner) && original.Preparation.Operation == operation &&
+                original.State == ExternalOperationState.Released;
     }
 
     private static bool CanRelease(Record record, ReleasePlan plan)

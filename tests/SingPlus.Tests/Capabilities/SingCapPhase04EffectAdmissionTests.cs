@@ -8,6 +8,63 @@ namespace SingPlus.Tests.Capabilities;
 public sealed class SingCapPhase04EffectAdmissionTests
 {
     [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)]
+    public void CopiedPermissionOwnerCannotConsumeOriginalOneShotOrQuota(int boundary)
+    {
+        var clock = new OperationClock();
+        var s = SessionScenario(CapabilityRights.Execute, 1, clock);
+        var records = (global::System.Collections.IDictionary)typeof(CapabilityAuthority)
+            .GetField("_records", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(s.Kernel.CapabilityAuthority)!;
+        var original = records[s.Capability]!;
+        void Replace() => records[s.Capability] = original.GetType()
+            .GetMethod("MemberwiseClone", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(original, null)!;
+        if (boundary == 3)
+        {
+            var other = s.Kernel.CapabilityAuthority.Mint(new(20), new(10), ResourceKind.File,
+                "file:namespace", CapabilityRights.Execute, s.Caller.Generation, 1, null, null, 1, 16).Value!.CapabilityId;
+            records[s.Capability] = records[other];
+        }
+        else if (boundary == 0) Replace();
+        else if (boundary == 1) clock.Next = Replace;
+        else s.Kernel.EffectAdmissionQualificationHook = new AdmissionHook(point =>
+        {
+            if (point == EffectAdmissionQualificationPoint.AfterFinalSessionRevalidation) Replace();
+        });
+        var admitted = s.Kernel.AdmitSessionCapabilityEffect(s.Caller, s.Service, s.Session, s.Capability,
+            ResourceKind.File, "file:namespace", 1, CapabilityOperation.Execute, quotaAmount: 1, oneShot: true);
+        Assert.False(admitted.IsSuccess);
+        Assert.Equal(0, s.Kernel.CapabilityAuthority.ActiveOperationLeaseCount);
+        Assert.Equal(0, s.Kernel.EndpointSessions.ActivePinCount(s.Session));
+        records[s.Capability] = original;
+        Assert.Equal(1UL, s.Kernel.CapabilityAuthority.InspectConstraints(s.Capability)!.Value.SharedRemaining);
+        Assert.Equal(0UL, s.Kernel.CapabilityAuthority.InspectConstraints(s.Capability)!.Value.HandleConsumed);
+        Assert.True(s.Kernel.CapabilityAuthority.Validate(s.Capability, new(10), s.Caller.Generation, CapabilityRights.Execute).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void DomainRevocationRetainsOriginalFactAndCompletedLeaseReleaseAfterRouteLoss(bool absent)
+    {
+        var s = SessionScenario(CapabilityRights.Execute, 1);
+        var admitted = s.Kernel.AdmitSessionCapabilityEffect(s.Caller, s.Service, s.Session, s.Capability,
+            ResourceKind.File, "file:namespace", 1, CapabilityOperation.Execute).Value!;
+        var records = (global::System.Collections.IDictionary)typeof(CapabilityAuthority)
+            .GetField("_records", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(s.Kernel.CapabilityAuthority)!;
+        var original = records[s.Capability]!;
+        var copy = original.GetType().GetMethod("MemberwiseClone", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(original, null)!;
+        if (absent) records.Remove(s.Capability); else records[s.Capability] = copy;
+        s.Kernel.CapabilityAuthority.RevokeAllForDomain(new(10));
+        Assert.Equal(CapabilityRecordState.Revoked, original.GetType().GetProperty("State")!.GetValue(original));
+        Assert.Equal(CapabilityRecordState.Active, copy.GetType().GetProperty("State")!.GetValue(copy));
+        admitted.Dispose();
+        Assert.Equal(0, s.Kernel.CapabilityAuthority.ActiveOperationLeaseCount);
+        Assert.Equal(0, s.Kernel.EndpointSessions.ActivePinCount(s.Session));
+        records[s.Capability] = original;
+        Assert.Equal(KernelError.CapabilityRevoked, s.Kernel.CapabilityAuthority.Validate(s.Capability,
+            new(10), s.Caller.Generation, CapabilityRights.Execute).Error);
+    }
+
+    [Theory]
     [InlineData(false, false)] [InlineData(false, true)]
     [InlineData(true, false)] [InlineData(true, true)]
     public void FinalCommitRejectsProcessStopAfterPreparedSession(bool caller, bool fault)

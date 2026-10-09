@@ -17,9 +17,11 @@ public sealed partial class PlatformAuthorityBridge
     internal KernelResult<PlatformExecutionPolicyRegistration> ConfigureExecutionPolicy(
         PlatformDomainBinding binding,
         PlatformDomainIdentity expectedSubject,
-        PlatformExecutionPolicy policy)
+        PlatformExecutionPolicy policy,
+        Func<Func<KernelResult>, KernelResult> ownerCommit)
     {
-        var bindingValidation = ValidateDomain(binding, expectedSubject);
+        KernelResult bindingValidation;
+        lock (_secureDomainLifecycleGate) bindingValidation = ValidateDomain(binding, expectedSubject);
         if (!bindingValidation.IsSuccess)
         {
             return KernelResult<PlatformExecutionPolicyRegistration>.Fail(
@@ -51,47 +53,113 @@ public sealed partial class PlatformAuthorityBridge
                 "The bound platform provider does not implement the execution-policy contract.");
         }
 
-        var record = _domains[binding.BindingId];
-        if (record.ExecutionPolicy is { } existing)
+        DomainRecord record = null!;
+        PlatformBackendEpoch epoch = default;
+        PlatformExecutionPolicyRegistration? existing = null;
+        PlatformProviderIncarnation source = default;
+        var admitted = ownerCommit(() =>
         {
-            return existing.Policy == policy
-                ? KernelResult<PlatformExecutionPolicyRegistration>.Ok(existing)
-                : KernelResult<PlatformExecutionPolicyRegistration>.Fail(
-                    KernelError.PlatformBindingActive,
-                    "A different immutable execution policy is already registered for this platform-domain binding.");
+            lock (_secureDomainLifecycleGate)
+            {
+                var current = ValidateDomain(binding, expectedSubject);
+                if (!current.IsSuccess) return current;
+                record = _domains[binding.BindingId];
+                epoch = BackendEpoch;
+                if (epoch != record.BackendEpoch || _backendEpochExhausted)
+                    return KernelResult.Fail(KernelError.PlatformFaulted, "Policy admission source changed.");
+                if (record.ExecutionTransitionInFlight)
+                    return KernelResult.Fail(KernelError.PlatformBindingActive, "Execution attachment transition is already pending.");
+                if (record.ExecutionPolicy is { } known)
+                {
+                    existing = known;
+                    if (known.Policy != policy)
+                        return KernelResult.Fail(KernelError.PlatformBindingActive, "A different immutable execution policy is already registered.");
+                }
+                record.ExecutionTransitionInFlight = true;
+                return KernelResult.Ok();
+            }
+        });
+        if (!admitted.IsSuccess) return Failure(admitted.Error, admitted.Message!);
+        var invoked = false;
+        try
+        {
+            source = CurrentProviderIncarnation();
+            var sourceAdmission = ownerCommit(CheckCurrent);
+            if (!sourceAdmission.IsSuccess) return Failure(sourceAdmission.Error, sourceAdmission.Message!);
+            if (existing is { } repeat) return KernelResult<PlatformExecutionPolicyRegistration>.Ok(repeat);
+            source = CurrentProviderIncarnation(); // Callback outside owner locks.
+            var beforeEffect = ownerCommit(CheckCurrent);
+            if (!beforeEffect.IsSuccess) return Failure(beforeEffect.Error, beforeEffect.Message!);
+            invoked = true;
+            var result = policyProvider.ConfigureExecutionPolicy(record.ProviderLease, policy);
+            if (!result.IsSuccess)
+            {
+                source = CurrentProviderIncarnation();
+                var current = ownerCommit(CheckCurrent);
+                if (!current.IsSuccess || RequiresDomainQuarantine(result.Status)) Pin();
+                return current.IsSuccess ? FromProviderFailure<PlatformExecutionPolicyRegistration>(result.Status, result.Message) :
+                    Failure(current.Error, current.Message!);
+            }
+            var receipt = PlatformExecutionPolicyContract.ValidateResult(record.ProviderLease, policy, result.Value!);
+            if (!receipt.IsSuccess)
+            {
+                Pin();
+                return Failure(KernelError.PlatformFaulted, receipt.Message ?? "Malformed policy acceptance.");
+            }
+            var registration = new PlatformExecutionPolicyRegistration(binding, policy, feature);
+            // Retain exact acceptance before a fallible source observation. A quarantined
+            // domain cannot expose it as usable policy or repeat the provider effect.
+            lock (_secureDomainLifecycleGate)
+            {
+                record.ExecutionPolicy = registration;
+                if (CurrentOriginalRootOwnerLocked(record) is { } current)
+                    current.ExecutionPolicy = registration;
+            }
+            source = CurrentProviderIncarnation();
+            var published = ownerCommit(CheckCurrent);
+            if (!published.IsSuccess)
+            {
+                Pin();
+                return Failure(published.Error, published.Message!);
+            }
+            return KernelResult<PlatformExecutionPolicyRegistration>.Ok(registration);
+        }
+        catch (Exception exception) when (exception is not StackOverflowException)
+        {
+            if (invoked) Pin();
+            return Failure(KernelError.PlatformFaulted, $"Policy source/provider outcome unavailable: {exception.Message}");
+        }
+        finally
+        {
+            lock (_secureDomainLifecycleGate)
+            {
+                record.ExecutionTransitionInFlight = false;
+                if (CurrentOriginalRootOwnerLocked(record) is { } current)
+                    current.ExecutionTransitionInFlight = false;
+            }
         }
 
-        var providerResult = policyProvider.ConfigureExecutionPolicy(
-            record.ProviderLease,
-            policy);
-        if (!providerResult.IsSuccess)
+        KernelResult CheckCurrent()
         {
-            if (RequiresDomainQuarantine(providerResult.Status))
+            lock (_secureDomainLifecycleGate)
+            {
+                if (!_domains.TryGetValue(binding.BindingId, out var current) || !ReferenceEquals(current, record) ||
+                    current.Binding != binding || BackendEpoch != epoch || _backendEpochExhausted ||
+                    source.Value == 0 || source != record.ProviderIncarnation || !record.ExecutionTransitionInFlight)
+                    return KernelResult.Fail(KernelError.PlatformFaulted, "Exact policy source/domain continuity changed.");
+                return ValidateDomain(binding, expectedSubject);
+            }
+        }
+        void Pin()
+        {
+            lock (_secureDomainLifecycleGate)
+            {
                 QuarantineDomain(record);
-
-            return FromProviderFailure<PlatformExecutionPolicyRegistration>(
-                providerResult.Status,
-                providerResult.Message);
+                if (CurrentOriginalRootOwnerLocked(record) is { } current)
+                    QuarantineDomain(current);
+            }
         }
-
-        var resultValidation = PlatformExecutionPolicyContract.ValidateResult(
-            record.ProviderLease,
-            policy,
-            providerResult.Value!);
-        if (!resultValidation.IsSuccess)
-        {
-            QuarantineDomain(record);
-            return KernelResult<PlatformExecutionPolicyRegistration>.Fail(
-                KernelError.PlatformFaulted,
-                resultValidation.Message ??
-                "The platform provider returned malformed execution-policy evidence.");
-        }
-
-        var registration = new PlatformExecutionPolicyRegistration(
-            binding,
-            policy,
-            feature);
-        record.ExecutionPolicy = registration;
-        return KernelResult<PlatformExecutionPolicyRegistration>.Ok(registration);
+        static KernelResult<PlatformExecutionPolicyRegistration> Failure(KernelError error, string message) =>
+            KernelResult<PlatformExecutionPolicyRegistration>.Fail(error, message);
     }
 }

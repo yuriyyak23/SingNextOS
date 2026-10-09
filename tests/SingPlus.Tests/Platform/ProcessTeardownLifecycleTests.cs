@@ -313,6 +313,34 @@ public sealed class ProcessTeardownLifecycleTests
     }
 
     [Fact]
+    public async Task PublishedResponseConsumptionUsesOwnerGateAcrossChannelTeardown()
+    {
+        var kernel = new RuntimeKernel();
+        var (_, requester) = TestFixtures.Create(kernel, 523, 541);
+        var (_, responder) = TestFixtures.Create(kernel, 524, 551);
+        var endpoints = CreateResponseChannel(kernel, requester, responder);
+        var transport = new RuntimeSipClientTransport(kernel, requester, responder, endpoints.Left);
+        var pending = transport.InvokeAsync(1).AsTask();
+        var request = kernel.Receive(responder, endpoints.Right);
+        Assert.True(request.IsSuccess, request.Message);
+        var gate = typeof(RuntimeKernel).GetField("_requestResponseCorrelationGate",
+            global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.GetValue(kernel)!;
+
+        lock (gate)
+        {
+            Assert.True(kernel.PublishResponse(responder, endpoints.Right, request.Value!.Sequence, 78).IsSuccess);
+            Assert.False(pending.Wait(TimeSpan.FromMilliseconds(200)),
+                "The waiter must not consume its completion outside the existing owner gate.");
+            Assert.True(kernel.TerminateProcess(responder).IsSuccess);
+            Assert.False(kernel.Channels.GetEndpoint(endpoints.Left).IsSuccess);
+        }
+
+        var response = await pending.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(ResponsePublicationStatus.Published, response.Status);
+        Assert.Equal(78, Assert.IsType<int>(response.Payload));
+    }
+
+    [Fact]
     [Trait("Category", "Runtime")]
     public void ProcessExitClosesExactChannelsButPreservesSharedDomainRegionsUntilFinalMember()
     {

@@ -35,6 +35,7 @@ public sealed class RegionAuthority
         public required MutationEpoch MutationEpoch { get; init; }
         public required RegionUseState State { get; set; }
         public ExternalOperationHandle? ReleaseOwnerOperation { get; init; }
+        public BorrowLeaseHandle? OriginalBorrowLease { get; init; }
     }
 
     private sealed class RegionRecord
@@ -88,7 +89,7 @@ public sealed class RegionAuthority
     internal KernelResult<RegionDamageDescriptorV1> QuarantineSubrange(
         RegionHandle handle,
         RegionOwner owner,
-        ProviderHealthEvidenceV1 evidence)
+        ProviderHealthEvidenceV1 evidence, RegionBackingLeaseHandle? requiredBacking = null)
     {
         FailureConsequenceV1 consequence;
         try { consequence = FailureConsequencePolicyV1.Project(evidence); }
@@ -107,6 +108,11 @@ public sealed class RegionAuthority
             var validation = ValidateCore(record, handle, owner, RegionState.Owned);
             if (!validation.IsSuccess)
                 return KernelResult<RegionDamageDescriptorV1>.Fail(validation.Error, validation.Message!);
+            if (requiredBacking is { } exact &&
+                (record.BackingLease is not { } backing || backing.Handle != exact ||
+                 backing.Region != handle || backing.Owner != owner || record.BackingClosureStarted))
+                return KernelResult<RegionDamageDescriptorV1>.Fail(KernelError.StaleGeneration,
+                    "Exact live backing is required at health consequence commit.");
             if (!IsValidRange(record, range))
                 return KernelResult<RegionDamageDescriptorV1>.Fail(KernelError.InvalidRegionState,
                     "Provider-health affected range is outside the exact Region bounds.");
@@ -526,6 +532,39 @@ public sealed class RegionAuthority
         lock (record.Gate) return ValidateCore(record, handle, owner, requiredState);
     }
 
+    // Exact overlay lifetime admission, not a byte-access grant or provider closure fact.
+    internal KernelResult<Func<Func<KernelResult>, KernelResult>> PrepareSecureGuestAdmission(
+        RegionHandle handle, RegionOwner owner, RegionUseRange range, IReadOnlyList<RegionBackingLeaseHandle> admittedBackings)
+    {
+        if (!_regions.TryGetValue(handle.RegionId, out var record))
+            return KernelResult<Func<Func<KernelResult>, KernelResult>>.Fail(KernelError.RegionNotFound, "Secure guest Region was not found.");
+        lock (record.Gate)
+        {
+            var backing = record.BackingLease;
+            KernelResult Commit(Func<KernelResult> commit)
+            {
+                lock (record.Gate)
+                {
+                    var valid = ValidateCore(record, handle, owner, RegionState.Owned);
+                    if (!valid.IsSuccess) return KernelResult.Fail(valid.Error, valid.Message!);
+                    if (record.BackingLease != backing || record.BackingClosureStarted || record.PendingBackingCreations != 0 || !record.PlatformMappingReserved)
+                        return KernelResult.Fail(KernelError.PlatformBindingDraining, "Exact secure guest Region backing/mapping stopped or changed.");
+                    if (backing is { } lease && (lease.Region != handle || lease.Owner != owner ||
+                        !admittedBackings.Contains(lease.Handle)))
+                        return KernelResult.Fail(KernelError.PlatformDenied, "Secure guest backing has no exact admitted existing owner.");
+                    if (!IsValidRange(record, range))
+                        return KernelResult.Fail(KernelError.InvalidRegionState, "Secure guest range is outside the exact Region.");
+                    if (record.Damage.Values.Any(damage => damage.State == RegionDamageStateV1.Quarantined && RangesOverlap(damage.Range, range)))
+                        return KernelResult.Fail(KernelError.Quarantined, "Secure guest range intersects an authoritative Region consequence.");
+                    return commit(); // Kernel-private pure owner mutation only.
+                }
+            }
+            var initial = Commit(KernelResult.Ok);
+            return initial.IsSuccess ? KernelResult<Func<Func<KernelResult>, KernelResult>>.Ok(Commit)
+                : KernelResult<Func<Func<KernelResult>, KernelResult>>.Fail(initial.Error, initial.Message!);
+        }
+    }
+
     private static KernelResult<RegionDescriptor> ValidateCore(RegionRecord record, RegionHandle handle, RegionOwner owner, RegionState requiredState)
     {
         if (record.Generation != handle.Generation) return KernelResult<RegionDescriptor>.Fail(KernelError.StaleGeneration, "Region generation is stale.");
@@ -643,6 +682,70 @@ public sealed class RegionAuthority
         }
     }
 
+    // Existing owner gate only, never a permission or closure receipt. The final
+    // mutation revalidates the exact lease/lifetime after the caller acquires it.
+    internal int CountExternalBorrowReservationsForDomain(DomainId domain)
+    {
+        var count = 0;
+        foreach (var record in _regions.Values)
+            lock (record.Gate)
+                if (record.ExternalBorrowReadGrantReserved &&
+                    (record.Owner.DomainId == domain || record.Borrower?.DomainId == domain))
+                    count++;
+        return count; // Existing reservation truth, not provider closure evidence.
+    }
+
+    internal KernelResult<object> GetExternalBorrowCompletionGate(BorrowLeaseAuthoritySnapshot expected)
+    {
+        if (!_regions.TryGetValue(expected.Handle.Region.RegionId, out var record))
+            return KernelResult<object>.Fail(KernelError.RegionNotFound, "Region was not found.");
+        lock (record.Gate)
+        {
+            var valid = ValidateBorrowLease(expected.Handle, expected.Owner, expected.Borrower);
+            if (!valid.IsSuccess) return KernelResult<object>.Fail(valid.Error, valid.Message!);
+            if (!ReferenceEquals(valid.Value!.Lifetime, expected.Lifetime) || !record.ExternalBorrowReadGrantReserved)
+                return KernelResult<object>.Fail(KernelError.StaleGeneration, "Exact external borrow reservation/lifetime changed.");
+            return KernelResult<object>.Ok(record.Gate);
+        }
+    }
+
+    internal KernelResult ValidateExternalBorrowReaderPublicationLocked(BorrowLeaseAuthoritySnapshot expected)
+    {
+        if (!_regions.TryGetValue(expected.Handle.Region.RegionId, out var record))
+            return KernelResult.Fail(KernelError.RegionNotFound, "Region was not found.");
+        if (!Monitor.IsEntered(record.Gate))
+            return KernelResult.Fail(KernelError.PlatformFaulted, "Borrow reader publication requires its existing Region gate.");
+        var valid = ValidateBorrowLease(expected.Handle, expected.Owner, expected.Borrower);
+        if (!valid.IsSuccess) return KernelResult.Fail(valid.Error, valid.Message!);
+        if (!ReferenceEquals(valid.Value!.Lifetime, expected.Lifetime) || !record.ExternalBorrowReadGrantReserved)
+            return KernelResult.Fail(KernelError.StaleGeneration, "Borrow reader lost its exact lifetime/reservation.");
+        if (record.Damage.Count != 0)
+            return KernelResult.Fail(KernelError.Quarantined, "Borrow reader region has unresolved damage.");
+        return record.BackingClosureStarted
+            ? KernelResult.Fail(KernelError.PlatformBindingDraining, "Backing closure forbids reader publication.")
+            : KernelResult.Ok();
+    }
+
+    internal KernelResult CompleteExternalBorrowReadGrantLocked(BorrowLeaseAuthoritySnapshot expected)
+    {
+        if (!_regions.TryGetValue(expected.Handle.Region.RegionId, out var record))
+            return KernelResult.Fail(KernelError.RegionNotFound, "Region was not found.");
+        if (!Monitor.IsEntered(record.Gate))
+            return KernelResult.Fail(KernelError.PlatformFaulted, "External borrow completion requires its existing Region owner gate.");
+        var valid = ValidateBorrowLease(expected.Handle, expected.Owner, expected.Borrower);
+        if (!valid.IsSuccess) return KernelResult.Fail(valid.Error, valid.Message!);
+        if (!ReferenceEquals(valid.Value!.Lifetime, expected.Lifetime) || !record.ExternalBorrowReadGrantReserved)
+            return KernelResult.Fail(KernelError.StaleGeneration, "Exact external borrow reservation/lifetime changed.");
+        var mutation = AdvanceMutation(record);
+        if (!mutation.IsSuccess) return mutation;
+        record.ExternalBorrowReadGrantReserved = false;
+        record.BorrowLifetime!.InvalidateForRuntime();
+        record.BorrowLifetime = null;
+        record.Borrower = null;
+        record.State = RegionState.Owned;
+        return KernelResult.Ok();
+    }
+
     public KernelResult ReturnLoan(BorrowLeaseHandle lease, RegionOwner borrower)
     {
         if (!_regions.TryGetValue(lease.Region.RegionId, out var record)) return KernelResult.Fail(KernelError.RegionNotFound, "Region was not found.");
@@ -724,6 +827,37 @@ public sealed class RegionAuthority
                 ? KernelResult.Fail(KernelError.StaleGeneration, "DMA Region mutation epoch changed before provider submission.")
                 : KernelResult.Ok();
         }
+    }
+
+    // Existing gate only; lookup is not mapping permission or closure evidence.
+    internal KernelResult<object> GetPlatformMappingCompletionGate(RegionHandle handle, RegionOwner owner)
+    {
+        if (!_regions.TryGetValue(handle.RegionId, out var record))
+            return KernelResult<object>.Fail(KernelError.RegionNotFound, "Region was not found.");
+        lock (record.Gate)
+        {
+            var valid = ValidateCore(record, handle, owner, RegionState.Owned);
+            return valid.IsSuccess ? KernelResult<object>.Ok(record.Gate)
+                : KernelResult<object>.Fail(valid.Error, valid.Message!);
+        }
+    }
+
+    internal KernelResult ValidatePlatformMappingRegionUsabilityLocked(RegionHandle handle, RegionOwner owner)
+    {
+        if (!_regions.TryGetValue(handle.RegionId, out var record))
+            return KernelResult.Fail(KernelError.RegionNotFound, "Region was not found.");
+        if (!Monitor.IsEntered(record.Gate))
+            return KernelResult.Fail(KernelError.PlatformFaulted, "Visibility publication requires its existing Region owner gate.");
+        return ValidatePlatformMappingRegionUsability(handle, owner);
+    }
+
+    internal KernelResult ReleasePlatformMappingReservationLocked(RegionHandle handle, RegionOwner owner)
+    {
+        if (!_regions.TryGetValue(handle.RegionId, out var record))
+            return KernelResult.Fail(KernelError.RegionNotFound, "Region was not found.");
+        if (!Monitor.IsEntered(record.Gate))
+            return KernelResult.Fail(KernelError.PlatformFaulted, "Mapping release requires its existing Region owner gate.");
+        return ReleasePlatformMappingReservation(handle, owner);
     }
 
     internal KernelResult ReleasePlatformMappingReservation(RegionHandle handle, RegionOwner owner)
@@ -975,7 +1109,22 @@ public sealed class RegionAuthority
                 "A read-only borrow lease cannot authorize a writable region use.");
         }
 
-        return AcquireUseCore(record, borrower, mode, range);
+        return AcquireUseCore(record, borrower, mode, range, originalBorrowLease: lease);
+        }
+    }
+
+    internal KernelResult<RegionUseDescriptor> ValidateBorrowUsePublication(
+        BorrowLeaseHandle lease, RegionOwner owner, RegionOwner borrower, RegionUseHandle use)
+    {
+        if (!_regions.TryGetValue(lease.Region.RegionId, out var record))
+            return KernelResult<RegionUseDescriptor>.Fail(KernelError.RegionNotFound, "Region was not found.");
+        lock (record.Gate)
+        {
+            var valid = ValidateBorrowLease(lease, owner, borrower);
+            if (!valid.IsSuccess) return KernelResult<RegionUseDescriptor>.Fail(valid.Error, valid.Message!);
+            if (!record.Uses.TryGetValue(use.UseId, out var exact) || exact.Handle != use || exact.Region != lease.Region || exact.OriginalBorrowLease != lease)
+                return KernelResult<RegionUseDescriptor>.Fail(KernelError.StaleGeneration, "Borrow publication lost its exact original Region use.");
+            return ValidateUse(use, borrower);
         }
     }
 
@@ -1014,6 +1163,21 @@ public sealed class RegionAuthority
         }
     }
 
+    internal KernelResult CommitPoolUsePublication(RegionUseHandle handle, RegionOwner principal, Func<KernelResult> commit)
+    {
+        var lookup = FindUse(handle);
+        if (!lookup.IsSuccess) return KernelResult.Fail(lookup.Error, lookup.Message!);
+        var (region, use) = lookup.Value!;
+        lock (region.Gate)
+        {
+            var active = ValidateUse(handle, principal);
+            if (!active.IsSuccess) return KernelResult.Fail(active.Error, active.Message!);
+            if (region.Owner != principal || region.State != RegionState.Owned ||
+                use.Mode != RegionUseMode.DevicePrivate || use.MutationEpoch != region.MutationEpoch)
+                return KernelResult.Fail(KernelError.StaleGeneration, "Pool publication lost its exact owned Region-use lifetime.");
+            return commit(); // caller supplies only a pure local manager mutation
+        }
+    }
     public KernelResult ReleaseUse(RegionUseHandle handle, RegionOwner principal)
     {
         var lookup = FindUse(handle);
@@ -1152,28 +1316,74 @@ public sealed class RegionAuthority
     public IReadOnlyList<RegionUseDescriptor> SnapshotUses() =>
         OrderedRecords().SelectMany(SnapshotUses).OrderBy(static use => use.Handle.UseId.Value).ToArray();
 
-    internal IReadOnlyList<RegionHandle> ReturnAllLoansForBorrowerDomain(DomainId borrowerDomainId)
+    internal KernelResult<IReadOnlyList<RegionHandle>> ReturnAllLoansForBorrowerDomain(DomainId borrowerDomainId)
     {
+        var records = OrderedRecords();
         var returned = new List<RegionHandle>();
-        foreach (var record in OrderedRecords())
+        var locked = 0;
+        try
         {
-            lock (record.Gate)
+            foreach (var record in records)
             {
-            if (record.State != RegionState.Loaned || record.Borrower?.DomainId != borrowerDomainId) continue;
-            if (record.ExternalBorrowReadGrantReserved)
-                throw new InvalidOperationException("External borrow read grants must reach verified closure before borrower-domain loan reclaim.");
-            returned.Add(new RegionHandle(record.Id, record.Generation));
-            AdvanceMutationOrThrow(record);
-            record.BorrowLifetime?.InvalidateForRuntime();
-            record.BorrowLifetime = null;
-            record.Borrower = null;
-            record.State = RegionState.Owned;
+                Monitor.Enter(record.Gate);
+                locked++;
             }
+            var targets = records.Where(record => record.State == RegionState.Loaned &&
+                record.Borrower?.DomainId == borrowerDomainId).ToArray();
+            // Refuse the whole local batch before invalidating any lifetime/use.
+            foreach (var record in targets)
+            {
+                if (record.ExternalBorrowReadGrantReserved)
+                    return KernelResult<IReadOnlyList<RegionHandle>>.Fail(KernelError.PlatformBindingDraining,
+                        "External borrow read grants must reach verified closure before borrower-domain loan reclaim.");
+                if (record.MutationEpoch.Value == ulong.MaxValue)
+                    return KernelResult<IReadOnlyList<RegionHandle>>.Fail(KernelError.CapacityExhausted,
+                        "Region mutation epoch is exhausted before borrower-domain loan return.");
+            }
+            foreach (var record in targets)
+            {
+                var mutation = AdvanceMutation(record);
+                if (!mutation.IsSuccess)
+                    return KernelResult<IReadOnlyList<RegionHandle>>.Fail(mutation.Error, mutation.Message!);
+                returned.Add(new RegionHandle(record.Id, record.Generation));
+                record.BorrowLifetime?.InvalidateForRuntime();
+                record.BorrowLifetime = null;
+                record.Borrower = null;
+                record.State = RegionState.Owned;
+            }
+            return KernelResult<IReadOnlyList<RegionHandle>>.Ok(returned);
         }
-        return returned.OrderBy(static h => h.RegionId.Value).ToArray();
+        finally
+        {
+            for (var index = locked - 1; index >= 0; index--) Monitor.Exit(records[index].Gate);
+        }
+    }
+
+    // Actual final-domain-exit consumer only. This closes local borrow uses,
+    // never provider grants or operation-owned possible effects/backing.
+    internal void ReleaseLocalBorrowUsesForExitedDomain(DomainId domainId)
+    {
+        foreach (var record in OrderedRecords())
+        lock (record.Gate)
+        {
+            if (record.ExternalBorrowReadGrantReserved) continue;
+            foreach (var use in record.Uses.Values)
+                if (use.Principal.DomainId == domainId && use.State != RegionUseState.Released &&
+                    use.ReleaseOwnerOperation is null && !IsWriteMode(use.Mode) &&
+                    use.OriginalBorrowLease is { } original && original.Region == use.Region &&
+                    original.Region.RegionId == record.Id)
+                    use.State = RegionUseState.Released;
+        }
     }
 
     internal IReadOnlyList<RegionHandle> ReclaimAllForDomain(DomainId domainId)
+    {
+        var reclaimed = TryReclaimAllForDomain(domainId);
+        if (!reclaimed.IsSuccess) throw new InvalidOperationException(reclaimed.Message);
+        return reclaimed.Value!;
+    }
+
+    internal KernelResult<IReadOnlyList<RegionHandle>> TryReclaimAllForDomain(DomainId domainId)
     {
         var records = OrderedRecords();
         var reclaimed = new List<RegionHandle>();
@@ -1191,16 +1401,16 @@ public sealed class RegionAuthority
             // must not leave earlier backing reclaimed during a failed teardown.
             foreach (var record in targets)
             {
-                if (record.PlatformMappingReserved) throw new InvalidOperationException("Platform-mapped regions must be revoked before domain reclaim.");
-                if (record.ExternalBorrowReadGrantReserved) throw new InvalidOperationException("External borrow read grants must be revoked before domain reclaim.");
-                if (record.BackingLease is not null) throw new InvalidOperationException("External backing leases must reach verified closure before domain reclaim.");
-                if (record.Damage.Count != 0) throw new InvalidOperationException("Damaged Region subranges must remain quarantined until authoritative replacement.");
+                if (record.PlatformMappingReserved) return KernelResult<IReadOnlyList<RegionHandle>>.Fail(KernelError.PlatformBindingDraining, "Platform-mapped regions must be revoked before domain reclaim.");
+                if (record.ExternalBorrowReadGrantReserved) return KernelResult<IReadOnlyList<RegionHandle>>.Fail(KernelError.PlatformBindingDraining, "External borrow read grants must be revoked before domain reclaim.");
+                if (record.BackingLease is not null) return KernelResult<IReadOnlyList<RegionHandle>>.Fail(KernelError.PlatformBindingDraining, "External backing leases must reach verified closure before domain reclaim.");
+                if (record.Damage.Count != 0) return KernelResult<IReadOnlyList<RegionHandle>>.Fail(KernelError.Quarantined, "Damaged Region subranges must remain quarantined until authoritative replacement.");
                 if (record.Uses.Values.Any(use => use.State != RegionUseState.Released &&
                         (use.State == RegionUseState.Invalidated || use.ReleaseOwnerOperation is not null)))
-                    throw new InvalidOperationException(
+                    return KernelResult<IReadOnlyList<RegionHandle>>.Fail(KernelError.PlatformBindingDraining,
                         "Invalidated or external-operation-bound Region uses must reach owner release before domain reclaim.");
                 if (record.MutationEpoch.Value == ulong.MaxValue)
-                    throw new InvalidOperationException("Region mutation epoch is exhausted before domain reclaim.");
+                    return KernelResult<IReadOnlyList<RegionHandle>>.Fail(KernelError.CapacityExhausted, "Region mutation epoch is exhausted before domain reclaim.");
             }
             foreach (var record in targets)
             {
@@ -1219,9 +1429,35 @@ public sealed class RegionAuthority
             for (var index = locked - 1; index >= 0; index--)
                 Monitor.Exit(records[index].Gate);
         }
-        return reclaimed.OrderBy(static h => h.RegionId.Value).ToArray();
+        return KernelResult<IReadOnlyList<RegionHandle>>.Ok(reclaimed.OrderBy(static h => h.RegionId.Value).ToArray());
     }
 
+    // Accounting routing only: successful local Transfer ends the old ownership
+    // generation. This does not prove closure of backing, mappings or current uses.
+    internal bool HasEndedAccountingLifetime(RegionHandle handle)
+    {
+        if (handle.Generation.Value == 0 || !_regions.TryGetValue(handle.RegionId, out var record)) return false;
+        lock (record.Gate)
+            return record.Generation.Value > handle.Generation.Value ||
+                (record.Generation == handle.Generation && record.State == RegionState.Released);
+    }
+
+    internal object? CaptureOriginalAccountingOwner(RegionHandle handle)
+    {
+        if (!_regions.TryGetValue(handle.RegionId, out var record)) return null;
+        lock (record.Gate)
+            return record.Generation == handle.Generation ? record : null;
+    }
+
+    internal KernelResult<bool> HasEndedOriginalAccountingLifetime(object original, RegionHandle handle)
+    {
+        if (original is not RegionRecord record || !_regions.TryGetValue(handle.RegionId, out var routed) ||
+            !ReferenceEquals(routed, record))
+            return KernelResult<bool>.Fail(KernelError.PlatformFaulted, "Original Region accounting owner is absent or foreign.");
+        lock (record.Gate)
+            return KernelResult<bool>.Ok(record.Generation.Value > handle.Generation.Value ||
+                record.Generation == handle.Generation && record.State == RegionState.Released);
+    }
     public IReadOnlyList<RegionDescriptor> Snapshot() => OrderedRecords().Select(Snapshot).ToArray();
 
     internal RegionAuthorityInspectionRecord[] InspectionSnapshot() =>
@@ -1262,7 +1498,8 @@ public sealed class RegionAuthority
         RegionUseMode mode,
         RegionUseRange range,
         bool allowPlatformMappingReservation = false,
-        ExternalOperationHandle? releaseOwnerOperation = null)
+        ExternalOperationHandle? releaseOwnerOperation = null,
+        BorrowLeaseHandle? originalBorrowLease = null)
     {
         var requestValidation = ValidateUseRequest(record, mode, range, allowPlatformMappingReservation);
         if (!requestValidation.IsSuccess)
@@ -1287,7 +1524,8 @@ public sealed class RegionAuthority
             Mode = mode,
             MutationEpoch = record.MutationEpoch,
             State = RegionUseState.Active,
-            ReleaseOwnerOperation = releaseOwnerOperation
+            ReleaseOwnerOperation = releaseOwnerOperation,
+            OriginalBorrowLease = originalBorrowLease
         };
         record.Uses.Add(use.Handle.UseId, use);
         if (!_useIndex.TryAdd(use.Handle.UseId, record))

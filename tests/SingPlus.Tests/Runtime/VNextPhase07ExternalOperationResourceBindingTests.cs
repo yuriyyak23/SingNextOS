@@ -6,6 +6,95 @@ namespace SingPlus.Tests.Runtime;
 public sealed class VNextPhase07ExternalOperationResourceBindingTests
 {
     [Fact]
+    public void ProcessStopDuringPublicationCannotReleaseIndependentResourceCharge()
+    {
+        var s = Create();
+        using var admission = Prepare(s, s.Operation).Value!;
+        var binding = s.Kernel.SubmitResourceExternalAdmission(admission, s.Dependencies, KernelResult.Ok).Value!;
+        Assert.True(s.Kernel.RecordExternalOperationCompletion(s.Process,
+            new(binding, ExternalOperationCompletionDisposition.Completed)).IsSuccess);
+        Assert.True(s.Kernel.RecordExternalOperationVisibility(s.Process,
+            new(binding, ExternalVisibilityRequirement.None, true)).IsSuccess);
+        ExternalPublicationDecisionV1 decision = default;
+        var publication = s.Kernel.PublishExternalOperation(s.Process, s.Operation, s.Dependencies,
+            new(ExternalPublicationPolicy.Staged), current =>
+            {
+                decision = current;
+                Assert.False(s.Kernel.TerminateProcess(s.Process).IsSuccess);
+                Assert.Equal(BudgetReservationState.Consuming, s.Kernel.QueryBudget(admission.Lease).Value!.State);
+                Assert.Equal(10UL, Used(s));
+            });
+        Assert.Equal(KernelError.ExternalEffectUncontained, publication.Error);
+        var snapshot = s.Kernel.QueryExternalOperation(s.Process, s.Operation).Value!;
+        Assert.Single(snapshot.Transitions, item => item.Event == "PublicationEffectAmbiguous");
+        Assert.DoesNotContain(snapshot.Transitions, item => item.Event is "Published" or "ProviderLost" or "Released");
+        Assert.False(s.Kernel.ReleaseExternalOperation(s.Process, s.Operation, new(true, false)).IsSuccess);
+        // Closing the modeled publication ambiguity does not settle a quantitative lease.
+        Assert.True(s.Kernel.ReconcileFailedExternalPublication(s.Process, s.Operation, decision, KernelResult.Ok).IsSuccess);
+        Assert.False(s.Kernel.ReleaseExternalOperation(s.Process, s.Operation, new(true, false)).IsSuccess);
+        Assert.Equal(BudgetReservationState.Consuming, s.Kernel.QueryBudget(admission.Lease).Value!.State);
+        Assert.Equal(10UL, Used(s));
+        Assert.False(s.Kernel.TerminateProcess(s.Process).IsSuccess);
+    }
+
+    [Fact]
+    public void ProviderLossInsidePublicationActionQuarantinesBudgetAndPreventsRelease()
+    {
+        var s = Create();
+        using var commit = Prepare(s, s.Operation).Value!;
+        var binding = s.Kernel.SubmitResourceExternalAdmission(commit, s.Dependencies, KernelResult.Ok).Value!;
+        Assert.True(s.Kernel.RecordExternalOperationCompletion(s.Process,
+            new(binding, ExternalOperationCompletionDisposition.Completed)).IsSuccess);
+        Assert.True(s.Kernel.RecordExternalOperationVisibility(s.Process,
+            new(binding, ExternalVisibilityRequirement.None, true)).IsSuccess);
+        var invoked = false;
+        var publication = s.Kernel.PublishExternalOperation(s.Process, s.Operation, s.Dependencies,
+            new(ExternalPublicationPolicy.Staged), () =>
+            {
+                invoked = true;
+                Assert.True(s.Kernel.RecordExternalOperationProviderLoss(s.Process, s.Operation).IsSuccess);
+                Assert.Equal(BudgetReservationState.Quarantined, s.Kernel.QueryBudget(commit.Lease).Value!.State);
+                Assert.Equal(ExternalResourceBindingState.Quarantined, s.Kernel.ExternalOperations.QueryResourceBinding(s.Operation).Value!.State);
+                Assert.False(s.Kernel.ReleaseExternalOperation(s.Process, s.Operation, new(true, true)).IsSuccess);
+            });
+        Assert.True(invoked);
+        Assert.Equal(KernelError.ExternalEffectUncontained, publication.Error);
+        var snapshot = s.Kernel.QueryExternalOperation(s.Process, s.Operation).Value!;
+        Assert.Single(snapshot.Transitions, item => item.Event == "ProviderLost");
+        Assert.Single(snapshot.Transitions, item => item.Event == "ResourceQuarantined");
+        Assert.Single(snapshot.Transitions, item => item.Event == "PublicationEffectAmbiguous");
+        Assert.False(s.Kernel.ReleaseExternalOperation(s.Process, s.Operation, new(true, true)).IsSuccess);
+        Assert.Equal(10UL, Used(s));
+        var trace = V6ExternalOperationTraceProjection.ProjectPublishedPrefix(snapshot, new string('a', 64));
+        Assert.True(SemanticTraceValidatorV1.Validate(trace).IsValid);
+    }
+
+    [Fact]
+    public async Task ConcurrentRepeatedLossPreservesOneFactAndResourceQuarantine()
+    {
+        var s = Create();
+        using var commit = Prepare(s, s.Operation).Value!;
+        Assert.True(s.Kernel.SubmitResourceExternalAdmission(commit, s.Dependencies, KernelResult.Ok).IsSuccess);
+        var losses = await Task.WhenAll(Enumerable.Range(0, 16).Select(_ => Task.Run(() =>
+            s.Kernel.RecordExternalOperationProviderLoss(s.Process, s.Operation))));
+        Assert.All(losses, loss => Assert.True(loss.IsSuccess, loss.Message));
+        var snapshot = s.Kernel.QueryExternalOperation(s.Process, s.Operation).Value!;
+        Assert.Single(snapshot.Transitions, transition => transition.Event == "ProviderLost");
+        Assert.Single(snapshot.Transitions, transition => transition.Event == "ResourceQuarantined");
+        Assert.Equal(ExternalResourceBindingState.Quarantined, s.Kernel.ExternalOperations.QueryResourceBinding(s.Operation).Value!.State);
+        Assert.Equal(BudgetReservationState.Quarantined, s.Kernel.QueryBudget(commit.Lease).Value!.State);
+        Assert.Equal(10UL, Used(s));
+        var calls = 0;
+        s.Kernel.ResourceProviderLossAfterBindingReadQualificationHook = () => calls++;
+        try { Assert.True(s.Kernel.RecordExternalOperationProviderLoss(s.Process, s.Operation).IsSuccess); }
+        finally { s.Kernel.ResourceProviderLossAfterBindingReadQualificationHook = null; }
+        Assert.Equal(1, calls); // Accounting follows the existing loss fact, even after ResourceQuarantined.
+        Assert.Equal(snapshot.Transitions, s.Kernel.QueryExternalOperation(s.Process, s.Operation).Value!.Transitions);
+        Assert.False(s.Kernel.ReleaseExternalOperation(s.Process, s.Operation, new(true, true)).IsSuccess);
+        Assert.Equal(10UL, Used(s));
+    }
+
+    [Fact]
     public void CancelledAdmittedOperationCannotBindNewResourceLease()
     {
         var s = Create();
@@ -199,6 +288,10 @@ public sealed class VNextPhase07ExternalOperationResourceBindingTests
         Assert.Equal(BudgetReservationState.Quarantined,
             setup.Kernel.QueryBudget(commit.Lease).Value!.State);
         Assert.Equal(10UL, Used(setup));
+        Assert.Equal(KernelError.ExternalEffectUncontained,
+            setup.Kernel.RecordExternalOperationProviderLoss(setup.Process, setup.Operation).Error);
+        Assert.Single(setup.Kernel.QueryExternalOperation(setup.Process, setup.Operation).Value!.Transitions,
+            transition => transition.Event == "ProviderLost");
         Assert.Equal(ExternalOperationDisposition.ProviderLost,
             setup.Kernel.CancelExternalOperation(setup.Process, setup.Operation,
                 providerCancellationSupported: true).Value!.Disposition);
@@ -237,6 +330,11 @@ public sealed class VNextPhase07ExternalOperationResourceBindingTests
             setup.Kernel.ExternalOperations.QueryResourceBinding(setup.Operation).Value!.State);
         Assert.Equal(BudgetReservationState.Consuming, setup.Kernel.QueryBudget(commit.Lease).Value!.State);
         Assert.Equal(10UL, Used(setup));
+        Assert.Equal(KernelError.ExternalEffectUncontained,
+            setup.Kernel.RecordExternalOperationProviderLoss(setup.Process, setup.Operation).Error);
+        Assert.Single(setup.Kernel.QueryExternalOperation(setup.Process, setup.Operation).Value!.Transitions,
+            transition => transition.Event == "ProviderLost");
+        Assert.Equal(BudgetReservationState.Consuming, setup.Kernel.QueryBudget(commit.Lease).Value!.State);
         Assert.Equal(KernelError.InvalidTransition,
             setup.Kernel.ReleaseExternalOperation(setup.Process, setup.Operation,
                 new(ProviderResourcesClosed: true, ProviderUnavailable: true)).Error);
@@ -413,8 +511,10 @@ public sealed class VNextPhase07ExternalOperationResourceBindingTests
             setup.Kernel.QueryExternalOperation(setup.Process, setup.Operation).Value!.Disposition);
     }
 
-    [Fact]
-    public void ProviderLossAfterBudgetSettlementAcceptsExactChargeBeforeBindingCompletion()
+    [Theory]
+    [InlineData(0UL)]
+    [InlineData(4UL)]
+    public void ProviderLossAfterBudgetSettlementAcceptsExactChargeBeforeBindingCompletion(ulong consumed)
     {
         var setup = Create();
         using var commit = Prepare(setup, setup.Operation).Value!;
@@ -429,12 +529,12 @@ public sealed class VNextPhase07ExternalOperationResourceBindingTests
             Assert.Equal(ExternalResourceBindingState.Settling,
                 setup.Kernel.ExternalOperations.QueryResourceBinding(setup.Operation).Value!.State);
             Assert.True(setup.Kernel.Budgets.IsExactSettledExternalLease(
-                commit.BudgetOwner, commit.Lease, 4));
+                commit.BudgetOwner, commit.Lease, consumed));
             Assert.False(setup.Kernel.Budgets.IsExactSettledExternalLease(
-                commit.BudgetOwner, commit.Lease, 5));
+                commit.BudgetOwner, commit.Lease, consumed + 1));
             Assert.False(setup.Kernel.Budgets.IsExactSettledExternalLease(
                 commit.BudgetOwner, new BudgetReservationHandle(commit.Lease.ReservationId,
-                    new BudgetGeneration(commit.Lease.Generation.Value + 1)), 4));
+                    new BudgetGeneration(commit.Lease.Generation.Value + 1)), consumed));
             var lost = setup.Kernel.RecordExternalOperationProviderLoss(setup.Process,
                 setup.Operation);
             Assert.True(lost.IsSuccess, lost.Message);
@@ -443,10 +543,10 @@ public sealed class VNextPhase07ExternalOperationResourceBindingTests
         };
 
         var settled = setup.Kernel.SettleResourceExternalOperation(setup.Process,
-            Evidence(binding, consumed: 4, sequence: 1));
+            Evidence(binding, consumed: consumed, sequence: 1));
 
         Assert.True(settled.IsSuccess, settled.Message);
-        Assert.Equal(4UL, Used(setup));
+        Assert.Equal(consumed, Used(setup));
         Assert.Equal(ExternalResourceBindingState.Settled,
             setup.Kernel.ExternalOperations.QueryResourceBinding(setup.Operation).Value!.State);
         Assert.Equal(ExternalOperationDisposition.ProviderLost,
@@ -650,6 +750,29 @@ public sealed class VNextPhase07ExternalOperationResourceBindingTests
         Assert.Equal(1UL, Used(setup));
     }
 
+    [Theory]
+    [InlineData(0UL)]
+    [InlineData(4UL)]
+    public void ExactZeroOrPositiveSettlementRefundsUnusedCapacityAndRejectsConflictingCharge(ulong consumed)
+    {
+        var setup = Create();
+        using var commit = Prepare(setup, setup.Operation).Value!;
+        var binding = setup.Kernel.SubmitResourceExternalAdmission(commit, setup.Dependencies, KernelResult.Ok).Value!;
+        Assert.True(setup.Kernel.RecordExternalOperationCompletion(setup.Process,
+            new(binding, ExternalOperationCompletionDisposition.Completed)).IsSuccess);
+        var evidence = Evidence(binding, consumed, 41);
+        var settled = setup.Kernel.SettleResourceExternalOperation(setup.Process, evidence);
+        Assert.True(settled.IsSuccess, settled.Message);
+        Assert.Equal(BudgetReservationState.Released, settled.Value!.State);
+        Assert.Equal(consumed, Used(setup));
+        if (consumed == 0) Assert.Empty(settled.Value.ChargedAmounts!);
+        else Assert.Equal(new BudgetAmount(ServiceBudgetDimension.ComputeTimeNanoseconds, consumed),
+            Assert.Single(settled.Value.ChargedAmounts!));
+        Assert.True(setup.Kernel.SettleResourceExternalOperation(setup.Process, evidence).IsSuccess);
+        Assert.False(setup.Kernel.SettleResourceExternalOperation(setup.Process,
+            Evidence(binding, consumed == 0 ? 1UL : 0UL, 42)).IsSuccess);
+        Assert.Equal(consumed, Used(setup));
+    }
     private static KernelResult<ResourceAdmissionCommit> Prepare(Setup setup, ExternalOperationHandle operation) =>
         setup.Kernel.PrepareResourceExternalAdmission(setup.Process, setup.EffectCapability,
             ResourceKind.Compute, "compute:effect", 1, setup.ResourceGrant, 1,

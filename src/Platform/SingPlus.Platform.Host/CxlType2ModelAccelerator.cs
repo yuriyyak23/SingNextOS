@@ -5,8 +5,17 @@ namespace SingPlus.Platform.Host;
 /// <summary>Synchronous staged Type-2 model with no transport, ISA, or compiler dependency.</summary>
 public sealed class CxlType2ModelAccelerator : ICxlType2ProtectedAcceleratorProvider
 {
-    private readonly Dictionary<CxlAcceleratorSubmissionId, CxlAcceleratorSubmission> _live = [];
-    private readonly HashSet<CxlAcceleratorSubmissionId> _cancelled = [];
+    private sealed class SubmissionRecord(CxlAcceleratorSubmission receipt)
+    {
+        public CxlAcceleratorSubmission Receipt { get; } = receipt;
+        public bool Cancelled { get; set; }
+        public bool Released { get; set; }
+    }
+    private readonly object _gate = new();
+    private const int MaximumRetainedSubmissions = 4096;
+    // One provider-owned lifetime record retains the exact closure fact for retries.
+    // Instance-local model evidence, neither physical containment nor persistence.
+    private readonly Dictionary<CxlAcceleratorSubmissionId, SubmissionRecord> _submissions = [];
     private ulong _nextId = 1;
     public int SubmitCount { get; private set; }
     public bool DeviceAvailable { get; set; } = true;
@@ -54,47 +63,69 @@ public sealed class CxlType2ModelAccelerator : ICxlType2ProtectedAcceleratorProv
         if (request.OperationBinding.BindingId.Value == 0 || request.RegionUses.Count != 2 ||
             request.RegionUses[0].Mode != RegionUseMode.ReadOnly || request.RegionUses[1].Mode != RegionUseMode.StagedOutput)
             return Fail<CxlAcceleratorSubmission>(PlatformAuthorityStatus.Denied, "Type-2 descriptor is malformed or has incompatible RegionUse modes.");
-        var submission = new CxlAcceleratorSubmission(new(_nextId++), new(1), request.OperationBinding,
-            request.EndpointId, request.DeviceGeneration, request.FabricBinding);
-        _live.Add(submission.SubmissionId, submission);
-        SubmitCount++;
-        if (SubmitThrowsAfterAcceptance)
-            throw new InvalidOperationException("Injected provider exception after Type-2 acceptance.");
-        if (SubmitAcceptanceAmbiguous)
-            return Fail<CxlAcceleratorSubmission>(PlatformAuthorityStatus.Unavailable, "Acceptance response was lost after provider effect.");
-        return PlatformAuthorityResult<CxlAcceleratorSubmission>.Ok(ReturnMalformedSubmission
-            ? submission with { OperationBinding = submission.OperationBinding with { Generation = submission.OperationBinding.Generation + 1 } }
-            : submission);
+        lock (_gate)
+        {
+            if (_submissions.Count >= MaximumRetainedSubmissions)
+                return Fail<CxlAcceleratorSubmission>(PlatformAuthorityStatus.NotAccepted, "Model receipt retention is full before acceptance.");
+            if (_nextId == ulong.MaxValue)
+                return Fail<CxlAcceleratorSubmission>(PlatformAuthorityStatus.NotAccepted, "Model submission identity is exhausted before acceptance.");
+            var submission = new CxlAcceleratorSubmission(new(_nextId++), new(1), request.OperationBinding,
+                request.EndpointId, request.DeviceGeneration, request.FabricBinding);
+            _submissions.Add(submission.SubmissionId, new(submission));
+            SubmitCount++;
+            if (SubmitThrowsAfterAcceptance)
+                throw new InvalidOperationException("Injected provider exception after Type-2 acceptance.");
+            if (SubmitAcceptanceAmbiguous)
+                return Fail<CxlAcceleratorSubmission>(PlatformAuthorityStatus.Unavailable, "Acceptance response was lost after provider effect.");
+            return PlatformAuthorityResult<CxlAcceleratorSubmission>.Ok(ReturnMalformedSubmission
+                ? submission with { OperationBinding = submission.OperationBinding with { Generation = submission.OperationBinding.Generation + 1 } }
+                : submission);
+        }
     }
 
-    public PlatformAuthorityResult<CxlAcceleratorCompletion> ObserveCompletion(CxlAcceleratorSubmission submission) =>
-        IsExact(submission)
+    public PlatformAuthorityResult<CxlAcceleratorCompletion> ObserveCompletion(CxlAcceleratorSubmission submission)
+    {
+        lock (_gate)
+            return TryExact(submission, out var record) && !record.Released
             ? PlatformAuthorityResult<CxlAcceleratorCompletion>.Ok(new(submission,
-                _cancelled.Contains(submission.SubmissionId) ? ExternalOperationCompletionDisposition.Cancelled :
+                record.Cancelled ? ExternalOperationCompletionDisposition.Cancelled :
                 DeviceAvailable ? ExternalOperationCompletionDisposition.Completed : ExternalOperationCompletionDisposition.Faulted))
             : Fail<CxlAcceleratorCompletion>(PlatformAuthorityStatus.Stale, "Type-2 submission identity is stale.");
+    }
 
-    public PlatformAuthorityResult<CxlAcceleratorVisibility> AcquireVisibility(CxlAcceleratorSubmission submission, ExternalVisibilityRequirement requirement) =>
-        IsExact(submission)
+    public PlatformAuthorityResult<CxlAcceleratorVisibility> AcquireVisibility(CxlAcceleratorSubmission submission, ExternalVisibilityRequirement requirement)
+    {
+        lock (_gate)
+            return TryExact(submission, out var record) && !record.Released
             ? PlatformAuthorityResult<CxlAcceleratorVisibility>.Ok(new(submission, requirement,
-                DeviceAvailable && VisibilitySatisfied && !_cancelled.Contains(submission.SubmissionId)))
+                DeviceAvailable && VisibilitySatisfied && !record.Cancelled))
             : Fail<CxlAcceleratorVisibility>(PlatformAuthorityStatus.Stale, "Type-2 submission identity is stale.");
+    }
 
     public PlatformAuthorityResult Cancel(CxlAcceleratorSubmission submission)
     {
-        if (!IsExact(submission)) return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Stale, "Submission is stale.");
-        if (CancellationFails) return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Model cancellation closure is ambiguous.");
-        _cancelled.Add(submission.SubmissionId);
-        return PlatformAuthorityResult.Ok();
+        lock (_gate)
+        {
+            if (!TryExact(submission, out var record)) return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Stale, "Submission is stale.");
+            if (record.Released) return PlatformAuthorityResult.Ok();
+            if (CancellationFails) return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Model cancellation closure is ambiguous.");
+            record.Cancelled = true;
+            return PlatformAuthorityResult.Ok();
+        }
     }
     public PlatformAuthorityResult Release(CxlAcceleratorSubmission submission)
     {
-        if (!IsExact(submission)) return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Stale, "Submission is stale.");
-        if (ReleaseFails) return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Model release closure is ambiguous.");
-        _live.Remove(submission.SubmissionId);
-        _cancelled.Remove(submission.SubmissionId);
-        return PlatformAuthorityResult.Ok();
+        lock (_gate)
+        {
+            if (!TryExact(submission, out var record)) return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Stale, "Submission is stale.");
+            if (record.Released) return PlatformAuthorityResult.Ok();
+            if (ReleaseFails) return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Model release closure is ambiguous.");
+            record.Released = true;
+            return PlatformAuthorityResult.Ok();
+        }
     }
-    private bool IsExact(CxlAcceleratorSubmission submission) => _live.TryGetValue(submission.SubmissionId, out var current) && current == submission;
+    // Called only under the provider gate; identity alone cannot establish closure.
+    private bool TryExact(CxlAcceleratorSubmission submission, out SubmissionRecord record) =>
+        _submissions.TryGetValue(submission.SubmissionId, out record!) && record.Receipt == submission;
     private static PlatformAuthorityResult<T> Fail<T>(PlatformAuthorityStatus status, string message) => PlatformAuthorityResult<T>.Fail(status, message);
 }

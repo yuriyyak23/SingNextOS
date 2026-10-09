@@ -9,6 +9,105 @@ namespace SingPlus.Tests.Platform;
 
 public sealed class PlatformDsc1ComputeTests
 {
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)]
+    public void ProcessDsc1StageRunsCallbacksOutsideBothGatesAndRetainsActualClosure(int fault)
+    {
+        var provider = new FaultInjectingDsc1Provider
+        {
+            ReturnPendingForFirstCancellation = fault == 0,
+            ForgeCancellationGeneration = fault == 2,
+        };
+        var scenario = CreateScenario(provider, 2133, 2430, 32);
+        Assert.True(SubmitWhole(scenario).IsSuccess);
+        var kernelGate = typeof(RuntimeKernel).GetField("_platformMemoryUseGate", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(scenario.Kernel)!;
+        var bridgeGate = typeof(PlatformAuthorityBridge).GetField("_dsc1Gate", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(scenario.Kernel.PlatformAuthority)!;
+        var outside = true;
+        var observed = false;
+        var pending = false;
+        KernelResult nested = default;
+        KernelResult<PlatformDsc1CopySubmission> newWork = default;
+        var added = new InventoryOnlyCxlParticipant();
+        Action callback = () =>
+        {
+            observed = true;
+            outside &= !Monitor.IsEntered(kernelGate) && !Monitor.IsEntered(bridgeGate);
+            nested = scenario.Kernel.TerminateProcess(scenario.Subject);
+            var progress = scenario.Kernel.ObserveProcessTeardown(scenario.Subject);
+            pending = progress.IsSuccess && !progress.Value!.LocalReclaimCompleted;
+            newWork = scenario.Kernel.SubmitPlatformDsc1Copy(scenario.Subject, scenario.Binding, scenario.ComputeCapability,
+                scenario.Source, new PlatformDsc1RegionRange(scenario.SourceMapping, 0, 32),
+                scenario.Destination, new PlatformDsc1RegionRange(scenario.DestinationMapping, 0, 32));
+            if (fault == 4) typeof(RuntimeKernel).GetMethod("RegisterCxlTeardownParticipant", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .Invoke(scenario.Kernel, new object[] { added });
+        };
+        provider.BeforeCancel = callback;
+        provider.BeforeObservation = callback;
+        provider.AfterCancel = fault == 3 ? () => throw new IOException("Exact cancellation reply lost after effect") : null;
+        var first = scenario.Kernel.TerminateProcess(scenario.Subject);
+        Assert.Equal(fault == 1, first.IsSuccess);
+        Assert.True(observed);
+        Assert.True(outside);
+        Assert.True(pending);
+        Assert.Equal(KernelError.PlatformBindingDraining, nested.Error);
+        Assert.False(newWork.IsSuccess);
+        Assert.Equal(1, provider.SubmitCalls);
+        Assert.Equal(1, provider.CancelCalls);
+        if (fault == 1) Assert.False(scenario.Kernel.Processes.Resolve(scenario.Subject).IsSuccess);
+        else
+        {
+            Assert.True(scenario.Kernel.Processes.Resolve(scenario.Subject).IsSuccess);
+            provider.BeforeCancel = null;
+            provider.AfterCancel = null;
+            var retry = scenario.Kernel.TerminateProcess(scenario.Subject);
+            Assert.Equal(fault is 0 or 4, retry.IsSuccess);
+            Assert.Equal(1, provider.CancelCalls);
+            Assert.Equal(fault == 0 ? 1 : 0, provider.ObserveCalls);
+            Assert.Equal(fault is 2 or 3, scenario.Kernel.Processes.Resolve(scenario.Subject).IsSuccess);
+            if (fault is 2 or 3) Assert.False(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.DestinationMapping).IsSuccess);
+            if (fault == 4) Assert.Equal(1, added.Calls);
+        }
+    }
+    [Fact]
+    public async Task PausedProcessDsc1CancelAllowsConcurrentObservationWithoutReclaim()
+    {
+        var provider = new FaultInjectingDsc1Provider();
+        var scenario = CreateScenario(provider, 2134, 2440, 32);
+        Assert.True(SubmitWhole(scenario).IsSuccess);
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var released = false;
+        provider.BeforeCancel = () => { entered.Set(); released = release.Wait(TimeSpan.FromSeconds(5)); };
+        var closure = Task.Run(() => scenario.Kernel.TerminateProcess(scenario.Subject));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+            Assert.Equal(KernelError.PlatformBindingDraining, scenario.Kernel.TerminateProcess(scenario.Subject).Error);
+            Assert.False(scenario.Kernel.ObserveProcessTeardown(scenario.Subject).Value!.LocalReclaimCompleted);
+            Assert.False(scenario.Kernel.QueryProcessTeardown(scenario.Subject).Value!.LocalReclaimCompleted);
+            Assert.False(scenario.Kernel.SubmitPlatformDsc1Copy(scenario.Subject, scenario.Binding, scenario.ComputeCapability,
+                scenario.Source, new PlatformDsc1RegionRange(scenario.SourceMapping, 0, 32),
+                scenario.Destination, new PlatformDsc1RegionRange(scenario.DestinationMapping, 0, 32)).IsSuccess);
+            Assert.Equal(1, provider.CancelCalls);
+            Assert.Equal(1, provider.SubmitCalls);
+            Assert.True(scenario.Kernel.Processes.Resolve(scenario.Subject).IsSuccess);
+        }
+        finally { release.Set(); }
+        Assert.True((await closure).IsSuccess);
+        Assert.True(released);
+        Assert.Equal(1, provider.CancelCalls);
+        Assert.False(scenario.Kernel.Processes.Resolve(scenario.Subject).IsSuccess);
+    }
+    // Inventory mutation fixture only: no provider/resource lifetime or containment claim.
+    private sealed class InventoryOnlyCxlParticipant : ICxlTeardownParticipant
+    {
+        public int Calls { get; private set; }
+        public KernelResult CloseForProcess(ProcessHandle process, RegionOwner owner)
+        {
+            Calls++;
+            return KernelResult.Ok();
+        }
+    }
     [Fact]
     public void HostModelPublishesBoundedCopyOnlyAfterExactClosedCompletion()
     {
@@ -477,6 +576,342 @@ public sealed class PlatformDsc1ComputeTests
         Assert.Equal(1, provider.SubmitCalls);
         Assert.All(scenario.Destination.Span.ToArray(), value => Assert.Equal((byte)0xB7, value));
         scenario.Source.Span[0] = 7;
+    }
+
+    [Theory]
+    [InlineData(1, false)] [InlineData(1, true)]
+    [InlineData(2, false)] [InlineData(2, true)]
+    [InlineData(3, false)] [InlineData(3, true)]
+    [InlineData(4, false)] [InlineData(4, true)]
+    [InlineData(5, false)] [InlineData(5, true)]
+    [InlineData(6, false)] [InlineData(6, true)]
+    [InlineData(7, false)] [InlineData(7, true)]
+    [InlineData(8, false)] [InlineData(8, true)]
+    [InlineData(9, false)] [InlineData(9, true)]
+    [InlineData(10, false)] [InlineData(10, true)]
+    [InlineData(11, false)] [InlineData(11, true)]
+    [InlineData(12, false)] [InlineData(12, true)]
+    public void KnownModelReceiptRefusesLatePublicationAndRemainsCleanable(int fault, bool duringSourceQuery)
+    {
+        var provider = new FaultInjectingDsc1Provider();
+        var scenario = CreateScenario(provider, 2182, 2282, 32);
+        scenario.Source.Span.Fill(0x41);
+        scenario.Destination.Span.Fill(0xB7);
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        global::System.Collections.IDictionary Records(string name) =>
+            (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge)
+                .GetField(name, flags)!.GetValue(scenario.Kernel.PlatformAuthority)!;
+        var domains = Records("_domains");
+        var subjects = Records("_activeSubjects");
+        var mappings = Records("_mappings");
+        var operations = Records("_dsc1Operations");
+        var originalDomain = domains[scenario.Binding.BindingId]!;
+        var originalMapping = mappings[scenario.SourceMapping.MappingId]!;
+        object? originalOperation = null;
+        var injected = false;
+        PlatformDsc1SubmissionId Identity(object record) =>
+            ((PlatformDsc1CopySubmission)record.GetType().GetProperty("Submission")!.GetValue(record)!).SubmissionId;
+        void Inject()
+        {
+            if (injected) return;
+            injected = true;
+            object Foreign(object original) => original.GetType().GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+            if (fault == 1) domains.Remove(scenario.Binding.BindingId);
+            if (fault == 2) domains[scenario.Binding.BindingId] = Foreign(originalDomain);
+            if (fault == 3) mappings.Remove(scenario.SourceMapping.MappingId);
+            if (fault == 4) mappings[scenario.SourceMapping.MappingId] = Foreign(originalMapping);
+            if (fault == 5) _ = scenario.Kernel.RevokeCapability(scenario.ComputeCapability.CapabilityId);
+            if (fault == 6) provider.Incarnation = 2;
+            if (fault == 7) provider.ThrowIncarnation = true;
+            if (fault == 8) subjects.Remove(scenario.Binding.Subject);
+            if (fault == 9) operations.Remove(Identity(originalOperation!));
+            if (fault == 10) operations[Identity(originalOperation!)] = Foreign(originalOperation!);
+            if (fault == 11) _ = scenario.Kernel.RevokeCapability(scenario.SourceCapability);
+            if (fault == 12) subjects[scenario.Binding.Subject] = Foreign(originalDomain);
+        }
+        provider.AfterSubmissionAdmission = () =>
+        {
+            originalOperation = Assert.Single(operations.Values.Cast<object>());
+            provider.BeforeIncarnationRead = () =>
+            {
+                Assert.NotNull(originalOperation.GetType().GetProperty("AcceptedProviderSubmission")!.GetValue(originalOperation));
+                foreach (var (owner, name) in new (object, string)[]
+                    { (scenario.Kernel, "_platformMemoryUseGate"), (scenario.Kernel.PlatformAuthority, "_dsc1Gate"),
+                      (scenario.Kernel.PlatformAuthority, "_secureDomainLifecycleGate") })
+                    Assert.False(Monitor.IsEntered(owner.GetType().GetField(name, flags)!.GetValue(owner)!));
+                var worker = Task.Run(() => scenario.Kernel.MintCapability(scenario.Binding.Subject.DomainId,
+                    scenario.Subject, ResourceKind.Compute, "compute/source-read-worker", CapabilityRights.Execute));
+                Assert.True(worker.Wait(TimeSpan.FromSeconds(5)));
+                Assert.True(worker.Result.IsSuccess);
+                if (duringSourceQuery) Inject();
+            };
+            if (!duringSourceQuery) Inject();
+        };
+
+        var result = SubmitWhole(scenario);
+        provider.BeforeIncarnationRead = null;
+        provider.Incarnation = 1;
+        provider.ThrowIncarnation = false;
+        Assert.Equal(fault == 9, result.IsSuccess);
+        Assert.True(injected);
+        Assert.NotNull(originalOperation!.GetType().GetProperty("AcceptedProviderSubmission")!.GetValue(originalOperation));
+        Assert.Equal(1, provider.ActiveOriginalSubmissions);
+        Assert.Equal(1, provider.SubmitCalls);
+        Assert.Throws<InvalidOperationException>(() => { _ = scenario.Source.Span.Length; });
+
+        // Restore only the same original records. Missing operation routing is
+        // deliberately left absent: cleanup must consume retained owner truth.
+        domains[scenario.Binding.BindingId] = originalDomain;
+        subjects[scenario.Binding.Subject] = originalDomain;
+        mappings[scenario.SourceMapping.MappingId] = originalMapping;
+        if (fault == 10) operations[Identity(originalOperation)] = originalOperation;
+        var teardown = scenario.Kernel.TerminateProcess(scenario.Subject);
+        Assert.True(teardown.IsSuccess, teardown.Message);
+        Assert.Equal(0, provider.ActiveOriginalSubmissions);
+        Assert.Equal(1, provider.SubmitCalls);
+        Assert.Equal(1, provider.CancelCalls);
+        Assert.All(scenario.Kernel.Regions.Snapshot().Where(r =>
+            r.Handle.RegionId == scenario.Source.Handle.RegionId || r.Handle.RegionId == scenario.Destination.Handle.RegionId),
+            r => Assert.Equal(RegionState.Released, r.State));
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)] [InlineData(5)]
+    public void ClosedModelFactConsumptionRequiresOriginalOwnersAndReceiptAtFinalCommit(int fault)
+    {
+        var provider = new FaultInjectingDsc1Provider();
+        Func<ulong> pinned = () => 0;
+        Func<ulong> owned = () => 0;
+        var scenario = CreateScenario(provider, 2183, 2283, 32, (kernel, owner) =>
+        {
+            var admin = TestFixtures.Create(kernel, 98, 980).Handle;
+            var administration = kernel.MintCapability(new DomainId(980), admin, ResourceKind.KernelService,
+                CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+            var budget = kernel.AdmitProcessBudget(admin, administration, owner, "dsc1-final-consumption",
+                [new(ServiceBudgetDimension.OwnedMemoryBytes, 64), new(ServiceBudgetDimension.PinnedMappedMemoryBytes, 64)])
+                .Value!.ProcessBudget;
+            pinned = () => kernel.QueryBudget(budget).Value!.Usage.Single(u => u.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used;
+            owned = () => kernel.QueryBudget(budget).Value!.Usage.Single(u => u.Dimension == ServiceBudgetDimension.OwnedMemoryBytes).Used;
+        });
+        scenario.Destination.Span.Fill(0xB7);
+        var submission = SubmitWhole(scenario).Value!;
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        global::System.Collections.IDictionary Records(object owner, string field) =>
+            (global::System.Collections.IDictionary)owner.GetType().GetField(field, flags)!.GetValue(owner)!;
+        var domains = Records(scenario.Kernel.PlatformAuthority, "_domains");
+        var mappings = Records(scenario.Kernel.PlatformAuthority, "_mappings");
+        var operations = Records(scenario.Kernel.PlatformAuthority, "_dsc1Operations");
+        var payloads = Records(scenario.Kernel, "_dsc1PayloadOperations");
+        var originalDomain = domains[scenario.Binding.BindingId]!;
+        var originalMapping = mappings[scenario.SourceMapping.MappingId]!;
+        var originalOperation = operations[submission.SubmissionId]!;
+        var originalPayload = payloads[submission.SubmissionId]!;
+        var observation = originalOperation.GetType().GetProperty("OriginalCompletionObservation")!;
+        object? originalObservation = null;
+        provider.AfterCancel = () => provider.BeforeIncarnationRead = () =>
+        {
+            provider.BeforeIncarnationRead = null;
+            originalObservation = observation.GetValue(originalOperation);
+            object Foreign(object original) => original.GetType().GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+            if (fault == 0) domains[scenario.Binding.BindingId] = Foreign(originalDomain);
+            if (fault == 1) domains.Remove(scenario.Binding.BindingId);
+            if (fault == 2) mappings[scenario.SourceMapping.MappingId] = Foreign(originalMapping);
+            if (fault == 3) observation.SetValue(originalOperation, null);
+            if (fault == 4) payloads[submission.SubmissionId] = Foreign(originalPayload);
+            if (fault == 5) payloads.Remove(submission.SubmissionId);
+        };
+
+        var first = scenario.Kernel.CancelPlatformDsc1Copy(scenario.Subject, submission);
+        Assert.False(first.IsSuccess);
+        Assert.Equal(0, provider.ActiveOriginalSubmissions);
+        Assert.Equal(1, provider.CancelCalls);
+        Assert.Throws<InvalidOperationException>(() => { _ = scenario.Destination.Span.Length; });
+        Assert.Equal(64UL, owned());
+        Assert.Equal(64UL, pinned());
+        domains[scenario.Binding.BindingId] = originalDomain;
+        mappings[scenario.SourceMapping.MappingId] = originalMapping;
+        payloads[submission.SubmissionId] = originalPayload;
+        observation.SetValue(originalOperation, originalObservation);
+        provider.AfterCancel = null;
+        provider.BeforeIncarnationRead = null;
+        // Consume already validated closure without another provider Cancel or active capability.
+        _ = scenario.Kernel.RevokeCapability(scenario.ComputeCapability.CapabilityId);
+        if (scenario.Kernel.PlatformAuthority.HasActiveDsc1Operations(scenario.Binding))
+            Assert.True(scenario.Kernel.CancelPlatformDsc1Copy(scenario.Subject, submission).IsSuccess);
+        Assert.Equal(1, provider.CancelCalls);
+        Assert.Equal(64UL, pinned());
+        Assert.All(scenario.Destination.Span.ToArray(), value => Assert.Equal((byte)0xB7, value));
+        Assert.True(scenario.Kernel.TerminateProcess(scenario.Subject).IsSuccess);
+        Assert.Equal(0UL, pinned());
+        Assert.Equal(0UL, owned());
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void FalseClosedModelProjectionCannotReplaceOriginalClosureFact(bool knownOriginal)
+    {
+        var provider = new FaultInjectingDsc1Provider { SubmissionOutcomeFault = knownOriginal ? 0 : 1 };
+        var scenario = CreateScenario(provider, 2185, 2285, 32);
+        var submitted = SubmitWhole(scenario);
+        Assert.Equal(knownOriginal, submitted.IsSuccess);
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var operations = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge)
+            .GetField("_dsc1Operations", flags)!.GetValue(scenario.Kernel.PlatformAuthority)!;
+        var record = Assert.Single(operations.Values.Cast<object>());
+        var identity = (PlatformDsc1CopySubmission)record.GetType().GetProperty("Submission")!.GetValue(record)!;
+        var state = record.GetType().GetProperty("State")!;
+        state.SetValue(record, Enum.Parse(state.PropertyType, "ClosedCancelled"));
+        if (knownOriginal)
+        {
+            Assert.True(scenario.Kernel.CancelPlatformDsc1Copy(scenario.Subject, identity).IsSuccess);
+            Assert.Equal(1, provider.CancelCalls);
+            Assert.Equal(0, provider.ActiveOriginalSubmissions);
+            Assert.True(scenario.Kernel.TerminateProcess(scenario.Subject).IsSuccess);
+        }
+        else
+        {
+            Assert.False(scenario.Kernel.PlatformAuthority.CancelDsc1ModelCopy(identity, scenario.Binding.Subject).IsSuccess);
+            Assert.Equal(0, provider.CancelCalls);
+            Assert.Equal(1, provider.ActiveOriginalSubmissions);
+            Assert.False(scenario.Kernel.TerminateProcess(scenario.Subject).IsSuccess);
+            Assert.All(scenario.Kernel.Regions.Snapshot(), r => Assert.Equal(RegionState.Owned, r.State));
+        }
+    }
+
+    [Fact]
+    public void CompletedModelClosureConsumesWithoutActivePermissionAndDoesNotRepinAfterEpochChange()
+    {
+        var provider = new FaultInjectingDsc1Provider(deferDsc1Completion: false);
+        var scenario = CreateScenario(provider, 2186, 2286, 32);
+        scenario.Destination.Span.Fill(0xB7);
+        var submission = SubmitWhole(scenario).Value!;
+        provider.BeforeObservation = () => { _ = scenario.Kernel.RevokeCapability(scenario.ComputeCapability.CapabilityId); };
+        var refused = scenario.Kernel.ObservePlatformDsc1Copy(scenario.Subject, submission);
+        Assert.False(refused.IsSuccess);
+        Assert.Equal(0, provider.ActiveOriginalSubmissions);
+        Assert.Throws<InvalidOperationException>(() => { _ = scenario.Destination.Span.Length; });
+        provider.BeforeObservation = null;
+        var consumed = scenario.Kernel.CancelPlatformDsc1Copy(scenario.Subject, submission);
+        Assert.True(consumed.IsSuccess, consumed.Message);
+        Assert.False(consumed.Value!.OutputPublished);
+        Assert.Equal(0, provider.CancelCalls);
+        Assert.Equal(1, provider.ObserveCalls);
+        Assert.False(scenario.Kernel.PlatformAuthority.HasActiveDsc1Operations(scenario.Binding));
+        Assert.All(scenario.Destination.Span.ToArray(), value => Assert.Equal((byte)0xB7, value));
+        Assert.True(scenario.Kernel.PlatformAuthority.ObserveBackendReset().IsSuccess);
+        Assert.False(scenario.Kernel.PlatformAuthority.HasActiveDsc1Operations(scenario.Binding));
+        scenario.Source.Span[0] = 7;
+        scenario.Destination.Span[0] = 8;
+    }
+
+    [Fact]
+    public async Task RootLifecycleInterlockSerializesActualModelAdmission()
+    {
+        var provider = new FaultInjectingDsc1Provider();
+        var scenario = CreateScenario(provider, 2184, 2284, 32);
+        var rootGate = typeof(PlatformAuthorityBridge).GetField("_secureDomainLifecycleGate",
+            BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(scenario.Kernel.PlatformAuthority)!;
+        using var started = new ManualResetEventSlim();
+        Task<KernelResult<PlatformDsc1CopySubmission>> task;
+        Monitor.Enter(rootGate);
+        try
+        {
+            task = Task.Run(() => { started.Set(); return SubmitWhole(scenario); });
+            Assert.True(started.Wait(TimeSpan.FromSeconds(5)));
+            Assert.False(task.Wait(TimeSpan.FromMilliseconds(200)));
+            Assert.Equal(0, provider.SubmitCalls);
+        }
+        finally { Monitor.Exit(rootGate); }
+        var accepted = await task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(accepted.IsSuccess, accepted.Message);
+        Assert.True(scenario.Kernel.CancelPlatformDsc1Copy(scenario.Subject, accepted.Value!).IsSuccess);
+        Assert.True(scenario.Kernel.TerminateProcess(scenario.Subject).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(1, 0)] [InlineData(1, 1)] [InlineData(1, 2)]
+    [InlineData(2, 0)] [InlineData(2, 1)] [InlineData(2, 2)]
+    [InlineData(3, 0)] [InlineData(3, 1)] [InlineData(3, 2)]
+    [InlineData(4, 0)] [InlineData(4, 1)] [InlineData(4, 2)]
+    public void LostModelSubmissionOutcomeRetainsOriginalLifecycleAndRefusesRepeatOrReclaim(int outcome, int routeLoss)
+    {
+        var provider = new FaultInjectingDsc1Provider { SubmissionOutcomeFault = outcome };
+        var scenario = CreateScenario(provider, 2181, 2281, 32);
+        scenario.Source.Span.Fill(0x41);
+        scenario.Destination.Span.Fill(0xB7);
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var operations = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge)
+            .GetField("_dsc1Operations", flags)!.GetValue(scenario.Kernel.PlatformAuthority)!;
+        var domains = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge)
+            .GetField("_domains", flags)!.GetValue(scenario.Kernel.PlatformAuthority)!;
+        var originalDomain = domains[scenario.Binding.BindingId]!;
+        object? foreignDomain = null;
+        object? originalRecord = null;
+        provider.AfterSubmissionAdmission = () =>
+        {
+            originalRecord ??= Assert.Single(operations.Values.Cast<object>());
+            if (routeLoss == 1) domains.Remove(scenario.Binding.BindingId);
+            if (routeLoss == 2)
+            {
+                foreignDomain = originalDomain.GetType().GetMethod("MemberwiseClone", flags)!.Invoke(originalDomain, null)!;
+                domains[scenario.Binding.BindingId] = foreignDomain;
+            }
+        };
+        var compensationCalls = 0;
+        var compensationVerified = false;
+        provider.BeforeCancel = () =>
+        {
+            compensationCalls++;
+            Assert.Same(originalRecord, Assert.Single(operations.Values.Cast<object>()));
+            Assert.Equal("Faulted", originalRecord!.GetType().GetProperty("State")!.GetValue(originalRecord)!.ToString());
+            foreach (var (owner, name) in new (object, string)[]
+                { (scenario.Kernel, "_platformMemoryUseGate"),
+                  (scenario.Kernel.PlatformAuthority, "_dsc1Gate"),
+                  (scenario.Kernel.PlatformAuthority, "_secureDomainLifecycleGate") })
+            {
+                var gate = owner.GetType().GetField(name, flags)!.GetValue(owner)!;
+                Assert.False(Monitor.IsEntered(gate));
+            }
+            Assert.False(SubmitWhole(scenario).IsSuccess);
+            compensationVerified = true;
+        };
+
+        var rejected = SubmitWhole(scenario);
+        var retained = operations.Values.Cast<object>().SingleOrDefault();
+        Assert.Equal("Quarantined", originalDomain.GetType().GetProperty("AuthorityState")!.GetValue(originalDomain)!.ToString());
+        if (foreignDomain is not null)
+            Assert.Equal("Active", foreignDomain.GetType().GetProperty("AuthorityState")!.GetValue(foreignDomain)!.ToString());
+        Assert.False(SubmitWhole(scenario).IsSuccess);
+        // Controlled restoration tests continuity of the same record, not recovery.
+        domains[scenario.Binding.BindingId] = originalDomain;
+        // ModelOnly promises no external byte access: byte staging can be rolled back
+        // independently of the unresolved original provider lifecycle.
+        scenario.Source.Span[0] = 7;
+        Assert.All(scenario.Destination.Span.ToArray(), value => Assert.Equal((byte)0xB7, value));
+        var repeated = SubmitWhole(scenario);
+        var root = scenario.Kernel.RevokePlatformDomain(scenario.Subject, scenario.Binding);
+        var mapping = scenario.Kernel.RevokeCapability(scenario.SourceCapability);
+        var teardown = scenario.Kernel.TerminateProcess(scenario.Subject);
+
+        Assert.False(rejected.IsSuccess);
+        Assert.Same(originalRecord, retained);
+        Assert.False((bool)retained!.GetType().GetProperty("ProviderCallInFlight")!.GetValue(retained)!);
+        Assert.False((bool)retained.GetType().GetProperty("LocalReservationsReleased")!.GetValue(retained)!);
+        Assert.Same(provider, retained.GetType().GetProperty("OriginalSource")!.GetValue(retained));
+        Assert.Equal(outcome >= 3 ? 1 : 0, compensationCalls);
+        Assert.Equal(outcome >= 3, compensationVerified);
+        Assert.Equal(outcome == 4, provider.LastCancellationClosed);
+        Assert.False(repeated.IsSuccess);
+        Assert.Equal(1, provider.SubmitCalls);
+        Assert.Equal(1, provider.ActiveOriginalSubmissions);
+        Assert.False(root.IsSuccess);
+        Assert.False(mapping.IsSuccess);
+        Assert.False(teardown.IsSuccess);
+        Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(scenario.Source.Handle,
+            new RegionOwner(scenario.Binding.Subject.DomainId, scenario.Subject.Generation)));
+        Assert.All(scenario.Kernel.Regions.Snapshot().Where(r =>
+            r.Handle.RegionId == scenario.Source.Handle.RegionId ||
+            r.Handle.RegionId == scenario.Destination.Handle.RegionId), r => Assert.Equal(RegionState.Owned, r.State));
     }
 
     [Fact]
@@ -1466,11 +1901,13 @@ public sealed class PlatformDsc1ComputeTests
         IPlatformAuthorityProvider provider,
         ulong processId,
         ulong domainId,
-        int length)
+        int length,
+        Action<RuntimeKernel, ProcessHandle>? beforeAllocation = null)
     {
         var kernel = new RuntimeKernel(provider);
         var (_, subject) = TestFixtures.Create(kernel, processId, domainId);
         var process = kernel.Processes.Resolve(subject).Value!;
+        beforeAllocation?.Invoke(kernel, subject);
         var source = kernel.AllocateBuffer<byte>(subject, length).Value!;
         var destination = kernel.AllocateBuffer<byte>(subject, length).Value!;
         var binding = kernel.BindPlatformDomain(subject).Value!;
@@ -1568,6 +2005,7 @@ public sealed class PlatformDsc1ComputeTests
 
     private sealed class FaultInjectingDsc1Provider :
         IPlatformAuthorityProvider,
+        IPlatformProviderIncarnationSource,
         IPlatformFeatureProvider,
         IPlatformRegionRevocationProvider,
         IPlatformDsc1ComputeProvider
@@ -1584,12 +2022,31 @@ public sealed class PlatformDsc1ComputeTests
         }
 
         public bool DenySubmit { get; init; }
+        public ulong Incarnation { get; set; } = 1;
+        public bool ThrowIncarnation { get; set; }
+        public Action? BeforeIncarnationRead { get; set; }
+        public PlatformProviderIncarnation CurrentIncarnation
+        {
+            get
+            {
+                BeforeIncarnationRead?.Invoke();
+                if (ThrowIncarnation) throw new InvalidOperationException("Original DSC1 source unavailable.");
+                return new(Incarnation);
+            }
+        }
+        public int SubmissionOutcomeFault { get; init; }
+        public Action? AfterSubmissionAdmission { get; set; }
+        public int ActiveOriginalSubmissions => _inner.ActiveDsc1SubmissionCount;
+        public bool LastCancellationClosed { get; private set; }
         public bool DenyFirstObservation { get; init; }
         public bool ForgeSubmissionRequest { get; init; }
         public bool ForgeCompletionGeneration { get; init; }
         public bool ForgeCancellationGeneration { get; init; }
         public bool ReturnPendingForFirstCancellation { get; init; }
         public bool DenyFirstCancellation { get; init; }
+        public Action? BeforeCancel { get; set; }
+        public Action? BeforeObservation { get; set; }
+        public Action? AfterCancel { get; set; }
         public int SubmitCalls { get; private set; }
         public int ObserveCalls { get; private set; }
         public int CancelCalls { get; private set; }
@@ -1660,7 +2117,22 @@ public sealed class PlatformDsc1ComputeTests
             }
 
             var submitted = _inner.SubmitDsc1Copy(request);
-            if (!submitted.IsSuccess || !ForgeSubmissionRequest)
+            if (submitted.IsSuccess)
+            {
+                AfterSubmissionAdmission?.Invoke();
+                if (SubmissionOutcomeFault == 1)
+                    return PlatformAuthorityResult<PlatformProviderDsc1Submission>.Fail(
+                        PlatformAuthorityStatus.Denied, "Original admitted model outcome unavailable.");
+                if (SubmissionOutcomeFault == 2)
+                    throw new InvalidOperationException("Original admitted model outcome lost.");
+                if (SubmissionOutcomeFault == 4)
+                    return _inner.SubmitDsc1Copy(request with
+                    {
+                        Source = request.Source with { Length = request.Source.Length / 2 },
+                        Destination = request.Destination with { Length = request.Destination.Length / 2 }
+                    });
+            }
+            if (!submitted.IsSuccess || (!ForgeSubmissionRequest && SubmissionOutcomeFault != 3))
                 return submitted;
 
             var submission = submitted.Value!;
@@ -1681,6 +2153,7 @@ public sealed class PlatformDsc1ComputeTests
             ObserveDsc1Completion(PlatformProviderDsc1Submission submission)
         {
             ObserveCalls++;
+            BeforeObservation?.Invoke();
             ObserveEntered?.Set();
             if (ObserveRelease is { } observeRelease &&
                 !observeRelease.Wait(TimeSpan.FromSeconds(5)))
@@ -1731,6 +2204,7 @@ public sealed class PlatformDsc1ComputeTests
             PlatformProviderDsc1Submission submission)
         {
             CancelCalls++;
+            BeforeCancel?.Invoke();
             if (DenyFirstCancellation && !_cancellationDenied)
             {
                 _cancellationDenied = true;
@@ -1754,6 +2228,9 @@ public sealed class PlatformDsc1ComputeTests
             }
 
             var cancelled = _inner.CancelDsc1(submission);
+            LastCancellationClosed = cancelled.IsSuccess &&
+                cancelled.Value!.Receipt.State == PlatformCompletionState.Closed;
+            if (cancelled.IsSuccess) AfterCancel?.Invoke();
             if (!cancelled.IsSuccess || !ForgeCancellationGeneration)
                 return cancelled;
 

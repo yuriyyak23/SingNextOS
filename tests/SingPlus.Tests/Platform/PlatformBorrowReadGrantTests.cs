@@ -8,6 +8,48 @@ namespace SingPlus.Tests.Platform;
 
 public sealed class PlatformBorrowReadGrantTests
 {
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)]
+    public void BorrowReaderLateWriterCannotPublishAndCleanupRemainsAuthoritative(int writer)
+    {
+        var scenario = CreateScenario();
+        var grant = CreateGrant(scenario);
+        scenario.Provider.BeforeVisibilityReturn = () =>
+        {
+            var kernelGate = typeof(RuntimeKernel).GetField("_platformMemoryUseGate",
+                BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(scenario.Kernel)!;
+            var bridgeGate = typeof(PlatformAuthorityBridge).GetField("_secureDomainLifecycleGate",
+                BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(scenario.Kernel.PlatformAuthority)!;
+            Assert.False(Monitor.IsEntered(kernelGate));
+            Assert.False(Monitor.IsEntered(bridgeGate));
+            if (writer < 2)
+                _ = scenario.Kernel.TerminateProcess(writer == 0 ? scenario.Owner : scenario.Borrower);
+            else if (writer == 2)
+                Assert.True(scenario.Kernel.RequestPlatformBorrowCompletion(scenario.Owner, scenario.Borrower,
+                    scenario.Lease.Handle, grant).IsSuccess);
+            else
+                Assert.True(scenario.Kernel.PlatformAuthority.ObserveBackendReset().IsSuccess);
+        };
+        var result = scenario.Kernel.PreparePlatformBorrowReadGrantForExternalReader(scenario.Owner, grant);
+        Assert.False(result.IsSuccess);
+        Assert.Equal(1, scenario.Provider.VisibilityCalls);
+        scenario.Provider.BeforeVisibilityReturn = null;
+        if (writer == 3)
+        {
+            Assert.False(scenario.Kernel.RequestPlatformBorrowCompletion(scenario.Owner, scenario.Borrower,
+                scenario.Lease.Handle, grant).IsSuccess);
+            Assert.False(scenario.Kernel.ReturnBorrow(scenario.Borrower, scenario.Lease.Handle).IsSuccess);
+            Assert.False(scenario.Kernel.TerminateProcess(scenario.Owner).IsSuccess);
+            Assert.True(scenario.Lease.IsValid);
+            Assert.Equal(RegionState.Loaned, Assert.Single(scenario.Kernel.Regions.Snapshot()).State);
+        }
+        else
+            Assert.False(scenario.Kernel.Regions.ValidateBorrowLease(scenario.Lease.Handle,
+                new RegionOwner(scenario.OwnerIdentity.DomainId, scenario.Owner.Generation),
+                new RegionOwner(new DomainId(920), scenario.Borrower.Generation)).IsSuccess);
+        Assert.Equal(writer == 3 ? 0 : 1, scenario.Provider.BeginCalls);
+    }
+
     [Fact]
     public void GrantRequiresLiveExactBorrowAndRejectsLocalStalenessBeforeProvider()
     {
@@ -137,6 +179,7 @@ public sealed class PlatformBorrowReadGrantTests
 
     [Theory]
     [InlineData(MapFaultMode.Denied, KernelError.PlatformDenied)]
+    [InlineData(MapFaultMode.NotAccepted, KernelError.PlatformFaulted)]
     [InlineData(MapFaultMode.Revoked, KernelError.PlatformBindingRevoked)]
     [InlineData(MapFaultMode.Faulted, KernelError.PlatformFaulted)]
     [InlineData(MapFaultMode.MalformedAccess, KernelError.PlatformFaulted)]
@@ -161,8 +204,12 @@ public sealed class PlatformBorrowReadGrantTests
         var returned = scenario.Kernel.ReturnBorrow(
             scenario.Borrower,
             scenario.Lease.Handle);
-        if (mode is MapFaultMode.Revoked or MapFaultMode.Faulted)
+        if (mode != MapFaultMode.NotAccepted)
+        {
             Assert.Equal(KernelError.PlatformBindingActive, returned.Error);
+            Assert.False(scenario.Kernel.TerminateProcess(scenario.Owner).IsSuccess);
+            Assert.Equal(RegionState.Loaned, Assert.Single(scenario.Kernel.Regions.Snapshot()).State);
+        }
         else
             Assert.True(returned.IsSuccess);
     }
@@ -170,22 +217,22 @@ public sealed class PlatformBorrowReadGrantTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public void MalformedBorrowMappingCleanupAmbiguityPinsBorrowLifetime(bool throws)
+    public void MalformedBorrowMappingKeepsOriginalPinForEitherProcessConsumer(bool ownerExits)
     {
         var scenario = CreateScenario();
         scenario.Provider.MapFault = MapFaultMode.MalformedAccess;
-        scenario.Provider.CleanupStatus = throws ? null : PlatformAuthorityStatus.Faulted;
-        scenario.Provider.ThrowOnCleanup = throws;
 
         var grant = scenario.Kernel.CreatePlatformBorrowReadGrant(
             scenario.Owner, scenario.Borrower, scenario.Binding,
             scenario.Lease.Handle, 0, 64);
 
         Assert.Equal(KernelError.PlatformFaulted, grant.Error);
-        Assert.Equal(1, scenario.Provider.CleanupCalls);
+        Assert.Equal(0, scenario.Provider.CleanupCalls);
         Assert.Equal(KernelError.PlatformBindingActive,
             scenario.Kernel.ReturnBorrow(scenario.Borrower,
                 scenario.Lease.Handle).Error);
+        Assert.False(scenario.Kernel.TerminateProcess(ownerExits ? scenario.Owner : scenario.Borrower).IsSuccess);
+        Assert.Equal(RegionState.Loaned, Assert.Single(scenario.Kernel.Regions.Snapshot()).State);
     }
 
     [Theory]
@@ -660,6 +707,7 @@ public sealed class PlatformBorrowReadGrantTests
         Revoked,
         Faulted,
         MalformedAccess,
+        NotAccepted,
     }
 
     public enum VisibilityFaultMode
@@ -711,6 +759,8 @@ public sealed class PlatformBorrowReadGrantTests
 
         public int MapCalls { get; private set; }
         public int VisibilityCalls { get; private set; }
+        public int BeginCalls { get; private set; }
+        public Action? BeforeVisibilityReturn { get; set; }
         public PlatformRegionSlice? LastSlice { get; private set; }
         public MapFaultMode MapFault { get; set; }
         public PlatformAuthorityStatus? CleanupStatus { get; set; }
@@ -803,6 +853,9 @@ public sealed class PlatformBorrowReadGrantTests
 
             switch (MapFault)
             {
+                case MapFaultMode.NotAccepted:
+                    return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(
+                        PlatformAuthorityStatus.NotAccepted, "Mapping refused before effect.");
                 case MapFaultMode.Denied:
                     return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(
                         PlatformAuthorityStatus.Denied,
@@ -871,6 +924,7 @@ public sealed class PlatformBorrowReadGrantTests
             var outcome = VisibilityFault == VisibilityFaultMode.Malformed
                 ? (PlatformMemoryVisibilityOutcome)999
                 : PlatformMemoryVisibilityOutcome.PublicationFenceSatisfied;
+            BeforeVisibilityReturn?.Invoke();
             return PlatformAuthorityResult<PlatformRegionVisibilityResult>.Ok(
                 new PlatformRegionVisibilityResult(
                     request.Mapping.MappingId,
@@ -898,6 +952,7 @@ public sealed class PlatformBorrowReadGrantTests
                 PlatformProviderRegionMappingLease mapping,
                 PlatformRegionRevocationPolicy policy)
         {
+            BeginCalls++;
             if (!_mappings.TryGetValue(mapping.MappingId, out var mapped) ||
                 mapped.Lease != mapping)
             {

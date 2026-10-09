@@ -9,6 +9,178 @@ namespace SingPlus.Tests.Runtime;
 public sealed class IpcMemoryBudgetCompositionTests
 {
     [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void SessionResponseBudgetObservationSeesCommittedInvocationEvenWhenItThrows(bool throws)
+    {
+        var clock = new TransferClock();
+        var kernel = new RuntimeKernel(null, clock);
+        byte[] image = [9, 8];
+        var manifest = new ServiceManifestV1(new("session-response-observe"), new("1"),
+            Convert.ToHexString(global::System.Security.Cryptography.SHA256.HashData(image)).ToLowerInvariant(),
+            TestFixtures.Manifest(8172, 817_200),
+            budgetRequests: [new(ServiceBudgetDimension.OwnedMemoryBytes, 4096), new(ServiceBudgetDimension.TraceTelemetryBufferBytes, 8192)],
+            telemetryPolicy: new(ServiceTelemetryVisibility.Self, 8192));
+        var caller = kernel.AdmitComponent(new(manifest, image)).Value!.Process;
+        var service = TestFixtures.Create(kernel, 8171, 817_100).Handle;
+        var protocol = new ProtocolDefinitionV1("session-response-observe", "1", "Ready", null,
+            [new(1, "Return", returnsOwnership: true, returnOwnershipPayloadKind: OwnershipPayloadKind.OwnedBuffer)],
+            [new(1, "Ready", "Ready")]);
+        var responseProtocol = new ResponseProtocolDefinitionV1(protocol.ContractName, protocol.ContractDigest,
+            [new(1, "Return", new(ResponsePayloadKind.Ownership, typeof(OwnedBuffer<>).Namespace + ".OwnedBuffer", ownershipPayloadKind: OwnershipPayloadKind.OwnedBuffer))]);
+        var descriptor = kernel.RegisterService(service, "session-response-observe",
+            new(protocol.ContractName, "1", protocol.ContractDigest), protocol, responseProtocol).Value!;
+        var session = kernel.OpenSession(caller, descriptor).Value;
+        var responseTask = kernel.InvokeSessionAsync(caller, session, 1, payload: null).AsTask();
+        var received = kernel.ReceiveSessionRequest(service, session).Value!;
+        Assert.True(kernel.AcceptSessionInvocation(service, received.Invocation, allowInFlightCancellation: false).IsSuccess);
+        var payload = kernel.AllocateBuffer<byte>(service, 4).Value!;
+        Assert.True(kernel.StartTraceSession(caller, 8).IsSuccess);
+        var observed = false;
+        ResponseEnvelope? delivered = null;
+        clock.Next = () =>
+        {
+            var worker = Task.Run(() =>
+            {
+                Assert.Equal(ResponsePublicationStatus.Published,
+                    kernel.SnapshotSessionInvocationConsequence(received.Invocation)!.Value.TerminalStatus);
+                var response = responseTask.WaitAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
+                Assert.True(response.IsSuccess, response.Message);
+                delivered = response.Value;
+            });
+            Assert.True(worker.Wait(TimeSpan.FromSeconds(5)));
+            observed = true;
+            if (throws) throw new InvalidOperationException("post-commit observation");
+        };
+        Assert.True(kernel.PublishSessionResponse(service, received.Invocation, payload).IsSuccess);
+        Assert.True(observed);
+        Assert.False(payload.IsValid);
+        var returned = Assert.IsType<OwnedBuffer<byte>>(delivered!.Payload);
+        Assert.True(returned.IsValid);
+        Assert.Equal(KernelError.ResponseNotPending, kernel.PublishSessionResponse(service, received.Invocation, payload).Error);
+        Assert.Equal(ResponsePublicationStatus.Published,
+            kernel.SnapshotSessionInvocationConsequence(received.Invocation)!.Value.TerminalStatus);
+        Assert.True(kernel.ReleaseRegion(caller, returned).IsSuccess);
+    }
+
+    [Fact]
+    public async Task MessagePermissionOwnerCommitOrdersRevokeAfterActualOwnershipPublication()
+    {
+        var kernel = new RuntimeKernel();
+        var sender = TestFixtures.Create(kernel, 8151, 815_100).Handle;
+        var receiver = TestFixtures.Create(kernel, 8152, 815_200).Handle;
+        var capability = kernel.MintCapability(new(815_100), sender, ResourceKind.Device, "message:move", CapabilityRights.Read).Value!.CapabilityId;
+        var request = new RequestPayloadDescriptorV1(RequestPayloadKind.Ownership, "payload", typeof(OwnedBuffer<>).Namespace + ".OwnedBuffer", ownershipPayloadKind: OwnershipPayloadKind.OwnedBuffer);
+        var protocol = new ProtocolDefinitionV1("message-commit", "1", "Ready", null,
+            [new(1, "Move", requiredCapabilities: [new(ResourceKind.Device, "message:move", CapabilityRights.Read)], consumes: ["payload"], requestPayload: request)],
+            [new(1, "Ready", "Ready")]);
+        var endpoints = kernel.CreateChannel(sender, receiver, protocol, 4).Value;
+        var payload = kernel.AllocateBuffer<byte>(sender, 4).Value!;
+        Task<KernelResult>? revoke = null;
+        using var started = new ManualResetEventSlim();
+        var sent = kernel.Channels.Send(kernel.Processes.Resolve(sender).Value!, kernel.Processes.Resolve(receiver).Value!, endpoints.Left, 1, payload, [capability],
+            transferRegion: (source, target, region, _) =>
+            {
+                revoke = Task.Run(() => { started.Set(); return kernel.CapabilityAuthority.Revoke(capability); });
+                Assert.True(started.Wait(TimeSpan.FromSeconds(5)));
+                Assert.False(revoke.Wait(TimeSpan.FromMilliseconds(150)));
+                return kernel.Regions.Transfer(region, new(source.DomainId, source.Generation), new(target.DomainId, target.Generation));
+            });
+        Assert.True(sent.IsSuccess);
+        Assert.True((await revoke!.WaitAsync(TimeSpan.FromSeconds(5))).IsSuccess);
+        Assert.False(payload.IsValid);
+        var received = kernel.Receive(receiver, endpoints.Right);
+        Assert.True(received.IsSuccess);
+        Assert.True(Assert.IsType<OwnedBuffer<byte>>(received.Value!.Payload).IsValid);
+        Assert.Equal(sent.Value!.Sequence, received.Value.Sequence);
+        var untouched = kernel.AllocateBuffer<byte>(sender, 4).Value!;
+        Assert.Equal(KernelError.MissingCapability, kernel.Send(sender, receiver, endpoints.Left, 1, untouched, [capability]).Error);
+        Assert.True(untouched.IsValid);
+    }
+
+    [Theory]
+    [InlineData(false, false)] [InlineData(true, false)] [InlineData(false, true)]
+    public void QueuedTransferBudgetClockCanReceiveCommittedOwnershipOutsideKernelGates(bool pair, bool response)
+    {
+        var clock = new TransferClock();
+        var kernel = new RuntimeKernel(null, clock);
+        byte[] image = [5, 6];
+        var manifest = new ServiceManifestV1(new("queued-observe"), new("1"),
+            Convert.ToHexString(global::System.Security.Cryptography.SHA256.HashData(image)).ToLowerInvariant(),
+            TestFixtures.Manifest(8162, 816_200),
+            budgetRequests: [new(ServiceBudgetDimension.OwnedMemoryBytes, 4096), new(ServiceBudgetDimension.TraceTelemetryBufferBytes, 8192)],
+            telemetryPolicy: new(ServiceTelemetryVisibility.Self, 8192));
+        var target = kernel.AdmitComponent(new(manifest, image)).Value!.Process;
+        var source = TestFixtures.Create(kernel, 8161, 816_100).Handle;
+        RequestPayloadDescriptorV1 request = pair
+            ? new(new OwnershipRequestDescriptorV1("borrow", OwnershipPayloadKind.OwnedBuffer, OwnershipRequestDisposition.Borrow),
+                new OwnershipRequestDescriptorV1("consume", OwnershipPayloadKind.OwnedBuffer, OwnershipRequestDisposition.Consume))
+            : new(RequestPayloadKind.Ownership, "consume", typeof(OwnedBuffer<>).Namespace + ".OwnedBuffer", ownershipPayloadKind: OwnershipPayloadKind.OwnedBuffer);
+        var protocol = new ProtocolDefinitionV1("queued-observe", "1", "Ready", null,
+            [new(1, "Move", consumes: ["consume"], borrows: pair ? ["borrow"] : [], requestPayload: request)], [new(1, "Ready", "Ready")]);
+        if (response) protocol = new("queued-observe", "1", "Ready", null,
+            [new(1, "Return", returnsOwnership: true, returnOwnershipPayloadKind: OwnershipPayloadKind.OwnedBuffer)], [new(1, "Ready", "Ready")]);
+        var endpoints = response
+            ? kernel.CreateChannel(target, source, protocol, new ResponseProtocolDefinitionV1(protocol.ContractName, protocol.ContractDigest,
+                [new(1, "Return", new(ResponsePayloadKind.Ownership, typeof(OwnedBuffer<>).Namespace + ".OwnedBuffer", ownershipPayloadKind: OwnershipPayloadKind.OwnedBuffer))]), 4).Value
+            : kernel.CreateChannel(source, target, protocol, 4).Value;
+        ulong requestSequence = 0;
+        if (response)
+        {
+            requestSequence = kernel.Send(target, source, endpoints.Left, 1).Value!.Sequence;
+            Assert.True(kernel.Receive(source, endpoints.Right).IsSuccess);
+        }
+        var payload = kernel.AllocateBuffer<byte>(source, 4).Value!;
+        var borrowed = pair ? kernel.AllocateBuffer<byte>(source, 4).Value! : null;
+        Assert.True(kernel.StartTraceSession(target, 8).IsSuccess);
+        ChannelEnvelope? received = null;
+        ResponseEnvelope? responseReceived = null;
+        clock.Next = () =>
+        {
+            var worker = Task.Run(() =>
+            {
+                if (response)
+                {
+                    var result = kernel.ReceiveResponse(target, endpoints.Left);
+                    Assert.True(result.IsSuccess);
+                    responseReceived = result.Value;
+                    return KernelResult.Ok();
+                }
+                var receive = kernel.Receive(target, endpoints.Right);
+                received = receive.Value;
+                return receive.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(receive.Error, receive.Message!);
+            });
+            Assert.True(worker.Wait(TimeSpan.FromSeconds(5)));
+            Assert.True(worker.Result.IsSuccess);
+        };
+        if (response)
+        {
+            var published = kernel.PublishResponse(source, endpoints.Right, requestSequence, payload);
+            Assert.True(published.IsSuccess);
+            Assert.NotNull(responseReceived);
+            Assert.Equal(requestSequence, responseReceived!.RequestSequence);
+            Assert.False(payload.IsValid);
+            Assert.True(Assert.IsType<OwnedBuffer<byte>>(responseReceived.Payload).IsValid);
+            Assert.Equal(KernelError.ResponseNotPending, kernel.PublishResponse(source, endpoints.Right, requestSequence, payload).Error);
+            return;
+        }
+        var sent = pair ? kernel.SendOwnershipPair(source, target, endpoints.Left, 1, borrowed!, payload)
+            : kernel.Send(source, target, endpoints.Left, 1, payload);
+        Assert.True(sent.IsSuccess);
+        Assert.NotNull(received);
+        Assert.Equal(sent.Value!.Sequence, received!.Sequence);
+        Assert.False(payload.IsValid);
+        var moved = Assert.IsType<OwnedBuffer<byte>>(pair ? received.SecondaryPayload : received.Payload);
+        Assert.True(moved.IsValid);
+        if (pair) Assert.True(kernel.ReturnBorrow(target, Assert.IsType<BorrowLease<byte>>(received.Payload).Handle).IsSuccess);
+    }
+
+    private sealed class TransferClock : TimeProvider
+    {
+        internal Action? Next;
+        public override long GetTimestamp() { var callback = Next; Next = null; callback?.Invoke(); return base.GetTimestamp(); }
+    }
+
+    [Theory]
     [InlineData(0, 0)]
     [InlineData(0, 1)]
     [InlineData(0, 2)]

@@ -16,6 +16,8 @@
     <ProjectReference Include="../../../../../../sdk/SingPlus.Generators/SingPlus.Generators.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" PrivateAssets="all" />
     <ProjectReference Include="../../../../../../sdk/SingPlus.Sip.Sdk/SingPlus.Sip.Sdk.csproj" />
     <ProjectReference Include="../../../../../../src/Sip/SingPlus.Sip/SingPlus.Sip.csproj" />
+    <Compile Include="SnakeContract.cs" />
+    <Compile Include="SnakeBindings.cs" />
     <Compile Include="CounterContract.cs" />
     <Compile Include="CounterBindings.cs" />
     <Compile Include="ForbiddenApi.cs" Condition="'$(IncludeForbiddenApi)' == 'true'" />

@@ -9,6 +9,93 @@ namespace SingPlus.Tests.Platform;
 public sealed class PlatformBoundedCopyFallbackTests
 {
     [Fact]
+    public void GenericUnsupportedAfterTargetMappingEffectCannotRematerializeOrReclaimBacking()
+    {
+        var s = CreateScenario(bufferLength: 256, rejectTargetMapping: true);
+        s.Provider.TargetRejectionStatus = PlatformAuthorityStatus.Unsupported;
+        var storage = StorageIdentity(s.Buffer);
+        var result = s.Kernel.MovePlatformOwnedBuffer(s.Source, s.Target, s.Buffer, s.SourceMapping,
+            s.TargetRequest, new PlatformBoundedCopyFallbackPolicy(256));
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.False(s.Buffer.IsValid);
+        Assert.Equal(PlatformMoveTargetExposureState.LocalOwnershipFallback, result.Value!.TargetExposure);
+        Assert.Equal(KernelError.PlatformBindingActive, result.Value.TargetExposureError);
+        Assert.Null(result.Value.BoundedCopy);
+        Assert.Same(storage, StorageIdentity(result.Value.Buffer));
+        Assert.Equal(1, s.Provider.UnclosedTargetMappings);
+        Assert.True(s.Kernel.Regions.HasPlatformMappingReservation(result.Value.Buffer.Handle,
+            new RegionOwner(new DomainId(1020), s.Target.Generation)));
+        Assert.False(s.Kernel.ReleaseRegion(s.Target, result.Value.Buffer).IsSuccess);
+        Assert.False(s.Kernel.TerminateProcess(s.Target).IsSuccess);
+        Assert.Equal(RegionState.Owned, s.Kernel.Regions.Snapshot().Single(r =>
+            r.Handle == result.Value.Buffer.Handle).State);
+        Assert.Equal(1, s.Provider.TargetMapAttempts);
+        Assert.Equal(0, s.Provider.TargetRevokeCalls);
+    }
+
+    [Fact]
+    public void ActualMappingAdmissionBeforeFallbackPreservesStorageUntilExactRevoke()
+    {
+        var s = CreateScenario(bufferLength: 256, rejectTargetMapping: true);
+        var storage = StorageIdentity(s.Buffer);
+        PlatformOwnedRegionSliceMapping? admitted = null;
+        s.Kernel.BeforeBoundedCopyRematerializationQualificationHook = () =>
+        {
+            s.Provider.RejectTargetDomain = null;
+            var region = Assert.Single(s.Kernel.Regions.Snapshot(), r => r.Owner.DomainId == new DomainId(1020));
+            var mapped = s.Kernel.MapPlatformOwnedRegionSlice(s.Target, s.TargetRequest.Binding,
+                s.TargetRequest.CapabilityId, region.Handle, 0, 256, PlatformMemoryAccess.Read);
+            Assert.True(mapped.IsSuccess, mapped.Message);
+            admitted = mapped.Value!;
+        };
+        var moved = s.Kernel.MovePlatformOwnedBuffer(s.Source, s.Target, s.Buffer, s.SourceMapping,
+            s.TargetRequest, new PlatformBoundedCopyFallbackPolicy(256));
+        Assert.True(moved.IsSuccess, moved.Message);
+        Assert.False(s.Buffer.IsValid);
+        Assert.Equal(PlatformMoveTargetExposureState.LocalOwnershipFallback, moved.Value!.TargetExposure);
+        Assert.Equal(KernelError.PlatformBindingActive, moved.Value.TargetExposureError);
+        Assert.Null(moved.Value.BoundedCopy);
+        Assert.Same(storage, StorageIdentity(moved.Value.Buffer));
+        Assert.True(s.Kernel.PlatformAuthority.HasActiveMapping(admitted!.Value.Region));
+        Assert.False(s.Kernel.ReleaseRegion(s.Target, moved.Value.Buffer).IsSuccess);
+        Assert.True(s.Kernel.RevokePlatformRegionMapping(s.Target, admitted.Value).IsSuccess);
+        Assert.True(s.Kernel.ReleaseRegion(s.Target, moved.Value.Buffer).IsSuccess);
+        Assert.False(moved.Value.Buffer.IsValid);
+        Assert.Equal(2, s.Provider.TargetMapAttempts);
+        Assert.Equal(1, s.Provider.TargetRevokeCalls);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ExistingUseOrTargetExitBeforeReplacementCannotPublishCopiedBacking(bool exit)
+    {
+        var s = CreateScenario(bufferLength: 256, rejectTargetMapping: true);
+        var storage = StorageIdentity(s.Buffer);
+        RegionUseDescriptor? held = null;
+        s.Kernel.BeforeBoundedCopyRematerializationQualificationHook = () =>
+        {
+            if (exit) { _ = s.Kernel.TerminateProcess(s.Target); return; }
+            var region = Assert.Single(s.Kernel.Regions.Snapshot(), r => r.Owner.DomainId == new DomainId(1020));
+            held = s.Kernel.AcquireRegionUse(s.Target, region.Handle, RegionUseMode.ExclusiveRead, new(0, 256)).Value!;
+        };
+        var moved = s.Kernel.MovePlatformOwnedBuffer(s.Source, s.Target, s.Buffer, s.SourceMapping,
+            s.TargetRequest, new PlatformBoundedCopyFallbackPolicy(256));
+        Assert.False(s.Buffer.IsValid);
+        if (exit) Assert.False(moved.IsSuccess);
+        else
+        {
+            Assert.True(moved.IsSuccess, moved.Message);
+            Assert.Equal(PlatformMoveTargetExposureState.LocalOwnershipFallback, moved.Value!.TargetExposure);
+            Assert.Equal(KernelError.RegionUseConflict, moved.Value.TargetExposureError);
+            Assert.Null(moved.Value.BoundedCopy);
+            Assert.Same(storage, StorageIdentity(moved.Value.Buffer));
+            Assert.True(s.Kernel.ReleaseRegionUse(s.Target, held!.Handle).IsSuccess);
+            Assert.True(s.Kernel.ReleaseRegion(s.Target, moved.Value.Buffer).IsSuccess);
+        }
+    }
+
+    [Fact]
     public void CopyFallbackLimitIsRejectedBeforeSourceDrain()
     {
         var scenario = CreateScenario(bufferLength: 256, rejectTargetMapping: true);
@@ -48,7 +135,7 @@ public sealed class PlatformBoundedCopyFallbackTests
     }
 
     [Fact]
-    public void UnsupportedTargetMappingRematerializesFullBufferThroughBoundedCopy()
+    public void NotAcceptedTargetMappingRematerializesFullBufferThroughBoundedCopy()
     {
         var scenario = CreateScenario(bufferLength: 256, rejectTargetMapping: true);
         for (var i = 0; i < scenario.Buffer.Length; i++)
@@ -73,7 +160,7 @@ public sealed class PlatformBoundedCopyFallbackTests
             result.Value.TargetExposure);
         Assert.Null(result.Value.TargetMapping);
         Assert.Null(result.Value.TargetPublication);
-        Assert.Equal(KernelError.PlatformUnsupported, result.Value.TargetExposureError);
+        Assert.Equal(KernelError.PlatformFaulted, result.Value.TargetExposureError);
 
         var copy = Assert.NotNull(result.Value.BoundedCopy);
         Assert.True(copy.IsExactAndBounded);
@@ -318,6 +405,9 @@ public sealed class PlatformBoundedCopyFallbackTests
         private ulong _nextOperation = 1;
 
         public DomainId? RejectTargetDomain { get; set; }
+        public PlatformAuthorityStatus TargetRejectionStatus { get; set; } = PlatformAuthorityStatus.NotAccepted;
+        public int UnclosedTargetMappings => _mappings.Values.Count(record =>
+            record.Mapping.Lease.DomainLease.Subject.DomainId == new DomainId(1020) && !record.Revoked);
         public DomainId? RejectPublicationDomain { get; set; }
         public int BeginRevokeCalls { get; private set; }
         public int AcquireCalls { get; private set; }
@@ -387,12 +477,12 @@ public sealed class PlatformBoundedCopyFallbackTests
             }
 
             if (RejectTargetDomain is { } targetDomain &&
-                domainLease.Subject.DomainId == targetDomain)
+                domainLease.Subject.DomainId == targetDomain && TargetRejectionStatus == PlatformAuthorityStatus.NotAccepted)
             {
                 TargetMapAttempts++;
                 return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(
-                    PlatformAuthorityStatus.Unsupported,
-                    "Target exact mapping is unavailable.");
+                    PlatformAuthorityStatus.NotAccepted,
+                    "Target exact mapping was refused before creating a lease.");
             }
 
             if (domainLease.Subject.DomainId == new DomainId(1020))
@@ -406,6 +496,9 @@ public sealed class PlatformBoundedCopyFallbackTests
                 slice.Access);
             var mapped = new PlatformProviderOwnedRegionMapping(lease, slice);
             _mappings.Add(lease.MappingId, new MappingRecord(mapped));
+            if (RejectTargetDomain == domainLease.Subject.DomainId)
+                return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(
+                    TargetRejectionStatus, "Generic target rejection after mapping effect.");
             return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Ok(mapped);
         }
 

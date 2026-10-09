@@ -8,6 +8,319 @@ public sealed class VNextPhase16DurableResourceAdmissionTests
     private static readonly byte[] Key = Enumerable.Range(33, 32).Select(static value => (byte)value).ToArray();
 
     [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)]
+    public void PostJournalAdmissionSeesLiveOwnersBeforeCreatingPossibleEffect(int fault)
+    {
+        WithJournalStore((path, context, store) =>
+        {
+            using var commit = Prepare(context).Value!;
+            int calls = 0, observations = 0;
+            bool mutationAccepted = false, outsideLocks = true, reentryBlocked = false;
+            store.AfterFrameWrite = () =>
+            {
+                store.AfterFrameWrite = null;
+                foreach (var owner in new object[] { context.Kernel.CapabilityAuthority, context.Kernel.ExternalOperations, context.Kernel.Budgets })
+                {
+                    var field = owner.GetType().GetField("_gate",
+                        global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic);
+                    outsideLocks &= field is not null && !Monitor.IsEntered(field.GetValue(owner)!);
+                }
+                reentryBlocked = !context.Kernel.SubmitResourceExternalAdmission(commit, context.Dependencies,
+                    () => { calls++; return KernelResult.Ok(); }).IsSuccess;
+                mutationAccepted = fault switch
+                {
+                    1 => context.Kernel.CapabilityAuthority.Revoke(commit.EffectCapability).IsSuccess,
+                    2 => context.Kernel.CapabilityAuthority.Revoke(commit.ResourceGrant).IsSuccess,
+                    3 => context.Kernel.Budgets.QuarantineLease(commit.BudgetOwner, commit.Lease).IsSuccess,
+                    4 => context.Kernel.ExternalOperations.RecordSubmission(context.Operation, context.Dependencies).IsSuccess,
+                    _ => true
+                };
+            };
+            var result = context.Kernel.SubmitResourceExternalAdmissionWithBinding(commit, context.Dependencies,
+                _ => { calls++; return KernelResult.Ok(); }, preSubmitFailureObservation: () => observations++);
+            Assert.True(mutationAccepted); Assert.True(outsideLocks); Assert.True(reentryBlocked);
+            var owner = context.Kernel.ExternalOperations.Query(context.Operation).Value!;
+            var resource = context.Kernel.ExternalOperations.QueryResourceBinding(context.Operation).Value!;
+            var budget = context.Kernel.QueryBudget(commit.Lease).Value!;
+            var cold = Kernel(path).ResourceBudgetRecovery!;
+            if (fault == 0)
+            {
+                Assert.True(result.IsSuccess, result.Message);
+                Assert.Equal(1, calls); Assert.Equal(0, observations);
+                Assert.Equal(ExternalOperationState.Submitted, owner.State);
+                Assert.Equal(BudgetReservationState.Consuming, budget.State);
+                Assert.Equal(ResourceBudgetRecoveryTransition.PossibleSubmit, Assert.Single(cold.Items).LastPayload.Transition);
+            }
+            else
+            {
+                Assert.False(result.IsSuccess); Assert.Equal(0, calls); Assert.Equal(1, observations);
+                if (fault is 1 or 2)
+                {
+                    Assert.Null(owner.Binding);
+                    Assert.Equal(ExternalEffectBoundaryState.NotCrossed, owner.EffectBoundary);
+                    Assert.DoesNotContain(owner.Transitions, item => item.To == ExternalOperationState.Submitted);
+                    Assert.Equal(BudgetReservationState.CancelledPreSubmit, budget.State);
+                    Assert.Equal(ExternalResourceBindingState.CancelledPreSubmit, resource.State);
+                    Assert.Equal(ResourceBudgetRecoveryTransition.SettledContained, Assert.Single(cold.Items).LastPayload.Transition);
+                    Assert.Empty(cold.ConservativeRecoveryCharge);
+                }
+                else
+                {
+                    if (fault == 3) Assert.Null(owner.Binding);
+                    else Assert.NotNull(owner.Binding);
+                    Assert.Equal(BudgetReservationState.Quarantined, budget.State);
+                    Assert.Equal(ExternalResourceBindingState.Quarantined, resource.State);
+                    Assert.Equal(10UL, Assert.Single(cold.ConservativeRecoveryCharge).Amount);
+                }
+            }
+            Assert.Equal(fault == 0 ? 2UL : 3UL, cold.LastSequence);
+        });
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)] [InlineData(5)]
+    public void LostCancellationFrameCannotLowerColdChargeWithoutExactOriginalOwnerTuple(int drift)
+    {
+        WithJournalStore((path, context, store) =>
+        {
+            using var commit = Prepare(context).Value!;
+            store.ThrowUnexpectedException = true;
+            store.ThrowAfterNextWrite = true;
+            store.BeforeAppendFailure = () => store.ThrowBeforeNextWrite = true;
+            int calls = 0;
+            Assert.Equal(KernelError.Quarantined, context.Kernel.SubmitResourceExternalAdmission(commit,
+                context.Dependencies, () => { calls++; return KernelResult.Ok(); }).Error);
+            Assert.Equal(BudgetReservationState.CancelledPreSubmit, context.Kernel.QueryBudget(commit.Lease).Value!.State);
+            var lease = drift == 0 ? new BudgetReservationHandle(commit.Lease.ReservationId,
+                new(commit.Lease.Generation.Value + 1)) : commit.Lease;
+            var owner = drift == 1 ? commit.BudgetOwner with { Generation = commit.BudgetOwner.Generation + 1 } : commit.BudgetOwner;
+            var correlation = drift == 2 ? commit.ProviderCorrelation with
+            {
+                CorrelationId = new(commit.ProviderCorrelation.CorrelationId.Value + 1)
+            } : drift == 3 ? commit.ProviderCorrelation with
+            {
+                Generation = new(commit.ProviderCorrelation.Generation.Value + 1)
+            } : commit.ProviderCorrelation;
+            var envelope = drift == 4 ? commit.Envelope with { Amount = commit.Envelope.Amount + 1 } : commit.Envelope;
+            IReadOnlyList<BudgetAmount> charge = drift == 5 ? [new(ServiceBudgetDimension.ComputeTimeNanoseconds, 1)] : [];
+            var writer = typeof(RuntimeKernel).GetMethod("AppendResourceRecovery",
+                global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!;
+            var refused = (KernelResult)writer.Invoke(context.Kernel,
+                [lease, owner, envelope, correlation, ResourceBudgetRecoveryTransition.CancelledPreSubmit, charge])!;
+            Assert.Equal(KernelError.Quarantined, refused.Error);
+            var pinned = Kernel(path).ResourceBudgetRecovery!;
+            Assert.Equal(2UL, pinned.LastSequence);
+            Assert.True(pinned.BlocksFreshAdmission);
+            Assert.Equal(10UL, Assert.Single(pinned.ConservativeRecoveryCharge).Amount);
+            Assert.True(context.Kernel.CompensateResourceAdmissionBeforeSubmit(commit).IsSuccess);
+            Assert.True(context.Kernel.CompensateResourceAdmissionBeforeSubmit(commit).IsSuccess);
+            var recovered = Kernel(path).ResourceBudgetRecovery!;
+            Assert.Equal(3UL, recovered.LastSequence);
+            Assert.False(recovered.BlocksFreshAdmission);
+            Assert.Empty(recovered.ConservativeRecoveryCharge);
+            Assert.Equal(ResourceBudgetRecoveryTransition.SettledContained, Assert.Single(recovered.Items).LastPayload.Transition);
+            Assert.Equal(0, calls);
+        });
+    }
+
+    [Theory]
+    [InlineData(false, false)] [InlineData(true, false)] [InlineData(false, true)] [InlineData(true, true)]
+    public void UnexpectedPossibleSubmitAppendFailureCompensatesOnlyOriginalPreEffectOwners(bool frameWritten, bool ownerSubmitted)
+    {
+        WithJournalStore((path, context, store) =>
+        {
+            using var commit = Prepare(context).Value!;
+            int calls = 0, observations = 0;
+            bool otherSubmitAccepted = false;
+            store.ThrowUnexpectedException = true;
+            store.ThrowBeforeNextWrite = !frameWritten;
+            store.ThrowAfterNextWrite = frameWritten;
+            if (ownerSubmitted) store.BeforeAppendFailure = () =>
+                otherSubmitAccepted = context.Kernel.ExternalOperations.RecordSubmission(
+                    context.Operation, context.Dependencies).IsSuccess;
+            var result = context.Kernel.SubmitResourceExternalAdmissionWithBinding(commit,
+                context.Dependencies, _ => { calls++; return KernelResult.Ok(); },
+                preSubmitFailureObservation: () => observations++);
+            Assert.Equal(KernelError.Quarantined, result.Error);
+            Assert.Equal(0, calls);
+            Assert.Equal(1, observations);
+            if (ownerSubmitted) Assert.True(otherSubmitAccepted);
+            var owner = context.Kernel.QueryExternalOperation(context.Process, context.Operation).Value!;
+            var resource = context.Kernel.ExternalOperations.QueryResourceBinding(context.Operation).Value!;
+            var budget = context.Kernel.QueryBudget(commit.Lease).Value!;
+            Assert.Equal(ownerSubmitted ? BudgetReservationState.Quarantined : BudgetReservationState.CancelledPreSubmit, budget.State);
+            Assert.Equal(ownerSubmitted ? ExternalResourceBindingState.Quarantined : ExternalResourceBindingState.CancelledPreSubmit, resource.State);
+            if (ownerSubmitted) Assert.NotNull(owner.Binding);
+            else { Assert.Null(owner.Binding); Assert.Equal(ExternalOperationDisposition.Cancelled, owner.Disposition); }
+            var cold = Kernel(path).ResourceBudgetRecovery!;
+            Assert.Equal(frameWritten ? 3UL : 2UL, cold.LastSequence);
+            Assert.Equal(ownerSubmitted ? ResourceBudgetRecoveryTransition.Quarantined : frameWritten
+                    ? ResourceBudgetRecoveryTransition.SettledContained : ResourceBudgetRecoveryTransition.CancelledPreSubmit,
+                Assert.Single(cold.Items).LastPayload.Transition);
+            if (ownerSubmitted) Assert.Equal(10UL, Assert.Single(cold.ConservativeRecoveryCharge).Amount);
+            else Assert.Empty(cold.ConservativeRecoveryCharge);
+            Assert.Equal(KernelError.InvalidTransition, context.Kernel.SubmitResourceExternalAdmission(commit,
+                context.Dependencies, () => { calls++; return KernelResult.Ok(); }).Error);
+            commit.Dispose();
+            Assert.Equal(0, calls);
+            Assert.Equal(cold.LastSequence, Kernel(path).ResourceBudgetRecovery!.LastSequence);
+            Assert.Equal(ownerSubmitted ? 10UL : 0UL, context.Kernel.Budgets.Query(context.ProcessBudget).Value!.Usage
+                .Single(usage => usage.Dimension == ServiceBudgetDimension.ComputeTimeNanoseconds).Used);
+        });
+    }
+
+    [Theory]
+    [InlineData(0UL, 0)] [InlineData(0UL, 1)] [InlineData(0UL, 2)] [InlineData(0UL, 3)] [InlineData(0UL, 4)]
+    [InlineData(4UL, 0)] [InlineData(4UL, 1)] [InlineData(4UL, 2)] [InlineData(4UL, 3)] [InlineData(4UL, 4)]
+    public void ExceptionalSettlementRetainsOriginalFactsAndBalancesOnlyItsAttempt(ulong consumed, int boundary)
+    {
+        WithJournalStore((path, context, store) =>
+        {
+            using var commit = Prepare(context).Value!;
+            var binding = context.Kernel.SubmitResourceExternalAdmission(commit,
+                context.Dependencies, KernelResult.Ok).Value!;
+            Assert.True(context.Kernel.RecordExternalOperationCompletion(context.Process,
+                new(binding, ExternalOperationCompletionDisposition.Completed)).IsSuccess);
+            var evidence = Evidence(binding, consumed);
+            bool outsideLocks = true, reentryBlocked = false;
+            void Interrupt()
+            {
+                foreach (var owner in new object[] { context.Kernel.ExternalOperations, context.Kernel.Budgets })
+                    outsideLocks &= !Monitor.IsEntered(owner.GetType().GetField("_gate",
+                        global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.GetValue(owner)!);
+                reentryBlocked = !context.Kernel.SettleResourceExternalOperation(context.Process, evidence).IsSuccess;
+                throw new InvalidOperationException("Settlement callback interrupted");
+            }
+            if (boundary == 0) context.Kernel.ResourceSettlementAfterBeginQualificationHook = Interrupt;
+            if (boundary == 1) context.Kernel.ResourceSettlementAfterBudgetQualificationHook = Interrupt;
+            if (boundary == 2) context.Kernel.ResourceSettlementAfterJournalQualificationHook = Interrupt;
+            store.ThrowUnexpectedException = boundary >= 3;
+            store.ThrowBeforeNextWrite = boundary == 3;
+            store.ThrowAfterNextWrite = boundary == 4;
+            Assert.Equal(KernelError.Quarantined,
+                context.Kernel.SettleResourceExternalOperation(context.Process, evidence).Error);
+            if (boundary <= 2) { Assert.True(outsideLocks); Assert.True(reentryBlocked); }
+            var original = context.Kernel.ExternalOperations.QueryResourceBinding(context.Operation).Value!;
+            Assert.Equal(ExternalResourceBindingState.Quarantined, original.State);
+            Assert.False(original.SettlementInFlight);
+            Assert.Equal(evidence.Usage, original.TerminalUsage);
+            Assert.Equal(evidence.EvidenceId, original.TerminalEvidenceId);
+            Assert.Equal(boundary == 0 ? BudgetReservationState.Consuming : BudgetReservationState.Released,
+                context.Kernel.QueryBudget(commit.Lease).Value!.State);
+            var cold = Kernel(path).ResourceBudgetRecovery!;
+            var expectedCharge = boundary is 2 or 4 ? consumed : 10UL;
+            if (expectedCharge == 0) Assert.Empty(cold.ConservativeRecoveryCharge);
+            else Assert.Equal(expectedCharge, Assert.Single(cold.ConservativeRecoveryCharge).Amount);
+            Assert.False(context.Kernel.ReleaseExternalOperation(context.Process, context.Operation, new(true, false)).IsSuccess);
+            context.Kernel.ResourceSettlementAfterBeginQualificationHook = null;
+            context.Kernel.ResourceSettlementAfterBudgetQualificationHook = null;
+            context.Kernel.ResourceSettlementAfterJournalQualificationHook = null;
+            Assert.Equal(KernelError.InvalidTransition,
+                context.Kernel.SettleResourceExternalOperation(context.Process, evidence with { ReceiptSequence = 2 }).Error);
+            Assert.True(context.Kernel.SettleResourceExternalOperation(context.Process, evidence).IsSuccess);
+            Assert.True(context.Kernel.SettleResourceExternalOperation(context.Process, evidence).IsSuccess);
+            Assert.Equal(3UL, Kernel(path).ResourceBudgetRecovery!.LastSequence);
+            Assert.Equal(consumed, context.Kernel.Budgets.Query(context.ProcessBudget).Value!.Usage
+                .Single(usage => usage.Dimension == ServiceBudgetDimension.ComputeTimeNanoseconds).Used);
+        });
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void LateSettlementExitCannotCompleteNestedRetryAttempt(bool throws)
+    {
+        WithJournal((path, context) =>
+        {
+            using var commit = Prepare(context).Value!;
+            var submitted = context.Kernel.SubmitResourceExternalAdmission(commit,
+                context.Dependencies, KernelResult.Ok).Value!;
+            Assert.True(context.Kernel.RecordExternalOperationCompletion(context.Process,
+                new(submitted, ExternalOperationCompletionDisposition.Completed)).IsSuccess);
+            var evidence = Evidence(submitted, 4);
+            ExternalOperationResourceBinding? nested = null;
+            context.Kernel.ResourceSettlementAfterJournalQualificationHook = () =>
+            {
+                var outer = context.Kernel.ExternalOperations.QueryResourceBinding(context.Operation).Value!;
+                Assert.True(context.Kernel.ExternalOperations.CompleteResourceSettlement(context.Operation,
+                    commit.Lease, false, outer.SettlementAttempt).IsSuccess);
+                nested = context.Kernel.ExternalOperations.BeginResourceSettlement(evidence).Value!;
+                Assert.NotSame(outer.SettlementAttempt, nested.SettlementAttempt);
+                if (throws) throw new InvalidOperationException("Late outer callback");
+            };
+            Assert.Equal(throws ? KernelError.Quarantined : KernelError.StaleGeneration,
+                context.Kernel.SettleResourceExternalOperation(context.Process, evidence).Error);
+            var current = context.Kernel.ExternalOperations.QueryResourceBinding(context.Operation).Value!;
+            Assert.Same(nested!.SettlementAttempt, current.SettlementAttempt);
+            Assert.True(current.SettlementInFlight);
+            Assert.Equal(ExternalResourceBindingState.Settling, current.State);
+            Assert.Equal(3UL, Kernel(path).ResourceBudgetRecovery!.LastSequence);
+            Assert.False(context.Kernel.SettleResourceExternalOperation(context.Process, evidence).IsSuccess);
+            Assert.True(context.Kernel.ExternalOperations.CompleteResourceSettlement(context.Operation,
+                commit.Lease, false, nested.SettlementAttempt).IsSuccess);
+            context.Kernel.ResourceSettlementAfterJournalQualificationHook = null;
+            Assert.True(context.Kernel.SettleResourceExternalOperation(context.Process, evidence).IsSuccess);
+            Assert.Equal(3UL, Kernel(path).ResourceBudgetRecovery!.LastSequence);
+            Assert.Equal(4UL, context.Kernel.Budgets.Query(context.ProcessBudget).Value!.Usage
+                .Single(usage => usage.Dimension == ServiceBudgetDimension.ComputeTimeNanoseconds).Used);
+        });
+    }
+
+    [Theory]
+    [InlineData(false, 0)] [InlineData(false, 1)] [InlineData(false, 2)] [InlineData(false, 3)]
+    [InlineData(true, 0)] [InlineData(true, 1)] [InlineData(true, 2)] [InlineData(true, 3)]
+    public void JournalFailurePinsOriginalUsageReceiptDespiteEqualNormalizedCharge(bool frameWritten, int conflict)
+    {
+        WithJournalStore((path, context, store) =>
+        {
+            using var commit = Prepare(context).Value!;
+            var binding = context.Kernel.SubmitResourceExternalAdmission(commit,
+                context.Dependencies, KernelResult.Ok).Value!;
+            Assert.True(context.Kernel.RecordExternalOperationCompletion(context.Process,
+                new(binding, ExternalOperationCompletionDisposition.Completed)).IsSuccess);
+            var evidence = Evidence(binding, 4) with
+            {
+                Usage = new(1, 0, 0, 1, 1, 1, 37, 1, 0, 41)
+            };
+            store.ThrowBeforeNextWrite = !frameWritten;
+            store.ThrowAfterNextWrite = frameWritten;
+            Assert.Equal(KernelError.Quarantined,
+                context.Kernel.SettleResourceExternalOperation(context.Process, evidence).Error);
+            var original = context.Kernel.ExternalOperations.QueryResourceBinding(context.Operation).Value!;
+            Assert.Equal(ExternalResourceBindingState.Quarantined, original.State);
+            Assert.False(original.SettlementInFlight);
+            Assert.Equal(BudgetReservationState.Released, context.Kernel.QueryBudget(commit.Lease).Value!.State);
+            var before = Kernel(path).ResourceBudgetRecovery!;
+            Assert.Equal(frameWritten ? 4UL : 10UL, Assert.Single(before.ConservativeRecoveryCharge).Amount);
+            var changed = conflict switch
+            {
+                0 => evidence with { ReceiptSequence = evidence.ReceiptSequence + 1 },
+                1 => evidence with { EvidenceId = Guid.NewGuid() },
+                2 => evidence with { Usage = evidence.Usage with { Executed = 0, Squashed = 2 } },
+                _ => evidence with { Usage = evidence.Usage with { Retired = 38, StalledOrBlocked = 42 } }
+            };
+            Assert.Equal(4UL, ResourceChargeabilityMatrixV1.For(ResourceClassV1.ComputeTime).Normalize(changed.Usage));
+            Assert.Equal(KernelError.InvalidTransition,
+                context.Kernel.SettleResourceExternalOperation(context.Process, changed).Error);
+            Assert.Equal(original, context.Kernel.ExternalOperations.QueryResourceBinding(context.Operation).Value!);
+            Assert.Equal(before.LastSequence, Kernel(path).ResourceBudgetRecovery!.LastSequence);
+            Assert.False(context.Kernel.ReleaseExternalOperation(context.Process, context.Operation, new(true, false)).IsSuccess);
+            Assert.True(context.Kernel.SettleResourceExternalOperation(context.Process, evidence).IsSuccess);
+            var after = Kernel(path).ResourceBudgetRecovery!;
+            Assert.Equal(3UL, after.LastSequence);
+            Assert.Equal(4UL, Assert.Single(after.ConservativeRecoveryCharge).Amount);
+            var settled = context.Kernel.ExternalOperations.QueryResourceBinding(context.Operation).Value!;
+            Assert.Equal(ExternalResourceBindingState.Settled, settled.State);
+            Assert.Equal(evidence.Usage, settled.TerminalUsage);
+            Assert.Equal(4UL, context.Kernel.Budgets.Query(context.ProcessBudget).Value!.Usage
+                .Single(usage => usage.Dimension == ServiceBudgetDimension.ComputeTimeNanoseconds).Used);
+            Assert.Equal(KernelError.InvalidTransition,
+                context.Kernel.SettleResourceExternalOperation(context.Process, changed).Error);
+            Assert.True(context.Kernel.SettleResourceExternalOperation(context.Process, evidence).IsSuccess);
+            Assert.Equal(3UL, Kernel(path).ResourceBudgetRecovery!.LastSequence);
+        });
+    }
+
+    [Theory]
     [InlineData(0)]
     [InlineData(1)]
     [InlineData(2)]
@@ -511,17 +824,25 @@ public sealed class VNextPhase16DurableResourceAdmissionTests
     {
         internal bool ThrowAfterNextWrite { get; set; }
         internal bool ThrowBeforeNextWrite { get; set; }
+        internal bool ThrowUnexpectedException { get; set; }
+        internal Action? BeforeAppendFailure { get; set; }
+        internal Action? AfterFrameWrite { get; set; }
         public IReadOnlyList<byte[]> ReadFrames() => inner.ReadFrames();
         public void AppendFrame(ReadOnlySpan<byte> frame)
         {
             if (ThrowBeforeNextWrite)
             {
                 ThrowBeforeNextWrite = false;
+                BeforeAppendFailure?.Invoke(); BeforeAppendFailure = null;
+                if (ThrowUnexpectedException) throw new InvalidOperationException("Unexpected append rejection before file frame.");
                 throw new IOException("Simulated append rejection before any file frame.");
             }
             inner.AppendFrame(frame);
+            AfterFrameWrite?.Invoke();
             if (!ThrowAfterNextWrite) return;
             ThrowAfterNextWrite = false;
+            BeforeAppendFailure?.Invoke(); BeforeAppendFailure = null;
+            if (ThrowUnexpectedException) throw new InvalidOperationException("Unexpected lost append acknowledgement after full file frame.");
             throw new IOException("Simulated lost append acknowledgement after full file frame.");
         }
     }

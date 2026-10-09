@@ -629,6 +629,16 @@ public interface IPlatformChildDomainProvider
         PlatformProviderChildDomainLease lease);
 }
 
+/// <summary>Optional exact disposition for this create invocation only. A true
+/// refusal proves no create effect for the supplied parent/intent; it is never
+/// permission or closure of an earlier invocation. Generic status is insufficient.</summary>
+public interface IPlatformChildCreateDispositionProvider : IPlatformChildDomainProvider
+{
+    PlatformAuthorityResult<PlatformProviderChildDomainLease> CreateChildDomain(
+        PlatformProviderDomainLease parentLease, PlatformChildDomainIntent intent,
+        out bool refusedBeforeEffect);
+}
+
 public interface IPlatformGuestMemoryProvider
 {
     PlatformAuthorityResult<PlatformProviderGuestRegionMappingLease> MapGuestRegion(

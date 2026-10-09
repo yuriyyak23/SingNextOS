@@ -10,6 +10,39 @@ namespace SingPlus.Tests.Contracts;
 public sealed class ComputeServiceCallerCancellationTests
 {
     [Fact]
+    public async Task PreSubmitCancellationRetainsExactCleanupAfterDestinationReleaseCallbackFault()
+    {
+        var provider = new HostPlatformAuthorityProvider();
+        var scenario = CreateScenario(provider, 3405, 3450, 3406, 3460);
+        using var cancellation = new CancellationTokenSource();
+        var response = CreateClient(scenario, cancellation.Token)
+            .CopyAsync(scenario.Source, scenario.Destination).AsTask();
+        cancellation.Cancel();
+        scenario.Kernel.BeforeRegionReleaseQualificationHook = () =>
+        {
+            scenario.Kernel.BeforeRegionReleaseQualificationHook = null;
+            throw new InvalidOperationException("destination release admission callback");
+        };
+
+        Assert.Throws<InvalidOperationException>(() => scenario.Host.ProcessNextCopy());
+        Assert.True(scenario.Host.HasPendingCopy);
+        Assert.Equal(0, provider.SubmitDsc1CopyCallCount);
+        Assert.Equal(0, provider.CancelDsc1CallCount);
+        Assert.Equal(RegionState.Owned, scenario.Kernel.Regions.Snapshot()
+            .Single(r => r.Handle.RegionId == scenario.Destination.Handle.RegionId).State);
+        Assert.Equal(0, scenario.Source.Span[0]);
+        await Assert.ThrowsAsync<OperationCanceledException>(async () => await response);
+
+        Assert.True(scenario.Host.AdvancePendingCopy().IsSuccess);
+        Assert.False(scenario.Host.HasPendingCopy);
+        Assert.Equal(RegionState.Released, scenario.Kernel.Regions.Snapshot()
+            .Single(r => r.Handle.RegionId == scenario.Destination.Handle.RegionId).State);
+        Assert.Equal(0, provider.SubmitDsc1CopyCallCount);
+        Assert.Equal(0, provider.CancelDsc1CallCount);
+        Assert.True(scenario.Kernel.RevokePlatformDomain(scenario.Service, scenario.Binding).IsSuccess);
+    }
+
+    [Fact]
     public async Task CallerCancellationBeforeProviderAcceptanceReturnsBorrowWithoutSubmittingDsc1()
     {
         var provider = new HostPlatformAuthorityProvider();

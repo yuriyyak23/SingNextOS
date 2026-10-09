@@ -33,7 +33,7 @@ public sealed partial class RuntimeKernel
             throw new InvalidOperationException("Native host binding requires an exact caller accepting new effects.");
         lock (_nativeServiceDrainGate)
         {
-            if (_nativeSessionDrains.ContainsKey(session))
+            if (_nativeSessionDrains.ContainsKey(session) || OriginalNativeDrains().Any(record => record.Session == session))
                 throw new InvalidOperationException("A native service host is already bound to this exact endpoint session.");
             if (!_nativeServiceDrains.TryGetValue(service, out var drains))
             {
@@ -52,8 +52,13 @@ public sealed partial class RuntimeKernel
         NativeServiceDrainRegistration registration;
         lock (_nativeServiceDrainGate)
         {
-            if (!_nativeSessionDrains.TryGetValue(session, out registration!))
-                return KernelResult.Ok();
+            registration = OriginalNativeDrains().SingleOrDefault(record => record.Session == session)!;
+            if (registration is null)
+                return _nativeSessionDrains.ContainsKey(session)
+                    ? KernelResult.Fail(KernelError.StaleGeneration, "Native route has no original registration.")
+                    : KernelResult.Ok();
+            if (_nativeSessionDrains.TryGetValue(session, out var routed) && !ReferenceEquals(routed, registration))
+                return KernelResult.Fail(KernelError.StaleGeneration, "Native session route is foreign to the original registration.");
         }
         return DrainNativeServiceRegistration(registration);
     }
@@ -64,7 +69,7 @@ public sealed partial class RuntimeKernel
         NativeServiceDrainRegistration[] work;
         lock (_nativeServiceDrainGate)
         {
-            work = _nativeSessionDrains.Values
+            work = OriginalNativeDrains()
                 .Where(registration => registration.Service == service || sessions.Contains(registration.Session))
                 .Reverse().ToArray();
         }
@@ -75,7 +80,7 @@ public sealed partial class RuntimeKernel
             if (!result.IsSuccess) return result;
         }
         lock (_nativeServiceDrainGate)
-            return _nativeSessionDrains.Values.Any(registration =>
+            return OriginalNativeDrains().Any(registration =>
                 registration.Service == service || sessions.Contains(registration.Session))
                 ? KernelResult.Fail(KernelError.SessionDraining, "Native registrations remain after the captured process drain batch.")
                 : KernelResult.Ok();
@@ -85,7 +90,8 @@ public sealed partial class RuntimeKernel
     {
         lock (_nativeServiceDrainGate)
         {
-            if (!_nativeSessionDrains.TryGetValue(registration.Session, out var current) || !ReferenceEquals(current, registration))
+            if (!OwnsOriginalNativeDrain(registration) ||
+                _nativeSessionDrains.TryGetValue(registration.Session, out var current) && !ReferenceEquals(current, registration))
                 return KernelResult.Fail(KernelError.StaleGeneration, "Captured native drain registration is no longer exact; reconcile through the existing consumer.");
             if (registration.DrainInProgress)
                 return KernelResult.Fail(KernelError.SessionDraining, "Exact native drain callback is already in progress.");
@@ -105,17 +111,27 @@ public sealed partial class RuntimeKernel
                 registration.DrainInProgress = false;
                 // A refused/throwing callback retains the real registration.
                 // Only its own successful producer drain consumes this record.
-                if (completed && _nativeSessionDrains.TryGetValue(registration.Session, out var current) &&
-                    ReferenceEquals(current, registration))
+                if (completed && OwnsOriginalNativeDrain(registration))
                 {
-                    _nativeSessionDrains.Remove(registration.Session);
+                    if (_nativeSessionDrains.TryGetValue(registration.Session, out var current) && ReferenceEquals(current, registration))
+                        _nativeSessionDrains.Remove(registration.Session);
                     if (_nativeServiceDrains.TryGetValue(registration.Service, out var drains))
                     {
-                        drains.Remove(registration);
+                        var exact = drains.FindIndex(record => ReferenceEquals(record, registration));
+                        if (exact >= 0) drains.RemoveAt(exact);
                         if (drains.Count == 0) _nativeServiceDrains.Remove(registration.Service);
                     }
                 }
             }
         }
     }
+
+    // Existing provider inventory retains the same registration objects; session map is routing.
+    // Caller holds the native drain gate. No callback is enumerated or invoked here.
+    private IEnumerable<NativeServiceDrainRegistration> OriginalNativeDrains() =>
+        _nativeServiceDrains.Values.SelectMany(records => records);
+
+    private bool OwnsOriginalNativeDrain(NativeServiceDrainRegistration registration) =>
+        _nativeServiceDrains.TryGetValue(registration.Service, out var records) &&
+        records.Any(record => ReferenceEquals(record, registration));
 }

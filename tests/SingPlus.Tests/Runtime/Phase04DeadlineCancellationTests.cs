@@ -6,7 +6,172 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class Phase04DeadlineCancellationTests
 {
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void DeadlineAdmissionClockCannotInventBeforeEffectAfterOriginalSubmission(bool published)
+    {
+        var clock = new CallbackScopeClock();
+        var kernel = new RuntimeKernel(null, clock);
+        var owner = TestFixtures.Create(kernel, 434, 4034).Handle;
+        var input = kernel.AllocateBuffer<byte>(owner, 8).Value!;
+        var output = kernel.AllocateBuffer<byte>(owner, 8).Value!;
+        var operation = kernel.PrepareExternalOperation(owner,
+            [new(input.Handle, RegionUseMode.ReadOnly, new(0, 8)), new(output.Handle, RegionUseMode.StagedOutput, new(0, 8))],
+            ExternalVisibilityRequirement.PublicationFence, ExternalPublicationPolicy.Staged).Value!.Operation;
+        var scope = kernel.CreateCancellationScope(owner, new(200)).Value!.Scope;
+        OperationBinding binding = default;
+        var effects = 0;
+        clock.Callback = () =>
+        {
+            Assert.True(kernel.AdmitExternalOperation(owner, operation, Dependencies, cancellationScope: scope).IsSuccess);
+            binding = kernel.RecordExternalOperationSubmission(owner, operation, Dependencies).Value;
+            if (published)
+            {
+                Assert.True(kernel.RecordExternalOperationCompletion(owner, new(binding, ExternalOperationCompletionDisposition.Completed)).IsSuccess);
+                Assert.True(kernel.RecordExternalOperationVisibility(owner, new(binding, ExternalVisibilityRequirement.PublicationFence, true)).IsSuccess);
+                Assert.True(kernel.PublishExternalOperation(owner, operation, Dependencies, new(ExternalPublicationPolicy.Staged), () => effects++).IsSuccess);
+            }
+            Assert.True(kernel.RequestCancellation(owner, scope).IsSuccess);
+        };
+        Assert.Equal(KernelError.DeadlineExpired, kernel.AdmitExternalOperation(owner, operation, Dependencies, cancellationScope: scope).Error);
+        var original = kernel.QueryExternalOperation(owner, operation).Value!;
+        Assert.Equal(binding, original.Binding);
+        Assert.Equal(published ? ExternalOperationState.Published : ExternalOperationState.Submitted, original.State);
+        Assert.Equal(published ? CancellationDisposition.TooLateEffectMayExist : CancellationDisposition.ProviderClosurePending,
+            kernel.ObserveCancellation(owner, scope).Value!.Disposition);
+        Assert.False(kernel.ReleaseExternalOperation(owner, operation, new(false, false)).IsSuccess);
+        Assert.False(kernel.ReleaseRegion(owner, input).IsSuccess);
+        if (!published) Assert.True(kernel.RecordExternalOperationCompletion(owner, new(binding, ExternalOperationCompletionDisposition.Cancelled)).IsSuccess);
+        Assert.True(kernel.ReleaseExternalOperation(owner, operation, new(true, false)).IsSuccess);
+        Assert.True(kernel.ReleaseRegion(owner, input).IsSuccess);
+        Assert.True(kernel.ReleaseRegion(owner, output).IsSuccess);
+        Assert.Equal(published ? 1 : 0, effects);
+    }
+
     private static readonly OperationDependencySnapshot Dependencies = new(7, 11);
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)]
+    public void ScopeClockCallbackCanCommitOnAnotherThreadBeforeFreshScopeProjection(int mode)
+    {
+        var clock = new CallbackScopeClock();
+        var kernel = new RuntimeKernel(null, clock);
+        var owner = TestFixtures.Create(kernel, 431, 4031).Handle;
+        var scope = kernel.CreateCancellationScope(owner, new(200)).Value!.Scope;
+        clock.Callback = () =>
+        {
+            var worker = Task.Run(() => kernel.CancellationScopes.Request(owner, scope, 100));
+            Assert.True(worker.Wait(TimeSpan.FromSeconds(5)), "Clock callback ran under scope commit lock.");
+            Assert.True(worker.Result.IsSuccess);
+        };
+        CancellationObservation observed = mode switch
+        {
+            0 => kernel.CreateCancellationScope(owner, new(150), scope).Value!,
+            1 => kernel.RequestCancellation(owner, scope).Value!,
+            2 => kernel.ObserveCancellation(owner, scope).Value!,
+            3 => kernel.CancellationScopes.RecordDisposition(owner, scope,
+                CancellationDisposition.CancelledBeforeEffect).Value!,
+            _ => Assert.Single(kernel.CancellationScopes.InspectionSnapshot(owner)),
+        };
+        Assert.True(observed.CancellationRequested);
+        Assert.Equal(mode == 3 ? CancellationDisposition.CancelledBeforeEffect
+            : CancellationDisposition.CancellationRequested, observed.Disposition);
+        Assert.False(observed.AuthorizesEffect);
+        Assert.False(observed.AuthorizesReclaim);
+        Assert.Equal(1, clock.CallbackCount);
+    }
+
+    [Fact]
+    public void ClockFailureBeforeScopeCreateDoesNotAllocateOrChangeParent()
+    {
+        var clock = new CallbackScopeClock();
+        var kernel = new RuntimeKernel(null, clock);
+        var owner = TestFixtures.Create(kernel, 432, 4032).Handle;
+        var parent = kernel.CreateCancellationScope(owner, new(200)).Value!;
+        clock.Callback = () => throw new InvalidOperationException("clock fault");
+        Assert.Throws<InvalidOperationException>(() => kernel.CreateCancellationScope(owner, new(150), parent.Scope));
+        Assert.Equal(parent, kernel.ObserveCancellation(owner, parent.Scope).Value);
+        var child = kernel.CreateCancellationScope(owner, new(150), parent.Scope).Value!;
+        Assert.Equal(parent.Scope.ScopeId.Value + 1, child.Scope.ScopeId.Value);
+    }
+
+    [Fact]
+    public void ScopeCreateRechecksActualProcessAfterClockCallbackBeforeAllocation()
+    {
+        var clock = new CallbackScopeClock();
+        var kernel = new RuntimeKernel(null, clock);
+        var owner = TestFixtures.Create(kernel, 433, 4033).Handle;
+        clock.Callback = () =>
+        {
+            var worker = Task.Run(() => kernel.TerminateProcess(owner));
+            Assert.True(worker.Wait(TimeSpan.FromSeconds(5)), "Clock callback ran under process commit lock.");
+            Assert.True(worker.Result.IsSuccess);
+        };
+        Assert.False(kernel.CreateCancellationScope(owner, new(200)).IsSuccess);
+        Assert.Empty(kernel.CancellationScopes.InspectionSnapshot(owner));
+    }
+
+    private sealed class CallbackScopeClock : TimeProvider
+    {
+        public Action? Callback { get; set; }
+        public int CallbackCount { get; private set; }
+        public override long GetTimestamp()
+        {
+            var callback = Callback;
+            Callback = null;
+            if (callback is not null) { CallbackCount++; callback(); }
+            return 100;
+        }
+    }
+
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)]
+    public void LateCancellationAndRepeatedReleaseUseOriginalOwnerFactsWithoutInventingContainment(int mode)
+    {
+        var s = CreateExternalScenario();
+        var prepared = Prepare(s);
+        var scope = s.Kernel.CreateCancellationScope(s.Owner).Value!;
+        Assert.True(s.Kernel.AdmitExternalOperation(s.Owner, prepared.Operation, Dependencies,
+            cancellationScope: scope.Scope).IsSuccess);
+        var effects = 0;
+        if (mode is 0 or 3)
+            Assert.True(s.Kernel.CancelExternalOperation(s.Owner, prepared.Operation, false).IsSuccess);
+        else
+        {
+            var binding = s.Kernel.RecordExternalOperationSubmission(s.Owner, prepared.Operation, Dependencies).Value;
+            Assert.True(s.Kernel.RecordExternalOperationCompletion(s.Owner,
+                new(binding, mode == 1 ? ExternalOperationCompletionDisposition.Cancelled : ExternalOperationCompletionDisposition.Completed)).IsSuccess);
+            if (mode == 2)
+            {
+                Assert.True(s.Kernel.RecordExternalOperationVisibility(s.Owner,
+                    new(binding, ExternalVisibilityRequirement.PublicationFence, true)).IsSuccess);
+                Assert.True(s.Kernel.PublishExternalOperation(s.Owner, prepared.Operation, Dependencies,
+                    new(ExternalPublicationPolicy.Staged), () => effects++).IsSuccess);
+            }
+        }
+        Assert.True(s.Kernel.ReleaseExternalOperation(s.Owner, prepared.Operation, new(mode is 1 or 2, false)).IsSuccess);
+        Assert.Equal(CancellationDisposition.Active, s.Kernel.ObserveCancellation(s.Owner, scope.Scope).Value!.Disposition);
+        if (mode == 3) Assert.True(s.Kernel.RequestCancellation(s.Owner, scope.Scope).IsSuccess);
+        else Assert.True(s.Kernel.RequestExternalOperationCancellation(s.Owner, prepared.Operation, scope.Scope, false).IsSuccess);
+        Assert.True(s.Kernel.ReleaseExternalOperation(s.Owner, prepared.Operation, new(false, false)).IsSuccess);
+        var expected = mode is 0 or 3 ? CancellationDisposition.CancelledBeforeEffect
+            : mode == 1 ? CancellationDisposition.ProviderEffectContained : CancellationDisposition.TooLateEffectMayExist;
+        var observed = s.Kernel.ObserveCancellation(s.Owner, scope.Scope).Value!;
+        Assert.Equal(expected, observed.Disposition);
+        Assert.False(observed.AuthorizesReclaim);
+        Assert.False(observed.AuthorizesEffect);
+        Assert.True(s.Kernel.RequestExternalOperationCancellation(s.Owner, prepared.Operation, scope.Scope, false).IsSuccess);
+        Assert.True(s.Kernel.ReleaseExternalOperation(s.Owner, prepared.Operation, new(false, false)).IsSuccess);
+        Assert.Equal(observed.Sequence, s.Kernel.ObserveCancellation(s.Owner, scope.Scope).Value!.Sequence);
+        var original = s.Kernel.QueryExternalOperation(s.Owner, prepared.Operation).Value!;
+        Assert.Equal(ExternalOperationState.Released, original.State);
+        Assert.Equal(mode == 2 ? 1 : 0, effects);
+        Assert.Equal(mode is 0 or 3, original.Binding is null);
+        Assert.Single(original.Transitions, item => item.Event == "Released");
+        Assert.True(s.Kernel.ReleaseRegion(s.Owner, s.Input).IsSuccess);
+        Assert.True(s.Kernel.ReleaseRegion(s.Owner, s.Output).IsSuccess);
+    }
 
     [Fact]
     public void ParentCancellationPropagatesRequestWithoutFabricatingChildClosure()

@@ -5,6 +5,155 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class EffectPublicationSemanticsV1Tests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ProcessStopAfterInitialSnapshotRefusesActionBeforeOwnerAdmission(bool sourceHook)
+    {
+        var c = Ready(ExternalPublicationPolicy.Staged);
+        var before = c.Kernel.QueryExternalOperation(c.Owner, c.Operation).Value!;
+        var blocker = new BlockingComposedWork();
+        c.Kernel.RegisterComposedWorkTeardownParticipant(blocker);
+        c.Kernel.ExternalPublicationBeforeAdmissionQualificationHook = () =>
+        {
+            Assert.False(c.Kernel.TerminateProcess(c.Owner).IsSuccess);
+            Assert.Equal(before.Transitions, c.Kernel.QueryExternalOperation(c.Owner, c.Operation).Value!.Transitions);
+        };
+        var actionCalls = 0;
+        var sourceCalls = 0;
+        KernelResult<ExternalOperationSnapshot> result;
+        try
+        {
+            result = sourceHook
+                ? c.Kernel.PublishExternalOperation(c.Owner, c.Operation, Dependencies,
+                    new(ExternalPublicationPolicy.Staged), _ => actionCalls++, commit => { sourceCalls++; return commit(); })
+                : c.Kernel.PublishExternalOperation(c.Owner, c.Operation, Dependencies,
+                    new(ExternalPublicationPolicy.Staged), () => actionCalls++);
+        }
+        finally { c.Kernel.ExternalPublicationBeforeAdmissionQualificationHook = null; }
+        Assert.False(result.IsSuccess);
+        Assert.Equal(0, actionCalls);
+        Assert.Equal(0, sourceCalls);
+        Assert.Equal(before.Transitions, c.Kernel.QueryExternalOperation(c.Owner, c.Operation).Value!.Transitions);
+        blocker.Blocked = false;
+        Assert.False(c.Kernel.TerminateProcess(c.Owner).IsSuccess);
+        Assert.True(c.Kernel.ReleaseExternalOperation(c.Owner, c.Operation, new(true, false)).IsSuccess);
+        Assert.True(c.Kernel.TerminateProcess(c.Owner).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)]
+    public void SourceAdmissionReplyCannotCreateDecisionOrLeaveInterlock(int fault)
+    {
+        var c = Ready(ExternalPublicationPolicy.Staged);
+        var before = c.Kernel.QueryExternalOperation(c.Owner, c.Operation).Value!;
+        Func<KernelResult<ExternalOperationSnapshot>>? delayed = null;
+        var calls = 0;
+        var result = c.Kernel.ExternalOperations.Publish(c.Operation, Dependencies,
+            new(ExternalPublicationPolicy.Staged), _ => calls++, null, admit =>
+            {
+                delayed = admit;
+                if (fault == 0) return KernelResult<ExternalOperationSnapshot>.Ok(before);
+                if (fault == 3) return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.PlatformDenied, "Controlled refusal.");
+                if (fault == 4)
+                {
+                    var foreign = Task.Run(admit);
+                    Assert.True(foreign.Wait(TimeSpan.FromSeconds(5)));
+                    Assert.False(foreign.Result.IsSuccess);
+                    return KernelResult<ExternalOperationSnapshot>.Ok(before);
+                }
+                Assert.True(admit().IsSuccess);
+                if (fault == 2) throw new InvalidOperationException("Controlled admission reply loss.");
+                return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.PlatformDenied, "Controlled late refusal.");
+            });
+        Assert.False(result.IsSuccess);
+        Assert.Equal(0, calls);
+        Assert.Equal(before.Transitions, c.Kernel.QueryExternalOperation(c.Owner, c.Operation).Value!.Transitions);
+        Assert.False(delayed!().IsSuccess);
+        Assert.True(c.Kernel.PublishExternalOperation(c.Owner, c.Operation, Dependencies,
+            new(ExternalPublicationPolicy.Staged), () => calls++).IsSuccess);
+        Assert.Equal(1, calls);
+    }
+
+    private sealed class BlockingComposedWork : IComposedWorkTeardownParticipant
+    {
+        internal bool Blocked { get; set; } = true;
+        public KernelResult CloseComposedWorkForProcess(ProcessHandle process, RegionOwner owner) =>
+            Blocked ? KernelResult.Fail(KernelError.PlatformBindingDraining, "Controlled pending composition.") : KernelResult.Ok();
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ProcessStopDuringPublicationRetainsLifetimeUntilActionReturnsAndRefusesCommit(bool sourceHook)
+    {
+        var context = Ready(ExternalPublicationPolicy.Staged);
+        var before = context.Kernel.QueryExternalOperation(context.Owner, context.Operation).Value!;
+        using var entered = new ManualResetEventSlim();
+        using var resume = new ManualResetEventSlim();
+        ExternalPublicationDecisionV1 decision = default;
+        Action<ExternalPublicationDecisionV1> action = current =>
+        {
+            decision = current;
+            entered.Set();
+            Assert.True(resume.Wait(TimeSpan.FromSeconds(10)));
+        };
+        var publication = Task.Run(() => sourceHook
+            ? context.Kernel.PublishExternalOperation(context.Owner, context.Operation, Dependencies,
+                new(ExternalPublicationPolicy.Staged), action, commit => commit())
+            : context.Kernel.PublishExternalOperation(context.Owner, context.Operation, Dependencies,
+                new(ExternalPublicationPolicy.Staged), action));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            Assert.False(context.Kernel.TerminateProcess(context.Owner).IsSuccess);
+            var pending = context.Kernel.QueryExternalOperation(context.Owner, context.Operation).Value!;
+            Assert.Equal(before.Disposition, pending.Disposition);
+            Assert.Equal(before.Transitions, pending.Transitions);
+            var called = false;
+            Assert.False(context.Kernel.PublishExternalOperation(context.Owner, context.Operation, Dependencies,
+                new(ExternalPublicationPolicy.Staged), () => called = true).IsSuccess);
+            Assert.False(called);
+            Assert.Equal(pending.Transitions, context.Kernel.QueryExternalOperation(context.Owner, context.Operation).Value!.Transitions);
+            Assert.False(context.Kernel.ReleaseExternalOperation(context.Owner, context.Operation, new(true, false)).IsSuccess);
+        }
+        finally { resume.Set(); }
+        Assert.Equal(KernelError.ExternalEffectUncontained, (await publication).Error);
+        var snapshot = context.Kernel.QueryExternalOperation(context.Owner, context.Operation).Value!;
+        Assert.Equal(ExternalOperationState.Visible, snapshot.State);
+        Assert.Equal(ExternalEffectBoundaryState.PossiblyExternallyVisible, snapshot.EffectBoundary);
+        Assert.Single(snapshot.Transitions, transition => transition.Event == "PublicationEffectAmbiguous");
+        Assert.DoesNotContain(snapshot.Transitions, transition => transition.Event is "Published" or "TeardownResultDiscarded");
+        Assert.False(context.Kernel.TerminateProcess(context.Owner).IsSuccess);
+        var trace = V6ExternalOperationTraceProjection.ProjectPublishedPrefix(snapshot, new string('a', 64));
+        Assert.True(SemanticTraceValidatorV1.Validate(trace).IsValid);
+        // Controlled closure evidence tests the existing retry path, not physical closure.
+        Assert.True(context.Kernel.ReconcileFailedExternalPublication(context.Owner, context.Operation,
+            decision, KernelResult.Ok).IsSuccess);
+        Assert.True(context.Kernel.ReleaseExternalOperation(context.Owner, context.Operation, new(true, false)).IsSuccess);
+        Assert.True(context.Kernel.TerminateProcess(context.Owner).IsSuccess);
+    }
+
+    [Fact]
+    public void SourceHookRunsOutsideProcessStopLockAndCannotPublishAfterStop()
+    {
+        var context = Ready(ExternalPublicationPolicy.Staged);
+        var actionCalls = 0;
+        var result = context.Kernel.PublishExternalOperation(context.Owner, context.Operation, Dependencies,
+            new(ExternalPublicationPolicy.Staged), _ => actionCalls++, commit =>
+            {
+                var stopping = Task.Run(() => context.Kernel.TerminateProcess(context.Owner));
+                Assert.True(stopping.Wait(TimeSpan.FromSeconds(5)));
+                Assert.False(stopping.Result.IsSuccess);
+                return commit();
+            });
+        Assert.Equal(1, actionCalls);
+        Assert.Equal(KernelError.ExternalEffectUncontained, result.Error);
+        var snapshot = context.Kernel.QueryExternalOperation(context.Owner, context.Operation).Value!;
+        Assert.Equal(ExternalEffectBoundaryState.PossiblyExternallyVisible, snapshot.EffectBoundary);
+        Assert.DoesNotContain(snapshot.Transitions, transition => transition.Event == "Published");
+    }
+
     [Fact]
     public void ExistingPoliciesMapOneWayWithoutInventingDurabilityCompensationOrCommutativity()
     {
@@ -45,7 +194,7 @@ public sealed class EffectPublicationSemanticsV1Tests
     }
 
     [Fact]
-    public async Task StagedDecisionIsExactCallbackRunsOutsideOwnerLockAndRacesCannotCrossIt()
+    public async Task StagedDecisionIsExactCallbackRunsOutsideOwnerLockAndLossPreventsCommit()
     {
         var context = Ready(ExternalPublicationPolicy.Staged);
         using var entered = new ManualResetEventSlim();
@@ -62,20 +211,27 @@ public sealed class EffectPublicationSemanticsV1Tests
             }));
 
         Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
-        var cancel = context.Kernel.CancelExternalOperation(context.Owner, context.Operation, true);
-        var loss = context.Kernel.RecordExternalOperationProviderLoss(context.Owner, context.Operation);
-        Assert.Equal(KernelError.InvalidTransition, cancel.Error);
-        Assert.Equal(KernelError.InvalidTransition, loss.Error);
-        release.Set();
+        try
+        {
+            var cancel = context.Kernel.CancelExternalOperation(context.Owner, context.Operation, true);
+            var loss = context.Kernel.RecordExternalOperationProviderLoss(context.Owner, context.Operation);
+            Assert.Equal(KernelError.InvalidTransition, cancel.Error);
+            Assert.True(loss.IsSuccess, loss.Message);
+        }
+        finally { release.Set(); }
         var result = await publish.WaitAsync(TimeSpan.FromSeconds(5));
 
-        Assert.True(result.IsSuccess, result.Message);
+        Assert.Equal(KernelError.ExternalEffectUncontained, result.Error);
         Assert.Equal(ExternalPublicationDecisionV1.CurrentVersion, observed.Version);
         Assert.Equal(context.Binding, observed.Binding);
         Assert.Equal(Dependencies, observed.Dependencies);
         Assert.False(observed.IsReusablePermit);
         Assert.False(observed.AuthorizesNewExecution);
-        Assert.Equal(ExternalOperationState.Published, result.Value!.State);
+        var snapshot = context.Kernel.QueryExternalOperation(context.Owner, context.Operation).Value!;
+        Assert.Equal(ExternalOperationState.Visible, snapshot.State);
+        Assert.Single(snapshot.Transitions, transition => transition.Event == "ProviderLost");
+        Assert.Equal(ExternalEffectBoundaryState.PossiblyExternallyVisible, snapshot.EffectBoundary);
+        Assert.DoesNotContain(snapshot.Transitions, transition => transition.Event == "Published");
     }
 
     [Fact]

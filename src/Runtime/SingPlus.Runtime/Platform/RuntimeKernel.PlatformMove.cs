@@ -75,7 +75,8 @@ public sealed partial class RuntimeKernel
         }
     }
 
-    private readonly HashSet<PlatformRegionMappingId> _movePublishedMappings = [];
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<PlatformRegionMappingId, byte> _movePublishedMappings = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<PlatformRegionMappingId, byte> _moveProgressingMappings = new();
 
     public KernelResult<PlatformOwnedBufferMoveResult<T>> MovePlatformOwnedBuffer<T>(
         ProcessHandle source,
@@ -85,6 +86,20 @@ public sealed partial class RuntimeKernel
         PlatformMoveTargetMappingRequest? targetMapping = null,
         PlatformBoundedCopyFallbackPolicy? copyFallback = null)
         where T : unmanaged
+    {
+        var mappingId = sourceMapping.Mapping.MappingId;
+        if (!_moveProgressingMappings.TryAdd(mappingId, 0))
+            return KernelResult<PlatformOwnedBufferMoveResult<T>>.Fail(KernelError.PlatformBindingDraining,
+                "This mapping MOVE is already progressing.");
+        try { return MovePlatformOwnedBufferCore(source, target, buffer, sourceMapping, targetMapping, copyFallback); }
+        finally { _moveProgressingMappings.TryRemove(mappingId, out _); }
+    }
+
+    private KernelResult<PlatformOwnedBufferMoveResult<T>> MovePlatformOwnedBufferCore<T>(
+        ProcessHandle source, ProcessHandle target, OwnedBuffer<T> buffer,
+        PlatformOwnedRegionSliceMapping sourceMapping,
+        PlatformMoveTargetMappingRequest? targetMapping,
+        PlatformBoundedCopyFallbackPolicy? copyFallback) where T : unmanaged
     {
         var sourceProcessResult = Processes.Resolve(source);
         if (!sourceProcessResult.IsSuccess)
@@ -228,7 +243,7 @@ public sealed partial class RuntimeKernel
                     publication.Message!);
             }
 
-            _movePublishedMappings.Add(sourceMapping.Mapping.MappingId);
+            _movePublishedMappings.TryAdd(sourceMapping.Mapping.MappingId, 0);
             var begin = PlatformAuthority.BeginRegionMappingRevocation(
                 sourceMapping.Mapping,
                 sourceIdentity,
@@ -244,7 +259,7 @@ public sealed partial class RuntimeKernel
         }
         else if (lifecycle.PlatformClosure == PlatformExternalClosureState.Draining)
         {
-            if (!_movePublishedMappings.Contains(sourceMapping.Mapping.MappingId))
+            if (!_movePublishedMappings.ContainsKey(sourceMapping.Mapping.MappingId))
             {
                 return KernelResult<PlatformOwnedBufferMoveResult<T>>.Fail(
                     KernelError.PlatformDenied,
@@ -278,14 +293,14 @@ public sealed partial class RuntimeKernel
                 "The source exact mapping is still draining; ownership remains with the source.");
         }
 
-        if (!_movePublishedMappings.Contains(sourceMapping.Mapping.MappingId))
+        if (!_movePublishedMappings.ContainsKey(sourceMapping.Mapping.MappingId))
         {
             return KernelResult<PlatformOwnedBufferMoveResult<T>>.Fail(
                 KernelError.PlatformDenied,
                 "MOVE closure is missing source publication evidence for this exact mapping.");
         }
 
-        if ((sourceMapping.Access & PlatformMemoryAccess.Write) != 0)
+        if ((sourceMapping.Access & PlatformMemoryAccess.Write) != 0 && !lifecycle.LocalReservationReleased)
         {
             var acquire = PlatformAuthority.AcquireClosedRegionMappingFromConsumer(
                 sourceMapping,
@@ -311,19 +326,20 @@ public sealed partial class RuntimeKernel
                 finalize.Message!);
         }
 
-        _movePublishedMappings.Remove(sourceMapping.Mapping.MappingId);
-
         var moved = TransferRegion(source, target, buffer);
         if (!moved.IsSuccess)
         {
+            if (!buffer.IsValid)
+                _movePublishedMappings.TryRemove(sourceMapping.Mapping.MappingId, out _);
             return KernelResult<PlatformOwnedBufferMoveResult<T>>.Fail(
                 moved.Error,
                 moved.Message!);
         }
+        _movePublishedMappings.TryRemove(sourceMapping.Mapping.MappingId, out _);
 
         if (targetMapping is not { } targetRequest)
         {
-            return KernelResult<PlatformOwnedBufferMoveResult<T>>.Ok(
+            return PublishResult(
                 new PlatformOwnedBufferMoveResult<T>(
                     moved.Value!,
                     PlatformMoveTargetExposureState.NotRequested,
@@ -353,7 +369,7 @@ public sealed partial class RuntimeKernel
                 if (rematerialized.IsSuccess)
                 {
                     var copy = rematerialized.Value!;
-                    return KernelResult<PlatformOwnedBufferMoveResult<T>>.Ok(
+                    return PublishResult(
                         new PlatformOwnedBufferMoveResult<T>(
                             copy.Buffer,
                             PlatformMoveTargetExposureState.BoundedCopyFallback,
@@ -365,7 +381,7 @@ public sealed partial class RuntimeKernel
                         });
                 }
 
-                return KernelResult<PlatformOwnedBufferMoveResult<T>>.Ok(
+                return PublishResult(
                     new PlatformOwnedBufferMoveResult<T>(
                         moved.Value,
                         PlatformMoveTargetExposureState.LocalOwnershipFallback,
@@ -374,7 +390,7 @@ public sealed partial class RuntimeKernel
                         rematerialized.Error));
             }
 
-            return KernelResult<PlatformOwnedBufferMoveResult<T>>.Ok(
+            return PublishResult(
                 new PlatformOwnedBufferMoveResult<T>(
                     moved.Value,
                     PlatformMoveTargetExposureState.LocalOwnershipFallback,
@@ -390,8 +406,11 @@ public sealed partial class RuntimeKernel
             PlatformMemoryVisibilityRequirement.PublicationFence);
         if (!targetPublication.IsSuccess)
         {
-            _ = RevokePlatformRegionMapping(target, mappedTarget.Value!);
-            return KernelResult<PlatformOwnedBufferMoveResult<T>>.Ok(
+            var cleanup = RevokePlatformRegionMapping(target, mappedTarget.Value!);
+            if (!cleanup.IsSuccess)
+                return KernelResult<PlatformOwnedBufferMoveResult<T>>.Fail(targetPublication.Error,
+                    $"{targetPublication.Message} Target mapping {mappedTarget.Value!.Mapping.MappingId} cleanup refused ({cleanup.Error}); exact owner facts remain retained.");
+            return PublishResult(
                 new PlatformOwnedBufferMoveResult<T>(
                     moved.Value,
                     PlatformMoveTargetExposureState.LocalOwnershipFallback,
@@ -400,13 +419,27 @@ public sealed partial class RuntimeKernel
                     targetPublication.Error));
         }
 
-        return KernelResult<PlatformOwnedBufferMoveResult<T>>.Ok(
+        return PublishResult(
             new PlatformOwnedBufferMoveResult<T>(
                 moved.Value,
                 PlatformMoveTargetExposureState.ExactMappedAndPublished,
                 mappedTarget.Value,
                 targetPublication.Value,
                 KernelError.None));
+
+        KernelResult<PlatformOwnedBufferMoveResult<T>> PublishResult(PlatformOwnedBufferMoveResult<T> result)
+        {
+            lock (_platformMemoryUseGate)
+            {
+                var ready = ValidateTransferredPublication(target, result.Buffer.Handle);
+                if (!ready.IsSuccess)
+                    return KernelResult<PlatformOwnedBufferMoveResult<T>>.Fail(ready.Error, ready.Message!);
+                return result.Buffer.IsValid
+                    ? KernelResult<PlatformOwnedBufferMoveResult<T>>.Ok(result)
+                    : KernelResult<PlatformOwnedBufferMoveResult<T>>.Fail(KernelError.InvalidRegionState,
+                        "MOVE target ownership changed before usable publication.");
+            }
+        }
     }
 
     private static KernelResult ValidateBoundedCopyPolicy(
@@ -440,6 +473,8 @@ public sealed partial class RuntimeKernel
         return KernelResult.Ok();
     }
 
+    internal Action? BeforeBoundedCopyRematerializationQualificationHook { get; set; }
+
     private KernelResult<(OwnedBuffer<T> Buffer, PlatformBoundedCopyEvidence Evidence)>
         RematerializeMovedBufferThroughBoundedCopy<T>(
             ProcessHandle target,
@@ -448,6 +483,26 @@ public sealed partial class RuntimeKernel
             long authoritativeByteLength,
             PlatformBoundedCopyFallbackPolicy policy)
         where T : unmanaged
+    {
+        BeforeBoundedCopyRematerializationQualificationHook?.Invoke();
+        lock (_platformMemoryUseGate)
+        {
+            var ready = ValidateTransferredPublication(target, moved.Handle);
+            if (!ready.IsSuccess)
+                return KernelResult<(OwnedBuffer<T>, PlatformBoundedCopyEvidence)>.Fail(ready.Error, ready.Message!);
+            var gate = Regions.GetPlatformMappingCompletionGate(moved.Handle,
+                new RegionOwner(targetProcess.DomainId, target.Generation));
+            if (!gate.IsSuccess)
+                return KernelResult<(OwnedBuffer<T>, PlatformBoundedCopyEvidence)>.Fail(gate.Error, gate.Message!);
+            lock (gate.Value!)
+                return RematerializeMovedBufferThroughBoundedCopyCore(target, targetProcess, moved, authoritativeByteLength, policy);
+        }
+    }
+
+    private KernelResult<(OwnedBuffer<T> Buffer, PlatformBoundedCopyEvidence Evidence)>
+        RematerializeMovedBufferThroughBoundedCopyCore<T>(ProcessHandle target,
+            SingProcess targetProcess, OwnedBuffer<T> moved, long authoritativeByteLength,
+            PlatformBoundedCopyFallbackPolicy policy) where T : unmanaged
     {
         var targetOwner = new RegionOwner(targetProcess.DomainId, target.Generation);
         var regionValidation = Regions.Validate(moved.Handle, targetOwner);
@@ -479,17 +534,27 @@ public sealed partial class RuntimeKernel
                 "The target region no longer fits the prevalidated bounded-copy limit.");
         }
 
+        var pin = Regions.AcquireUse(moved.Handle, targetOwner, RegionUseMode.ExclusiveRead,
+            new(0, authoritativeByteLength));
+        if (!pin.IsSuccess)
+            return KernelResult<(OwnedBuffer<T>, PlatformBoundedCopyEvidence)>.Fail(pin.Error, pin.Message!);
         try
         {
+            RuntimeBufferLease<T> lease;
+            try { lease = moved.ReserveForRuntime(RuntimeBufferAccess.Read); }
+            catch (InvalidOperationException exception)
+            { return KernelResult<(OwnedBuffer<T>, PlatformBoundedCopyEvidence)>.Fail(KernelError.RegionUseConflict, exception.Message); }
+            using var bufferLease = lease;
             using var staging = new BoundedCopyStagingRegion<T>(
                 moved.Length,
                 authoritativeByteLength,
                 policy.MaxBytes);
-            moved.Span.CopyTo(staging.Span);
+            bufferLease.ReadOnlySpan.CopyTo(staging.Span);
 
             var replacementData = new T[moved.Length];
             staging.Span.CopyTo(replacementData);
             var replacement = new OwnedBuffer<T>(moved.Handle, replacementData);
+            bufferLease.Dispose();
 
             Regions.ReplacePayload(
                 moved.Handle,
@@ -510,6 +575,7 @@ public sealed partial class RuntimeKernel
                 KernelError.CapacityExhausted,
                 "The bounded-copy staging or replacement backing could not be allocated.");
         }
+        finally { _ = Regions.ReleaseUse(pin.Value!.Handle, targetOwner); }
     }
 
     private KernelResult ValidateMoveTargetMappingPrerequisites(

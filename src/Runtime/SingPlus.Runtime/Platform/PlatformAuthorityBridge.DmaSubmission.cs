@@ -34,8 +34,12 @@ public sealed partial class PlatformAuthorityBridge
         public bool CompletionObservationInFlight { get; set; }
         public bool CompletionProven { get; set; }
         public PlatformDmaCompletionEvidence? CompletionEvidence { get; set; }
+        public PlatformDmaPostCompletionVisibilityEvidence? CopyVisibilityEvidence { get; set; }
+        public PlatformProviderDmaCompletionEvidence? KnownCompletionEvidence { get; set; }
+        public PlatformBackendEpoch KnownCompletionEpoch { get; set; }
         public HashSet<ulong> PageFaultsInFlight { get; } = [];
         public HashSet<ulong> ResolvedPageFaults { get; } = [];
+        public Dictionary<ulong, (PlatformBackendEpoch Epoch, PlatformProviderDmaPageFaultEvidence Evidence)> KnownPageFaultEvidence { get; } = [];
         public DmaTraceObserver? Trace { get; set; }
     }
 
@@ -62,79 +66,255 @@ public sealed partial class PlatformAuthorityBridge
             providerTrace.ProviderGeneration != incarnation.Value)
             QueueDmaTraceLocked(record, SemanticTraceEventKindV1.GenerationChanged,
                 incarnation);
-        if (newlyPinned)
+        if (newlyPinned && record.Trace?.QuarantineQueued != true)
             QueueDmaTraceLocked(record, SemanticTraceEventKindV1.Quarantined);
     }
 
     internal KernelResult<PlatformDmaSubmission> SubmitDmaGrant(
-        PlatformDmaGrant grant,
-        PlatformDmaPrepareEvidence prepareEvidence,
-        PlatformDomainIdentity expectedSubject,
-        Func<KernelResult> revalidateRegion)
-    {
-        // Keep the bridge lock order stable: DSC1 state precedes DMA state.
-        // RuntimeKernel holds its platform-memory-use gate outside both.
-        lock (_dsc1Gate)
-        lock (_dmaCompletionGate)
-            return SubmitDmaGrantLocked(grant, prepareEvidence, expectedSubject, null,
-                null, revalidateRegion, out _);
-    }
+        PlatformDmaGrant grant, PlatformDmaPrepareEvidence prepareEvidence, PlatformDomainIdentity expectedSubject,
+        Func<Func<KernelResult<PlatformDmaSubmission>>, KernelResult<PlatformDmaSubmission>> ownerCommit) =>
+        SubmitDmaGrantCore(grant, prepareEvidence, expectedSubject, null, null, ownerCommit, out _, out _);
 
-    internal KernelResult<(PlatformDmaSubmission Submission, DmaExecutionBindingV1 Binding)>
-        SubmitDmaGrantBound(
-            PlatformDmaGrant grant,
-            PlatformDmaPrepareEvidence prepareEvidence,
-            PlatformDomainIdentity expectedSubject,
-            ulong regionMutationGeneration,
-            ISemanticTraceSinkV1? traceSink,
-            Func<KernelResult> revalidateRegion,
-            out DmaTraceObserver? ambiguityTrace)
+    private KernelResult<PlatformDmaSubmission> SubmitDmaGrantCore(
+        PlatformDmaGrant grant, PlatformDmaPrepareEvidence prepareEvidence, PlatformDomainIdentity expectedSubject,
+        ulong? regionMutationGeneration, ISemanticTraceSinkV1? traceSink,
+        Func<Func<KernelResult<PlatformDmaSubmission>>, KernelResult<PlatformDmaSubmission>> ownerCommit,
+        out DmaExecutionBindingV1? effectBinding, out DmaTraceObserver? trace)
     {
-        ambiguityTrace = null;
+        DmaGrantRecord record;
+        DmaVisibilityState visibility;
+        IPlatformDmaSubmissionProvider provider;
+        PlatformBackendEpoch epoch;
+        PlatformDmaSubmission submission = default;
+        PlatformProviderDmaSubmitRequest request = default;
+        DmaSubmissionRecord? accepted = null;
+        DmaExecutionBindingV1? admittedBinding = null;
+        DmaTraceObserver? observation = null;
+        var invoked = false;
+        var observedSource = default(PlatformProviderIncarnation);
+        effectBinding = null;
+        trace = null;
+        lock (_secureDomainLifecycleGate)
         lock (_dsc1Gate)
         lock (_dmaCompletionGate)
         {
-            var result = SubmitDmaGrantLocked(grant, prepareEvidence, expectedSubject,
-                regionMutationGeneration, traceSink, revalidateRegion, out ambiguityTrace);
-            if (!result.IsSuccess)
-                return KernelResult<(PlatformDmaSubmission, DmaExecutionBindingV1)>.Fail(
-                    result.Error, result.Message!);
-            var record = _activeDmaSubmissions[result.Value!.GrantId];
-            if (traceSink is not null)
-                RegisterDmaTraceLocked(record, traceSink);
-            return KernelResult<(PlatformDmaSubmission, DmaExecutionBindingV1)>.Ok(
-                (result.Value, record.SemanticBinding!.Value));
+            var valid = ValidateDmaSubmitIntentLocked(grant, prepareEvidence, expectedSubject, regionMutationGeneration,
+                out record, out visibility, out provider);
+            if (!valid.IsSuccess) return KernelResult<PlatformDmaSubmission>.Fail(valid.Error, valid.Message!);
+            epoch = BackendEpoch;
+            record.SubmissionInFlight = true;
+        }
+        try
+        {
+            var incarnation = CurrentProviderIncarnation();
+            var admission = ownerCommit(() =>
+            {
+                lock (_secureDomainLifecycleGate)
+                lock (_dsc1Gate)
+                lock (_dmaCompletionGate)
+                {
+                    var exact = ValidateOriginal(incarnation, false);
+                    if (!exact.IsSuccess) return KernelResult<PlatformDmaSubmission>.Fail(exact.Error, exact.Message!);
+                    if (_nextDmaOperationId == 0)
+                        return KernelResult<PlatformDmaSubmission>.Fail(KernelError.CapacityExhausted, "DMA operation identities exhausted.");
+                    var mappingUse = ValidateDmaMappingUseAdmissionLocked(grant);
+                    if (!mappingUse.IsSuccess) return KernelResult<PlatformDmaSubmission>.Fail(mappingUse.Error, mappingUse.Message!);
+                    try
+                    {
+                        _activeDmaSubmissions.EnsureCapacity(_activeDmaSubmissions.Count + 1);
+                        _dmaSubmissionFaultPins.EnsureCapacity(_dmaSubmissionFaultPins.Count + 1);
+                    }
+                    catch (OutOfMemoryException)
+                    {
+                        return KernelResult<PlatformDmaSubmission>.Fail(KernelError.CapacityExhausted,
+                            "Local DMA tracking capacity exhausted before invocation.");
+                    }
+                    request = new(record.ProviderGrant, visibility.ProviderCycle);
+                    var requestValid = PlatformDmaSubmissionContract.ValidateRequest(request);
+                    if (!requestValid.IsSuccess)
+                        return KernelResult<PlatformDmaSubmission>.Fail(KernelError.PlatformFaulted, requestValid.Message!);
+                    if (regionMutationGeneration is { } mutation)
+                    {
+                        try { admittedBinding = CreateDmaExecutionBinding(grant, expectedSubject, mutation, incarnation, DmaEffectStateV1.Admitted); }
+                        catch (Exception exception) when (exception is ArgumentException or NotSupportedException)
+                        {
+                            return KernelResult<PlatformDmaSubmission>.Fail(KernelError.InvalidMessage, exception.Message);
+                        }
+                    }
+                    submission = new(new(NextLocalDmaOperationId()), new(1), grant.GrantId, grant.Generation,
+                        visibility.LocalCycle, grant.Range, grant.Direction);
+                    return KernelResult<PlatformDmaSubmission>.Ok(submission);
+                }
+            });
+            if (!admission.IsSuccess) return admission;
+            invoked = true;
+            var reply = admittedBinding is { } binding
+                ? ((IPlatformDmaBoundSubmissionProvider)provider).SubmitDmaBound(request, binding)
+                : provider.SubmitDma(request);
+            if (!reply.IsSuccess)
+            {
+                var refusedIncarnation = CurrentProviderIncarnation();
+                observedSource = refusedIncarnation;
+                lock (_secureDomainLifecycleGate)
+                lock (_dmaCompletionGate)
+                {
+                    if (BackendEpoch != epoch || refusedIncarnation.Value == 0 ||
+                        refusedIncarnation != record.ProviderIncarnation)
+                    {
+                        FaultPinDmaSubmissionLocked(grant.GrantId);
+                        return KernelResult<PlatformDmaSubmission>.Fail(KernelError.PlatformFaulted,
+                            "DMA provider refusal lost original source continuity; mapping pinned.");
+                    }
+                }
+                if (reply.Status == PlatformAuthorityStatus.Faulted ||
+                    admittedBinding is not null && reply.Status != PlatformAuthorityStatus.NotAccepted)
+                {
+                    lock (_dmaCompletionGate) FaultPinDmaSubmissionLocked(grant.GrantId);
+
+                }
+                return FromProviderFailure<PlatformDmaSubmission>(reply.Status, reply.Message);
+            }
+            var replyValid = PlatformDmaSubmissionContract.ValidateSubmission(request, reply.Value!);
+            if (!replyValid.IsSuccess)
+            {
+                lock (_dmaCompletionGate) FaultPinDmaSubmissionLocked(grant.GrantId);
+                return KernelResult<PlatformDmaSubmission>.Fail(KernelError.PlatformFaulted, replyValid.Message!);
+            }
+            // Preserve exact original accepted effect before late query/publication refusal.
+            lock (_dmaCompletionGate)
+            {
+                var semantic = admittedBinding is { } admitted ? admitted with { EffectState = DmaEffectStateV1.EffectPossible } : (DmaExecutionBindingV1?)null;
+                accepted = new(submission, reply.Value!, semantic);
+                _activeDmaSubmissions.Add(grant.GrantId, accepted);
+                visibility.Consumed = true;
+                if (traceSink is not null && admittedBinding is not null)
+                {
+                    RegisterDmaTraceLocked(accepted, traceSink, epoch);
+                    observation = accepted.Trace;
+                }
+            }
+            incarnation = CurrentProviderIncarnation();
+            observedSource = incarnation;
+            var published = ownerCommit(() =>
+            {
+                lock (_secureDomainLifecycleGate)
+                lock (_dsc1Gate)
+                lock (_dmaCompletionGate)
+                {
+                    var exact = ValidateOriginal(incarnation, true);
+                    return exact.IsSuccess ? KernelResult<PlatformDmaSubmission>.Ok(submission)
+                        : KernelResult<PlatformDmaSubmission>.Fail(exact.Error, exact.Message!);
+                }
+            });
+            if (!published.IsSuccess)
+            {
+                lock (_dmaCompletionGate)
+                {
+                    ObserveRefusal(observedSource.Value != 0 ? observedSource : record.ProviderIncarnation);
+                    FaultPinDmaSubmissionLocked(grant.GrantId);
+                }
+            }
+            return published;
+        }
+        catch (Exception exception) when (exception is not StackOverflowException)
+        {
+            lock (_dmaCompletionGate) FaultPinDmaSubmissionLocked(grant.GrantId);
+            return KernelResult<PlatformDmaSubmission>.Fail(KernelError.PlatformFaulted,
+                $"DMA submit refused; accepted/unknown original effect retained: {exception.GetType().Name}.");
+        }
+        finally
+        {
+            lock (_dmaCompletionGate)
+            {
+                if (invoked && _dmaSubmissionFaultPins.Contains(grant.GrantId))
+                    ObserveRefusal(observedSource.Value != 0 ? observedSource : record.ProviderIncarnation);
+                record.SubmissionInFlight = false;
+                effectBinding = admittedBinding is { } admitted ? admitted with { EffectState = DmaEffectStateV1.EffectPossible } : null;
+                trace = observation;
+            }
+        }
+
+        void ObserveRefusal(PlatformProviderIncarnation observed)
+        {
+            if (traceSink is not null && admittedBinding is { } binding)
+            {
+                if (accepted?.Trace is { } existing)
+                {
+                    observation = existing;
+                    PlatformProviderIncarnation? providerChange = observed.Value > 0 && observed.Value != existing.ProviderGeneration ? observed : null;
+                    PlatformBackendEpoch? epochChange = BackendEpoch.Value != existing.BackendEpoch ? BackendEpoch : null;
+                    if (providerChange is not null || epochChange is not null)
+                        QueueDmaTraceLocked(accepted, SemanticTraceEventKindV1.GenerationChanged, providerChange, epochChange);
+                    if (!existing.QuarantineQueued) QueueDmaTraceLocked(accepted, SemanticTraceEventKindV1.Quarantined);
+                }
+                else
+                {
+                    observation = CreateAmbiguousDmaSubmitTraceLocked(traceSink, binding,
+                        submission.OperationId, record.ProviderIncarnation, epoch, observed, BackendEpoch);
+                    if (accepted is not null) accepted.Trace = observation;
+                }
+            }
+        }
+        KernelResult ValidateOriginal(PlatformProviderIncarnation incarnation, bool publishing)
+        {
+            if (BackendEpoch != epoch || _dmaSubmissionFaultPins.Contains(grant.GrantId))
+                return KernelResult.Fail(KernelError.PlatformFaulted, "DMA backend/possible effect continuity lost.");
+            if (incarnation.Value == 0 || incarnation != record.ProviderIncarnation)
+                return KernelResult.Fail(publishing ? KernelError.PlatformFaulted : KernelError.StaleGeneration, "DMA provider source changed.");
+            if (!_dmaGrants.TryGetValue(grant.GrantId, out var current) || !ReferenceEquals(current, record) ||
+                !record.SubmissionInFlight || record.PlatformClosed ||
+                !_dmaVisibilityStates.TryGetValue(grant.GrantId, out var cycle) || !ReferenceEquals(cycle, visibility) ||
+                visibility.Acquired || (!publishing && visibility.Consumed) ||
+                publishing && (!visibility.Consumed || !_activeDmaSubmissions.TryGetValue(grant.GrantId, out var active) || !ReferenceEquals(active, accepted)))
+                return KernelResult.Fail(KernelError.PlatformFaulted, "DMA original grant/cycle/lifetime changed.");
+            var device = ValidateDeviceLease(grant.DeviceLease, expectedSubject);
+            var mapping = device.IsSuccess ? ValidateExactMapping(grant.Mapping, expectedSubject) : device;
+            if (!mapping.IsSuccess)
+            {
+                FaultPinDmaSubmissionLocked(grant.GrantId);
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Original DMA authorization changed before publication.");
+            }
+            return KernelResult.Ok();
         }
     }
-
-    private KernelResult<PlatformDmaSubmission> SubmitDmaGrantLocked(
-        PlatformDmaGrant grant,
-        PlatformDmaPrepareEvidence prepareEvidence,
-        PlatformDomainIdentity expectedSubject,
-        ulong? regionMutationGeneration,
-        ISemanticTraceSinkV1? traceSink,
-        Func<KernelResult> revalidateRegion,
-        out DmaTraceObserver? ambiguityTrace)
+    internal KernelResult<(PlatformDmaSubmission Submission, DmaExecutionBindingV1 Binding)> SubmitDmaGrantBound(
+        PlatformDmaGrant grant, PlatformDmaPrepareEvidence prepareEvidence, PlatformDomainIdentity expectedSubject,
+        ulong regionMutationGeneration, ISemanticTraceSinkV1? traceSink,
+        Func<Func<KernelResult<PlatformDmaSubmission>>, KernelResult<PlatformDmaSubmission>> ownerCommit,
+        out DmaTraceObserver? trace)
     {
-        ambiguityTrace = null;
+        var submitted = SubmitDmaGrantCore(grant, prepareEvidence, expectedSubject, regionMutationGeneration,
+            traceSink, ownerCommit, out var binding, out trace);
+        return submitted.IsSuccess
+            ? KernelResult<(PlatformDmaSubmission, DmaExecutionBindingV1)>.Ok((submitted.Value!, binding!.Value))
+            : KernelResult<(PlatformDmaSubmission, DmaExecutionBindingV1)>.Fail(submitted.Error, submitted.Message!);
+    }
+    private KernelResult ValidateDmaSubmitIntentLocked(
+        PlatformDmaGrant grant, PlatformDmaPrepareEvidence prepareEvidence, PlatformDomainIdentity expectedSubject,
+        ulong? regionMutationGeneration, out DmaGrantRecord grantRecord,
+        out DmaVisibilityState visibilityState, out IPlatformDmaSubmissionProvider submissionProvider)
+    {
+        grantRecord = null!;
+        visibilityState = null!;
+        submissionProvider = null!;
         var validation = ValidateDmaGrant(grant, expectedSubject);
         if (!validation.IsSuccess)
         {
-            return KernelResult<PlatformDmaSubmission>.Fail(
+            return KernelResult.Fail(
                 validation.Error,
                 validation.Message!);
         }
 
         if (HasFaultPinnedDmaSubmission(grant.GrantId))
         {
-            return KernelResult<PlatformDmaSubmission>.Fail(
+            return KernelResult.Fail(
                 KernelError.PlatformFaulted,
                 "DMA submission state is fault-pinned because an external effect may have been accepted ambiguously.");
         }
 
         if (HasActiveDmaSubmission(grant.GrantId))
         {
-            return KernelResult<PlatformDmaSubmission>.Fail(
+            return KernelResult.Fail(
                 KernelError.PlatformBindingActive,
                 "The exact DMA grant already has a submitted operation whose post-submit lifecycle is not closed.");
         }
@@ -144,278 +324,83 @@ public sealed partial class PlatformAuthorityBridge
                 PlatformDmaSubmissionContract.ContractVersion,
                 PlatformFeatureAvailability.RuntimeAdmission))
         {
-            return KernelResult<PlatformDmaSubmission>.Fail(
+            return KernelResult.Fail(
                 KernelError.PlatformUnsupported,
                 "The platform provider does not advertise bounded DMA submission contract v3.");
         }
 
-        if (_provider is not IPlatformDmaSubmissionProvider submissionProvider)
+        if (_provider is not IPlatformDmaSubmissionProvider availableProvider)
         {
-            return KernelResult<PlatformDmaSubmission>.Fail(
+            return KernelResult.Fail(
                 KernelError.PlatformUnsupported,
                 "The platform provider does not expose bounded DMA submission.");
         }
+        submissionProvider = availableProvider;
         if (regionMutationGeneration is not null &&
             _provider is not IPlatformDmaBoundSubmissionProvider)
-            return KernelResult<PlatformDmaSubmission>.Fail(KernelError.PlatformUnsupported,
+            return KernelResult.Fail(KernelError.PlatformUnsupported,
                 "The platform provider does not expose the v6 DMA semantic-binding submit boundary.");
+
         if (regionMutationGeneration is not null &&
             _provider is not IPlatformProviderIncarnationSource)
-            return KernelResult<PlatformDmaSubmission>.Fail(KernelError.PlatformUnsupported,
+            return KernelResult.Fail(KernelError.PlatformUnsupported,
                 "Bound DMA requires a live provider incarnation source; the legacy fallback cannot validate generation drift.");
         if (regionMutationGeneration == 0)
-            return KernelResult<PlatformDmaSubmission>.Fail(KernelError.StaleGeneration,
+            return KernelResult.Fail(KernelError.StaleGeneration,
                 "The v6 DMA semantic binding requires a current non-zero Region mutation generation.");
 
         if (!prepareEvidence.IsSatisfied)
         {
-            return KernelResult<PlatformDmaSubmission>.Fail(
+            return KernelResult.Fail(
                 KernelError.PlatformDenied,
                 "DMA submission requires satisfied publication evidence for the exact prepared cycle.");
         }
 
         if (prepareEvidence.GrantId != grant.GrantId)
         {
-            return KernelResult<PlatformDmaSubmission>.Fail(
+            return KernelResult.Fail(
                 KernelError.PlatformDenied,
                 "DMA prepare evidence belongs to a different local grant.");
         }
 
         if (prepareEvidence.GrantGeneration != grant.Generation)
         {
-            return KernelResult<PlatformDmaSubmission>.Fail(
+            return KernelResult.Fail(
                 KernelError.StaleGeneration,
                 "DMA prepare evidence uses a stale local grant generation.");
         }
 
         if (prepareEvidence.Direction != grant.Direction)
         {
-            return KernelResult<PlatformDmaSubmission>.Fail(
+            return KernelResult.Fail(
                 KernelError.PlatformDenied,
                 "DMA prepare evidence direction does not match the exact grant.");
         }
 
-        if (!_dmaVisibilityStates.TryGetValue(grant.GrantId, out var visibilityState) ||
+        if (!_dmaVisibilityStates.TryGetValue(grant.GrantId, out visibilityState) ||
             visibilityState.LocalCycle.Value == 0)
         {
-            return KernelResult<PlatformDmaSubmission>.Fail(
+            return KernelResult.Fail(
                 KernelError.PlatformDenied,
                 "The exact DMA grant has no prepared visibility cycle to submit.");
         }
 
         if (visibilityState.LocalCycle != prepareEvidence.Cycle)
         {
-            return KernelResult<PlatformDmaSubmission>.Fail(
+            return KernelResult.Fail(
                 KernelError.PlatformDenied,
                 "DMA prepare evidence does not match the current exact visibility cycle.");
         }
 
         if (visibilityState.Acquired || visibilityState.Consumed)
         {
-            return KernelResult<PlatformDmaSubmission>.Fail(
+            return KernelResult.Fail(
                 KernelError.PlatformDenied,
                 "The current DMA visibility cycle was already consumed and cannot be submitted.");
         }
 
-        var grantRecord = _dmaGrants[grant.GrantId];
-        grantRecord.SubmissionInFlight = true;
-        try
-        {
-            return SubmitDmaGrantProviderLocked(grant, expectedSubject, regionMutationGeneration,
-                traceSink, submissionProvider, grantRecord, visibilityState, revalidateRegion, out ambiguityTrace);
-        }
-        finally { grantRecord.SubmissionInFlight = false; }
-    }
-
-    private KernelResult<PlatformDmaSubmission> SubmitDmaGrantProviderLocked(
-        PlatformDmaGrant grant, PlatformDomainIdentity expectedSubject,
-        ulong? regionMutationGeneration, ISemanticTraceSinkV1? traceSink,
-        IPlatformDmaSubmissionProvider submissionProvider, DmaGrantRecord grantRecord,
-        DmaVisibilityState visibilityState, Func<KernelResult> revalidateRegion,
-        out DmaTraceObserver? ambiguityTrace)
-    {
-        ambiguityTrace = null;
-        var providerGrant = grantRecord.ProviderGrant;
-        var submitBackendEpoch = BackendEpoch;
-        PlatformProviderIncarnation submitIncarnation;
-        try { submitIncarnation = CurrentProviderIncarnation(); }
-        catch (Exception exception)
-        {
-            _dmaSubmissionFaultPins.Add(grant.GrantId);
-            return KernelResult<PlatformDmaSubmission>.Fail(KernelError.PlatformFaulted,
-                $"DMA generation is unavailable before submission; mapping remains pinned: {exception.Message}");
-        }
-        if (BackendEpoch != submitBackendEpoch || HasFaultPinnedDmaSubmission(grant.GrantId) ||
-            HasActiveDmaSubmission(grant.GrantId) ||
-            !ValidateDeviceLease(grant.DeviceLease, expectedSubject).IsSuccess ||
-            !ValidateExactMapping(grant.Mapping, expectedSubject).IsSuccess ||
-            !_dmaVisibilityStates.TryGetValue(grant.GrantId, out var currentVisibility) ||
-            !ReferenceEquals(currentVisibility, visibilityState) || visibilityState.Acquired || visibilityState.Consumed)
-        {
-            _dmaSubmissionFaultPins.Add(grant.GrantId);
-            return KernelResult<PlatformDmaSubmission>.Fail(KernelError.PlatformFaulted,
-                "DMA authorization, visibility cycle or backend changed before submission; mapping remains pinned.");
-        }
-        if (submitIncarnation.Value == 0 || submitIncarnation != grantRecord.ProviderIncarnation)
-        {
-            return KernelResult<PlatformDmaSubmission>.Fail(
-                KernelError.StaleGeneration,
-                "The DMA provider restarted or reset after the exact grant was admitted.");
-        }
-        // Region facts remain owned by RuntimeKernel's existing RegionAuthority.
-        // The trusted consumer re-reads them after the provider-owned getter.
-        var regionAdmission = revalidateRegion();
-        if (!regionAdmission.IsSuccess)
-            return KernelResult<PlatformDmaSubmission>.Fail(regionAdmission.Error, regionAdmission.Message!);
-        var request = new PlatformProviderDmaSubmitRequest(
-            providerGrant,
-            visibilityState.ProviderCycle);
-        var requestValidation = PlatformDmaSubmissionContract.ValidateRequest(request);
-        if (!requestValidation.IsSuccess)
-        {
-            _dmaSubmissionFaultPins.Add(grant.GrantId);
-            return KernelResult<PlatformDmaSubmission>.Fail(
-                KernelError.PlatformFaulted,
-                requestValidation.Message ?? "The bridge constructed malformed provider DMA submission state.");
-        }
-
-        if (_nextDmaOperationId == 0)
-        {
-            return KernelResult<PlatformDmaSubmission>.Fail(
-                KernelError.CapacityExhausted,
-                "Local DMA operation identity space is exhausted.");
-        }
-
-        try
-        {
-            _activeDmaSubmissions.EnsureCapacity(_activeDmaSubmissions.Count + 1);
-            _dmaSubmissionFaultPins.EnsureCapacity(_dmaSubmissionFaultPins.Count + 1);
-        }
-        catch (OutOfMemoryException)
-        {
-            return KernelResult<PlatformDmaSubmission>.Fail(
-                KernelError.CapacityExhausted,
-                "Local DMA submission tracking capacity is exhausted before provider admission.");
-        }
-
-        // All exact grant/evidence checks precede the cross-mechanism query so
-        // forged inputs cannot use the interlock as a mapping-use oracle.
-        var mappingUse = ValidateDmaMappingUseAdmissionLocked(grant);
-        if (!mappingUse.IsSuccess)
-        {
-            return KernelResult<PlatformDmaSubmission>.Fail(
-                mappingUse.Error,
-                mappingUse.Message!);
-        }
-
-        var operationId = new PlatformDmaOperationId(NextLocalDmaOperationId());
-        DmaExecutionBindingV1? admittedBinding = null;
-        if (regionMutationGeneration is { } mutationGeneration)
-        {
-            try
-            {
-                admittedBinding = CreateDmaExecutionBinding(grant, expectedSubject,
-                    mutationGeneration, submitIncarnation, DmaEffectStateV1.Admitted);
-            }
-            catch (Exception exception) when (exception is ArgumentException or NotSupportedException)
-            {
-                return KernelResult<PlatformDmaSubmission>.Fail(KernelError.InvalidMessage,
-                    exception.Message);
-            }
-        }
-        DmaTraceObserver? TraceAmbiguity(PlatformProviderIncarnation observedIncarnation,
-            PlatformBackendEpoch observedEpoch)
-        {
-            return traceSink is not null && admittedBinding is { } binding
-                ? CreateAmbiguousDmaSubmitTraceLocked(traceSink, binding,
-                    operationId, submitIncarnation, submitBackendEpoch,
-                    observedIncarnation, observedEpoch)
-                : null;
-        }
-        PlatformAuthorityResult<PlatformProviderDmaSubmission> providerResult;
-        PlatformProviderIncarnation observedIncarnation;
-        PlatformBackendEpoch observedEpoch;
-        try
-        {
-            providerResult = admittedBinding is { } exactBinding
-                ? ((IPlatformDmaBoundSubmissionProvider)submissionProvider)
-                    .SubmitDmaBound(request, exactBinding)
-                : submissionProvider.SubmitDma(request);
-            observedIncarnation = CurrentProviderIncarnation();
-            observedEpoch = BackendEpoch;
-        }
-        catch (Exception exception)
-        {
-            _dmaSubmissionFaultPins.Add(grant.GrantId);
-            ambiguityTrace = TraceAmbiguity(submitIncarnation, submitBackendEpoch);
-            return KernelResult<PlatformDmaSubmission>.Fail(
-                KernelError.PlatformFaulted,
-                $"The DMA provider threw during submission; acceptance is ambiguous and the exact mapping remains pinned: {exception.Message}");
-        }
-        if (observedIncarnation != submitIncarnation || observedEpoch != submitBackendEpoch)
-        {
-            _dmaSubmissionFaultPins.Add(grant.GrantId);
-            ambiguityTrace = TraceAmbiguity(observedIncarnation, observedEpoch);
-            return KernelResult<PlatformDmaSubmission>.Fail(
-                KernelError.PlatformFaulted,
-                "The DMA provider incarnation or local backend epoch changed during submission; acceptance is ambiguous and the exact mapping remains pinned.");
-        }
-
-        if (!providerResult.IsSuccess)
-        {
-            if (providerResult.Status == PlatformAuthorityStatus.Faulted ||
-                admittedBinding is not null && providerResult.Status != PlatformAuthorityStatus.NotAccepted)
-            {
-                _dmaSubmissionFaultPins.Add(grant.GrantId);
-                ambiguityTrace = TraceAmbiguity(observedIncarnation, observedEpoch);
-            }
-
-            return FromProviderFailure<PlatformDmaSubmission>(
-                providerResult.Status,
-                providerResult.Message);
-        }
-
-        var providerSubmission = providerResult.Value!;
-        var providerValidation = PlatformDmaSubmissionContract.ValidateSubmission(
-            request,
-            providerSubmission);
-        if (!providerValidation.IsSuccess)
-        {
-            _dmaSubmissionFaultPins.Add(grant.GrantId);
-            ambiguityTrace = TraceAmbiguity(observedIncarnation, observedEpoch);
-            return KernelResult<PlatformDmaSubmission>.Fail(
-                KernelError.PlatformFaulted,
-                providerValidation.Message ?? "The provider returned malformed DMA submission evidence.");
-        }
-
-        var submission = new PlatformDmaSubmission(
-            operationId,
-            new PlatformDmaOperationGeneration(1),
-            grant.GrantId,
-            grant.Generation,
-            visibilityState.LocalCycle,
-            grant.Range,
-            grant.Direction);
-        try
-        {
-            var effectBinding = admittedBinding is { } bound
-                ? bound with { EffectState = DmaEffectStateV1.EffectPossible }
-                : (DmaExecutionBindingV1?)null;
-            var record = new DmaSubmissionRecord(submission, providerSubmission, effectBinding);
-            _activeDmaSubmissions.Add(grant.GrantId, record);
-            visibilityState.Consumed = true;
-        }
-        catch (Exception exception) when (
-            exception is OutOfMemoryException or InvalidOperationException)
-        {
-            _dmaSubmissionFaultPins.Add(grant.GrantId);
-            ambiguityTrace = TraceAmbiguity(observedIncarnation, observedEpoch);
-            return KernelResult<PlatformDmaSubmission>.Fail(
-                KernelError.PlatformFaulted,
-                $"The provider accepted DMA but exact local tracking failed; the mapping remains fault-pinned: {exception.Message}");
-        }
-
-        return KernelResult<PlatformDmaSubmission>.Ok(submission);
+        grantRecord = _dmaGrants[grant.GrantId];
+        return KernelResult.Ok();
     }
 
     internal bool HasActiveDmaSubmission(PlatformDmaGrantId grantId)

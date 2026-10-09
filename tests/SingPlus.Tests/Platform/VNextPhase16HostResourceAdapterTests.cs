@@ -34,6 +34,44 @@ public sealed class VNextPhase16HostResourceAdapterTests
         Assert.Equal(3, context.Provider.ReconcileResourceUsageCallCount);
     }
 
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void FinalResourceReceiptCannotWrapOrDiscardExactTerminalEvidence(bool terminal)
+    {
+        var context = Create(enabled: true);
+        var reservation = context.Bridge.PrepareResource(context.Domain, context.Subject, Correlation(), Envelope()).Value!;
+        var operation = context.Provider.StageOperation(reservation.DomainLease).Value!;
+        Assert.True(context.Provider.AdvanceOperation(operation, PlatformCompletionState.Pending).IsSuccess);
+        var binding = context.Bridge.BindResourceSubmission(reservation, operation).Value!;
+        if (terminal)
+        {
+            Assert.True(context.Provider.AdvanceOperation(operation, PlatformCompletionState.Completed).IsSuccess);
+            Assert.True(context.Provider.AdvanceOperation(operation, PlatformCompletionState.Closed).IsSuccess);
+        }
+        var records = (global::System.Collections.IDictionary)typeof(HostPlatformAuthorityProvider)
+            .GetField("_resourceReservations", global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(context.Provider)!;
+        var record = records[reservation.ReservationId]!;
+        var sequence = record.GetType().GetProperty("NextReceiptSequence")!;
+        sequence.SetValue(record, ulong.MaxValue);
+
+        var last = context.Bridge.ReconcileResourceUsage(binding);
+
+        Assert.True(last.IsSuccess, last.Message);
+        Assert.Equal(ulong.MaxValue, last.Value!.ReceiptSequence);
+        Assert.Equal(terminal, last.Value.IsTerminal);
+        Assert.Equal(0UL, (ulong)sequence.GetValue(record)!);
+        for (var retry = 0; retry < 2; retry++)
+        {
+            var next = context.Bridge.ReconcileResourceUsage(binding);
+            if (terminal) Assert.Equal(last.Value, next.Value);
+            else Assert.Equal(KernelError.PlatformFaulted, next.Error);
+            Assert.Equal(0UL, (ulong)sequence.GetValue(record)!);
+        }
+        Assert.Equal(PlatformAuthorityStatus.Denied, context.Provider.CancelPreparedResource(reservation).Status);
+        Assert.Equal(binding, context.Provider.BindResourceSubmission(reservation, operation).Value);
+    }
+
     [Fact]
     public void FeatureIsOptInAndUnsupportedOrWidenedDimensionsFailClosed()
     {

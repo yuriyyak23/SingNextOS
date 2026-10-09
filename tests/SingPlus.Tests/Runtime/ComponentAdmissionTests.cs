@@ -10,6 +10,586 @@ namespace SingPlus.Tests.Runtime;
 public sealed class ComponentAdmissionTests
 {
     [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void ControllerBindingRefusalPreservesLateReceiptForActualCleanup(bool late)
+    {
+        var provider = new HostPlatformAuthorityProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, principal) = TestFixtures.Create(kernel, 927, 9270, identity: "binding-controller");
+        Assert.True(kernel.AdmitProcess(principal).IsSuccess);
+        var control = kernel.MintCapability(new DomainId(9270), principal, ResourceKind.KernelService,
+            CapabilityResourceIds.ServiceSupervisor, CapabilityRights.Configure | CapabilityRights.Execute).Value!.CapabilityId;
+        var image = new byte[] { 7, 27 };
+        var manifest = new ServiceManifestV1(new("controlled-binding"), new("1"), Digest(image),
+            TestFixtures.Manifest(928, 9280), platformRequirements:
+            [new PlatformRequirementV1(ComponentPlatformFeatureFamily.NeutralDomains, PlatformDomainContract.ContractVersion,
+                ComponentPlatformFeatureAvailability.RuntimeAdmission)],
+            resourceRequirements: [ComponentResourceRequirementV1.ForPlatformAuthorityDomain()]);
+        Action revoke = () => Assert.True(kernel.CapabilityAuthority.Revoke(control).IsSuccess);
+        if (late) kernel.BeforePlatformBindingAttachmentQualificationHook = revoke;
+        else kernel.BeforeComponentPlatformBindingQualificationHook = revoke;
+        Assert.Equal(KernelError.SupervisorDenied, kernel.AdmitComponent(new(manifest, image), principal, control).Error);
+        Assert.Equal(late ? 1 : 0, provider.BindDomainCallCount);
+        var component = kernel.QueryComponent(manifest.Identity).Value!;
+        Assert.Equal(ComponentLifecycleState.Reclaimable, component.State);
+        Assert.True(kernel.Processes.ResolveTerminalState(component.Process).IsSuccess);
+        Assert.True(kernel.RetireReclaimableComponent(manifest.Identity, component.Process).IsSuccess);
+        Assert.False(kernel.Budgets.HasProcessAccount(component.Process));
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void LateTeardownIntentCannotRegressActualReclaimOrDrainReplacement(bool replace)
+    {
+        var kernel = new RuntimeKernel();
+        byte[] image = [30, 31];
+        var identity = new ComponentIdentity("teardown-intent");
+        var admitted = kernel.AdmitComponent(new(new ServiceManifestV1(identity, new("1"), Digest(image),
+            TestFixtures.Manifest(1121, 2121)), image)).Value!;
+        ProcessHandle fresh = default;
+        kernel.BeforeComponentTeardownIntentQualificationHook = () =>
+        {
+            kernel.BeforeComponentTeardownIntentQualificationHook = null;
+            Assert.True(kernel.DrainComponent(identity, admitted.Process).Value!.Reclaimable);
+            if (replace)
+            {
+                Assert.True(kernel.RetireReclaimableComponent(identity, admitted.Process).IsSuccess);
+                fresh = kernel.AdmitComponent(new(new ServiceManifestV1(identity, new("2"), Digest(image),
+                    TestFixtures.Manifest(1121, 2121, generation: 2)), image)).Value!.Process;
+            }
+        };
+        var result = kernel.DrainComponent(identity, admitted.Process);
+        Assert.Equal(!replace, result.IsSuccess);
+        Assert.Equal(ProcessState.Exited, kernel.Processes.ResolveTerminalState(admitted.Process).Value);
+        var current = kernel.QueryComponent(identity).Value!;
+        if (replace)
+        {
+            Assert.Equal(KernelError.StaleGeneration, result.Error);
+            Assert.Equal(fresh, current.Process);
+            Assert.Equal(ComponentLifecycleState.Running, current.State);
+            Assert.Equal(ProcessState.Running, kernel.Processes.Resolve(fresh).Value!.State);
+            Assert.Null(current.Failure);
+        }
+        else
+        {
+            Assert.True(current.Reclaimable);
+            Assert.True(kernel.RetireReclaimableComponent(identity, admitted.Process).IsSuccess);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void OptionalEvidenceCannotPublishAfterOriginalProcessClosure(bool stop)
+    {
+        var kernel = new RuntimeKernel();
+        byte[] image = [28, 29];
+        var identity = new ComponentIdentity("optional-evidence-tracking");
+        var old = new ProcessHandle(new ProcessId(1120), 1);
+        ManifestAdmissionResultV1? before = null;
+        kernel.BeforeComponentOptionalEvidenceQualificationHook = () =>
+        {
+            kernel.BeforeComponentOptionalEvidenceQualificationHook = null;
+            before = kernel.QueryComponent(identity).Value!.Admission;
+            if (stop) Assert.True(kernel.TerminateProcess(old).IsSuccess);
+        };
+        var result = kernel.AdmitComponent(new(new ServiceManifestV1(identity, new("1"), Digest(image),
+            TestFixtures.Manifest(1120, 2120), dependencies: [new(new ServiceContractIdentity("OptionalAbsent", "1", "optional"), ServiceDependencyKind.Optional)]), image));
+        Assert.NotNull(before);
+        if (stop)
+        {
+            Assert.Equal(KernelError.StaleHandle, result.Error);
+            var component = kernel.QueryComponent(identity).Value!;
+            Assert.True(component.Reclaimable);
+            Assert.Same(before, component.Admission);
+            Assert.True(kernel.RetireReclaimableComponent(identity, old).IsSuccess);
+        }
+        else
+        {
+            Assert.True(result.IsSuccess, result.Message);
+            Assert.Equal(ComponentLifecycleState.Running, result.Value!.State);
+            Assert.Empty(result.Value.Sessions);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void LateDomainBindingTrackingUsesOriginalClosureWithoutPublishingOrTouchingReplacement(bool replace)
+    {
+        var provider = new HostPlatformAuthorityProvider();
+        var kernel = new RuntimeKernel(provider);
+        byte[] image = [26, 27];
+        var identity = new ComponentIdentity("binding-tracking");
+        var old = new ProcessHandle(new ProcessId(1119), 1);
+        ProcessHandle fresh = default;
+        kernel.BeforeComponentBindingTrackingQualificationHook = () =>
+        {
+            kernel.BeforeComponentBindingTrackingQualificationHook = null;
+            Assert.False(kernel.QueryComponent(identity).Value!.PlatformAuthorityLive);
+            Assert.True(kernel.TerminateProcess(old).IsSuccess);
+            if (replace)
+            {
+                (_, fresh) = TestFixtures.Create(kernel, 1119, 2119, generation: 2);
+                Assert.True(kernel.AdmitProcess(fresh).IsSuccess);
+                Assert.True(kernel.StartProcess(fresh).IsSuccess);
+            }
+        };
+        var result = kernel.AdmitComponent(new(new ServiceManifestV1(identity, new("1"), Digest(image),
+            TestFixtures.Manifest(1119, 2119), requiresPlatformDomain: true), image));
+        Assert.Equal(KernelError.StaleHandle, result.Error);
+        Assert.Equal(1, provider.BindDomainCallCount);
+        var component = kernel.QueryComponent(identity).Value!;
+        Assert.True(component.Reclaimable);
+        Assert.False(component.PlatformAuthorityLive);
+        Assert.Equal(ProcessState.Exited, kernel.Processes.ResolveTerminalState(old).Value);
+        Assert.True(kernel.RetireReclaimableComponent(identity, old).IsSuccess);
+        if (replace) Assert.Equal(ProcessState.Running, kernel.Processes.Resolve(fresh).Value!.State);
+    }
+
+    [Theory]
+    [InlineData(false, false)] [InlineData(false, true)]
+    [InlineData(true, false)] [InlineData(true, true)]
+    public void LateServiceOrSessionTrackingRefusesTerminalOriginalAndPreservesReplacement(bool sessionStage, bool replace)
+    {
+        var kernel = new RuntimeKernel();
+        byte[] image = [24, 25];
+        var identity = new ComponentIdentity("service-session-tracking");
+        var old = new ProcessHandle(new ProcessId(1117), 1);
+        var dependency = new ServiceContractIdentity("TrackingDependency", "1", "dependency-tracking");
+        var provider = TestFixtures.Create(kernel, 1118, 2118).Handle;
+        Assert.True(kernel.AdmitProcess(provider).IsSuccess);
+        Assert.True(kernel.RegisterService(provider, "tracking-dependency", dependency,
+            Protocol(dependency.Name, dependency.Digest)).IsSuccess);
+        var own = new ServiceContractIdentity("TrackingService", "1", "service-tracking");
+        var provided = new ProvidedServiceManifestV1("tracking-service", own);
+        ProcessHandle fresh = default;
+        Action stop = () =>
+        {
+            kernel.BeforeComponentServiceTrackingQualificationHook = null;
+            kernel.BeforeComponentSessionTrackingQualificationHook = null;
+            Assert.True(kernel.TerminateProcess(old).IsSuccess);
+            if (replace)
+            {
+                (_, fresh) = TestFixtures.Create(kernel, 1117, 2117, generation: 2);
+                Assert.True(kernel.AdmitProcess(fresh).IsSuccess);
+                Assert.True(kernel.StartProcess(fresh).IsSuccess);
+            }
+        };
+        if (sessionStage) kernel.BeforeComponentSessionTrackingQualificationHook = stop;
+        else kernel.BeforeComponentServiceTrackingQualificationHook = stop;
+        var result = kernel.AdmitComponent(new(new ServiceManifestV1(identity, new("1"), Digest(image),
+            TestFixtures.Manifest(1117, 2117), [provided], [dependency]), image,
+            providedServices: [new ComponentProvidedServiceRegistration(provided, Protocol(own.Name, own.Digest))]));
+        Assert.Equal(KernelError.StaleHandle, result.Error);
+        var component = kernel.QueryComponent(identity).Value!;
+        Assert.True(component.Reclaimable);
+        Assert.Empty(component.ServiceInstances);
+        Assert.Empty(component.Sessions);
+        Assert.Empty(kernel.ResolveByContract(own).Value!);
+        Assert.Single(kernel.ResolveByContract(dependency).Value!);
+        Assert.Equal(ProcessState.Exited, kernel.Processes.ResolveTerminalState(old).Value);
+        Assert.True(kernel.RetireReclaimableComponent(identity, old).IsSuccess);
+        if (replace) Assert.Equal(ProcessState.Running, kernel.Processes.Resolve(fresh).Value!.State);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void MintedCapabilityTrackingRefusesTerminalOriginalAndPreservesReplacementProcess(bool replace)
+    {
+        var kernel = new RuntimeKernel();
+        byte[] image = [22, 23];
+        var identity = new ComponentIdentity("capability-tracking");
+        var old = new ProcessHandle(new ProcessId(1116), 1);
+        var requirement = new CapabilityRequirementV1(ResourceKind.KernelService, "tracking-data", CapabilityRights.Read);
+        ProcessHandle fresh = default;
+        CapabilityId freshCapability = default;
+        kernel.BeforeComponentCapabilityTrackingQualificationHook = () =>
+        {
+            kernel.BeforeComponentCapabilityTrackingQualificationHook = null;
+            Assert.Empty(kernel.QueryComponent(identity).Value!.Capabilities);
+            Assert.True(kernel.TerminateProcess(old).IsSuccess);
+            Assert.Equal(ProcessState.Exited, kernel.Processes.ResolveTerminalState(old).Value);
+            if (replace)
+            {
+                (_, fresh) = TestFixtures.Create(kernel, 1116, 2116, generation: 2, capabilities: [requirement]);
+                freshCapability = kernel.MintCapability(new DomainId(2116), fresh, requirement.ResourceKind,
+                    requirement.ResourceId, requirement.Rights).Value!.CapabilityId;
+                Assert.True(kernel.AdmitProcess(fresh).IsSuccess);
+                Assert.True(kernel.StartProcess(fresh).IsSuccess);
+            }
+        };
+        var result = kernel.AdmitComponent(new(new ServiceManifestV1(identity, new("1"), Digest(image),
+            TestFixtures.Manifest(1116, 2116, capabilities: [requirement])), image,
+            [new ComponentCapabilityGrant(new DomainId(2116), requirement)]));
+        Assert.Equal(KernelError.StaleHandle, result.Error);
+        var current = kernel.QueryComponent(identity).Value!;
+        Assert.Equal(old, current.Process);
+        Assert.True(current.Reclaimable);
+        Assert.Empty(current.Capabilities);
+        Assert.True(kernel.RetireReclaimableComponent(identity, old).IsSuccess);
+        if (replace)
+        {
+            Assert.Equal(ProcessState.Running, kernel.Processes.Resolve(fresh).Value!.State);
+            Assert.True(kernel.ValidateCapability(fresh, freshCapability, CapabilityRights.Read).IsSuccess);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void CreatedPublicationRefusesChangedProcessBeforeCapabilityMint(bool replace)
+    {
+        var kernel = new RuntimeKernel();
+        byte[] image = [20, 21];
+        var identity = new ComponentIdentity("created-publication");
+        var old = new ProcessHandle(new ProcessId(1115), 1);
+        ProcessHandle fresh = default;
+        var requirement = new CapabilityRequirementV1(ResourceKind.KernelService, "created-data", CapabilityRights.Read);
+        kernel.BeforeComponentCreatedPublicationQualificationHook = () =>
+        {
+            kernel.BeforeComponentCreatedPublicationQualificationHook = null;
+            Assert.Empty(kernel.QueryComponent(identity).Value!.Capabilities);
+            if (replace)
+            {
+                Assert.True(kernel.TerminateProcess(old).IsSuccess);
+                (_, fresh) = TestFixtures.Create(kernel, 1115, 2115, generation: 2);
+                Assert.True(kernel.AdmitProcess(fresh).IsSuccess);
+            }
+            else
+            {
+                Assert.True(kernel.MintCapability(new DomainId(2115), old, requirement.ResourceKind,
+                    requirement.ResourceId, requirement.Rights).IsSuccess);
+                Assert.True(kernel.AdmitProcess(old).IsSuccess);
+            }
+        };
+        var result = kernel.AdmitComponent(new(new ServiceManifestV1(identity, new("1"), Digest(image),
+            TestFixtures.Manifest(1115, 2115, capabilities: [requirement])), image, [new ComponentCapabilityGrant(new DomainId(2115), requirement)]));
+        Assert.Equal(replace ? KernelError.StaleHandle : KernelError.InvalidTransition, result.Error);
+        var component = kernel.QueryComponent(identity).Value!;
+        Assert.True(component.Reclaimable);
+        Assert.Empty(component.Capabilities);
+        Assert.Equal(ProcessState.Exited, kernel.Processes.ResolveTerminalState(old).Value);
+        Assert.True(kernel.RetireReclaimableComponent(identity, old).IsSuccess);
+        if (replace) Assert.Equal(ProcessState.Admitted, kernel.Processes.Resolve(fresh).Value!.State);
+    }
+
+    [Theory]
+    [InlineData(false, false)] [InlineData(false, true)]
+    [InlineData(true, false)] [InlineData(true, true)]
+    public void ComponentStartupAndFinalPublicationRequireFreshMandatoryCapability(bool afterStart, bool revokeDomain)
+    {
+        var kernel = new RuntimeKernel();
+        byte[] image = [18, 19];
+        var identity = new ComponentIdentity("fresh-start-capability");
+        var requirement = new CapabilityRequirementV1(ResourceKind.KernelService, "start-data", CapabilityRights.Read);
+        var startup = 0;
+        Action revoke = () =>
+        {
+            var capability = Assert.Single(kernel.QueryComponent(identity).Value!.Capabilities);
+            if (revokeDomain) kernel.CapabilityAuthority.RevokeAllForDomain(new DomainId(2111));
+            else Assert.True(kernel.RevokeCapability(capability).IsSuccess);
+        };
+        kernel.BeforeComponentStartingPublicationQualificationHook = () =>
+        {
+            kernel.BeforeComponentStartingPublicationQualificationHook = null;
+            if (!afterStart) revoke();
+        };
+        kernel.BeforeComponentRunningPublicationQualificationHook = () =>
+        {
+            kernel.BeforeComponentRunningPublicationQualificationHook = null;
+            startup++;
+            Assert.Equal(ProcessState.Running, kernel.Processes.Resolve(new(new ProcessId(1111), 1)).Value!.State);
+            if (afterStart) revoke();
+        };
+        var result = kernel.AdmitComponent(new(new ServiceManifestV1(identity, new("1"), Digest(image),
+            TestFixtures.Manifest(1111, 2111, capabilities: [requirement])), image,
+            [new ComponentCapabilityGrant(new DomainId(2111), requirement)]));
+        Assert.Equal(KernelError.MissingCapability, result.Error);
+        Assert.Equal(afterStart ? 1 : 0, startup);
+        var component = kernel.QueryComponent(identity).Value!;
+        Assert.True(component.Reclaimable);
+        Assert.Equal(result.Error, component.Failure);
+        Assert.Equal(ProcessState.Exited, kernel.Processes.ResolveTerminalState(component.Process).Value);
+        Assert.True(kernel.RetireReclaimableComponent(identity, component.Process).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void RollbackSourceSnapshotSurvivesActualReclaimAndCannotRevokeReplacement(bool replace)
+    {
+        var kernel = new RuntimeKernel();
+        byte[] image = [16, 17];
+        var identity = new ComponentIdentity("source-snapshot");
+        var old = new ProcessHandle(new ProcessId(1110), 1);
+        var requirement = new CapabilityRequirementV1(ResourceKind.KernelService, "snapshot-data", CapabilityRights.Read);
+        CapabilityId oldCapability = default;
+        CapabilityId freshCapability = default;
+        ProcessHandle fresh = default;
+        kernel.BeforeComponentRollbackSourceStopQualificationHook = () =>
+        {
+            kernel.BeforeComponentRollbackSourceStopQualificationHook = null;
+            oldCapability = Assert.Single(kernel.QueryComponent(identity).Value!.Capabilities);
+            Assert.True(kernel.TerminateProcess(old).IsSuccess);
+            Assert.True(kernel.ObserveComponentTeardown(identity).Value!.Reclaimable);
+            if (replace)
+            {
+                Assert.True(kernel.RetireReclaimableComponent(identity, old).IsSuccess);
+                var next = kernel.AdmitComponent(new(new ServiceManifestV1(identity, new("2"), Digest(image),
+                    TestFixtures.Manifest(1110, 2110, generation: 2, capabilities: [requirement])), image,
+                    [new ComponentCapabilityGrant(new DomainId(2110), requirement)])).Value!;
+                fresh = next.Process;
+                freshCapability = Assert.Single(next.Capabilities);
+            }
+        };
+        var result = kernel.AdmitComponent(new(new ServiceManifestV1(identity, new("1"), Digest(image),
+            TestFixtures.Manifest(1110, 2110, capabilities: [requirement]),
+            requiredContracts: [new("MissingSnapshot", "1", "missing")]), image,
+            [new ComponentCapabilityGrant(new DomainId(2110), requirement)]));
+        Assert.Equal(KernelError.ServiceNotFound, result.Error);
+        Assert.False(kernel.ValidateCapability(old, oldCapability, CapabilityRights.Read).IsSuccess);
+        var current = kernel.QueryComponent(identity).Value!;
+        if (replace)
+        {
+            Assert.Equal(fresh, current.Process);
+            Assert.Equal(ComponentLifecycleState.Running, current.State);
+            Assert.True(kernel.ValidateCapability(fresh, freshCapability, CapabilityRights.Read).IsSuccess);
+            Assert.Null(current.Failure);
+        }
+        else
+        {
+            Assert.True(current.Reclaimable);
+            Assert.True(kernel.RetireReclaimableComponent(identity, old).IsSuccess);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void RollbackFinalTerminalReceiptClosesOldComponentWithoutTouchingNewProcess(bool faulted)
+    {
+        var kernel = new RuntimeKernel();
+        byte[] image = [14, 15];
+        var identity = new ComponentIdentity("terminal-final");
+        var old = new ProcessHandle(new ProcessId(1109), 1);
+        ProcessHandle fresh = default;
+        var calls = 0;
+        kernel.RegisterComposedWorkTeardownParticipant(new ComponentClosureCallback(() =>
+        {
+            calls++;
+            return KernelResult.Ok();
+        }));
+        kernel.BeforeComponentRollbackCleanupQualificationHook = () =>
+        {
+            kernel.BeforeComponentRollbackCleanupQualificationHook = null;
+            Assert.False(kernel.Processes.ResolveTerminalState(old).IsSuccess);
+            Assert.True((faulted ? kernel.FaultProcess(old) : kernel.TerminateProcess(old)).IsSuccess);
+            (_, fresh) = TestFixtures.Create(kernel, 1109, 2109, generation: 2);
+            Assert.True(kernel.AdmitProcess(fresh).IsSuccess);
+        };
+        var result = kernel.AdmitComponent(new(new ServiceManifestV1(identity, new("1"), Digest(image),
+            TestFixtures.Manifest(1109, 2109), requiredContracts: [new("MissingFinal", "1", "missing")]), image));
+        Assert.Equal(KernelError.StaleHandle, result.Error);
+        Assert.Equal(1, calls);
+        var component = kernel.QueryComponent(identity).Value!;
+        Assert.True(component.Reclaimable);
+        Assert.Equal(result.Error, component.Failure);
+        Assert.Equal(faulted ? ProcessState.Faulted : ProcessState.Exited, kernel.Processes.ResolveTerminalState(old).Value);
+        Assert.Equal(ProcessState.Admitted, kernel.Processes.Resolve(fresh).Value!.State);
+        Assert.False(kernel.Processes.ResolveTerminalState(fresh).IsSuccess);
+        Assert.True(kernel.RetireReclaimableComponent(identity, old).IsSuccess);
+        Assert.Equal(ProcessState.Admitted, kernel.Processes.Resolve(fresh).Value!.State);
+        Assert.Equal(1, calls);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void RunningPublicationRequiresCurrentProcessStateAndRollbackClosesExactGeneration(bool terminate)
+    {
+        var kernel = new RuntimeKernel();
+        byte[] image = [12, 13];
+        var identity = new ComponentIdentity("running-publication");
+        var process = new ProcessHandle(new ProcessId(1108), 1);
+        kernel.BeforeComponentRunningPublicationQualificationHook = () =>
+        {
+            kernel.BeforeComponentRunningPublicationQualificationHook = null;
+            Assert.Equal(ProcessState.Running, kernel.Processes.Resolve(process).Value!.State);
+            Assert.True((terminate ? kernel.TerminateProcess(process) : kernel.ParkProcess(process)).IsSuccess);
+        };
+        var result = kernel.AdmitComponent(new(new ServiceManifestV1(identity, new("1"), Digest(image),
+            TestFixtures.Manifest(1108, 2108)), image));
+        Assert.False(result.IsSuccess);
+        Assert.Equal(terminate ? KernelError.StaleHandle : KernelError.InvalidTransition, result.Error);
+        var component = kernel.QueryComponent(identity).Value!;
+        Assert.True(component.Reclaimable);
+        Assert.Equal(ProcessState.Exited, kernel.Processes.ResolveTerminalState(process).Value);
+        Assert.Equal(result.Error, component.Failure);
+        Assert.True(kernel.RetireReclaimableComponent(identity, process).IsSuccess);
+        Assert.True(kernel.AdmitComponent(new(new ServiceManifestV1(identity, new("2"), Digest(image),
+            TestFixtures.Manifest(1108, 2108, generation: 2)), image)).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void RollbackFailureMetadataRequiresExactRecordAndRetainsOriginalResult(bool replace)
+    {
+        var kernel = new RuntimeKernel();
+        byte[] image = [10, 11];
+        var identity = new ComponentIdentity("rollback-publication");
+        var oldProcess = new ProcessHandle(new ProcessId(1107), 1);
+        var refuse = true;
+        var calls = 0;
+        kernel.RegisterComposedWorkTeardownParticipant(new ComponentClosureCallback(() =>
+        {
+            calls++;
+            return refuse ? KernelResult.Fail(KernelError.PlatformFaulted, "rollback closure pending") : KernelResult.Ok();
+        }));
+        kernel.BeforeComponentRollbackPublicationQualificationHook = () =>
+        {
+            kernel.BeforeComponentRollbackPublicationQualificationHook = null;
+            refuse = false;
+            Assert.True(kernel.ObserveComponentTeardown(identity).Value!.Reclaimable);
+            if (replace)
+            {
+                Assert.True(kernel.RetireReclaimableComponent(identity, oldProcess).IsSuccess);
+                Assert.True(kernel.AdmitComponent(new(new ServiceManifestV1(identity, new("2"), Digest(image),
+                    TestFixtures.Manifest(1107, 2107, generation: 2)), image)).IsSuccess);
+            }
+        };
+        var result = kernel.AdmitComponent(new(new ServiceManifestV1(identity, new("1"), Digest(image),
+            TestFixtures.Manifest(1107, 2107), requiredContracts: [new("MissingRollback", "1", "missing")]), image));
+        Assert.Equal(KernelError.PlatformFaulted, result.Error);
+        Assert.Equal(2, calls);
+        var after = kernel.QueryComponent(identity).Value!;
+        if (replace)
+        {
+            Assert.Equal(2UL, after.Process.Generation);
+            Assert.Equal(ComponentLifecycleState.Running, after.State);
+            Assert.Null(after.Failure);
+        }
+        else
+        {
+            Assert.True(after.Reclaimable);
+            Assert.Equal(KernelError.PlatformFaulted, after.Failure);
+            Assert.True(kernel.RetireReclaimableComponent(identity, oldProcess).IsSuccess);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void LateDirectFailureCannotUndoActualReclaimOrReplacement(bool replace)
+    {
+        var kernel = new RuntimeKernel();
+        byte[] image = [8, 9];
+        var identity = new ComponentIdentity("late-direct-failure");
+        var old = kernel.AdmitComponent(new(new ServiceManifestV1(identity, new("1"), Digest(image),
+            TestFixtures.Manifest(1106, 2106)), image)).Value!;
+        var refuse = true;
+        var calls = 0;
+        kernel.RegisterComposedWorkTeardownParticipant(new ComponentClosureCallback(() =>
+        {
+            calls++;
+            return refuse ? KernelResult.Fail(KernelError.PlatformFaulted, "initial failure") : KernelResult.Ok();
+        }));
+        kernel.BeforeComponentFailurePublicationQualificationHook = () =>
+        {
+            kernel.BeforeComponentFailurePublicationQualificationHook = null;
+            refuse = false;
+            Assert.True(kernel.ObserveComponentTeardown(identity).Value!.Reclaimable);
+            if (replace)
+            {
+                Assert.True(kernel.RetireReclaimableComponent(identity, old.Process).IsSuccess);
+                Assert.True(kernel.AdmitComponent(new(new ServiceManifestV1(identity, new("2"), Digest(image),
+                    TestFixtures.Manifest(1106, 2106, generation: 2)), image)).IsSuccess);
+            }
+        };
+        Assert.Equal(KernelError.PlatformFaulted, kernel.FaultComponent(identity).Error);
+        Assert.Equal(2, calls);
+        var after = kernel.QueryComponent(identity).Value!;
+        if (replace)
+        {
+            Assert.Equal(2UL, after.Process.Generation);
+            Assert.Equal(ComponentLifecycleState.Running, after.State);
+            Assert.True(kernel.Budgets.HasProcessAccount(after.Process));
+        }
+        else
+        {
+            Assert.True(after.Reclaimable);
+            Assert.True(kernel.RetireReclaimableComponent(identity, old.Process).IsSuccess);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void LateBlockedTeardownPublicationCannotUndoReclaimOrReplacement(bool replace)
+    {
+        var kernel = new RuntimeKernel();
+        byte[] image = [6, 7];
+        var identity = new ComponentIdentity("late-teardown");
+        var plan = new ComponentAdmissionPlan(new ServiceManifestV1(identity, new("1"), Digest(image),
+            TestFixtures.Manifest(1105, 2105)), image);
+        var old = kernel.AdmitComponent(plan).Value!;
+        var refuse = true;
+        var calls = 0;
+        kernel.RegisterComposedWorkTeardownParticipant(new ComponentClosureCallback(() =>
+        {
+            calls++;
+            return refuse ? KernelResult.Fail(KernelError.PlatformFaulted, "pending closure") : KernelResult.Ok();
+        }));
+        Assert.Equal(KernelError.PlatformFaulted, kernel.FaultComponent(identity).Error);
+        kernel.BeforeComponentTeardownPublicationQualificationHook = () =>
+        {
+            kernel.BeforeComponentTeardownPublicationQualificationHook = null;
+            refuse = false;
+            Assert.True(kernel.ObserveComponentTeardown(identity).Value!.Reclaimable);
+            if (replace)
+            {
+                Assert.True(kernel.RetireReclaimableComponent(identity, old.Process).IsSuccess);
+                Assert.True(kernel.AdmitComponent(new(new ServiceManifestV1(identity, new("2"), Digest(image),
+                    TestFixtures.Manifest(1105, 2105, generation: 2)), image)).IsSuccess);
+            }
+        };
+        Assert.True(kernel.ObserveComponentTeardown(identity).IsSuccess);
+        Assert.Equal(3, calls);
+        var after = kernel.QueryComponent(identity).Value!;
+        if (replace)
+        {
+            Assert.Equal(2UL, after.Process.Generation);
+            Assert.Equal(ComponentLifecycleState.Running, after.State);
+            Assert.True(kernel.Budgets.HasProcessAccount(after.Process));
+            Assert.False(kernel.Budgets.HasProcessAccount(old.Process));
+        }
+        else
+        {
+            Assert.True(after.Reclaimable);
+            Assert.True(kernel.RetireReclaimableComponent(identity, old.Process).IsSuccess);
+            Assert.Equal(KernelError.ComponentNotFound, kernel.QueryComponent(identity).Error);
+        }
+    }
+
+    [Fact]
+    public async Task ConcurrentComponentAdmissionRefusesDuplicateBeforeHierarchyAllocation()
+    {
+        var kernel = new RuntimeKernel();
+        byte[] image = [4, 5];
+        var plans = new[] { 1103UL, 1104UL }.Select(id => new ComponentAdmissionPlan(
+            new ServiceManifestV1(new("concurrent-admission"), new("1"), Digest(image),
+                TestFixtures.Manifest(id, id + 1000)), image)).ToArray();
+        using var barrier = new Barrier(2);
+        kernel.BeforeComponentAdmissionCommitQualificationHook = () =>
+            Assert.True(barrier.SignalAndWait(TimeSpan.FromSeconds(10)));
+        var results = await Task.WhenAll(plans.Select(plan => Task.Run(() => kernel.AdmitComponent(plan))))
+            .WaitAsync(TimeSpan.FromSeconds(20));
+        kernel.BeforeComponentAdmissionCommitQualificationHook = null;
+        var winner = Assert.Single(results, result => result.IsSuccess).Value!;
+        Assert.Equal(KernelError.DuplicateIdentity, Assert.Single(results, result => !result.IsSuccess).Error);
+        var loser = plans.Select(plan => new ProcessHandle(plan.Manifest.Process.ProcessId, plan.Manifest.Process.Generation))
+            .Single(process => process != winner.Process);
+        Assert.False(kernel.Budgets.HasProcessAccount(loser));
+        Assert.False(kernel.Processes.Resolve(loser).IsSuccess);
+        Assert.Equal(winner.Process, kernel.QueryComponent(new("concurrent-admission")).Value!.Process);
+        Assert.True(kernel.DrainComponent(new("concurrent-admission"), winner.Process).Value!.Reclaimable);
+        Assert.True(kernel.RetireReclaimableComponent(new("concurrent-admission"), winner.Process).IsSuccess);
+        Assert.True(kernel.AdmitComponent(plans.Single(plan => plan.Manifest.Process.ProcessId == loser.ProcessId)).IsSuccess);
+    }
+
+    [Theory]
     [InlineData(0, false)] [InlineData(0, true)]
     [InlineData(1, false)] [InlineData(1, true)]
     [InlineData(2, false)] [InlineData(2, true)]

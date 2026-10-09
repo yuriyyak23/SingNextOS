@@ -13,8 +13,10 @@ public sealed partial class RuntimeKernel
         if (!resolved.IsSuccess)
             return KernelResult<PlatformDmaCompletionEvidence>.Fail(
                 resolved.Error, resolved.Message!);
-        var proven = PlatformAuthority.GetProvenDmaCompletion(
-            submission, PlatformIdentity(resolved.Value!));
+        var trace = PlatformAuthority.CaptureDmaTrace(submission);
+        KernelResult<PlatformDmaCompletionEvidence> proven;
+        try { proven = PlatformAuthority.GetProvenDmaCompletion(submission, PlatformIdentity(resolved.Value!)); }
+        finally { PlatformAuthority.FlushDmaTrace(trace); }
         return proven.Error == KernelError.PlatformBindingDraining
             ? ObservePlatformDmaCompletion(subject, submission)
             : proven;
@@ -76,9 +78,10 @@ public sealed partial class RuntimeKernel
         }
 
         var identity = PlatformIdentity(process);
-        var submissionValidation = PlatformAuthority.ValidateDmaSubmissionIdentity(
-            submission,
-            identity);
+        var trace = PlatformAuthority.CaptureDmaTrace(submission);
+        KernelResult submissionValidation;
+        try { submissionValidation = PlatformAuthority.ValidateDmaSubmissionIdentity(submission, identity); }
+        finally { PlatformAuthority.FlushDmaTrace(trace); }
         if (!submissionValidation.IsSuccess)
         {
             return KernelResult<PlatformDmaCompletionEvidence>.Fail(
@@ -99,7 +102,6 @@ public sealed partial class RuntimeKernel
         }
 
         KernelResult<PlatformDmaCompletionEvidence> completion;
-        var trace = PlatformAuthority.CaptureDmaTrace(submission);
         try { completion = PlatformAuthority.ObserveDmaCompletion(submission, identity); }
         finally { PlatformAuthority.FlushDmaTrace(trace); }
         if (!completion.IsSuccess)

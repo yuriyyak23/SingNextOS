@@ -8,6 +8,538 @@ namespace SingPlus.Tests.Platform;
 public sealed class PlatformBorrowReadGrantTeardownTests
 {
     [Fact]
+    public void BorrowerExitCannotCloseLocalUsePastUnknownExternalGrant()
+    {
+        var s = CreateScenario();
+        var use = s.Kernel.AcquireBorrowRegionUse(s.Owner, s.Borrower, s.Lease.Handle,
+            RegionUseMode.ReadOnly, new(0, 64)).Value!;
+        _ = CreateGrant(s);
+        s.Provider.BeforeBegin = () => throw new IOException("Original grant closure lost response");
+        Assert.False(s.Kernel.TerminateProcess(s.Borrower).IsSuccess);
+        s.Provider.BeforeBegin = null;
+        Assert.False(s.Kernel.TerminateProcess(s.Borrower).IsSuccess);
+        Assert.False(s.Kernel.QueryProcessTeardown(s.Borrower).Value!.LocalReclaimCompleted);
+        Assert.NotEqual(RegionUseState.Released, s.Kernel.Regions.SnapshotUses().Single(u => u.Handle == use.Handle).State);
+        Assert.Equal(RegionState.Loaned, Assert.Single(s.Kernel.Regions.Snapshot()).State);
+        Assert.False(s.Kernel.ReturnBorrow(s.Borrower, s.Lease.Handle).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false, false)] [InlineData(false, true)]
+    [InlineData(true, false)] [InlineData(true, true)]
+    public async Task ProcessBorrowProgressionAllowsConcurrentOwnerQueriesAndOtherExit(bool observe, bool ownerExits)
+    {
+        var s = CreateScenario();
+        var grant = CreateGrant(s);
+        if (observe)
+        {
+            s.Provider.CompletionState = PlatformCompletionState.Draining;
+            Assert.False(s.Kernel.TerminateProcess(ownerExits ? s.Owner : s.Borrower).IsSuccess);
+            s.Provider.CompletionState = PlatformCompletionState.Closed;
+        }
+        var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var kernelGate = typeof(RuntimeKernel).GetField("_platformMemoryUseGate", flags)!.GetValue(s.Kernel)!;
+        var bridgeGate = typeof(PlatformAuthorityBridge).GetField("_secureDomainLifecycleGate", flags)!.GetValue(s.Kernel.PlatformAuthority)!;
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        Action callback = () =>
+        {
+            Assert.False(Monitor.IsEntered(kernelGate));
+            Assert.False(Monitor.IsEntered(bridgeGate));
+            entered.Set();
+            Assert.True(release.Wait(TimeSpan.FromSeconds(5)));
+        };
+        if (observe) s.Provider.BeforeObserve = callback; else s.Provider.BeforeBegin = callback;
+        var exiting = ownerExits ? s.Owner : s.Borrower;
+        var other = ownerExits ? s.Borrower : s.Owner;
+        var progression = Task.Run(() => s.Kernel.TerminateProcess(exiting));
+        Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+        try
+        {
+            var queries = Task.Run(() =>
+            {
+                Assert.True(s.Kernel.QueryProcessTeardown(exiting).IsSuccess);
+                Assert.True(s.Kernel.ObserveProcessTeardown(exiting).IsSuccess);
+                Assert.False(s.Kernel.TerminateProcess(other).IsSuccess);
+                Assert.False(s.Kernel.ReturnBorrow(s.Borrower, s.Lease.Handle).IsSuccess);
+                Assert.Equal(RegionState.Loaned, Assert.Single(s.Kernel.Regions.Snapshot()).State);
+            });
+            await queries.WaitAsync(TimeSpan.FromSeconds(3));
+        }
+        finally { release.Set(); }
+        Assert.True((await progression).IsSuccess);
+        s.Provider.BeforeBegin = null;
+        s.Provider.BeforeObserve = null;
+        Assert.True(s.Kernel.TerminateProcess(other).IsSuccess);
+        Assert.Equal(0, s.Provider.ActiveMappingCount);
+        Assert.Equal(1, s.Provider.BeginCalls);
+        Assert.Equal(observe ? 2 : 1, s.Provider.ObserveCalls);
+        Assert.False(s.Lease.IsValid);
+        Assert.Equal(RegionState.Released, Assert.Single(s.Kernel.Regions.Snapshot()).State);
+    }
+
+    [Theory]
+    [InlineData(false, false)] [InlineData(false, true)]
+    [InlineData(true, false)] [InlineData(true, true)]
+    public void ProcessBorrowCallbackFaultOrResetKeepsActualReclaimPinned(bool observe, bool reset)
+    {
+        var s = CreateScenario();
+        _ = CreateGrant(s);
+        if (observe)
+        {
+            s.Provider.CompletionState = PlatformCompletionState.Draining;
+            Assert.False(s.Kernel.TerminateProcess(s.Borrower).IsSuccess);
+            s.Provider.CompletionState = PlatformCompletionState.Closed;
+        }
+        var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var gate = typeof(RuntimeKernel).GetField("_platformMemoryUseGate", flags)!.GetValue(s.Kernel)!;
+        Action callback = () =>
+        {
+            Assert.False(Monitor.IsEntered(gate));
+            Assert.True(s.Kernel.QueryProcessTeardown(s.Borrower).IsSuccess);
+            if (reset) Assert.True(s.Kernel.ObservePlatformBackendReset().IsSuccess);
+            else throw new IOException("Provider progression lost response");
+        };
+        if (observe) s.Provider.BeforeObserve = callback; else s.Provider.BeforeBegin = callback;
+        Assert.False(s.Kernel.TerminateProcess(s.Borrower).IsSuccess);
+        s.Provider.BeforeBegin = null;
+        s.Provider.BeforeObserve = null;
+        Assert.False(s.Kernel.TerminateProcess(s.Borrower).IsSuccess);
+        Assert.False(s.Kernel.ReturnBorrow(s.Borrower, s.Lease.Handle).IsSuccess);
+        Assert.False(s.Kernel.QueryProcessTeardown(s.Borrower).Value!.LocalReclaimCompleted);
+        Assert.Equal(RegionState.Loaned, Assert.Single(s.Kernel.Regions.Snapshot()).State);
+        Assert.Equal(observe && reset ? 0 : 1, s.Provider.ActiveMappingCount);
+    }
+
+    [Fact]
+    public void BorrowClosureCannotReclaimProcessPastChangedCxlParticipantInventory()
+    {
+        var s = CreateScenario();
+        _ = CreateGrant(s);
+        var participant = new InventoryOnlyCxlParticipant();
+        var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        s.Provider.AfterObserve = () => typeof(RuntimeKernel).GetMethod("RegisterCxlTeardownParticipant", flags)!
+            .Invoke(s.Kernel, new object[] { participant });
+        Assert.False(s.Kernel.TerminateProcess(s.Borrower).IsSuccess);
+        Assert.True(s.Kernel.Processes.Resolve(s.Borrower).IsSuccess);
+        Assert.False(s.Kernel.QueryProcessTeardown(s.Borrower).Value!.LocalReclaimCompleted);
+        Assert.Equal(RegionState.Owned, Assert.Single(s.Kernel.Regions.Snapshot()).State);
+        Assert.Equal(0, participant.Calls);
+        s.Provider.AfterObserve = null;
+        Assert.True(s.Kernel.TerminateProcess(s.Borrower).IsSuccess);
+        Assert.Equal(1, participant.Calls);
+        Assert.Equal(1, s.Provider.BeginCalls);
+        Assert.Equal(1, s.Provider.ObserveCalls);
+    }
+
+    private sealed class InventoryOnlyCxlParticipant : ICxlTeardownParticipant
+    {
+        public int Calls { get; private set; }
+        public KernelResult CloseForProcess(ProcessHandle process, RegionOwner owner)
+        {
+            Calls++;
+            return KernelResult.Ok();
+        }
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)]
+    [InlineData(4)] [InlineData(5)] [InlineData(6)]
+    public void BorrowCreateRefusesLatePublicationAndRetainsActualCleanupConsumer(int fault)
+    {
+        var s = CreateScenario();
+        var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var kernelGate = typeof(RuntimeKernel).GetField("_platformMemoryUseGate", flags)!.GetValue(s.Kernel)!;
+        var bridgeGate = typeof(PlatformAuthorityBridge).GetField("_secureDomainLifecycleGate", flags)!.GetValue(s.Kernel.PlatformAuthority)!;
+        var outside = false;
+        var generationOutside = false;
+        s.Provider.AfterMap = () =>
+        {
+            outside = !Monitor.IsEntered(kernelGate) && !Monitor.IsEntered(bridgeGate);
+            s.Provider.BeforeGeneration = () =>
+            {
+                generationOutside = !Monitor.IsEntered(kernelGate) && !Monitor.IsEntered(bridgeGate);
+                s.Provider.BeforeGeneration = null;
+            };
+            if (fault == 0 || fault == 1) Assert.False(s.Kernel.TerminateProcess(fault == 0 ? s.Owner : s.Borrower).IsSuccess);
+            else if (fault == 2) s.Provider.ThrowGeneration = true;
+            else if (fault == 3) s.Provider.Incarnation = new PlatformProviderIncarnation(2);
+            else if (fault == 4) Assert.True(s.Kernel.ObservePlatformBackendReset().IsSuccess);
+            else if (fault == 5) throw new IOException("Mapping reply lost after effect");
+        };
+        s.Provider.MalformedMap = fault == 6;
+        var result = s.Kernel.CreatePlatformBorrowReadGrant(s.Owner, s.Borrower, s.Binding, s.Lease.Handle, 0, 64);
+        Assert.True(outside);
+        if (fault != 5) Assert.True(generationOutside);
+        Assert.False(result.IsSuccess);
+        Assert.Equal(1, s.Provider.MapCalls);
+        Assert.Equal(1, s.Provider.ActiveMappingCount);
+        Assert.Equal(RegionState.Loaned, Assert.Single(s.Kernel.Regions.Snapshot()).State);
+        s.Provider.AfterMap = null;
+        s.Provider.ThrowGeneration = false;
+        if (fault <= 2)
+        {
+            Assert.True(s.Kernel.TerminateProcess(fault == 0 ? s.Owner : s.Borrower).IsSuccess);
+            Assert.Equal(0, s.Provider.ActiveMappingCount);
+            Assert.Equal(1, s.Provider.BeginCalls);
+            Assert.Equal(1, s.Provider.ObserveCalls);
+            Assert.False(s.Lease.IsValid);
+            var remaining = Assert.Single(s.Kernel.Regions.Snapshot());
+            Assert.Equal(fault == 0 ? RegionState.Released : RegionState.Owned, remaining.State);
+        }
+        else
+        {
+            Assert.False(s.Kernel.ReturnBorrow(s.Borrower, s.Lease.Handle).IsSuccess);
+            Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+            Assert.False(s.Kernel.TerminateProcess(s.Borrower).IsSuccess);
+            Assert.Equal(RegionState.Loaned, Assert.Single(s.Kernel.Regions.Snapshot()).State);
+            Assert.Equal(0, s.Provider.BeginCalls);
+            Assert.Equal(0, s.Provider.ObserveCalls);
+        }
+    }
+
+    [Fact]
+    public async Task PausedBorrowMappingCannotPublishAfterConcurrentBorrowerExitAndCanDrainLater()
+    {
+        var s = CreateScenario();
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        s.Provider.AfterMap = () => { entered.Set(); Assert.True(release.Wait(TimeSpan.FromSeconds(5))); };
+        var create = Task.Run(() => s.Kernel.CreatePlatformBorrowReadGrant(s.Owner, s.Borrower, s.Binding, s.Lease.Handle, 0, 64));
+        Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+        try
+        {
+            Assert.False(s.Kernel.TerminateProcess(s.Borrower).IsSuccess);
+            Assert.Equal(RegionState.Loaned, Assert.Single(s.Kernel.Regions.Snapshot()).State);
+            Assert.Equal(0, s.Provider.BeginCalls);
+        }
+        finally { release.Set(); }
+        Assert.False((await create).IsSuccess);
+        s.Provider.AfterMap = null;
+        var drained = s.Kernel.ObserveProcessTeardown(s.Borrower);
+        Assert.True(drained.IsSuccess);
+        Assert.True(drained.Value!.LocalReclaimCompleted);
+        Assert.Equal(RegionState.Owned, Assert.Single(s.Kernel.Regions.Snapshot()).State);
+        Assert.Equal(1, s.Provider.MapCalls);
+        Assert.Equal(1, s.Provider.BeginCalls);
+        Assert.Equal(1, s.Provider.ObserveCalls);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void ExhaustedLocalBorrowMutationRetainsClosedGrantReservationAndTracking(int consumer)
+    {
+        var s = CreateScenario();
+        var grant = CreateGrant(s);
+        var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var records = (global::System.Collections.IDictionary)typeof(RegionAuthority).GetField("_regions", flags)!.GetValue(s.Kernel.Regions)!;
+        var record = records.Values.Cast<object>().Single();
+        record.GetType().GetProperty("MutationEpoch")!.SetValue(record, new MutationEpoch(ulong.MaxValue));
+        var result = consumer == 0
+            ? s.Kernel.RequestPlatformBorrowCompletion(s.Owner, s.Borrower, s.Lease.Handle, grant)
+            : s.Kernel.TerminateProcess(consumer == 1 ? s.Owner : s.Borrower);
+        Assert.False(result.IsSuccess);
+        Assert.Equal(KernelError.CapacityExhausted, result.Error);
+        var lifecycle = s.Kernel.QueryPlatformBorrowReadGrantLifecycle(s.Owner, grant);
+        Assert.True(lifecycle.IsSuccess);
+        Assert.Equal(PlatformExternalClosureState.Closed, lifecycle.Value.PlatformClosure);
+        Assert.False(lifecycle.Value.LocalReservationReleased);
+        Assert.Equal(RegionState.Loaned, Assert.Single(s.Kernel.Regions.Snapshot()).State);
+        var borrower = s.Kernel.Processes.Resolve(s.Borrower).Value!;
+        var owner = s.Kernel.Processes.Resolve(s.Owner).Value!;
+        Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.Regions.ReturnLoan(s.Lease.Handle,
+            new RegionOwner(borrower.DomainId, s.Borrower.Generation)).Error);
+        Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.Regions.RevokeLoan(s.Lease.Handle,
+            new RegionOwner(owner.DomainId, s.Owner.Generation)).Error);
+        var tracking = (global::System.Collections.IDictionary)typeof(RuntimeKernel).GetField("_platformBorrowReadGrants", flags)!.GetValue(s.Kernel)!;
+        Assert.Equal(1, tracking.Count);
+        Assert.Equal(1, s.Provider.BeginCalls);
+        Assert.Equal(1, s.Provider.ObserveCalls);
+        Assert.Equal(0, s.Provider.ActiveMappingCount);
+    }
+
+    [Fact]
+    public async Task ClosedBorrowCommitKeepsReservationUntilOwnerCompositionAndOrdinaryReturnSettlesOnce()
+    {
+        var s = CreateScenario();
+        var grant = CreateGrant(s);
+        Assert.True(Progress(s, grant, true).IsSuccess);
+        var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var gate = typeof(PlatformAuthorityBridge).GetField("_secureDomainLifecycleGate", flags)!.GetValue(s.Kernel.PlatformAuthority)!;
+        using var held = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var holder = Task.Factory.StartNew(() =>
+        {
+            lock (gate) { held.Set(); Assert.True(release.Wait(TimeSpan.FromSeconds(5))); }
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        Assert.True(held.Wait(TimeSpan.FromSeconds(5)));
+        Task<KernelResult> completion;
+        Task<KernelResult> ordinary;
+        try
+        {
+            completion = Task.Run(() => s.Kernel.RequestPlatformBorrowCompletion(s.Owner, s.Borrower, s.Lease.Handle, grant));
+            ordinary = Task.Run(() => s.Kernel.ReturnBorrow(s.Borrower, s.Lease.Handle));
+            await Task.Delay(200);
+            Assert.False(completion.IsCompleted);
+        }
+        finally { release.Set(); }
+        await holder;
+        Assert.True((await completion).IsSuccess);
+        Assert.False((await ordinary).IsSuccess);
+        Assert.Equal(RegionState.Owned, Assert.Single(s.Kernel.Regions.Snapshot()).State);
+        Assert.False(s.Lease.IsValid);
+        Assert.Equal(1, s.Provider.BeginCalls);
+        Assert.Equal(1, s.Provider.ObserveCalls);
+        var nextLease = CreateCpuBorrow(s.Kernel, s.Owner, s.Borrower, s.Buffer);
+        Assert.NotEqual(s.Lease.Handle.Generation, nextLease.Handle.Generation);
+        var nextGrant = s.Kernel.CreatePlatformBorrowReadGrant(s.Owner, s.Borrower, s.Binding, nextLease.Handle, 0, 64);
+        Assert.True(nextGrant.IsSuccess);
+        Assert.False(s.Kernel.RequestPlatformBorrowCompletion(s.Owner, s.Borrower, s.Lease.Handle, grant).IsSuccess);
+        Assert.True(nextLease.IsValid);
+        Assert.True(s.Kernel.RequestPlatformBorrowCompletion(s.Owner, s.Borrower, nextLease.Handle, nextGrant.Value).IsSuccess);
+        Assert.Equal(2, s.Provider.BeginCalls);
+        Assert.Equal(2, s.Provider.ObserveCalls);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public async Task ResetHoldingMappingCommitGatePreventsOldAdmissionOrClosedPublication(int stage)
+    {
+        var s = CreateScenario();
+        var grant = CreateGrant(s);
+        var retained = stage == 2;
+        if (retained)
+        {
+            s.Provider.AfterObserve = () => s.Provider.ThrowGeneration = true;
+            Assert.Equal(KernelError.PlatformFaulted, Progress(s, grant, true).Error);
+            s.Provider.AfterObserve = null;
+            s.Provider.ThrowGeneration = false;
+        }
+        var bridge = s.Kernel.PlatformAuthority;
+        var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var gate = typeof(PlatformAuthorityBridge).GetField("_secureDomainLifecycleGate", flags)!.GetValue(bridge)!;
+        var mappings = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_mappings", flags)!.GetValue(bridge)!;
+        var record = mappings.Values.Cast<object>().Single();
+        var closureProperty = record.GetType().GetProperty("ClosureState")!;
+        using var sourceRead = new ManualResetEventSlim();
+        using var gateHeld = new ManualResetEventSlim();
+        var outside = false;
+        var prematureClosed = false;
+        KernelResult<PlatformBackendResetSnapshot> reset = default;
+        var resetWriter = Task.Factory.StartNew(() =>
+        {
+            Assert.True(sourceRead.Wait(TimeSpan.FromSeconds(5)));
+            lock (gate)
+            {
+                gateHeld.Set();
+                // An older implementation publishes Closed while this owner gate
+                // is held and then blocks only in the transition's finally block.
+                prematureClosed = SpinWait.SpinUntil(() =>
+                    (PlatformExternalClosureState)closureProperty.GetValue(record)! == PlatformExternalClosureState.Closed,
+                    TimeSpan.FromMilliseconds(500));
+                reset = bridge.ObserveBackendReset();
+            }
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        Action pauseSource = () =>
+        {
+            s.Provider.BeforeGeneration = null;
+            outside = !Monitor.IsEntered(gate);
+            sourceRead.Set();
+            Assert.True(gateHeld.Wait(TimeSpan.FromSeconds(5)));
+        };
+        if (stage != 1) s.Provider.BeforeGeneration = pauseSource;
+        else s.Provider.AfterObserve = () => s.Provider.BeforeGeneration = pauseSource;
+        var progressed = await Task.Run(() => Progress(s, grant, !retained));
+        await resetWriter;
+        Assert.True(outside);
+        Assert.False(prematureClosed);
+        Assert.True(reset.IsSuccess);
+        Assert.Equal(1, reset.Value.FaultPinnedMappings);
+        Assert.Equal(KernelError.PlatformFaulted, progressed.Error);
+        Assert.Equal(stage == 0 ? 0 : 1, s.Provider.BeginCalls);
+        Assert.Equal(stage == 0 ? 0 : 1, s.Provider.ObserveCalls);
+        Assert.Equal(stage == 0 ? 1 : 0, s.Provider.ActiveMappingCount);
+        Assert.False(s.Kernel.RequestPlatformBorrowCompletion(s.Owner, s.Borrower, s.Lease.Handle, grant).IsSuccess);
+        Assert.True(s.Lease.IsValid);
+        Assert.False(s.Kernel.TerminateProcess(s.Borrower).IsSuccess);
+        Assert.False(s.Kernel.QueryProcessTeardown(s.Borrower).Value!.LocalReclaimCompleted);
+        Assert.Equal(RegionState.Loaned, Assert.Single(s.Kernel.Regions.Snapshot()).State);
+    }
+
+    [Fact]
+    public void FaultedMappingReceiptRemainsPinnedWhenLateGenerationQueryThrows()
+    {
+        var s = CreateScenario();
+        var grant = CreateGrant(s);
+        s.Provider.CompletionState = PlatformCompletionState.Faulted;
+        s.Provider.AfterObserve = () => s.Provider.ThrowGeneration = true;
+        Assert.Equal(KernelError.PlatformFaulted, Progress(s, grant, true).Error);
+        s.Provider.AfterObserve = null;
+        s.Provider.ThrowGeneration = false;
+        s.Provider.CompletionState = PlatformCompletionState.Closed;
+        Assert.False(s.Kernel.RequestPlatformBorrowCompletion(s.Owner, s.Borrower, s.Lease.Handle, grant).IsSuccess);
+        Assert.False(s.Kernel.TerminateProcess(s.Borrower).IsSuccess);
+        Assert.Equal(1, s.Provider.BeginCalls);
+        Assert.Equal(1, s.Provider.ObserveCalls);
+        Assert.Equal(RegionState.Loaned, Assert.Single(s.Kernel.Regions.Snapshot()).State);
+    }
+
+    [Theory]
+    [InlineData(false, 0)] [InlineData(false, 1)] [InlineData(false, 2)]
+    [InlineData(true, 0)] [InlineData(true, 1)] [InlineData(true, 2)]
+    [InlineData(false, 3)] [InlineData(true, 3)]
+    public void ExactMappingCleanupFactsSurviveLateQueryButUnknownOrChangedSourcePins(bool observe, int fault)
+    {
+        var s = CreateScenario();
+        var grant = CreateGrant(s);
+        if (observe)
+        {
+            s.Provider.CompletionState = PlatformCompletionState.Draining;
+            Assert.True(Progress(s, grant, true).IsSuccess);
+            s.Provider.CompletionState = PlatformCompletionState.Closed;
+        }
+        Action late = () =>
+        {
+            if (fault == 0) s.Provider.ThrowGeneration = true;
+            else if (fault == 1) s.Provider.Incarnation = new PlatformProviderIncarnation(2);
+            else if (fault == 3) Assert.True(s.Kernel.ObservePlatformBackendReset().IsSuccess);
+            else throw new IOException("Exact provider reply lost after effect");
+        };
+        if (observe) s.Provider.AfterObserve = late;
+        else s.Provider.AfterBegin = late;
+        Assert.Equal(KernelError.PlatformFaulted, Progress(s, grant, !observe).Error);
+        Assert.Equal(RegionState.Loaned, Assert.Single(s.Kernel.Regions.Snapshot()).State);
+        Assert.True(s.Lease.IsValid);
+        var begins = s.Provider.BeginCalls;
+        var observations = s.Provider.ObserveCalls;
+        s.Provider.AfterBegin = null;
+        s.Provider.AfterObserve = null;
+        s.Provider.ThrowGeneration = false;
+        if (fault == 0)
+        {
+            Assert.True(s.Kernel.RequestPlatformBorrowCompletion(s.Owner, s.Borrower, s.Lease.Handle, grant).IsSuccess);
+            Assert.Equal(begins, s.Provider.BeginCalls);
+            Assert.Equal(observations + (observe ? 0 : 1), s.Provider.ObserveCalls);
+            Assert.False(s.Lease.IsValid);
+            Assert.Equal(RegionState.Owned, Assert.Single(s.Kernel.Regions.Snapshot()).State);
+            Assert.Equal(0, s.Provider.ActiveMappingCount);
+            Assert.True(s.Kernel.TerminateProcess(s.Borrower).IsSuccess);
+        }
+        else
+        {
+            Assert.False(s.Kernel.RequestPlatformBorrowCompletion(s.Owner, s.Borrower, s.Lease.Handle, grant).IsSuccess);
+            Assert.False(s.Kernel.TerminateProcess(s.Borrower).IsSuccess);
+            Assert.Equal(RegionState.Loaned, Assert.Single(s.Kernel.Regions.Snapshot()).State);
+            Assert.Equal(begins, s.Provider.BeginCalls);
+            Assert.Equal(observations, s.Provider.ObserveCalls);
+        }
+    }
+
+    private static KernelResult<PlatformBorrowReadGrantLifecycle> Progress(Scenario s, PlatformBorrowReadGrant grant, bool begin)
+    {
+        var method = typeof(PlatformAuthorityBridge).GetMethod(begin ? "BeginBorrowReadGrantRevocation" : "ObserveBorrowReadGrantRevocation",
+            global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!;
+        return (KernelResult<PlatformBorrowReadGrantLifecycle>)method.Invoke(s.Kernel.PlatformAuthority,
+            new object[] { grant, grant.DomainBinding.Subject })!;
+    }
+    [Theory]
+    [InlineData(false, 0)] [InlineData(false, 1)] [InlineData(false, 2)]
+    [InlineData(true, 0)] [InlineData(true, 1)] [InlineData(true, 2)]
+    public void MappingTransitionRefusesNestedBeginAndObserveWithoutDuplicateEffect(bool observe, int fault)
+    {
+        var s = CreateScenario();
+        var grant = CreateGrant(s);
+        if (observe)
+        {
+            s.Provider.CompletionState = PlatformCompletionState.Draining;
+            Assert.True(Progress(s, grant, true).IsSuccess);
+            s.Provider.CompletionState = PlatformCompletionState.Closed;
+        }
+        var gate = typeof(PlatformAuthorityBridge).GetField("_secureDomainLifecycleGate",
+            global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.GetValue(s.Kernel.PlatformAuthority)!;
+        var outside = false;
+        KernelResult<PlatformBorrowReadGrantLifecycle> nestedBegin = default;
+        KernelResult<PlatformBorrowReadGrantLifecycle> nestedObserve = default;
+        Action callback = () =>
+        {
+            outside = !Monitor.IsEntered(gate);
+            nestedBegin = Progress(s, grant, true);
+            nestedObserve = Progress(s, grant, false);
+            if (fault == 1) throw new IOException("Provider transition reply lost");
+        };
+        if (observe) s.Provider.BeforeObserve = callback;
+        else s.Provider.BeforeBegin = callback;
+        s.Provider.MalformedReceipt = fault == 2;
+        var result = Progress(s, grant, !observe);
+        Assert.True(outside);
+        Assert.Equal(KernelError.PlatformBindingDraining, nestedBegin.Error);
+        Assert.Equal(KernelError.PlatformBindingDraining, nestedObserve.Error);
+        Assert.Equal(1, s.Provider.BeginCalls);
+        Assert.Equal(observe ? 2 : fault == 1 ? 0 : 1, s.Provider.ObserveCalls);
+        s.Provider.BeforeBegin = null;
+        s.Provider.BeforeObserve = null;
+        if (fault == 0)
+        {
+            Assert.True(result.IsSuccess);
+            Assert.True(s.Kernel.RequestPlatformBorrowCompletion(s.Owner, s.Borrower, s.Lease.Handle, grant).IsSuccess);
+            Assert.Equal(0, s.Provider.ActiveMappingCount);
+            Assert.True(s.Kernel.TerminateProcess(s.Borrower).IsSuccess);
+        }
+        else
+        {
+            Assert.False(result.IsSuccess);
+            if (fault == 1)
+            {
+                Assert.Equal(KernelError.PlatformFaulted, Progress(s, grant, true).Error);
+                Assert.False(s.Kernel.TerminateProcess(s.Borrower).IsSuccess);
+                Assert.Equal(RegionState.Loaned, Assert.Single(s.Kernel.Regions.Snapshot()).State);
+            }
+            else
+            {
+                Assert.Equal(KernelError.StaleGeneration, result.Error);
+                Assert.Equal(RegionState.Loaned, Assert.Single(s.Kernel.Regions.Snapshot()).State);
+                s.Provider.MalformedReceipt = false;
+                Assert.True(Progress(s, grant, false).IsSuccess);
+                Assert.True(s.Kernel.RequestPlatformBorrowCompletion(s.Owner, s.Borrower, s.Lease.Handle, grant).IsSuccess);
+                Assert.Equal(1, s.Provider.BeginCalls);
+            }
+        }
+    }
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public async Task PausedMappingTransitionAllowsCompetingCallsWithoutDuplicateProviderInvocation(bool observe)
+    {
+        var s = CreateScenario();
+        var grant = CreateGrant(s);
+        if (observe)
+        {
+            s.Provider.CompletionState = PlatformCompletionState.Draining;
+            Assert.True(Progress(s, grant, true).IsSuccess);
+            s.Provider.CompletionState = PlatformCompletionState.Closed;
+        }
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var released = false;
+        Action callback = () => { entered.Set(); released = release.Wait(TimeSpan.FromSeconds(5)); };
+        if (observe) s.Provider.BeforeObserve = callback; else s.Provider.BeforeBegin = callback;
+        var task = Task.Run(() => Progress(s, grant, !observe));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+            Assert.Equal(KernelError.PlatformBindingDraining, Progress(s, grant, true).Error);
+            Assert.Equal(KernelError.PlatformBindingDraining, Progress(s, grant, false).Error);
+            Assert.Equal(1, s.Provider.BeginCalls);
+            Assert.Equal(observe ? 2 : 0, s.Provider.ObserveCalls);
+            Assert.Equal(RegionState.Loaned, Assert.Single(s.Kernel.Regions.Snapshot()).State);
+        }
+        finally { release.Set(); }
+        Assert.True((await task).IsSuccess);
+        Assert.True(released);
+        Assert.True(s.Kernel.RequestPlatformBorrowCompletion(s.Owner, s.Borrower, s.Lease.Handle, grant).IsSuccess);
+        Assert.Equal(1, s.Provider.BeginCalls);
+        Assert.Equal(observe ? 2 : 1, s.Provider.ObserveCalls);
+    }
+    [Fact]
     public void BorrowerTeardownClosesGrantBeforeReturningCpuBorrow()
     {
         var scenario = CreateScenario();
@@ -161,7 +693,8 @@ public sealed class PlatformBorrowReadGrantTeardownTests
         IPlatformFeatureProvider,
         IPlatformOwnedRegionMappingProvider,
         IPlatformRegionVisibilityProvider,
-        IPlatformRegionRevocationProvider
+        IPlatformRegionRevocationProvider,
+        IPlatformProviderIncarnationSource
     {
         private sealed class MappingRecord(
             PlatformProviderOwnedRegionMapping mapping)
@@ -182,6 +715,20 @@ public sealed class PlatformBorrowReadGrantTeardownTests
 
         public PlatformCompletionState CompletionState { get; set; } =
             PlatformCompletionState.Closed;
+        public bool ThrowGeneration { get; set; }
+        public Action? AfterMap { get; set; }
+        public bool MalformedMap { get; set; }
+        public int MapCalls { get; private set; }
+        public Action? BeforeGeneration { get; set; }
+        public PlatformProviderIncarnation Incarnation { get; set; } = new(1);
+        public PlatformProviderIncarnation CurrentIncarnation
+        {
+            get
+            {
+                BeforeGeneration?.Invoke();
+                return ThrowGeneration ? throw new IOException("Generation source unavailable") : Incarnation;
+            }
+        }
         public int ActiveMappingCount => _mappings.Values.Count(static record => !record.Revoked);
 
         public PlatformProviderDescriptor Descriptor { get; } = new(
@@ -250,6 +797,7 @@ public sealed class PlatformBorrowReadGrantTeardownTests
             PlatformProviderDomainLease domainLease,
             PlatformRegionSlice slice)
         {
+            MapCalls++;
             if (!_domains.TryGetValue(domainLease.LeaseId, out var active) || active != domainLease)
             {
                 return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(
@@ -275,7 +823,10 @@ public sealed class PlatformBorrowReadGrantTeardownTests
                 slice.Access);
             var mapping = new PlatformProviderOwnedRegionMapping(lease, slice);
             _mappings.Add(lease.MappingId, new MappingRecord(mapping));
-            return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Ok(mapping);
+            AfterMap?.Invoke();
+            return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Ok(MalformedMap
+                ? mapping with { Lease = lease with { Access = PlatformMemoryAccess.Read | PlatformMemoryAccess.Write } }
+                : mapping);
         }
 
         public PlatformAuthorityResult<PlatformRegionVisibilityResult>
@@ -298,11 +849,20 @@ public sealed class PlatformBorrowReadGrantTeardownTests
             return PlatformAuthorityResult.Ok();
         }
 
+        public Action? BeforeBegin { get; set; }
+        public Action? BeforeObserve { get; set; }
+        public Action? AfterBegin { get; set; }
+        public Action? AfterObserve { get; set; }
+        public int BeginCalls { get; private set; }
+        public int ObserveCalls { get; private set; }
+        public bool MalformedReceipt { get; set; }
         public PlatformAuthorityResult<PlatformRegionRevocationTicket>
             BeginRegionMappingRevocation(
                 PlatformProviderRegionMappingLease mapping,
                 PlatformRegionRevocationPolicy policy)
         {
+            BeginCalls++;
+            BeforeBegin?.Invoke();
             if (!_mappings.TryGetValue(mapping.MappingId, out var record) ||
                 record.Mapping.Lease != mapping)
             {
@@ -316,6 +876,7 @@ public sealed class PlatformBorrowReadGrantTeardownTests
                 new PlatformOperationId(_nextOperation++),
                 new PlatformOperationGeneration(1),
                 mapping.DomainLease);
+            AfterBegin?.Invoke();
             return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Ok(
                 new PlatformRegionRevocationTicket(
                     mapping.MappingId,
@@ -326,6 +887,8 @@ public sealed class PlatformBorrowReadGrantTeardownTests
         public PlatformAuthorityResult<PlatformCompletionReceipt> ObserveCompletion(
             PlatformOperationIdentity operation)
         {
+            ObserveCalls++;
+            BeforeObserve?.Invoke();
             if (_operation != operation || _revokingMapping is null)
             {
                 return PlatformAuthorityResult<PlatformCompletionReceipt>.Fail(
@@ -339,10 +902,11 @@ public sealed class PlatformBorrowReadGrantTeardownTests
                 record.Revoked = true;
             }
 
+            AfterObserve?.Invoke();
             return PlatformAuthorityResult<PlatformCompletionReceipt>.Ok(
                 new PlatformCompletionReceipt(
                     operation.OperationId,
-                    operation.Generation,
+                    MalformedReceipt ? new PlatformOperationGeneration(operation.Generation.Value + 1) : operation.Generation,
                     operation.DomainLease,
                     CompletionState));
         }

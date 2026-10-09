@@ -11,15 +11,27 @@ public sealed partial class RuntimeKernel
 
     public KernelResult<PlatformMmioLease> BindPlatformMmio(
         ProcessHandle subject, PlatformDeviceLease deviceLease, CapabilityId mmioCapabilityId,
-        long offset, long length, PlatformMmioAccess access)
+        long offset, long length, PlatformMmioAccess access) => BindPlatformMmioCore(subject, deviceLease, mmioCapabilityId, offset, length, access, null);
+
+    private KernelResult<PlatformMmioLease> BindPlatformMmioCore(ProcessHandle subject, PlatformDeviceLease deviceLease,
+        CapabilityId mmioCapabilityId, long offset, long length, PlatformMmioAccess access,
+        (ProcessHandle Principal, CapabilityId Capability)? source,
+        Func<Func<KernelResult>, KernelResult>? sourceCommit = null)
     {
+        KernelResult CommitSource(Func<KernelResult> commit) => sourceCommit is null
+            ? CommitControllerMmio(source, commit) : sourceCommit(commit);
         lock (_platformMemoryUseGate)
         {
-            if (_pendingPlatformMmioCapabilities.Count == int.MaxValue)
-                return KernelResult<PlatformMmioLease>.Fail(KernelError.CapacityExhausted, "MMIO admission accounting is exhausted.");
-            _pendingPlatformMmioCapabilities.Add(mmioCapabilityId);
+            var pending = CommitSource(() =>
+            {
+                if (_pendingPlatformMmioCapabilities.Count == int.MaxValue)
+                    return KernelResult.Fail(KernelError.CapacityExhausted, "MMIO admission accounting is exhausted.");
+                _pendingPlatformMmioCapabilities.Add(mmioCapabilityId);
+                return KernelResult.Ok();
+            });
+            if (!pending.IsSuccess) return KernelResult<PlatformMmioLease>.Fail(pending.Error, pending.Message!);
         }
-        try { return BindPlatformMmioAdmitted(subject, deviceLease, mmioCapabilityId, offset, length, access); }
+        try { return BindPlatformMmioAdmitted(subject, deviceLease, mmioCapabilityId, offset, length, access, source, sourceCommit); }
         finally { lock (_platformMemoryUseGate) _pendingPlatformMmioCapabilities.Remove(mmioCapabilityId); }
     }
 
@@ -29,8 +41,11 @@ public sealed partial class RuntimeKernel
         CapabilityId mmioCapabilityId,
         long offset,
         long length,
-        PlatformMmioAccess access)
+        PlatformMmioAccess access, (ProcessHandle Principal, CapabilityId Capability)? source,
+        Func<Func<KernelResult>, KernelResult>? sourceCommit)
     {
+        KernelResult CommitSource(Func<KernelResult> commit) => sourceCommit is null
+            ? CommitControllerMmio(source, commit) : sourceCommit(commit);
         if (access == PlatformMmioAccess.None ||
             (access & ~(PlatformMmioAccess.Read | PlatformMmioAccess.Write)) != 0)
         {
@@ -117,7 +132,7 @@ public sealed partial class RuntimeKernel
         KernelResult Authorize(Func<KernelResult> commit)
         {
             lock (_platformMemoryUseGate)
-                return CapabilityAuthority.CommitMmioAdmission(mmioCapabilityId, process.DomainId,
+                return CommitSource(() => CapabilityAuthority.CommitMmioAdmission(mmioCapabilityId, process.DomainId,
                     subject.Generation, requiredCapabilityRights, descriptor.ResourceId, () =>
                     {
                         var current = Processes.Resolve(subject);
@@ -126,7 +141,7 @@ public sealed partial class RuntimeKernel
                             return KernelResult.Fail(KernelError.StaleGeneration, "Exact MMIO process incarnation changed.");
                         var accepting = EnsureProcessAcceptsNewEffects(current.Value!);
                         return accepting.IsSuccess ? commit() : accepting;
-                    });
+                    }));
         }
         var lease = PlatformAuthority.BindMmio(
             deviceLease,
@@ -139,8 +154,19 @@ public sealed partial class RuntimeKernel
                 var result = commit();
                 if (result.IsSuccess) TrackPlatformMmioLease(subject, candidate);
                 return result;
-            }));
+            }), admissionConsumer: source is null && sourceCommit is null ? null : Authorize);
         return lease;
+    }
+
+    private KernelResult CommitControllerMmio((ProcessHandle Principal, CapabilityId Capability)? source, Func<KernelResult> commit)
+    {
+        if (source is not { } controller) return commit();
+        var principal = Processes.Resolve(controller.Principal);
+        if (!principal.IsSuccess) return KernelResult.Fail(KernelError.SupervisorDenied, principal.Message!);
+        var effect = EnsureProcessAcceptsNewEffects(principal.Value!);
+        if (!effect.IsSuccess) return KernelResult.Fail(KernelError.SupervisorDenied, effect.Message!);
+        return CapabilityAuthority.CommitSupervisorMmioBinding(controller.Capability, principal.Value!.DomainId,
+            controller.Principal.Generation, commit);
     }
 
     public KernelResult RevokePlatformMmio(
@@ -176,8 +202,11 @@ public sealed partial class RuntimeKernel
         }
 
         if (firstFailure is { } failed) return failed;
+        lock (_platformMemoryUseGate)
+        {
         if (_pendingPlatformMmioCapabilities.Any(id => CapabilityAuthority.DependsOnCapability(id, capabilityId)))
             return KernelResult.Fail(KernelError.PlatformBindingDraining, "MMIO admission must settle before capability closure.");
+        }
         if (PlatformAuthority.HasUnresolvedMmioEffect(id => CapabilityAuthority.DependsOnCapability(id, capabilityId)))
             return KernelResult.Fail(KernelError.PlatformFaulted, "MMIO receipt/closure is unresolved; parent remains pinned.");
         return KernelResult.Ok();
@@ -207,15 +236,8 @@ public sealed partial class RuntimeKernel
         SingProcess process,
         ProcessHandle handle)
     {
-        PlatformMmioLease[] leases;
-        lock (_platformMemoryUseGate)
-        {
-            if (!_processPlatformMmioLeases.TryGetValue(handle, out var tracked) || tracked.Count == 0)
-                return KernelResult.Ok();
-            leases = tracked.ToArray();
-        }
-
         var identity = PlatformIdentity(process);
+        var leases = PlatformAuthority.ActiveMmioLeasesForProcess(identity);
         KernelResult? firstFailure = null;
         foreach (var lease in leases.ToArray())
         {

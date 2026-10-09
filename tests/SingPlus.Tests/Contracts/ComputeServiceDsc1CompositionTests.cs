@@ -10,6 +10,131 @@ namespace SingPlus.Tests.Contracts;
 public sealed class ComputeServiceDsc1CompositionTests
 {
     [Fact]
+    public async Task SessionCloseAfterDeliveryRetainsOriginalPairAndRefusesAllProgression()
+    {
+        var provider = new HostPlatformAuthorityProvider();
+        var clock = new ReentryClock();
+        var scenario = CreateScenario(provider, 3255, 3265, 3256, 3266, 8, 8, clock);
+        var response = CreateClient(scenario).CopyAsync(scenario.Source, scenario.Destination).AsTask();
+        Assert.True(scenario.Kernel.StartTraceSession(scenario.Service, 128).IsSuccess);
+        var closed = false;
+        clock.Callback = () =>
+        {
+            Assert.True(scenario.Kernel.CloseSession(scenario.Requester, scenario.Session).IsSuccess);
+            closed = true;
+        };
+
+        var refused = scenario.Host.ProcessNextCopy();
+        Assert.True(closed);
+        Assert.False(refused.IsSuccess);
+        Assert.True(scenario.Host.HasPendingCopy);
+        Assert.Equal(refused, scenario.Host.AdvancePendingCopy());
+        Assert.Equal(refused, scenario.Host.CancelPendingCopy());
+        Assert.Equal(KernelError.InvalidTransition, scenario.Host.ProcessNextCopy().Error);
+        Assert.Equal(0, provider.SubmitDsc1CopyCallCount);
+        Assert.Equal(0, provider.CancelDsc1CallCount);
+        Assert.Equal(RegionState.Loaned, scenario.Kernel.Regions.Snapshot()
+            .Single(r => r.Handle.RegionId == scenario.Source.Handle.RegionId).State);
+        Assert.Equal(RegionState.Owned, scenario.Kernel.Regions.Snapshot()
+            .Single(r => r.Handle.RegionId == scenario.Destination.Handle.RegionId).State);
+        Assert.False(scenario.Destination.IsValid);
+        Assert.Throws<InvalidOperationException>(() => _ = scenario.Source.Span[0]);
+        await Assert.ThrowsAsync<OperationCanceledException>(async () => await response.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.True(scenario.Host.HasPendingCopy);
+    }
+
+    [Theory]
+    [InlineData(true)] [InlineData(false)]
+    public async Task MappingCloseRetryUsesOwnerLifecycleAfterChildDrainRefusal(bool source)
+    {
+        var provider = new HostPlatformAuthorityProvider(deferDsc1Completion: true);
+        var scenario = CreateScenario(provider, 3253, 3263, 3254, 3264, 8, 8);
+        scenario.Source.Span.Fill(0x4D);
+        var response = CreateClient(scenario).CopyAsync(scenario.Source, scenario.Destination).AsTask();
+        Assert.Equal(KernelError.PlatformBindingDraining, scenario.Host.ProcessNextCopy().Error);
+        var pending = typeof(RuntimeComputeServiceHost).GetField("_pending",
+            global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(scenario.Host)!;
+        var mapping = (PlatformRegionMapping)pending.GetType().GetProperty(
+            source ? "StagingMapping" : "DestinationMapping")!.GetValue(pending)!;
+        Assert.True(provider.CompleteDsc1Copy(provider.LastDsc1Submission!.Value).IsSuccess);
+        Assert.True(scenario.Kernel.PlatformAuthority.BeginMappingChildDrain(
+            mapping, scenario.Binding.Subject, out var release).IsSuccess);
+        try
+        {
+            Assert.Equal(KernelError.PlatformBindingDraining, scenario.Host.AdvancePendingCopy().Error);
+            Assert.Equal(PlatformExternalClosureState.Active,
+                scenario.Kernel.QueryPlatformRegionMappingLifecycle(scenario.Service, mapping).Value.PlatformClosure);
+            Assert.True(scenario.Host.HasPendingCopy);
+            Assert.False(response.IsCompleted);
+            Assert.Equal(0, provider.ActiveDsc1SubmissionCount);
+            Assert.Throws<InvalidOperationException>(() => _ = scenario.Source.Span[0]);
+        }
+        finally { release(); }
+
+        Assert.True(scenario.Host.AdvancePendingCopy().IsSuccess);
+        var returned = await response.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.All(returned.Span.ToArray(), value => Assert.Equal((byte)0x4D, value));
+        Assert.False(scenario.Host.HasPendingCopy);
+        Assert.Equal(1, provider.SubmitDsc1CopyCallCount);
+        Assert.Equal((byte)0x4D, scenario.Source.Span[0]);
+        Assert.True(scenario.Kernel.RevokePlatformDomain(scenario.Service, scenario.Binding).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public async Task TraceReentryCannotProgressOriginalCopyAndLaterRetryStillCloses(int entry)
+    {
+        var provider = new HostPlatformAuthorityProvider(deferDsc1Completion: true);
+        var clock = new ReentryClock();
+        var scenario = CreateScenario(provider, 3251, 3261, 3252, 3262, 8, 8, clock);
+        scenario.Source.Span.Fill(0x3B);
+        Assert.True(scenario.Kernel.StartTraceSession(scenario.Service, 128).IsSuccess);
+        var pending = CreateClient(scenario).CopyAsync(scenario.Source, scenario.Destination).AsTask();
+        var observed = false;
+        clock.Callback = () =>
+        {
+            var worker = Task.Run(() => entry switch
+            {
+                0 => scenario.Host.ProcessNextCopy(),
+                1 => scenario.Host.AdvancePendingCopy(),
+                _ => scenario.Host.CancelPendingCopy()
+            });
+            Assert.True(worker.Wait(TimeSpan.FromSeconds(5)));
+            Assert.Equal(KernelError.InvalidTransition, worker.Result.Error);
+            observed = true;
+        };
+
+        Assert.Equal(KernelError.PlatformBindingDraining, scenario.Host.ProcessNextCopy().Error);
+        Assert.True(observed);
+        Assert.True(scenario.Host.HasPendingCopy);
+        Assert.Equal(1, provider.SubmitDsc1CopyCallCount);
+        Assert.Equal(0, provider.CancelDsc1CallCount);
+        Assert.False(pending.IsCompleted);
+        Assert.True(provider.CompleteDsc1Copy(provider.LastDsc1Submission!.Value).IsSuccess);
+        Assert.True(scenario.Host.AdvancePendingCopy().IsSuccess);
+        var returned = await pending.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.All(returned.Span.ToArray(), value => Assert.Equal((byte)0x3B, value));
+        Assert.False(scenario.Host.HasPendingCopy);
+        Assert.Equal(1, provider.SubmitDsc1CopyCallCount);
+        Assert.Equal(0, provider.ActiveDsc1SubmissionCount);
+        Assert.Equal((byte)0x3B, scenario.Source.Span[0]);
+        Assert.True(scenario.Kernel.RevokePlatformDomain(scenario.Service, scenario.Binding).IsSuccess);
+    }
+
+    private sealed class ReentryClock : TimeProvider
+    {
+        public Action? Callback { get; set; }
+        public override long GetTimestamp()
+        {
+            var callback = Callback;
+            Callback = null;
+            callback?.Invoke();
+            return 100;
+        }
+    }
+
+    [Fact]
     [Trait("Category", "Runtime")]
     public async Task TypedCopyComposesThroughHostModelAndReturnsOwnershipOnlyAfterPlatformClosure()
     {
@@ -166,9 +291,10 @@ public sealed class ComputeServiceDsc1CompositionTests
         ulong serviceId,
         ulong serviceDomainId,
         int sourceLength,
-        int destinationLength)
+        int destinationLength,
+        TimeProvider? clock = null)
     {
-        var kernel = new RuntimeKernel(provider);
+        var kernel = new RuntimeKernel(provider, timeProvider: clock);
         var requesterDomain = new DomainId(requesterDomainId);
         var serviceDomain = new DomainId(serviceDomainId);
         var (_, requester) = TestFixtures.Create(

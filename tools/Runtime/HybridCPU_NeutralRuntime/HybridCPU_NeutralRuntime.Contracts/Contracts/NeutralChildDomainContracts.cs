@@ -12,6 +12,12 @@ public enum NeutralVirtualizationStatus
     WrongOwner,
     Faulted,
     Ambiguous,
+    /// <summary>
+    /// This invocation was refused before any provider callback or possible external effect.
+    /// Does not close an earlier invocation or release existing resources/receipts.
+    /// Unknown consumers must continue to fail closed rather than infer closure.
+    /// </summary>
+    NotInvoked = 10,
 }
 
 public readonly record struct NeutralVirtualizationResult(

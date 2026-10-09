@@ -126,6 +126,8 @@ public sealed class CxlType3ModelProvider : ICxlDiscoveryProvider, ICxlEndpointE
                 return NotAccepted<CxlFabricBinding>("Device generation changed before Type-3 binding.");
             if (request.Persistence != e.Persistence || request.CapacityBytes <= 0 || request.CapacityBytes > e.Capacity - e.Reserved)
                 return NotAccepted<CxlFabricBinding>("Requested Type-3 capacity or persistence is unavailable.");
+            if (_nextFabric is 0 or ulong.MaxValue)
+                return NotAccepted<CxlFabricBinding>("Fabric binding identity capacity is exhausted before allocation.");
             var binding = new CxlFabricBinding(new(_nextFabric++), new(1), e.Id,
                 new(e.DeviceGeneration), request.CapacityBytes);
             _fabric.Add(binding.BindingId, new(binding, request.CapacityBytes));
@@ -148,7 +150,8 @@ public sealed class CxlType3ModelProvider : ICxlDiscoveryProvider, ICxlEndpointE
             if (!_fabric.TryGetValue(bindingId, out var record)) return Missing<CxlFabricResourceSnapshot>();
             var current = Query(bindingId);
             if (!current.IsSuccess) return Missing<CxlFabricResourceSnapshot>();
-            var state = _draining.Contains(bindingId) ? CxlFabricResourceState.Draining : CxlFabricResourceState.Bound;
+            var state = !_endpoints[record.Binding.EndpointId].Available ? CxlFabricResourceState.Faulted
+                : _draining.Contains(bindingId) ? CxlFabricResourceState.Draining : CxlFabricResourceState.Bound;
             return PlatformAuthorityResult<CxlFabricResourceSnapshot>.Ok(new(current.Value!, state, record.ReservedBytes));
         }
     }
@@ -159,9 +162,15 @@ public sealed class CxlType3ModelProvider : ICxlDiscoveryProvider, ICxlEndpointE
         {
             if (!_fabric.TryGetValue(binding.BindingId, out var record) || record.Binding != binding || _draining.Contains(binding.BindingId))
                 return NotAccepted<CxlFabricReconfigurationTicket>("Fabric binding is stale or already draining before reconfiguration.");
-            var endpoint = _endpoints[binding.EndpointId];
+            if (!_endpoints.TryGetValue(binding.EndpointId, out var endpoint) || !endpoint.Available ||
+                endpoint.DeviceGeneration != binding.DeviceGeneration.Value)
+                return NotAccepted<CxlFabricReconfigurationTicket>("Endpoint source changed before reconfiguration.");
+            var affectedMemory = _memory.Where(entry => entry.Value.Binding.FabricBinding.BindingId == binding.BindingId).ToArray();
+            if (_nextReconfiguration is 0 or ulong.MaxValue || binding.Generation.Value is 0 or ulong.MaxValue ||
+                affectedMemory.Any(entry => entry.Value.Binding.Generation.Value is 0 or ulong.MaxValue))
+                return NotAccepted<CxlFabricReconfigurationTicket>("Reconfiguration identity or generation capacity is exhausted before effect.");
             var replacementGeneration = checked(record.Binding.Generation.Value + 1);
-            foreach (var memory in _memory.Where(entry => entry.Value.Binding.FabricBinding.BindingId == binding.BindingId).ToArray())
+            foreach (var memory in affectedMemory)
                 _memory[memory.Key] = new(memory.Value.Binding with { Generation = new(memory.Value.Binding.Generation.Value + 1) });
             _draining.Add(binding.BindingId);
             var ticket = new CxlFabricReconfigurationTicket(new(_nextReconfiguration++), binding, new(replacementGeneration));
@@ -179,6 +188,9 @@ public sealed class CxlType3ModelProvider : ICxlDiscoveryProvider, ICxlEndpointE
                 record.Binding != ticket.PreviousBinding || !_draining.Contains(ticket.PreviousBinding.BindingId) ||
                 ticket.ReplacementGeneration.Value != checked(record.Binding.Generation.Value + 1))
                 return Stale<CxlFabricBinding>("Fabric reconfiguration ticket is stale.");
+            if (!_endpoints.TryGetValue(record.Binding.EndpointId, out var endpoint) || !endpoint.Available ||
+                endpoint.DeviceGeneration != record.Binding.DeviceGeneration.Value)
+                return NotAccepted<CxlFabricBinding>("Endpoint source changed before reconfiguration completion.");
             var replacement = record.Binding with { Generation = ticket.ReplacementGeneration };
             _reconfigurations.Remove(ticket.ReconfigurationId);
             _fabric[ticket.PreviousBinding.BindingId] = new(replacement, record.ReservedBytes);
@@ -256,6 +268,9 @@ public sealed class CxlType3ModelProvider : ICxlDiscoveryProvider, ICxlEndpointE
             if (FabricUnbindFails) return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Fabric closure is ambiguous.");
             if (_memory.Values.Any(m => m.Binding.FabricBinding.BindingId == binding.BindingId))
                 return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Denied, "Memory binding remains active.");
+            foreach (var ticket in _reconfigurations.Where(entry => entry.Value.PreviousBinding == binding).ToArray())
+                _reconfigurations.Remove(ticket.Key);
+            _draining.Remove(binding.BindingId);
             _fabric.Remove(binding.BindingId);
             var e = _endpoints[record.Binding.EndpointId];
             e.Reserved -= record.ReservedBytes;
@@ -269,11 +284,15 @@ public sealed class CxlType3ModelProvider : ICxlDiscoveryProvider, ICxlEndpointE
         {
             if (!_fabric.TryGetValue(fabricBinding.BindingId, out var f) || f.Binding != fabricBinding)
                 return NotAccepted<CxlMemoryBinding>("Fabric binding is stale before memory binding.");
+            if (_draining.Contains(fabricBinding.BindingId))
+                return NotAccepted<CxlMemoryBinding>("Fabric binding is draining before memory binding.");
             var e = _endpoints[fabricBinding.EndpointId];
             if (!e.Available)
                 return NotAccepted<CxlMemoryBinding>("Type-3 backing is unavailable or rebound before binding.");
             if (backingLease.ByteLength <= 0 || backingLease.ByteLength > fabricBinding.CapacityBytes)
                 return NotAccepted<CxlMemoryBinding>("Region backing cannot fit the Type-3 binding.");
+            if (_nextMemory is 0 or ulong.MaxValue)
+                return NotAccepted<CxlMemoryBinding>("Memory binding identity capacity is exhausted before allocation.");
             var binding = new CxlMemoryBinding(new(_nextMemory++), new(1), fabricBinding, backingLease.Handle);
             _memory.Add(binding.BindingId, new(binding));
             if (MemoryThrowsAfterAcceptance)
@@ -329,6 +348,9 @@ public sealed class CxlType3ModelProvider : ICxlDiscoveryProvider, ICxlEndpointE
                 binding.FabricBinding.Generation, binding.BindingId, binding.Generation);
             if (request != exact || fault.Binding != binding)
                 return Stale<CxlType3HealthObservation>("Type-3 health observation tuple is stale.");
+            if (_nextHealthObservation is 0 or ulong.MaxValue)
+                return PlatformAuthorityResult<CxlType3HealthObservation>.Fail(PlatformAuthorityStatus.Unavailable,
+                    "Type-3 health observation sequence capacity is exhausted.");
             var sequence = _nextHealthObservation++;
             var domain = $"endpoint/{binding.FabricBinding.EndpointId.Value}/memory/{binding.BindingId.Value}";
             var evidence = new ProviderHealthEvidenceV1(ProviderHealthEvidenceV1.CurrentVersion,
@@ -357,6 +379,9 @@ public sealed class CxlType3ModelProvider : ICxlDiscoveryProvider, ICxlEndpointE
         {
             if (!_endpoints.TryGetValue(endpointId, out var e)) return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Unavailable, "Endpoint not found.");
             e.Available = false;
+            if (!HasEndpointGenerationCapacity(e))
+                return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted,
+                    "Type-3 endpoint is unavailable; generation invalidation capacity is exhausted and receipts remain pinned.");
             checked { e.DeviceGeneration++; }
             InvalidateEndpointBindings(endpointId, e.DeviceGeneration);
             return PlatformAuthorityResult.Ok();
@@ -368,6 +393,9 @@ public sealed class CxlType3ModelProvider : ICxlDiscoveryProvider, ICxlEndpointE
         lock (_gate)
         {
             if (!_endpoints.TryGetValue(endpointId, out var e)) return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Unavailable, "Endpoint not found.");
+            if (!HasEndpointGenerationCapacity(e))
+                return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.NotAccepted,
+                    "Type-3 affected generation capacity is exhausted before rebind.");
             checked { e.DeviceGeneration++; }
             InvalidateEndpointBindings(endpointId, e.DeviceGeneration);
             e.Available = true;
@@ -381,6 +409,12 @@ public sealed class CxlType3ModelProvider : ICxlDiscoveryProvider, ICxlEndpointE
         PlatformAuthorityResult<T>.Fail(PlatformAuthorityStatus.Stale, message);
     private static PlatformAuthorityResult<T> NotAccepted<T>(string message) =>
         PlatformAuthorityResult<T>.Fail(PlatformAuthorityStatus.NotAccepted, message);
+
+    // Pure preflight under the existing provider gate; no generation or fault ledger.
+    private bool HasEndpointGenerationCapacity(EndpointRecord endpoint) =>
+        endpoint.DeviceGeneration is not (0 or ulong.MaxValue) &&
+        !_fabric.Values.Any(record => record.Binding.EndpointId == endpoint.Id && record.Binding.Generation.Value is 0 or ulong.MaxValue) &&
+        !_memory.Values.Any(record => record.Binding.FabricBinding.EndpointId == endpoint.Id && record.Binding.Generation.Value is 0 or ulong.MaxValue);
 
     private void InvalidateEndpointBindings(CxlEndpointId endpointId, ulong deviceGeneration)
     {

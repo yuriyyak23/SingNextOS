@@ -16,7 +16,9 @@ public enum EmulatorDemo
     External,
     Sessions,
     GeneratedSip,
+    HostedService,
     Backing,
+    VirtualDomain,
     ChildDomain,
     ChildExecute,
     ServiceRestart,
@@ -57,6 +59,7 @@ public sealed class EmulatorOptions
     public string? ScriptPath { get; private init; }
     public bool ShellRequested { get; private init; }
     public bool ShellSuppressed { get; private init; }
+    public bool SnakeRequested { get; private init; }
     public bool PauseRequested { get; private init; }
 
     /// <summary>Fallback options used when argument parsing failed; every switch stays off.</summary>
@@ -92,6 +95,7 @@ public sealed class EmulatorOptions
         var shell = false;
         var noShell = false;
         var pause = false;
+        var snake = false;
 
         for (var index = 0; index < arguments.Count; index++)
         {
@@ -181,12 +185,12 @@ public sealed class EmulatorOptions
                         if (string.Equals(name, "all", StringComparison.OrdinalIgnoreCase))
                         {
                             foreach (var availableDemo in Enum.GetValues<EmulatorDemo>())
-                                if (availableDemo is not EmulatorDemo.ChildExecute and not EmulatorDemo.ChildDomain and not EmulatorDemo.PlatformRegions and not EmulatorDemo.SupervisedRestart and not EmulatorDemo.Platform and not EmulatorDemo.Compute and not EmulatorDemo.ComputeCancel and not EmulatorDemo.ComputeFault && !demos.Contains(availableDemo)) demos.Add(availableDemo);
+                                if (availableDemo is not EmulatorDemo.VirtualDomain and not EmulatorDemo.ChildExecute and not EmulatorDemo.ChildDomain and not EmulatorDemo.PlatformRegions and not EmulatorDemo.SupervisedRestart and not EmulatorDemo.Platform and not EmulatorDemo.Compute and not EmulatorDemo.ComputeCancel and not EmulatorDemo.ComputeFault && !demos.Contains(availableDemo)) demos.Add(availableDemo);
                             continue;
                         }
 
                         if (!TryParseDemo(name, out var demo))
-                            return EmulatorOptionsParseResult.Failure($"Unknown demo workload '{name}'. Available: ipc, regions, caps, lifecycle, borrows, platform, compute, compute-cancel, compute-fault, platform-regions, external, sessions, child-execute, child-domain, backing, generated-sip, service-restart, supervised-restart, all.");
+                            return EmulatorOptionsParseResult.Failure($"Unknown demo workload '{name}'. Available: ipc, regions, caps, lifecycle, borrows, platform, compute, compute-cancel, compute-fault, platform-regions, external, sessions, child-execute, child-domain, virtual-domain, backing, generated-sip, hosted-service, service-restart, supervised-restart, all.");
                         if (!demos.Contains(demo)) demos.Add(demo);
                     }
                     break;
@@ -207,6 +211,12 @@ public sealed class EmulatorOptions
                     }
                     break;
                 }
+
+                case "--game":
+                    if (snake || ++index >= arguments.Count || !string.Equals(arguments[index], "snake", StringComparison.OrdinalIgnoreCase))
+                        return EmulatorOptionsParseResult.Failure("--game requires snake and may be supplied once.");
+                    snake = true;
+                    break;
 
                 case "--budget":
                     budget = true;
@@ -256,6 +266,8 @@ public sealed class EmulatorOptions
             return EmulatorOptionsParseResult.Failure("--replacement-sip requires exactly one --sip and --sip-root.");
         if (sipRoot is not null && sipPaths.Count != 1)
             return EmulatorOptionsParseResult.Failure("--sip-root requires exactly one --sip image.");
+        if (snake && (script is not null || pause))
+            return EmulatorOptionsParseResult.Failure("--game cannot be combined with --script or --pause.");
         if (shell && noShell)
             return EmulatorOptionsParseResult.Failure("--shell and --no-shell cannot be combined.");
         if (pause && (shell || script is not null))
@@ -280,6 +292,7 @@ public sealed class EmulatorOptions
             ScriptPath = script,
             ShellRequested = shell,
             ShellSuppressed = noShell,
+            SnakeRequested = snake,
             PauseRequested = pause,
         });
     }
@@ -303,8 +316,10 @@ public sealed class EmulatorOptions
         else if (string.Equals(name, "compute-fault", StringComparison.OrdinalIgnoreCase)) demo = EmulatorDemo.ComputeFault;
         else if (string.Equals(name, "platform-regions", StringComparison.OrdinalIgnoreCase)) demo = EmulatorDemo.PlatformRegions;
         else if (string.Equals(name, "child-execute", StringComparison.OrdinalIgnoreCase)) demo = EmulatorDemo.ChildExecute;
+        else if (string.Equals(name, "virtual-domain", StringComparison.OrdinalIgnoreCase)) demo = EmulatorDemo.VirtualDomain;
         else if (string.Equals(name, "child-domain", StringComparison.OrdinalIgnoreCase)) demo = EmulatorDemo.ChildDomain;
         else if (string.Equals(name, "backing", StringComparison.OrdinalIgnoreCase)) demo = EmulatorDemo.Backing;
+        else if (string.Equals(name, "hosted-service", StringComparison.OrdinalIgnoreCase)) demo = EmulatorDemo.HostedService;
         else if (string.Equals(name, "generated-sip", StringComparison.OrdinalIgnoreCase)) demo = EmulatorDemo.GeneratedSip;
         else return false;
         return true;
@@ -317,7 +332,9 @@ public sealed class EmulatorOptions
         EmulatorDemo.Capabilities => "caps",
         EmulatorDemo.Lifecycle => "lifecycle",
         EmulatorDemo.Borrows => "borrows",
+        EmulatorDemo.VirtualDomain => "virtual-domain",
         EmulatorDemo.Platform => "platform",
+        EmulatorDemo.HostedService => "hosted-service",
         EmulatorDemo.Compute => "compute",
         EmulatorDemo.ComputeCancel => "compute-cancel",
         EmulatorDemo.ComputeFault => "compute-fault",
@@ -350,7 +367,7 @@ public sealed class EmulatorOptions
         writer.WriteLine("  --replacement-sip <path>  Optional generation-2 image for supervised-restart; same static root.");
         writer.WriteLine("                            Requires one --sip and --sip-root. No CLR image execution.");
         writer.WriteLine("  --demo <name>       Run a built-in runtime workload after boot: ipc, regions, caps,");
-        writer.WriteLine("                      lifecycle, borrows, platform, compute, compute-cancel, compute-fault, platform-regions, external, sessions, child-execute, child-domain, backing, generated-sip, service-restart, supervised-restart, or 'all'. Repeatable and comma-separable.");
+        writer.WriteLine("                      lifecycle, borrows, platform, compute, compute-cancel, compute-fault, platform-regions, external, sessions, child-execute, child-domain, virtual-domain, backing, generated-sip, hosted-service, service-restart, supervised-restart, or 'all'. Repeatable and comma-separable.");
         writer.WriteLine("  --trace [capacity]  Start a deterministic trace session on the system process");
         writer.WriteLine($"                      (producer capacity 1..{MaximumTraceCapacity}, default {DefaultTraceCapacity}).");
         writer.WriteLine("  --budget            Configure the system resource budget and admit process budgets");
@@ -358,6 +375,7 @@ public sealed class EmulatorOptions
         writer.WriteLine("  --recovery-journal <path>  Replay the authenticated runtime resource journal (--budget).");
         writer.WriteLine("  --recovery-key <path>      Existing binary 32-byte key; required with journal. No key generation.");
         writer.WriteLine("  --script <path>     Execute emulator commands from a script file after boot, then exit.");
+        writer.WriteLine("  --game snake       Play interactive ASCII snake after boot; Q exits (requires terminal input).");
         writer.WriteLine("  --shell             Force the interactive kernel shell after boot.");
         writer.WriteLine("  --no-shell          Never enter the interactive shell (boot, then exit).");
         writer.WriteLine("  --pause             Legacy behavior: wait for Enter after a successful boot.");

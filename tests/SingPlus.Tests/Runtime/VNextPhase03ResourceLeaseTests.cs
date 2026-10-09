@@ -5,6 +5,67 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class VNextPhase03ResourceLeaseTests
 {
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void SplitCapturesOnceBeforeDebitAndRechecksCancelledParent(int fault)
+    {
+        var (authority, process, _, account) = Create(10);
+        var parent = Reserve(authority, process, 10);
+        var input = new ChangingSplitAmounts(() =>
+        {
+            var query = Task.Run(() => authority.Query(account));
+            Assert.True(query.Wait(TimeSpan.FromSeconds(5)), "Split enumerated caller under owner lock.");
+            Assert.True(query.Result.IsSuccess);
+            if (fault == 1) Assert.True(authority.CancelLeasePreSubmit(process, parent).IsSuccess);
+            if (fault == 2) throw new InvalidOperationException("Missing child amounts.");
+        });
+        BudgetReservationSnapshot? child = null;
+        if (fault == 2)
+            Assert.Throws<InvalidOperationException>(() => authority.SplitLease(process, parent, input));
+        else
+        {
+            var split = authority.SplitLease(process, parent, input);
+            Assert.Equal(fault == 0, split.IsSuccess);
+            if (split.IsSuccess) child = split.Value!;
+            else Assert.Equal(KernelError.InvalidTransition, split.Error);
+        }
+        Assert.Equal(1, input.Reads);
+        if (fault == 1)
+        {
+            Assert.Equal(0UL, Used(authority.Query(account).Value!));
+            parent = Reserve(authority, process, 10);
+        }
+        if (fault == 2)
+        {
+            Assert.Equal(10UL, Assert.Single(authority.Query(parent).Value!.Amounts).Amount);
+            Assert.Equal(10UL, Used(authority.Query(account).Value!));
+        }
+        child ??= authority.SplitLease(process, parent, [Amount(4)]).Value!;
+        Assert.Equal(4UL, Assert.Single(child.Amounts).Amount);
+        Assert.Equal(6UL, Assert.Single(authority.Query(parent).Value!.Amounts).Amount);
+        Assert.Equal(10UL, Used(authority.Query(account).Value!));
+        Assert.True(authority.CancelLeasePreSubmit(process, parent).IsSuccess);
+        Assert.Equal(4UL, Used(authority.Query(account).Value!));
+        Assert.True(authority.CancelLeasePreSubmit(process, child.Reservation).IsSuccess);
+        Assert.Equal(0UL, Used(authority.Query(account).Value!));
+        Assert.True(authority.CancelLeasePreSubmit(process, child.Reservation).IsSuccess);
+        Assert.True(authority.Reserve(process, [Amount(10)], BudgetReservationLifetime.ExternalEffect, AdmissionQosHint.None).IsSuccess);
+    }
+
+    private sealed class ChangingSplitAmounts(Action callback) : IReadOnlyList<BudgetAmount>
+    {
+        public int Reads { get; private set; }
+        public int Count => 1;
+        public BudgetAmount this[int index] => Amount(4);
+        public IEnumerator<BudgetAmount> GetEnumerator()
+        {
+            Reads++;
+            callback();
+            yield return Amount(Reads == 1 ? 4UL : 9UL);
+        }
+        global::System.Collections.IEnumerator global::System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+    }
+
     [Fact]
     public async Task LastUnitReservationHasExactlyOneWinner()
     {

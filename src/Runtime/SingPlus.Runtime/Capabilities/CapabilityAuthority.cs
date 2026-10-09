@@ -81,6 +81,8 @@ public sealed class CapabilityAuthority
     // Sole authoritative record store. Opaque identity is verified against the record
     // reached through the non-reusable monotonic V1 compatibility slot.
     private readonly Dictionary<CapabilityId, CapabilityRecord> _records = [];
+    // Same authoritative facts retained independently of the routing index.
+    private readonly Dictionary<CapabilityId, CapabilityRecord> _originalRecords = [];
     // Opaque-token lookup index only. All authority remains in _records.
     private readonly Dictionary<Guid, CapabilityId> _opaqueIndex = [];
     private readonly Dictionary<DomainId, ulong> _domainEpochs = [];
@@ -211,6 +213,9 @@ public sealed class CapabilityAuthority
                         var account = new QuotaAccount(quotaReference, quota);
                         var record = new CapabilityRecord(id, nonce, issuerDomainId, subjectDomainId, subjectGeneration,
                             resourceKind, resourceId, resourceGeneration, rights, subjectEpoch, null, committed, account);
+                        _originalRecords.EnsureCapacity(_originalRecords.Count + 1);
+                        _records.EnsureCapacity(_records.Count + 1);
+                        _originalRecords.Add(id, record);
                         _records.Add(id, record);
                         _opaqueIndex.Add(nonce, id);
                         IncrementLive(record);
@@ -245,7 +250,7 @@ public sealed class CapabilityAuthority
         ulong targetEpoch;
         lock (_gate)
         {
-            if (!_records.TryGetValue(sourceId, out source!))
+            if (!TryResolveRecord(sourceId, out source!))
                 return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapabilityNotFound, $"Capability {sourceId} does not exist.");
             var validation = ValidateRecord(source, delegatorDomain, source.SubjectGeneration, CapabilityRights.Delegate, null);
             if (!validation.IsSuccess) return KernelResult<CapabilityDescriptorV1>.Fail(validation.Error, validation.Message!);
@@ -281,7 +286,7 @@ public sealed class CapabilityAuthority
             return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.DelegationDenied, "Child constraints are not a canonical subset of the parent.");
         KernelResult ValidateFreshSource()
         {
-            if (!_records.TryGetValue(sourceId, out var current) || !ReferenceEquals(current, source))
+            if (!TryResolveRecord(sourceId, out var current) || !ReferenceEquals(current, source))
                 return KernelResult.Fail(KernelError.CapabilityNotFound, "Captured source is no longer the authoritative record.");
             var validation = ValidateRecord(current, delegatorDomain, current.SubjectGeneration, CapabilityRights.Delegate, null);
             if (!validation.IsSuccess) return validation;
@@ -321,6 +326,9 @@ public sealed class CapabilityAuthority
                     var record = new CapabilityRecord(id, nonce, delegatorDomain, targetDomain, targetGeneration,
                         source.ResourceKind, source.ResourceId, source.ResourceGeneration, rights,
                         targetEpoch, sourceId, child, source.QuotaAccount);
+                    _originalRecords.EnsureCapacity(_originalRecords.Count + 1);
+                    _records.EnsureCapacity(_records.Count + 1);
+                    _originalRecords.Add(id, record);
                     _records.Add(id, record);
                     _opaqueIndex.Add(nonce, id);
                     IncrementLive(record);
@@ -340,7 +348,7 @@ public sealed class CapabilityAuthority
     {
         lock (_gate)
         {
-            if (!_records.TryGetValue(id, out var record))
+            if (!TryResolveRecord(id, out var record))
                 return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapabilityNotFound, $"Capability {id} does not exist.");
             return ValidateAndProject(record, subject, generation, requiredRights, expectedResourceGeneration);
         }
@@ -361,7 +369,7 @@ public sealed class CapabilityAuthority
     {
         lock (_gate)
         {
-            if (!_records.TryGetValue(id, out var source))
+            if (!TryResolveRecord(id, out var source))
                 return KernelResult<long>.Fail(KernelError.CapabilityNotFound, "Resource-use grant does not exist.");
             var live = ValidateRecord(source, subject, subjectGeneration, CapabilityRights.None, expectedResourceGeneration);
             if (!live.IsSuccess) return KernelResult<long>.Fail(live.Error, live.Message!);
@@ -380,7 +388,7 @@ public sealed class CapabilityAuthority
         CapabilityId id, DomainId subject, ulong subjectGeneration, ulong expectedResourceGeneration,
         ResourceEnvelopeV1 requestedEnvelope, long now)
     {
-        if (!_records.TryGetValue(id, out var record))
+        if (!TryResolveRecord(id, out var record))
             return KernelResult<ResourceUseConstraintV1>.Fail(KernelError.CapabilityNotFound, "Resource-use grant does not exist.");
         var live = ValidateRecord(record, subject, subjectGeneration, CapabilityRights.None, expectedResourceGeneration);
         if (!live.IsSuccess) return KernelResult<ResourceUseConstraintV1>.Fail(live.Error, live.Message!);
@@ -397,6 +405,46 @@ public sealed class CapabilityAuthority
         return ResourceUseConstraintV1.IsSubset(requested, grant)
             ? KernelResult<ResourceUseConstraintV1>.Ok(grant)
             : KernelResult<ResourceUseConstraintV1>.Fail(KernelError.InsufficientRights, "Requested resource envelope exceeds the live grant.");
+    }
+
+    internal KernelResult CommitResourceDonationPublication(CapabilityId source, DomainId callerDomain,
+        ulong callerGeneration, ulong sourceResourceGeneration, CapabilityId derived, DomainId serviceDomain,
+        ulong serviceGeneration, ulong derivedResourceGeneration, ResourceEnvelopeV1 envelope,
+        Func<Func<KernelResult>, KernelResult> ownerCommit, Func<KernelResult> publish)
+    {
+        var time = ReadResourceUseClock(derived, serviceDomain, serviceGeneration, derivedResourceGeneration);
+        if (!time.IsSuccess) return KernelResult.Fail(time.Error, time.Message!);
+        return ownerCommit(() =>
+        {
+            lock (_gate)
+            {
+                var original = ValidateResourceUseCore(source, callerDomain, callerGeneration,
+                    sourceResourceGeneration, envelope, time.Value);
+                if (!original.IsSuccess) return KernelResult.Fail(original.Error, original.Message!);
+                var delegated = ValidateResourceUseCore(derived, serviceDomain, serviceGeneration,
+                    derivedResourceGeneration, envelope, time.Value);
+                if (!delegated.IsSuccess) return KernelResult.Fail(delegated.Error, delegated.Message!);
+                if (!TryResolveRecord(derived, out var record) || record.DelegatedFrom != source)
+                    return KernelResult.Fail(KernelError.DelegationDenied, "Donation derived grant lost exact source lineage.");
+                return publish(); // Trusted local commits only.
+            }
+        });
+    }
+
+    internal KernelResult CommitDonationConsumption(CapabilityId grant, DomainId subject,
+        ulong subjectGeneration, ulong resourceGeneration, ResourceEnvelopeV1 envelope,
+        Func<Func<KernelResult>, KernelResult> ownerCommit, Func<KernelResult> consume)
+    {
+        var time = ReadResourceUseClock(grant, subject, subjectGeneration, resourceGeneration);
+        if (!time.IsSuccess) return KernelResult.Fail(time.Error, time.Message!);
+        return ownerCommit(() =>
+        {
+            lock (_gate)
+            {
+                var permission = ValidateResourceUseCore(grant, subject, subjectGeneration, resourceGeneration, envelope, time.Value);
+                return permission.IsSuccess ? consume() : KernelResult.Fail(permission.Error, permission.Message!);
+            }
+        });
     }
 
     internal KernelResult<ResourceUseAuthorityLease> AcquireResourceUseAuthority(
@@ -436,7 +484,7 @@ public sealed class CapabilityAuthority
         {
             if (reference.RealmId != RealmId)
                 return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.WrongAuthorityRealm, "Capability belongs to another runtime authority realm.");
-            if (!_records.TryGetValue(reference.CapabilityId, out var record))
+            if (!TryResolveRecord(reference.CapabilityId, out var record))
                 return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.CapabilityNotFound, "Capability does not exist in this authority realm.");
             if (record.Nonce != reference.Nonce)
                 return KernelResult<CapabilityDescriptorV1>.Fail(KernelError.ForgedCapability, "Capability opaque identity is invalid.");
@@ -447,7 +495,7 @@ public sealed class CapabilityAuthority
     internal KernelResult<CapabilityAuthorityReference> GetReference(CapabilityId id)
     {
         lock (_gate)
-            return _records.TryGetValue(id, out var record)
+            return TryResolveRecord(id, out var record)
                 ? KernelResult<CapabilityAuthorityReference>.Ok(new(RealmId, id, record.Nonce))
                 : KernelResult<CapabilityAuthorityReference>.Fail(KernelError.CapabilityNotFound, "Capability does not exist.");
     }
@@ -457,7 +505,7 @@ public sealed class CapabilityAuthority
     {
         lock (_gate)
         {
-            if (!_records.TryGetValue(id, out var record))
+            if (!TryResolveRecord(id, out var record))
                 return KernelResult<CapabilityHandleV2>.Fail(KernelError.CapabilityNotFound, "Capability does not exist.");
             var validation = ValidateRecord(record, subject, subjectGeneration, CapabilityRights.None, null);
             return validation.IsSuccess
@@ -510,7 +558,7 @@ public sealed class CapabilityAuthority
             return KernelResult<CapabilityHandleV2>.Fail(delegated.Error, delegated.Message!);
         lock (_gate)
         {
-            if (!_records.TryGetValue(delegated.Value!.CapabilityId, out var child))
+            if (!TryResolveRecord(delegated.Value!.CapabilityId, out var child))
                 return KernelResult<CapabilityHandleV2>.Fail(KernelError.CapabilityNotFound, "Delegation committed but projection record is unavailable.");
             return KernelResult<CapabilityHandleV2>.Ok(child.ProjectV2(RealmId).Handle);
         }
@@ -528,7 +576,7 @@ public sealed class CapabilityAuthority
     {
         lock (_gate)
         {
-            if (!_records.TryGetValue(id, out var record))
+            if (!TryResolveRecord(id, out var record))
                 return KernelResult.Fail(KernelError.CapabilityNotFound, $"Capability {id} does not exist.");
             TransitionOutOfActive(record, CapabilityRecordState.Revoked);
             return KernelResult.Ok();
@@ -544,7 +592,7 @@ public sealed class CapabilityAuthority
             {
                 if (id == ancestor) return true;
                 // Missing/cyclic lineage cannot prove independence during pending admission.
-                if (!visited.Add(id) || !_records.TryGetValue(id, out var record)) return true;
+                if (!visited.Add(id) || !TryResolveRecord(id, out var record)) return true;
                 if (record.DelegatedFrom is not { } parent) return false;
                 id = parent;
             }
@@ -605,6 +653,129 @@ public sealed class CapabilityAuthority
         }
     }
 
+    internal KernelResult CommitSupervisorComponentAllocation(CapabilityId id, DomainId subject,
+        ulong generation, Func<KernelResult> allocate)
+    {
+        lock (_gate)
+        {
+            var valid = CommitSupervisorTelemetryPublication(id, subject, generation);
+            // Caller holds lifecycle/component scopes. Trusted local budget hierarchy
+            // and component record mutation only; no lifecycle/provider/clock callback.
+            return valid.IsSuccess ? allocate() : valid;
+        }
+    }
+
+    internal KernelResult<T> CommitSupervisorProcessCreation<T>(CapabilityId id, DomainId subject,
+        ulong generation, Func<KernelResult<T>> create)
+    {
+        lock (_gate)
+        {
+            var valid = CommitSupervisorTelemetryPublication(id, subject, generation);
+            // Caller holds lifecycle scope. Trusted ProcessRegistry/DomainRegistry
+            // metadata mutation only, with no provider/clock/trace callback.
+            return valid.IsSuccess ? create() : KernelResult<T>.Fail(valid.Error, valid.Message!);
+        }
+    }
+
+    internal KernelResult<ServiceEndpointDescriptor> CommitSupervisorServiceRegistration(CapabilityId id, DomainId subject,
+        ulong generation, Func<KernelResult<ServiceEndpointDescriptor>> register)
+    {
+        lock (_gate)
+        {
+            var valid = CommitSupervisorTelemetryPublication(id, subject, generation);
+            // Caller holds lifecycle/service scopes. Prepared local registry mutation only.
+            return valid.IsSuccess ? register() : KernelResult<ServiceEndpointDescriptor>.Fail(valid.Error, valid.Message!);
+        }
+    }
+
+    internal KernelResult CommitSupervisorIrqBinding(CapabilityId id, DomainId subject,
+        ulong generation, Func<KernelResult> commit)
+    {
+        lock (_gate)
+        {
+            var valid = CommitSupervisorTelemetryPublication(id, subject, generation);
+            return valid.IsSuccess ? commit() : valid;
+        }
+    }
+
+    internal KernelResult<KernelEventEndpoint> CommitSupervisorIrqEndpoint(CapabilityId id, DomainId subject,
+        ulong generation, Func<KernelResult<KernelEventEndpoint>> create)
+    {
+        lock (_gate)
+        {
+            var valid = CommitSupervisorTelemetryPublication(id, subject, generation);
+            // Trusted KernelEventRegistry local creation only; no callback.
+            return valid.IsSuccess ? create() : KernelResult<KernelEventEndpoint>.Fail(valid.Error, valid.Message!);
+        }
+    }
+
+    internal KernelResult CommitSupervisorMmioBinding(CapabilityId id, DomainId subject,
+        ulong generation, Func<KernelResult> commit)
+    {
+        lock (_gate)
+        {
+            var valid = CommitSupervisorTelemetryPublication(id, subject, generation);
+            // Trusted local MMIO reservation/receipt mutation only.
+            return valid.IsSuccess ? commit() : valid;
+        }
+    }
+
+    internal KernelResult CommitSupervisorDeviceBinding(CapabilityId id, DomainId subject,
+        ulong generation, Func<KernelResult> commit)
+    {
+        lock (_gate)
+        {
+            var valid = CommitSupervisorTelemetryPublication(id, subject, generation);
+            // Trusted device pending/receipt commit only; no provider callbacks.
+            return valid.IsSuccess ? commit() : valid;
+        }
+    }
+
+    internal KernelResult CommitSupervisorExecution(CapabilityId id, DomainId subject,
+        ulong generation, Func<KernelResult> commit)
+    {
+        lock (_gate)
+        {
+            var valid = CommitSupervisorTelemetryPublication(id, subject, generation);
+            // Trusted local admission/state/publication only; provider/trace outside.
+            return valid.IsSuccess ? commit() : valid;
+        }
+    }
+
+    internal KernelResult CommitSupervisorPlatformBinding(CapabilityId id, DomainId subject,
+        ulong generation, Func<KernelResult> commit)
+    {
+        lock (_gate)
+        {
+            var valid = CommitSupervisorTelemetryPublication(id, subject, generation);
+            // Trusted local pending/attachment mutation only; no provider callback.
+            return valid.IsSuccess ? commit() : valid;
+        }
+    }
+
+    internal KernelResult CommitSupervisorProcessAdmission(CapabilityId id, DomainId subject,
+        ulong generation, Func<KernelResult> admit)
+    {
+        lock (_gate)
+        {
+            var valid = CommitSupervisorTelemetryPublication(id, subject, generation);
+            // Trusted mandatory-capability check and local process state commit only.
+            return valid.IsSuccess ? admit() : valid;
+        }
+    }
+
+    internal KernelResult<CapabilityDescriptorV1> CommitSupervisorGrantMint(CapabilityId id, DomainId subject,
+        ulong generation, Func<KernelResult<CapabilityDescriptorV1>> mint)
+    {
+        lock (_gate)
+        {
+            var valid = CommitSupervisorTelemetryPublication(id, subject, generation);
+            // Only the prepared authority mint commit enters here. Nonce preparation,
+            // trace sinks and component callbacks remain outside owner locks.
+            return valid.IsSuccess ? mint() : KernelResult<CapabilityDescriptorV1>.Fail(valid.Error, valid.Message!);
+        }
+    }
+
     internal KernelResult<T> CommitSupervisorSessionAdmission<T>(CapabilityId id, DomainId subject,
         ulong generation, Func<KernelResult<T>> commit)
     {
@@ -618,6 +789,24 @@ public sealed class CapabilityAuthority
         }
     }
 
+    // Trusted local channel/session publication with private owner snapshots only.
+    internal KernelResult<T> CommitSessionPublication<T>(DomainId subject, ulong generation,
+        CapabilityId[] capabilities, CapabilityRequirementV1[] requirements, Func<KernelResult<T>> publish)
+    {
+        lock (_gate)
+        {
+            foreach (var requirement in requirements)
+            {
+                var found = capabilities.Any(id => TryResolveRecord(id, out var record) &&
+                    ValidateRecord(record, subject, generation, requirement.Rights, null).IsSuccess &&
+                    record.ResourceKind == requirement.ResourceKind && record.ResourceId == requirement.ResourceId);
+                if (!found) return KernelResult<T>.Fail(KernelError.MissingCapability,
+                    $"Session requires {requirement.ResourceKind}:{requirement.ResourceId} ({requirement.Rights}).");
+            }
+            return publish();
+        }
+    }
+
     internal KernelResult CommitSupervisorTelemetryPublication(CapabilityId id, DomainId subject, ulong generation)
     {
         lock (_gate)
@@ -628,6 +817,34 @@ public sealed class CapabilityAuthority
                 valid.Value.ResourceId == CapabilityResourceIds.ServiceSupervisor
                 ? KernelResult.Ok()
                 : KernelResult.Fail(KernelError.SupervisorDenied, "Capability does not authorize service-supervisor control.");
+        }
+    }
+
+    internal KernelResult CommitCheckpointPublication(CapabilityId id, DomainId subject,
+        ulong generation, Func<KernelResult> commit)
+    {
+        lock (_gate)
+        {
+            var valid = Validate(id, subject, generation, CapabilityRights.Configure);
+            if (!valid.IsSuccess) return KernelResult.Fail(valid.Error, valid.Message!);
+            if (valid.Value!.ResourceKind != ResourceKind.KernelService ||
+                valid.Value.ResourceId != CapabilityResourceIds.CheckpointAdministration)
+                return KernelResult.Fail(KernelError.SupervisorDenied, "Checkpoint publication requires exact administration permission.");
+            return commit(); // Trusted local checkpoint owner commit only; no external callbacks.
+        }
+    }
+
+    internal KernelResult CommitAuthorityInspectionPublication(CapabilityId id, DomainId subject,
+        ulong generation, Func<KernelResult> commit)
+    {
+        lock (_gate)
+        {
+            var valid = Validate(id, subject, generation, CapabilityRights.Read);
+            if (!valid.IsSuccess) return KernelResult.Fail(KernelError.ProjectionDenied, valid.Message!);
+            if (valid.Value!.ResourceKind != ResourceKind.KernelService ||
+                valid.Value.ResourceId != CapabilityResourceIds.AuthorityInspector)
+                return KernelResult.Fail(KernelError.ProjectionDenied, "The capability does not authorize authority inspection.");
+            return commit(); // Trusted pure detached snapshot publication only.
         }
     }
 
@@ -656,6 +873,36 @@ public sealed class CapabilityAuthority
             if (valid.Value!.ResourceKind != ResourceKind.Virtualization || valid.Value.ResourceId != resourceId)
                 return KernelResult.Fail(KernelError.WrongCapabilityResource, "Virtual effect source changed.");
             return commit(); // Trusted pure local owner mutation only.
+        }
+    }
+
+    internal KernelResult CommitGuestRegionSource(CapabilityId id, DomainId subject,
+        ulong generation, CapabilityRights rights, string resourceId, Func<KernelResult> commit)
+    {
+        lock (_gate)
+        {
+            var valid = Validate(id, subject, generation, rights);
+            if (!valid.IsSuccess) return KernelResult.Fail(valid.Error, valid.Message!);
+            if (valid.Value!.ResourceKind != ResourceKind.MemoryRegion || valid.Value.ResourceId != resourceId)
+                return KernelResult.Fail(KernelError.WrongCapabilityResource, "Guest Region source changed.");
+            return commit(); // Pure local admission/publication; never a provider callback.
+        }
+    }
+
+    internal KernelResult CommitSecureDomainEffect(CapabilityId id, DomainId subject,
+        ulong generation, string resourceId, Func<KernelResult> commit)
+        => CommitSecureDomainEffect(id, subject, generation, CapabilityRights.Configure, resourceId, commit);
+
+    internal KernelResult CommitSecureDomainEffect(CapabilityId id, DomainId subject,
+        ulong generation, CapabilityRights rights, string resourceId, Func<KernelResult> commit)
+    {
+        lock (_gate)
+        {
+            var valid = Validate(id, subject, generation, rights);
+            if (!valid.IsSuccess) return KernelResult.Fail(valid.Error, valid.Message!);
+            if (valid.Value!.ResourceKind != ResourceKind.SecureCompute || valid.Value.ResourceId != resourceId)
+                return KernelResult.Fail(KernelError.WrongCapabilityResource, "Secure composition source changed.");
+            return commit(); // Trusted pure owner transition only, never provider code.
         }
     }
 
@@ -734,7 +981,7 @@ public sealed class CapabilityAuthority
     {
         lock (_gate)
         {
-            if (!_records.TryGetValue(id, out var record))
+            if (!TryResolveRecord(id, out var record))
                 return KernelResult.Fail(KernelError.CapabilityNotFound, $"Capability {id} does not exist.");
             if (record.State == CapabilityRecordState.Active) TransitionOutOfActive(record, CapabilityRecordState.Retired);
             else record.State = CapabilityRecordState.Retired;
@@ -748,7 +995,7 @@ public sealed class CapabilityAuthority
         {
             var epoch = CurrentEpoch(domainId);
             _domainEpochs[domainId] = epoch == ulong.MaxValue ? ulong.MaxValue : epoch + 1;
-            foreach (var record in _records.Values.Where(record => record.SubjectDomainId == domainId))
+            foreach (var record in _originalRecords.Values.Where(record => record.SubjectDomainId == domainId))
                 TransitionOutOfActive(record, CapabilityRecordState.Revoked);
         }
     }
@@ -756,7 +1003,7 @@ public sealed class CapabilityAuthority
     public IReadOnlyList<CapabilityDescriptorV1> SnapshotForDomain(DomainId domainId)
     {
         lock (_gate)
-            return _records.Values
+            return _originalRecords.Values
                 .Where(record => record.State == CapabilityRecordState.Active &&
                                  record.SubjectDomainId == domainId &&
                                  CurrentEpoch(domainId) != ulong.MaxValue &&
@@ -770,7 +1017,7 @@ public sealed class CapabilityAuthority
     internal CapabilityAuthorityInspectionRecord[] InspectionSnapshot()
     {
         lock (_gate)
-            return _records.Values
+            return _originalRecords.Values
                 .Select(record => new CapabilityAuthorityInspectionRecord(record.ProjectV1(), _realmFingerprint,
                     record.ResourceGeneration, record.DelegatedFrom, record.State))
                 .OrderBy(static record => record.Descriptor.CapabilityId.Value)
@@ -781,7 +1028,7 @@ public sealed class CapabilityAuthority
     {
         lock (_gate)
         {
-            if (!_records.TryGetValue(id, out var record))
+            if (!TryResolveRecord(id, out var record))
                 return KernelResult.Fail(KernelError.CapabilityNotFound, "Capability does not exist.");
             var validation = ValidateRecord(record, subject, generation, CapabilityRights.None, null);
             if (!validation.IsSuccess) return validation;
@@ -819,7 +1066,7 @@ public sealed class CapabilityAuthority
         {
             lock (_gate)
             {
-                if (!_records.TryGetValue(id, out var source))
+                if (!TryResolveRecord(id, out var source))
                     return KernelResult<OperationAuthorityLease>.Fail(KernelError.CapabilityNotFound, "Capability does not exist.");
                 var valid = ValidateOperationAdmission(source, subject, subjectGeneration, resourceKind,
                     resourceId, resourceGeneration, operation, session, time.Value);
@@ -837,7 +1084,7 @@ public sealed class CapabilityAuthority
         {
             lock (_gate)
             {
-                if (!_records.TryGetValue(id, out var record))
+                if (!TryResolveRecord(id, out var record))
                     return KernelResult<OperationAuthorityLease>.Fail(KernelError.CapabilityNotFound, "Capability does not exist.");
                 var validation = ValidateOperationAdmission(record, subject, subjectGeneration,
                     resourceKind, resourceId, resourceGeneration, operation, session, time.Value);
@@ -886,7 +1133,7 @@ public sealed class CapabilityAuthority
             resourceId, resourceGeneration, operation, session);
         if (!time.IsSuccess) return KernelResult.Fail(time.Error, time.Message!);
         lock (_gate)
-            return _records.TryGetValue(id, out var record)
+            return TryResolveRecord(id, out var record)
                 ? ValidateOperationAdmission(record, subject, subjectGeneration, resourceKind, resourceId,
                     resourceGeneration, operation, session, time.Value)
                 : KernelResult.Fail(KernelError.CapabilityNotFound, "Capability does not exist.");
@@ -898,7 +1145,7 @@ public sealed class CapabilityAuthority
     {
         lock (_gate)
         {
-            if (!_records.TryGetValue(id, out var source))
+            if (!TryResolveRecord(id, out var source))
                 return KernelResult<long>.Fail(KernelError.CapabilityNotFound, "Capability does not exist.");
             var valid = ValidateOperationAdmission(source, subject, subjectGeneration, resourceKind,
                 resourceId, resourceGeneration, operation, session, null);
@@ -942,16 +1189,28 @@ public sealed class CapabilityAuthority
     internal (EffectiveCapabilityConstraints Constraints, ulong SharedRemaining, ulong HandleConsumed)? InspectConstraints(CapabilityId id)
     {
         lock (_gate)
-            return _records.TryGetValue(id, out var record)
+            return TryResolveRecord(id, out var record)
                 ? (record.Constraints, record.QuotaAccount.Remaining, record.QuotaConsumed)
                 : null;
     }
 
+    private bool TryResolveRecord(CapabilityId id, out CapabilityRecord record)
+    {
+        if (_records.TryGetValue(id, out var routed) &&
+            _originalRecords.TryGetValue(id, out var original) &&
+            ReferenceEquals(routed, original) && original.Id == id)
+        {
+            record = original;
+            return true;
+        }
+        record = null!;
+        return false;
+    }
     private KernelResult EnsureCapacity(SubjectIdentity subject)
     {
         if (CurrentEpoch(subject.DomainId) == ulong.MaxValue)
             return KernelResult.Fail(KernelError.CapabilityRevoked, "Capability domain revocation epoch is terminal.");
-        if (_records.Count >= _limits.GlobalRecordCapacity)
+        if (_originalRecords.Count >= _limits.GlobalRecordCapacity)
             return KernelResult.Fail(KernelError.CapacityExhausted, "The global capability record table is exhausted.");
         if (_subjectLiveCounts.GetValueOrDefault(subject) >= _limits.PerSubjectLiveCapacity)
             return KernelResult.Fail(KernelError.CapacityExhausted, "The subject live-capability quota is exhausted.");
@@ -965,7 +1224,7 @@ public sealed class CapabilityAuthority
         if (handle.RealmId != RealmId)
             return KernelResult<CapabilityRecord>.Fail(KernelError.WrongAuthorityRealm, "Capability belongs to another runtime authority realm.");
         if (handle.OpaqueToken == Guid.Empty || !_opaqueIndex.TryGetValue(handle.OpaqueToken, out var id) ||
-            !_records.TryGetValue(id, out var record) || record.Nonce != handle.OpaqueToken)
+            !TryResolveRecord(id, out var record) || record.Nonce != handle.OpaqueToken)
             return KernelResult<CapabilityRecord>.Fail(KernelError.ForgedCapability, "Capability opaque identity is invalid.");
         return KernelResult<CapabilityRecord>.Ok(record);
     }
@@ -984,6 +1243,8 @@ public sealed class CapabilityAuthority
         CapabilityRecord record, DomainId subject, ulong generation,
         CapabilityRights requiredRights, ulong? expectedResourceGeneration)
     {
+        if (!TryResolveRecord(record.Id, out var original) || !ReferenceEquals(original, record))
+            return KernelResult.Fail(KernelError.CapabilityNotFound, "Capability route is not the original owner record.");
         if (record.SubjectDomainId != subject)
             return KernelResult.Fail(KernelError.WrongCapabilitySubject, "Capability subject does not match the caller domain.");
         if (record.SubjectGeneration != generation)
@@ -1026,7 +1287,7 @@ public sealed class CapabilityAuthority
         {
             if (--remaining == 0)
                 return KernelResult.Fail(KernelError.DelegationDenied, "Capability lineage exceeds its deterministic bound.");
-            if (!_records.TryGetValue(parentId, out var parent) || parent.State != CapabilityRecordState.Active ||
+            if (!TryResolveRecord(parentId, out var parent) || parent.State != CapabilityRecordState.Active ||
                 CurrentEpoch(parent.SubjectDomainId) == ulong.MaxValue ||
                 parent.RevocationEpoch != CurrentEpoch(parent.SubjectDomainId))
                 return KernelResult.Fail(KernelError.CapabilityRevoked, "A capability ancestor is no longer active.");

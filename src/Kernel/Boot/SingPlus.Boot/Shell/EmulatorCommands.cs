@@ -31,6 +31,12 @@ public static partial class EmulatorCommands
 
     private static IReadOnlyList<Entry> BuildEntries() =>
     [
+        new("snake", "snake [WASDRQ moves]", "Play ASCII snake through a generated SIP service; scripts supply moves.",
+            (session, args) => args.Length <= 1 ? SnakeGame.Run(session, args.Length == 0 ? null : args[0]) : Fail(KernelError.InvalidMessage, "usage: snake [WASDRQ moves]")),
+        new("counter-start", "counter-start <name>", "Start a cooperative generated SIP application.", StartHostedCounter),
+        new("counter-call", "counter-call <name> <Int32>", "Invoke generated Increment through a live runtime session.", CallHostedCounter),
+        new("counter-stop", "counter-stop <name>", "Close application session and reclaim both processes.", StopHostedCounter),
+        new("counters", "counters", "Show hosted application handles and successful calls.", ShowHostedCounters),
         new("status", "status", "Emulated machine summary (uptime, counts, options).",
             (session, _) => Inspect(session, RuntimeInspector.WriteStatus)),
         new("env", "env", "Host environment facts captured at boot.",
@@ -134,7 +140,7 @@ public static partial class EmulatorCommands
         new("trace-stop", "trace-stop <pid>", "Stop the trace session of a process.", TraceStop),
         new("trace-show", "trace-show <pid> [count]", "Show active or last completed trace events (also after process exit).", TraceShow),
 
-        new("demo", "demo <ipc|regions|caps|lifecycle|borrows|platform|compute|compute-cancel|compute-fault|platform-regions|external|sessions|child-execute|child-domain|backing|generated-sip|service-restart|supervised-restart|all>", "Run a built-in runtime workload now.", RunDemo),
+        new("demo", "demo <ipc|regions|caps|lifecycle|borrows|platform|compute|compute-cancel|compute-fault|platform-regions|external|sessions|child-execute|child-domain|virtual-domain|backing|generated-sip|hosted-service|service-restart|supervised-restart|all>", "Run a built-in runtime workload now.", RunDemo),
     ];
 
     private static bool Inspect(EmulatorSession session, Action<EmulatorSession> view)
@@ -531,14 +537,14 @@ public static partial class EmulatorCommands
     {
         if (args.Length < 1)
         {
-            EmulatorConsole.Error("[emulator] usage: demo <ipc|regions|caps|lifecycle|borrows|platform|compute|compute-cancel|compute-fault|platform-regions|external|sessions|child-execute|child-domain|backing|generated-sip|service-restart|supervised-restart|all>\r\n");
+            EmulatorConsole.Error("[emulator] usage: demo <ipc|regions|caps|lifecycle|borrows|platform|compute|compute-cancel|compute-fault|platform-regions|external|sessions|child-execute|child-domain|virtual-domain|backing|generated-sip|hosted-service|service-restart|supervised-restart|all>\r\n");
             return false;
         }
 
         if (string.Equals(args[0], "all", StringComparison.OrdinalIgnoreCase))
         {
             foreach (var demo in Enum.GetValues<EmulatorDemo>())
-                if (demo is not EmulatorDemo.ChildExecute and not EmulatorDemo.ChildDomain and not EmulatorDemo.PlatformRegions and not EmulatorDemo.SupervisedRestart and not EmulatorDemo.Platform and not EmulatorDemo.Compute and not EmulatorDemo.ComputeCancel and not EmulatorDemo.ComputeFault && !RunSingleDemo(session, demo)) return false;
+                if (demo is not EmulatorDemo.VirtualDomain and not EmulatorDemo.ChildExecute and not EmulatorDemo.ChildDomain and not EmulatorDemo.PlatformRegions and not EmulatorDemo.SupervisedRestart and not EmulatorDemo.Platform and not EmulatorDemo.Compute and not EmulatorDemo.ComputeCancel and not EmulatorDemo.ComputeFault && !RunSingleDemo(session, demo)) return false;
             return true;
         }
 

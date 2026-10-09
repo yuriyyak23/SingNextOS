@@ -224,6 +224,8 @@ public sealed class Phase02ServiceSupervisorTests
             .GetValue(s.Kernel.EndpointSessions)!;
         var allocator = s.Kernel.Channels.GetType().GetField("_nextChannelId", BindingFlags.Instance | BindingFlags.NonPublic)!;
         var beforeAllocation = (ulong)allocator.GetValue(s.Kernel.Channels)!;
+        var lifecycleGate = s.Kernel.GetType().GetField("_platformMemoryUseGate", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(s.Kernel)!;
         using var release = new ManualResetEventSlim();
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var locker = Task.Run(() =>
@@ -232,19 +234,29 @@ public sealed class Phase02ServiceSupervisorTests
         });
         Task<KernelResult<EndpointSessionHandle>>? admission = null;
         Task<KernelResult<ComponentLifecycleSnapshot>>? teardown = null;
+        ComponentLifecycleSnapshot? drainingSnapshot = null;
         try
         {
             await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
             admission = Task.Run(() => s.Kernel.RebindComponentDependency(dependent.Identity, peer.Process,
                 descriptor, s.Principal, s.ControlCapability));
             // Observation coordinates the test only; it grants no permission or closure.
-            Assert.True(await Task.Run(() => SpinWait.SpinUntil(
-                () => (ulong)allocator.GetValue(s.Kernel.Channels)! > beforeAllocation, TimeSpan.FromSeconds(10))));
+            Assert.True(await Task.Run(() => SpinWait.SpinUntil(() =>
+            {
+                if (!Monitor.TryEnter(lifecycleGate)) return true;
+                Monitor.Exit(lifecycleGate);
+                return false;
+            }, TimeSpan.FromSeconds(10))));
+            Assert.Equal(beforeAllocation, (ulong)allocator.GetValue(s.Kernel.Channels)!);
             teardown = Task.Run(() => s.Kernel.DrainComponent(dependent.Identity, peer.Process));
             Assert.True(await Task.Run(() => SpinWait.SpinUntil(
                 () => s.Kernel.QueryComponent(dependent.Identity).Value!.State == ComponentLifecycleState.Draining,
                 TimeSpan.FromSeconds(10))));
             Assert.False(teardown.IsCompleted);
+            drainingSnapshot = (await Task.Run(() => s.Kernel.QueryComponent(dependent.Identity))
+                .WaitAsync(TimeSpan.FromSeconds(5))).Value!;
+            Assert.Equal(ComponentLifecycleState.Draining, drainingSnapshot.State);
+            Assert.Empty(drainingSnapshot.Sessions);
         }
         finally { release.Set(); }
         await locker.WaitAsync(TimeSpan.FromSeconds(10));
@@ -253,10 +265,35 @@ public sealed class Phase02ServiceSupervisorTests
         Assert.True(closed.IsSuccess, closed.Message);
         Assert.True(closed.Value!.Reclaimable);
         Assert.Empty(s.Kernel.QueryComponent(dependent.Identity).Value!.Sessions);
+        Assert.Empty(drainingSnapshot!.Sessions);
         Assert.Equal(0, s.Kernel.Channels.InspectionSummary(peer.Process).Channels);
         var ownerRecords = s.Kernel.EndpointSessions.SnapshotForProcess(peer.Process);
         Assert.Equal(2, ownerRecords.Length);
         Assert.All(ownerRecords, record => Assert.Equal(EndpointSessionState.Closed, record.State));
+    }
+
+    [Fact]
+    public void ComponentSnapshotKeepsCapturedSessionAfterRebindAndActualReclaim()
+    {
+        var (s, dependent, peer, descriptor) = CreateUnboundRebindScenario();
+        var first = s.Kernel.RebindComponentDependency(dependent.Identity, peer.Process, descriptor,
+            s.Principal, s.ControlCapability);
+        Assert.True(first.IsSuccess, first.Message);
+        var captured = s.Kernel.QueryComponent(dependent.Identity).Value!;
+        Assert.Equal(first.Value, Assert.Single(captured.Sessions));
+        var second = s.Kernel.RebindComponentDependency(dependent.Identity, peer.Process, descriptor,
+            s.Principal, s.ControlCapability);
+        Assert.True(second.IsSuccess, second.Message);
+        Assert.NotEqual(first.Value, second.Value);
+        Assert.Equal(second.Value, Assert.Single(s.Kernel.QueryComponent(dependent.Identity).Value!.Sessions));
+        Assert.True(s.Kernel.DrainComponent(dependent.Identity, peer.Process).Value!.Reclaimable);
+        var closed = s.Kernel.QueryComponent(dependent.Identity).Value!;
+        Assert.Empty(closed.Sessions);
+        Assert.Empty(closed.Capabilities);
+        Assert.Empty(closed.ServiceInstances);
+        Assert.Equal(first.Value, Assert.Single(captured.Sessions));
+        Assert.Equal(ComponentLifecycleState.Running, captured.State);
+        Assert.All(s.Kernel.EndpointSessions.SnapshotForProcess(peer.Process), record => Assert.Equal(EndpointSessionState.Closed, record.State));
     }
 
     [Fact]
@@ -741,6 +778,78 @@ public sealed class Phase02ServiceSupervisorTests
         Assert.Equal(ServiceLifecycleState.Stopped, s.Supervisor.Query(second.Identity).Value!.State);
     }
 
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void FailureBatchSameStateHealthChangeRefusesBeforeAnyPeerMutation(bool degraded)
+    {
+        var clock = new CallbackHealthClock();
+        var (s, provider, dependent, failed, _) = CreateFailureDependencyScenario(clock);
+        var second = Definition("same-state-peer", 1219, 1220, Contract("SameStatePeer"),
+            dependencies: [new(Contract("FailureProvider"), ServiceDependencyKind.Hard)]);
+        Assert.True(s.Supervisor.Register(second).IsSuccess);
+        var peer = s.Supervisor.Start(second.Identity).Value!.Snapshot.Instance!.Value;
+        if (degraded) Assert.True(s.Supervisor.ReportHealth(peer, ServiceHealthState.Degraded, "Initial observation").IsSuccess);
+        var firstBefore = s.Supervisor.Query(dependent.Identity).Value!;
+        var secondBefore = s.Supervisor.Query(second.Identity).Value!;
+        clock.OnRead = () => clock.OnRead = () =>
+            Assert.True(s.Supervisor.ReportHealth(peer,
+                degraded ? ServiceHealthState.Degraded : ServiceHealthState.Ready, "Fresh independent observation").IsSuccess);
+
+        Assert.Equal(KernelError.StaleGeneration,
+            s.Supervisor.ReportHealth(failed, ServiceHealthState.Failed, "Captured failure batch").Error);
+
+        var firstAfter = s.Supervisor.Query(dependent.Identity).Value!;
+        Assert.Equal(firstBefore.State, firstAfter.State);
+        Assert.Equal(firstBefore.Health, firstAfter.Health);
+        Assert.Equal(firstBefore.Dependencies.ToArray(), firstAfter.Dependencies.ToArray());
+        var secondAfter = s.Supervisor.Query(second.Identity).Value!;
+        Assert.Equal(secondBefore.State, secondAfter.State);
+        Assert.Equal("Fresh independent observation", secondAfter.Health!.Reason);
+        Assert.Equal(secondBefore.Dependencies.ToArray(), secondAfter.Dependencies.ToArray());
+        Assert.Equal(ProcessState.Running, s.Kernel.Processes.Resolve(peer.Process).Value!.State);
+        Assert.True(s.Kernel.QueryComponent(provider.Identity).Value!.Reclaimable);
+    }
+
+    [Theory]
+    [InlineData(ServiceFailurePropagationPolicy.DrainDependent)]
+    [InlineData(ServiceFailurePropagationPolicy.StopDependent)]
+    public void SequentialFailurePolicyChecksLaterPeerAfterEarlierDrainCallback(ServiceFailurePropagationPolicy policy)
+    {
+        var clock = new CallbackHealthClock();
+        var s = CreateSupervisor(clock);
+        var contract = Contract("SequentialPolicyProvider");
+        var provider = Definition("sequential-provider", 1221, 1222, contract);
+        var firstPlan = Definition("sequential-first", 1223, 1224, Contract("SequentialFirst"),
+            dependencies: [new(contract, ServiceDependencyKind.Hard)]);
+        var secondPlan = Definition("sequential-second", 1225, 1226, Contract("SequentialSecond"),
+            dependencies: [new(contract, ServiceDependencyKind.Hard)]);
+        var first = new ManagedServiceDefinition(firstPlan.Admission, firstPlan.PrimaryServiceName, dependencyFailurePolicy: policy);
+        var second = new ManagedServiceDefinition(secondPlan.Admission, secondPlan.PrimaryServiceName, dependencyFailurePolicy: policy);
+        Assert.True(s.Supervisor.Register(provider).IsSuccess);
+        Assert.True(s.Supervisor.Register(first).IsSuccess);
+        Assert.True(s.Supervisor.Register(second).IsSuccess);
+        Assert.True(s.Supervisor.StartAll().IsSuccess);
+        var failed = s.Supervisor.Query(provider.Identity).Value!.Instance!.Value;
+        var later = s.Supervisor.Query(second.Identity).Value!.Instance!.Value;
+        var bindings = s.Supervisor.Query(second.Identity).Value!.Dependencies.ToArray();
+        // Failure health, first drain intent, then first drain completion clock.
+        // This batch contains no Degrade policy and needs no observation clock.
+        clock.OnRead = () => clock.OnRead = () => clock.OnRead = () =>
+            Assert.True(s.Supervisor.ReportHealth(later, ServiceHealthState.Ready, "New peer source between effects").IsSuccess);
+
+        Assert.Equal(KernelError.StaleGeneration,
+            s.Supervisor.ReportHealth(failed, ServiceHealthState.Failed, "Sequential failure").Error);
+
+        Assert.Equal(ServiceLifecycleState.Stopped, s.Supervisor.Query(first.Identity).Value!.State);
+        Assert.True(s.Kernel.QueryComponent(first.Identity).Value!.Reclaimable);
+        var after = s.Supervisor.Query(second.Identity).Value!;
+        Assert.Equal(ServiceLifecycleState.Ready, after.State);
+        Assert.Equal("New peer source between effects", after.Health!.Reason);
+        Assert.Equal(bindings, after.Dependencies.ToArray());
+        Assert.Equal(ProcessState.Running, s.Kernel.Processes.Resolve(later.Process).Value!.State);
+        Assert.Equal(ComponentLifecycleState.Running, s.Kernel.QueryComponent(second.Identity).Value!.State);
+    }
+
     [Fact]
     public async Task BlockedDependencyFailureClockAllowsQueryAndSourceRevoke()
     {
@@ -800,6 +909,88 @@ public sealed class Phase02ServiceSupervisorTests
         Assert.Equal(fault == 3 ? ServiceLifecycleState.Stopped : ServiceLifecycleState.Admitting, after.State);
         Assert.True(s.Kernel.QueryComponent(definition.Identity).Value!.Reclaimable);
         Assert.Equal(KernelError.ServiceNotFound, s.Kernel.ResolveByServiceName(definition.PrimaryServiceName).Error);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void ReadinessClockRequiresActualRunningProcessAndAcceptingService(int fault)
+    {
+        var clock = new CallbackHealthClock();
+        var s = CreateSupervisor(clock);
+        var definition = Definition("readiness-owner", 251, 2051, Contract("ReadinessOwner"));
+        Assert.True(s.Supervisor.Register(definition).IsSuccess);
+        var process = new ProcessHandle(definition.Admission.Manifest.Process.ProcessId,
+            definition.Admission.Manifest.Process.Generation);
+        clock.OnRead = () =>
+        {
+            Assert.Equal(ComponentLifecycleState.Running, s.Kernel.QueryComponent(definition.Identity).Value!.State);
+            if (fault == 0) Assert.True(s.Kernel.TerminateProcess(process).IsSuccess);
+            if (fault == 1) Assert.True(s.Kernel.ParkProcess(process).IsSuccess);
+            if (fault == 2)
+            {
+                var service = s.Kernel.ResolveByServiceName(definition.PrimaryServiceName).Value!;
+                Assert.True(s.Kernel.SetServiceAvailability(service.Service, ServiceAvailability.Unavailable).IsSuccess);
+            }
+        };
+        var result = s.Supervisor.Start(definition.Identity);
+        Assert.Equal(fault == 0 ? KernelError.StaleHandle : fault == 1 ? KernelError.InvalidTransition : KernelError.ServiceUnavailable, result.Error);
+        var current = s.Supervisor.Query(definition.Identity).Value!;
+        Assert.Null(current.Instance);
+        Assert.NotEqual(ServiceLifecycleState.Ready, current.State);
+        Assert.True(s.Kernel.QueryComponent(definition.Identity).Value!.Reclaimable);
+        Assert.Equal(ProcessState.Exited, s.Kernel.Processes.ResolveTerminalState(process).Value);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public async Task ReadinessRefusesComponentIntentBeforeProcessOwnerTransition(bool dependency)
+    {
+        var clock = new CallbackHealthClock();
+        var s = CreateSupervisor(clock);
+        var contract = Contract("IntentProvider");
+        var provider = Definition("intent-provider", 259, 2059, contract);
+        var peer = Definition("intent-peer", 260, 2060, Contract("IntentPeer"),
+            dependencies: dependency ? [new(contract, ServiceDependencyKind.Hard)] : []);
+        Assert.True(s.Supervisor.Register(peer).IsSuccess);
+        if (dependency)
+        {
+            Assert.True(s.Supervisor.Register(provider).IsSuccess);
+            Assert.True(s.Supervisor.Start(provider.Identity).IsSuccess);
+        }
+        using var intent = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var target = dependency ? provider.Identity : peer.Identity;
+        var targetProcess = new ProcessHandle((dependency ? provider : peer).Admission.Manifest.Process.ProcessId, 1);
+        Task<KernelResult<ComponentLifecycleSnapshot>>? drain = null;
+        var intentCalls = 0;
+        s.Kernel.AfterComponentTeardownIntentQualificationHook = () =>
+        {
+            if (Interlocked.Increment(ref intentCalls) != 1) return;
+            intent.Set();
+            Assert.True(release.Wait(TimeSpan.FromSeconds(10)));
+        };
+        clock.OnRead = () =>
+        {
+            drain = Task.Run(() => s.Kernel.DrainComponent(target));
+            Assert.True(intent.Wait(TimeSpan.FromSeconds(10)));
+            Assert.Equal(ComponentLifecycleState.Draining, s.Kernel.QueryComponent(target).Value!.State);
+            Assert.Equal(ProcessState.Running, s.Kernel.Processes.Resolve(targetProcess).Value!.State);
+        };
+        try
+        {
+            Assert.Equal(KernelError.InvalidTransition, s.Supervisor.Start(peer.Identity).Error);
+            var after = s.Supervisor.Query(peer.Identity).Value!;
+            Assert.Null(after.Instance);
+            Assert.NotEqual(ServiceLifecycleState.Ready, after.State);
+        }
+        finally
+        {
+            s.Kernel.AfterComponentTeardownIntentQualificationHook = null;
+            release.Set();
+            if (drain is not null) Assert.True((await drain).IsSuccess);
+        }
+        Assert.True(s.Kernel.ObserveComponentTeardown(target).Value!.Reclaimable);
+        Assert.True(s.Kernel.ObserveComponentTeardown(peer.Identity).Value!.Reclaimable);
     }
 
     [Fact]
@@ -937,6 +1128,31 @@ public sealed class Phase02ServiceSupervisorTests
 
     [Theory]
     [InlineData(false)] [InlineData(true)]
+    public void DeadlinePublicationCannotRegressActualStoppedSameInstance(bool quarantine)
+    {
+        var clock = new CallbackHealthClock();
+        var kernelClock = new SupervisorTimeProvider();
+        var s = CreateSupervisor(clock, kernelClock);
+        var definition = Definition("deadline-same-instance", 246, 2046, Contract("DeadlineSameInstance"));
+        Assert.True(s.Supervisor.Register(definition).IsSuccess);
+        var instance = s.Supervisor.Start(definition.Identity).Value!.Snapshot.Instance!.Value;
+        var scope = s.Kernel.CreateCancellationScope(instance.Process, new(1)).Value!.Scope;
+        kernelClock.AdvanceMilliseconds(1);
+        clock.OnRead = () => Assert.True(s.Supervisor.Drain(instance).Value!.ClosureProven);
+        var result = s.Supervisor.Drain(instance, scope,
+            quarantine ? ServiceDrainTimeoutPolicy.Quarantine : ServiceDrainTimeoutPolicy.FailReplacement);
+        Assert.Equal(KernelError.StaleGeneration, result.Error);
+        var current = s.Supervisor.Query(definition.Identity).Value!;
+        Assert.Equal(instance, current.Instance);
+        Assert.Equal(ServiceLifecycleState.Stopped, current.State);
+        Assert.Equal(ServiceHealthState.Stopped, current.Health!.State);
+        Assert.Null(current.BlockingReason);
+        Assert.True(s.Kernel.QueryComponent(definition.Identity).Value!.Reclaimable);
+        Assert.Equal(ProcessState.Exited, s.Kernel.Processes.ResolveTerminalState(instance.Process).Value);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
     public async Task BlockedDeadlinePublicationClockAllowsQueryAndRevoke(bool quarantine)
     {
         var clock = new CallbackHealthClock();
@@ -989,6 +1205,33 @@ public sealed class Phase02ServiceSupervisorTests
         Assert.Equal(ProcessState.Running, s.Kernel.Processes.Resolve(instance.Process).Value!.State);
         Assert.Equal(KernelError.InvalidTransition, s.Kernel.QueryProcessTeardown(instance.Process).Error);
         if (fault == 3) Assert.True(s.Supervisor.Drain(instance).Value!.ClosureProven);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void DrainRequestClockCannotRestartIntentAfterSameInstanceActualClosure(bool planned)
+    {
+        var clock = new CallbackHealthClock();
+        var s = CreateSupervisor(clock);
+        var definition = Definition("drain-intent-source", 247, 2047, Contract("DrainIntentSource"));
+        Assert.True(s.Supervisor.Register(definition).IsSuccess);
+        var instance = s.Supervisor.Start(definition.Identity).Value!.Snapshot.Instance!.Value;
+        var effects = 0;
+        s.Kernel.RegisterComposedWorkTeardownParticipant(new SupervisorClosureCallback(() =>
+        {
+            effects++;
+            return KernelResult.Ok();
+        }, instance.Process));
+        clock.OnRead = () => Assert.True(s.Supervisor.Drain(instance).Value!.ClosureProven);
+        Assert.Equal(KernelError.StaleGeneration, s.Supervisor.Drain(instance, planned).Error);
+        var current = s.Supervisor.Query(definition.Identity).Value!;
+        Assert.Equal(instance, current.Instance);
+        Assert.Equal(ServiceLifecycleState.Stopped, current.State);
+        Assert.Equal(ServiceHealthState.Stopped, current.Health!.State);
+        Assert.Null(current.BlockingReason);
+        Assert.Equal(1, effects);
+        Assert.True(s.Kernel.QueryComponent(definition.Identity).Value!.Reclaimable);
+        Assert.Equal(ProcessState.Exited, s.Kernel.Processes.ResolveTerminalState(instance.Process).Value);
     }
 
     [Fact]
@@ -1090,6 +1333,33 @@ public sealed class Phase02ServiceSupervisorTests
         Assert.True(s.Kernel.QueryComponent(definition.Identity).Value!.Reclaimable);
         if (fault == 3)
             Assert.Equal(ServiceLifecycleState.Stopped, s.Supervisor.Observe(definition.Identity).Value!.State);
+    }
+
+    [Fact]
+    public void LateDrainCompletionCannotRegressStoppedSameInstanceAfterClockReentry()
+    {
+        var clock = new CallbackHealthClock();
+        var s = CreateSupervisor(clock);
+        var definition = Definition("drain-same-instance", 239, 2039, Contract("DrainSameInstance"));
+        Assert.True(s.Supervisor.Register(definition).IsSuccess);
+        var instance = s.Supervisor.Start(definition.Identity).Value!.Snapshot.Instance!.Value;
+        var calls = 0;
+        s.Kernel.RegisterComposedWorkTeardownParticipant(new SupervisorClosureCallback(() =>
+        {
+            if (++calls != 1) return KernelResult.Ok();
+            clock.OnRead = () => Assert.Equal(ServiceLifecycleState.Stopped,
+                s.Supervisor.Observe(definition.Identity).Value!.State);
+            return KernelResult.Fail(KernelError.PlatformFaulted, "Original cleanup pending.");
+        }, instance.Process));
+        Assert.Equal(KernelError.StaleGeneration, s.Supervisor.Drain(instance).Error);
+        var current = s.Supervisor.Query(definition.Identity).Value!;
+        Assert.Equal(instance, current.Instance);
+        Assert.Equal(ServiceLifecycleState.Stopped, current.State);
+        Assert.Equal(ServiceHealthState.Stopped, current.Health!.State);
+        Assert.Null(current.BlockingReason);
+        Assert.True(s.Kernel.QueryComponent(definition.Identity).Value!.Reclaimable);
+        Assert.Equal(ProcessState.Exited, s.Kernel.Processes.ResolveTerminalState(instance.Process).Value);
+        Assert.Equal(2, calls);
     }
 
     [Fact]
@@ -1547,6 +1817,365 @@ public sealed class Phase02ServiceSupervisorTests
             Assert.True(s.Supervisor.ReportHealth(before.Instance.Value, ServiceHealthState.Degraded, "recovered").IsSuccess);
     }
 
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void HealthClockCannotOverwriteNewerSameInstanceFact(bool closure)
+    {
+        var clock = new CallbackHealthClock();
+        var s = CreateSupervisor(clock);
+        var definition = Definition("health-source", 264, 2064, Contract("HealthSource"));
+        Assert.True(s.Supervisor.Register(definition).IsSuccess);
+        var instance = s.Supervisor.Start(definition.Identity).Value!.Snapshot.Instance!.Value;
+        ServiceSupervisorSnapshot? newer = null;
+        clock.OnRead = () =>
+        {
+            if (closure) Assert.True(s.Supervisor.Drain(instance).Value!.ClosureProven);
+            else Assert.True(s.Supervisor.ReportHealth(instance, ServiceHealthState.Degraded, "newer health").IsSuccess);
+            newer = s.Supervisor.Query(definition.Identity).Value!;
+        };
+        var refused = s.Supervisor.ReportHealth(instance, ServiceHealthState.Ready, "late health");
+        Assert.Equal(KernelError.StaleGeneration, refused.Error);
+        var after = s.Supervisor.Query(definition.Identity).Value!;
+        Assert.Equal(newer!.State, after.State);
+        Assert.Equal(newer.Health, after.Health);
+        Assert.Equal(newer.BlockingReason, after.BlockingReason);
+        if (closure)
+        {
+            Assert.Equal(ServiceLifecycleState.Stopped, after.State);
+            Assert.True(s.Kernel.QueryComponent(definition.Identity).Value!.Reclaimable);
+        }
+        else Assert.True(s.Supervisor.ReportHealth(instance, ServiceHealthState.Degraded, "fresh followup").IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)]
+    public void FailureIntentRequiresFreshAuthorityAndOriginalHealthSource(int fault)
+    {
+        var s = CreateSupervisor();
+        var definition = Definition("failure-intent", 265, 2065, Contract("FailureIntent"));
+        Assert.True(s.Supervisor.Register(definition).IsSuccess);
+        var instance = s.Supervisor.Start(definition.Identity).Value!.Snapshot.Instance!.Value;
+        ServiceSupervisorSnapshot? newer = null;
+        s.Supervisor.BeforeFailureIntentQualificationHook = () =>
+        {
+            s.Supervisor.BeforeFailureIntentQualificationHook = null;
+            var published = s.Supervisor.Query(definition.Identity).Value!;
+            Assert.Equal(ServiceLifecycleState.Ready, published.State);
+            Assert.Equal(fault == 4 ? ServiceHealthState.Unhealthy : ServiceHealthState.Failed, published.Health!.State);
+            if (fault == 0) Assert.True(s.Kernel.CapabilityAuthority.Revoke(s.ControlCapability).IsSuccess);
+            if (fault == 1) s.Kernel.CapabilityAuthority.RevokeAllForDomain(s.IssuerDomain);
+            if (fault == 2) Assert.True(s.Kernel.TerminateProcess(s.Principal).IsSuccess);
+            if (fault == 3) Assert.True(s.Supervisor.Drain(instance).Value!.ClosureProven);
+            if (fault == 4) Assert.True(s.Supervisor.ReportHealth(instance, ServiceHealthState.Degraded, "newer").IsSuccess);
+            if (fault >= 3) newer = s.Supervisor.Query(definition.Identity).Value!;
+        };
+        var refused = s.Supervisor.ReportHealth(instance,
+            fault == 4 ? ServiceHealthState.Unhealthy : ServiceHealthState.Failed, "failure observation");
+        Assert.Equal(fault < 3 ? KernelError.SupervisorDenied : KernelError.StaleGeneration, refused.Error);
+        var after = InspectSupervisorRecord(s.Supervisor, definition.Identity);
+        if (fault < 3)
+        {
+            Assert.Equal(ServiceLifecycleState.Ready, after.State);
+            Assert.Equal(ServiceHealthState.Failed, after.Health!.State);
+            Assert.Equal(ProcessState.Running, s.Kernel.Processes.Resolve(instance.Process).Value!.State);
+            Assert.Equal(ComponentLifecycleState.Running, s.Kernel.QueryComponent(definition.Identity).Value!.State);
+        }
+        else
+        {
+            Assert.Equal(newer!.State, after.State);
+            Assert.Equal(newer.Health, after.Health);
+            Assert.Equal(newer.BlockingReason, after.BlockingReason);
+            if (fault == 3) Assert.True(s.Kernel.QueryComponent(definition.Identity).Value!.Reclaimable);
+        }
+        Assert.Equal(0U, after.RestartAttemptsInWindow);
+    }
+
+    [Fact]
+    public void RestartClockPreservesNewerStoppedHealthAndRetriesThroughObserve()
+    {
+        var clock = new CallbackHealthClock();
+        var s = CreateSupervisor(clock);
+        var contract = Contract("RestartHealthSource");
+        var policy = new ServiceRestartPolicyV1(ServiceRestartMode.OnFailure, 2, 1, 10, 1000);
+        var definition = Definition("restart-health-source", 266, 2066, contract, restart: policy,
+            replacementFactory: generation => Plan("restart-health-source", 266, 2066, contract, generation, restart: policy));
+        Assert.True(s.Supervisor.Register(definition).IsSuccess);
+        var instance = s.Supervisor.Start(definition.Identity).Value!.Snapshot.Instance!.Value;
+        ServiceSupervisorSnapshot? newer = null;
+        clock.OnFrequency = () =>
+        {
+            Assert.Equal(ServiceLifecycleState.Stopped, s.Supervisor.Query(definition.Identity).Value!.State);
+            Assert.True(s.Supervisor.ReportHealth(instance, ServiceHealthState.Degraded, "newer stopped observation").IsSuccess);
+            newer = s.Supervisor.Query(definition.Identity).Value!;
+        };
+        Assert.Equal(KernelError.StaleGeneration, s.Supervisor.ReportHealth(instance, ServiceHealthState.Failed, "failure").Error);
+        var after = s.Supervisor.Query(definition.Identity).Value!;
+        Assert.Equal(ServiceLifecycleState.Stopped, after.State);
+        Assert.Equal(newer!.Health, after.Health);
+        Assert.Equal(newer.BlockingReason, after.BlockingReason);
+        Assert.Equal(0U, after.RestartAttemptsInWindow);
+        Assert.Null(after.RestartEligibleTimestamp);
+        Assert.True(s.Kernel.QueryComponent(definition.Identity).Value!.Reclaimable);
+        var retried = s.Supervisor.Observe(definition.Identity);
+        Assert.True(retried.IsSuccess, retried.Message);
+        Assert.Equal(ServiceLifecycleState.RestartBackoff, retried.Value!.State);
+        Assert.Equal(1U, retried.Value.RestartAttemptsInWindow);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void FailureHealthReceiptCannotBeRedirectedToReplacement(bool beforeSnapshot)
+    {
+        var s = CreateSupervisor();
+        var contract = Contract("FailureReceipt");
+        var definition = Definition("failure-receipt", 267, 2067, contract);
+        Assert.True(s.Supervisor.Register(definition).IsSuccess);
+        var instance = s.Supervisor.Start(definition.Identity).Value!.Snapshot.Instance!.Value;
+        ServiceHealthSnapshot? original = null;
+        Action replace = () =>
+        {
+            original = s.Supervisor.Query(definition.Identity).Value!.Health;
+            Assert.True(s.Kernel.QueryComponent(definition.Identity).Value!.Reclaimable);
+            var next = Definition("failure-receipt", 267, 2067, contract, generation: 2);
+            Assert.True(s.Supervisor.Replace(instance, next).IsSuccess);
+        };
+        if (beforeSnapshot) s.Supervisor.BeforeFailureSnapshotQualificationHook = replace;
+        else s.Supervisor.AfterFailureCompletionQualificationHook = replace;
+        var result = s.Supervisor.ReportHealth(instance, ServiceHealthState.Failed, "original failure");
+        if (beforeSnapshot) Assert.Equal(KernelError.StaleGeneration, result.Error);
+        else
+        {
+            Assert.True(result.IsSuccess, result.Message);
+            Assert.Equal(original, result.Value);
+            Assert.Equal(instance, result.Value!.Instance);
+        }
+        var fresh = s.Supervisor.Query(definition.Identity).Value!;
+        Assert.Equal(2UL, fresh.Instance!.Value.Process.Generation);
+        Assert.Equal(ServiceLifecycleState.Ready, fresh.State);
+        Assert.Equal(ServiceHealthState.Ready, fresh.Health!.State);
+    }
+
+    [Theory]
+    [InlineData(false, 0)] [InlineData(false, 1)] [InlineData(false, 2)]
+    [InlineData(true, 0)] [InlineData(true, 1)] [InlineData(true, 2)]
+    public void StartControllerLossRefusesBeforeComponentAllocation(bool allocation, int fault)
+    {
+        var s = CreateSupervisor();
+        var definition = Definition("controller-allocation", 268, 2068, Contract("ControllerAllocation"));
+        Assert.True(s.Supervisor.Register(definition).IsSuccess);
+        Action lose = () =>
+        {
+            if (fault == 0) Assert.True(s.Kernel.CapabilityAuthority.Revoke(s.ControlCapability).IsSuccess);
+            if (fault == 1) s.Kernel.CapabilityAuthority.RevokeAllForDomain(s.IssuerDomain);
+            if (fault == 2) Assert.True(s.Kernel.TerminateProcess(s.Principal).IsSuccess);
+        };
+        if (allocation) s.Kernel.BeforeComponentAdmissionCommitQualificationHook = lose;
+        else s.Supervisor.BeforeStartIntentQualificationHook = lose;
+        Assert.Equal(KernelError.SupervisorDenied, s.Supervisor.Start(definition.Identity).Error);
+        var after = InspectSupervisorRecord(s.Supervisor, definition.Identity);
+        Assert.Equal(allocation ? ServiceLifecycleState.Failed : ServiceLifecycleState.Declared, after.State);
+        Assert.Null(after.Instance);
+        Assert.Null(after.Health);
+        Assert.Equal(KernelError.ComponentNotFound, s.Kernel.QueryComponent(definition.Identity).Error);
+        Assert.False(s.Kernel.Processes.Resolve(new ProcessHandle(definition.Admission.Manifest.Process.ProcessId, 1)).IsSuccess);
+        Assert.False(s.Kernel.Budgets.HasProcessAccount(new ProcessHandle(definition.Admission.Manifest.Process.ProcessId, 1)));
+    }
+
+    [Theory]
+    [InlineData(false, 0)] [InlineData(false, 1)] [InlineData(false, 2)]
+    [InlineData(true, 0)] [InlineData(true, 1)] [InlineData(true, 2)]
+    public void ControllerCreationRefusalRetiresOnlyExactUncreatedHierarchy(bool foreign, int fault)
+    {
+        var s = CreateSupervisor();
+        var definition = Definition("controller-creation", 269, 2069, Contract("ControllerCreation"));
+        Assert.True(s.Supervisor.Register(definition).IsSuccess);
+        var process = new ProcessHandle(definition.Admission.Manifest.Process.ProcessId, 1);
+        s.Kernel.BeforeComponentProcessCreationQualificationHook = () =>
+        {
+            Assert.True(s.Kernel.Budgets.HasProcessAccount(process));
+            if (foreign) Assert.True(s.Kernel.CreateProcess(definition.Admission.Manifest.Process).IsSuccess);
+            if (fault == 0) Assert.True(s.Kernel.CapabilityAuthority.Revoke(s.ControlCapability).IsSuccess);
+            if (fault == 1) s.Kernel.CapabilityAuthority.RevokeAllForDomain(s.IssuerDomain);
+            if (fault == 2) Assert.True(s.Kernel.TerminateProcess(s.Principal).IsSuccess);
+        };
+        Assert.Equal(KernelError.SupervisorDenied, s.Supervisor.Start(definition.Identity).Error);
+        Assert.False(s.Kernel.Processes.ResolveTerminalState(process).IsSuccess);
+        Assert.Equal(foreign, s.Kernel.Budgets.HasProcessAccount(process));
+        if (foreign)
+        {
+            Assert.Equal(ProcessState.Created, s.Kernel.Processes.Resolve(process).Value!.State);
+            var retained = s.Kernel.QueryComponent(definition.Identity).Value!;
+            Assert.Equal(ComponentLifecycleState.Faulted, retained.State);
+            Assert.False(retained.Reclaimable);
+            Assert.True(s.Kernel.QueryBudget(retained.ProcessBudget).IsSuccess);
+        }
+        else
+        {
+            Assert.False(s.Kernel.Processes.Resolve(process).IsSuccess);
+            Assert.Equal(KernelError.ComponentNotFound, s.Kernel.QueryComponent(definition.Identity).Error);
+        }
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void ControllerLossBeforeGrantMintRefusesAndReclaimsCreatedProcess(int fault)
+    {
+        var s = CreateSupervisor();
+        var requirement = new CapabilityRequirementV1(ResourceKind.KernelService, "controller-mint", CapabilityRights.Read);
+        var definition = Definition("controller-mint", 270, 2070, Contract("ControllerMint"),
+            capability: requirement, issuer: new DomainId(2070));
+        Assert.True(s.Supervisor.Register(definition).IsSuccess);
+        s.Kernel.BeforeComponentGrantMintQualificationHook = () =>
+        {
+            if (fault == 0) Assert.True(s.Kernel.CapabilityAuthority.Revoke(s.ControlCapability).IsSuccess);
+            if (fault == 1) s.Kernel.CapabilityAuthority.RevokeAllForDomain(s.IssuerDomain);
+            if (fault == 2) Assert.True(s.Kernel.TerminateProcess(s.Principal).IsSuccess);
+        };
+        Assert.Equal(KernelError.SupervisorDenied, s.Supervisor.Start(definition.Identity).Error);
+        var component = s.Kernel.QueryComponent(definition.Identity).Value!;
+        Assert.Empty(component.Capabilities);
+        Assert.Equal(ComponentLifecycleState.Reclaimable, component.State);
+        Assert.True(s.Kernel.Processes.ResolveTerminalState(component.Process).IsSuccess);
+        Assert.True(s.Kernel.Budgets.HasProcessAccount(component.Process));
+        Assert.DoesNotContain(s.Kernel.CapabilityAuthority.InspectionSnapshot(),
+            record => record.Descriptor.ResourceId == "controller-mint");
+        Assert.True(s.Kernel.RetireReclaimableComponent(definition.Identity, component.Process).IsSuccess);
+        Assert.False(s.Kernel.Budgets.HasProcessAccount(component.Process));
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void ControllerLossBeforeProcessAdmissionPreservesMintFactAndUsesExactCleanup(int fault)
+    {
+        var s = CreateSupervisor();
+        var requirement = new CapabilityRequirementV1(ResourceKind.KernelService, "controller-admit", CapabilityRights.Read);
+        var definition = Definition("controller-admit", 271, 2071, Contract("ControllerAdmit"),
+            capability: requirement, issuer: new DomainId(2071));
+        Assert.True(s.Supervisor.Register(definition).IsSuccess);
+        CapabilityId minted = default;
+        s.Kernel.BeforeComponentProcessAdmissionQualificationHook = () =>
+        {
+            var before = s.Kernel.QueryComponent(definition.Identity).Value!;
+            minted = Assert.Single(before.Capabilities);
+            Assert.Equal(ProcessState.Created, s.Kernel.Processes.Resolve(before.Process).Value!.State);
+            if (fault == 0) Assert.True(s.Kernel.CapabilityAuthority.Revoke(s.ControlCapability).IsSuccess);
+            if (fault == 1) s.Kernel.CapabilityAuthority.RevokeAllForDomain(s.IssuerDomain);
+            if (fault == 2) Assert.True(s.Kernel.TerminateProcess(s.Principal).IsSuccess);
+        };
+        Assert.Equal(KernelError.SupervisorDenied, s.Supervisor.Start(definition.Identity).Error);
+        var component = s.Kernel.QueryComponent(definition.Identity).Value!;
+        Assert.Empty(component.Capabilities);
+        Assert.Equal(ComponentLifecycleState.Reclaimable, component.State);
+        Assert.True(s.Kernel.Processes.ResolveTerminalState(component.Process).IsSuccess);
+        Assert.False(s.Kernel.CapabilityAuthority.Validate(minted, new DomainId(2071), 1, CapabilityRights.Read).IsSuccess);
+        Assert.Single(s.Kernel.CapabilityAuthority.InspectionSnapshot(), record => record.Descriptor.CapabilityId == minted);
+        Assert.True(s.Kernel.Budgets.HasProcessAccount(component.Process));
+        Assert.True(s.Kernel.RetireReclaimableComponent(definition.Identity, component.Process).IsSuccess);
+        Assert.False(s.Kernel.Budgets.HasProcessAccount(component.Process));
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void ControllerLossBeforeRegistrationCreatesNoServiceAndUsesActualCleanup(int fault)
+    {
+        var s = CreateSupervisor();
+        var contract = Contract("ControllerRegister");
+        var definition = Definition("controller-register", 272, 2072, contract);
+        Assert.True(s.Supervisor.Register(definition).IsSuccess);
+        s.Kernel.BeforeComponentServiceRegistrationQualificationHook = () =>
+        {
+            if (fault == 0) Assert.True(s.Kernel.CapabilityAuthority.Revoke(s.ControlCapability).IsSuccess);
+            if (fault == 1) s.Kernel.CapabilityAuthority.RevokeAllForDomain(s.IssuerDomain);
+            if (fault == 2) Assert.True(s.Kernel.TerminateProcess(s.Principal).IsSuccess);
+        };
+        Assert.Equal(KernelError.SupervisorDenied, s.Supervisor.Start(definition.Identity).Error);
+        Assert.Empty(s.Kernel.ResolveByContract(contract).Value!);
+        var component = s.Kernel.QueryComponent(definition.Identity).Value!;
+        Assert.Equal(ComponentLifecycleState.Reclaimable, component.State);
+        Assert.True(s.Kernel.Processes.ResolveTerminalState(component.Process).IsSuccess);
+        Assert.True(s.Kernel.RetireReclaimableComponent(definition.Identity, component.Process).IsSuccess);
+    }
+
+    [Fact]
+    public void RegistrationTraceClockAllowsIndependentLifecycleCommit()
+    {
+        var clock = new CallbackHealthClock();
+        var s = CreateSupervisor(clock);
+        Assert.True(s.Kernel.StartTraceSession(s.Principal, 16).IsSuccess);
+        var completed = false;
+        clock.OnRead = () =>
+        {
+            var task = Task.Run(() => s.Kernel.CreateProcess(TestFixtures.Manifest(273, 2073)));
+            completed = task.Wait(TimeSpan.FromSeconds(3));
+            if (completed) Assert.True(task.Result.IsSuccess);
+        };
+        var contract = Contract("TraceRegister");
+        var result = s.Kernel.RegisterService(s.Principal, "trace-register", contract, Protocol(contract));
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.True(completed, "Trace clock ran while lifecycle scope blocked independent creation.");
+        Assert.Single(s.Kernel.ResolveByContract(contract).Value!);
+    }
+
+    [Theory]
+    [InlineData(false, 0)] [InlineData(false, 1)] [InlineData(false, 2)]
+    [InlineData(true, 0)] [InlineData(true, 1)] [InlineData(true, 2)]
+    public void ControllerDependencySessionRefusalDoesNotAllocateOrDowngrade(bool optional, int fault)
+    {
+        var s = CreateSupervisor();
+        var contract = Contract("SessionSourceProvider");
+        var provider = Definition("session-source-provider", 274, 2074, contract);
+        Assert.True(s.Supervisor.Register(provider).IsSuccess);
+        var liveProvider = s.Supervisor.Start(provider.Identity).Value!.Snapshot.Instance!.Value;
+        var dependent = Definition("session-source-dependent", 275, 2075, Contract("SessionSourceDependent"),
+            dependencies: [new(contract, optional ? ServiceDependencyKind.Optional : ServiceDependencyKind.Hard)]);
+        Assert.True(s.Supervisor.Register(dependent).IsSuccess);
+        s.Kernel.BeforeComponentDependencySessionQualificationHook = () =>
+        {
+            if (fault == 0) Assert.True(s.Kernel.CapabilityAuthority.Revoke(s.ControlCapability).IsSuccess);
+            if (fault == 1) s.Kernel.CapabilityAuthority.RevokeAllForDomain(s.IssuerDomain);
+            if (fault == 2) Assert.True(s.Kernel.TerminateProcess(s.Principal).IsSuccess);
+        };
+        Assert.Equal(KernelError.SupervisorDenied, s.Supervisor.Start(dependent.Identity).Error);
+        var component = s.Kernel.QueryComponent(dependent.Identity).Value!;
+        Assert.Empty(s.Kernel.EndpointSessions.SnapshotForProcess(component.Process));
+        Assert.Empty(s.Kernel.EndpointSessions.SnapshotForProcess(liveProvider.Process));
+        Assert.Equal(ProcessState.Running, s.Kernel.Processes.Resolve(liveProvider.Process).Value!.State);
+        Assert.Single(s.Kernel.ResolveByContract(contract).Value!);
+        Assert.Equal(ComponentLifecycleState.Reclaimable, component.State);
+        Assert.True(s.Kernel.Processes.ResolveTerminalState(component.Process).IsSuccess);
+        Assert.True(s.Kernel.RetireReclaimableComponent(dependent.Identity, component.Process).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(0, 0)] [InlineData(0, 1)] [InlineData(0, 2)]
+    [InlineData(1, 0)] [InlineData(1, 1)] [InlineData(1, 2)]
+    [InlineData(2, 0)] [InlineData(2, 1)] [InlineData(2, 2)]
+    public void ControllerExecutionRefusalUsesActualCleanupBeforeAndAfterRunning(int stage, int fault)
+    {
+        var s = CreateSupervisor();
+        var contract = Contract("ControllerStart");
+        var definition = Definition("controller-start", 276, 2076, contract);
+        Assert.True(s.Supervisor.Register(definition).IsSuccess);
+        Action lose = () =>
+        {
+            var process = s.Kernel.QueryComponent(definition.Identity).Value!.Process;
+            Assert.Equal(stage == 2 ? ProcessState.Running : ProcessState.Admitted,
+                s.Kernel.Processes.Resolve(process).Value!.State);
+            if (fault == 0) Assert.True(s.Kernel.CapabilityAuthority.Revoke(s.ControlCapability).IsSuccess);
+            if (fault == 1) s.Kernel.CapabilityAuthority.RevokeAllForDomain(s.IssuerDomain);
+            if (fault == 2) Assert.True(s.Kernel.TerminateProcess(s.Principal).IsSuccess);
+        };
+        if (stage == 0) s.Kernel.BeforeComponentStartingPublicationQualificationHook = lose;
+        if (stage == 1) s.Kernel.BeforeComponentExecutionStartQualificationHook = lose;
+        if (stage == 2) s.Kernel.BeforeComponentRunningPublicationQualificationHook = lose;
+        Assert.Equal(KernelError.SupervisorDenied, s.Supervisor.Start(definition.Identity).Error);
+        var component = s.Kernel.QueryComponent(definition.Identity).Value!;
+        Assert.Equal(ComponentLifecycleState.Reclaimable, component.State);
+        Assert.True(s.Kernel.Processes.ResolveTerminalState(component.Process).IsSuccess);
+        Assert.Empty(s.Kernel.ResolveByContract(contract).Value!);
+        Assert.True(s.Kernel.RetireReclaimableComponent(definition.Identity, component.Process).IsSuccess);
+    }
+
     private sealed class CallbackHealthClock : TimeProvider
     {
         public Action? OnRead { get; set; }
@@ -1665,6 +2294,41 @@ public sealed class Phase02ServiceSupervisorTests
         Assert.Equal(ServiceLifecycleState.Declared, s.Supervisor.Query(definition.Identity).Value!.State);
     }
 
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void DependencyReadinessClockRequiresActualProviderOwners(int fault)
+    {
+        var clock = new CallbackHealthClock();
+        var s = CreateSupervisor(clock);
+        var contract = Contract("ActualDependencyProvider");
+        var provider = Definition("actual-provider", 252, 2052, contract);
+        var dependent = Definition("actual-dependent", 253, 2053, Contract("ActualDependent"),
+            dependencies: [new(contract, ServiceDependencyKind.Hard)]);
+        Assert.True(s.Supervisor.Register(provider).IsSuccess);
+        Assert.True(s.Supervisor.Register(dependent).IsSuccess);
+        var instance = s.Supervisor.Start(provider.Identity).Value!.Snapshot.Instance!.Value;
+        clock.OnRead = () =>
+        {
+            Assert.Equal(ComponentLifecycleState.Running, s.Kernel.QueryComponent(dependent.Identity).Value!.State);
+            if (fault == 0) Assert.True(s.Kernel.TerminateProcess(instance.Process).IsSuccess);
+            if (fault == 1) Assert.True(s.Kernel.ParkProcess(instance.Process).IsSuccess);
+            if (fault == 2)
+                Assert.True(s.Kernel.SetServiceAvailability(
+                    s.Kernel.ResolveByServiceName(provider.PrimaryServiceName).Value!.Service,
+                    ServiceAvailability.Unavailable).IsSuccess);
+        };
+        var refused = s.Supervisor.Start(dependent.Identity);
+        Assert.Equal(fault == 0 ? KernelError.StaleHandle : fault == 1 ? KernelError.InvalidTransition : KernelError.ServiceUnavailable,
+            refused.Error);
+        var after = s.Supervisor.Query(dependent.Identity).Value!;
+        Assert.Null(after.Instance);
+        Assert.Empty(after.Dependencies);
+        Assert.Equal(ServiceLifecycleState.Stopped, after.State);
+        Assert.True(s.Kernel.QueryComponent(dependent.Identity).Value!.Reclaimable);
+        // Supervisor metadata alone still describes the provider as Ready.
+        Assert.Equal(ServiceLifecycleState.Ready, s.Supervisor.Query(provider.Identity).Value!.State);
+    }
+
     [Fact]
     public void HardDependenciesStartFirstAndBindExactGeneration()
     {
@@ -1684,6 +2348,104 @@ public sealed class Phase02ServiceSupervisorTests
         var binding = Assert.Single(dependentSnapshot.Dependencies);
         Assert.Equal(scenario.Supervisor.Query(provider.Identity).Value!.Instance, binding.Provider);
         Assert.Equal(dependentSnapshot.Instance, binding.Consumer);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void LateRebindCannotPublishReadyAfterActualHardProviderLoss(int fault)
+    {
+        var clock = new CallbackHealthClock();
+        var s = CreateSupervisor(clock);
+        var hardContract = Contract("ActualHardProvider");
+        var lateContract = Contract("ActualLateProvider");
+        var hard = Definition("actual-hard", 256, 2056, hardContract);
+        var late = Definition("actual-late", 257, 2057, lateContract);
+        var peer = Definition("actual-peer", 258, 2058, Contract("ActualPeer"),
+            dependencies: [new(hardContract, ServiceDependencyKind.Hard), new(lateContract, ServiceDependencyKind.Optional)]);
+        Assert.True(s.Supervisor.Register(hard).IsSuccess);
+        Assert.True(s.Supervisor.Register(peer).IsSuccess);
+        var hardInstance = s.Supervisor.Start(hard.Identity).Value!.Snapshot.Instance!.Value;
+        var peerInstance = s.Supervisor.Start(peer.Identity).Value!.Snapshot.Instance!.Value;
+        Assert.Equal(ServiceLifecycleState.Degraded, s.Supervisor.Query(peer.Identity).Value!.State);
+        Assert.True(s.Supervisor.Register(late).IsSuccess);
+        clock.OnRead = () => clock.OnRead = () =>
+        {
+            if (fault == 0) Assert.True(s.Kernel.TerminateProcess(hardInstance.Process).IsSuccess);
+            if (fault == 1) Assert.True(s.Kernel.ParkProcess(hardInstance.Process).IsSuccess);
+            if (fault == 2)
+                Assert.True(s.Kernel.SetServiceAvailability(s.Kernel.ResolveByServiceName(hard.PrimaryServiceName).Value!.Service,
+                    ServiceAvailability.Unavailable).IsSuccess);
+        };
+        var refused = s.Supervisor.Start(late.Identity);
+        Assert.Equal(fault == 0 ? KernelError.StaleHandle : fault == 1 ? KernelError.InvalidTransition : KernelError.ServiceUnavailable,
+            refused.Error);
+        var after = s.Supervisor.Query(peer.Identity).Value!;
+        Assert.Equal(ServiceLifecycleState.Degraded, after.State);
+        Assert.Equal(hardContract, Assert.Single(after.Dependencies).Contract);
+        // Successful local session admission remains an exact cleanup fact despite publication refusal.
+        var tracked = s.Kernel.QueryComponent(peer.Identity).Value!.Sessions;
+        var lateSnapshot = s.Supervisor.Query(late.Identity).Value!;
+        Assert.Contains(tracked, session =>
+        {
+            var actual = s.Kernel.EndpointSessions.Resolve(session, peerInstance.Process);
+            return actual.IsSuccess && actual.Value!.Service == lateSnapshot.Instance!.Value.Process;
+        });
+        Assert.Equal(ServiceLifecycleState.Ready, lateSnapshot.State);
+        Assert.True(s.Supervisor.Drain(peerInstance).Value!.ClosureProven);
+        Assert.True(s.Kernel.QueryComponent(peer.Identity).Value!.Reclaimable);
+    }
+
+    [Fact]
+    public async Task LateRebindRetainsSessionButRefusesReadyAfterHardComponentIntent()
+    {
+        var clock = new CallbackHealthClock();
+        var s = CreateSupervisor(clock);
+        var hardContract = Contract("IntentHard");
+        var lateContract = Contract("IntentLate");
+        var hard = Definition("intent-hard", 261, 2061, hardContract);
+        var late = Definition("intent-late", 262, 2062, lateContract);
+        var peer = Definition("intent-rebind-peer", 263, 2063, Contract("IntentRebindPeer"),
+            dependencies: [new(hardContract, ServiceDependencyKind.Hard), new(lateContract, ServiceDependencyKind.Optional)]);
+        Assert.True(s.Supervisor.Register(hard).IsSuccess);
+        Assert.True(s.Supervisor.Register(peer).IsSuccess);
+        var hardInstance = s.Supervisor.Start(hard.Identity).Value!.Snapshot.Instance!.Value;
+        var peerInstance = s.Supervisor.Start(peer.Identity).Value!.Snapshot.Instance!.Value;
+        Assert.True(s.Supervisor.Register(late).IsSuccess);
+        using var intent = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        Task<KernelResult<ComponentLifecycleSnapshot>>? drain = null;
+        s.Kernel.AfterComponentTeardownIntentQualificationHook = () =>
+        {
+            intent.Set();
+            Assert.True(release.Wait(TimeSpan.FromSeconds(10)));
+        };
+        clock.OnRead = () => clock.OnRead = () =>
+        {
+            drain = Task.Run(() => s.Kernel.DrainComponent(hard.Identity));
+            Assert.True(intent.Wait(TimeSpan.FromSeconds(10)));
+            Assert.Equal(ProcessState.Running, s.Kernel.Processes.Resolve(hardInstance.Process).Value!.State);
+        };
+        try
+        {
+            Assert.Equal(KernelError.InvalidTransition, s.Supervisor.Start(late.Identity).Error);
+            var after = s.Supervisor.Query(peer.Identity).Value!;
+            Assert.Equal(ServiceLifecycleState.Degraded, after.State);
+            Assert.Equal(hardContract, Assert.Single(after.Dependencies).Contract);
+            var lateInstance = s.Supervisor.Query(late.Identity).Value!.Instance!.Value;
+            Assert.Contains(s.Kernel.QueryComponent(peer.Identity).Value!.Sessions, session =>
+            {
+                var actual = s.Kernel.EndpointSessions.Resolve(session, peerInstance.Process);
+                return actual.IsSuccess && actual.Value!.Service == lateInstance.Process;
+            });
+        }
+        finally
+        {
+            s.Kernel.AfterComponentTeardownIntentQualificationHook = null;
+            release.Set();
+            if (drain is not null) Assert.True((await drain).IsSuccess);
+        }
+        Assert.True(s.Supervisor.Drain(peerInstance).Value!.ClosureProven);
+        Assert.True(s.Kernel.QueryComponent(peer.Identity).Value!.Reclaimable);
     }
 
     [Fact]
@@ -1738,6 +2500,437 @@ public sealed class Phase02ServiceSupervisorTests
         Assert.Equal(KernelError.InvalidManifest, rejected.Error);
         Assert.Equal(KernelError.ProcessNotFound, scenario.Kernel.Processes.Resolve(new(new(205), 1)).Error);
         Assert.Equal(KernelError.ComponentNotFound, scenario.Supervisor.Query(b.Identity).Error);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void ReplacementProspectiveGraphRefusesBeforeOriginalDrain(bool duplicate)
+    {
+        var s = CreateSupervisor();
+        var a = Contract("ReplacementGraphA");
+        var b = Contract("ReplacementGraphB");
+        var original = Definition("replacement-graph-a", 1201, 1202, a);
+        Assert.True(s.Supervisor.Register(original).IsSuccess);
+        var old = s.Supervisor.Start(original.Identity).Value!.Snapshot.Instance!.Value;
+        Assert.True(s.Supervisor.Register(Definition("replacement-graph-b", 1203, 1204, b,
+            dependencies: [new(a, ServiceDependencyKind.Hard)])).IsSuccess);
+        var before = s.Supervisor.Query(original.Identity).Value!;
+        var component = s.Kernel.QueryComponent(original.Identity).Value!;
+        var next = Definition("replacement-graph-a", 1201, 1202, duplicate ? b : a, generation: 2,
+            dependencies: duplicate ? [] : [new(b, ServiceDependencyKind.Hard)]);
+        Assert.Equal(KernelError.InvalidManifest, s.Supervisor.Replace(old, next).Error);
+        var after = s.Supervisor.Query(original.Identity).Value!;
+        Assert.Equal(before.State, after.State);
+        Assert.Equal(before.Health, after.Health);
+        Assert.Equal(old, after.Instance);
+        Assert.Equal(ComponentLifecycleState.Running, s.Kernel.QueryComponent(original.Identity).Value!.State);
+        Assert.True(s.Kernel.QueryBudget(component.ProcessBudget).IsSuccess);
+        Assert.True(s.Kernel.Processes.Resolve(old.Process).IsSuccess);
+    }
+
+    [Fact]
+    public void ReplacementFinalGraphDriftPreservesOldReclaimableAccounts()
+    {
+        var s = CreateSupervisor();
+        var a = Contract("FinalGraphA");
+        var b = Contract("FinalGraphB");
+        var original = Definition("final-graph-a", 1205, 1206, a);
+        Assert.True(s.Supervisor.Register(original).IsSuccess);
+        var old = s.Supervisor.Start(original.Identity).Value!.Snapshot.Instance!.Value;
+        var component = s.Kernel.QueryComponent(original.Identity).Value!;
+        s.Supervisor.BeforeReplacementRetirementQualificationHook = () =>
+            Assert.True(s.Supervisor.Register(Definition("final-graph-b", 1207, 1208, b)).IsSuccess);
+        var refused = s.Supervisor.Replace(old,
+            Definition("final-graph-a", 1205, 1206, b, generation: 2));
+        Assert.Equal(KernelError.InvalidManifest, refused.Error);
+        var retained = s.Kernel.QueryComponent(original.Identity).Value!;
+        Assert.Equal(old.Process, retained.Process);
+        Assert.Equal(ComponentLifecycleState.Reclaimable, retained.State);
+        Assert.True(s.Kernel.QueryBudget(component.ProcessBudget).IsSuccess);
+        Assert.True(s.Kernel.Budgets.HasProcessAccount(old.Process));
+        Assert.False(s.Kernel.Processes.Resolve(new(old.Process.ProcessId, 2)).IsSuccess);
+        Assert.Equal(old, s.Supervisor.Query(original.Identity).Value!.Instance);
+    }
+
+    [Theory]
+    [InlineData(false, false)] [InlineData(true, false)]
+    [InlineData(false, true)] [InlineData(true, true)]
+    public void ReplacementRemovedContractKeepsActualDependentDegradedWithoutStaleBinding(bool optional, bool secondary)
+    {
+        var s = CreateSupervisor();
+        var oldContract = Contract("RemovedDependency");
+        var freshContract = Contract("FreshUnrelated");
+        var provider = Definition("removed-provider", 1211, 1212, oldContract);
+        if (secondary)
+        {
+            var image = new byte[] { 187, 1 };
+            var services = new[] { new ProvidedServiceManifestV1("removed-provider", freshContract),
+                new ProvidedServiceManifestV1("removed-secondary", oldContract) };
+            var manifest = new ServiceManifestV1(new("removed-provider"), new("1.1"), Digest(image),
+                TestFixtures.Manifest(1211, 1212, 1, "removed-entry"), services);
+            provider = new(new ComponentAdmissionPlan(manifest, image,
+                providedServices: services.Select(item => new ComponentProvidedServiceRegistration(item, Protocol(item.Contract)))),
+                "removed-provider");
+        }
+        var dependent = Definition("removed-dependent", 1213, 1214, Contract("RemovedConsumer"),
+            dependencies: [new(oldContract, optional ? ServiceDependencyKind.Optional : ServiceDependencyKind.Hard)]);
+        Assert.True(s.Supervisor.Register(provider).IsSuccess);
+        Assert.True(s.Supervisor.Register(dependent).IsSuccess);
+        var old = s.Supervisor.Start(provider.Identity).Value!.Snapshot.Instance!.Value;
+        var consumer = s.Supervisor.Start(dependent.Identity).Value!.Snapshot.Instance!.Value;
+        Assert.Single(s.Supervisor.Query(dependent.Identity).Value!.Dependencies);
+        var oldSession = Assert.Single(s.Kernel.QueryComponent(dependent.Identity).Value!.Sessions);
+
+        var replacement = s.Supervisor.Replace(old,
+            Definition("removed-provider", 1211, 1212, freshContract, generation: 2));
+
+        Assert.True(replacement.IsSuccess, replacement.Message);
+        var after = s.Supervisor.Query(dependent.Identity).Value!;
+        Assert.Equal(consumer, after.Instance);
+        Assert.Equal(ServiceLifecycleState.Degraded, after.State);
+        Assert.Equal(ServiceHealthState.Degraded, after.Health!.State);
+        Assert.Empty(after.Dependencies);
+        Assert.Empty(s.Kernel.ResolveByContract(oldContract).Value!);
+        Assert.Equal(KernelError.SessionClosed, s.Kernel.CloseSession(consumer.Process, oldSession).Error);
+        Assert.Equal(ComponentLifecycleState.Running, s.Kernel.QueryComponent(dependent.Identity).Value!.State);
+    }
+
+    [Theory]
+    [InlineData(ServiceFailurePropagationPolicy.DegradeDependent)]
+    [InlineData(ServiceFailurePropagationPolicy.DrainDependent)]
+    [InlineData(ServiceFailurePropagationPolicy.StopDependent)]
+    public void SecondaryContractFailureUsesActualDependentPolicy(ServiceFailurePropagationPolicy policy)
+    {
+        var s = CreateSupervisor();
+        var primary = Contract("SecondaryFailurePrimary");
+        var secondary = Contract("SecondaryFailureSecondary");
+        var image = new byte[] { 191, 1 };
+        var services = new[] { new ProvidedServiceManifestV1("secondary-failure-provider", primary),
+            new ProvidedServiceManifestV1("secondary-failure-service", secondary) };
+        var manifest = new ServiceManifestV1(new("secondary-failure-provider"), new("1.1"), Digest(image),
+            TestFixtures.Manifest(1215, 1216, 1, "secondary-failure-entry"), services);
+        var provider = new ManagedServiceDefinition(new ComponentAdmissionPlan(manifest, image,
+            providedServices: services.Select(item => new ComponentProvidedServiceRegistration(item, Protocol(item.Contract)))),
+            "secondary-failure-provider");
+        var baseDependent = Definition("secondary-failure-peer", 1217, 1218, Contract("SecondaryFailureConsumer"),
+            dependencies: [new(secondary, ServiceDependencyKind.Hard)]);
+        var dependent = new ManagedServiceDefinition(baseDependent.Admission, baseDependent.PrimaryServiceName,
+            dependencyFailurePolicy: policy);
+        Assert.True(s.Supervisor.Register(provider).IsSuccess);
+        Assert.True(s.Supervisor.Register(dependent).IsSuccess);
+        Assert.True(s.Supervisor.StartAll().IsSuccess);
+        var failed = s.Supervisor.Query(provider.Identity).Value!.Instance!.Value;
+        var peer = s.Supervisor.Query(dependent.Identity).Value!.Instance!.Value;
+        var binding = Assert.Single(s.Supervisor.Query(dependent.Identity).Value!.Dependencies);
+        Assert.NotEqual(failed.ServiceId, binding.Provider.ServiceId);
+        Assert.Equal(failed.Process, binding.Provider.Process);
+
+        Assert.True(s.Supervisor.ReportHealth(failed, ServiceHealthState.Failed, "Secondary provider failed").IsSuccess);
+
+        var after = s.Supervisor.Query(dependent.Identity).Value!;
+        Assert.Equal(peer, after.Instance);
+        if (policy == ServiceFailurePropagationPolicy.DegradeDependent)
+        {
+            Assert.Equal(ServiceLifecycleState.Degraded, after.State);
+            Assert.Equal(ServiceHealthState.Degraded, after.Health!.State);
+            Assert.Equal(ProcessState.Running, s.Kernel.Processes.Resolve(peer.Process).Value!.State);
+        }
+        else
+        {
+            Assert.Equal(ServiceLifecycleState.Stopped, after.State);
+            Assert.Equal(ComponentLifecycleState.Reclaimable, s.Kernel.QueryComponent(dependent.Identity).Value!.State);
+            Assert.True(s.Kernel.Processes.ResolveTerminalState(peer.Process).IsSuccess);
+        }
+    }
+
+    [Fact]
+    public void ReplacementDrainClockCannotDispatchCompetingReplacement()
+    {
+        var clock = new CallbackHealthClock();
+        var s = CreateSupervisor(clock);
+        var definition = Definition("replacement-interlock", 1101, 1102, Contract("ReplacementInterlock"));
+        Assert.True(s.Supervisor.Register(definition).IsSuccess);
+        var old = s.Supervisor.Start(definition.Identity).Value!.Snapshot.Instance!.Value;
+        var next = Definition("replacement-interlock", 1101, 1102, Contract("ReplacementInterlock"), generation: 2);
+        var calls = 0;
+        clock.OnRead = () =>
+        {
+            calls++;
+            Assert.Equal(KernelError.ReplacementBlocked, s.Supervisor.Replace(old, next).Error);
+            Assert.Equal(old, s.Supervisor.Query(definition.Identity).Value!.Instance);
+        };
+        var replaced = s.Supervisor.Replace(old, next);
+        Assert.True(replaced.IsSuccess, replaced.Message);
+        Assert.Equal(1, calls);
+        Assert.Equal(2UL, replaced.Value!.Snapshot.Instance!.Value.Process.Generation);
+        Assert.True(s.Supervisor.Replace(replaced.Value.Snapshot.Instance.Value,
+            Definition("replacement-interlock", 1101, 1102, Contract("ReplacementInterlock"), generation: 3)).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void RestartFactoryReentryCannotDuplicateDispatchAndThrowAllowsRetry(bool throws)
+    {
+        var clock = new SupervisorTimeProvider();
+        var s = CreateSupervisor(clock);
+        var contract = Contract("DispatchInterlock");
+        var policy = new ServiceRestartPolicyV1(ServiceRestartMode.OnFailure, 2, 1, 10, 1000);
+        var calls = 0;
+        var refuse = throws;
+        var definition = Definition("dispatch-interlock", 1099, 1100, contract, restart: policy,
+            replacementFactory: generation =>
+            {
+                calls++;
+                Assert.Equal(KernelError.ReplacementBlocked, s.Supervisor.Observe(new("dispatch-interlock")).Error);
+                Assert.Equal(ServiceLifecycleState.RestartBackoff, s.Supervisor.Query(new("dispatch-interlock")).Value!.State);
+                var captured = s.Supervisor.Query(new("dispatch-interlock")).Value!.Instance!.Value;
+                var component = s.Kernel.QueryComponent(new("dispatch-interlock")).Value!;
+                Assert.Equal(KernelError.ReplacementBlocked, s.Supervisor.Replace(captured,
+                    Definition("dispatch-interlock", 1099, 1100, contract, generation, restart: policy)).Error);
+                Assert.Equal(captured, s.Supervisor.Query(new("dispatch-interlock")).Value!.Instance);
+                Assert.Equal(component.ProcessBudget, s.Kernel.QueryComponent(new("dispatch-interlock")).Value!.ProcessBudget);
+                Assert.True(s.Kernel.QueryBudget(component.ProcessBudget).IsSuccess);
+                if (refuse) throw new InvalidOperationException("factory failure");
+                return Plan("dispatch-interlock", 1099, 1100, contract, generation, restart: policy);
+            });
+        Assert.True(s.Supervisor.Register(definition).IsSuccess);
+        var old = s.Supervisor.Start(definition.Identity).Value!.Snapshot.Instance!.Value;
+        Assert.True(s.Supervisor.ReportHealth(old, ServiceHealthState.Failed, "restart").IsSuccess);
+        clock.AdvanceMilliseconds(1);
+        var result = s.Supervisor.Observe(definition.Identity);
+        if (throws)
+        {
+            Assert.Equal(KernelError.PlatformFaulted, result.Error);
+            Assert.Equal(old, s.Supervisor.Query(definition.Identity).Value!.Instance);
+            refuse = false;
+            result = s.Supervisor.Observe(definition.Identity);
+        }
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.Equal(ServiceLifecycleState.Ready, result.Value!.State);
+        Assert.Equal(2UL, result.Value.Instance!.Value.Process.Generation);
+        Assert.Equal(throws ? 2 : 1, calls);
+        Assert.True(s.Supervisor.Observe(definition.Identity).IsSuccess);
+        Assert.Equal(throws ? 2 : 1, calls);
+    }
+
+    [Theory]
+    [InlineData(true)] [InlineData(false)]
+    public void RestartGenerationCapacityRefusesBeforeFactoryOrUsesLastGeneration(bool exhausted)
+    {
+        var clock = new SupervisorTimeProvider();
+        var s = CreateSupervisor(clock);
+        var contract = Contract("LastRestart");
+        var policy = new ServiceRestartPolicyV1(ServiceRestartMode.OnFailure, 2, 1, 10, 1000);
+        var calls = 0;
+        var definition = Definition("last-restart", 1097, 1098, contract,
+            generation: exhausted ? ulong.MaxValue : ulong.MaxValue - 1, restart: policy,
+            replacementFactory: generation =>
+            {
+                calls++;
+                Assert.Equal(ulong.MaxValue, generation);
+                return Plan("last-restart", 1097, 1098, contract, generation, restart: policy);
+            });
+        Assert.True(s.Supervisor.Register(definition).IsSuccess);
+        var old = s.Supervisor.Start(definition.Identity).Value!.Snapshot.Instance!.Value;
+        Assert.True(s.Supervisor.ReportHealth(old, ServiceHealthState.Failed, "restart").IsSuccess);
+        var before = s.Supervisor.Query(definition.Identity).Value!;
+        var oldComponent = s.Kernel.QueryComponent(definition.Identity).Value!;
+        clock.AdvanceMilliseconds(1);
+        var observed = s.Supervisor.Observe(definition.Identity);
+        if (exhausted)
+        {
+            Assert.Equal(KernelError.StaleGeneration, observed.Error);
+            Assert.Equal(KernelError.StaleGeneration, s.Supervisor.Observe(definition.Identity).Error);
+            Assert.Equal(0, calls);
+            var after = s.Supervisor.Query(definition.Identity).Value!;
+            Assert.Equal(before.Instance, after.Instance);
+            Assert.Equal(before.State, after.State);
+            Assert.Equal(before.RestartAttemptsInWindow, after.RestartAttemptsInWindow);
+            Assert.Equal(before.RestartEligibleTimestamp, after.RestartEligibleTimestamp);
+            Assert.Equal(ComponentLifecycleState.Reclaimable, s.Kernel.QueryComponent(definition.Identity).Value!.State);
+            Assert.True(s.Kernel.QueryBudget(oldComponent.ProcessBudget).IsSuccess);
+        }
+        else
+        {
+            Assert.True(observed.IsSuccess, observed.Message);
+            Assert.Equal(ServiceLifecycleState.Ready, observed.Value!.State);
+            Assert.Equal(ulong.MaxValue, observed.Value.Instance!.Value.Process.Generation);
+            Assert.True(s.Supervisor.Observe(definition.Identity).IsSuccess);
+            Assert.Equal(1, calls);
+            Assert.Equal(KernelError.StaleGeneration, s.Kernel.QueryBudget(oldComponent.ProcessBudget).Error);
+        }
+    }
+
+    [Fact]
+    public void ReplacementGenerationCapacityRefusesBeforeDrainOrRetirement()
+    {
+        var s = CreateSupervisor();
+        var current = Definition("last-generation", 1095, 1096, Contract("LastGeneration"), generation: ulong.MaxValue);
+        Assert.True(s.Supervisor.Register(current).IsSuccess);
+        var before = s.Supervisor.Start(current.Identity).Value!.Snapshot;
+        var component = s.Kernel.QueryComponent(current.Identity).Value!;
+        var budget = s.Kernel.QueryBudget(component.ProcessBudget).Value!;
+        var next = Definition("last-generation", 1095, 1096, Contract("LastGeneration"), generation: 1);
+
+        Assert.Equal(KernelError.StaleGeneration, s.Supervisor.Replace(before.Instance!.Value, next).Error);
+        var after = s.Supervisor.Query(current.Identity).Value!;
+        Assert.Equal(before.Instance, after.Instance);
+        Assert.Equal(before.State, after.State);
+        Assert.Equal(before.Health, after.Health);
+        var afterComponent = s.Kernel.QueryComponent(current.Identity).Value!;
+        Assert.Equal(component.Process, afterComponent.Process);
+        Assert.Equal(ComponentLifecycleState.Running, afterComponent.State);
+        Assert.Equal(component.ProcessBudget, afterComponent.ProcessBudget);
+        Assert.Equal(budget.Usage.ToArray(), s.Kernel.QueryBudget(component.ProcessBudget).Value!.Usage.ToArray());
+        Assert.True(s.Kernel.Budgets.HasProcessAccount(component.Process));
+    }
+
+    [Theory]
+    [InlineData(0, false)] [InlineData(0, true)]
+    [InlineData(1, false)] [InlineData(1, true)]
+    [InlineData(2, false)] [InlineData(2, true)]
+    public void ReplacementPropagatesControllerToActualAllocationCreationAndStart(int stage, bool terminate)
+    {
+        var s = CreateSupervisor();
+        var contract = Contract("ReplacementController");
+        var current = Definition("replacement-controller", 1195, 1196, contract);
+        Assert.True(s.Supervisor.Register(current).IsSuccess);
+        var old = s.Supervisor.Start(current.Identity).Value!.Snapshot.Instance!.Value;
+        var oldComponent = s.Kernel.QueryComponent(current.Identity).Value!;
+        var runningPublications = 0;
+        s.Kernel.BeforeComponentRunningPublicationQualificationHook = () => runningPublications++;
+        Action lose = () =>
+        {
+            Assert.False(s.Kernel.Budgets.HasProcessAccount(old.Process));
+            if (terminate) Assert.True(s.Kernel.TerminateProcess(s.Principal).IsSuccess);
+            else Assert.True(s.Kernel.CapabilityAuthority.Revoke(s.ControlCapability).IsSuccess);
+        };
+        if (stage == 0) s.Kernel.BeforeComponentAdmissionCommitQualificationHook = lose;
+        if (stage == 1) s.Kernel.BeforeComponentProcessCreationQualificationHook = lose;
+        if (stage == 2) s.Kernel.BeforeComponentExecutionStartQualificationHook = lose;
+        var next = Definition("replacement-controller", 1195, 1196, contract, generation: 2);
+
+        Assert.Equal(KernelError.SupervisorDenied, s.Supervisor.Replace(old, next).Error);
+
+        var fresh = new ProcessHandle(old.Process.ProcessId, 2);
+        Assert.False(s.Kernel.Processes.Resolve(fresh).IsSuccess);
+        Assert.Equal(0, runningPublications);
+        Assert.Empty(s.Kernel.ResolveByContract(contract).Value!);
+        Assert.Equal(KernelError.StaleGeneration, s.Kernel.QueryBudget(oldComponent.ProcessBudget).Error);
+        if (stage < 2)
+        {
+            Assert.False(s.Kernel.Processes.ResolveTerminalState(fresh).IsSuccess);
+            Assert.Equal(KernelError.ComponentNotFound, s.Kernel.QueryComponent(current.Identity).Error);
+            Assert.False(s.Kernel.Budgets.HasProcessAccount(fresh));
+        }
+        else
+        {
+            var retained = s.Kernel.QueryComponent(current.Identity).Value!;
+            Assert.Equal(fresh, retained.Process);
+            Assert.Equal(ComponentLifecycleState.Reclaimable, retained.State);
+            Assert.True(s.Kernel.Processes.ResolveTerminalState(fresh).IsSuccess);
+            Assert.True(s.Kernel.RetireReclaimableComponent(current.Identity, fresh).IsSuccess);
+            Assert.False(s.Kernel.Budgets.HasProcessAccount(fresh));
+        }
+    }
+
+    [Fact]
+    public void ReplacementAdmissionFailureCannotOverwriteReentrantDrainFact()
+    {
+        var s = CreateSupervisor();
+        var contract = Contract("FailureDrainSource");
+        var current = Definition("failure-drain-source", 1197, 1198, contract);
+        Assert.True(s.Supervisor.Register(current).IsSuccess);
+        var old = s.Supervisor.Start(current.Identity).Value!.Snapshot.Instance!.Value;
+        ServiceSupervisorSnapshot? drained = null;
+        s.Kernel.BeforeComponentAdmissionCommitQualificationHook = () =>
+        {
+            // The old component has retired. This actual drain records its
+            // newer state even though its exact component is no longer present.
+            Assert.False(s.Supervisor.Drain(old).IsSuccess);
+            drained = s.Supervisor.Query(current.Identity).Value!;
+            Assert.True(s.Kernel.CapabilityAuthority.Revoke(s.ControlCapability).IsSuccess);
+        };
+        var refused = s.Supervisor.Replace(old,
+            Definition("failure-drain-source", 1197, 1198, contract, generation: 2));
+        Assert.Equal(KernelError.SupervisorDenied, refused.Error);
+        Assert.NotNull(drained);
+        var after = InspectSupervisorRecord(s.Supervisor, current.Identity);
+        Assert.Equal(drained!.State, after.State);
+        Assert.Equal(drained.Health, after.Health);
+        Assert.Equal(drained.BlockingReason, after.BlockingReason);
+        Assert.Equal(KernelError.ComponentNotFound, s.Kernel.QueryComponent(current.Identity).Error);
+        Assert.False(s.Kernel.Processes.Resolve(new(old.Process.ProcessId, 2)).IsSuccess);
+    }
+
+    [Fact]
+    public void ReplacementControlRevokeBeforeRetirementPreservesExactOldAccounting()
+    {
+        var s = CreateSupervisor();
+        var current = Definition("retirement-control", 1193, 1194, Contract("RetirementControl"));
+        Assert.True(s.Supervisor.Register(current).IsSuccess);
+        var old = s.Supervisor.Start(current.Identity).Value!.Snapshot.Instance!.Value;
+        var component = s.Kernel.QueryComponent(current.Identity).Value!;
+        var calls = 0;
+        s.Supervisor.BeforeReplacementRetirementQualificationHook = () =>
+        {
+            calls++;
+            var revoke = Task.Run(() => s.Kernel.CapabilityAuthority.Revoke(s.ControlCapability));
+            Assert.True(revoke.Wait(TimeSpan.FromSeconds(5)), "Retirement hook must run outside capability locks.");
+            Assert.True(revoke.Result.IsSuccess);
+        };
+        var next = Definition("retirement-control", 1193, 1194, Contract("RetirementControl"), generation: 2);
+
+        var refused = s.Supervisor.Replace(old, next);
+
+        Assert.Equal(KernelError.SupervisorDenied, refused.Error);
+        Assert.Equal(1, calls);
+        var retained = s.Kernel.QueryComponent(current.Identity).Value!;
+        Assert.Equal(old.Process, retained.Process);
+        Assert.Equal(ComponentLifecycleState.Reclaimable, retained.State);
+        Assert.Equal(component.ProcessBudget, retained.ProcessBudget);
+        Assert.True(s.Kernel.Budgets.HasProcessAccount(old.Process));
+        Assert.True(s.Kernel.QueryBudget(component.ProcessBudget).IsSuccess);
+        Assert.True(s.Kernel.QueryBudget(component.ServiceBudget).IsSuccess);
+        Assert.Equal(KernelError.ProcessNotFound, s.Kernel.Processes.Resolve(new(old.Process.ProcessId, 2)).Error);
+    }
+
+    [Theory]
+    [InlineData(0UL)] [InlineData(10UL)]
+    public void ActualReplacementPreservesOldTerminalChargeAndSeparatesFreshAccounting(ulong charge)
+    {
+        var s = CreateSupervisor();
+        var current = Definition("charged-replacement", 1093, 1094, Contract("ChargedReplacement"));
+        Assert.True(s.Supervisor.Register(current).IsSuccess);
+        var old = s.Supervisor.Start(current.Identity).Value!.Snapshot.Instance!.Value;
+        var oldComponent = s.Kernel.QueryComponent(current.Identity).Value!;
+        var lease = s.Kernel.Budgets.Reserve(old.Process,
+            [new(ServiceBudgetDimension.ComputeTimeNanoseconds, 40)],
+            BudgetReservationLifetime.ExternalEffect, AdmissionQosHint.None).Value!.Reservation;
+        Assert.True(s.Kernel.Budgets.BindLease(old.Process, lease).IsSuccess);
+        Assert.True(s.Kernel.Budgets.BeginConsumption(old.Process, lease).IsSuccess);
+        var terminal = s.Kernel.Budgets.SettleLease(old.Process, lease,
+            charge == 0 ? [] : [new(ServiceBudgetDimension.ComputeTimeNanoseconds, charge)]).Value!;
+        var next = Definition("charged-replacement", 1093, 1094, Contract("ChargedReplacement"), generation: 2);
+
+        var replaced = s.Supervisor.Replace(old, next);
+
+        Assert.True(replaced.IsSuccess, replaced.Message);
+        Assert.Equal(ServiceLifecycleState.Ready, replaced.Value!.Snapshot.State);
+        var fresh = s.Kernel.QueryComponent(current.Identity).Value!;
+        Assert.Equal(2UL, fresh.Process.Generation);
+        Assert.False(s.Kernel.Budgets.HasProcessAccount(old.Process));
+        Assert.Equal(KernelError.StaleGeneration, s.Kernel.QueryBudget(oldComponent.ProcessBudget).Error);
+        Assert.Equal(KernelError.StaleGeneration, s.Kernel.QueryBudget(oldComponent.ServiceBudget).Error);
+        Assert.NotEqual(oldComponent.ProcessBudget, fresh.ProcessBudget);
+        BudgetSnapshotAssertions.Equal(terminal, s.Kernel.Budgets.Query(lease).Value!);
+        Assert.Equal(charge, Assert.Single(s.Kernel.QueryBudget(s.Kernel.Budgets.SystemBudget).Value!.Usage,
+            item => item.Dimension == ServiceBudgetDimension.ComputeTimeNanoseconds).Used);
+        Assert.Equal(0UL, Assert.Single(s.Kernel.QueryBudget(fresh.ProcessBudget).Value!.Usage,
+            item => item.Dimension == ServiceBudgetDimension.ComputeTimeNanoseconds).Used);
+        Assert.Equal(KernelError.StaleGeneration, s.Supervisor.Replace(old, next).Error);
+        Assert.Equal(fresh.Process, s.Kernel.QueryComponent(current.Identity).Value!.Process);
+        BudgetSnapshotAssertions.Equal(terminal, s.Kernel.Budgets.Query(lease).Value!);
     }
 
     [Fact]

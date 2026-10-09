@@ -22,19 +22,21 @@ public sealed partial class PlatformAuthorityBridge
         public object DeliveryGate { get; } = new();
         public bool DeliveryInProgress { get; set; }
         public bool DeliveryFailed { get; set; }
+        public bool QuarantineQueued { get; set; }
         public SemanticTraceEventV1? LastQueuedEvent { get; set; }
     }
 
-    private void RegisterDmaTraceLocked(DmaSubmissionRecord record, ISemanticTraceSinkV1 sink)
+    private void RegisterDmaTraceLocked(DmaSubmissionRecord record, ISemanticTraceSinkV1 sink, PlatformBackendEpoch? originalEpoch = null)
     {
         try
         {
             var binding = record.SemanticBinding!.Value;
-            var digest = DmaTraceGenerationDigest(binding, binding.ProviderGeneration, _backendEpoch);
+            var epoch = originalEpoch?.Value ?? _backendEpoch;
+            var digest = DmaTraceGenerationDigest(binding, binding.ProviderGeneration, epoch);
             var correlation = FormattableString.Invariant(
                 $"dma:{record.Submission.OperationId.Value}:{record.Submission.Generation.Value}");
             var observer = new DmaTraceObserver(sink, correlation, digest,
-                binding.ProviderGeneration, _backendEpoch);
+                binding.ProviderGeneration, epoch);
             record.Trace = observer;
             QueueDmaTraceLocked(record, SemanticTraceEventKindV1.Submit);
             QueueDmaTraceLocked(record, SemanticTraceEventKindV1.EffectPossible);
@@ -110,6 +112,7 @@ public sealed partial class PlatformAuthorityBridge
             SemanticTraceEventV1.CurrentVersion, observer.Correlation, sequence, kind,
             "singnext.platform-dma", observer.GenerationDigest, evidence).Validate();
         observer.Pending.Enqueue(item);
+        if (kind == SemanticTraceEventKindV1.Quarantined) observer.QuarantineQueued = true;
         observer.LastQueuedEvent = item;
     }
 
@@ -125,6 +128,7 @@ public sealed partial class PlatformAuthorityBridge
     internal KernelResult<DmaGrantClosureObservationV1> QueryDmaGrantClosureObservation(
         PlatformDmaGrant grant, PlatformDomainIdentity subject)
     {
+        lock (_secureDomainLifecycleGate)
         lock (_dmaCompletionGate)
         {
             var identity = ValidateDmaGrantIdentity(grant, subject);

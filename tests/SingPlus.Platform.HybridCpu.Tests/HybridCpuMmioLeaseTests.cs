@@ -6,6 +6,84 @@ namespace SingPlus.Platform.HybridCpu.Tests;
 
 public sealed class HybridCpuMmioLeaseTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ForeignMmioOwnerCannotConsumeOriginalKernelClosure(bool completed)
+    {
+        var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, ChildClosureTupleTests.RootCloseRuntimeProxy>();
+        var proxy = (ChildClosureTupleTests.RootCloseRuntimeProxy)(object)runtime;
+        var provider = new HybridCpuPlatformAuthorityProvider(runtime);
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = HybridCpuPlatformAuthorityProviderTests.CreateProcess(kernel, 71, 710, 1);
+        var binding = kernel.BindPlatformDomain(subject).Value!;
+        var deviceCapability = Mint(kernel, subject, ResourceKind.Device, "device/uart0",
+            CapabilityRights.Read | CapabilityRights.Configure);
+        var device = kernel.BindPlatformDevice(subject, binding, deviceCapability,
+            PlatformDeviceRights.Read | PlatformDeviceRights.Configure).Value!;
+        var mmioCapability = Mint(kernel, subject, ResourceKind.MmioRegion,
+            CapabilityResourceIds.MmioRegion("device/uart0", "registers", 4096), CapabilityRights.Map | CapabilityRights.Read);
+        var mapping = kernel.BindPlatformMmio(subject, device, mmioCapability, 0, 64, PlatformMmioAccess.Read).Value!;
+        var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var records = (global::System.Collections.IDictionary)provider.GetType().GetField("_mmioLeases", flags)!.GetValue(provider)!;
+        var original = records.Values.Cast<object>().Single();
+        var lease = (PlatformProviderMmioLease)original.GetType().GetProperty("Lease")!.GetValue(original)!;
+        var copy = typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+        if (completed)
+        {
+            var other = provider.MapMmio(lease.DeviceLease, new("other-registers", 4096), new(0, 64), PlatformMmioAccess.Read).Value!;
+            Assert.True(provider.RevokeMmio(other).IsSuccess);
+            var otherRecord = records[other.LeaseId]!;
+            copy.GetType().GetProperty("CloseObservation")!.SetValue(copy,
+                otherRecord.GetType().GetProperty("CloseObservation")!.GetValue(otherRecord));
+        }
+        records[lease.LeaseId] = copy;
+        var calls = proxy.MmioCloseCalls;
+        Assert.False(kernel.RevokePlatformMmio(subject, mapping).IsSuccess);
+        Assert.Equal(calls, proxy.MmioCloseCalls);
+        Assert.Equal(1, proxy.Runtime.ActiveMmioLeaseCount);
+        Assert.False(provider.RevokeDevice(lease.DeviceLease).IsSuccess);
+        Assert.Equal(0, proxy.DeviceCloseCalls);
+        records[lease.LeaseId] = original;
+        Assert.True(provider.RevokeMmio(lease).IsSuccess);
+        Assert.Equal(calls + 1, proxy.MmioCloseCalls);
+        Assert.Equal(0, proxy.Runtime.ActiveMmioLeaseCount);
+        Assert.False(kernel.RevokePlatformMmio(subject, mapping).IsSuccess);
+        Assert.False(kernel.RevokePlatformDevice(subject, device).IsSuccess);
+        Assert.Equal(1, proxy.Runtime.ActiveDeviceLeaseCount);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void LostMmioRouteCannotHideOriginalDeviceDependency(bool copiedClosed)
+    {
+        var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, ChildClosureTupleTests.RootCloseRuntimeProxy>();
+        var proxy = (ChildClosureTupleTests.RootCloseRuntimeProxy)(object)runtime;
+        var provider = new HybridCpuPlatformAuthorityProvider(runtime);
+        var parent = provider.BindDomain(new(new DomainId(710), new ProcessHandle(new ProcessId(71), 1))).Value!;
+        var device = provider.BindDevice(parent, new("device/uart0"), PlatformDeviceRights.Read).Value!;
+        var mapping = provider.MapMmio(device, new("registers", 4096), new(0, 64), PlatformMmioAccess.Read).Value!;
+        var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var records = (global::System.Collections.IDictionary)provider.GetType().GetField("_mmioLeases", flags)!.GetValue(provider)!;
+        var original = records[mapping.LeaseId]!;
+        if (copiedClosed)
+        {
+            var copy = typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+            copy.GetType().GetProperty("Revoked")!.SetValue(copy, true);
+            records[mapping.LeaseId] = copy;
+        }
+        else records.Remove(mapping.LeaseId);
+        Assert.False(provider.RevokeDevice(device).IsSuccess);
+        Assert.Equal(0, proxy.DeviceCloseCalls);
+        Assert.Equal(1, proxy.Runtime.ActiveMmioLeaseCount);
+        records[mapping.LeaseId] = original;
+        Assert.True(provider.RevokeMmio(mapping).IsSuccess);
+        Assert.True(provider.RevokeDevice(device).IsSuccess);
+        Assert.True(provider.RevokeDomain(parent).IsSuccess);
+        Assert.Equal(0, proxy.Runtime.ActiveBindingCount);
+    }
+
     [Fact]
     public void ExactCapabilityBackedMmioLeaseMaterializesInNeutralRuntime()
     {

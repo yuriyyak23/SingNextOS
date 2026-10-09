@@ -7,6 +7,138 @@ namespace SingPlus.Tests.Platform;
 
 public sealed class PlatformExecutionPolicyTests
 {
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void PolicyCompletionCannotMutateForeignRootSourceFactsOrInterlock(bool epoch)
+    {
+        var provider = new PolicyProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = CreateAdmittedProcess(kernel, 1824, 1944, 1);
+        var binding = kernel.BindPlatformDomain(subject).Value!;
+        var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var roots = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_domains", flags)!.GetValue(kernel.PlatformAuthority)!;
+        var original = roots[binding.BindingId]!;
+        object foreign = null!;
+        provider.PolicyCallback = () =>
+        {
+            foreign = typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+            var type = foreign.GetType();
+            if (epoch) type.GetProperty("BackendEpoch")!.SetValue(foreign, new PlatformBackendEpoch(2));
+            else type.GetProperty("ProviderIncarnation")!.SetValue(foreign, new PlatformProviderIncarnation(2));
+            roots[binding.BindingId] = foreign;
+        };
+        Assert.False(kernel.ConfigurePlatformExecutionPolicy(subject, binding, InteractivePolicy).IsSuccess);
+        Assert.Equal(true, foreign.GetType().GetProperty("ExecutionTransitionInFlight")!.GetValue(foreign));
+        Assert.Null(foreign.GetType().GetProperty("ExecutionPolicy")!.GetValue(foreign));
+        Assert.Equal("Active", foreign.GetType().GetProperty("AuthorityState")!.GetValue(foreign)!.ToString());
+        Assert.Equal(false, original.GetType().GetProperty("ExecutionTransitionInFlight")!.GetValue(original));
+        Assert.NotNull(original.GetType().GetProperty("ExecutionPolicy")!.GetValue(original));
+        Assert.False(kernel.StartProcess(subject).IsSuccess);
+        Assert.False(kernel.TerminateProcess(subject).IsSuccess);
+        Assert.Single(provider.PolicyRequests);
+        Assert.Equal(0, provider.RevokeCalls);
+        roots[binding.BindingId] = original; // model repair of exact owner, not durable recovery
+        provider.PolicyCallback = null;
+        Assert.True(kernel.TerminateProcess(subject).IsSuccess);
+        Assert.Single(provider.PolicyRequests);
+        Assert.Equal(1, provider.RevokeCalls);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)] [InlineData(5)]
+    public void PolicyCallbackFaultCannotPublishOrRepeatAcceptance(int fault)
+    {
+        var provider = new PolicyProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = CreateAdmittedProcess(kernel, 1820, 1940, 1);
+        var binding = kernel.BindPlatformDomain(subject).Value!;
+        provider.PolicyCallback = () =>
+        {
+            if (fault == 0) provider.Incarnation++;
+            if (fault == 1) kernel.PlatformAuthority.ObserveBackendReset();
+            if (fault == 2) Assert.False(kernel.TerminateProcess(subject).IsSuccess);
+            if (fault == 3) throw new InvalidOperationException("Lost policy outcome.");
+            if (fault == 4) provider.ThrowOnSource = true;
+            if (fault == 5) Assert.Equal(KernelError.PlatformBindingActive, kernel.RevokePlatformDomain(subject, binding).Error);
+        };
+        var result = kernel.ConfigurePlatformExecutionPolicy(subject, binding, InteractivePolicy);
+        Assert.False(result.IsSuccess);
+        Assert.Equal(default(PlatformExecutionPolicyRegistration), result.Value);
+        provider.ThrowOnSource = false;
+        Assert.False(kernel.ConfigurePlatformExecutionPolicy(subject, binding, InteractivePolicy).IsSuccess);
+        Assert.Single(provider.PolicyRequests);
+        Assert.True(kernel.Processes.Resolve(subject).IsSuccess);
+        if (fault is 2 or 3 or 4 or 5)
+        {
+            Assert.True(kernel.TerminateProcess(subject).IsSuccess);
+            Assert.True(kernel.Processes.ResolveTerminalState(subject).IsSuccess);
+            Assert.Equal(1, provider.RevokeCalls);
+        }
+    }
+
+    [Fact]
+    public void PolicyPendingBlocksReentrantConfigureAndStartWithoutRepeatingEffect()
+    {
+        var provider = new PolicyProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = CreateAdmittedProcess(kernel, 1821, 1941, 1);
+        var binding = kernel.BindPlatformDomain(subject).Value!;
+        provider.PolicyCallback = () =>
+        {
+            Assert.Equal(KernelError.PlatformBindingActive,
+                kernel.ConfigurePlatformExecutionPolicy(subject, binding, BackgroundPolicy).Error);
+            Assert.False(kernel.StartProcess(subject).IsSuccess);
+            Assert.Equal(0, provider.RevokeCalls);
+        };
+        var configured = kernel.ConfigurePlatformExecutionPolicy(subject, binding, InteractivePolicy);
+        Assert.True(configured.IsSuccess, configured.Message);
+        Assert.True(kernel.ConfigurePlatformExecutionPolicy(subject, binding, InteractivePolicy).IsSuccess);
+        Assert.Single(provider.PolicyRequests);
+        Assert.True(kernel.TerminateProcess(subject).IsSuccess);
+        Assert.True(kernel.Processes.ResolveTerminalState(subject).IsSuccess);
+    }
+
+    [Fact]
+    public void PolicyInterlockPrecedesFirstSourceCallbackAndBalancesRepeat()
+    {
+        var provider = new PolicyProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = CreateAdmittedProcess(kernel, 1823, 1943, 1);
+        var binding = kernel.BindPlatformDomain(subject).Value!;
+        var sourceReads = 0;
+        provider.SourceCallback = () =>
+        {
+            sourceReads++;
+            Assert.Equal(KernelError.PlatformBindingActive,
+                kernel.ConfigurePlatformExecutionPolicy(subject, binding, InteractivePolicy).Error);
+        };
+        Assert.True(kernel.ConfigurePlatformExecutionPolicy(subject, binding, InteractivePolicy).IsSuccess);
+        Assert.True(kernel.ConfigurePlatformExecutionPolicy(subject, binding, InteractivePolicy).IsSuccess);
+        Assert.Equal(4, sourceReads);
+        Assert.Single(provider.PolicyRequests);
+        provider.SourceCallback = null;
+        Assert.True(kernel.TerminateProcess(subject).IsSuccess);
+    }
+
+    [Fact]
+    public void SourceCallbackBeforePolicyEffectRechecksActualProcessOwner()
+    {
+        var provider = new PolicyProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = CreateAdmittedProcess(kernel, 1822, 1942, 1);
+        var binding = kernel.BindPlatformDomain(subject).Value!;
+        var reads = 0;
+        provider.SourceCallback = () =>
+        {
+            if (++reads == 2) Assert.False(kernel.TerminateProcess(subject).IsSuccess);
+        };
+        Assert.False(kernel.ConfigurePlatformExecutionPolicy(subject, binding, InteractivePolicy).IsSuccess);
+        Assert.Empty(provider.PolicyRequests);
+        provider.SourceCallback = null;
+        Assert.True(kernel.TerminateProcess(subject).IsSuccess);
+        Assert.True(kernel.Processes.ResolveTerminalState(subject).IsSuccess);
+    }
+
     private static readonly PlatformExecutionPolicy InteractivePolicy = new(
         new ExecutionBudget(
             TimeSpan.FromMilliseconds(4),
@@ -570,7 +702,8 @@ public sealed class PlatformExecutionPolicyTests
         IPlatformAuthorityProvider,
         IPlatformFeatureProvider,
         IPlatformDomainExecutionProvider,
-        IPlatformExecutionPolicyProvider
+        IPlatformExecutionPolicyProvider,
+        IPlatformProviderIncarnationSource
     {
         private readonly Dictionary<
             PlatformProviderDomainLeaseId,
@@ -586,6 +719,19 @@ public sealed class PlatformExecutionPolicyTests
         public List<(PlatformProviderDomainLease DomainLease, PlatformExecutionPolicy Policy)>
             PolicyRequests { get; } = [];
         public int RevokeCalls { get; private set; }
+        public ulong Incarnation { get; set; } = 1;
+        public bool ThrowOnSource { get; set; }
+        public Action? SourceCallback { get; set; }
+        public Action? PolicyCallback { get; set; }
+        public PlatformProviderIncarnation CurrentIncarnation
+        {
+            get
+            {
+                SourceCallback?.Invoke();
+                if (ThrowOnSource) throw new InvalidOperationException("Unavailable policy source.");
+                return new(Incarnation);
+            }
+        }
 
         public PlatformProviderDescriptor Descriptor { get; } = new(
             new PlatformProviderId("execution-policy-test"),
@@ -628,6 +774,7 @@ public sealed class PlatformExecutionPolicyTests
             PlatformExecutionPolicy policy)
         {
             PolicyRequests.Add((domainLease, policy));
+            PolicyCallback?.Invoke();
             if (!_leases.TryGetValue(domainLease.LeaseId, out var active) ||
                 active != domainLease)
             {

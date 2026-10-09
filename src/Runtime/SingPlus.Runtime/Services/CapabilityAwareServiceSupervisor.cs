@@ -45,6 +45,7 @@ public sealed class CapabilityAwareServiceSupervisor
         public long? RestartEligibleTimestamp { get; set; }
         public string? BlockingReason { get; set; }
         public bool RestartAfterDrain { get; set; }
+        public bool RestartDispatchPending { get; set; }
     }
 
     private readonly RuntimeKernel _kernel;
@@ -56,6 +57,11 @@ public sealed class CapabilityAwareServiceSupervisor
     private readonly TimeProvider _timeProvider;
     private readonly Dictionary<ComponentIdentity, Record> _records = [];
     private readonly object _gate = new();
+    internal Action? BeforeFailureIntentQualificationHook { get; set; }
+    internal Action? BeforeStartIntentQualificationHook { get; set; }
+    internal Action? BeforeFailureSnapshotQualificationHook { get; set; }
+    internal Action? BeforeReplacementRetirementQualificationHook { get; set; }
+    internal Action? AfterFailureCompletionQualificationHook { get; set; }
 
     internal CapabilityAwareServiceSupervisor(
         RuntimeKernel kernel,
@@ -138,25 +144,37 @@ public sealed class CapabilityAwareServiceSupervisor
             if (!started.IsSuccess) return KernelResult<ServiceStartReceipt>.Fail(KernelError.DependencyUnavailable, started.Message ?? "Hard dependency failed to start.");
         }
 
+        BeforeStartIntentQualificationHook?.Invoke();
         lock (_gate)
         {
-            var record = _records[identity];
-            if (record.State != ServiceLifecycleState.Declared || !ReferenceEquals(record.Definition, definition))
-                return KernelResult<ServiceStartReceipt>.Fail(KernelError.InvalidTransition, "Managed definition changed during start.");
-            record.State = ServiceLifecycleState.Admitting;
-            record.Health = null;
-            record.BlockingReason = null;
+            var principal = _kernel.Processes.Resolve(_principal);
+            if (!principal.IsSuccess) return KernelResult<ServiceStartReceipt>.Fail(KernelError.SupervisorDenied, principal.Message!);
+            var intent = _kernel.CapabilityAuthority.CommitSupervisorRecordPublication(_controlCapability,
+                principal.Value!.DomainId, _principal.Generation, () =>
+                {
+                    var record = _records[identity];
+                    if (record.State != ServiceLifecycleState.Declared || !ReferenceEquals(record.Definition, definition))
+                        return KernelResult.Fail(KernelError.InvalidTransition, "Managed definition changed during start.");
+                    record.State = ServiceLifecycleState.Admitting;
+                    record.Health = null;
+                    record.BlockingReason = null;
+                    return KernelResult.Ok();
+                });
+            if (!intent.IsSuccess) return KernelResult<ServiceStartReceipt>.Fail(intent.Error, intent.Message!);
         }
 
-        var admitted = _kernel.AdmitComponent(definition.Admission);
+        var admitted = _kernel.AdmitComponent(definition.Admission, _principal, _controlCapability);
         if (!admitted.IsSuccess)
         {
             lock (_gate)
             {
-                var record = _records[identity];
-                record.State = ServiceLifecycleState.Failed;
-                record.BlockingReason = admitted.Message;
-                record.Health = null;
+                if (_records.TryGetValue(identity, out var record) &&
+                    ReferenceEquals(record.Definition, definition) && record.State == ServiceLifecycleState.Admitting)
+                {
+                    record.State = ServiceLifecycleState.Failed;
+                    record.BlockingReason = admitted.Message;
+                    record.Health = null;
+                }
             }
             return KernelResult<ServiceStartReceipt>.Fail(admitted.Error, admitted.Message!);
         }
@@ -205,13 +223,20 @@ public sealed class CapabilityAwareServiceSupervisor
         var control = ValidateControl();
         if (!control.IsSuccess) return KernelResult<ServiceHealthSnapshot>.Fail(control.Error, control.Message!);
         if (!Enum.IsDefined(state)) return KernelResult<ServiceHealthSnapshot>.Fail(KernelError.InvalidTransition, "Health state is undefined.");
-        ComponentIdentity identity;
         ServiceHealthSnapshot health;
+        Record sourceRecord;
+        ServiceLifecycleState sourceState;
+        ServiceHealthSnapshot? sourceHealth;
+        string? sourceReason;
         // Validate the local instance before observing time, then revalidate after the callback.
         lock (_gate)
         {
             var initial = ResolveExactLocked(instance);
             if (!initial.IsSuccess) return KernelResult<ServiceHealthSnapshot>.Fail(initial.Error, initial.Message!);
+            sourceRecord = initial.Value!;
+            sourceState = sourceRecord.State;
+            sourceHealth = sourceRecord.Health;
+            sourceReason = sourceRecord.BlockingReason;
         }
         long timestamp;
         try { timestamp = _timeProvider.GetTimestamp(); }
@@ -223,40 +248,53 @@ public sealed class CapabilityAwareServiceSupervisor
         {
             var principal = _kernel.Processes.Resolve(_principal);
             if (!principal.IsSuccess) return KernelResult<ServiceHealthSnapshot>.Fail(KernelError.SupervisorDenied, principal.Message!);
-            ComponentIdentity committedIdentity = default;
             var observation = new ServiceHealthSnapshot(instance, state, timestamp, reason ?? string.Empty);
             var committed = _kernel.CapabilityAuthority.CommitSupervisorRecordPublication(_controlCapability,
                 principal.Value!.DomainId, _principal.Generation, () =>
                 {
                     var exact = ResolveExactLocked(instance);
                     if (!exact.IsSuccess) return KernelResult.Fail(exact.Error, exact.Message!);
-                    committedIdentity = exact.Value!.Definition.Identity;
+                    if (!ReferenceEquals(exact.Value, sourceRecord) || exact.Value!.State != sourceState ||
+                        exact.Value.Health != sourceHealth || exact.Value.BlockingReason != sourceReason)
+                        return KernelResult.Fail(KernelError.StaleGeneration, "Health source changed during clock observation.");
                     exact.Value.Health = observation;
                     if (state == ServiceHealthState.Degraded && exact.Value.State == ServiceLifecycleState.Ready)
                         exact.Value.State = ServiceLifecycleState.Degraded;
                     return KernelResult.Ok();
                 });
             if (!committed.IsSuccess) return KernelResult<ServiceHealthSnapshot>.Fail(committed.Error, committed.Message!);
-            identity = committedIdentity;
             health = observation;
         }
         if (state is ServiceHealthState.Unhealthy or ServiceHealthState.Failed)
         {
-            var failed = HandleFailure(instance, reason ?? string.Empty);
+            var failed = HandleFailure(instance, reason ?? string.Empty, sourceRecord, sourceState, health, sourceReason);
             if (!failed.IsSuccess) return KernelResult<ServiceHealthSnapshot>.Fail(failed.Error, failed.Message!);
-            lock (_gate) health = _records[identity].Health ?? health;
+            AfterFailureCompletionQualificationHook?.Invoke();
+            health = failed.Value!.Health ?? health;
         }
         return KernelResult<ServiceHealthSnapshot>.Ok(health);
     }
 
-    public KernelResult<ServiceDrainReceipt> Drain(ServiceInstanceHandle instance, bool planned = true)
+    public KernelResult<ServiceDrainReceipt> Drain(ServiceInstanceHandle instance, bool planned = true) =>
+        DrainCore(instance, planned, expectedSource: null);
+
+    private KernelResult<ServiceDrainReceipt> DrainCore(ServiceInstanceHandle instance, bool planned,
+        Func<KernelResult>? expectedSource)
     {
         var control = ValidateControl();
         if (!control.IsSuccess) return KernelResult<ServiceDrainReceipt>.Fail(control.Error, control.Message!);
+        Record sourceRecord;
+        ServiceLifecycleState sourceState;
+        ServiceHealthSnapshot? sourceHealth;
+        string? sourceReason;
         lock (_gate)
         {
             var initial = ResolveExactLocked(instance);
             if (!initial.IsSuccess) return KernelResult<ServiceDrainReceipt>.Fail(initial.Error, initial.Message!);
+            sourceRecord = initial.Value!;
+            sourceState = sourceRecord.State;
+            sourceHealth = sourceRecord.Health;
+            sourceReason = sourceRecord.BlockingReason;
         }
         long timestamp;
         try { timestamp = _timeProvider.GetTimestamp(); }
@@ -277,6 +315,16 @@ public sealed class CapabilityAwareServiceSupervisor
                 {
                     var exact = ResolveExactLocked(instance);
                     if (!exact.IsSuccess) return KernelResult.Fail(exact.Error, exact.Message!);
+                    if (!ReferenceEquals(exact.Value, sourceRecord) || exact.Value!.State != sourceState ||
+                        exact.Value.Health != sourceHealth || exact.Value.BlockingReason != sourceReason)
+                        return KernelResult.Fail(KernelError.StaleGeneration, "Drain request source changed during clock observation.");
+                    // Trusted pure policy source check shares the actual drain
+                    // intent commit, after the last clock callback.
+                    if (expectedSource is not null)
+                    {
+                        var policySource = expectedSource();
+                        if (!policySource.IsSuccess) return policySource;
+                    }
                     identity = exact.Value!.Definition.Identity;
                     exact.Value.State = ServiceLifecycleState.Draining;
                     exact.Value.Health = health;
@@ -311,10 +359,18 @@ public sealed class CapabilityAwareServiceSupervisor
 
         var control = ValidateControl();
         if (!control.IsSuccess) return KernelResult<ServiceDrainReceipt>.Fail(control.Error, control.Message!);
+        Record sourceRecord;
+        ServiceLifecycleState sourceState;
+        ServiceHealthSnapshot? sourceHealth;
+        string? sourceReason;
         lock (_gate)
         {
             var initial = ResolveExactLocked(instance);
             if (!initial.IsSuccess) return KernelResult<ServiceDrainReceipt>.Fail(initial.Error, initial.Message!);
+            sourceRecord = initial.Value!;
+            sourceState = sourceRecord.State;
+            sourceHealth = sourceRecord.Health;
+            sourceReason = sourceRecord.BlockingReason;
         }
         long timestamp;
         try { timestamp = _timeProvider.GetTimestamp(); }
@@ -339,6 +395,9 @@ public sealed class CapabilityAwareServiceSupervisor
                     var exact = ResolveExactLocked(instance);
                     if (!exact.IsSuccess) return KernelResult.Fail(exact.Error, exact.Message!);
                     var record = exact.Value!;
+                    if (!ReferenceEquals(record, sourceRecord) || record.State != sourceState ||
+                        record.Health != sourceHealth || record.BlockingReason != sourceReason)
+                        return KernelResult.Fail(KernelError.StaleGeneration, "Drain timeout source changed during clock observation.");
                     record.State = quarantine ? ServiceLifecycleState.Quarantined : ServiceLifecycleState.Draining;
                     record.Health = health;
                     record.BlockingReason = blockingReason;
@@ -356,19 +415,39 @@ public sealed class CapabilityAwareServiceSupervisor
         ArgumentNullException.ThrowIfNull(next);
         var control = ValidateControl();
         if (!control.IsSuccess) return KernelResult<ServiceReplacementReceipt>.Fail(control.Error, control.Message!);
+        Record? dispatchRecord = null;
         lock (_gate)
         {
-            var exact = ResolveExactLocked(previous);
-            if (!exact.IsSuccess) return KernelResult<ServiceReplacementReceipt>.Fail(exact.Error, exact.Message!);
-            var validation = ValidateReplacementDefinition(exact.Value!, previous, next);
+            var principal = _kernel.Processes.Resolve(_principal);
+            if (!principal.IsSuccess) return KernelResult<ServiceReplacementReceipt>.Fail(KernelError.SupervisorDenied, principal.Message!);
+            var validation = _kernel.CapabilityAuthority.CommitSupervisorRecordPublication(_controlCapability,
+                principal.Value!.DomainId, _principal.Generation, () =>
+                {
+                    var exact = ResolveExactLocked(previous);
+                    if (!exact.IsSuccess) return KernelResult.Fail(exact.Error, exact.Message!);
+                    var contract = ValidateReplacementDefinition(exact.Value!, previous, next);
+                    if (!contract.IsSuccess) return contract;
+                    if (exact.Value!.RestartDispatchPending)
+                        return KernelResult.Fail(KernelError.ReplacementBlocked, "Exact replacement dispatch is already pending.");
+                    exact.Value.RestartDispatchPending = true;
+                    dispatchRecord = exact.Value;
+                    return KernelResult.Ok();
+                });
             if (!validation.IsSuccess) return KernelResult<ServiceReplacementReceipt>.Fail(validation.Error, validation.Message!);
         }
 
-        var drained = Drain(previous, planned: true);
-        if (!drained.IsSuccess) return KernelResult<ServiceReplacementReceipt>.Fail(drained.Error, drained.Message!);
-        if (!drained.Value!.ClosureProven)
-            return KernelResult<ServiceReplacementReceipt>.Fail(KernelError.ReplacementBlocked, "Old generation has not reached exact closure/containment.");
-        return AdmitReplacement(previous, next);
+        try
+        {
+            var drained = Drain(previous, planned: true);
+            if (!drained.IsSuccess) return KernelResult<ServiceReplacementReceipt>.Fail(drained.Error, drained.Message!);
+            if (!drained.Value!.ClosureProven)
+                return KernelResult<ServiceReplacementReceipt>.Fail(KernelError.ReplacementBlocked, "Old generation has not reached exact closure/containment.");
+            return AdmitReplacement(previous, next);
+        }
+        finally
+        {
+            lock (_gate) dispatchRecord!.RestartDispatchPending = false;
+        }
     }
 
     public KernelResult<ServiceSupervisorSnapshot> Observe(ComponentIdentity identity)
@@ -428,6 +507,7 @@ public sealed class CapabilityAwareServiceSupervisor
             {
                 ManagedServiceDefinition? definition = null;
                 ServiceInstanceHandle prior = default;
+                Record? dispatchRecord = null;
                 lock (_gate)
                 {
                     var principal = _kernel.Processes.Resolve(_principal);
@@ -440,41 +520,70 @@ public sealed class CapabilityAwareServiceSupervisor
                                 return KernelResult.Fail(KernelError.StaleGeneration, "Restart source changed during eligibility observation.");
                             definition = current.Definition;
                             prior = current.Instance!.Value;
+                            if (prior.Process.Generation == ulong.MaxValue)
+                                return KernelResult.Fail(KernelError.StaleGeneration, "Restart process generation capacity is exhausted.");
+                            if (current.RestartDispatchPending)
+                                return KernelResult.Fail(KernelError.ReplacementBlocked, "Exact restart dispatch is already pending.");
+                            current.RestartDispatchPending = true;
+                            dispatchRecord = current;
                             return KernelResult.Ok();
                         });
                     if (!captured.IsSuccess) return KernelResult<ServiceSupervisorSnapshot>.Fail(captured.Error, captured.Message!);
                 }
-                ManagedServiceDefinition replacement;
                 try
                 {
-                    var factory = definition!.ReplacementFactory;
-                    if (factory is null) return KernelResult<ServiceSupervisorSnapshot>.Fail(KernelError.ReplacementBlocked, "Restart factory is absent.");
-                    var generation = checked(prior.Process.Generation + 1);
-                    replacement = new ManagedServiceDefinition(factory(generation), definition.PrimaryServiceName,
-                        definition.ReadinessPolicy, definition.DependencyFailurePolicy, factory);
-                }
-                catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+                    ManagedServiceDefinition replacement;
+                    try
+                    {
+                        var factory = definition!.ReplacementFactory;
+                        if (factory is null) return KernelResult<ServiceSupervisorSnapshot>.Fail(KernelError.ReplacementBlocked, "Restart factory is absent.");
+                        var generation = checked(prior.Process.Generation + 1);
+                        replacement = new ManagedServiceDefinition(factory(generation), definition.PrimaryServiceName,
+                            definition.ReadinessPolicy, definition.DependencyFailurePolicy, factory);
+                    }
+                    catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+                    {
+                        return KernelResult<ServiceSupervisorSnapshot>.Fail(KernelError.PlatformFaulted, "Fresh-admission factory failed; restart dispatch was not committed.");
+                    }
+                    var replaced = AdmitReplacement(prior, replacement);
+                    if (!replaced.IsSuccess) return KernelResult<ServiceSupervisorSnapshot>.Fail(replaced.Error, replaced.Message!);
+                    }
+                finally
                 {
-                    return KernelResult<ServiceSupervisorSnapshot>.Fail(KernelError.PlatformFaulted, "Fresh-admission factory failed; restart dispatch was not committed.");
+                    lock (_gate) dispatchRecord!.RestartDispatchPending = false;
                 }
-                var replaced = AdmitReplacement(prior, replacement);
-                if (!replaced.IsSuccess) return KernelResult<ServiceSupervisorSnapshot>.Fail(replaced.Error, replaced.Message!);
             }
         }
 
         return Query(identity);
     }
-    private KernelResult<ServiceSupervisorSnapshot> HandleFailure(ServiceInstanceHandle instance, string reason)
+    private KernelResult<ServiceSupervisorSnapshot> HandleFailure(ServiceInstanceHandle instance, string reason,
+        Record sourceRecord, ServiceLifecycleState sourceState, ServiceHealthSnapshot sourceHealth, string? sourceReason)
     {
-        ComponentIdentity identity;
+        BeforeFailureIntentQualificationHook?.Invoke();
+        ComponentIdentity identity = default;
         lock (_gate)
         {
-            var exact = ResolveExactLocked(instance);
-            if (!exact.IsSuccess) return KernelResult<ServiceSupervisorSnapshot>.Fail(exact.Error, exact.Message!);
-            identity = exact.Value!.Definition.Identity;
-            exact.Value.State = ServiceLifecycleState.Failed;
-            exact.Value.RestartAfterDrain = true;
-            exact.Value.BlockingReason = reason;
+            var principal = _kernel.Processes.Resolve(_principal);
+            if (!principal.IsSuccess)
+                return KernelResult<ServiceSupervisorSnapshot>.Fail(KernelError.SupervisorDenied, principal.Message!);
+            var admitted = _kernel.CapabilityAuthority.CommitSupervisorRecordPublication(_controlCapability,
+                principal.Value!.DomainId, _principal.Generation, () =>
+                {
+                    var exact = ResolveExactLocked(instance);
+                    if (!exact.IsSuccess) return KernelResult.Fail(exact.Error, exact.Message!);
+                    var record = exact.Value!;
+                    if (!ReferenceEquals(record, sourceRecord) || record.State != sourceState ||
+                        record.Health != sourceHealth || record.BlockingReason != sourceReason)
+                        return KernelResult.Fail(KernelError.StaleGeneration, "Failure source changed after health publication.");
+                    identity = record.Definition.Identity;
+                    record.State = ServiceLifecycleState.Failed;
+                    record.RestartAfterDrain = true;
+                    record.BlockingReason = reason;
+                    return KernelResult.Ok();
+                });
+            if (!admitted.IsSuccess)
+                return KernelResult<ServiceSupervisorSnapshot>.Fail(admitted.Error, admitted.Message!);
         }
 
         var propagation = PropagateDependencyFailure(identity, instance);
@@ -487,7 +596,13 @@ public sealed class CapabilityAwareServiceSupervisor
             var scheduled = ScheduleRestart(identity);
             if (!scheduled.IsSuccess) return KernelResult<ServiceSupervisorSnapshot>.Fail(scheduled.Error, scheduled.Message!);
         }
-        lock (_gate) return KernelResult<ServiceSupervisorSnapshot>.Ok(Snapshot(_records[identity]));
+        BeforeFailureSnapshotQualificationHook?.Invoke();
+        lock (_gate)
+        {
+            var exact = ResolveExactLocked(instance);
+            return exact.IsSuccess ? KernelResult<ServiceSupervisorSnapshot>.Ok(Snapshot(exact.Value!))
+                : KernelResult<ServiceSupervisorSnapshot>.Fail(exact.Error, exact.Message!);
+        }
     }
 
     private KernelResult<ServiceStartReceipt> CompleteAdmission(
@@ -528,8 +643,12 @@ public sealed class CapabilityAwareServiceSupervisor
         lock (_gate)
         {
             var principal = _kernel.Processes.Resolve(_principal);
+            var dependencyInstances = definition.Admission.Manifest.Dependencies
+                .Select(dependency => ResolveProviderRecordLocked(dependency.Contract)?.ProvidedInstances.GetValueOrDefault(dependency.Contract))
+                .Where(provider => provider is not null && provider.Value != default)
+                .Select(provider => provider!.Value).Distinct().ToArray();
             committed = !principal.IsSuccess ? KernelResult.Fail(KernelError.SupervisorDenied, principal.Message!) :
-                _kernel.CapabilityAuthority.CommitSupervisorRecordPublication(_controlCapability,
+                _kernel.CommitComponentReadiness(component, dependencyInstances, () => _kernel.CapabilityAuthority.CommitSupervisorRecordPublication(_controlCapability,
                     principal.Value!.DomainId, _principal.Generation, () =>
                     {
                         if (!_records.TryGetValue(identity, out var record) || !ReferenceEquals(record.Definition, definition))
@@ -562,7 +681,7 @@ public sealed class CapabilityAwareServiceSupervisor
                         record.RestartAfterDrain = false;
                         record.BlockingReason = null;
                         return KernelResult.Ok();
-                    });
+                    }));
         }
         if (!committed.IsSuccess)
             return CompensateIncompleteAdmission(identity, definition, component.Process, committed.Error, committed.Message!);
@@ -592,6 +711,19 @@ public sealed class CapabilityAwareServiceSupervisor
             unsafeOutcome ? ServiceHealthState.Quarantined : ServiceHealthState.Draining;
         var reason = closure ? "Old process/provider authority reached exact reclaimable closure." :
             result.Message ?? (unsafeOutcome ? "External effect closure is ambiguous." : "Exact teardown is still draining.");
+        Record sourceRecord;
+        ServiceLifecycleState sourceState;
+        ServiceHealthSnapshot? sourceHealth;
+        string? sourceReason;
+        lock (_gate)
+        {
+            var exact = ResolveExactLocked(instance);
+            if (!exact.IsSuccess) return KernelResult<ServiceDrainReceipt>.Fail(exact.Error, exact.Message!);
+            sourceRecord = exact.Value!;
+            sourceState = sourceRecord.State;
+            sourceHealth = sourceRecord.Health;
+            sourceReason = sourceRecord.BlockingReason;
+        }
         long timestamp;
         try { timestamp = _timeProvider.GetTimestamp(); }
         catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
@@ -613,10 +745,32 @@ public sealed class CapabilityAwareServiceSupervisor
                     var record = exact.Value!;
                     if (record.Definition.Identity != identity)
                         return KernelResult.Fail(KernelError.StaleGeneration, "Drain identity changed before publication.");
+                    if (!ReferenceEquals(record, sourceRecord) || record.State != sourceState ||
+                        record.Health != sourceHealth || record.BlockingReason != sourceReason)
+                        return KernelResult.Fail(KernelError.StaleGeneration, "Drain source changed during completion observation.");
                     record.State = state;
                     record.Health = health;
                     record.BlockingReason = closure ? null :
                         unsafeOutcome ? result.Message ?? result.Error.ToString() : result.Message;
+                    // Failure drains use their existing policy-scoped batch
+                    // propagation. Planned closure independently invalidates
+                    // bindings for every exact service of the old process.
+                    if (closure && planned)
+                    {
+                        var closedProviders = record.ProvidedInstances.Values.Append(instance).ToHashSet();
+                        foreach (var dependent in _records.Values.Where(candidate =>
+                                     candidate.Instance is not null &&
+                                     candidate.Bindings.Any(binding => closedProviders.Contains(binding.Provider))))
+                        {
+                            dependent.Bindings.RemoveAll(binding => closedProviders.Contains(binding.Provider));
+                            if (dependent.State is ServiceLifecycleState.Ready or ServiceLifecycleState.Degraded)
+                            {
+                                dependent.State = ServiceLifecycleState.Degraded;
+                                dependent.Health = new(dependent.Instance!.Value, ServiceHealthState.Degraded,
+                                    timestamp, "Exact dependency provider reached closure; fresh binding is required.");
+                            }
+                        }
+                    }
                     receipt = new ServiceDrainReceipt(new(instance, planned), Snapshot(record), closure);
                     return KernelResult.Ok();
                 });
@@ -658,27 +812,41 @@ public sealed class CapabilityAwareServiceSupervisor
                 });
             if (!validated.IsSuccess) return KernelResult<ServiceReplacementReceipt>.Fail(validated.Error, validated.Message!);
         }
-        var retired = _kernel.RetireReclaimableComponent(next.Identity, previous.Process);
-        if (!retired.IsSuccess) return KernelResult<ServiceReplacementReceipt>.Fail(retired.Error, retired.Message!);
+        BeforeReplacementRetirementQualificationHook?.Invoke();
         lock (_gate)
         {
-            var record = _records[next.Identity];
-            record.Definition = next;
-            record.State = ServiceLifecycleState.Admitting;
-            record.Bindings.Clear();
-            record.ProvidedInstances.Clear();
-            record.Health = null;
-            record.BlockingReason = null;
+            var retired = _kernel.CommitSupervisorReplacementRetirement(next.Identity, previous.Process,
+                _principal, _controlCapability, () =>
+                {
+                    var exact = ResolveExactLocked(previous);
+                    return exact.IsSuccess ? ValidateReplacementDefinition(exact.Value!, previous, next)
+                        : KernelResult.Fail(exact.Error, exact.Message!);
+                }, () =>
+                {
+                    var record = _records[next.Identity];
+                    record.Definition = next;
+                    record.State = ServiceLifecycleState.Admitting;
+                    record.Bindings.Clear();
+                    record.ProvidedInstances.Clear();
+                    record.Health = null;
+                    record.BlockingReason = null;
+                });
+            if (!retired.IsSuccess) return KernelResult<ServiceReplacementReceipt>.Fail(retired.Error, retired.Message!);
         }
 
-        var admitted = _kernel.AdmitComponent(next.Admission);
+        var admitted = _kernel.AdmitComponent(next.Admission, _principal, _controlCapability);
         if (!admitted.IsSuccess)
         {
             lock (_gate)
             {
-                var record = _records[next.Identity];
-                record.State = ServiceLifecycleState.Failed;
-                record.BlockingReason = admitted.Message;
+                // Retain the original error, but do not overwrite a newer drain
+                // or publication with this admission attempt's failure fact.
+                if (_records.TryGetValue(next.Identity, out var record) &&
+                    ReferenceEquals(record.Definition, next) && record.State == ServiceLifecycleState.Admitting)
+                {
+                    record.State = ServiceLifecycleState.Failed;
+                    record.BlockingReason = admitted.Message;
+                }
             }
             return KernelResult<ServiceReplacementReceipt>.Fail(admitted.Error, admitted.Message!);
         }
@@ -692,6 +860,8 @@ public sealed class CapabilityAwareServiceSupervisor
         Record record;
         long[] attempts;
         ServiceInstanceHandle? instance;
+        ServiceHealthSnapshot? sourceHealth;
+        string? sourceReason;
         lock (_gate)
         {
             if (!_records.TryGetValue(identity, out record!)) return KernelResult.Fail(KernelError.ComponentNotFound, "Restart record is absent.");
@@ -699,6 +869,8 @@ public sealed class CapabilityAwareServiceSupervisor
                 return KernelResult.Fail(KernelError.ReplacementBlocked, "Restart scheduling requires completed old-generation drain.");
             attempts = record.RestartAttempts.ToArray();
             instance = record.Instance;
+            sourceHealth = record.Health;
+            sourceReason = record.BlockingReason;
         }
         var policy = record.Definition.Admission.Manifest.RestartPolicy;
         var disabled = policy.Mode == ServiceRestartMode.Never || record.Definition.ReplacementFactory is null;
@@ -737,7 +909,8 @@ public sealed class CapabilityAwareServiceSupervisor
                 {
                     if (!_records.TryGetValue(identity, out var current) || !ReferenceEquals(current, record) ||
                         current.Instance != instance || current.State != ServiceLifecycleState.Stopped ||
-                        !current.RestartAfterDrain || !current.RestartAttempts.SequenceEqual(attempts))
+                        !current.RestartAfterDrain || !current.RestartAttempts.SequenceEqual(attempts) ||
+                        current.Health != sourceHealth || current.BlockingReason != sourceReason)
                         return KernelResult.Fail(KernelError.StaleGeneration, "Restart source changed during observation.");
                     if (disabled)
                     {
@@ -819,7 +992,8 @@ public sealed class CapabilityAwareServiceSupervisor
             {
                 var principal = _kernel.Processes.Resolve(_principal);
                 if (!principal.IsSuccess) return KernelResult.Fail(KernelError.SupervisorDenied, principal.Message!);
-                var published = _kernel.CapabilityAuthority.CommitSupervisorRecordPublication(_controlCapability,
+                var published = _kernel.CommitServiceDependencyReadiness([item.Provider, item.Dependent], () =>
+                    _kernel.CapabilityAuthority.CommitSupervisorRecordPublication(_controlCapability,
                     principal.Value!.DomainId, _principal.Generation, () =>
                     {
                         var exact = ValidateDependencyRebindLocked(providerIdentity, expectedProvider, providerDefinition, item);
@@ -836,16 +1010,28 @@ public sealed class CapabilityAwareServiceSupervisor
                         bindings.Add(new(item.Dependent, item.Provider, item.Dependency.Contract, item.Dependency.Kind));
                         var ready = item.State == ServiceLifecycleState.Degraded &&
                             AllHardDependenciesBoundLocked(item.Definition, bindings);
-                        dependent.Bindings.Clear();
-                        dependent.Bindings.AddRange(bindings);
                         if (ready)
                         {
-                            dependent.State = ServiceLifecycleState.Ready;
-                            dependent.Health = new(item.Dependent, ServiceHealthState.Ready, timestamp,
-                                "Dependency rebound to the fresh exact generation.");
+                            var readiness = _kernel.CommitServiceDependencyReadiness(
+                                bindings.Select(binding => binding.Provider).Distinct().ToArray(), () => KernelResult.Ok());
+                            if (!readiness.IsSuccess) return readiness;
                         }
-                        return KernelResult.Ok();
-                    });
+                        return _kernel.CommitRunningComponentPublication(
+                            ready || item.State == ServiceLifecycleState.Ready
+                                ? bindings.Select(binding => binding.Provider.Process).Append(item.Dependent.Process).ToArray()
+                                : [item.Provider.Process, item.Dependent.Process], () =>
+                        {
+                            dependent.Bindings.Clear();
+                            dependent.Bindings.AddRange(bindings);
+                            if (ready)
+                            {
+                                dependent.State = ServiceLifecycleState.Ready;
+                                dependent.Health = new(item.Dependent, ServiceHealthState.Ready, timestamp,
+                                    "Dependency rebound to the fresh exact generation.");
+                            }
+                            return KernelResult.Ok();
+                        });
+                    }));
                 if (!published.IsSuccess) return published;
                 // Only our committed publication advances snapshots for further
                 // contracts on this same dependent. External changes still fail
@@ -904,14 +1090,20 @@ public sealed class CapabilityAwareServiceSupervisor
     }
     private KernelResult PropagateDependencyFailure(ComponentIdentity failedIdentity, ServiceInstanceHandle failed)
     {
-        (ServiceInstanceHandle Instance, ManagedServiceDefinition Definition, ServiceLifecycleState State)[] dependents;
+        (ServiceInstanceHandle Instance, ManagedServiceDefinition Definition, ServiceLifecycleState State,
+            ServiceHealthSnapshot? Health, string? Reason, ServiceDependencyBinding[] Bindings)[] dependents;
+        ManagedServiceDefinition providerDefinition;
+        HashSet<ServiceInstanceHandle> failedProviders;
         lock (_gate)
         {
             if (!_records.TryGetValue(failedIdentity, out var provider) || provider.Instance != failed)
                 return KernelResult.Fail(KernelError.StaleGeneration, "Failed provider generation changed before propagation.");
+            providerDefinition = provider.Definition;
+            failedProviders = provider.ProvidedInstances.Values.Append(failed).ToHashSet();
             dependents = _records.Values
-                .Where(record => record.Instance is not null && record.Bindings.Any(binding => binding.Provider == failed))
-                .Select(record => (record.Instance!.Value, record.Definition, record.State)).ToArray();
+                .Where(record => record.Instance is not null && record.Bindings.Any(binding => failedProviders.Contains(binding.Provider)))
+                .Select(record => (record.Instance!.Value, record.Definition, record.State,
+                    record.Health, record.BlockingReason, record.Bindings.ToArray())).ToArray();
         }
         var degraded = dependents.Where(item => item.Definition.DependencyFailurePolicy == ServiceFailurePropagationPolicy.DegradeDependent).ToArray();
         long timestamp = 0;
@@ -931,7 +1123,8 @@ public sealed class CapabilityAwareServiceSupervisor
                 principal.Value!.DomainId, _principal.Generation, () =>
                 {
                     if (!_records.TryGetValue(failedIdentity, out var provider) || provider.Instance != failed ||
-                        provider.State != ServiceLifecycleState.Failed)
+                        provider.State != ServiceLifecycleState.Failed || !ReferenceEquals(provider.Definition, providerDefinition) ||
+                        !failedProviders.SetEquals(provider.ProvidedInstances.Values.Append(failed)))
                         return KernelResult.Fail(KernelError.StaleGeneration, "Failed provider changed before dependency publication.");
                     // Validate the entire captured batch before publishing any peer change.
                     foreach (var item in dependents)
@@ -939,10 +1132,13 @@ public sealed class CapabilityAwareServiceSupervisor
                         var exact = ResolveExactLocked(item.Instance);
                         if (!exact.IsSuccess) return KernelResult.Fail(exact.Error, exact.Message!);
                         var record = exact.Value!;
-                        if (!ReferenceEquals(record.Definition, item.Definition) || !record.Bindings.Any(binding => binding.Provider == failed))
+                        if (!ReferenceEquals(record.Definition, item.Definition) || !record.Bindings.Any(binding => failedProviders.Contains(binding.Provider)))
                             return KernelResult.Fail(KernelError.StaleGeneration, "Dependent definition or binding changed before propagation.");
                         if (record.State != item.State)
                             return KernelResult.Fail(KernelError.InvalidTransition, "Dependent state changed before propagation.");
+                        if (record.Health != item.Health || record.BlockingReason != item.Reason ||
+                            !record.Bindings.SequenceEqual(item.Bindings))
+                            return KernelResult.Fail(KernelError.StaleGeneration, "Dependent source changed during propagation observation.");
                     }
                     foreach (var item in degraded)
                     {
@@ -956,7 +1152,23 @@ public sealed class CapabilityAwareServiceSupervisor
         }
         foreach (var item in dependents.Where(item => item.Definition.DependencyFailurePolicy != ServiceFailurePropagationPolicy.DegradeDependent))
         {
-            var drained = Drain(item.Instance, planned: item.Definition.DependencyFailurePolicy == ServiceFailurePropagationPolicy.StopDependent);
+            var drained = DrainCore(item.Instance,
+                planned: item.Definition.DependencyFailurePolicy == ServiceFailurePropagationPolicy.StopDependent,
+                expectedSource: () =>
+                {
+                    if (!_records.TryGetValue(failedIdentity, out var provider) || provider.Instance != failed ||
+                        provider.State != ServiceLifecycleState.Failed || !ReferenceEquals(provider.Definition, providerDefinition) ||
+                        !failedProviders.SetEquals(provider.ProvidedInstances.Values.Append(failed)))
+                        return KernelResult.Fail(KernelError.StaleGeneration, "Failure policy provider changed before drain dispatch.");
+                    var exact = ResolveExactLocked(item.Instance);
+                    if (!exact.IsSuccess) return KernelResult.Fail(exact.Error, exact.Message!);
+                    var record = exact.Value!;
+                    return ReferenceEquals(record.Definition, item.Definition) && record.State == item.State &&
+                           record.Health == item.Health && record.BlockingReason == item.Reason &&
+                           record.Bindings.SequenceEqual(item.Bindings)
+                        ? KernelResult.Ok()
+                        : KernelResult.Fail(KernelError.StaleGeneration, "Failure policy peer changed before drain dispatch.");
+                });
             if (!drained.IsSuccess) return KernelResult.Fail(drained.Error, drained.Message!);
         }
         return KernelResult.Ok();
@@ -984,17 +1196,23 @@ public sealed class CapabilityAwareServiceSupervisor
         if (next.Identity != record.Definition.Identity)
             return KernelResult.Fail(KernelError.InvalidManifest, "Replacement must preserve the managed component identity.");
         var process = next.Admission.Manifest.Process;
-        if (process.ProcessId != previous.Process.ProcessId || process.Generation != checked(previous.Process.Generation + 1))
+        if (previous.Process.Generation == ulong.MaxValue ||
+            process.ProcessId != previous.Process.ProcessId || process.Generation != previous.Process.Generation + 1)
             return KernelResult.Fail(KernelError.StaleGeneration, "Replacement must use the same process identity and exactly the next generation.");
         if (!string.Equals(next.PrimaryServiceName, record.Definition.PrimaryServiceName, StringComparison.Ordinal))
             return KernelResult.Fail(KernelError.InvalidManifest, "Replacement must preserve the primary service identity.");
-        return KernelResult.Ok();
+        return ValidateAcyclicGraphLocked(next);
     }
 
-    private KernelResult ValidateAcyclicGraphLocked()
+    private KernelResult ValidateAcyclicGraphLocked(ManagedServiceDefinition? replacement = null)
     {
-        var duplicateProvider = _records.Values
-            .SelectMany(record => record.Definition.Admission.Manifest.ProvidedContracts.Select(provided => (provided.Contract, record.Definition.Identity)))
+        // Evaluate the prospective definitions without publishing a temporary
+        // record or changing the authoritative managed graph.
+        var definitions = _records.Values.Select(record =>
+            replacement is not null && record.Definition.Identity == replacement.Identity
+                ? replacement : record.Definition).ToDictionary(definition => definition.Identity);
+        var duplicateProvider = definitions.Values
+            .SelectMany(definition => definition.Admission.Manifest.ProvidedContracts.Select(provided => (provided.Contract, definition.Identity)))
             .GroupBy(item => item.Contract)
             .FirstOrDefault(group => group.Select(item => item.Identity).Distinct().Count() > 1);
         if (duplicateProvider is not null)
@@ -1005,13 +1223,15 @@ public sealed class CapabilityAwareServiceSupervisor
         {
             if (!visiting.Add(identity)) return false;
             if (visited.Contains(identity)) { visiting.Remove(identity); return true; }
-            foreach (var provider in ResolveProviderIdentitiesLocked(_records[identity].Definition, null))
-                if (!Visit(provider)) return false;
+            foreach (var dependency in definitions[identity].Admission.Manifest.Dependencies)
+            foreach (var provider in definitions.Values.Where(candidate =>
+                         candidate.Admission.Manifest.ProvidedContracts.Any(provided => provided.Contract == dependency.Contract)))
+                if (!Visit(provider.Identity)) return false;
             visiting.Remove(identity);
             visited.Add(identity);
             return true;
         }
-        return _records.Keys.All(Visit)
+        return definitions.Keys.All(Visit)
             ? KernelResult.Ok()
             : KernelResult.Fail(KernelError.InvalidManifest, "Managed service dependency graph contains a cycle.");
     }

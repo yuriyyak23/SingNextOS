@@ -10,6 +10,116 @@ public sealed class CxlSecurityAndMultiHostTests
     private static readonly CxlSecurityProperties SecureProperties =
         CxlSecurityProperties.LinkEncryptionAvailable | CxlSecurityProperties.IdeEnabled | CxlSecurityProperties.DeviceAuthenticated;
 
+    [Theory]
+    [InlineData(false, 0, false)]
+    [InlineData(false, 0, true)]
+    [InlineData(true, 0, false)]
+    [InlineData(true, 0, true)]
+    [InlineData(false, 1, false)]
+    [InlineData(false, 1, true)]
+    [InlineData(true, 1, false)]
+    [InlineData(true, 1, true)]
+    [InlineData(false, 2, false)]
+    [InlineData(false, 2, true)]
+    [InlineData(true, 2, false)]
+    [InlineData(true, 2, true)]
+    [InlineData(false, 3, false)]
+    [InlineData(false, 3, true)]
+    [InlineData(true, 3, false)]
+    [InlineData(true, 3, true)]
+    public void ActualSecurityReadinessRequiresOriginalParentAcrossQueries(bool foreign, int lossStage, bool required)
+    {
+        SecurityDiscoveryHook? discovery = null;
+        var s = CreateSecurityScenario(SecureProperties, model => discovery = new(model));
+        const global::System.Reflection.BindingFlags flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(CxlAuthorityBridge).GetField("_trackedFabric", flags)!.GetValue(s.Bridge)!;
+        var original = routes[s.Fabric.BindingId]!;
+        var gate = typeof(CxlAuthorityBridge).GetField("_gate", flags)!.GetValue(s.Bridge)!;
+        var lost = false;
+        void Lose()
+        {
+            Assert.False(Monitor.IsEntered(gate));
+            lock (gate)
+            {
+                if (foreign) routes[s.Fabric.BindingId] = typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+                else routes.Remove(s.Fabric.BindingId);
+            }
+            lost = true;
+        }
+        var queries = 0;
+        var authority = new CxlSecurityAuthority(s.Bridge, new OverriddenSecurityProvider(s.SecurityProvider, (endpoint, generation) =>
+        {
+            queries++;
+            var state = s.SecurityProvider.QuerySecurityState(endpoint, generation);
+            if (lossStage == 2) Lose();
+            if (lossStage == 3) discovery!.BeforeQuery = count => { if (count == 2) Lose(); };
+            return state;
+        }));
+        if (lossStage == 0) Lose();
+        if (lossStage == 1) discovery!.BeforeQuery = count => { if (count == 2) Lose(); };
+        var result = authority.Evaluate(s.Owner, s.Use.Handle, s.Subject, s.Lease, s.Endpoint, s.Fabric,
+            new(SecureProperties, new(1), required));
+        Assert.True(lost);
+        Assert.Equal(KernelError.StaleGeneration, result.Error);
+        Assert.Equal(lossStage < 2 ? 0 : 1, queries);
+        Assert.True(s.Kernel.Regions.ValidateUse(s.Use.Handle, s.Owner).IsSuccess);
+        Assert.Equal(s.Fabric, s.Model.Query(s.Fabric.BindingId).Value!);
+        Assert.False(s.Kernel.RevokePlatformDevice(s.Subject.Process, s.Lease).IsSuccess);
+        lock (gate) routes[s.Fabric.BindingId] = original;
+        discovery!.BeforeQuery = null;
+        Assert.True(s.Bridge.ReleaseFabric(s.Fabric).IsSuccess);
+        Assert.True(s.Kernel.RevokePlatformDevice(s.Subject.Process, s.Lease).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public async Task ConcurrentSecurityReplyCannotPublishReadinessThroughForeignParent(bool foreign)
+    {
+        var s = CreateSecurityScenario(SecureProperties);
+        const global::System.Reflection.BindingFlags flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(CxlAuthorityBridge).GetField("_trackedFabric", flags)!.GetValue(s.Bridge)!;
+        var original = routes[s.Fabric.BindingId]!;
+        var gate = typeof(CxlAuthorityBridge).GetField("_gate", flags)!.GetValue(s.Bridge)!;
+        using var resume = new ManualResetEventSlim();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var authority = new CxlSecurityAuthority(s.Bridge, new OverriddenSecurityProvider(s.SecurityProvider, (endpoint, generation) =>
+        {
+            Assert.False(Monitor.IsEntered(gate));
+            var reply = s.SecurityProvider.QuerySecurityState(endpoint, generation);
+            entered.SetResult();
+            Assert.True(resume.Wait(TimeSpan.FromSeconds(15)));
+            return reply;
+        }));
+        var querying = Task.Run(() => authority.Evaluate(s.Owner, s.Use.Handle, s.Subject, s.Lease, s.Endpoint, s.Fabric,
+            new(SecureProperties, new(1), true)));
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(15));
+            lock (gate)
+            {
+                if (foreign) routes[s.Fabric.BindingId] = typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+                else routes.Remove(s.Fabric.BindingId);
+            }
+        }
+        finally { resume.Set(); }
+        var result = await querying.WaitAsync(TimeSpan.FromSeconds(15));
+        Assert.Equal(KernelError.StaleGeneration, result.Error);
+        Assert.False(s.Kernel.TerminateProcess(s.Subject.Process).IsSuccess);
+        Assert.False(s.Kernel.QueryProcessTeardown(s.Subject.Process).Value!.LocalReclaimCompleted);
+    }
+
+    private sealed class SecurityDiscoveryHook(ICxlDiscoveryProvider inner) : ICxlDiscoveryProvider
+    {
+        private Action<int>? _before;
+        private int _queries;
+        internal Action<int>? BeforeQuery { set { _before = value; _queries = 0; } }
+        public PlatformAuthorityResult<CxlEndpointSnapshot> QueryEndpoint(CxlEndpointId id)
+        {
+            _before?.Invoke(++_queries);
+            return inner.QueryEndpoint(id);
+        }
+    }
+
     [Fact]
     public void AuthenticatedEvidenceCannotReplaceRegionAuthority()
     {
@@ -299,7 +409,8 @@ public sealed class CxlSecurityAndMultiHostTests
         Assert.DoesNotContain(typeof(IPlatformAuthorityProvider), typeof(CxlSecurityModelProvider).GetInterfaces());
     }
 
-    private static SecurityScenario CreateSecurityScenario(CxlSecurityProperties? properties)
+    private static SecurityScenario CreateSecurityScenario(CxlSecurityProperties? properties,
+        Func<CxlType3ModelProvider, ICxlDiscoveryProvider>? discoveryFactory = null)
     {
         var platform = new AuthorityProvider();
         var kernel = new RuntimeKernel(platform);
@@ -317,7 +428,7 @@ public sealed class CxlSecurityAndMultiHostTests
         var endpoint = model.QueryEndpoint(new("secure-cxl")).Value!;
         var security = new CxlSecurityModelProvider();
         if (properties is not null) Assert.True(security.Register(endpoint.EndpointId, endpoint.DeviceGeneration, properties.Value).IsSuccess);
-        var bridge = new CxlAuthorityBridge(kernel, model, model, model, model,
+        var bridge = new CxlAuthorityBridge(kernel, discoveryFactory?.Invoke(model) ?? model, model, model, model,
             new CoherentStub(), security);
         var control = kernel.AllocateBuffer<byte>(handle, 16).Value!;
         var use = kernel.AcquireRegionUse(handle, control.Handle, RegionUseMode.DevicePrivate, new(0, 16)).Value!;

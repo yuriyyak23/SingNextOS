@@ -1,7 +1,6 @@
 using SingPlus.Contracts;
 using SingPlus.Platform;
 using SingPlus.Sip.Sdk;
-using System.Security.Cryptography;
 
 namespace SingPlus.Runtime;
 
@@ -360,6 +359,12 @@ public sealed partial class RuntimeKernel
             commit.ProviderCorrelation, ResourceBudgetRecoveryTransition.PossibleSubmit, []);
         if (!durableSubmit.IsSuccess)
             return FailBeforeSubmit(commit, durableSubmit.Error, durableSubmit.Message!, ownsSubmit: true, observation: preSubmitFailureObservation);
+        // Journal store callbacks can change admission owners. Re-read before
+        // recording a possible effect or consuming capacity; dispatch still
+        // independently revalidates after the owner submit commit.
+        var finalAdmission = RevalidateResourceAdmissionCommit(commit);
+        if (!finalAdmission.IsSuccess)
+            return FailBeforeSubmit(commit, finalAdmission.Error, finalAdmission.Message!, ownsSubmit: true, observation: preSubmitFailureObservation);
         var submitted = ExternalOperations.RecordSubmission(commit.Operation, dependencies);
         if (!submitted.IsSuccess) return FailBeforeSubmit(commit, submitted.Error, submitted.Message!, ownsSubmit: true, observation: preSubmitFailureObservation);
         try { submissionObservation?.Invoke(); }
@@ -503,6 +508,33 @@ public sealed partial class RuntimeKernel
             {
                 var prior = _resourceBudgetRecoveryJournal.Replay().Items
                     .SingleOrDefault(item => item.LastPayload.Lease == lease);
+                if (transition == ResourceBudgetRecoveryTransition.CancelledPreSubmit &&
+                    prior?.LastPayload.Transition is ResourceBudgetRecoveryTransition.PossibleSubmit or
+                        ResourceBudgetRecoveryTransition.SettledContained)
+                {
+                    // ADR-011: a journal intent is not an owner submit. Project
+                    // zero-charge recovery only from exact committed no-effect
+                    // owner facts; raw journal cancellation stays prohibited.
+                    var operation = new ExternalOperationHandle(new(correlation.CorrelationId.Value),
+                        new(correlation.Generation.Value));
+                    var effect = ExternalOperations.Query(operation);
+                    var resource = ExternalOperations.QueryResourceBinding(operation);
+                    var budget = Budgets.Query(lease);
+                    if (charged.Count != 0 || !effect.IsSuccess || !resource.IsSuccess || !budget.IsSuccess ||
+                        effect.Value!.Binding is not null || effect.Value.Disposition != ExternalOperationDisposition.Cancelled ||
+                        effect.Value.EffectBoundary != ExternalEffectBoundaryState.NotCrossed ||
+                        effect.Value.State is not (ExternalOperationState.Prepared or ExternalOperationState.Admitted or ExternalOperationState.Released) ||
+                        resource.Value!.Operation != operation || resource.Value.Lease != lease ||
+                        resource.Value.BudgetOwner != owner || resource.Value.Envelope != envelope ||
+                        resource.Value.State != ExternalResourceBindingState.CancelledPreSubmit ||
+                        budget.Value!.Owner != owner || budget.Value.Lifetime != BudgetReservationLifetime.ExternalEffect ||
+                        budget.Value.State != BudgetReservationState.CancelledPreSubmit ||
+                        !budget.Value.Amounts.SequenceEqual([new BudgetAmount(ServiceBudgetDimension.ComputeTimeNanoseconds, envelope.Amount)]) ||
+                        budget.Value.ChargedAmounts?.Count != 0)
+                        return KernelResult.Fail(KernelError.Quarantined,
+                            "Exact original no-effect owners did not confirm zero-charge recovery.");
+                    transition = ResourceBudgetRecoveryTransition.SettledContained;
+                }
                 if (prior?.LastPayload.Transition == transition)
                 {
                     var payload = prior.LastPayload;
@@ -522,8 +554,11 @@ public sealed partial class RuntimeKernel
                 correlation, transition, charged));
             return KernelResult.Ok();
         }
-        catch (Exception exception) when (exception is IOException or InvalidDataException or UnauthorizedAccessException or CryptographicException)
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
         {
+            // A store callback can fail before or after a frame is committed.
+            // Report failure; existing consumers must confirm their own exact
+            // cleanup/charge facts rather than infer no effect from this exception.
             return KernelResult.Fail(KernelError.Quarantined,
                 $"Durable resource recovery journal failed closed: {exception.Message}");
         }

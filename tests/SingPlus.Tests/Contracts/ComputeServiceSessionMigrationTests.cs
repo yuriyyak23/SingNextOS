@@ -8,6 +8,32 @@ namespace SingPlus.Tests.Contracts;
 
 public sealed class ComputeServiceSessionMigrationTests
 {
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void HostCreationRefusesSourceLossAfterComponentAuthoritySnapshot(bool drain)
+    {
+        var scenario = CreateComponentScenario(new HostPlatformAuthorityProvider());
+        var identity = new ComponentIdentity("compute-session-test");
+        var capability = Assert.Single(scenario.Kernel.QueryComponent(identity).Value!.Capabilities);
+        scenario.Kernel.AfterComputeComponentAuthoritySnapshotQualificationHook = () =>
+        {
+            scenario.Kernel.AfterComputeComponentAuthoritySnapshotQualificationHook = null;
+            if (drain) Assert.True(scenario.Kernel.DrainComponent(identity).Value!.Reclaimable);
+            else Assert.True(scenario.Kernel.RevokeCapability(capability).IsSuccess);
+        };
+        var host = RuntimeComputeServiceHost.CreateForComponent(scenario.Kernel, identity, scenario.Session);
+        Assert.Equal(KernelError.MissingCapability, host.Error);
+        Assert.Null(host.Value);
+        var component = scenario.Kernel.QueryComponent(identity).Value!;
+        if (drain)
+        {
+            Assert.Empty(component.Capabilities);
+            Assert.Equal(ProcessState.Exited, scenario.Kernel.Processes.ResolveTerminalState(scenario.Service).Value);
+            Assert.True(scenario.Kernel.RetireReclaimableComponent(identity, scenario.Service).IsSuccess);
+        }
+        else Assert.Equal(ComponentLifecycleState.Running, component.State);
+    }
+
     [Fact]
     public async Task ComponentDiscoverySessionTypedClientAndDsc1LifecycleCompose()
     {

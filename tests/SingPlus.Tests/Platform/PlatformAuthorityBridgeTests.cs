@@ -7,6 +7,105 @@ namespace SingPlus.Tests.Platform;
 
 public sealed class PlatformAuthorityBridgeTests
 {
+    [Theory]
+    [InlineData(0, 0)] [InlineData(0, 1)] [InlineData(0, 2)]
+    [InlineData(1, 0)] [InlineData(1, 1)] [InlineData(1, 2)]
+    [InlineData(2, 0)] [InlineData(2, 1)] [InlineData(2, 2)]
+    public void MalformedRootCleanupCannotForgetOriginalSubject(int mutation, int cleanup)
+    {
+        var provider = new MalformedRootProvider(mutation, cleanup);
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 1348, 1780);
+        var subject = new PlatformDomainIdentity(process.DomainId, owner);
+        var pinObserved = false;
+        provider.BeforeCleanup = () => pinObserved = kernel.PlatformAuthority.HasUnresolvedDomainBindEffect(subject);
+        Assert.Equal(KernelError.PlatformFaulted, kernel.BindPlatformDomain(owner).Error);
+        Assert.True(pinObserved);
+        Assert.True(kernel.PlatformAuthority.HasUnresolvedDomainBindEffect(subject));
+        Assert.False(kernel.BindPlatformDomain(owner).IsSuccess);
+        Assert.Equal(1, provider.BindCalls);
+        Assert.False(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.True(kernel.Processes.Resolve(owner).IsSuccess);
+        Assert.Equal(1, provider.CleanupCalls);
+    }
+
+    private sealed class MalformedRootProvider(int mutation, int cleanup) : IPlatformAuthorityProvider, IPlatformFeatureProvider
+    {
+        private readonly HostPlatformAuthorityProvider host = new();
+        public int BindCalls { get; private set; }
+        public int CleanupCalls { get; private set; }
+        public Action? BeforeCleanup { get; set; }
+        public PlatformProviderDescriptor Descriptor => host.Descriptor;
+        public PlatformFeatureManifest QueryFeatures() => host.QueryFeatures();
+        public PlatformAuthorityResult<PlatformProviderDomainLease> BindDomain(PlatformDomainIdentity subject)
+        {
+            BindCalls++;
+            var receipt = host.BindDomain(subject).Value!;
+            return PlatformAuthorityResult<PlatformProviderDomainLease>.Ok(mutation switch
+            {
+                0 => receipt with { Subject = subject with { Process = new(subject.ProcessId, subject.ProcessGeneration + 1) } },
+                1 => receipt with { LeaseId = new(0) },
+                _ => receipt with { Generation = new(0) }
+            });
+        }
+        public PlatformAuthorityResult RevokeDomain(PlatformProviderDomainLease lease)
+        {
+            CleanupCalls++;
+            BeforeCleanup?.Invoke();
+            if (cleanup == 2) throw new IOException("malformed root cleanup reply lost");
+            return cleanup == 0 ? PlatformAuthorityResult.Ok() : PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "cleanup refused");
+        }
+        public PlatformAuthorityResult<PlatformProviderRegionMappingLease> MapOwnedRegion(PlatformProviderDomainLease d, PlatformRegionIdentity r, PlatformMemoryAccess a) => host.MapOwnedRegion(d, r, a);
+        public PlatformAuthorityResult RevokeRegionMapping(PlatformProviderRegionMappingLease m, PlatformRegionRevocationPolicy p) => host.RevokeRegionMapping(m, p);
+    }
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void MalformedMappingCleanupSuccessDoesNotReleaseRequestedReservation(int mutation)
+    {
+        var provider = new MalformedMappingProvider(mutation);
+        var kernel = new RuntimeKernel(provider);
+        var (_, owner) = TestFixtures.Create(kernel, 1346, 1760);
+        var (_, target) = TestFixtures.Create(kernel, 1347, 1770);
+        var region = kernel.AllocateRegion(owner, 123).Value!;
+        var domain = kernel.BindPlatformDomain(owner).Value!;
+        var capability = MintRegionCapability(kernel, owner, region.Handle, CapabilityRights.Map | CapabilityRights.Read);
+        Assert.Equal(KernelError.PlatformFaulted, kernel.MapPlatformOwnedRegion(owner, domain,
+            capability, region.Handle, PlatformMemoryAccess.Read).Error);
+        Assert.Equal(1, provider.CleanupCalls);
+        Assert.False(kernel.TransferRegion(owner, target, region).IsSuccess);
+        Assert.False(kernel.RevokeCapability(capability).IsSuccess);
+        Assert.False(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.True(kernel.Processes.Resolve(owner).IsSuccess);
+        Assert.Equal(1, provider.CleanupCalls);
+    }
+
+    private sealed class MalformedMappingProvider(int mutation) : IPlatformAuthorityProvider, IPlatformFeatureProvider
+    {
+        private readonly HostPlatformAuthorityProvider host = new();
+        public int CleanupCalls { get; private set; }
+        public PlatformProviderDescriptor Descriptor => host.Descriptor;
+        public PlatformFeatureManifest QueryFeatures() => host.QueryFeatures();
+        public PlatformAuthorityResult<PlatformProviderDomainLease> BindDomain(PlatformDomainIdentity subject) => host.BindDomain(subject);
+        public PlatformAuthorityResult RevokeDomain(PlatformProviderDomainLease lease) => host.RevokeDomain(lease);
+        public PlatformAuthorityResult<PlatformProviderRegionMappingLease> MapOwnedRegion(
+            PlatformProviderDomainLease domain, PlatformRegionIdentity region, PlatformMemoryAccess access)
+        {
+            var result = host.MapOwnedRegion(domain, region, access);
+            if (!result.IsSuccess) return result;
+            var receipt = result.Value!;
+            return PlatformAuthorityResult<PlatformProviderRegionMappingLease>.Ok(mutation switch
+            {
+                0 => receipt with { DomainLease = domain with { Generation = new(99) } },
+                1 => receipt with { Region = region with { ByteLength = region.ByteLength + 1 } },
+                _ => receipt with { Access = PlatformMemoryAccess.Write }
+            });
+        }
+        public PlatformAuthorityResult RevokeRegionMapping(PlatformProviderRegionMappingLease mapping, PlatformRegionRevocationPolicy policy)
+        {
+            CleanupCalls++;
+            return PlatformAuthorityResult.Ok(); // Returned object closure is not original-effect evidence.
+        }
+    }
     [Fact]
     [Trait("Category", "Runtime")]
     public void DefaultKernelFailsClosedWhenPlatformProviderIsUnavailable()

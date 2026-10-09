@@ -113,7 +113,7 @@ public static class NeutralChildExecutionContract
             return NeutralChildDomainContract.Fail(NeutralVirtualizationStatus.Stale, "Execution receipt has a stale binding epoch.");
         if (receipt.ContentDigest != artifact.ContentDigest || receipt.StartOperationId != request.OperationId ||
             receipt.StartOperationGeneration != request.OperationGeneration || receipt.ExecutionGeneration.Value == 0 ||
-            receipt.RetiredWorkUnits <= 0 || receipt.RetiredSequence == 0 || !receipt.IsTerminal)
+            receipt.RetiredWorkUnits <= 0 || receipt.RetiredWorkUnits > artifact.MaximumExecutionSteps || receipt.RetiredSequence == 0 || !receipt.IsTerminal)
             return NeutralChildDomainContract.Fail(NeutralVirtualizationStatus.Ambiguous,
                 "Execution receipt does not independently prove exact terminal retired work.");
         return NeutralChildDomainContract.Ok();

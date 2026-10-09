@@ -45,7 +45,7 @@ internal interface INativeSipDeterministicHook
 
 internal static class NativeServiceDispatch
 {
-    internal static KernelResult Dispatch(RuntimeKernel kernel, ProcessHandle service, EndpointSessionHandle session, Func<TrustedSipInvocationContext, ChannelEnvelope, KernelResult<object?>> operation, INativeSipCompletedEventSink? trace = null, INativeSipDeterministicHook? hook = null, Func<KernelResult>? beforePublication = null)
+    internal static KernelResult Dispatch(RuntimeKernel kernel, ProcessHandle service, EndpointSessionHandle session, Func<TrustedSipInvocationContext, ChannelEnvelope, KernelResult<object?>> operation, INativeSipCompletedEventSink? trace = null, INativeSipDeterministicHook? hook = null, Func<KernelResult>? beforePublication = null, Func<ChannelEnvelope, bool>? objectCapacityExhausted = null)
     {
         var received = kernel.ReceiveSessionRequest(service, session);
         if (!received.IsSuccess) return KernelResult.Fail(received.Error, received.Message!);
@@ -60,6 +60,16 @@ internal static class NativeServiceDispatch
             var cancelled = kernel.CancelSessionResponse(service, invocation);
             if (cancelled.IsSuccess) trace?.Record(NativeSipCompletedEvent.ResponseCancelled);
             return cancelled.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(cancelled.Error, cancelled.Message!);
+        }
+        // Pure local host capacity refusal before implementation acceptance.
+        // Later callback failures still carry the existing possible-effect pins.
+        if (objectCapacityExhausted?.Invoke(received.Value.Request) == true)
+        {
+            var cancelled = kernel.CancelSessionResponse(service, invocation);
+            if (cancelled.IsSuccess) trace?.Record(NativeSipCompletedEvent.ResponseCancelled);
+            return cancelled.IsSuccess
+                ? KernelResult.Fail(KernelError.CapacityExhausted, "Native object identity space is exhausted before acceptance.")
+                : KernelResult.Fail(cancelled.Error, cancelled.Message!);
         }
         var accepted = kernel.AcceptSessionInvocation(service, invocation, allowInFlightCancellation: false);
         if (!accepted.IsSuccess) return accepted;
@@ -405,7 +415,9 @@ public sealed class RuntimeFileServiceHost : IIFileServiceGeneratedSentryTarget_
         try
         {
             var result = NativeServiceDispatch.Dispatch(_kernel, _service, _session, Execute, _trace, _hook,
-                beforePublication: RefuseDrainingDispatch);
+                beforePublication: RefuseDrainingDispatch,
+                objectCapacityExhausted: request => _nextId == ulong.MaxValue &&
+                    (request.MessageId == IFileServiceProtocol.Message_OpenAsync || request.MessageId == IFileServiceProtocol.Message_OpenV2Async));
             returned = true;
             return result;
         }
@@ -655,6 +667,15 @@ public sealed class RuntimeFileServiceHost : IIFileServiceGeneratedSentryTarget_
         var finalSeal = _kernel.SealedObjects.Revalidate(objectPin, _serviceDescriptor, _service);
         if (!finalSeal.IsSuccess) return KernelResult<object?>.Fail(finalSeal.Error, finalSeal.Message!);
         _trace?.Record(NativeSipCompletedEvent.ImplementationEntered);
+        if (message == IFileServiceProtocol.Message_WriteAsync || message == IFileServiceProtocol.Message_ReadAsync)
+        {
+            // Trace callbacks can revoke or redirect the original seal source.
+            // The admitted capability lease remains independent permission.
+            var afterTraceSeal = _kernel.SealedObjects.Revalidate(objectPin, _serviceDescriptor, _service);
+            if (!afterTraceSeal.IsSuccess) return KernelResult<object?>.Fail(afterTraceSeal.Error, afterTraceSeal.Message!);
+            var afterTraceAdmission = RefuseDrainingDispatch();
+            if (!afterTraceAdmission.IsSuccess) return KernelResult<object?>.Fail(afterTraceAdmission.Error, afterTraceAdmission.Message!);
+        }
         if (message == IFileServiceProtocol.Message_WriteAsync) { entry.Data = bytes!.Value.ToArray(); _trace?.Record(NativeSipCompletedEvent.ImplementationExited); return KernelResult<object?>.Ok(null); }
         if (message == IFileServiceProtocol.Message_ReadAsync) { var response = new FileReadResponse(new BoundedBytes(entry.Data)); _trace?.Record(NativeSipCompletedEvent.ImplementationExited); return KernelResult<object?>.Ok(response); }
         if (message == IFileServiceProtocol.Message_CloseAsync)
@@ -720,7 +741,11 @@ public sealed class RuntimeNetworkServiceHost
         try
         {
             var result = NativeServiceDispatch.Dispatch(_kernel, _service, _session, Execute, _trace, _hook,
-                beforePublication: RefuseDrainingDispatch);
+                beforePublication: RefuseDrainingDispatch,
+                objectCapacityExhausted: request =>
+                {
+                    lock (_gate) return _nextId == ulong.MaxValue && request.MessageId == INetworkServiceProtocol.Message_OpenAsync;
+                });
             returned = true;
             return result;
         }

@@ -9,78 +9,18 @@ public sealed partial class RuntimeKernel
     private readonly Dictionary<ProcessHandle, List<PlatformDmaGrant>> _processPlatformDmaGrants = [];
 
     public KernelResult<PlatformDmaGrant> BindPlatformDma(
-        ProcessHandle subject,
-        PlatformDeviceLease deviceLease,
-        PlatformOwnedRegionSliceMapping mapping,
-        long offset,
-        long length,
-        PlatformDmaDirection direction)
+        ProcessHandle subject, PlatformDeviceLease deviceLease, PlatformOwnedRegionSliceMapping mapping,
+        long offset, long length, PlatformDmaDirection direction)
     {
+        PlatformDomainIdentity identity;
         lock (_platformMemoryUseGate)
         {
-            return BindPlatformDmaLocked(
-                subject,
-                deviceLease,
-                mapping,
-                offset,
-                length,
-                direction);
+            var resolved = Processes.Resolve(subject);
+            if (!resolved.IsSuccess) return KernelResult<PlatformDmaGrant>.Fail(resolved.Error, resolved.Message!);
+            identity = PlatformIdentity(resolved.Value!);
         }
-    }
-
-    private KernelResult<PlatformDmaGrant> BindPlatformDmaLocked(
-        ProcessHandle subject,
-        PlatformDeviceLease deviceLease,
-        PlatformOwnedRegionSliceMapping mapping,
-        long offset,
-        long length,
-        PlatformDmaDirection direction)
-    {
-        var resolved = Processes.Resolve(subject);
-        if (!resolved.IsSuccess)
-        {
-            return KernelResult<PlatformDmaGrant>.Fail(
-                resolved.Error,
-                resolved.Message!);
-        }
-
-        var process = resolved.Value!;
-        var effect = EnsureProcessAcceptsNewEffects(process);
-        if (!effect.IsSuccess)
-        {
-            return KernelResult<PlatformDmaGrant>.Fail(
-                effect.Error,
-                effect.Message!);
-        }
-
-        var identity = PlatformIdentity(process);
-        var device = PlatformAuthority.ValidateDeviceLease(deviceLease, identity);
-        if (!device.IsSuccess)
-        {
-            return KernelResult<PlatformDmaGrant>.Fail(
-                device.Error,
-                device.Message!);
-        }
-
-        var exactMapping = PlatformAuthority.ValidateExactMapping(mapping, identity);
-        if (!exactMapping.IsSuccess)
-        {
-            return KernelResult<PlatformDmaGrant>.Fail(
-                exactMapping.Error,
-                exactMapping.Message!);
-        }
-
-        var usability = Regions.ValidatePlatformMappingRegionUsability(mapping.Mapping.Region,
-            new RegionOwner(process.DomainId, subject.Generation));
-        if (!usability.IsSuccess)
-            return KernelResult<PlatformDmaGrant>.Fail(usability.Error, usability.Message!);
-
-        var grant = PlatformAuthority.BindDmaGrant(
-            deviceLease,
-            mapping,
-            identity,
-            new PlatformDmaRange(offset, length),
-            direction, () =>
+        return PlatformAuthority.BindDmaGrant(deviceLease, mapping, identity,
+            new PlatformDmaRange(offset, length), direction, () =>
             {
                 var current = Processes.Resolve(subject);
                 if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
@@ -88,32 +28,47 @@ public sealed partial class RuntimeKernel
                 if (!accepts.IsSuccess) return accepts;
                 return Regions.ValidatePlatformMappingRegionUsability(mapping.Mapping.Region,
                     new RegionOwner(current.Value!.DomainId, subject.Generation));
+            }, commit => { lock (_platformMemoryUseGate) return commit(); },
+            (candidate, retain) =>
+            {
+                // Trusted local mutation inside ownerCommit only.
+                if (retain) TrackPlatformDmaGrant(subject, candidate);
+                else UntrackPlatformDmaGrant(candidate);
+            }, (deviceSource, mappingSource, commit) =>
+            {
+                var current = Processes.Resolve(subject);
+                if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
+                return CapabilityAuthority.CommitDeviceLeaseAdmission(deviceSource, current.Value!.DomainId,
+                    subject.Generation, ToDeviceCapabilityRights(deviceLease.Rights), deviceLease.Device.ResourceId, () =>
+                    {
+                        var rights = CapabilityRights.Map;
+                        if ((mapping.Mapping.Access & PlatformMemoryAccess.Read) != 0) rights |= CapabilityRights.Read;
+                        if ((mapping.Mapping.Access & PlatformMemoryAccess.Write) != 0) rights |= CapabilityRights.Write;
+                        var source = CapabilityAuthority.Validate(mappingSource, current.Value.DomainId, subject.Generation, rights);
+                        if (!source.IsSuccess) return KernelResult.Fail(source.Error, source.Message!);
+                        if (source.Value!.ResourceKind != ResourceKind.MemoryRegion ||
+                            source.Value.ResourceId != CapabilityResourceIds.MemoryRegion(mapping.Mapping.Region.RegionId))
+                            return KernelResult.Fail(KernelError.WrongCapabilityResource, "DMA mapping source changed.");
+                        return commit();
+                    });
             });
-        if (grant.IsSuccess)
-            TrackPlatformDmaGrant(subject, grant.Value!);
-        return grant;
     }
-
     public KernelResult RevokePlatformDma(
         ProcessHandle subject,
         PlatformDmaGrant grant)
     {
+        PlatformDomainIdentity identity;
         lock (_platformMemoryUseGate)
-            return RevokePlatformDmaLocked(subject, grant);
-    }
-
-    private KernelResult RevokePlatformDmaLocked(
-        ProcessHandle subject,
-        PlatformDmaGrant grant)
-    {
+        {
         var resolved = Processes.Resolve(subject);
         if (!resolved.IsSuccess)
             return KernelResult.Fail(resolved.Error, resolved.Message!);
 
-        var identity = PlatformIdentity(resolved.Value!);
+        identity = PlatformIdentity(resolved.Value!);
+        }
         var revoke = PlatformAuthority.RevokeDmaGrant(grant, identity);
         if (revoke.IsSuccess)
-            UntrackPlatformDmaGrant(grant);
+            lock (_platformMemoryUseGate) UntrackPlatformDmaGrant(grant);
         return revoke;
     }
 
@@ -131,7 +86,7 @@ public sealed partial class RuntimeKernel
                 continue;
             }
 
-            UntrackPlatformDmaGrant(grant);
+            lock (_platformMemoryUseGate) UntrackPlatformDmaGrant(grant);
         }
 
         return firstFailure ?? KernelResult.Ok();
@@ -151,7 +106,7 @@ public sealed partial class RuntimeKernel
                 continue;
             }
 
-            UntrackPlatformDmaGrant(grant);
+            lock (_platformMemoryUseGate) UntrackPlatformDmaGrant(grant);
         }
 
         return firstFailure ?? KernelResult.Ok();
@@ -161,12 +116,17 @@ public sealed partial class RuntimeKernel
         SingProcess process,
         ProcessHandle handle)
     {
-        if (!_processPlatformDmaGrants.TryGetValue(handle, out var grants) || grants.Count == 0)
-            return KernelResult.Ok();
+        PlatformDmaGrant[] grants;
+        lock (_platformMemoryUseGate)
+        {
+            if (!_processPlatformDmaGrants.TryGetValue(handle, out var tracked) || tracked.Count == 0)
+                return KernelResult.Ok();
+            grants = tracked.ToArray();
+        }
 
         var identity = PlatformIdentity(process);
         KernelResult? firstFailure = null;
-        foreach (var grant in grants.ToArray())
+        foreach (var grant in grants)
         {
             var revoke = PlatformAuthority.RevokeDmaGrant(grant, identity);
             if (!revoke.IsSuccess)
@@ -175,7 +135,7 @@ public sealed partial class RuntimeKernel
                 continue;
             }
 
-            UntrackPlatformDmaGrant(grant);
+            lock (_platformMemoryUseGate) UntrackPlatformDmaGrant(grant);
         }
 
         return firstFailure ?? KernelResult.Ok();

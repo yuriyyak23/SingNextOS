@@ -39,10 +39,86 @@ internal sealed class KernelEventRegistry
         public WaiterRecord? Waiter { get; set; }
         public EndpointState State { get; set; }
         public int PendingIrqAdmissions { get; set; }
+        public HashSet<IrqSourceReservation> IrqSources { get; } = [];
+    }
+
+    // Opaque local source lifetime, never provider closure or capability permission.
+    internal sealed class IrqSourceReservation
+    {
+        private readonly KernelEventRegistry _registry;
+        private readonly EndpointRecord _owner;
+        private object? _source;
+        private IrqSourceReservation(KernelEventRegistry registry, EndpointRecord owner)
+        { _registry = registry; _owner = owner; }
+        internal static IrqSourceReservation Create(KernelEventRegistry registry, KernelEventEndpoint endpoint) =>
+            new(registry, registry._endpoints[endpoint.EndpointId]);
+        internal void BindSource(object source)
+        {
+            lock (_registry._gate)
+            {
+                if (_source is not null) throw new InvalidOperationException("Original endpoint source was already bound.");
+                _source = source;
+            }
+        }
+        internal void TransferSource(object original, object target)
+        {
+            lock (_registry._gate)
+            {
+                if (!ReferenceEquals(_source, original)) throw new InvalidOperationException("Original endpoint source correlation changed.");
+                _source = target;
+            }
+        }
+        internal object? SnapshotSource()
+        {
+            lock (_registry._gate) return _source;
+        }
+
+        internal KernelResult CommitRelease(object? source, Func<KernelResult> commit)
+        {
+            lock (_registry._gate)
+            {
+                if (!_registry._ownedEndpoints.TryGetValue(_owner.Endpoint.EndpointId, out var original) ||
+                    !ReferenceEquals(original, _owner) ||
+                    _registry._endpoints.TryGetValue(_owner.Endpoint.EndpointId, out var current) && !ReferenceEquals(current, _owner) ||
+                    !_owner.IrqSources.Contains(this) || !ReferenceEquals(_source, source))
+                    return KernelResult.Fail(KernelError.PlatformFaulted, "Original endpoint source reservation continuity was lost.");
+                // Pure local owner commit only, matching existing IRQ admission lock order.
+                var result = commit();
+                if (result.IsSuccess) _owner.IrqSources.Remove(this);
+                return result;
+            }
+        }
+    }
+
+    // Snapshot correlations from the existing local lifetime owner. The caller must
+    // inspect provider facts after releasing this gate; snapshot does not prove closure.
+    internal IReadOnlyList<object> SnapshotIrqSources()
+    {
+        lock (_gate)
+            return _ownedEndpoints.Values.SelectMany(record => record.IrqSources)
+                .Select(reservation => reservation.SnapshotSource()).OfType<object>().ToArray();
+    }
+
+    internal KernelResult<IrqSourceReservation> ReserveIrqSource(ProcessHandle owner, KernelEventEndpoint endpoint)
+    {
+        lock (_gate)
+        {
+            var valid = ValidateLocked(owner, endpoint);
+            if (!valid.IsSuccess) return KernelResult<IrqSourceReservation>.Fail(valid.Error, valid.Message!);
+            var record = _endpoints[endpoint.EndpointId];
+            if (record.State != EndpointState.Active || record.PendingIrqAdmissions == 0)
+                return KernelResult<IrqSourceReservation>.Fail(KernelError.PlatformBindingDraining, "Exact endpoint IRQ admission was lost.");
+            if (record.IrqSources.Count == int.MaxValue)
+                return KernelResult<IrqSourceReservation>.Fail(KernelError.CapacityExhausted, "Endpoint source lifetime capacity is exhausted.");
+            var reservation = IrqSourceReservation.Create(this, endpoint);
+            record.IrqSources.Add(reservation);
+            return KernelResult<IrqSourceReservation>.Ok(reservation);
+        }
     }
 
     private readonly object _gate = new();
     private readonly Dictionary<KernelEventEndpointId, EndpointRecord> _endpoints = [];
+    private readonly Dictionary<KernelEventEndpointId, EndpointRecord> _ownedEndpoints = [];
     private ulong _nextEndpointId = 1;
     private ulong _nextEventSequence = 1;
 
@@ -63,7 +139,11 @@ internal sealed class KernelEventRegistry
                     new KernelEventEndpointId(NextNonZero(ref _nextEndpointId)),
                     new KernelEventEndpointGeneration(1),
                     owner);
-                _endpoints.Add(endpoint.EndpointId, new EndpointRecord(endpoint));
+                var record = new EndpointRecord(endpoint);
+                _ownedEndpoints.EnsureCapacity(_ownedEndpoints.Count + 1);
+                _endpoints.EnsureCapacity(_endpoints.Count + 1);
+                _ownedEndpoints.Add(endpoint.EndpointId, record);
+                _endpoints.Add(endpoint.EndpointId, record);
                 return KernelResult<KernelEventEndpoint>.Ok(endpoint);
             }
             catch (Exception)
@@ -112,7 +192,7 @@ internal sealed class KernelEventRegistry
     {
         lock (_gate)
         {
-            if (!_endpoints.TryGetValue(endpoint.EndpointId, out var record) ||
+            if (!_ownedEndpoints.TryGetValue(endpoint.EndpointId, out var record) ||
                 record.Endpoint != endpoint || record.PendingIrqAdmissions <= 0)
                 throw new InvalidOperationException("Exact endpoint IRQ admission accounting was lost.");
             // OwnerClosing is allowed here: it denies new effects, but does not erase pending admission.
@@ -135,7 +215,12 @@ internal sealed class KernelEventRegistry
         KernelEventEndpoint endpoint,
         KernelEventClass eventClass,
         string sourceResourceId)
+        => Stage(owner, endpoint, eventClass, sourceResourceId, out _);
+
+    internal KernelResult<KernelEvent> Stage(ProcessHandle owner, KernelEventEndpoint endpoint,
+        KernelEventClass eventClass, string sourceResourceId, out Func<KernelResult>? rollback)
     {
+        rollback = null;
         lock (_gate)
         {
             var validation = ValidateLocked(owner, endpoint);
@@ -177,6 +262,8 @@ internal sealed class KernelEventRegistry
                     new KernelEventSequence(NextNonZero(ref _nextEventSequence)),
                     eventClass,
                     sourceResourceId);
+                // Retain the existing original owner before callbacks can lose its route.
+                rollback = () => RollbackOriginalStaged(record, owner, @event);
                 record.Staged = @event;
                 return KernelResult<KernelEvent>.Ok(@event);
             }
@@ -189,10 +276,49 @@ internal sealed class KernelEventRegistry
         }
     }
 
+    // A staged mailbox pins its capacity, not permission. Revalidate the original
+    // endpoint and exact reservation inside the source's existing pure commit.
+    internal KernelResult CommitStagedAdmission(ProcessHandle owner, KernelEvent staged, Func<KernelResult> commit)
+    {
+        lock (_gate)
+        {
+            var validation = ValidateLocked(owner, staged.Endpoint);
+            if (!validation.IsSuccess) return validation;
+            var record = _endpoints[staged.Endpoint.EndpointId];
+            if (record.State != EndpointState.Active || record.Staged != staged || record.Pending is not null)
+                return KernelResult.Fail(KernelError.InvalidTransition, "Original staged event no longer admits delivery.");
+            return commit();
+        }
+    }
+
+    private KernelResult RollbackOriginalStaged(EndpointRecord record, ProcessHandle owner, KernelEvent staged)
+    {
+        lock (_gate)
+        {
+            if (!_ownedEndpoints.TryGetValue(staged.Endpoint.EndpointId, out var original) ||
+                !ReferenceEquals(original, record) || record.Endpoint != staged.Endpoint || record.Endpoint.Owner != owner ||
+                record.Staged != staged)
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Original staged event rollback fact changed.");
+            // Consumption of a completed local refusal; routing/active permission is not required.
+            record.Staged = null;
+            return KernelResult.Ok();
+        }
+    }
+
     public KernelResult<KernelEvent> CommitExact(
         ProcessHandle owner,
         KernelEvent staged)
     {
+        var result = CommitExactDeferred(owner, staged, out var notify);
+        notify?.Invoke();
+        return result;
+    }
+
+    // The source calls the returned notification only after all admission locks exit.
+    internal KernelResult<KernelEvent> CommitExactDeferred(
+        ProcessHandle owner, KernelEvent staged, out Action? notify)
+    {
+        notify = null;
         WaiterRecord? waiter;
         KernelResult<KernelEvent> result;
         lock (_gate)
@@ -229,7 +355,7 @@ internal sealed class KernelEventRegistry
             result = KernelResult<KernelEvent>.Ok(staged);
         }
 
-        _ = waiter?.Source.TrySetResult(result);
+        if (waiter is not null) notify = () => { _ = waiter.Source.TrySetResult(result); };
         return result;
     }
 
@@ -263,6 +389,9 @@ internal sealed class KernelEventRegistry
                 KernelError.EndpointNotFound,
                 "The kernel event endpoint does not exist.");
         }
+
+        if (!_ownedEndpoints.TryGetValue(endpoint.EndpointId, out var original) || !ReferenceEquals(record, original))
+            return KernelResult.Fail(KernelError.EndpointNotFound, "Kernel event route is not the original owner.");
 
         if (record.Endpoint.Generation != endpoint.Generation)
         {
@@ -405,7 +534,7 @@ internal sealed class KernelEventRegistry
         var removed = false;
         lock (_gate)
         {
-            if (_endpoints.TryGetValue(cancellation.Endpoint.EndpointId, out var record) &&
+            if (_ownedEndpoints.TryGetValue(cancellation.Endpoint.EndpointId, out var record) &&
                 record.Endpoint == cancellation.Endpoint &&
                 ReferenceEquals(record.Waiter, cancellation.Waiter))
             {
@@ -429,11 +558,11 @@ internal sealed class KernelEventRegistry
             if (!validation.IsSuccess) return validation;
 
             var record = _endpoints[endpoint.EndpointId];
-            if (record.Staged is not null || record.PendingIrqAdmissions != 0)
+            if (record.Staged is not null || record.PendingIrqAdmissions != 0 || record.IrqSources.Count != 0)
             {
                 return KernelResult.Fail(
                     KernelError.PlatformBindingDraining,
-                    "The kernel event endpoint has an in-flight IRQ admission or publication reservation.");
+                    "The kernel event endpoint still owns IRQ admission, source lifetime or staged publication.");
             }
 
             record.Pending = null;
@@ -455,7 +584,7 @@ internal sealed class KernelEventRegistry
         List<WaiterRecord> waiters = [];
         lock (_gate)
         {
-            foreach (var record in _endpoints.Values)
+            foreach (var record in _ownedEndpoints.Values)
             {
                 if (record.State != EndpointState.Closed && record.Endpoint.Owner == owner)
                 {
@@ -474,22 +603,22 @@ internal sealed class KernelEventRegistry
     }
 
     /// <summary>
-    /// Reclaims all local event state only after no source still owns a staged
-    /// publication. The precheck makes the close all-or-none for one owner.
+    /// Reclaims local event state after source lifetime and staged publication end.
+    /// The precheck makes the close all-or-none for one owner.
     /// </summary>
     public KernelResult CloseAllForProcess(ProcessHandle owner)
     {
         List<WaiterRecord> waiters = [];
         lock (_gate)
         {
-            var records = _endpoints.Values
+            var records = _ownedEndpoints.Values
                 .Where(record => record.State != EndpointState.Closed && record.Endpoint.Owner == owner)
                 .ToArray();
-            if (records.Any(static record => record.Staged is not null || record.PendingIrqAdmissions != 0))
+            if (records.Any(static record => record.Staged is not null || record.PendingIrqAdmissions != 0 || record.IrqSources.Count != 0))
             {
                 return KernelResult.Fail(
                     KernelError.PlatformBindingDraining,
-                    "A kernel event source still owns IRQ admission or staged publication during process teardown.");
+                    "A kernel event source still owns IRQ admission, lifetime or staged publication during process teardown.");
             }
 
             foreach (var record in records)
@@ -511,10 +640,10 @@ internal sealed class KernelEventRegistry
 
     private static ulong NextNonZero(ref ulong next)
     {
-        var value = next;
-        unchecked { next++; }
-        if (value == 0)
+        if (next == 0)
             throw new InvalidOperationException("Kernel event identity space is exhausted.");
+        var value = next;
+        next = value == ulong.MaxValue ? 0 : value + 1;
         return value;
     }
 }

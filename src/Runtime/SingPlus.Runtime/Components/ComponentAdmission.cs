@@ -83,22 +83,33 @@ public sealed record ComponentLifecycleSnapshot(
 
 internal sealed class ComponentAdmissionRecord
 {
+    // Metadata only. Never hold this gate across registry/provider admission.
+    internal object SnapshotGate { get; } = new();
+    private ManifestAdmissionResultV1 _admission = null!;
+    private ComponentLifecycleState _state = ComponentLifecycleState.Declared;
+    private PlatformDomainBinding? _platformBinding;
+    private DeviceResourceSet? _deviceResources;
+    private KernelError? _failure;
     public required ComponentAdmissionPlan Plan { get; init; }
     public required ServiceManifestV1 Manifest { get; init; }
     public required ProcessHandle Process { get; init; }
-    public required ManifestAdmissionResultV1 Admission { get; set; }
+    public required ManifestAdmissionResultV1 Admission { get { lock (SnapshotGate) return _admission; } set { lock (SnapshotGate) _admission = value; } }
     public required BudgetAccountHandle ServiceBudget { get; init; }
     public required BudgetAccountHandle ProcessBudget { get; init; }
-    public ComponentLifecycleState State { get; set; } = ComponentLifecycleState.Declared;
+    public ComponentLifecycleState State { get { lock (SnapshotGate) return _state; } set { lock (SnapshotGate) _state = value; } }
     public List<CapabilityId> Capabilities { get; } = [];
     public List<EndpointSessionHandle> Sessions { get; } = [];
     public Dictionary<ServiceContractIdentity, EndpointSessionHandle> DependencySessions { get; } = [];
     public List<ServiceEndpointDescriptor> Services { get; } = [];
-    public PlatformDomainBinding? PlatformBinding { get; set; }
-    public DeviceResourceSet? DeviceResources { get; set; }
-    public KernelError? Failure { get; set; }
+    public PlatformDomainBinding? PlatformBinding { get { lock (SnapshotGate) return _platformBinding; } set { lock (SnapshotGate) _platformBinding = value; } }
+    public DeviceResourceSet? DeviceResources { get { lock (SnapshotGate) return _deviceResources; } set { lock (SnapshotGate) _deviceResources = value; } }
+    public KernelError? Failure { get { lock (SnapshotGate) return _failure; } set { lock (SnapshotGate) _failure = value; } }
 
-    public ComponentLifecycleSnapshot Snapshot => new(
+    public ComponentLifecycleSnapshot Snapshot
+    {
+        get
+        {
+            lock (SnapshotGate) return new(
         Manifest.Identity, Manifest.Version, Manifest.ImageDigest, Process, Manifest.Process.DomainId, State,
         Manifest.ProvidedContracts.Select(x => x.Contract).ToArray(), Manifest.RequiredContracts.ToArray(),
         Manifest.ResourceRequirements.ToArray(), Capabilities.ToArray(), Sessions.ToArray(), PlatformBinding is not null,
@@ -107,4 +118,6 @@ internal sealed class ComponentAdmissionRecord
         Services.Select(service => new ServiceInstanceHandle(service.Service.Id, service.Generation, Process, Manifest.Process.DomainId)).ToArray(),
         ServiceBudget,
         ProcessBudget);
+        }
+    }
 }

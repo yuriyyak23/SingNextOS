@@ -7,25 +7,49 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
     IPlatformRegionVisibilityProvider,
     IPlatformRegionRevocationProvider
 {
+    private sealed record OwnedMapFailure(PlatformProviderRegionMappingId InvocationId,
+        PlatformProviderDomainLease Domain, NeutralDomainBindingLease NeutralDomain,
+        PlatformRegionSlice Slice, NeutralOwnedRegionSlice NeutralSlice, NeutralOwnedRegionMapResult? Observation);
     private sealed class ProviderMappingRecord(
         PlatformProviderOwnedRegionMapping mapping,
         NeutralOwnedRegionMappingLease hybridCpuLease)
     {
         public PlatformProviderOwnedRegionMapping Mapping { get; } = mapping;
         public NeutralOwnedRegionMappingLease HybridCpuLease { get; } = hybridCpuLease;
+        public DomainRecord? MapParent { get; init; }
+        public bool GuestMapInFlight { get; set; }
+        public GuestMapFailure? FailedGuestMap { get; set; }
         public bool Revoked { get; set; }
+        public bool DmaBindInFlight { get; set; }
+        public DmaBindFailure? FailedDmaBind { get; set; }
+        public bool VisibilityInFlight { get; set; }
+        public bool VisibilityUncertain { get; set; }
+        public PlatformRegionVisibilityRequest? VisibilityRequest { get; set; }
+        public DomainRecord? VisibilityParent { get; set; }
+        public NeutralOwnedRegionVisibilityResult? VisibilityObservation { get; set; }
+        public bool CloseInFlight { get; set; }
+        public bool CloseUncertain { get; set; }
+        public NeutralOwnedRegionCloseResult? CloseObservation { get; set; }
+        public DomainRecord? CloseParent { get; set; }
+        public NeutralOwnedRegionAcquireResult? AcquireObservation { get; set; }
+        public ProviderOperationRecord? CloseOperation { get; set; }
     }
 
     private sealed class ProviderOperationRecord(
         PlatformOperationIdentity identity,
-        PlatformCompletionReceipt receipt)
+        PlatformCompletionReceipt receipt,
+        ProviderMappingRecord mappingSource)
     {
         public PlatformOperationIdentity Identity { get; } = identity;
         public PlatformCompletionReceipt Receipt { get; } = receipt;
+        public ProviderMappingRecord MappingSource { get; } = mappingSource;
     }
 
     private readonly Dictionary<PlatformProviderRegionMappingId, ProviderMappingRecord>
         _providerMappings = [];
+    // Same authoritative mapping records; the routing projection may never replace them.
+    private readonly Dictionary<PlatformProviderRegionMappingId, ProviderMappingRecord>
+        _originalProviderMappings = [];
     private readonly Dictionary<PlatformOperationId, ProviderOperationRecord>
         _providerOperations = [];
     private ulong _nextProviderMappingId = 1;
@@ -61,16 +85,52 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                 "The exact region slice is owned by a different Sing subject.");
         }
 
-        var domainRecord = _domains[domainLease.LeaseId];
+        DomainRecord domainRecord;
+        PlatformProviderRegionMappingId reservedId;
         var neutralSlice = new NeutralOwnedRegionSlice(
             slice.Offset,
             slice.Length,
             ToNeutralAccess(slice.Access));
-        var external = _runtime.MapOwnedRegion(
-            domainRecord.HybridCpuLease,
-            neutralSlice);
+        lock (_childCreateCommitGate)
+        {
+            var current = ValidateDomain(domainLease);
+            if (!current.IsSuccess)
+                return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(current.Status, current.Message!);
+            domainRecord = _domains[domainLease.LeaseId];
+            if (domainRecord.OwnedMapInFlight || domainRecord.FailedOwnedMap is not null)
+                return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(PlatformAuthorityStatus.NotAccepted,
+                    "Original owned mapping invocation is in flight or pinned.");
+            if (_nextProviderMappingId == 0 || _nextProviderMappingId == ulong.MaxValue)
+                return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(PlatformAuthorityStatus.NotAccepted,
+                    "Owned mapping identity capacity is exhausted before neutral invocation.");
+            _providerMappings.EnsureCapacity(checked(_providerMappings.Count + 1));
+            _originalProviderMappings.EnsureCapacity(checked(_originalProviderMappings.Count + 1));
+            reservedId = new(_nextProviderMappingId++);
+            domainRecord.OwnedMapInFlight = true;
+        }
+        try
+        {
+        NeutralOwnedRegionMapResult external;
+        try { external = _runtime.MapOwnedRegion(domainRecord.HybridCpuLease, neutralSlice); }
+        catch
+        {
+            lock (_childCreateCommitGate)
+                domainRecord.FailedOwnedMap ??= new(reservedId, domainLease, domainRecord.HybridCpuLease, slice, neutralSlice, null);
+            throw;
+        }
+        lock (_childCreateCommitGate)
+        {
+        if (external is null)
+        {
+            domainRecord.FailedOwnedMap ??= new(reservedId, domainLease, domainRecord.HybridCpuLease, slice, neutralSlice, null);
+            return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(PlatformAuthorityStatus.Faulted,
+                "Original owned mapping outcome is absent; source remains pinned.");
+        }
         if (!external.IsMapped)
         {
+            if (external.Lease != default ||
+                external.Decision is not (NeutralOwnedRegionMapDecision.InvalidRange or NeutralOwnedRegionMapDecision.InvalidAccess))
+                domainRecord.FailedOwnedMap ??= new(reservedId, domainLease, domainRecord.HybridCpuLease, slice, neutralSlice, external);
             var status = external.Decision switch
             {
                 NeutralOwnedRegionMapDecision.InvalidRange => PlatformAuthorityStatus.Denied,
@@ -80,32 +140,45 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                 NeutralOwnedRegionMapDecision.NotFound => PlatformAuthorityStatus.Faulted,
                 _ => PlatformAuthorityStatus.Faulted,
             };
+            if (external.Lease != default) status = PlatformAuthorityStatus.Faulted;
             return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(
                 status,
                 external.Reason);
         }
 
-        if (external.Lease.DomainLease != domainRecord.HybridCpuLease ||
+        if (external.Decision != NeutralOwnedRegionMapDecision.Mapped || external.Lease.Handle.Value == 0 ||
+            external.Lease.Epoch.Value == 0 || external.Lease.DomainLease != domainRecord.HybridCpuLease ||
             external.Lease.Slice != neutralSlice ||
             external.Lease.Coherence != NeutralMemoryCoherenceModel.NonCoherent)
         {
-            _ = _runtime.CloseOwnedRegionMapping(external.Lease);
+            domainRecord.FailedOwnedMap ??= new(reservedId, domainLease, domainRecord.HybridCpuLease, slice, neutralSlice, external);
             return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(
                 PlatformAuthorityStatus.Faulted,
                 "HybridCPU returned mapping evidence that does not match the exact provider request.");
         }
 
+        if (!ValidateDomain(domainLease).IsSuccess ||
+            !_domains.TryGetValue(domainLease.LeaseId, out var finalDomain) || !ReferenceEquals(finalDomain, domainRecord))
+        {
+            domainRecord.FailedOwnedMap ??= new(reservedId, domainLease, domainRecord.HybridCpuLease, slice, neutralSlice, external);
+            return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(PlatformAuthorityStatus.Faulted,
+                "Original exact owned mapping retained without current owner publication.");
+        }
+
         var lease = new PlatformProviderRegionMappingLease(
-            new PlatformProviderRegionMappingId(NextNonZero(ref _nextProviderMappingId)),
+            reservedId,
             new PlatformProviderLeaseGeneration(1),
             domainRecord.Lease,
             slice.Region,
             slice.Access);
         var mapping = new PlatformProviderOwnedRegionMapping(lease, slice);
-        _providerMappings.Add(
-            lease.MappingId,
-            new ProviderMappingRecord(mapping, external.Lease));
+        var originalMapping = new ProviderMappingRecord(mapping, external.Lease) { MapParent = domainRecord };
+        _originalProviderMappings.Add(lease.MappingId, originalMapping);
+        _providerMappings.Add(lease.MappingId, originalMapping);
         return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Ok(mapping);
+        }
+        }
+        finally { lock (_childCreateCommitGate) domainRecord.OwnedMapInFlight = false; }
     }
 
     public PlatformAuthorityResult<PlatformRegionVisibilityResult> PrepareRegionMappingForConsumer(
@@ -119,56 +192,99 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                 requestValidation.Message ?? "The region-visibility request is invalid.");
         }
 
-        var mappingValidation = ValidateProviderMapping(request.Mapping, request.Slice);
-        if (!mappingValidation.IsSuccess)
+        ProviderMappingRecord record;
+        DomainRecord parent;
+        lock (_childCreateCommitGate)
         {
-            return PlatformAuthorityResult<PlatformRegionVisibilityResult>.Fail(
-                mappingValidation.Status,
-                mappingValidation.Message ?? "The provider mapping is not live.");
-        }
-
-        var record = _providerMappings[request.Mapping.MappingId];
-        if (request.Consumer != PlatformMemoryConsumerClass.ExternalExecutionDomain)
-        {
-            return PlatformAuthorityResult<PlatformRegionVisibilityResult>.Ok(
-                VisibilityResult(request, PlatformMemoryVisibilityOutcome.Unsupported));
-        }
-
-        var external = _runtime.PrepareOwnedRegionVisibility(
-            record.HybridCpuLease,
-            ToNeutralVisibilityRequirement(request.Requirement));
-        switch (external.Decision)
-        {
-            case NeutralOwnedRegionVisibilityDecision.Satisfied:
-                if (external.Lease != record.HybridCpuLease ||
-                    external.Requirement != ToNeutralVisibilityRequirement(request.Requirement))
-                {
-                    return PlatformAuthorityResult<PlatformRegionVisibilityResult>.Fail(
-                        PlatformAuthorityStatus.Faulted,
-                        "HybridCPU returned visibility evidence for a different mapping lease.");
-                }
-
-                return PlatformAuthorityResult<PlatformRegionVisibilityResult>.Ok(
-                    VisibilityResult(request, FromNeutralVisibilityOutcome(external.Outcome)));
-
-            case NeutralOwnedRegionVisibilityDecision.Unsupported:
+            var validation = ValidateProviderMapping(request.Mapping, request.Slice);
+            if (!validation.IsSuccess)
+                return PlatformAuthorityResult<PlatformRegionVisibilityResult>.Fail(validation.Status, validation.Message!);
+            record = _providerMappings[request.Mapping.MappingId];
+            var domainValidation = ValidateDomain(request.Mapping.DomainLease);
+            if (!domainValidation.IsSuccess)
+                return PlatformAuthorityResult<PlatformRegionVisibilityResult>.Fail(domainValidation.Status, domainValidation.Message!);
+            parent = _domains[request.Mapping.DomainLease.LeaseId];
+            if (record.VisibilityInFlight || record.VisibilityUncertain ||
+                (record.VisibilityRequest is { } previous && (previous != request || !ReferenceEquals(record.VisibilityParent, parent))))
+                return PlatformAuthorityResult<PlatformRegionVisibilityResult>.Fail(PlatformAuthorityStatus.Faulted,
+                    "Original visibility invocation is pending, unknown or belongs to a different source.");
+            if (request.Consumer != PlatformMemoryConsumerClass.ExternalExecutionDomain)
                 return PlatformAuthorityResult<PlatformRegionVisibilityResult>.Ok(
                     VisibilityResult(request, PlatformMemoryVisibilityOutcome.Unsupported));
-
-            case NeutralOwnedRegionVisibilityDecision.Revoked:
-                record.Revoked = true;
-                return PlatformAuthorityResult<PlatformRegionVisibilityResult>.Fail(
-                    PlatformAuthorityStatus.Revoked,
-                    external.Reason);
-
-            case NeutralOwnedRegionVisibilityDecision.Stale:
-            case NeutralOwnedRegionVisibilityDecision.NotFound:
-            case NeutralOwnedRegionVisibilityDecision.Faulted:
-            default:
-                return PlatformAuthorityResult<PlatformRegionVisibilityResult>.Fail(
-                    PlatformAuthorityStatus.Faulted,
-                    external.Reason);
+            record.VisibilityRequest ??= request;
+            record.VisibilityParent ??= parent;
+            record.VisibilityInFlight = true;
         }
+        try
+        {
+            NeutralOwnedRegionVisibilityResult external;
+            try { external = record.VisibilityObservation ?? _runtime.PrepareOwnedRegionVisibility(
+                record.HybridCpuLease, ToNeutralVisibilityRequirement(request.Requirement)); }
+            catch
+            {
+                lock (_childCreateCommitGate) record.VisibilityUncertain = true;
+                throw;
+            }
+            lock (_childCreateCommitGate)
+            {
+                record.VisibilityObservation = external;
+                if (external is null || !Enum.IsDefined(external.Decision) || !Enum.IsDefined(external.Outcome) ||
+                    external.Lease != record.HybridCpuLease ||
+                    external.Requirement != ToNeutralVisibilityRequirement(request.Requirement))
+                {
+                    record.VisibilityUncertain = true;
+                    return PlatformAuthorityResult<PlatformRegionVisibilityResult>.Fail(PlatformAuthorityStatus.Faulted,
+                        "Original visibility observation is absent, unknown or mismatches its invocation.");
+                }
+                var expectedOutcome = request.Requirement switch
+                {
+                    PlatformMemoryVisibilityRequirement.CoherentAccess => NeutralMemoryVisibilityOutcome.Coherent,
+                    PlatformMemoryVisibilityRequirement.PublicationFence => NeutralMemoryVisibilityOutcome.PublicationFenceSatisfied,
+                    PlatformMemoryVisibilityRequirement.CacheMaintenance => NeutralMemoryVisibilityOutcome.CacheMaintenanceSatisfied,
+                    _ => NeutralMemoryVisibilityOutcome.Unsupported
+                };
+                if ((external.Decision == NeutralOwnedRegionVisibilityDecision.Satisfied &&
+                        (external.Outcome != expectedOutcome ||
+                         (external.Outcome == NeutralMemoryVisibilityOutcome.Coherent &&
+                          record.HybridCpuLease.Coherence != NeutralMemoryCoherenceModel.Coherent))) ||
+                    (external.Decision == NeutralOwnedRegionVisibilityDecision.Unsupported &&
+                        external.Outcome != NeutralMemoryVisibilityOutcome.Unsupported))
+                {
+                    record.VisibilityUncertain = true;
+                    return PlatformAuthorityResult<PlatformRegionVisibilityResult>.Fail(PlatformAuthorityStatus.Faulted,
+                        "Visibility outcome does not refine the requested semantics.");
+                }
+                if (!_providerMappings.TryGetValue(request.Mapping.MappingId, out var current) || !ReferenceEquals(current, record) ||
+                    !_domains.TryGetValue(parent.Lease.LeaseId, out var currentParent) || !ReferenceEquals(currentParent, parent) ||
+                    !ValidateDomain(request.Mapping.DomainLease).IsSuccess ||
+                    !ValidateProviderMapping(request.Mapping, request.Slice).IsSuccess)
+                    return PlatformAuthorityResult<PlatformRegionVisibilityResult>.Fail(PlatformAuthorityStatus.Faulted,
+                        "Original visibility observation retained without current source publication.");
+                switch (external.Decision)
+                {
+                    case NeutralOwnedRegionVisibilityDecision.Satisfied:
+                    case NeutralOwnedRegionVisibilityDecision.Unsupported:
+                        var result = VisibilityResult(request, external.Decision == NeutralOwnedRegionVisibilityDecision.Unsupported
+                            ? PlatformMemoryVisibilityOutcome.Unsupported : FromNeutralVisibilityOutcome(external.Outcome));
+                        var resultValidation = PlatformRegionVisibilityContract.ValidateResult(request, result);
+                        if (!resultValidation.IsSuccess)
+                        {
+                            record.VisibilityUncertain = true;
+                            return PlatformAuthorityResult<PlatformRegionVisibilityResult>.Fail(PlatformAuthorityStatus.Faulted,
+                                resultValidation.Message!);
+                        }
+                        record.VisibilityObservation = null;
+                        record.VisibilityRequest = null;
+                        record.VisibilityParent = null;
+                        return PlatformAuthorityResult<PlatformRegionVisibilityResult>.Ok(result);
+                    default:
+                        record.VisibilityUncertain = true;
+                        return PlatformAuthorityResult<PlatformRegionVisibilityResult>.Fail(PlatformAuthorityStatus.Faulted,
+                            "Visibility response does not establish mapping closure: " + external.Reason);
+                }
+            }
+        }
+        finally { lock (_childCreateCommitGate) record.VisibilityInFlight = false; }
     }
 
     public PlatformAuthorityResult<PlatformRegionRevocationTicket> BeginRegionMappingRevocation(
@@ -182,7 +298,12 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                 "Only drain-before-revoke is supported for neutral owned-region mappings.");
         }
 
-        var validation = ValidateProviderMapping(mapping, expectedSlice: null);
+        PlatformOperationIdentity operation;
+        ProviderMappingRecord original;
+        ProviderOperationRecord fact;
+        lock (_childCreateCommitGate)
+        {
+        var validation = ValidateProviderMapping(mapping, expectedSlice: null, allowClose: true);
         if (!validation.IsSuccess)
         {
             return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Fail(
@@ -190,7 +311,22 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                 validation.Message ?? "The provider mapping is not live.");
         }
 
-        var close = CloseProviderRegionMapping(mapping);
+        original = _providerMappings[mapping.MappingId];
+        if (original.CloseInFlight || original.CloseUncertain || original.VisibilityInFlight || HasActiveProviderGuestMappings(mapping))
+            return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Fail(PlatformAuthorityStatus.Faulted,
+                "Original mapping close is pending or unknown; repeat refused before operation reservation.");
+        if (_nextProviderOperationId is 0 or ulong.MaxValue)
+            return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Fail(PlatformAuthorityStatus.Faulted,
+                "Provider operation identity capacity is exhausted before mapping close.");
+        operation = new PlatformOperationIdentity(new PlatformOperationId(_nextProviderOperationId++),
+            new PlatformOperationGeneration(1), mapping.DomainLease);
+        _providerOperations.EnsureCapacity(checked(_providerOperations.Count + 1));
+        // Immutable intended output, unpublished until exact original Close succeeds.
+        fact = new(operation, new(operation.OperationId, operation.Generation,
+            operation.DomainLease, PlatformCompletionState.Closed), original);
+        }
+
+        var close = CloseProviderRegionMapping(mapping, original);
         if (!close.IsSuccess)
         {
             return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Fail(
@@ -198,18 +334,17 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                 close.Message ?? "The provider mapping could not be closed.");
         }
 
-        var operation = new PlatformOperationIdentity(
-            new PlatformOperationId(NextNonZero(ref _nextProviderOperationId)),
-            new PlatformOperationGeneration(1),
-            mapping.DomainLease);
-        var receipt = new PlatformCompletionReceipt(
-            operation.OperationId,
-            operation.Generation,
-            operation.DomainLease,
-            PlatformCompletionState.Closed);
-        _providerOperations.Add(
-            operation.OperationId,
-            new ProviderOperationRecord(operation, receipt));
+        lock (_childCreateCommitGate)
+        {
+            // Retain the completed fact before routing publication; neither a lost
+            // index nor an allocation failure may erase a legally completed Close.
+            original.CloseOperation = fact;
+            if (!_originalProviderMappings.TryGetValue(mapping.MappingId, out var current) || !ReferenceEquals(current, original) ||
+                !original.Revoked || original.CloseObservation?.Decision is not (NeutralOwnedRegionCloseDecision.Closed or NeutralOwnedRegionCloseDecision.Revoked))
+                return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Fail(PlatformAuthorityStatus.Faulted,
+                    "Original completed mapping operation retained without owner publication.");
+            _providerOperations.Add(operation.OperationId, fact);
+        }
 
         return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Ok(
             new PlatformRegionRevocationTicket(
@@ -221,7 +356,25 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
     public PlatformAuthorityResult<PlatformCompletionReceipt> ObserveCompletion(
         PlatformOperationIdentity operation)
     {
-        if (!_providerOperations.TryGetValue(operation.OperationId, out var record))
+        lock (_childCreateCommitGate)
+        {
+        ProviderOperationRecord? record;
+        if (_providerOperations.TryGetValue(operation.OperationId, out var routed))
+        {
+            if (routed.Identity.OperationId != operation.OperationId ||
+                !_originalProviderMappings.TryGetValue(routed.MappingSource.Mapping.Lease.MappingId, out var owner) ||
+                !ReferenceEquals(owner, routed.MappingSource) || !ReferenceEquals(owner.CloseOperation, routed))
+                return PlatformAuthorityResult<PlatformCompletionReceipt>.Fail(PlatformAuthorityStatus.Faulted,
+                    "Provider completion route is not the original completed fact.");
+            record = routed;
+        }
+        else
+        {
+            var source = _originalProviderMappings.Values.FirstOrDefault(mapping => mapping.CloseOperation?.Identity.OperationId == operation.OperationId);
+            record = source?.CloseOperation;
+            if (record is not null && !ReferenceEquals(record.MappingSource, source)) record = null;
+        }
+        if (record is null)
         {
             return PlatformAuthorityResult<PlatformCompletionReceipt>.Fail(
                 PlatformAuthorityStatus.Denied,
@@ -257,17 +410,32 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
         }
 
         return PlatformAuthorityResult<PlatformCompletionReceipt>.Ok(record.Receipt);
+        }
     }
 
     private bool HasActiveProviderMappings(PlatformProviderDomainLease domainLease) =>
-        _providerMappings.Values.Any(record =>
+        _originalProviderMappings.Values.Any(record =>
             !record.Revoked && record.Mapping.Lease.DomainLease == domainLease);
 
     private PlatformAuthorityResult CloseProviderRegionMapping(
-        PlatformProviderRegionMappingLease mapping)
+        PlatformProviderRegionMappingLease mapping, ProviderMappingRecord? expectedOriginal = null)
     {
-        var validation = ValidateProviderMapping(mapping, expectedSlice: null);
+        ProviderMappingRecord record;
+        DomainRecord parent;
+        lock (_childCreateCommitGate)
+        {
+        var validation = ValidateProviderMapping(mapping, expectedSlice: null, allowClose: true);
         if (!validation.IsSuccess) return validation;
+        record = _providerMappings[mapping.MappingId];
+        if (expectedOriginal is not null && !ReferenceEquals(record, expectedOriginal))
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Mapping owner changed after operation preparation.");
+        if (record.CloseInFlight || record.CloseUncertain || record.VisibilityInFlight || HasActiveProviderGuestMappings(mapping))
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted,
+                "Original mapping close is in flight or has an unknown outcome; repeat refused.");
+        if (!_domains.TryGetValue(mapping.DomainLease.LeaseId, out parent!) || parent.Lease != mapping.DomainLease ||
+            parent.RootCloseInFlight)
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted,
+                "Original mapping parent is absent, changed or closing.");
 
         if (HasActiveProviderDmaGrants(mapping))
         {
@@ -276,8 +444,34 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                 "HybridCPU DMA grants must close before the provider region mapping.");
         }
 
-        var record = _providerMappings[mapping.MappingId];
-        var external = _runtime.CloseOwnedRegionMapping(record.HybridCpuLease);
+        if (record.CloseParent is not null && !ReferenceEquals(record.CloseParent, parent))
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Original mapping close parent owner has changed.");
+        record.CloseParent ??= parent;
+        record.CloseInFlight = true;
+        }
+        try
+        {
+        NeutralOwnedRegionCloseResult external;
+        try { external = record.CloseObservation ?? _runtime.CloseOwnedRegionMapping(record.HybridCpuLease); }
+        catch
+        {
+            lock (_childCreateCommitGate) record.CloseUncertain = true;
+            throw;
+        }
+        lock (_childCreateCommitGate)
+        {
+        if (external is null)
+        {
+            record.CloseUncertain = true;
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Original mapping close observation is absent.");
+        }
+        record.CloseObservation = external;
+        if (!_providerMappings.TryGetValue(mapping.MappingId, out var current) || !ReferenceEquals(current, record) ||
+            record.Mapping.Lease != mapping || record.HybridCpuLease.DomainLease != parent.HybridCpuLease ||
+            !_domains.TryGetValue(mapping.DomainLease.LeaseId, out var currentParent) || !ReferenceEquals(currentParent, parent) ||
+            parent.Lease != mapping.DomainLease || parent.Revoked || parent.RootCloseInFlight || HasActiveProviderDmaGrants(mapping))
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted,
+                "Original mapping close observation retained without current owner/source publication.");
         switch (external.Decision)
         {
             case NeutralOwnedRegionCloseDecision.Closed:
@@ -285,34 +479,47 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                 record.Revoked = true;
                 return PlatformAuthorityResult.Ok();
             case NeutralOwnedRegionCloseDecision.ActiveDependents:
+                record.CloseObservation = null;
+                record.CloseParent = null;
                 return PlatformAuthorityResult.Fail(
                     PlatformAuthorityStatus.Denied,
                     external.Reason);
             case NeutralOwnedRegionCloseDecision.Stale:
+                record.CloseUncertain = true;
                 return PlatformAuthorityResult.Fail(
                     PlatformAuthorityStatus.Faulted,
                     "HybridCPU rejected the provider-owned mapping lease as stale; closure is not proven.");
             case NeutralOwnedRegionCloseDecision.NotFound:
+                record.CloseUncertain = true;
                 return PlatformAuthorityResult.Fail(
                     PlatformAuthorityStatus.Faulted,
                     "HybridCPU no longer recognizes the provider-owned mapping lease; closure is not proven.");
             default:
+                record.CloseUncertain = true;
                 return PlatformAuthorityResult.Fail(
                     PlatformAuthorityStatus.Faulted,
                     external.Reason);
         }
+        }
+        }
+        finally { lock (_childCreateCommitGate) record.CloseInFlight = false; }
     }
 
     private PlatformAuthorityResult ValidateProviderMapping(
         PlatformProviderRegionMappingLease mapping,
-        PlatformRegionSlice? expectedSlice)
+        PlatformRegionSlice? expectedSlice,
+        bool allowClose = false)
     {
+        lock (_childCreateCommitGate)
+        {
         if (!_providerMappings.TryGetValue(mapping.MappingId, out var record))
         {
             return PlatformAuthorityResult.Fail(
                 PlatformAuthorityStatus.Denied,
                 "The provider mapping does not exist.");
         }
+        if (!_originalProviderMappings.TryGetValue(mapping.MappingId, out var original) || !ReferenceEquals(original, record))
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Provider mapping route is not the original owner.");
 
         if (record.Mapping.Lease.Generation != mapping.Generation)
         {
@@ -378,8 +585,14 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                 PlatformAuthorityStatus.Revoked,
                 "The provider mapping has already been revoked.");
         }
+        if (!allowClose && (record.CloseInFlight || record.CloseUncertain || record.CloseObservation is not null))
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted,
+                "Original mapping close is pending or retained; new mapping effects refused.");
+        if (!_domains.TryGetValue(mapping.DomainLease.LeaseId, out var parent) || !ReferenceEquals(parent, record.MapParent))
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Original mapping parent changed before admission.");
 
         return PlatformAuthorityResult.Ok();
+        }
     }
 
     private static PlatformRegionVisibilityResult VisibilityResult(

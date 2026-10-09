@@ -44,10 +44,10 @@ public sealed class AuthorityInspector
             return KernelResult<AuthorityInspectionSnapshot>.Fail(access.Error, access.Message!);
 
         if (consistency == AuthorityInspectionConsistency.HistoricalReference)
-            return KernelResult<AuthorityInspectionSnapshot>.Ok(Materialize(BuildHistoricalProjection(), consistency));
+            return Materialize(BuildHistoricalProjection(), consistency);
 
         if (consistency == AuthorityInspectionConsistency.PointInTimeBestEffort)
-            return KernelResult<AuthorityInspectionSnapshot>.Ok(Materialize(BuildLiveProjection(), consistency));
+            return Materialize(BuildLiveProjection(), consistency);
 
         // A bounded stable cut: every owning registry supplies detached snapshots; the complete
         // projection must converge twice before it is labelled AuthorityLockedSnapshot.
@@ -56,7 +56,7 @@ public sealed class AuthorityInspector
             var first = BuildLiveProjection();
             var second = BuildLiveProjection();
             if (string.Equals(first.Fingerprint, second.Fingerprint, StringComparison.Ordinal))
-                return KernelResult<AuthorityInspectionSnapshot>.Ok(Materialize(second, consistency));
+                return Materialize(second, consistency);
         }
 
         return KernelResult<AuthorityInspectionSnapshot>.Fail(
@@ -82,6 +82,7 @@ public sealed class AuthorityInspector
             return KernelResult<AuthorityInspectionSnapshot>.Fail(KernelError.ProjectionDenied, "Cross-service capability inspection requires system inspection authority.");
 
         var full = Materialize(BuildLiveProjection(), AuthorityInspectionConsistency.PointInTimeBestEffort);
+        if (!full.IsSuccess) return full;
         var ids = new HashSet<AuthorityNodeId> { CapabilityNodeId(target.Descriptor) };
         var byId = records.ToDictionary(record => record.Descriptor.CapabilityId);
         var cursor = target;
@@ -93,31 +94,31 @@ public sealed class AuthorityInspector
                 ids.Add(RedactedNodeId());
             cursor = parent;
         }
-        return KernelResult<AuthorityInspectionSnapshot>.Ok(SelectSubgraph(full, ids));
+        return KernelResult<AuthorityInspectionSnapshot>.Ok(SelectSubgraph(full.Value!, ids));
     }
 
     public KernelResult<AuthorityInspectionExplanation> WhyMoveBlocked(RegionHandle region)
     {
         var resolved = ResolveVisibleRegion(region);
         if (resolved.Error == KernelError.StaleGeneration)
-            return KernelResult<AuthorityInspectionExplanation>.Ok(Explanation([
+            return Explanation([
                 new(AuthorityBlockReasonKind.StaleGeneration, RegionNodeId(region), "The requested region generation is stale and was not merged with the current node.", false)
-            ]));
+            ]);
         if (!resolved.IsSuccess)
             return KernelResult<AuthorityInspectionExplanation>.Fail(resolved.Error, resolved.Message!);
-        return KernelResult<AuthorityInspectionExplanation>.Ok(ExplainRegion(resolved.Value!, includeOwnershipState: true));
+        return ExplainRegion(resolved.Value!, includeOwnershipState: true);
     }
 
     public KernelResult<AuthorityInspectionExplanation> WhyReclaimBlocked(RegionHandle region)
     {
         var resolved = ResolveVisibleRegion(region);
         if (resolved.Error == KernelError.StaleGeneration)
-            return KernelResult<AuthorityInspectionExplanation>.Ok(Explanation([
+            return Explanation([
                 new(AuthorityBlockReasonKind.StaleGeneration, RegionNodeId(region), "The requested region generation is stale and was not merged with the current node.", false)
-            ]));
+            ]);
         if (!resolved.IsSuccess)
             return KernelResult<AuthorityInspectionExplanation>.Fail(resolved.Error, resolved.Message!);
-        return KernelResult<AuthorityInspectionExplanation>.Ok(ExplainRegion(resolved.Value!, includeOwnershipState: false));
+        return ExplainRegion(resolved.Value!, includeOwnershipState: false);
     }
 
     public KernelResult<AuthorityInspectionExplanation> WhyReclaimBlocked(ProcessHandle process)
@@ -130,9 +131,9 @@ public sealed class AuthorityInspector
         {
             var stale = _kernel.Processes.Resolve(process);
             if (stale.Error is KernelError.StaleHandle or KernelError.StaleGeneration)
-                return KernelResult<AuthorityInspectionExplanation>.Ok(Explanation([
+                return Explanation([
                     new(AuthorityBlockReasonKind.StaleGeneration, ProcessNodeId(process), "The requested process generation is stale.", false)
-                ]));
+                ]);
             return KernelResult<AuthorityInspectionExplanation>.Fail(diagnostic.Error, diagnostic.Message!);
         }
 
@@ -157,7 +158,7 @@ public sealed class AuthorityInspector
         }
         if (!diagnostic.Value.Reclaimable && diagnostic.Value.ReclaimRequested && reasons.Count == 0)
             reasons.Add(new(AuthorityBlockReasonKind.ProviderClosurePending, ProcessNodeId(process), "Process teardown has not reached exact reclaim closure.", false));
-        return KernelResult<AuthorityInspectionExplanation>.Ok(Explanation(reasons));
+        return Explanation(reasons);
     }
 
     public KernelResult<AuthorityInspectionExplanation> WhyServiceDrainBlocked(ServiceInstanceHandle service)
@@ -173,9 +174,9 @@ public sealed class AuthorityInspector
         var process = _kernel.Processes.Resolve(record.Provider);
         var domain = process.IsSuccess ? process.Value!.DomainId : default;
         if (record.Descriptor.Generation != service.Generation || record.Provider != service.Process || domain != service.Domain)
-            return KernelResult<AuthorityInspectionExplanation>.Ok(Explanation([
+            return Explanation([
                 new(AuthorityBlockReasonKind.StaleGeneration, ServiceNodeId(service.ServiceId, service.Generation, service.Process), "The requested service instance is stale and was not merged with the current generation.", false)
-            ]));
+            ]);
         return WhyReclaimBlocked(record.Provider);
     }
 
@@ -190,9 +191,9 @@ public sealed class AuthorityInspector
         if (!CanSee(current.Principal))
             return KernelResult<AuthorityInspectionExplanation>.Fail(KernelError.ProjectionDenied, "Cross-service operation inspection requires system inspection authority.");
         if (current.Operation.Generation != operation.Generation)
-            return KernelResult<AuthorityInspectionExplanation>.Ok(Explanation([
+            return Explanation([
                 new(AuthorityBlockReasonKind.StaleGeneration, OperationNodeId(operation), "The requested external-operation generation is stale.", false)
-            ]));
+            ]);
 
         var reasons = new List<AuthorityBlockReason>();
         if (current.State != ExternalOperationState.Released)
@@ -206,7 +207,7 @@ public sealed class AuthorityInspector
         }
         foreach (var use in current.Admission?.RegionUses.Where(static use => use.State == RegionUseState.Active) ?? [])
             reasons.Add(new(AuthorityBlockReasonKind.RegionUseActive, RegionUseNodeId(use.Handle), "An exact RegionUse remains active for this operation.", false));
-        return KernelResult<AuthorityInspectionExplanation>.Ok(Explanation(reasons));
+        return Explanation(reasons);
     }
 
     private KernelResult<AuthorityInspectionSnapshot> SelectRegionSubgraph(RegionHandle region, bool incomingOnly)
@@ -215,22 +216,24 @@ public sealed class AuthorityInspector
         if (resolved.Error == KernelError.StaleGeneration)
         {
             var staleBase = Materialize(BuildLiveProjection(), AuthorityInspectionConsistency.PointInTimeBestEffort);
+            if (!staleBase.IsSuccess) return staleBase;
             var stale = new AuthorityInspectionNode(RegionNodeId(region), AuthorityNodeKind.OwnedRegion, "Stale", region.Generation.Value, true, false);
-            return KernelResult<AuthorityInspectionSnapshot>.Ok(staleBase with { Nodes = [stale], Edges = [] });
+            return KernelResult<AuthorityInspectionSnapshot>.Ok(staleBase.Value! with { Nodes = [stale], Edges = [] });
         }
         if (!resolved.IsSuccess) return KernelResult<AuthorityInspectionSnapshot>.Fail(resolved.Error, resolved.Message!);
         var full = Materialize(BuildLiveProjection(), AuthorityInspectionConsistency.PointInTimeBestEffort);
+        if (!full.IsSuccess) return full;
         var target = RegionNodeId(resolved.Value!.Region.Handle);
         var ids = new HashSet<AuthorityNodeId> { target };
-        foreach (var edge in full.Edges.Where(edge => edge.Target == target || (!incomingOnly && edge.Source == target)))
+        foreach (var edge in full.Value!.Edges.Where(edge => edge.Target == target || (!incomingOnly && edge.Source == target)))
         {
             ids.Add(edge.Source);
             ids.Add(edge.Target);
         }
-        return KernelResult<AuthorityInspectionSnapshot>.Ok(SelectSubgraph(full, ids));
+        return KernelResult<AuthorityInspectionSnapshot>.Ok(SelectSubgraph(full.Value!, ids));
     }
 
-    private AuthorityInspectionExplanation ExplainRegion(RegionAuthorityInspectionRecord region, bool includeOwnershipState)
+    private KernelResult<AuthorityInspectionExplanation> ExplainRegion(RegionAuthorityInspectionRecord region, bool includeOwnershipState)
     {
         var reasons = new List<AuthorityBlockReason>();
         if (region.Borrow is { } borrow)
@@ -248,9 +251,13 @@ public sealed class AuthorityInspector
         return Explanation(reasons);
     }
 
-    private AuthorityInspectionExplanation Explanation(IReadOnlyList<AuthorityBlockReason> reasons) =>
-        new(Materialize(BuildLiveProjection(), AuthorityInspectionConsistency.PointInTimeBestEffort), reasons);
-
+    private KernelResult<AuthorityInspectionExplanation> Explanation(IReadOnlyList<AuthorityBlockReason> reasons)
+    {
+        var snapshot = Materialize(BuildLiveProjection(), AuthorityInspectionConsistency.PointInTimeBestEffort);
+        return snapshot.IsSuccess
+            ? KernelResult<AuthorityInspectionExplanation>.Ok(new(snapshot.Value!, reasons))
+            : KernelResult<AuthorityInspectionExplanation>.Fail(snapshot.Error, snapshot.Message!);
+    }
     private KernelResult<RegionAuthorityInspectionRecord> ResolveVisibleRegion(RegionHandle region)
     {
         var access = ValidateAccess();
@@ -477,19 +484,33 @@ public sealed class AuthorityInspector
         return Projection.Create(nodes.Values, edges, 0);
     }
 
-    private AuthorityInspectionSnapshot Materialize(Projection projection, AuthorityInspectionConsistency consistency)
+    private KernelResult<AuthorityInspectionSnapshot> Materialize(Projection projection, AuthorityInspectionConsistency consistency)
     {
-        ulong sequence;
-        lock (_captureGate) sequence = ++_captureSequence;
-        return new(
-            AuthorityInspectionContract.Version,
-            sequence,
-            _timeProvider.GetTimestamp(),
-            consistency,
-            _systemCapability is null ? AuthorityInspectionScope.Self : AuthorityInspectionScope.System,
-            projection.Nodes,
-            projection.Edges,
-            projection.RedactedFactCount);
+        long timestamp;
+        try { timestamp = _timeProvider.GetTimestamp(); }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        { return KernelResult<AuthorityInspectionSnapshot>.Fail(KernelError.PlatformFaulted, "Inspection clock observation failed."); }
+        var access = ValidateAccess();
+        if (!access.IsSuccess) return KernelResult<AuthorityInspectionSnapshot>.Fail(access.Error, access.Message!);
+        if (consistency == AuthorityInspectionConsistency.AuthorityLockedSnapshot &&
+            BuildLiveProjection().Fingerprint != projection.Fingerprint)
+            return KernelResult<AuthorityInspectionSnapshot>.Fail(KernelError.SnapshotUnstable, "Inspection source changed during timestamp observation.");
+        AuthorityInspectionSnapshot? snapshot = null;
+        var publication = _kernel.CommitAuthorityInspectionPublication(_principal, _systemCapability, () =>
+        {
+            lock (_captureGate)
+            {
+                if (_captureSequence == ulong.MaxValue)
+                    return KernelResult.Fail(KernelError.CapacityExhausted, "Inspection sequence is exhausted.");
+                snapshot = new(AuthorityInspectionContract.Version, ++_captureSequence, timestamp,
+                    consistency, _systemCapability is null ? AuthorityInspectionScope.Self : AuthorityInspectionScope.System,
+                    projection.Nodes, projection.Edges, projection.RedactedFactCount);
+                return KernelResult.Ok();
+            }
+        });
+        return publication.IsSuccess
+            ? KernelResult<AuthorityInspectionSnapshot>.Ok(snapshot!)
+            : KernelResult<AuthorityInspectionSnapshot>.Fail(publication.Error, publication.Message!);
     }
 
     private static AuthorityInspectionSnapshot SelectSubgraph(AuthorityInspectionSnapshot full, HashSet<AuthorityNodeId> ids)
@@ -576,6 +597,19 @@ internal static class ExternalOperationInspectionExtensions
 
 public sealed partial class RuntimeKernel
 {
+    internal KernelResult CommitAuthorityInspectionPublication(ProcessHandle principal,
+        CapabilityId? systemCapability, Func<KernelResult> commit)
+    {
+        lock (_platformMemoryUseGate)
+        {
+            var process = Processes.Resolve(principal);
+            if (!process.IsSuccess) return KernelResult.Fail(process.Error, process.Message!);
+            return systemCapability is { } capability
+                ? CapabilityAuthority.CommitAuthorityInspectionPublication(capability, process.Value!.DomainId, principal.Generation, commit)
+                : commit();
+        }
+    }
+
     public KernelResult<AuthorityInspector> CreateAuthorityInspector(
         ProcessHandle principal,
         CapabilityId? systemInspectionCapability = null,

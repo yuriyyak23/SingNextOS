@@ -39,6 +39,8 @@ public sealed class EmulatorSession
     public SingProcessManifestV1? SystemManifest { get; set; }
     public ProcessHandle? SystemProcess { get; set; }
 
+    internal Dictionary<string, HostedCounterApp> HostedCounters { get; } = new(StringComparer.Ordinal);
+
     public List<SipAdmissionRecord> Sips { get; } = [];
     public Dictionary<string, ServiceEndpointDescriptor> ShellServices { get; } = new(StringComparer.Ordinal);
     public Dictionary<ulong, EndpointSessionHandle> ShellSessions { get; } = [];
@@ -366,6 +368,15 @@ public sealed class EmulatorSession
             report?.Invoke(released.IsSuccess && released.Value!.State == BudgetReservationState.Released
                 ? $"budget reservation {reservation.Reservation.ReservationId.Value} released"
                 : $"budget reservation shutdown incomplete: {released.Error}: {released.Message ?? released.Value?.State.ToString()}");
+        }
+
+        foreach (var (name, app) in HostedCounters.ToArray())
+        {
+            var stopped = app.Stop(this);
+            report?.Invoke(stopped.IsSuccess
+                ? $"hosted application {name} stopped and reclaimed"
+                : $"hosted application {name} shutdown incomplete: {stopped.Error}: {stopped.Message}");
+            if (stopped.IsSuccess) HostedCounters.Remove(name);
         }
 
         var spawned = EmulatorSpawnedPids.ToArray();

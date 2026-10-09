@@ -816,7 +816,7 @@ public sealed class VNextPhase04CrossOwnerAdmissionTests
     }
 
     [Fact]
-    public void RevokeAfterLocalCommitDoesNotRetroactivelyUndoAdmissionWinner()
+    public void RevokeAfterLocalCommitPreservesAdmissionUntilFreshSubmitRefusal()
     {
         var context = Create();
         using var commit = Prepare(context).Value!;
@@ -834,9 +834,14 @@ public sealed class VNextPhase04CrossOwnerAdmissionTests
 
         Assert.Equal(KernelError.CapabilityRevoked, result.Error);
         Assert.Equal(0, callbacks);
-        Assert.Equal(10UL, Used(context));
-        Assert.Equal(BudgetReservationState.Quarantined,
+        Assert.Equal(0UL, Used(context));
+        Assert.Equal(BudgetReservationState.CancelledPreSubmit,
             context.Kernel.Budgets.Query(commit.Lease).Value!.State);
+        var original = context.Kernel.ExternalOperations.Query(context.Operation).Value!;
+        Assert.Null(original.Binding);
+        Assert.Equal(ExternalEffectBoundaryState.NotCrossed, original.EffectBoundary);
+        Assert.Equal(ExternalOperationDisposition.Cancelled, original.Disposition);
+        Assert.DoesNotContain(original.Transitions, item => item.To == ExternalOperationState.Submitted);
     }
 
     [Fact]

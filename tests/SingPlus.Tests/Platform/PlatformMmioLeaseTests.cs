@@ -8,6 +8,723 @@ namespace SingPlus.Tests.Platform;
 public sealed class PlatformMmioLeaseTests
 {
     [Theory]
+    [InlineData(PlatformAuthorityStatus.NotAccepted, 0, false, false)]
+    [InlineData(PlatformAuthorityStatus.Denied, 0, false, false)]
+    [InlineData(PlatformAuthorityStatus.Stale, 0, false, false)]
+    [InlineData((PlatformAuthorityStatus)999, 0, false, false)]
+    [InlineData(PlatformAuthorityStatus.NotAccepted, 1, false, false)]
+    [InlineData(PlatformAuthorityStatus.NotAccepted, 2, false, false)]
+    [InlineData(PlatformAuthorityStatus.NotAccepted, 0, true, false)]
+    [InlineData(PlatformAuthorityStatus.NotAccepted, 0, false, true)]
+    public void FailedOriginalMmioMapAfterEffectRetainsRawAndPinsActualConsumers(
+        PlatformAuthorityStatus status, int ownerLoss, bool sourceThrows, bool lostReply)
+    {
+        var provider = new MmioProvider { MmioMapReplyStatus = status };
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1248, 1808);
+        _ = kernel.AllocateRegion(subject, 4096).Value!;
+        var (device, capability) = CreateAuthorities(kernel, subject, "device/failed-original-map", "registers", 128);
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var devices = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_deviceLeases", flags)!.GetValue(kernel.PlatformAuthority)!;
+        var domains = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_domains", flags)!.GetValue(kernel.PlatformAuthority)!;
+        var original = devices[device.LeaseId]!;
+        var parent = domains[device.DomainBinding.BindingId]!;
+        var sources = (HashSet<object>)parent.GetType().GetProperty("MmioSources")!.GetValue(parent)!;
+        object? foreign = null;
+        object? Read(string name) => original.GetType().GetProperty(name)!.GetValue(original);
+        var effectSeen = false;
+        provider.BeforeMmioMap = () =>
+        {
+            Assert.Equal(true, Read("MmioMapMayHaveEffect"));
+            Assert.Same(parent, Read("MmioMapParent"));
+            Assert.Contains(original, sources);
+            Assert.Null(Read("MmioMapObservation"));
+            Assert.False(Monitor.IsEntered(typeof(PlatformAuthorityBridge).GetField("_secureDomainLifecycleGate", flags)!.GetValue(kernel.PlatformAuthority)!));
+        };
+        provider.AfterMmioMapEffect = () =>
+        {
+            var mappings = (global::System.Collections.IDictionary)provider.GetType().GetField("_mmio", flags)!.GetValue(provider)!;
+            Assert.Equal(1, mappings.Count);
+            effectSeen = true;
+            if (ownerLoss == 1) devices.Remove(device.LeaseId);
+            if (ownerLoss == 2)
+            {
+                foreign = original.GetType().GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+                devices[device.LeaseId] = foreign;
+            }
+            if (sourceThrows) provider.IncarnationRead = () =>
+            {
+                Assert.Equal(status, Assert.IsType<PlatformAuthorityResult<PlatformProviderMmioLease>>(Read("MmioMapObservation")).Status);
+                throw new IOException("Late map source observation failed.");
+            };
+            if (lostReply) throw new IOException("Original map reply lost after provider effect.");
+        };
+        Assert.False(kernel.BindPlatformMmio(subject, device, capability, 0, 64, PlatformMmioAccess.Read).IsSuccess);
+        Assert.True(effectSeen);
+        Assert.Equal(true, Read("MmioMapMayHaveEffect"));
+        Assert.Equal(true, Read("FaultPinned"));
+        Assert.Equal(0, Read("PendingMmioBinds"));
+        Assert.Contains(original, sources);
+        if (lostReply) Assert.Null(Read("MmioMapObservation"));
+        else Assert.Equal(status, Assert.IsType<PlatformAuthorityResult<PlatformProviderMmioLease>>(Read("MmioMapObservation")).Status);
+        if (foreign is not null) Assert.Null(foreign.GetType().GetProperty("MmioMapObservation")!.GetValue(foreign));
+        provider.IncarnationRead = null;
+        provider.AfterMmioMapEffect = null;
+        provider.BeforeMmioMap = null;
+        provider.MmioMapReplyStatus = null;
+        Assert.False(kernel.BindPlatformMmio(subject, device, capability, 0, 64, PlatformMmioAccess.Read).IsSuccess);
+        if (ownerLoss == 0) Assert.False(kernel.RevokeCapability(capability).IsSuccess);
+        Assert.False(kernel.PlatformAuthority.RevokeDomain(device.DomainBinding, device.DomainBinding.Subject).IsSuccess);
+        Assert.False(kernel.TerminateProcess(subject).IsSuccess);
+        Assert.Equal(1, provider.MmioMapCalls);
+        Assert.Equal(0, provider.MmioRevokeCalls);
+        Assert.Equal(0, provider.DeviceRevokeCalls);
+        Assert.Equal(0, provider.DomainRevokeCalls);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
+        Assert.False(kernel.QueryProcessTeardown(subject).Value!.LocalReclaimCompleted);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void KnownMapSourceLifetimeSurvivesLostPublicationIndexAndReleasesOnlyOriginalClosure(bool loseIndex)
+    {
+        var provider = new MmioProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1249, 1809);
+        var (device, capability) = CreateAuthorities(kernel, subject, "device/map-lifetime-index", "registers", 128);
+        var map = kernel.BindPlatformMmio(subject, device, capability, 0, 64, PlatformMmioAccess.Read).Value!;
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var mappings = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_mmioLeases", flags)!.GetValue(kernel.PlatformAuthority)!;
+        var domains = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_domains", flags)!.GetValue(kernel.PlatformAuthority)!;
+        var original = mappings[map.LeaseId]!;
+        var parent = domains[device.DomainBinding.BindingId]!;
+        var sources = (HashSet<object>)parent.GetType().GetProperty("MmioSources")!.GetValue(parent)!;
+        Assert.Contains(original, sources);
+        Assert.True(Assert.IsType<PlatformAuthorityResult<PlatformProviderMmioLease>>(original.GetType().GetProperty("MapObservation")!.GetValue(original)).IsSuccess);
+        if (loseIndex)
+        {
+            mappings.Remove(map.LeaseId);
+            var devices = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_deviceLeases", flags)!.GetValue(kernel.PlatformAuthority)!;
+            devices.Remove(device.LeaseId);
+            Assert.False(kernel.PlatformAuthority.RevokeDomain(device.DomainBinding, device.DomainBinding.Subject).IsSuccess);
+            Assert.Contains(original, sources);
+            Assert.Equal(0, provider.DomainRevokeCalls);
+            Assert.Equal(0, provider.MmioRevokeCalls);
+        }
+        else
+        {
+            Assert.True(kernel.RevokePlatformMmio(subject, map).IsSuccess);
+            Assert.Empty(sources);
+            Assert.True(kernel.RevokePlatformDevice(subject, device).IsSuccess);
+            Assert.True(kernel.PlatformAuthority.RevokeDomain(device.DomainBinding, device.DomainBinding.Subject).IsSuccess);
+            Assert.Equal(1, provider.MmioRevokeCalls);
+            Assert.Equal(1, provider.DomainRevokeCalls);
+        }
+    }
+
+    [Theory]
+    [InlineData(false, 0, false)] [InlineData(false, 0, true)]
+    [InlineData(false, 1, false)] [InlineData(false, 1, true)]
+    [InlineData(false, 2, false)] [InlineData(false, 2, true)]
+    [InlineData(true, 0, false)] [InlineData(true, 0, true)]
+    [InlineData(true, 1, false)] [InlineData(true, 1, true)]
+    [InlineData(true, 2, false)] [InlineData(true, 2, true)]
+    public void KnownMmioClosureRetainsOriginalDomainAndPinsActualReclaim(bool rejectedBind, int ownerLoss, bool sourceThrows)
+    {
+        var provider = new MmioProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1392, 1892);
+        _ = kernel.AllocateRegion(subject, 4096).Value!;
+        var (device, capability) = CreateAuthorities(kernel, subject, "device/known-child-domain", "registers", 128);
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var children = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_mmioLeases", flags)!.GetValue(kernel.PlatformAuthority)!;
+        var devices = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_deviceLeases", flags)!.GetValue(kernel.PlatformAuthority)!;
+        var domains = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_domains", flags)!.GetValue(kernel.PlatformAuthority)!;
+        var originalDomain = domains[device.DomainBinding.BindingId]!;
+        var deviceOwner = devices[device.LeaseId]!;
+        object original = null!;
+        object? foreign = null;
+        provider.AfterMmioRevokeEffect = () =>
+        {
+            original = Assert.Single(children.Values.Cast<object>());
+            Assert.Same(originalDomain, original.GetType().GetProperty("RevokeParent")!.GetValue(original));
+            var providerFacts = (global::System.Collections.IDictionary)provider.GetType().GetField("_mmio", flags)!.GetValue(provider)!; Assert.Empty(providerFacts);
+            if (ownerLoss == 0) domains.Remove(device.DomainBinding.BindingId);
+            else if (ownerLoss == 1)
+            {
+                foreign = originalDomain.GetType().GetMethod("MemberwiseClone", flags)!.Invoke(originalDomain, null)!;
+                domains[device.DomainBinding.BindingId] = foreign;
+            }
+            else originalDomain.GetType().GetProperty("ParentRevokeMayHaveEffect")!.SetValue(originalDomain, true);
+            if (sourceThrows) provider.IncarnationRead = () => throw new IOException("Final child source observation failed.");
+        };
+        if (rejectedBind)
+        {
+            provider.BeforeMmioMap = () => Assert.True(kernel.CapabilityAuthority.Revoke(capability).IsSuccess);
+            Assert.False(kernel.BindPlatformMmio(subject, device, capability, 0, 64, PlatformMmioAccess.Read).IsSuccess);
+        }
+        else
+        {
+            var child = kernel.BindPlatformMmio(subject, device, capability, 0, 64, PlatformMmioAccess.Read).Value!;
+            Assert.Equal(KernelError.PlatformFaulted, kernel.RevokePlatformMmio(subject, child).Error);
+        }
+        Assert.NotNull(original);
+        Assert.True(((PlatformAuthorityResult)original.GetType().GetProperty("RevokeObservation")!.GetValue(original)!).IsSuccess);
+        Assert.Equal(true, original.GetType().GetProperty("ProviderClosureConfirmed")!.GetValue(original));
+        Assert.Equal(false, original.GetType().GetProperty("PlatformClosed")!.GetValue(original));
+        Assert.Equal(false, original.GetType().GetProperty("ClosureInFlight")!.GetValue(original));
+        Assert.Equal(true, deviceOwner.GetType().GetProperty("FaultPinned")!.GetValue(deviceOwner));
+        if (foreign is not null)
+        {
+            Assert.Equal(false, foreign.GetType().GetProperty("ParentRevokeMayHaveEffect")!.GetValue(foreign));
+            Assert.Null(foreign.GetType().GetProperty("RootRevokeObservation")!.GetValue(foreign));
+        }
+        provider.IncarnationRead = null;
+        provider.AfterMmioRevokeEffect = null;
+        Assert.False(kernel.RevokePlatformDevice(subject, device).IsSuccess);
+        Assert.False(kernel.TerminateProcess(subject).IsSuccess);
+        Assert.Equal(1, provider.MmioRevokeCalls);
+        Assert.Equal(0, provider.DeviceRevokeCalls);
+        Assert.True(kernel.Processes.Resolve(subject).IsSuccess);
+        Assert.False(kernel.QueryProcessTeardown(subject).Value!.LocalReclaimCompleted);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
+    }
+
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)]
+    public void MalformedMmioCompensationRetainsRawFactWithoutOriginalClosure(int outcome)
+    {
+        var provider = new MmioProvider { ReturnedMutation = 0 };
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1390, 1890);
+        _ = kernel.AllocateRegion(subject, 4096).Value!;
+        var (device, capability) = CreateAuthorities(kernel, subject, "device/malformed-fact", "registers", 128);
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var facts = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_deviceLeases", flags)!.GetValue(kernel.PlatformAuthority)!;
+        var original = facts[device.LeaseId]!;
+        object? Read(string name) => original.GetType().GetProperty(name)!.GetValue(original);
+        if (outcome == 1) provider.MmioRevokeStatus = PlatformAuthorityStatus.NotAccepted;
+        if (outcome == 2) provider.MmioRevokeStatus = (PlatformAuthorityStatus)999;
+        if (outcome == 3) provider.AfterMmioRevokeEffect = () => throw new IOException("Compensation reply lost after provider effect.");
+        provider.BeforeMmioRevoke = () =>
+        {
+            Assert.Equal(true, Read("MalformedMmioCleanupMayHaveEffect"));
+            Assert.NotNull(Read("MalformedMmioReceipt"));
+            Assert.False(Monitor.IsEntered(typeof(PlatformAuthorityBridge).GetField("_secureDomainLifecycleGate", flags)!.GetValue(kernel.PlatformAuthority)!));
+            Assert.False(kernel.RevokePlatformDevice(subject, device).IsSuccess);
+        };
+        Assert.Equal(KernelError.PlatformFaulted, kernel.BindPlatformMmio(subject, device, capability, 0, 64, PlatformMmioAccess.Read).Error);
+        Assert.Equal(true, Read("MalformedMmioCleanupMayHaveEffect"));
+        if (outcome == 3) Assert.Null(Read("MalformedMmioCleanupObservation"));
+        else
+        {
+            var raw = Assert.IsType<PlatformAuthorityResult>(Read("MalformedMmioCleanupObservation"));
+            if (outcome == 0) Assert.True(raw.IsSuccess);
+            else Assert.Equal(outcome == 1 ? PlatformAuthorityStatus.NotAccepted : (PlatformAuthorityStatus)999, raw.Status);
+        }
+        Assert.Equal(false, Read("ProviderClosureConfirmed"));
+        Assert.True(kernel.PlatformAuthority.HasUnresolvedMmioEffect(id => id == capability));
+        provider.MmioRevokeStatus = null;
+        provider.AfterMmioRevokeEffect = null;
+        Assert.False(kernel.RevokeCapability(capability).IsSuccess);
+        Assert.False(kernel.TerminateProcess(subject).IsSuccess);
+        Assert.Equal(1, provider.MmioRevokeCalls);
+        Assert.Equal(0, provider.DeviceRevokeCalls);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void MalformedMmioCompensationRefusesReplacedParentBeforeCallback(bool domainOwner)
+    {
+        var provider = new MmioProvider { ReturnedMutation = 0 };
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1391, 1891);
+        _ = kernel.AllocateRegion(subject, 4096).Value!;
+        var (device, capability) = CreateAuthorities(kernel, subject, "device/malformed-fact", "registers", 128);
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var deviceFacts = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_deviceLeases", flags)!.GetValue(kernel.PlatformAuthority)!;
+        var deviceOwner = deviceFacts[device.LeaseId]!;
+        var facts = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField(domainOwner ? "_domains" : "_deviceLeases", flags)!.GetValue(kernel.PlatformAuthority)!;
+        object key = domainOwner ? device.DomainBinding.BindingId : device.LeaseId;
+        var original = facts[key]!;
+        var replaced = false;
+        provider.BeforeMmioMap = () =>
+        {
+            var reads = 0;
+            provider.IncarnationRead = () =>
+            {
+                if (++reads != 2) return;
+                provider.IncarnationRead = null;
+                facts[key] = original.GetType().GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+                replaced = true;
+            };
+        };
+        Assert.Equal(KernelError.PlatformFaulted, kernel.BindPlatformMmio(subject, device, capability, 0, 64, PlatformMmioAccess.Read).Error);
+        Assert.True(replaced);
+        Assert.Equal(0, provider.MmioRevokeCalls);
+        Assert.Equal(false, deviceOwner.GetType().GetProperty("MalformedMmioCleanupMayHaveEffect")!.GetValue(deviceOwner));
+        Assert.Null(deviceOwner.GetType().GetProperty("MalformedMmioCleanupObservation")!.GetValue(deviceOwner));
+        Assert.NotNull(deviceOwner.GetType().GetProperty("MalformedMmioReceipt")!.GetValue(deviceOwner));
+        Assert.False(kernel.TerminateProcess(subject).IsSuccess);
+        Assert.Equal(0, provider.DeviceRevokeCalls);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void RejectedMmioCleanupRefusesChangedOriginalParentBeforeEffect(bool domainOwner)
+    {
+        var provider = new MmioProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1245, 1805);
+        _ = kernel.AllocateRegion(subject, 4096).Value!;
+        var (device, capability) = CreateAuthorities(kernel, subject, "device/rejected-mmio-source", "registers", 128);
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var facts = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField(domainOwner ? "_domains" : "_deviceLeases", flags)!.GetValue(kernel.PlatformAuthority)!;
+        object key = domainOwner ? device.DomainBinding.BindingId : device.LeaseId;
+        var original = facts[key]!;
+        var replaced = false;
+        provider.BeforeMmioMap = () =>
+        {
+            Assert.True(kernel.CapabilityAuthority.Revoke(capability).IsSuccess);
+            var reads = 0;
+            provider.IncarnationRead = () =>
+            {
+                if (++reads != 2) return;
+                provider.IncarnationRead = null;
+                facts[key] = original.GetType().GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+                replaced = true;
+            };
+        };
+        Assert.False(kernel.BindPlatformMmio(subject, device, capability, 0, 64, PlatformMmioAccess.Read).IsSuccess);
+        Assert.True(replaced);
+        Assert.Equal(0, provider.MmioRevokeCalls);
+        var children = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_mmioLeases", flags)!.GetValue(kernel.PlatformAuthority)!;
+        var child = Assert.Single(children.Values.Cast<object>());
+        Assert.Equal(false, child.GetType().GetProperty("RevokeMayHaveEffect")!.GetValue(child));
+        Assert.Null(child.GetType().GetProperty("RevokeObservation")!.GetValue(child));
+        Assert.False(kernel.TerminateProcess(subject).IsSuccess);
+        Assert.Equal(0, provider.DeviceRevokeCalls);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
+    }
+
+    [Theory]
+    [InlineData(PlatformAuthorityStatus.NotAccepted, false, false)]
+    [InlineData(PlatformAuthorityStatus.Denied, false, false)]
+    [InlineData(PlatformAuthorityStatus.Stale, false, false)]
+    [InlineData((PlatformAuthorityStatus)999, false, false)]
+    [InlineData(PlatformAuthorityStatus.NotAccepted, true, false)]
+    [InlineData(PlatformAuthorityStatus.NotAccepted, true, true)]
+    public void RejectedMmioCleanupRetainsOriginalOutcomeAndPinsActualTeardown(PlatformAuthorityStatus status, bool loseOwner, bool loseReply)
+    {
+        var provider = new MmioProvider { MmioRevokeReplyStatus = status };
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1244, 1804);
+        _ = kernel.AllocateRegion(subject, 4096).Value!;
+        var (device, capability) = CreateAuthorities(kernel, subject, "device/rejected-mmio-outcome", "registers", 128);
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var children = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_mmioLeases", flags)!.GetValue(kernel.PlatformAuthority)!;
+        object? original = null;
+        provider.BeforeMmioMap = () => Assert.True(kernel.CapabilityAuthority.Revoke(capability).IsSuccess);
+        provider.AfterMmioRevokeEffect = () =>
+        {
+            original = Assert.Single(children.Values.Cast<object>());
+            Assert.Equal(true, original.GetType().GetProperty("RevokeMayHaveEffect")!.GetValue(original));
+            Assert.False(Monitor.IsEntered(typeof(PlatformAuthorityBridge).GetField("_secureDomainLifecycleGate", flags)!.GetValue(kernel.PlatformAuthority)!));
+            Assert.Equal(0, ((global::System.Collections.IDictionary)typeof(MmioProvider).GetField("_mmio", flags)!.GetValue(provider)!).Count);
+            if (loseOwner) children.Clear();
+            if (loseReply) throw new IOException("Rejected MMIO original cleanup reply lost");
+        };
+        Assert.False(kernel.BindPlatformMmio(subject, device, capability, 0, 64, PlatformMmioAccess.Read).IsSuccess);
+        Assert.NotNull(original);
+        Assert.Equal(false, original.GetType().GetProperty("ClosureInFlight")!.GetValue(original));
+        Assert.Equal(false, original.GetType().GetProperty("ProviderClosureConfirmed")!.GetValue(original));
+        var raw = original.GetType().GetProperty("RevokeObservation")!.GetValue(original);
+        if (loseReply) Assert.Null(raw); else Assert.Equal(status, ((PlatformAuthorityResult)raw!).Status);
+        provider.MmioRevokeReplyStatus = null;
+        provider.AfterMmioRevokeEffect = null;
+        _ = kernel.RevokeCapability(capability);
+        Assert.False(kernel.RevokePlatformDevice(subject, device).IsSuccess);
+        Assert.False(kernel.TerminateProcess(subject).IsSuccess);
+        Assert.Equal(1, provider.MmioRevokeCalls);
+        Assert.Equal(0, provider.DeviceRevokeCalls);
+        Assert.False(kernel.QueryProcessTeardown(subject).Value!.LocalReclaimCompleted);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
+    }
+
+    [Theory]
+    [InlineData(false, false)] [InlineData(false, true)]
+    [InlineData(true, false)] [InlineData(true, true)]
+    public void KnownMmioClosureWithLostChildOwnerPinsOriginalParent(bool foreignOwner, bool sourceThrows)
+    {
+        var provider = new MmioProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1243, 1803);
+        var (device, capability) = CreateAuthorities(kernel, subject, "device/known-mmio-child-loss", "registers", 128);
+        var child = kernel.BindPlatformMmio(subject, device, capability, 0, 64, PlatformMmioAccess.Read).Value!;
+        _ = kernel.AllocateRegion(subject, 4096).Value!;
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var children = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_mmioLeases", flags)!.GetValue(kernel.PlatformAuthority)!;
+        var parents = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_deviceLeases", flags)!.GetValue(kernel.PlatformAuthority)!;
+        var original = children[child.LeaseId]!;
+        var parent = parents[device.LeaseId]!;
+        object? foreign = null;
+        provider.AfterMmioRevokeEffect = () =>
+        {
+            Assert.Equal(0, ((global::System.Collections.IDictionary)typeof(MmioProvider).GetField("_mmio", flags)!.GetValue(provider)!).Count);
+            if (foreignOwner)
+            {
+                foreign = Activator.CreateInstance(original.GetType(), child with { Generation = new PlatformMmioLeaseGeneration(child.Generation.Value + 1) },
+                    original.GetType().GetProperty("ProviderLease")!.GetValue(original), capability)!;
+                children[child.LeaseId] = foreign;
+            }
+            else children.Remove(child.LeaseId);
+            if (sourceThrows) provider.IncarnationRead = () => throw new IOException("Source observation failed after owner loss");
+        };
+        Assert.Equal(KernelError.PlatformFaulted, kernel.RevokePlatformMmio(subject, child).Error);
+        Assert.True(((PlatformAuthorityResult)original.GetType().GetProperty("RevokeObservation")!.GetValue(original)!).IsSuccess);
+        Assert.Equal(true, original.GetType().GetProperty("ProviderClosureConfirmed")!.GetValue(original));
+        Assert.Equal(false, original.GetType().GetProperty("PlatformClosed")!.GetValue(original));
+        Assert.Equal(false, original.GetType().GetProperty("ClosureInFlight")!.GetValue(original));
+        Assert.Equal(true, parent.GetType().GetProperty("FaultPinned")!.GetValue(parent));
+        if (foreign is not null)
+        {
+            Assert.Null(foreign.GetType().GetProperty("RevokeObservation")!.GetValue(foreign));
+            Assert.Equal(false, foreign.GetType().GetProperty("FaultPinned")!.GetValue(foreign));
+        }
+        provider.IncarnationRead = null;
+        provider.AfterMmioRevokeEffect = null;
+        Assert.False(kernel.RevokePlatformDevice(subject, device).IsSuccess);
+        Assert.False(kernel.TerminateProcess(subject).IsSuccess);
+        Assert.Equal(1, provider.MmioRevokeCalls);
+        Assert.Equal(0, provider.DeviceRevokeCalls);
+        Assert.True(kernel.Processes.Resolve(subject).IsSuccess);
+        Assert.False(kernel.QueryProcessTeardown(subject).Value!.LocalReclaimCompleted);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void MmioCleanupRefusesAbsentOrForeignOriginalDeviceBeforeEffect(bool foreign)
+    {
+        var provider = new MmioProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1242, 1802);
+        var (device, capability) = CreateAuthorities(kernel, subject, "device/mmio-device-source", "registers", 128);
+        var child = kernel.BindPlatformMmio(subject, device, capability, 0, 64, PlatformMmioAccess.Read).Value!;
+        _ = kernel.AllocateRegion(subject, 4096).Value!;
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var parents = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_deviceLeases", flags)!.GetValue(kernel.PlatformAuthority)!;
+        var children = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_mmioLeases", flags)!.GetValue(kernel.PlatformAuthority)!;
+        var original = parents[device.LeaseId]!;
+        var originalChild = children[child.LeaseId]!;
+        if (foreign) parents[device.LeaseId] = typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+        else parents.Remove(device.LeaseId);
+        Assert.False(kernel.RevokePlatformMmio(subject, child).IsSuccess);
+        Assert.Equal(0, provider.MmioRevokeCalls);
+        Assert.Same(original, originalChild.GetType().GetProperty("MapDeviceSource")!.GetValue(originalChild));
+        Assert.Null(originalChild.GetType().GetProperty("RevokeObservation")!.GetValue(originalChild));
+        Assert.Equal(false, originalChild.GetType().GetProperty("ClosureInFlight")!.GetValue(originalChild));
+        Assert.False(kernel.RevokeCapability(capability).IsSuccess);
+        Assert.False(kernel.TerminateProcess(subject).IsSuccess);
+        Assert.Equal(0, provider.MmioRevokeCalls);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
+    }
+
+    [Theory]
+    [InlineData(PlatformAuthorityStatus.NotAccepted, false, false, 0)]
+    [InlineData(PlatformAuthorityStatus.Denied, false, false, 0)]
+    [InlineData(PlatformAuthorityStatus.Stale, false, false, 0)]
+    [InlineData((PlatformAuthorityStatus)999, false, false, 0)]
+    [InlineData(PlatformAuthorityStatus.NotAccepted, true, false, 0)]
+    [InlineData(PlatformAuthorityStatus.NotAccepted, true, true, 0)]
+    [InlineData(PlatformAuthorityStatus.NotAccepted, true, false, 1)]
+    [InlineData(PlatformAuthorityStatus.NotAccepted, true, false, 2)]
+    [InlineData(PlatformAuthorityStatus.NotAccepted, true, true, 1)]
+    public void OriginalMmioRevokeAfterEffectPinsActualTeardown(PlatformAuthorityStatus status, bool loseOwner, bool loseReply, int parentLoss)
+    {
+        var provider = new MmioProvider { MmioRevokeReplyStatus = status };
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1242, 1802);
+        var (device, capability) = CreateAuthorities(kernel, subject, "device/mmio-original-outcome", "registers", 128);
+        var child = kernel.BindPlatformMmio(subject, device, capability, 0, 64, PlatformMmioAccess.Read).Value!;
+        _ = kernel.AllocateRegion(subject, 4096).Value!;
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var children = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_mmioLeases", flags)!.GetValue(kernel.PlatformAuthority)!;
+        var parents = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_deviceLeases", flags)!.GetValue(kernel.PlatformAuthority)!;
+        var original = children[child.LeaseId]!;
+        var parent = parents[device.LeaseId]!;
+        var domains = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_domains", flags)!.GetValue(kernel.PlatformAuthority)!;
+        var originalDomain = domains[device.DomainBinding.BindingId]!;
+        provider.AfterMmioRevokeEffect = () =>
+        {
+            var gate = typeof(PlatformAuthorityBridge).GetField("_secureDomainLifecycleGate", flags)!.GetValue(kernel.PlatformAuthority)!;
+            Assert.False(Monitor.IsEntered(gate));
+            Assert.Equal(true, original.GetType().GetProperty("RevokeMayHaveEffect")!.GetValue(original));
+            Assert.Equal(0, ((global::System.Collections.IDictionary)typeof(MmioProvider).GetField("_mmio", flags)!.GetValue(provider)!).Count);
+            if (loseOwner) children.Remove(child.LeaseId);
+            if (parentLoss == 1) domains.Remove(device.DomainBinding.BindingId);
+            if (parentLoss == 2)
+            {
+                var foreign = typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(originalDomain, null)!;
+                foreign.GetType().GetProperty("MmioSources")!.SetValue(foreign, new HashSet<object>(ReferenceEqualityComparer.Instance));
+                domains[device.DomainBinding.BindingId] = foreign;
+            }
+            if (loseReply) throw new IOException("Original MMIO reply lost after effect");
+        };
+        Assert.Equal(KernelError.PlatformFaulted, kernel.RevokePlatformMmio(subject, child).Error);
+        Assert.Equal(true, parent.GetType().GetProperty("FaultPinned")!.GetValue(parent));
+        Assert.Equal(false, original.GetType().GetProperty("ClosureInFlight")!.GetValue(original));
+        Assert.Equal(false, original.GetType().GetProperty("ProviderClosureConfirmed")!.GetValue(original));
+        var raw = original.GetType().GetProperty("RevokeObservation")!.GetValue(original);
+        if (loseReply) Assert.Null(raw);
+        else Assert.Equal(status, ((PlatformAuthorityResult)raw!).Status);
+        provider.AfterMmioRevokeEffect = null;
+        provider.MmioRevokeReplyStatus = null;
+        Assert.False(kernel.RevokePlatformMmio(subject, child).IsSuccess);
+        // Original parent lifetime references retain unresolved cleanup even when the child index is absent.
+        Assert.False(kernel.RevokeCapability(capability).IsSuccess);
+        Assert.False(kernel.RevokePlatformDevice(subject, device).IsSuccess);
+        Assert.False(kernel.TerminateProcess(subject).IsSuccess);
+        Assert.Equal(1, provider.MmioRevokeCalls);
+        Assert.Equal(0, provider.DeviceRevokeCalls);
+        Assert.True(kernel.Processes.Resolve(subject).IsSuccess);
+        Assert.False(kernel.QueryProcessTeardown(subject).Value!.LocalReclaimCompleted);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
+    }
+
+    [Theory]
+    [InlineData(false, false)][InlineData(false, true)]
+    [InlineData(true, false)][InlineData(true, true)]
+    public void CleanupSourceOwnerLossRefusesEffectAndPinsTeardown(bool parentOwner, bool replacementOwner)
+    {
+        var provider = new MmioProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1241, 1801);
+        var (device, capability) = CreateAuthorities(kernel, subject, "device/mmio-capture", "registers", 128);
+        var child = kernel.BindPlatformMmio(subject, device, capability, 0, 64, PlatformMmioAccess.Read).Value!;
+        object childKey = child.LeaseId;
+        KernelResult Close() => kernel.RevokePlatformMmio(subject, child);
+        var buffer = kernel.AllocateRegion(subject, 4096).Value!;
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var children = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge)
+            .GetField("_mmioLeases", flags)!.GetValue(kernel.PlatformAuthority)!;
+        var originalChild = children[childKey]!;
+        var facts = parentOwner ? (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge)
+            .GetField("_deviceLeases", flags)!.GetValue(kernel.PlatformAuthority)! : children;
+        object key = parentOwner ? device.LeaseId : childKey;
+        var original = facts[key]!;
+        provider.IncarnationRead = () =>
+        {
+            provider.IncarnationRead = null;
+            if (replacementOwner)
+            {
+                var replacement = original.GetType().GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+                if (parentOwner) replacement.GetType().GetProperty("ProviderIncarnation")!.SetValue(replacement, new PlatformProviderIncarnation(2));
+                facts[key] = replacement;
+            }
+            else facts.Remove(key);
+        };
+        Assert.False(Close().IsSuccess);
+        Assert.Equal(0, provider.MmioRevokeCalls);
+        Assert.Equal(false, originalChild.GetType().GetProperty("ClosureInFlight")!.GetValue(originalChild));
+        Assert.Equal(false, originalChild.GetType().GetProperty("ProviderClosureConfirmed")!.GetValue(originalChild));
+        Assert.False(kernel.TerminateProcess(subject).IsSuccess);
+        Assert.True(kernel.Processes.Resolve(subject).IsSuccess);
+        Assert.Equal(RegionState.Owned, kernel.Regions.Snapshot().Single(r => r.Handle == buffer.Handle).State);
+        Assert.Equal(0, provider.MmioRevokeCalls);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CapabilityMmioClosureAllowsWorkerAndRetainsOriginalFault(bool fault)
+    {
+        var provider = new MmioProvider { ThrowOnMmioRevoke = fault };
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1240, 1800);
+        var (device, capability) = CreateAuthorities(kernel, subject,
+            "device/capability-mmio", "registers", 128);
+        var lease = kernel.BindPlatformMmio(subject, device, capability, 0, 64, PlatformMmioAccess.Read).Value!;
+        var observed = false;
+        provider.BeforeMmioRevoke = () =>
+        {
+            var worker = Task.Run(() =>
+            {
+                Assert.True(kernel.MintCapability(new DomainId(1800), subject,
+                    ResourceKind.Compute, "compute/mmio-closure", CapabilityRights.Execute).IsSuccess);
+                Assert.Equal(KernelError.PlatformBindingActive,
+                    kernel.RevokePlatformMmio(subject, lease).Error);
+            });
+            Assert.True(worker.Wait(TimeSpan.FromSeconds(5)));
+            observed = true;
+        };
+        var result = kernel.RevokeCapability(capability);
+        Assert.True(observed);
+        Assert.Equal(1, provider.MmioRevokeCalls);
+        Assert.Equal(!fault, result.IsSuccess);
+        if (fault)
+        {
+            Assert.Equal(KernelError.PlatformFaulted, result.Error);
+            provider.ThrowOnMmioRevoke = false;
+            Assert.False(kernel.RevokeCapability(capability).IsSuccess);
+            Assert.False(kernel.RevokePlatformDevice(subject, device).IsSuccess);
+            Assert.Equal(0, provider.DeviceRevokeCalls);
+            Assert.Equal(1, provider.MmioRevokeCalls);
+        }
+        else
+        {
+            Assert.Equal(KernelError.PlatformBindingRevoked,
+                kernel.RevokePlatformMmio(subject, lease).Error);
+            Assert.True(kernel.RevokePlatformDevice(subject, device).IsSuccess);
+        }
+    }
+
+    [Theory]
+    [InlineData(0, 0)] [InlineData(0, 1)] [InlineData(0, 2)] [InlineData(0, 3)]
+    [InlineData(1, 0)] [InlineData(1, 1)] [InlineData(1, 2)] [InlineData(1, 3)]
+    [InlineData(2, 0)] [InlineData(2, 1)] [InlineData(2, 2)] [InlineData(2, 3)]
+    public void RefusedMmioPublicationRetainsCleanupOwnerAndKnownReply(int consumer, int fault)
+    {
+        var provider = new MmioProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1241, 1741);
+        var (device, capability) = CreateAuthorities(kernel, subject, "device/refused-mmio", "registers", 128);
+        var admissionRefused = false;
+        provider.BeforeMmioMap = () => admissionRefused = !kernel.RevokeCapability(capability).IsSuccess;
+        var ownerObserved = false;
+        provider.BeforeMmioRevoke = () =>
+        {
+            ownerObserved = kernel.PlatformAuthority.ActiveMmioLeasesForDevice(device).Count == 1;
+            if (fault == 1) provider.IncarnationRead = () => throw new InvalidOperationException("Late compensation query loss");
+            if (fault == 3) provider.Incarnation++;
+        };
+        provider.ThrowAfterMmioRevoke = fault == 2;
+        var bind = kernel.BindPlatformMmio(subject, device, capability, 0, 64, PlatformMmioAccess.Read);
+        Assert.Equal(KernelError.CapabilityRevoked, bind.Error);
+        Assert.True(admissionRefused);
+        Assert.True(ownerObserved);
+        Assert.Equal(1, provider.MmioMapCalls);
+        Assert.Equal(1, provider.MmioRevokeCalls);
+        provider.IncarnationRead = null;
+        provider.Incarnation = 1;
+        provider.ThrowAfterMmioRevoke = false;
+        var closed = consumer switch
+        {
+            0 => kernel.RevokeCapability(capability),
+            1 => kernel.RevokePlatformDevice(subject, device),
+            _ => kernel.TerminateProcess(subject),
+        };
+        Assert.Equal(fault is 0 or 1, closed.IsSuccess);
+        Assert.Equal(1, provider.MmioRevokeCalls);
+        if (fault is 0 or 1)
+        {
+            if (consumer != 2) Assert.True(kernel.TerminateProcess(subject).IsSuccess);
+            Assert.Equal(1, provider.DeviceRevokeCalls);
+        }
+        else
+        {
+            Assert.False(kernel.TerminateProcess(subject).IsSuccess);
+            Assert.True(kernel.Processes.Resolve(subject).IsSuccess);
+            Assert.Equal(0, provider.DeviceRevokeCalls);
+        }
+    }
+    [Theory]
+    [InlineData(0, 0)] [InlineData(0, 1)] [InlineData(0, 2)]
+    [InlineData(1, 0)] [InlineData(1, 1)] [InlineData(1, 2)]
+    [InlineData(2, 0)] [InlineData(2, 1)] [InlineData(2, 2)]
+    [InlineData(3, 0)] [InlineData(3, 1)] [InlineData(3, 2)]
+    [InlineData(4, 0)] [InlineData(4, 1)] [InlineData(4, 2)]
+    [InlineData(5, 0)] [InlineData(5, 1)] [InlineData(5, 2)]
+    public void MalformedMmioCleanupCannotClearOriginalEffectPin(int mutation, int cleanup)
+    {
+        var provider = new MmioProvider { ReturnedMutation = mutation };
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1240, 1740);
+        var (device, capability) = CreateAuthorities(kernel, subject, "device/malformed-original", "registers", 128);
+        var pinObserved = false;
+        provider.BeforeMmioRevoke = () => pinObserved =
+            kernel.PlatformAuthority.HasUnresolvedMmioEffect(id => id == capability) &&
+            kernel.RevokePlatformDevice(subject, device).Error == KernelError.PlatformFaulted;
+        if (cleanup == 1) provider.MmioRevokeStatus = PlatformAuthorityStatus.Faulted;
+        if (cleanup == 2) provider.ThrowOnMmioRevoke = true;
+        var bind = kernel.BindPlatformMmio(subject, device, capability, 0, 64, PlatformMmioAccess.Read);
+        Assert.Equal(KernelError.PlatformFaulted, bind.Error);
+        Assert.True(pinObserved);
+        Assert.True(kernel.PlatformAuthority.HasUnresolvedMmioEffect(id => id == capability));
+        provider.MmioRevokeStatus = null;
+        provider.ThrowOnMmioRevoke = false;
+        Assert.False(kernel.RevokeCapability(capability).IsSuccess);
+        Assert.False(kernel.RevokePlatformDevice(subject, device).IsSuccess);
+        Assert.False(kernel.TerminateProcess(subject).IsSuccess);
+        Assert.True(kernel.Processes.Resolve(subject).IsSuccess);
+        Assert.Equal(1, provider.MmioMapCalls);
+        Assert.Equal(1, provider.MmioRevokeCalls);
+        Assert.Equal(0, provider.DeviceRevokeCalls);
+        Assert.Equal(0, provider.DomainRevokeCalls);
+    }
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void KnownMmioReplyRetriesActualConsumerWithoutDuplicateEffect(int consumer)
+    {
+        var provider = new MmioProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1238, 1738);
+        var (device, capability) = CreateAuthorities(kernel, subject, "device/known-mmio", "registers", 128);
+        var lease = kernel.BindPlatformMmio(subject, device, capability, 0, 64, PlatformMmioAccess.Read).Value!;
+        provider.BeforeMmioRevoke = () => provider.IncarnationRead = () => throw new InvalidOperationException("Late MMIO query fault");
+        KernelResult Close() => consumer switch
+        {
+            0 => kernel.RevokePlatformMmio(subject, lease),
+            1 => kernel.RevokeCapability(capability),
+            2 => kernel.RevokePlatformDevice(subject, device),
+            _ => kernel.TerminateProcess(subject),
+        };
+        Assert.False(Close().IsSuccess);
+        Assert.Equal(1, provider.MmioRevokeCalls);
+        Assert.Equal(0, provider.DeviceRevokeCalls);
+        Assert.True(kernel.Processes.Resolve(subject).IsSuccess);
+        provider.IncarnationRead = null;
+        Assert.True(Close().IsSuccess);
+        Assert.Equal(1, provider.MmioRevokeCalls);
+        if (consumer != 3) Assert.True(kernel.TerminateProcess(subject).IsSuccess);
+        Assert.Equal(1, provider.MmioRevokeCalls);
+        Assert.Equal(1, provider.DeviceRevokeCalls);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void MmioKnownMismatchOrLostReplyPinsParentAndPreventsReclaim(int fault)
+    {
+        var provider = new MmioProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1239, 1739);
+        var (device, capability) = CreateAuthorities(kernel, subject, "device/lost-mmio", "registers", 128);
+        var lease = kernel.BindPlatformMmio(subject, device, capability, 0, 64, PlatformMmioAccess.Read).Value!;
+        provider.BeforeMmioRevoke = () =>
+        {
+            if (fault == 0) provider.Incarnation++;
+            if (fault == 1) kernel.PlatformAuthority.ObserveBackendReset();
+        };
+        provider.ThrowAfterMmioRevoke = fault == 2;
+        Assert.False(kernel.RevokePlatformMmio(subject, lease).IsSuccess);
+        provider.Incarnation = 1;
+        provider.ThrowAfterMmioRevoke = false;
+        Assert.False(kernel.RevokePlatformMmio(subject, lease).IsSuccess);
+        Assert.False(kernel.RevokePlatformDevice(subject, device).IsSuccess);
+        Assert.False(kernel.TerminateProcess(subject).IsSuccess);
+        Assert.True(kernel.Processes.Resolve(subject).IsSuccess);
+        Assert.Equal(1, provider.MmioRevokeCalls);
+        Assert.Equal(0, provider.DeviceRevokeCalls);
+    }
+    [Theory]
     [InlineData(PlatformAuthorityStatus.NotAccepted, false)]
     [InlineData(PlatformAuthorityStatus.NotAccepted, true)]
     [InlineData(PlatformAuthorityStatus.Denied, false)]
@@ -25,10 +742,9 @@ public sealed class PlatformMmioLeaseTests
         Assert.Equal(1, provider.MmioMapCalls);
         Assert.Equal(0, provider.MmioRevokeCalls);
         AssertMmioAdmissionBalanced(kernel, device);
-        var noEffect = status == PlatformAuthorityStatus.NotAccepted && !reset;
-        Assert.Equal(noEffect, kernel.RevokeCapability(capability).IsSuccess);
-        Assert.Equal(noEffect, kernel.RevokePlatformDevice(subject, device).IsSuccess);
-        Assert.Equal(noEffect ? 1 : 0, provider.DeviceRevokeCalls);
+        Assert.False(kernel.RevokeCapability(capability).IsSuccess);
+        Assert.False(kernel.RevokePlatformDevice(subject, device).IsSuccess);
+        Assert.Equal(0, provider.DeviceRevokeCalls);
     }
 
     [Theory]
@@ -268,6 +984,14 @@ public sealed class PlatformMmioLeaseTests
         else
         {
             Assert.Equal(KernelError.PlatformFaulted, result.Error);
+            if (read == 2 && fault == 1)
+            {
+                Assert.True((bool)record.GetType().GetProperty("ProviderClosureConfirmed")!.GetValue(record)!);
+                Assert.True(kernel.RevokePlatformDevice(subject, device).IsSuccess);
+                Assert.Equal(1, provider.MmioRevokeCalls);
+                Assert.True(kernel.TerminateProcess(subject).IsSuccess);
+                return;
+            }
             Assert.False(kernel.RevokeCapability(capability).IsSuccess);
             Assert.False(kernel.RevokePlatformDevice(subject, device).IsSuccess);
             Assert.Equal(0, provider.DeviceRevokeCalls);
@@ -275,7 +999,7 @@ public sealed class PlatformMmioLeaseTests
     }
 
     [Fact]
-    public void MmioClosureNotAcceptedAllowsExactExistingConsumerRetry()
+    public void MmioClosureGenericNotAcceptedPinsOriginalCapabilityCleanup()
     {
         var provider = new MmioProvider { MmioRevokeStatus = PlatformAuthorityStatus.NotAccepted };
         var kernel = new RuntimeKernel(provider);
@@ -285,9 +1009,9 @@ public sealed class PlatformMmioLeaseTests
         Assert.False(kernel.RevokeCapability(capability).IsSuccess);
         Assert.Equal(1, provider.MmioRevokeCalls);
         provider.MmioRevokeStatus = null;
-        Assert.True(kernel.RevokeCapability(capability).IsSuccess);
-        Assert.Equal(2, provider.MmioRevokeCalls);
-        Assert.True(kernel.RevokePlatformDevice(subject, device).IsSuccess);
+        Assert.False(kernel.RevokeCapability(capability).IsSuccess);
+        Assert.Equal(1, provider.MmioRevokeCalls);
+        Assert.False(kernel.RevokePlatformDevice(subject, device).IsSuccess);
     }
 
     [Fact]
@@ -706,16 +1430,23 @@ public sealed class PlatformMmioLeaseTests
         private ulong _nextMmio = 1;
 
         public bool ReturnWrongRange { get; set; }
+        public int ReturnedMutation { get; set; } = -1;
         public bool ThrowOnMmioMap { get; set; }
         public PlatformAuthorityStatus? MmioMapStatus { get; set; }
+        public PlatformAuthorityStatus? MmioMapReplyStatus { get; set; }
+        public Action? AfterMmioMapEffect { get; set; }
         public PlatformAuthorityStatus? MmioRevokeStatus { get; set; }
+        public PlatformAuthorityStatus? MmioRevokeReplyStatus { get; set; }
+        public Action? AfterMmioRevokeEffect { get; set; }
         public bool ThrowOnMmioRevoke { get; set; }
+        public bool ThrowAfterMmioRevoke { get; set; }
+        public ulong Incarnation { get; set; } = 1;
         public Action? BeforeMmioRevoke { get; set; }
         public Action? BeforeMmioMap { get; set; }
         public Action? IncarnationRead { get; set; }
         public PlatformProviderIncarnation CurrentIncarnation
         {
-            get { IncarnationRead?.Invoke(); return new PlatformProviderIncarnation(1); }
+            get { IncarnationRead?.Invoke(); return new PlatformProviderIncarnation(Incarnation); }
         }
         public int MmioMapCalls { get; private set; }
         public int MmioRevokeCalls { get; private set; }
@@ -810,7 +1541,20 @@ public sealed class PlatformMmioLeaseTests
                 region,
                 returnedRange,
                 access);
+            lease = ReturnedMutation switch
+            {
+                0 => lease with { DeviceLease = deviceLease with { Generation = new(99) } },
+                1 => lease with { Region = new("wrong-region", region.ByteLength) },
+                2 => lease with { Range = new(range.Offset + 1, range.Length) },
+                3 => lease with { Access = PlatformMmioAccess.Write },
+                4 => lease with { LeaseId = new(0) },
+                5 => lease with { Generation = new(0) },
+                _ => lease,
+            };
             _mmio[lease.LeaseId] = lease;
+            AfterMmioMapEffect?.Invoke();
+            if (MmioMapReplyStatus is { } replyStatus)
+                return PlatformAuthorityResult<PlatformProviderMmioLease>.Fail(replyStatus, "Original map failed after effect.");
             if (ThrowOnMmioMap) throw new InvalidOperationException("Injected MMIO map receipt loss.");
             return PlatformAuthorityResult<PlatformProviderMmioLease>.Ok(lease);
         }
@@ -824,6 +1568,10 @@ public sealed class PlatformMmioLeaseTests
             if (MmioRevokeStatus is { } status)
                 return PlatformAuthorityResult.Fail(status, "Injected MMIO revoke fault.");
             _mmio.Remove(lease.LeaseId);
+            AfterMmioRevokeEffect?.Invoke();
+            if (ThrowAfterMmioRevoke) throw new InvalidOperationException("MMIO removed but response lost");
+            if (MmioRevokeReplyStatus is { } replyStatus)
+                return PlatformAuthorityResult.Fail(replyStatus, "Injected failed reply after original MMIO effect.");
             return PlatformAuthorityResult.Ok();
         }
 

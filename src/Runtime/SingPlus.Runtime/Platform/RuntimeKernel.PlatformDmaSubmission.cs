@@ -11,43 +11,40 @@ public sealed partial class RuntimeKernel
         PlatformDmaGrant grant,
         PlatformDmaPrepareEvidence prepareEvidence)
     {
+        SingProcess process;
+        PlatformDomainIdentity identity;
         lock (_platformMemoryUseGate)
-            return SubmitPlatformDmaLocked(subject, grant, prepareEvidence);
-    }
-
-    private KernelResult<PlatformDmaSubmission> SubmitPlatformDmaLocked(
-        ProcessHandle subject,
-        PlatformDmaGrant grant,
-        PlatformDmaPrepareEvidence prepareEvidence)
-    {
-        var resolved = Processes.Resolve(subject);
-        if (!resolved.IsSuccess)
         {
-            return KernelResult<PlatformDmaSubmission>.Fail(
-                resolved.Error,
-                resolved.Message!);
+            var resolved = Processes.Resolve(subject);
+            if (!resolved.IsSuccess) return KernelResult<PlatformDmaSubmission>.Fail(resolved.Error, resolved.Message!);
+            process = resolved.Value!;
+            var ready = EnsureProcessAcceptsNewEffects(process);
+            if (!ready.IsSuccess) return KernelResult<PlatformDmaSubmission>.Fail(ready.Error, ready.Message!);
+            identity = PlatformIdentity(process);
+            var usable = ValidateDmaGrantRegionUsability(grant, identity);
+            if (!usable.IsSuccess) return KernelResult<PlatformDmaSubmission>.Fail(usable.Error, usable.Message!);
         }
-
-        var process = resolved.Value!;
-        var effect = EnsureProcessAcceptsNewEffects(process);
-        if (!effect.IsSuccess)
+        return PlatformAuthority.SubmitDmaGrant(grant, prepareEvidence, identity, commit =>
         {
-            return KernelResult<PlatformDmaSubmission>.Fail(
-                effect.Error,
-                effect.Message!);
-        }
-
-        var identity = PlatformIdentity(process);
-        var usable = ValidateDmaGrantRegionUsability(grant, identity);
-        if (!usable.IsSuccess)
-            return KernelResult<PlatformDmaSubmission>.Fail(usable.Error, usable.Message!);
-        return PlatformAuthority.SubmitDmaGrant(
-            grant,
-            prepareEvidence,
-            identity,
-            () => RevalidatePlatformDmaRegionSubmission(subject, grant));
+            lock (_platformMemoryUseGate)
+            {
+                var current = Processes.Resolve(subject);
+                if (!current.IsSuccess) return KernelResult<PlatformDmaSubmission>.Fail(current.Error, current.Message!);
+                if (!ReferenceEquals(current.Value, process))
+                    return KernelResult<PlatformDmaSubmission>.Fail(KernelError.StaleGeneration, "DMA submit process incarnation changed.");
+                var ready = EnsureProcessAcceptsNewEffects(process);
+                if (!ready.IsSuccess) return KernelResult<PlatformDmaSubmission>.Fail(ready.Error, ready.Message!);
+                var owner = new RegionOwner(identity.DomainId, subject.Generation);
+                var gate = Regions.GetPlatformMappingCompletionGate(grant.Mapping.Region, owner);
+                if (!gate.IsSuccess) return KernelResult<PlatformDmaSubmission>.Fail(gate.Error, gate.Message!);
+                lock (gate.Value!)
+                {
+                    var usable = Regions.ValidatePlatformMappingRegionUsabilityLocked(grant.Mapping.Region, owner);
+                    return usable.IsSuccess ? commit() : KernelResult<PlatformDmaSubmission>.Fail(usable.Error, usable.Message!);
+                }
+            }
+        });
     }
-
     private KernelResult RevalidatePlatformDmaRegionSubmission(
         ProcessHandle subject, PlatformDmaGrant grant, ulong? expectedMutationEpoch = null)
     {

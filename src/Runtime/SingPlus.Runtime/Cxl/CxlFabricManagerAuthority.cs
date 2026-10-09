@@ -24,15 +24,26 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
         public CxlFabricReconfigurationTicket? Ticket { get; set; }
         public int PendingAdmissions { get; set; }
         public bool CompletionInFlight { get; set; }
+        public CxlFabricBinding? LastCompletionReceipt { get; set; }
         public List<(ProcessHandle Principal, ExternalOperationHandle Operation, Func<KernelResult>? ProviderClosure)> Operations { get; } = [];
     }
 
+    private sealed class PoolRecord(CxlOwnedPoolAllocation allocation)
+    {
+        public CxlOwnedPoolAllocation Allocation { get; } = allocation;
+        public bool ReleaseInFlight { get; set; }
+        public bool ReceiptValidated { get; set; }
+        public bool Published { get; set; }
+        public CxlPoolAssignment? ReleasedReceipt { get; set; }
+    }
+    internal Action? BeforePoolUseRelease { get; set; }
     private readonly RuntimeKernel _kernel;
     private readonly RegionAuthority _regions;
     private readonly ICxlFabricManagementProvider _provider;
     private readonly Dictionary<CxlFabricBindingId, BindingRecord> _bindings = [];
-    private readonly Dictionary<CxlPoolAssignmentId, CxlOwnedPoolAllocation> _poolAllocations = [];
+    private readonly Dictionary<RegionHandle, PoolRecord> _poolAllocations = [];
     private readonly HashSet<RegionOwner> _uncontainedPoolAssignments = [];
+    private readonly Dictionary<RegionHandle, RegionOwner> _pendingPoolAssignments = [];
     private readonly object _gate = new();
 
     public CxlFabricManagerAuthority(RuntimeKernel kernel, ICxlFabricManagementProvider provider)
@@ -109,6 +120,13 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
 
     public KernelResult UntrackOperation(CxlFabricBinding binding, ProcessHandle principal, ExternalOperationHandle operation)
     {
+        // Released is a terminal local operation lifetime, independently owned by
+        // the existing operation authority. It is not a provider closure receipt.
+        var lifetime = _kernel.QueryExternalOperation(principal, operation);
+        if (!lifetime.IsSuccess) return KernelResult.Fail(lifetime.Error, lifetime.Message!);
+        if (lifetime.Value!.State != ExternalOperationState.Released)
+            return KernelResult.Fail(KernelError.ExternalEffectUncontained,
+                "A live or unresolved operation must retain its fabric dependency.");
         lock (_gate)
         {
             if (!_bindings.TryGetValue(binding.BindingId, out var record))
@@ -190,13 +208,38 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
             }
             if (!begun.IsSuccess)
             {
-                lock (_gate) record.State = begun.Status == PlatformAuthorityStatus.NotAccepted
-                    ? CxlFabricResourceState.Bound : CxlFabricResourceState.Faulted;
+                var rejectedSourceCurrent = false;
+                if (begun.Status == PlatformAuthorityStatus.NotAccepted)
+                {
+                    var source = _provider.QueryResource(binding.BindingId); // outside owner gate
+                    rejectedSourceCurrent = source.IsSuccess && source.Value!.Binding == binding &&
+                        source.Value.State == CxlFabricResourceState.Bound;
+                }
+                lock (_gate)
+                {
+                    if (begun.Status == PlatformAuthorityStatus.NotAccepted &&
+                        (!rejectedSourceCurrent || !_bindings.TryGetValue(binding.BindingId, out var current) ||
+                         !ReferenceEquals(current, record) || record.Binding != binding ||
+                         record.State != CxlFabricResourceState.Draining || record.Ticket is not null))
+                    {
+                        record.State = CxlFabricResourceState.Faulted;
+                        return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.ExternalEffectUncontained,
+                            "Rejected reconfiguration did not preserve its exact provider/local source.");
+                    }
+                    record.State = rejectedSourceCurrent ? CxlFabricResourceState.Bound : CxlFabricResourceState.Faulted;
+                }
                 return KernelResult<CxlFabricManagedBinding>.Fail(Map(begun.Status), begun.Message ?? "Fabric reconfiguration failed to begin.");
             }
             lock (_gate)
             {
-                record.Ticket = begun.Value!;
+                record.Ticket = begun.Value!; // cleanup fact, never admission by itself
+                if (begun.Value!.ReconfigurationId.Value == 0 || begun.Value.PreviousBinding != binding ||
+                    begun.Value.ReplacementGeneration.Value <= binding.Generation.Value)
+                {
+                    record.State = CxlFabricResourceState.Faulted;
+                    return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.ExternalEffectUncontained,
+                        "Fabric reconfiguration ticket does not preserve the exact source and forward generation.");
+                }
                 return KernelResult<CxlFabricManagedBinding>.Ok(Snapshot(record));
             }
         }
@@ -228,7 +271,14 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
             try
             {
                 completed = _provider.CompleteReconfiguration(ticket);
-                if (completed.IsSuccess) observed = _provider.QueryResource(bindingId);
+                if (completed.IsSuccess)
+                {
+                    // Preserve a returned receipt even when later observation/publication fails.
+                    lock (_gate) record.LastCompletionReceipt = completed.Value;
+                    observed = _provider.QueryResource(bindingId);
+                }
+                else if (completed.Status == PlatformAuthorityStatus.NotAccepted)
+                    observed = _provider.QueryResource(bindingId); // fresh original source, outside owner gate
             }
             catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
             {
@@ -246,6 +296,11 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
                 }
                 if (!completed.IsSuccess)
                 {
+                    if (completed.Status == PlatformAuthorityStatus.NotAccepted &&
+                        observed.IsSuccess && observed.Value!.Binding == ticket.PreviousBinding &&
+                        observed.Value.State == CxlFabricResourceState.Draining)
+                        return KernelResult<CxlFabricManagedBinding>.Fail(Map(completed.Status),
+                            completed.Message ?? "Fabric completion was rejected before effect; exact draining ticket retained.");
                     record.State = CxlFabricResourceState.Faulted;
                     return KernelResult<CxlFabricManagedBinding>.Fail(Map(completed.Status), completed.Message ?? "Fabric reconfiguration completion failed.");
                 }
@@ -276,8 +331,15 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
     {
         var descriptor = _regions.Validate(region, owner);
         if (!descriptor.IsSuccess) return KernelResult<CxlOwnedPoolAllocation>.Fail(descriptor.Error, descriptor.Message!);
-        if (_poolAllocations.Values.Any(allocation => allocation.Region.RegionId == region.RegionId))
-            return KernelResult<CxlOwnedPoolAllocation>.Fail(KernelError.PlatformBindingActive, "Region already has a live pool assignment.");
+        lock (_gate)
+        {
+            if (_poolAllocations.Values.Any(allocation => allocation.Allocation.Region.RegionId == region.RegionId) ||
+                _pendingPoolAssignments.Keys.Any(pending => pending.RegionId == region.RegionId))
+                return KernelResult<CxlOwnedPoolAllocation>.Fail(KernelError.PlatformBindingActive, "Region already has a live or pending pool assignment.");
+            _pendingPoolAssignments.Add(region, owner);
+        }
+        try
+        {
         var use = _regions.AcquireUse(region, owner, RegionUseMode.DevicePrivate, new(0, descriptor.Value!.ByteLength));
         if (!use.IsSuccess) return KernelResult<CxlOwnedPoolAllocation>.Fail(use.Error, use.Message!);
         PlatformAuthorityResult<CxlPoolAssignment> assigned;
@@ -287,7 +349,7 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
         }
         catch (Exception exception)
         {
-            _uncontainedPoolAssignments.Add(owner);
+            lock (_gate) _uncontainedPoolAssignments.Add(owner);
             return KernelResult<CxlOwnedPoolAllocation>.Fail(KernelError.ExternalEffectUncontained,
                 $"Pool assignment threw after its effect boundary and remains quarantined: {exception.Message}");
         }
@@ -298,29 +360,91 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
                 _ = _regions.ReleaseUse(use.Value!.Handle, owner);
                 return KernelResult<CxlOwnedPoolAllocation>.Fail(Map(assigned.Status), assigned.Message ?? "Pool assignment was rejected before effect.");
             }
-            _uncontainedPoolAssignments.Add(owner);
+            lock (_gate) _uncontainedPoolAssignments.Add(owner);
             return KernelResult<CxlOwnedPoolAllocation>.Fail(KernelError.ExternalEffectUncontained,
                 assigned.Message ?? "Pool assignment acceptance is ambiguous and remains quarantined.");
         }
-        var allocation = new CxlOwnedPoolAllocation(assigned.Value!, region, owner, use.Value!.Handle);
-        _poolAllocations.Add(allocation.Assignment.AssignmentId, allocation);
-        return KernelResult<CxlOwnedPoolAllocation>.Ok(allocation);
+        if (assigned.Value is not { } receipt)
+        {
+            lock (_gate) _uncontainedPoolAssignments.Add(owner);
+            return KernelResult<CxlOwnedPoolAllocation>.Fail(KernelError.ExternalEffectUncontained, "Pool success returned no receipt.");
+        }
+        var allocation = new CxlOwnedPoolAllocation(receipt, region, owner, use.Value!.Handle);
+        lock (_gate)
+        {
+            var collision = _poolAllocations.Values.Any(item => item.Allocation.Assignment.AssignmentId == receipt.AssignmentId);
+            var record = new PoolRecord(allocation);
+            _poolAllocations.Add(region, record); // retained exact returned cleanup fact before publication
+            if (receipt.AssignmentId.Value == 0 || receipt.Generation == 0 || receipt.PoolId != poolId ||
+                receipt.EndpointId != endpointId || receipt.CapacityBytes != descriptor.Value!.ByteLength || collision)
+            {
+                _uncontainedPoolAssignments.Add(owner);
+                return KernelResult<CxlOwnedPoolAllocation>.Fail(KernelError.ExternalEffectUncontained,
+                    "Pool assignment receipt does not preserve the exact request or collides with an existing owner.");
+            }
+            record.ReceiptValidated = true;
+        }
+        var published = _regions.CommitPoolUsePublication(allocation.RegionUse, owner, () =>
+        {
+            lock (_gate)
+            {
+                if (!_poolAllocations.TryGetValue(region, out var current) || current.Allocation != allocation ||
+                    !current.ReceiptValidated || current.ReleaseInFlight || current.ReleasedReceipt is not null)
+                    return KernelResult.Fail(KernelError.StaleGeneration, "Pool publication lost its exact tracked receipt/lifetime.");
+                current.Published = true;
+                return KernelResult.Ok();
+            }
+        });
+        return published.IsSuccess ? KernelResult<CxlOwnedPoolAllocation>.Ok(allocation)
+            : KernelResult<CxlOwnedPoolAllocation>.Fail(published.Error, published.Message!);
+        }
+        finally { lock (_gate) _pendingPoolAssignments.Remove(region); }
     }
 
     public KernelResult ReleasePool(CxlOwnedPoolAllocation allocation)
     {
-        if (!_poolAllocations.TryGetValue(allocation.Assignment.AssignmentId, out var exact) || exact != allocation)
-            return KernelResult.Fail(KernelError.StaleGeneration, "Pool assignment is stale.");
-        var region = _regions.Validate(allocation.Region, allocation.Owner);
-        if (!region.IsSuccess) return KernelResult.Fail(region.Error, region.Message!);
-        var released = _provider.ReleasePoolCapacity(allocation.Assignment);
-        if (!released.IsSuccess) return KernelResult.Fail(Map(released.Status), released.Message ?? "Pool release failed.");
-        var use = _regions.ReleaseUse(allocation.RegionUse, allocation.Owner);
-        if (!use.IsSuccess) return use;
-        _poolAllocations.Remove(allocation.Assignment.AssignmentId);
-        return KernelResult.Ok();
+        PoolRecord record;
+        bool providerClosed;
+        lock (_gate)
+        {
+            if (!_poolAllocations.TryGetValue(allocation.Region, out record!) || record.Allocation != allocation)
+                return KernelResult.Fail(KernelError.StaleGeneration, "Pool assignment is stale.");
+            if (!record.ReceiptValidated)
+                return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Malformed pool receipt requires exact reconciliation before release.");
+            if (record.ReleaseInFlight)
+                return KernelResult.Fail(KernelError.PlatformBindingDraining, "Exact pool release is already in flight.");
+            record.ReleaseInFlight = true;
+            providerClosed = record.ReleasedReceipt == allocation.Assignment;
+        }
+        try
+        {
+            var region = _regions.Validate(allocation.Region, allocation.Owner);
+            if (!region.IsSuccess) return KernelResult.Fail(region.Error, region.Message!);
+            if (!providerClosed)
+            {
+                var released = _provider.ReleasePoolCapacity(allocation.Assignment);
+                if (!released.IsSuccess) return KernelResult.Fail(Map(released.Status), released.Message ?? "Pool release failed.");
+                lock (_gate) record.ReleasedReceipt = allocation.Assignment; // exact successful closure fact only
+            }
+            BeforePoolUseRelease?.Invoke(); // outside manager/Region gates
+            var use = _regions.ReleaseUse(allocation.RegionUse, allocation.Owner);
+            if (!use.IsSuccess) return use;
+            lock (_gate)
+            {
+                if (!_poolAllocations.TryGetValue(allocation.Region, out var current) ||
+                    !ReferenceEquals(current, record))
+                    return KernelResult.Fail(KernelError.StaleGeneration, "Pool cleanup lost its exact owner record.");
+                _poolAllocations.Remove(allocation.Region);
+            }
+            return KernelResult.Ok();
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        {
+            return KernelResult.Fail(KernelError.ExternalEffectUncontained,
+                $"Pool release did not complete local cleanup: {exception.Message}");
+        }
+        finally { lock (_gate) record.ReleaseInFlight = false; }
     }
-
     public KernelResult<CxlPeerAccessEvidence> ValidatePeerAccess(
         CxlPeerAccessRequest request,
         CxlFabricBinding? initiatorAuthority = null,
@@ -378,10 +502,18 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
 
     KernelResult ICxlTeardownParticipant.CloseForProcess(ProcessHandle process, RegionOwner owner)
     {
-        if (_uncontainedPoolAssignments.Contains(owner))
-            return KernelResult.Fail(KernelError.ExternalEffectUncontained,
-                "A pool assignment has ambiguous acceptance and reclaim remains quarantined.");
-        foreach (var allocation in _poolAllocations.Values.Where(item => item.Owner == owner).ToArray())
+        CxlOwnedPoolAllocation[] allocations;
+        lock (_gate)
+        {
+            if (_pendingPoolAssignments.Values.Contains(owner))
+                return KernelResult.Fail(KernelError.PlatformBindingDraining,
+                    "Pool assignment callback and receipt tracking must finish before teardown.");
+            if (_uncontainedPoolAssignments.Contains(owner))
+                return KernelResult.Fail(KernelError.ExternalEffectUncontained,
+                    "A pool assignment has ambiguous acceptance and reclaim remains quarantined.");
+            allocations = _poolAllocations.Values.Where(item => item.Allocation.Owner == owner).Select(item => item.Allocation).ToArray();
+        }
+        foreach (var allocation in allocations)
         {
             var released = ReleasePool(allocation);
             if (!released.IsSuccess) return released;

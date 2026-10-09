@@ -28,6 +28,19 @@ public sealed partial class PlatformAuthorityBridge
 
     internal PlatformBackendEpoch BackendEpoch => new(_backendEpoch);
 
+    // Exact epoch interlock for local composition cleanup, never provider closure evidence.
+    internal KernelResult CommitSecureExecutionClosure(PlatformBackendEpoch admissionEpoch,
+        Func<KernelResult> commit, out PlatformBackendEpoch currentEpoch)
+    {
+        lock (_secureDomainLifecycleGate)
+        {
+            currentEpoch = BackendEpoch;
+            if (_backendEpochExhausted || currentEpoch != admissionEpoch)
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Backend changed before composition closure commit.");
+            return commit();
+        }
+    }
+
     /// <summary>
     /// Records that the configured platform backend reset or otherwise lost the
     /// continuity needed to validate previously issued provider authority.
@@ -98,7 +111,7 @@ public sealed partial class PlatformAuthorityBridge
         var faultPinnedDsc1Operations = 0;
         lock (_dsc1Gate)
         {
-            foreach (var record in _dsc1Operations.Values)
+            foreach (var record in OriginalDsc1OperationsLocked())
             {
                 if (record.LocalReservationsReleased ||
                     record.State is Dsc1OperationState.ClosedCompleted or
@@ -127,7 +140,7 @@ public sealed partial class PlatformAuthorityBridge
             faultPinnedChildDomains++;
         }
 
-        foreach (var record in _guestBindings.Values)
+        foreach (var record in _originalGuestOwners.Values.Concat(_guestBindings.Values).Distinct())
         {
             if (record.Closure != PlatformExternalClosureState.Closed)
                 record.Closure = PlatformExternalClosureState.Faulted;
@@ -139,7 +152,7 @@ public sealed partial class PlatformAuthorityBridge
                 record.Closure = PlatformExternalClosureState.Faulted;
         }
 
-        foreach (var record in _secureDomains.Values)
+        foreach (var record in SecureDependencyRecordsLocked().Where(record => !record.ClosureConsumed))
             record.TerminalQuarantined = true;
 
         var domainIds = _domains
@@ -160,9 +173,21 @@ public sealed partial class PlatformAuthorityBridge
                 AuthorityState = DomainAuthorityState.Quarantined,
                 SecureCreateMayHaveEffect = record.SecureCreateMayHaveEffect,
                 DeviceBindMayHaveEffect = record.DeviceBindMayHaveEffect || record.PendingDeviceBinds != 0,
+                DeviceBindSource = record.DeviceBindSource,
                 MappingMayHaveEffect = record.MappingMayHaveEffect || record.PendingMappings != 0,
                 ChildCreateMayHaveEffect = record.ChildCreateMayHaveEffect || record.PendingChildCreates != 0,
-                PendingSecureCreates = record.PendingSecureCreates,
+                ChildCreateInvocations = record.ChildCreateInvocations,
+                UnpublishedChildCreates = record.UnpublishedChildCreates,
+                PendingSecureCreates = 0, // Original owner balances its invocation interlock; facts retain effect lifetime.
+                SecureCreateInvocations = record.SecureCreateInvocations,
+                MmioSources = record.MmioSources,
+                IrqSources = record.IrqSources,
+                UnpublishedSecureCreates = record.UnpublishedSecureCreates,
+                ProviderIncarnation = record.ProviderIncarnation,
+                BackendEpoch = record.BackendEpoch,
+                ProviderClosureConfirmed = record.ProviderClosureConfirmed,
+                RootRevokeObservation = record.RootRevokeObservation,
+                ParentRevokeInFlight = record.ParentRevokeInFlight,
                 ParentRevokeMayHaveEffect = record.ParentRevokeMayHaveEffect,
                 ExecutionTransitionInFlight = record.ExecutionTransitionInFlight,
                 ExecutionPolicy = record.ExecutionPolicy,

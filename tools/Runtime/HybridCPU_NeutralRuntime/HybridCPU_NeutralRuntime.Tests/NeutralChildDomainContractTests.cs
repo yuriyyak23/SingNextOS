@@ -33,6 +33,10 @@ public sealed class NeutralChildDomainContractTests
         var execution = new NeutralChildExecutionReceipt(artifact.ArtifactHandle, artifact.ArtifactEpoch,
             child.Handle, child.Epoch, mapping.Handle, mapping.Epoch, parent.Handle, parent.Epoch,
             artifact.ContentDigest, start.OperationId, start.OperationGeneration, new(4), 12, 9, 256, true);
+        Assert.True(NeutralChildExecutionContract.ValidateExecutionReceipt(start,
+            execution with { RetiredWorkUnits = artifact.MaximumExecutionSteps }).IsSuccess);
+        Assert.False(NeutralChildExecutionContract.ValidateExecutionReceipt(start,
+            execution with { RetiredWorkUnits = artifact.MaximumExecutionSteps + 1 }).IsSuccess);
         Assert.True(NeutralChildExecutionContract.ValidateExecutionReceipt(start, execution).IsSuccess);
         Assert.Equal(NeutralVirtualizationStatus.Stale,
             NeutralChildExecutionContract.ValidateExecutionReceipt(start,

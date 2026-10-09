@@ -16,6 +16,10 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                 requestValidation.Message ?? "The region-acquire request is invalid.");
         }
 
+        ProviderMappingRecord record;
+        DomainRecord parent;
+        lock (_childCreateCommitGate)
+        {
         var mappingValidation = ValidateProviderMappingForAcquire(
             request.Mapping,
             request.Slice);
@@ -32,11 +36,25 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                 AcquireResult(request, PlatformMemoryAcquireOutcome.Unsupported));
         }
 
-        var record = _providerMappings[request.Mapping.MappingId];
+        record = _providerMappings[request.Mapping.MappingId];
+        parent = _domains[request.Mapping.DomainLease.LeaseId];
+        }
         var external = _runtime.AcquireOwnedRegionVisibility(
             record.HybridCpuLease,
             ToNeutralAcquireRequirement(request.Requirement));
 
+        lock (_childCreateCommitGate)
+        {
+        record.AcquireObservation = external;
+        if (!_providerMappings.TryGetValue(request.Mapping.MappingId, out var current) || !ReferenceEquals(current, record) ||
+            !_domains.TryGetValue(request.Mapping.DomainLease.LeaseId, out var currentParent) || !ReferenceEquals(currentParent, parent) ||
+            !ValidateProviderMappingForAcquire(request.Mapping, request.Slice).IsSuccess)
+            return PlatformAuthorityResult<PlatformRegionAcquireResult>.Fail(PlatformAuthorityStatus.Faulted,
+                "Original acquire observation retained without current mapping/domain publication.");
+        if (external is null || external.Lease != record.HybridCpuLease || external.Requirement != ToNeutralAcquireRequirement(request.Requirement) ||
+            !Enum.IsDefined(external.Decision) || !Enum.IsDefined(external.Outcome))
+            return PlatformAuthorityResult<PlatformRegionAcquireResult>.Fail(PlatformAuthorityStatus.Faulted,
+                "Original acquire observation is malformed or unknown.");
         switch (external.Decision)
         {
             case NeutralOwnedRegionAcquireDecision.Satisfied:
@@ -73,6 +91,7 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                     PlatformAuthorityStatus.Faulted,
                     external.Reason);
         }
+        }
     }
 
     private PlatformAuthorityResult ValidateProviderMappingForAcquire(
@@ -85,6 +104,8 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                 PlatformAuthorityStatus.Denied,
                 "The provider mapping does not exist.");
         }
+        if (!_originalProviderMappings.TryGetValue(mapping.MappingId, out var original) || !ReferenceEquals(original, record))
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Provider acquire mapping route is not the original owner.");
 
         if (record.Mapping.Lease.Generation != mapping.Generation)
         {
@@ -145,7 +166,11 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                 "The provider mapping must reach exact closure before acquire evidence is requested.");
         }
 
-        return ValidateDomain(mapping.DomainLease);
+        var domainValidation = ValidateDomain(mapping.DomainLease);
+        if (!domainValidation.IsSuccess) return domainValidation;
+        if (!ReferenceEquals(record.MapParent, _domains[mapping.DomainLease.LeaseId]))
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Original mapping parent changed before acquire.");
+        return PlatformAuthorityResult.Ok();
     }
 
     private static PlatformRegionAcquireResult AcquireResult(

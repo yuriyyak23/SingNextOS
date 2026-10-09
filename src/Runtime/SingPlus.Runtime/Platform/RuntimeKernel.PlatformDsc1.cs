@@ -20,6 +20,9 @@ public sealed partial class RuntimeKernel
         public RuntimeBufferLease<byte> SourceLease { get; } = sourceLease;
         public RuntimeBufferLease<byte> DestinationLease { get; } = destinationLease;
         public byte[] StagedOutput { get; } = stagedOutput;
+        public CapabilityId ComputeCapability { get; set; }
+        public CapabilityId SourceCapability { get; set; }
+        public CapabilityId DestinationCapability { get; set; }
 
         public void Accept(PlatformDsc1CopySubmission submission) =>
             AcceptedSubmission = submission;
@@ -197,6 +200,35 @@ public sealed partial class RuntimeKernel
                     computeCapability.CapabilityId,
                     source,
                     destination,
+                    out providerAccepted,
+                    (sourceCapability, destinationCapability, commit) =>
+                    {
+                        lock (_platformMemoryUseGate)
+                        {
+                            record.ComputeCapability = computeCapability.CapabilityId;
+                            record.SourceCapability = sourceCapability;
+                            record.DestinationCapability = destinationCapability;
+                            var current = Processes.Resolve(subject);
+                            if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
+                            if (!ReferenceEquals(current.Value, process))
+                                return KernelResult.Fail(KernelError.StaleGeneration, "Original DSC1 process owner changed.");
+                            var accepts = EnsureProcessAcceptsNewEffects(process);
+                            if (!accepts.IsSuccess) return accepts;
+                            return CapabilityAuthority.CommitProcessAdmission(process.DomainId, subject.Generation,
+                                [new(ResourceKind.Compute, CapabilityResourceIds.Dsc1Copy, CapabilityRights.Execute)], () =>
+                                {
+                                    foreach (var (id, rights) in new (CapabilityId, CapabilityRights)[]
+                                        { (computeCapability.CapabilityId, CapabilityRights.Execute),
+                                          (sourceCapability, CapabilityRights.Map | CapabilityRights.Read),
+                                          (destinationCapability, CapabilityRights.Map | CapabilityRights.Write) })
+                                    {
+                                        var exact = CapabilityAuthority.Validate(id, process.DomainId, subject.Generation, rights);
+                                        if (!exact.IsSuccess) return KernelResult.Fail(exact.Error, exact.Message!);
+                                    }
+                                    return commit();
+                                });
+                        }
+                    },
                     boundaryReady), reserved =>
                     {
                         record.Accept(reserved);
@@ -357,12 +389,14 @@ public sealed partial class RuntimeKernel
         }
 
         var outputPublished = terminal.Outcome == PlatformDsc1CopyOutcome.Completed &&
-                              !discardCompletedOutput;
+                              !discardCompletedOutput && PlatformAuthority.IsDsc1PublicationAdmitted(payload.Submission);
 
-        var releaseValidation = PlatformAuthority.ValidateDsc1LocalReservationRelease(
-            payload.Submission,
-            payload.Submission.DomainBinding.Subject,
-            terminal.Outcome);
+        var releaseValidation = InvokeDsc1ProviderOutsideMemoryUseGate(boundaryReady =>
+            PlatformAuthority.ValidateDsc1LocalReservationRelease(
+                payload.Submission,
+                payload.Submission.DomainBinding.Subject,
+                terminal.Outcome,
+                boundaryReady));
         if (!releaseValidation.IsSuccess)
         {
             return KernelResult<PlatformDsc1CopyReceipt>.Fail(
@@ -370,20 +404,49 @@ public sealed partial class RuntimeKernel
                 releaseValidation.Message!);
         }
 
-        if (outputPublished)
+        KernelResult Consume()
         {
-            payload.StagedOutput.AsSpan().CopyTo(
-                payload.DestinationLease.WritableSpan.Slice(
-                    checked((int)payload.Submission.Destination.Offset),
-                    checked((int)payload.Submission.Destination.Length)));
+            if (!_dsc1PayloadOperations.TryGetValue(payload.Submission.SubmissionId, out var currentPayload) ||
+                !ReferenceEquals(currentPayload, payload))
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Original DSC1 payload owner changed before consumption.");
+            return PlatformAuthority.CommitDsc1LocalReservationRelease(payload.Submission, admitted =>
+            {
+                outputPublished &= admitted;
+                if (outputPublished)
+                    payload.StagedOutput.AsSpan().CopyTo(
+                        payload.DestinationLease.WritableSpan.Slice(
+                            checked((int)payload.Submission.Destination.Offset),
+                            checked((int)payload.Submission.Destination.Length)));
+                payload.DestinationLease.Dispose();
+                payload.SourceLease.Dispose();
+                Array.Clear(payload.StagedOutput);
+                _dsc1PayloadOperations.Remove(payload.Submission.SubmissionId);
+            });
         }
-
-        payload.DestinationLease.Dispose();
-        payload.SourceLease.Dispose();
-        Array.Clear(payload.StagedOutput);
-
-        _dsc1PayloadOperations.Remove(payload.Submission.SubmissionId);
-        PlatformAuthority.CommitDsc1LocalReservationRelease(payload.Submission);
+        var released = outputPublished ? CapabilityAuthority.CommitProcessAdmission(
+            payload.Submission.DomainBinding.Subject.DomainId, payload.Owner.Generation,
+            [new(ResourceKind.Compute, CapabilityResourceIds.Dsc1Copy, CapabilityRights.Execute)], () =>
+            {
+                var current = Processes.Resolve(payload.Owner);
+                if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
+                var accepts = EnsureProcessAcceptsNewEffects(current.Value!);
+                if (!accepts.IsSuccess) return accepts;
+                foreach (var (id, rights) in new (CapabilityId, CapabilityRights)[]
+                    { (payload.ComputeCapability, CapabilityRights.Execute),
+                      (payload.SourceCapability, CapabilityRights.Map | CapabilityRights.Read),
+                      (payload.DestinationCapability, CapabilityRights.Map | CapabilityRights.Write) })
+                {
+                    var exact = CapabilityAuthority.Validate(id, payload.Submission.DomainBinding.Subject.DomainId,
+                        payload.Owner.Generation, rights);
+                    if (!exact.IsSuccess) return KernelResult.Fail(exact.Error, exact.Message!);
+                }
+                return Consume();
+            }) : Consume();
+        if (!released.IsSuccess)
+        {
+            PlatformAuthority.RefuseDsc1OutputPublication(payload.Submission);
+            return KernelResult<PlatformDsc1CopyReceipt>.Fail(released.Error, released.Message!);
+        }
         return KernelResult<PlatformDsc1CopyReceipt>.Ok(
             new PlatformDsc1CopyReceipt(
                 payload.Submission,
@@ -494,11 +557,10 @@ public sealed partial class RuntimeKernel
     private KernelResult CascadePlatformDsc1CapabilityRevocation(
         CapabilityId capabilityId)
     {
-        lock (_platformMemoryUseGate)
-        {
-            return CancelAndReleaseDsc1Operations(
-                PlatformAuthority.Dsc1OperationsForCapability(capabilityId));
-        }
+        // RevokeCapabilityLocked already holds the memory gate. A recursive
+        // acquisition would leave it held when the provider boundary releases it.
+        return CancelAndReleaseDsc1Operations(
+            PlatformAuthority.Dsc1OperationsForCapability(capabilityId));
     }
 
     private KernelResult CancelAndReleaseDsc1Operations(

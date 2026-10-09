@@ -22,6 +22,7 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
         public Hc.ExternalOperationStage LastDelivered { get; set; } = Hc.ExternalOperationStage.Admitted;
         public bool TransitionInFlight { get; set; }
         public bool GenerationInvalidated { get; set; }
+        public bool AdmissionFailed { get; set; }
     }
 
     private readonly object gate = new();
@@ -96,27 +97,31 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
                 : SingPlus.Contracts.ExternalVisibilityRequirement.PublicationFence;
             var effect = TryMapEffect(semantic.ReplayEffectClass);
             if (effect is null) return FaultWithoutAuthority(semantic);
-            var prepared = kernel.PrepareExternalOperation(principal, regionUses, visibility, publication, effect);
+            var prepared = kernel.PrepareExternalOperationCore(principal, regionUses, visibility, publication, effect,
+                out var originalPreparation);
             if (!prepared.IsSuccess)
-                return FaultWithoutAuthority(semantic);
+                return originalPreparation is null ? FaultWithoutAuthority(semantic)
+                    : CleanupFailedAdmission(semantic, generationSnapshot, originalPreparation.Operation);
+            bool sourceCurrent;
+            lock (gate) sourceCurrent = ProviderSourceMatches(generationSnapshot);
+            if (!sourceCurrent)
+                return CleanupFailedAdmission(semantic, generationSnapshot, prepared.Value!.Operation);
+            var request = new Hc.ExternalOperationRequest(
+                new(new(Guid.NewGuid()), new(prepared.Value!.Operation.Generation.Value)), scope,
+                semantic.ContractVersion, generationSnapshot, semantic.Correlation, semantic.EffectClass,
+                semantic.VisibilityRequirement, semantic.CancellationMode);
             var admitted = kernel.AdmitExternalOperation(principal, prepared.Value!.Operation, dependencies, service,
                 semantic.CancellationMode == Hc.ExternalCancellationMode.Unsupported
                     ? ExternalCancellationSupport.BeforeSubmissionOnly
                     : ExternalCancellationSupport.ProviderCooperative);
             if (!admitted.IsSuccess)
-            {
-                _ = kernel.CancelExternalOperation(principal, prepared.Value.Operation, false);
-                _ = kernel.ReleaseExternalOperation(principal, prepared.Value.Operation, new(false, false));
-                return FaultWithoutAuthority(semantic);
-            }
-
-            var request = new Hc.ExternalOperationRequest(
-                new(new(Guid.NewGuid()), new(prepared.Value.Operation.Generation.Value)), scope,
-                semantic.ContractVersion, generationSnapshot, semantic.Correlation, semantic.EffectClass,
-                semantic.VisibilityRequirement, semantic.CancellationMode);
+                return CleanupFailedAdmission(semantic, generationSnapshot, prepared.Value.Operation);
             lock (gate)
             {
-                entries.Add(semantic.Correlation, new Entry(request, prepared.Value.Operation, null));
+                var stale = !ProviderSourceMatches(generationSnapshot);
+                entries.Add(semantic.Correlation, new Entry(request, prepared.Value.Operation, null)
+                { AdmissionFailed = stale });
+                if (stale) return StaleFor(request);
                 return new(Hc.ExternalOperationProviderPollStatus.Receipt, generationSnapshot,
                     new Hc.ExternalOperationAdmissionReceipt(request, Hc.ExternalRuntimeOutcome.Succeeded));
             }
@@ -139,6 +144,9 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
         lock (gate)
         {
             if (!TryExact(request, out entry!)) return StaleFor(request);
+            if (entry.AdmissionFailed)
+                return Failure(request, Hc.ExternalOperationProviderPollStatus.Faulted,
+                    Hc.ExternalOperationStage.Submitted, Hc.ExternalRuntimeOutcome.Faulted);
             if (!IsCurrent(entry) || entry.LastDelivered == Hc.ExternalOperationStage.Released)
                 return StaleFor(request);
             if (!BeginTransitionLocked(entry))
@@ -148,12 +156,29 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
         {
             var submitted = kernel.RecordExternalOperationSubmission(principal, entry.Operation, dependencies);
             if (!submitted.IsSuccess)
+            {
+                // A late publication refusal does not erase an owner-recorded submission.
+                // Retain its exact binding only as a cleanup fact, never as admission.
+                var original = kernel.ExternalOperations.Query(entry.Operation);
+                if (original.IsSuccess && original.Value!.Binding is { } binding && binding.Operation == entry.Operation)
+                {
+                    lock (gate)
+                    {
+                        entry.Binding = binding;
+                        if (entry.LastDelivered < Hc.ExternalOperationStage.Submitted)
+                            entry.LastDelivered = Hc.ExternalOperationStage.Submitted;
+                    }
+                }
                 return Receipt(new Hc.ExternalOperationProgressReceipt(request,
                     Hc.ExternalOperationStage.Submitted, Hc.ExternalRuntimeOutcome.Faulted));
+            }
             lock (gate)
             {
                 entry.Binding = submitted.Value!;
                 entry.LastDelivered = Hc.ExternalOperationStage.Submitted;
+                if (!IsCurrent(entry) || !ProviderSourceMatches(entry.Request.Generations))
+                    return Failure(request, Hc.ExternalOperationProviderPollStatus.Stale,
+                        Hc.ExternalOperationStage.Submitted, Hc.ExternalRuntimeOutcome.Stale);
                 return Receipt(new Hc.ExternalOperationProgressReceipt(request,
                     Hc.ExternalOperationStage.Submitted, Hc.ExternalRuntimeOutcome.Succeeded));
             }
@@ -163,6 +188,8 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
             FinishTransition(entry);
         }
     }
+
+    internal Action? BeforePollPublicationQualificationHook { private get; set; }
 
     public Hc.ExternalOperationProviderPollResult Poll(Hc.ExternalOperationRequest request)
     {
@@ -179,22 +206,29 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
         {
             var queried = kernel.QueryExternalOperation(principal, entry.Operation);
             if (!queried.IsSuccess) return StaleFor(request);
-            if (queried.Value!.Disposition == ExternalOperationDisposition.ProviderLost)
-                return Failure(request, Hc.ExternalOperationProviderPollStatus.Unavailable,
-                    MapStage(queried.Value.State), Hc.ExternalRuntimeOutcome.Unknown);
-            if (queried.Value.Disposition is ExternalOperationDisposition.Faulted or
-                ExternalOperationDisposition.Discarded or ExternalOperationDisposition.Cancelled)
-                return Failure(request, Hc.ExternalOperationProviderPollStatus.Faulted,
-                    MapStage(queried.Value.State), Hc.ExternalRuntimeOutcome.Faulted);
-            var stage = MapStage(queried.Value!.State);
-            if (stage == entry.LastDelivered)
-                return new(Hc.ExternalOperationProviderPollStatus.Pending, generations);
-            if (stage == Hc.ExternalOperationStage.Failed || stage < entry.LastDelivered ||
-                queried.Value.State == ExternalOperationState.Released &&
-                queried.Value.Disposition != ExternalOperationDisposition.Published)
-                return Receipt(new Hc.ExternalOperationAdmissionReceipt(request, Hc.ExternalRuntimeOutcome.Faulted));
+            BeforePollPublicationQualificationHook?.Invoke();
             lock (gate)
             {
+                if (!TryExact(request, out var current) || !ReferenceEquals(current, entry) ||
+                    !IsCurrent(entry) || !ProviderSourceMatches(request.Generations))
+                    return StaleFor(request);
+                // Pure existing owner query only. No callback runs under the provider gate.
+                queried = kernel.QueryExternalOperation(principal, entry.Operation);
+                if (!queried.IsSuccess) return StaleFor(request);
+                if (queried.Value!.Disposition == ExternalOperationDisposition.ProviderLost)
+                    return Failure(request, Hc.ExternalOperationProviderPollStatus.Unavailable,
+                        MapStage(queried.Value.State), Hc.ExternalRuntimeOutcome.Unknown);
+                if (queried.Value.Disposition is ExternalOperationDisposition.Faulted or
+                    ExternalOperationDisposition.Discarded or ExternalOperationDisposition.Cancelled)
+                    return Failure(request, Hc.ExternalOperationProviderPollStatus.Faulted,
+                        MapStage(queried.Value.State), Hc.ExternalRuntimeOutcome.Faulted);
+                var stage = MapStage(queried.Value!.State);
+                if (stage == entry.LastDelivered)
+                    return new(Hc.ExternalOperationProviderPollStatus.Pending, generations);
+                if (stage == Hc.ExternalOperationStage.Failed || stage < entry.LastDelivered ||
+                    queried.Value.State == ExternalOperationState.Released &&
+                    queried.Value.Disposition != ExternalOperationDisposition.Published)
+                    return Receipt(new Hc.ExternalOperationAdmissionReceipt(request, Hc.ExternalRuntimeOutcome.Faulted));
                 var next = (Hc.ExternalOperationStage)((byte)entry.LastDelivered + 1);
                 entry.LastDelivered = next;
                 return Receipt(CreateReceipt(request, next));
@@ -312,6 +346,8 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
         {
             if (!TryExact(request, out entry!))
                 return KernelResult.Fail(KernelError.ExternalOperationNotFound, "Operation correlation was not admitted.");
+            if (entry.AdmissionFailed)
+                return KernelResult.Fail(KernelError.PlatformDenied, "Failed admission retains only cleanup access.");
             if (!IsCurrent(entry))
                 return KernelResult.Fail(KernelError.StaleGeneration, "External provider generations changed before publication.");
             if (!BeginTransitionLocked(entry))
@@ -322,8 +358,25 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
             var policy = entry.Request.VisibilityRequirement == Hc.ExternalVisibilityRequirement.Coherent
                 ? ExternalPublicationPolicy.DirectCoherent
                 : ExternalPublicationPolicy.Staged;
-            var result = kernel.PublishExternalOperation(principal, entry.Operation, dependencies,
-                new(policy), publicationAction);
+            KernelResult<ExternalOperationSnapshot> CommitProvider(Func<KernelResult<ExternalOperationSnapshot>> commit)
+            {
+                lock (gate)
+                {
+                    if (!TryExact(request, out var current) || !ReferenceEquals(current, entry) ||
+                        !entry.TransitionInFlight || !IsCurrent(entry) || pendingGenerationDrift ||
+                        pendingGenerations is { } pending && !pending.Equals(entry.Request.Generations))
+                        return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.StaleGeneration,
+                            "Exact provider source changed before staged admission or publication.");
+                    // Pure local process/owner admission or commit only; action and generation
+                    // projection callbacks remain outside this provider gate.
+                    return commit();
+                }
+            }
+            var result = policy == ExternalPublicationPolicy.Staged
+                ? kernel.PublishExternalOperation(principal, entry.Operation, dependencies,
+                    new(policy), _ => publicationAction(), CommitProvider, sourceAdmission: CommitProvider)
+                : kernel.PublishExternalOperation(principal, entry.Operation, dependencies,
+                    new(policy), publicationAction);
             return result.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(result.Error, result.Message!);
         }
         finally
@@ -357,8 +410,19 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
                     if (!lost.IsSuccess) return KernelResult.Fail(lost.Error, lost.Message!);
                 }
             }
-            var result = kernel.ReleaseExternalOperation(principal, entry.Operation,
-                new(providerResourcesClosed, providerUnavailable, providerEffectContained));
+            KernelResult<ExternalOperationSnapshot> CommitSource(Func<KernelResult<ExternalOperationSnapshot>> commit)
+            {
+                lock (gate)
+                {
+                    if (!TryExact(request, out var exact) || !ReferenceEquals(exact, entry) ||
+                        !entry.TransitionInFlight || !IsCurrent(entry) || !ProviderSourceMatches(request.Generations))
+                        return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.StaleGeneration,
+                            "Exact provider source changed before operation release commit.");
+                    return commit();
+                }
+            }
+            var result = kernel.ReleaseExternalOperationCore(principal, entry.Operation,
+                new(providerResourcesClosed, providerUnavailable, providerEffectContained), CommitSource);
             return result.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(result.Error, result.Message!);
         }
         finally
@@ -393,6 +457,8 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
     /// request identifies the operation; it is never used as permission to submit,
     /// publish, or release. Resource closure remains an explicit provider assertion.
     /// </summary>
+    internal Action? BeforeReconciliationReleaseQualificationHook { private get; set; }
+
     public KernelResult ReconcileReconfiguredOperation(Hc.ExternalOperationRequest request,
         Hc.ExternalGenerationSet observedCurrentGenerations, bool providerResourcesClosed)
     {
@@ -425,8 +491,21 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
                 if (!lost.IsSuccess) return KernelResult.Fail(lost.Error, lost.Message!);
             }
             if (!providerResourcesClosed) return KernelResult.Ok();
-            var released = kernel.ReleaseExternalOperation(principal, entry.Operation,
-                new(ProviderResourcesClosed: true, ProviderUnavailable: true));
+            BeforeReconciliationReleaseQualificationHook?.Invoke();
+            KernelResult<ExternalOperationSnapshot> CommitSource(Func<KernelResult<ExternalOperationSnapshot>> commit)
+            {
+                lock (gate)
+                {
+                    if (!TryExact(request, out var exact) || !ReferenceEquals(exact, entry) ||
+                        !entry.TransitionInFlight || !entry.GenerationInvalidated ||
+                        !ProviderSourceMatches(observedCurrentGenerations))
+                        return KernelResult<ExternalOperationSnapshot>.Fail(KernelError.StaleGeneration,
+                            "Reconciliation source changed before original owner release.");
+                    return commit();
+                }
+            }
+            var released = kernel.ReleaseExternalOperationCore(principal, entry.Operation,
+                new(ProviderResourcesClosed: true, ProviderUnavailable: true), CommitSource);
             return released.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(released.Error, released.Message!);
         }
         finally
@@ -440,6 +519,11 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
 
     private bool IsCurrent(Entry entry) =>
         !entry.GenerationInvalidated && entry.Request.Generations.Equals(generations);
+
+    // Called under the existing provider gate. A deferred A -> B -> A is still drift.
+    private bool ProviderSourceMatches(Hc.ExternalGenerationSet expected) =>
+        generations.Equals(expected) && !pendingGenerationDrift &&
+        (pendingGenerations is null || pendingGenerations.Equals(expected));
 
     private List<Entry> ApplyGenerationsLocked(Hc.ExternalGenerationSet next,
         bool forceInvalidate = false)
@@ -530,6 +614,27 @@ public sealed class HybridCpuExternalOperationProvider : Hc.IExternalOperationPr
     private Hc.ExternalOperationProviderPollResult StaleFor(Hc.ExternalOperationRequest request) =>
         new(Hc.ExternalOperationProviderPollStatus.Stale, generations,
             new Hc.ExternalOperationAdmissionReceipt(request, Hc.ExternalRuntimeOutcome.Stale));
+
+    private Hc.ExternalOperationProviderPollResult CleanupFailedAdmission(
+        Hc.ExternalOperationSemanticRequest semantic, Hc.ExternalGenerationSet generationSnapshot,
+        ExternalOperationHandle operation)
+    {
+        _ = kernel.CancelExternalOperation(principal, operation, false);
+        _ = kernel.ReleaseExternalOperation(principal, operation, new(false, false));
+        var original = kernel.ExternalOperations.Query(operation);
+        if (!original.IsSuccess || original.Value!.State == ExternalOperationState.Released)
+            return FaultWithoutAuthority(semantic);
+        var request = new Hc.ExternalOperationRequest(
+            new(new(Guid.NewGuid()), new(operation.Generation.Value)), scope,
+            semantic.ContractVersion, generationSnapshot, semantic.Correlation, semantic.EffectClass,
+            semantic.VisibilityRequirement, semantic.CancellationMode);
+        // The exact owner fact survives refusal; this entry grants cleanup access only.
+        lock (gate)
+            entries.Add(semantic.Correlation, new Entry(request, operation, original.Value.Binding)
+            { AdmissionFailed = true });
+        return new(Hc.ExternalOperationProviderPollStatus.Faulted, generationSnapshot,
+            new Hc.ExternalOperationAdmissionReceipt(request, Hc.ExternalRuntimeOutcome.Faulted));
+    }
 
     private Hc.ExternalOperationProviderPollResult FaultWithoutAuthority(Hc.ExternalOperationSemanticRequest semantic)
     {

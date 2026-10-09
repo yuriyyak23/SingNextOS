@@ -15,7 +15,7 @@ public sealed partial class V6ArchitectureGuardTests
     [Theory]
     [InlineData("HybridCPU.ExternalRuntime")]
     [InlineData("HybridCPU.ExternalRuntime.Contracts")]
-    public void CurrentCrossProjectPackageVocabularyMatchesAdapterProjectAndLock(string packageId)
+    public void CurrentCrossProjectPackageResolutionMatchesAdapterProjectAndLock(string packageId)
     {
         string adapter = Path.Combine(RepositoryRoot, "tools", "HybridCpu_ExecutableAdapter");
         var project = XDocument.Load(Path.Combine(adapter, "HybridCpu_ExecutableAdapter.csproj"));
@@ -29,9 +29,15 @@ public sealed partial class V6ArchitectureGuardTests
         var dependency = locked.RootElement.GetProperty("dependencies").GetProperty("net11.0").GetProperty(packageId);
         Assert.Equal(version, dependency.GetProperty("resolved").GetString());
         Assert.Equal($"[{version}, {version}]", dependency.GetProperty("requested").GetString());
-        string document = File.ReadAllText(Path.Combine(RepositoryRoot, "docs",
-            "SingNextOS-v6-roadmap-reworked-2026-09-23", "30-CROSS-PROJECT-CONTRACTS.md"));
-        Assert.Contains($"{packageId} {version}", document, StringComparison.Ordinal);
+        using var assets = JsonDocument.Parse(File.ReadAllText(Path.Combine(adapter, "obj", "project.assets.json")));
+        string identity = $"{packageId}/{version}";
+        var library = assets.RootElement.GetProperty("libraries").GetProperty(identity);
+        Assert.Equal("package", library.GetProperty("type").GetString());
+        Assert.Equal(dependency.GetProperty("contentHash").GetString(), library.GetProperty("sha512").GetString());
+        var resolved = Assert.Single(assets.RootElement.GetProperty("targets").GetProperty("net11.0")
+            .EnumerateObject(), item => item.Name.StartsWith($"{packageId}/", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(identity, resolved.Name);
+        Assert.Equal("package", resolved.Value.GetProperty("type").GetString());
     }
 
     [Fact]

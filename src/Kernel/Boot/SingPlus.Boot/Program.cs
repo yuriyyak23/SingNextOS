@@ -42,6 +42,9 @@ internal class Program
                 EmulatorConsole.Ok($"[demo] '{name}' passed\r\n");
             }
 
+            if (session.Options.SnakeRequested)
+                return SnakeGame.Run(session, null) ? 0 : 1;
+
             if (session.Options.ScriptPath is { } scriptPath)
                 return EmulatorShell.RunScript(session, scriptPath);
 

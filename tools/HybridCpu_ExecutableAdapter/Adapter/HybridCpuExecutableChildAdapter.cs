@@ -16,15 +16,29 @@ public sealed class HybridCpuExecutableChildAdapter : INeutralRuntimeFeatureProv
     private sealed record Child(NeutralChildDomainLease Neutral, ExternalChildDomainLease External,
         ExternalDomainLease Parent, NeutralChildDomainState State)
     {
+        public bool AdmissionPublished { get; init; } = true;
+        public ExternalChildDomainCreateReceipt? CreateReceipt { get; init; }
         public bool GuestMapMayHaveEffect { get; init; }
         public bool CloseMayHaveEffect { get; init; }
+        public ExternalChildDomainCloseReceipt? CloseReceipt { get; init; }
+        public ExternalOperationIdentity CloseOperation { get; init; }
+        public NeutralChildDomainLease CloseLease { get; init; }
     }
     private sealed record Mapping(NeutralGuestMappingLease Neutral, ExternalGuestMappingLease External)
     {
+        public bool AdmissionPublished { get; init; }
         public bool ArtifactMayHaveEffect { get; init; }
         public bool ClosureMayHaveEffect { get; init; }
+        public ExternalGuestMemoryUnmapReceipt? ClosureReceipt { get; init; }
+        public ExternalOperationIdentity ClosureOperation { get; init; }
+        public NeutralGuestMappingLease ClosureLease { get; init; }
     }
-    private sealed record Artifact(NeutralExecutableArtifactReceipt Neutral, ExternalChildArtifactBindReceipt External);
+    private sealed record Artifact(NeutralExecutableArtifactReceipt Neutral, ExternalChildArtifactBindReceipt External)
+    {
+        public bool AdmissionPublished { get; init; }
+        public NeutralChildExecutionReceipt? ExecutionReceipt { get; set; }
+        public ExternalChildExecutionReceipt? TupleMatchedExecutionObservation { get; set; }
+    }
     private sealed record Io(NeutralVirtualIoLease Neutral, ExternalChildVirtualIoBindReceipt External);
 
     private readonly object sync = new();
@@ -81,34 +95,54 @@ public sealed class HybridCpuExecutableChildAdapter : INeutralRuntimeFeatureProv
     {
         var valid = NeutralChildDomainContract.ValidateCreate(parentLease, intent);
         if (!valid.IsSuccess) return Fail<NeutralChildDomainLease>(valid);
+        ExternalChildAuthority authority;
+        ExternalDomainLease parent;
+        bool hasParent;
+        ulong reservedIdentity;
+        ExternalOperationIdentity bindOperation, createOperation;
         lock (sync)
         {
             if (parentCreateMayHaveEffect.Contains(parentLease.Handle))
                 return Fail<NeutralChildDomainLease>(NeutralVirtualizationStatus.Ambiguous,
                     "Parent bind or child creation may have taken effect without exact evidence.");
             if (pendingParentBinds.Contains(parentLease.Handle))
-                return Fail<NeutralChildDomainLease>(NeutralVirtualizationStatus.Denied,
+                return Fail<NeutralChildDomainLease>(NeutralVirtualizationStatus.NotInvoked,
                     "Parent bind admission is already in flight for this handle.");
             if (parents.Keys.Any(existing => existing.Handle == parentLease.Handle && existing != parentLease))
                 return Fail<NeutralChildDomainLease>(NeutralVirtualizationStatus.Stale,
                     "Parent binding epoch changed without exact external rebind or closure.");
-            ExternalChildAuthority authority = ToExternal(intent.Authority.ChildAuthority);
+            authority = ToExternal(intent.Authority.ChildAuthority);
             if (authority == ExternalChildAuthority.None)
                 return Fail<NeutralChildDomainLease>(NeutralVirtualizationStatus.Denied,
                     "No executable child authority was admitted.");
-            if (!parents.TryGetValue(parentLease, out ExternalDomainLease parent))
+            if (nextIdentity == 0 || nextIdentity == ulong.MaxValue)
+                return Fail<NeutralChildDomainLease>(NeutralVirtualizationStatus.NotInvoked,
+                    "Local child identity capacity is exhausted before parent/provider effects.");
+            hasParent = parents.TryGetValue(parentLease, out parent);
+            ulong operationCount = hasParent ? 1UL : 2UL;
+            if (nextOperation == 0 || nextOperation > ulong.MaxValue - operationCount)
+                return Fail<NeutralChildDomainLease>(NeutralVirtualizationStatus.NotInvoked,
+                    "External create operation capacity is exhausted before parent/provider effects.");
+            reservedIdentity = Next(); // consumed before any external effect; no rollback/recycle
+            bindOperation = hasParent ? default : Op();
+            createOperation = Op(); // applicable operation tuple reserved before first callback
+            if (!hasParent) pendingParentBinds.Add(parentLease.Handle);
+        }
+            if (!hasParent)
             {
-                var bindRequest = new ExternalDomainBindRequest(Guid.NewGuid(), ExternalDomainProfile.IsolatedDomain, Op());
+                try
+                {
+                var bindRequest = new ExternalDomainBindRequest(Guid.NewGuid(), ExternalDomainProfile.IsolatedDomain, bindOperation);
                 ExternalDomainBindResult bound;
-                pendingParentBinds.Add(parentLease.Handle);
                 try { bound = root.BindDomain(bindRequest); }
                 catch (Exception exception) when (exception is not StackOverflowException)
                 {
-                    parentCreateMayHaveEffect.Add(parentLease.Handle);
+                    lock (sync) parentCreateMayHaveEffect.Add(parentLease.Handle);
                     return Fail<NeutralChildDomainLease>(NeutralVirtualizationStatus.Ambiguous,
                         $"External parent bind may have taken effect without a receipt: {exception.Message}");
                 }
-                finally { pendingParentBinds.Remove(parentLease.Handle); }
+                lock (sync)
+                {
                 if (bound.Outcome != ExternalRuntimeOutcome.Bound || bound.Receipt is not { } bindReceipt ||
                     bindReceipt.Lease.Handle.Value == Guid.Empty || bindReceipt.Lease.Epoch.Value == 0 ||
                     bindReceipt.Operation != bindRequest.Operation ||
@@ -122,19 +156,32 @@ public sealed class HybridCpuExecutableChildAdapter : INeutralRuntimeFeatureProv
                 }
                 parent = bindReceipt.Lease;
                 parents.Add(parentLease, parent);
+                }
+                }
+                finally { lock (sync) pendingParentBinds.Remove(parentLease.Handle); }
             }
             var createRequest = new ExternalChildDomainCreateRequest(Guid.NewGuid(), authority,
-                checked((ulong)intent.Profile.MaximumGuestMemoryBytes), Op());
+                checked((ulong)intent.Profile.MaximumGuestMemoryBytes), createOperation);
+            lock (sync)
+            {
+                if (parentCreateMayHaveEffect.Contains(parentLease.Handle) ||
+                    !parents.TryGetValue(parentLease, out var admittedParent) || admittedParent != parent)
+                    return Fail<NeutralChildDomainLease>(NeutralVirtualizationStatus.Ambiguous,
+                        "Parent admission changed before child creation; provider was not invoked.");
+            }
             ExternalChildResult<ExternalChildDomainCreateReceipt> result;
             try { result = childRuntime.CreateChildDomain(parent, createRequest); }
             catch (Exception exception) when (exception is not StackOverflowException)
             {
-                parentCreateMayHaveEffect.Add(parentLease.Handle);
+                lock (sync) parentCreateMayHaveEffect.Add(parentLease.Handle);
                 return Fail<NeutralChildDomainLease>(NeutralVirtualizationStatus.Ambiguous,
                     $"External child creation may have taken effect without a receipt: {exception.Message}");
             }
-            if (parentCreateMayHaveEffect.Contains(parentLease.Handle) ||
-                !parents.TryGetValue(parentLease, out ExternalDomainLease returnedParent) || returnedParent != parent)
+            lock (sync)
+            {
+            bool continuity = !parentCreateMayHaveEffect.Contains(parentLease.Handle) &&
+                parents.TryGetValue(parentLease, out ExternalDomainLease returnedParent) && returnedParent == parent;
+            if (!continuity && (result.Outcome != ExternalRuntimeOutcome.Bound || result.Receipt is null))
             {
                 parentCreateMayHaveEffect.Add(parentLease.Handle);
                 return Fail<NeutralChildDomainLease>(NeutralVirtualizationStatus.Ambiguous,
@@ -153,49 +200,75 @@ public sealed class HybridCpuExecutableChildAdapter : INeutralRuntimeFeatureProv
                 return Fail<NeutralChildDomainLease>(NeutralVirtualizationStatus.Ambiguous,
                     "External child creation lacks exact effect evidence; parent remains pinned.");
             }
-            var lease = new NeutralChildDomainLease(parentLease, new(Next()), new(1), intent);
-            children.Add(lease.Handle, new(lease, createReceipt.Lease, parent, NeutralChildDomainState.Created));
+            var lease = new NeutralChildDomainLease(parentLease, new(reservedIdentity), new(1), intent);
+            children.Add(lease.Handle, new(lease, createReceipt.Lease, parent,
+                continuity ? NeutralChildDomainState.Created : NeutralChildDomainState.Faulted)
+            { AdmissionPublished = continuity, CreateReceipt = createReceipt });
+            if (!continuity)
+            {
+                parentCreateMayHaveEffect.Add(parentLease.Handle);
+                return Fail<NeutralChildDomainLease>(NeutralVirtualizationStatus.Ambiguous,
+                    "External child creation parent continuity changed; exact child retained for cleanup, publication refused.");
+            }
             return Ok(lease);
         }
     }
 
+    // Called only under sync; facts remain owned by the existing admission sets/mappings.
+    private bool HasPendingGuestAdmission(NeutralChildDomainLease child) =>
+        pendingGuestMaps.ContainsKey(child.Handle) || pendingArtifactBinds.Any(handle =>
+            mappings.TryGetValue(handle, out var mapping) && mapping.Neutral.ChildLease == child) ||
+        pendingGuestUnmaps.Any(handle =>
+            mappings.TryGetValue(handle, out var mapping) && mapping.Neutral.ChildLease == child);
+
     public NeutralVirtualizationResult TransitionChildDomain(NeutralChildDomainLease lease, NeutralChildDomainTransition transition)
     {
+        Child record;
+        ExternalChildDomainTransition external;
+        ExternalOperationIdentity operation;
         lock (sync)
         {
-            if (!TryChild(lease, out Child? record, out var failure)) return failure;
+            if (!TryChild(lease, out Child? admittedChild, out var failure)) return failure;
+            record = admittedChild!;
             if (record!.State == NeutralChildDomainState.Closed)
                 return Fail(NeutralVirtualizationStatus.Stale, "Exact child is already closed.");
             if (record!.State == NeutralChildDomainState.Faulted)
                 return Fail(NeutralVirtualizationStatus.Ambiguous,
                     "Child transition outcome is quarantined pending external reconciliation.");
+            if (pendingChildTransitions.Contains(lease.Handle) || pendingChildStarts.Contains(lease.Handle) || HasPendingGuestAdmission(lease))
+                return Fail(NeutralVirtualizationStatus.NotInvoked, "Child provider transition or executable start is already in flight.");
             if (transition == NeutralChildDomainTransition.BeginDrain)
             {
                 children[lease.Handle] = record! with { State = NeutralChildDomainState.Draining };
                 return Ok();
             }
             if (transition == NeutralChildDomainTransition.Start)
-                return Fail(NeutralVirtualizationStatus.Denied,
+                return Fail(NeutralVirtualizationStatus.NotInvoked,
                     "Executable Start requires the exact artifact/start operation contract.");
-            if (pendingChildTransitions.Contains(lease.Handle) || pendingChildStarts.Contains(lease.Handle))
-                return Fail(NeutralVirtualizationStatus.Denied, "Child provider transition or executable start is already in flight.");
-            ExternalChildDomainTransition external = transition switch
+            external = transition switch
             {
                 NeutralChildDomainTransition.Park => ExternalChildDomainTransition.Park,
                 NeutralChildDomainTransition.Resume => ExternalChildDomainTransition.Resume,
                 _ => throw new ArgumentOutOfRangeException(nameof(transition)),
             };
-            var operation = Op();
-            ExternalChildResult<ExternalChildDomainTransitionReceipt> result;
+            if (nextOperation == 0 || nextOperation == ulong.MaxValue)
+                return Fail(NeutralVirtualizationStatus.NotInvoked,
+                    "External transition operation capacity is exhausted before provider invocation.");
+            operation = Op();
             pendingChildTransitions.Add(lease.Handle);
+        }
+        try
+        {
+            ExternalChildResult<ExternalChildDomainTransitionReceipt> result;
             try { result = childRuntime.TransitionChildDomain(record!.External, external, operation); }
             catch (Exception exception) when (exception is not StackOverflowException)
             {
-                FaultTransitionChild(lease.Handle);
+                lock (sync) FaultTransitionChild(lease.Handle);
                 return Fail(NeutralVirtualizationStatus.Ambiguous,
                     $"External child transition may have taken effect without a receipt: {exception.Message}");
             }
-            finally { pendingChildTransitions.Remove(lease.Handle); }
+            lock (sync)
+            {
             if (!children.TryGetValue(lease.Handle, out Child? returnedChild) || returnedChild != record)
             {
                 FaultTransitionChild(lease.Handle);
@@ -223,7 +296,9 @@ public sealed class HybridCpuExecutableChildAdapter : INeutralRuntimeFeatureProv
             var state = transition == NeutralChildDomainTransition.Park ? NeutralChildDomainState.Parked : NeutralChildDomainState.Running;
             children[lease.Handle] = record with { State = state };
             return Ok();
+            }
         }
+        finally { lock (sync) pendingChildTransitions.Remove(lease.Handle); }
     }
 
     private void FaultTransitionChild(NeutralChildDomainHandle handle)
@@ -234,22 +309,28 @@ public sealed class HybridCpuExecutableChildAdapter : INeutralRuntimeFeatureProv
 
     public NeutralVirtualizationResult<NeutralChildDomainCloseReceipt> CloseChildDomain(NeutralChildDomainLease lease)
     {
+        Child record;
+        ExternalOperationIdentity operation;
         lock (sync)
         {
-            if (!TryChild(lease, out Child? record, out var failure)) return Fail<NeutralChildDomainCloseReceipt>(failure);
+            if (!TryChild(lease, out Child? admittedChild, out var failure, allowCleanup: true)) return Fail<NeutralChildDomainCloseReceipt>(failure);
+            record = admittedChild!;
             if (record!.State == NeutralChildDomainState.Closed)
                 return Fail<NeutralChildDomainCloseReceipt>(NeutralVirtualizationStatus.Stale,
                     "Exact child is already closed.");
             if (pendingGuestMaps.ContainsKey(lease.Handle))
-                return Fail<NeutralChildDomainCloseReceipt>(NeutralVirtualizationStatus.Denied,
+                return Fail<NeutralChildDomainCloseReceipt>(NeutralVirtualizationStatus.NotInvoked,
                     "Guest mapping admission is in flight; child closure is prohibited.");
             if (pendingChildTransitions.Contains(lease.Handle))
-                return Fail<NeutralChildDomainCloseReceipt>(NeutralVirtualizationStatus.Denied,
+                return Fail<NeutralChildDomainCloseReceipt>(NeutralVirtualizationStatus.NotInvoked,
                     "Child provider transition is in flight; child closure is prohibited.");
+            if (pendingChildStarts.Contains(lease.Handle))
+                return Fail<NeutralChildDomainCloseReceipt>(NeutralVirtualizationStatus.NotInvoked,
+                    "Executable Start is in flight; child closure is prohibited.");
             if (record!.GuestMapMayHaveEffect)
                 return Fail<NeutralChildDomainCloseReceipt>(NeutralVirtualizationStatus.Ambiguous,
                     "Guest mapping may exist without an exact lease or closure receipt; child remains pinned.");
-            if (record.CloseMayHaveEffect)
+            if (record.CloseMayHaveEffect && record.CloseReceipt is null)
                 return Fail<NeutralChildDomainCloseReceipt>(NeutralVirtualizationStatus.Ambiguous,
                     "External child close may have taken effect without exact evidence; retry is prohibited.");
             if (mappings.Values.Any(mapping => mapping.Neutral.ChildLease == lease))
@@ -258,37 +339,64 @@ public sealed class HybridCpuExecutableChildAdapter : INeutralRuntimeFeatureProv
             if (ioBindings.Values.Any(io => io.Neutral.ChildLease == lease))
                 return Fail<NeutralChildDomainCloseReceipt>(NeutralVirtualizationStatus.Ambiguous,
                     "Virtual-I/O bindings must close before external child closure.");
-            var operation = Op();
-            ExternalChildResult<ExternalChildDomainCloseReceipt> result;
+            if (record.CloseReceipt is { } knownClose)
+            {
+                if (record.Neutral != record.CloseLease || knownClose.Lease != record.External ||
+                    knownClose.Lease.Parent != record.Parent || knownClose.Operation != record.CloseOperation ||
+                    knownClose.ContractVersion != externalFeatures.ContractVersion ||
+                    knownClose.ManifestGeneration != externalFeatures.Generation ||
+                    knownClose.ResultingState != ExternalChildDomainState.Closed || !knownClose.IsTerminal)
+                    return Fail<NeutralChildDomainCloseReceipt>(NeutralVirtualizationStatus.Ambiguous,
+                        "Retained child closure no longer matches the original child/parent/operation/provider tuple.");
+                children[lease.Handle] = record with { State = NeutralChildDomainState.Closed };
+                return Ok(new NeutralChildDomainCloseReceipt(lease.Handle, lease.Epoch, lease.ParentLease.Handle, lease.ParentLease.Epoch,
+                    NeutralChildDomainState.Closed, true)); // local cleanup; no repeated provider close
+            }
+            if (nextOperation == 0 || nextOperation == ulong.MaxValue)
+                return Fail<NeutralChildDomainCloseReceipt>(NeutralVirtualizationStatus.NotInvoked,
+                    "External child-close operation capacity is exhausted; child remains pinned.");
+            operation = Op();
             pendingChildCloses.Add(lease.Handle);
+        }
+        try
+        {
+            ExternalChildResult<ExternalChildDomainCloseReceipt> result;
             try { result = childRuntime.CloseChildDomain(record.External, operation); }
             catch (Exception exception) when (exception is not StackOverflowException)
             {
-                PinChildCloseUncertainty(lease.Handle);
+                lock (sync) PinChildCloseUncertainty(lease.Handle);
                 return Fail<NeutralChildDomainCloseReceipt>(NeutralVirtualizationStatus.Ambiguous,
                     $"External child close may have taken effect without a receipt: {exception.Message}");
             }
-            finally { pendingChildCloses.Remove(lease.Handle); }
-            if (!children.TryGetValue(lease.Handle, out Child? returnedChild) || returnedChild != record)
+            lock (sync)
             {
-                PinChildCloseUncertainty(lease.Handle);
-                return Fail<NeutralChildDomainCloseReceipt>(NeutralVirtualizationStatus.Ambiguous,
-                    "External child close owner continuity changed during provider callback; child remains pinned.");
-            }
-            if (result.Outcome != ExternalRuntimeOutcome.Closed || result.Receipt is not { } receipt ||
-                receipt.Lease != record.External || receipt.Operation != operation ||
-                receipt.ContractVersion != externalFeatures.ContractVersion ||
-                receipt.ManifestGeneration != externalFeatures.Generation ||
-                receipt.ResultingState != ExternalChildDomainState.Closed || !receipt.IsTerminal)
-            {
-                PinChildCloseUncertainty(lease.Handle);
-                return Fail<NeutralChildDomainCloseReceipt>(NeutralVirtualizationStatus.Ambiguous,
-                    "External child close lacks exact terminal evidence; child remains quarantined.");
-            }
-            children[lease.Handle] = record with { State = NeutralChildDomainState.Closed };
-            return Ok(new NeutralChildDomainCloseReceipt(lease.Handle, lease.Epoch, lease.ParentLease.Handle, lease.ParentLease.Epoch,
-                NeutralChildDomainState.Closed, true));
+                bool continuity = children.TryGetValue(lease.Handle, out Child? returnedChild) && returnedChild == record;
+                if (result.Outcome != ExternalRuntimeOutcome.Closed || result.Receipt is not { } receipt ||
+                    receipt.Lease != record.External || receipt.Operation != operation ||
+                    receipt.ContractVersion != externalFeatures.ContractVersion ||
+                    receipt.ManifestGeneration != externalFeatures.Generation ||
+                    receipt.ResultingState != ExternalChildDomainState.Closed || !receipt.IsTerminal)
+                {
+                    PinChildCloseUncertainty(lease.Handle);
+                    return Fail<NeutralChildDomainCloseReceipt>(NeutralVirtualizationStatus.Ambiguous,
+                        "External child close lacks exact terminal evidence; child remains quarantined.");
+                }
+                if (!continuity)
+                {
+                    if (returnedChild is not null && returnedChild.Neutral == record.Neutral &&
+                        returnedChild.External == record.External && returnedChild.Parent == record.Parent)
+                        children[lease.Handle] = returnedChild with { CloseReceipt = receipt, CloseOperation = operation,
+                            CloseLease = record.Neutral };
+                    PinChildCloseUncertainty(lease.Handle);
+                    return Fail<NeutralChildDomainCloseReceipt>(NeutralVirtualizationStatus.Ambiguous,
+                        "External child close owner continuity changed; exact closure retained when the original tuple remains, publication refused.");
+                }
+                children[lease.Handle] = record with { State = NeutralChildDomainState.Closed };
+                return Ok(new NeutralChildDomainCloseReceipt(lease.Handle, lease.Epoch, lease.ParentLease.Handle, lease.ParentLease.Epoch,
+                    NeutralChildDomainState.Closed, true));
+                }
         }
+        finally { lock (sync) pendingChildCloses.Remove(lease.Handle); }
     }
 
     private void PinChildCloseUncertainty(NeutralChildDomainHandle handle)
@@ -301,31 +409,45 @@ public sealed class HybridCpuExecutableChildAdapter : INeutralRuntimeFeatureProv
     {
         var valid = NeutralGuestMemoryContract.ValidateMap(request, NeutralChildDomainState.Created);
         if (!valid.IsSuccess) return Fail<NeutralGuestMappingLease>(valid);
+        Child child;
+        ulong reservedIdentity;
+        ExternalGuestMemoryMapRequest externalRequest;
         lock (sync)
         {
-            if (!TryChild(request.ChildLease, out Child? child, out var failure)) return Fail<NeutralGuestMappingLease>(failure);
+            if (!TryChild(request.ChildLease, out Child? admittedChild, out var failure)) return Fail<NeutralGuestMappingLease>(failure);
+            child = admittedChild!;
+            if (pendingChildStarts.Contains(request.ChildLease.Handle) || pendingChildTransitions.Contains(request.ChildLease.Handle))
+                return Fail<NeutralGuestMappingLease>(NeutralVirtualizationStatus.NotInvoked,
+                    "Child execution or transition is in flight; guest map provider was not invoked.");
             if (child!.State != NeutralChildDomainState.Created)
                 return Fail<NeutralGuestMappingLease>(NeutralVirtualizationStatus.Denied,
                     "Child lifecycle must be Created for guest mapping admission.");
-            var externalRequest = new ExternalGuestMemoryMapRequest(request.GuestRange.Offset,
+            if (nextIdentity == 0 || nextIdentity == ulong.MaxValue)
+                return Fail<NeutralGuestMappingLease>(NeutralVirtualizationStatus.NotInvoked,
+                    "Local guest mapping identity capacity is exhausted before provider invocation.");
+            if (nextOperation == 0 || nextOperation == ulong.MaxValue)
+                return Fail<NeutralGuestMappingLease>(NeutralVirtualizationStatus.NotInvoked,
+                    "External guest-map operation capacity is exhausted before provider invocation.");
+            reservedIdentity = Next(); // consumed before possible effect; never recycled
+            externalRequest = new ExternalGuestMemoryMapRequest(request.GuestRange.Offset,
                 checked((ulong)request.GuestRange.Length), Op());
-            ExternalChildResult<ExternalGuestMemoryMapReceipt> result;
             pendingGuestMaps.TryGetValue(request.ChildLease.Handle, out int pendingMaps);
             pendingGuestMaps[request.ChildLease.Handle] = checked(pendingMaps + 1);
+        }
+        try
+        {
+            ExternalChildResult<ExternalGuestMemoryMapReceipt> result;
             try { result = childRuntime.MapChildGuestMemory(child.External, externalRequest); }
             catch (Exception exception) when (exception is not StackOverflowException)
             {
-                PinGuestMapUncertainty(request.ChildLease.Handle);
+                lock (sync) PinGuestMapUncertainty(request.ChildLease.Handle);
                 return Fail<NeutralGuestMappingLease>(NeutralVirtualizationStatus.Ambiguous,
                     $"External guest map may have taken effect without a receipt: {exception.Message}");
             }
-            finally
+            lock (sync)
             {
-                int remaining = pendingGuestMaps[request.ChildLease.Handle] - 1;
-                if (remaining == 0) pendingGuestMaps.Remove(request.ChildLease.Handle);
-                else pendingGuestMaps[request.ChildLease.Handle] = remaining;
-            }
-            if (!children.TryGetValue(request.ChildLease.Handle, out Child? returnedChild) || returnedChild != child)
+            bool continuity = children.TryGetValue(request.ChildLease.Handle, out Child? returnedChild) && returnedChild == child;
+            if (!continuity && (result.Outcome != ExternalRuntimeOutcome.Succeeded || result.Receipt is null))
             {
                 PinGuestMapUncertainty(request.ChildLease.Handle);
                 return Fail<NeutralGuestMappingLease>(NeutralVirtualizationStatus.Ambiguous,
@@ -333,10 +455,7 @@ public sealed class HybridCpuExecutableChildAdapter : INeutralRuntimeFeatureProv
             }
             if (result.Outcome != ExternalRuntimeOutcome.Succeeded || result.Receipt is null)
             {
-                children[request.ChildLease.Handle] = child with
-                {
-                    State = NeutralChildDomainState.Faulted, GuestMapMayHaveEffect = true,
-                };
+                PinGuestMapUncertainty(request.ChildLease.Handle);
                 return Fail<NeutralGuestMappingLease>(NeutralVirtualizationStatus.Ambiguous,
                     $"External guest map lacks exact effect evidence: {result.Outcome}: {result.Reason}");
             }
@@ -349,33 +468,52 @@ public sealed class HybridCpuExecutableChildAdapter : INeutralRuntimeFeatureProv
                 externalReceipt.ContractVersion != externalFeatures.ContractVersion ||
                 externalReceipt.ManifestGeneration != externalFeatures.Generation)
             {
-                children[request.ChildLease.Handle] = child with
-                {
-                    State = NeutralChildDomainState.Faulted, GuestMapMayHaveEffect = true,
-                };
+                PinGuestMapUncertainty(request.ChildLease.Handle);
                 return Fail<NeutralGuestMappingLease>(NeutralVirtualizationStatus.Ambiguous,
                     "External guest map receipt does not match the exact child, range, operation, or provider generation.");
             }
             var lease = new NeutralGuestMappingLease(request.ChildLease, request.ParentMapping, request.GuestRange,
-                request.Access, new(Next()), new(1));
-            mappings.Add(lease.Handle, new(lease, externalReceipt.Mapping));
+                request.Access, new(reservedIdentity), new(1));
+            mappings.Add(lease.Handle, new(lease, externalReceipt.Mapping) { AdmissionPublished = continuity });
+            if (!continuity)
+            {
+                FaultTransitionChild(request.ChildLease.Handle); // preserve independent unknown invocation pins
+                return Fail<NeutralGuestMappingLease>(NeutralVirtualizationStatus.Ambiguous,
+                    "External guest map owner continuity changed; exact mapping retained for cleanup, publication refused.");
+            }
             return Ok(lease);
+            }
+        }
+        finally
+        {
+            lock (sync)
+            {
+                int remaining = pendingGuestMaps[request.ChildLease.Handle] - 1;
+                if (remaining == 0) pendingGuestMaps.Remove(request.ChildLease.Handle);
+                else pendingGuestMaps[request.ChildLease.Handle] = remaining;
+            }
         }
     }
 
     public NeutralVirtualizationResult<NeutralGuestMappingCloseReceipt> UnmapGuestRegion(NeutralGuestMappingLease lease)
     {
+        Mapping mapping;
+        ExternalOperationIdentity operation;
         lock (sync)
         {
-            if (!mappings.TryGetValue(lease.Handle, out Mapping? mapping) || mapping.Neutral != lease)
+            if (!mappings.TryGetValue(lease.Handle, out Mapping? admittedMapping) || admittedMapping.Neutral != lease)
                 return Fail<NeutralGuestMappingCloseReceipt>(NeutralVirtualizationStatus.Stale, "Guest mapping is absent or stale.");
+            mapping = admittedMapping;
+            if (pendingChildStarts.Contains(lease.ChildLease.Handle) || pendingChildTransitions.Contains(lease.ChildLease.Handle))
+                return Fail<NeutralGuestMappingCloseReceipt>(NeutralVirtualizationStatus.NotInvoked,
+                    "Child execution or transition is in flight; guest unmap provider was not invoked.");
             if (pendingGuestUnmaps.Contains(lease.Handle))
                 return Fail<NeutralGuestMappingCloseReceipt>(NeutralVirtualizationStatus.Denied,
                     "Guest unmap admission is already in flight for this mapping.");
             if (pendingArtifactBinds.Contains(lease.Handle))
                 return Fail<NeutralGuestMappingCloseReceipt>(NeutralVirtualizationStatus.Denied,
                     "Executable artifact bind admission is in flight for this mapping.");
-            if (mapping.ClosureMayHaveEffect)
+            if (mapping.ClosureMayHaveEffect && mapping.ClosureReceipt is null)
                 return Fail<NeutralGuestMappingCloseReceipt>(NeutralVirtualizationStatus.Ambiguous,
                     "Guest unmap may have taken effect without exact closure; retry is prohibited.");
             if (mapping.ArtifactMayHaveEffect ||
@@ -383,30 +521,64 @@ public sealed class HybridCpuExecutableChildAdapter : INeutralRuntimeFeatureProv
                     artifact.Neutral.MappingEpoch == lease.Epoch))
                 return Fail<NeutralGuestMappingCloseReceipt>(NeutralVirtualizationStatus.Denied,
                     "Executable artifact effect has no exact release evidence for this guest mapping.");
-            var operation = Op();
-            ExternalChildResult<ExternalGuestMemoryUnmapReceipt> result;
+            if (mapping.ClosureReceipt is { } knownClosure)
+            {
+                if (mapping.Neutral != mapping.ClosureLease || knownClosure.Mapping != mapping.External ||
+                    knownClosure.Operation != mapping.ClosureOperation || !knownClosure.IsTerminal ||
+                    knownClosure.ContractVersion != externalFeatures.ContractVersion ||
+                    knownClosure.ManifestGeneration != externalFeatures.Generation)
+                    return Fail<NeutralGuestMappingCloseReceipt>(NeutralVirtualizationStatus.Ambiguous,
+                        "Retained guest closure no longer matches the exact mapping/provider generation.");
+                mappings.Remove(lease.Handle); // local cleanup only; original provider effect is not repeated
+                return Ok(new NeutralGuestMappingCloseReceipt(lease.Handle, lease.Epoch, lease.ChildLease.Handle, lease.ChildLease.Epoch,
+                    lease.ChildLease.ParentLease.Handle, lease.ChildLease.ParentLease.Epoch, true));
+            }
+            if (nextOperation == 0 || nextOperation == ulong.MaxValue)
+                return Fail<NeutralGuestMappingCloseReceipt>(NeutralVirtualizationStatus.NotInvoked,
+                    "External guest-unmap operation capacity is exhausted; mapping remains pinned.");
+            operation = Op();
             pendingGuestUnmaps.Add(lease.Handle);
+        }
+        try
+        {
+            ExternalChildResult<ExternalGuestMemoryUnmapReceipt> result;
             try { result = childRuntime.UnmapChildGuestMemory(mapping.External, operation); }
             catch (Exception exception) when (exception is not StackOverflowException)
             {
-                PinGuestUnmapUncertainty(mapping);
+                lock (sync) PinGuestUnmapUncertainty(mapping);
                 return Fail<NeutralGuestMappingCloseReceipt>(NeutralVirtualizationStatus.Ambiguous,
                     $"External guest unmap may have taken effect without a closure receipt: {exception.Message}");
             }
-            finally { pendingGuestUnmaps.Remove(lease.Handle); }
-            if (result.Outcome != ExternalRuntimeOutcome.Closed || result.Receipt is not { } receipt ||
-                receipt.Mapping != mapping.External || receipt.Operation != operation ||
-                receipt.ContractVersion != externalFeatures.ContractVersion ||
-                receipt.ManifestGeneration != externalFeatures.Generation || !receipt.IsTerminal)
+            lock (sync)
             {
-                PinGuestUnmapUncertainty(mapping);
-                return Fail<NeutralGuestMappingCloseReceipt>(NeutralVirtualizationStatus.Ambiguous,
-                    "External guest unmap lacks exact closure evidence; mapping remains pinned.");
-            }
-            mappings.Remove(lease.Handle);
-            return Ok(new NeutralGuestMappingCloseReceipt(lease.Handle, lease.Epoch, lease.ChildLease.Handle, lease.ChildLease.Epoch,
-                lease.ChildLease.ParentLease.Handle, lease.ChildLease.ParentLease.Epoch, true));
+                bool continuity = mappings.TryGetValue(lease.Handle, out Mapping? returnedMapping) && returnedMapping == mapping;
+                if (result.Outcome != ExternalRuntimeOutcome.Closed || result.Receipt is not { } receipt ||
+                    receipt.Mapping != mapping.External || receipt.Operation != operation ||
+                    receipt.ContractVersion != externalFeatures.ContractVersion ||
+                    receipt.ManifestGeneration != externalFeatures.Generation || !receipt.IsTerminal)
+                {
+                    PinGuestUnmapUncertainty(mapping);
+                    return Fail<NeutralGuestMappingCloseReceipt>(NeutralVirtualizationStatus.Ambiguous,
+                        "External guest unmap lacks exact closure evidence; mapping remains pinned.");
+                }
+                if (!continuity)
+                {
+                    // Preserve the validated original closure only on its exact existing owner tuple.
+                    // A replacement tuple cannot inherit this fact or authorize cleanup.
+                    if (returnedMapping is not null && returnedMapping.Neutral == mapping.Neutral &&
+                        returnedMapping.External == mapping.External)
+                        mappings[lease.Handle] = returnedMapping with { ClosureReceipt = receipt, ClosureOperation = operation,
+                            ClosureLease = mapping.Neutral };
+                    PinGuestUnmapUncertainty(mapping);
+                    return Fail<NeutralGuestMappingCloseReceipt>(NeutralVirtualizationStatus.Ambiguous,
+                        "External guest unmap owner continuity changed; exact closure retained when the original tuple remains, publication refused.");
+                }
+                mappings.Remove(lease.Handle);
+                return Ok(new NeutralGuestMappingCloseReceipt(lease.Handle, lease.Epoch, lease.ChildLease.Handle, lease.ChildLease.Epoch,
+                    lease.ChildLease.ParentLease.Handle, lease.ChildLease.ParentLease.Epoch, true));
+                }
         }
+        finally { lock (sync) pendingGuestUnmaps.Remove(lease.Handle); }
     }
 
     private void PinGuestMapUncertainty(NeutralChildDomainHandle handle)
@@ -427,37 +599,61 @@ public sealed class HybridCpuExecutableChildAdapter : INeutralRuntimeFeatureProv
     {
         var valid = NeutralChildExecutionContract.ValidateAdmission(request);
         if (!valid.IsSuccess) return Fail<NeutralExecutableArtifactReceipt>(valid);
+        Child child;
+        Mapping mapping;
+        ulong reservedIdentity;
+        ExternalChildArtifactBindRequest externalRequest;
         lock (sync)
         {
-            if (!TryChild(request.ChildLease, out Child? child, out var failure)) return Fail<NeutralExecutableArtifactReceipt>(failure);
+            if (!TryChild(request.ChildLease, out Child? admittedChild, out var failure)) return Fail<NeutralExecutableArtifactReceipt>(failure);
+            child = admittedChild!;
             if (child!.State == NeutralChildDomainState.Faulted)
                 return Fail<NeutralExecutableArtifactReceipt>(NeutralVirtualizationStatus.Ambiguous,
                     "Child execution outcome is quarantined pending external reconciliation.");
+            if (pendingChildStarts.Contains(request.ChildLease.Handle) || pendingChildTransitions.Contains(request.ChildLease.Handle))
+                return Fail<NeutralExecutableArtifactReceipt>(NeutralVirtualizationStatus.NotInvoked,
+                    "Child execution or transition is in flight; artifact bind provider was not invoked.");
             if (child.State != NeutralChildDomainState.Created)
                 return Fail<NeutralExecutableArtifactReceipt>(NeutralVirtualizationStatus.Denied,
                     "Executable artifact admission requires a Created child.");
-            if (!mappings.TryGetValue(request.GuestMapping.Handle, out Mapping? mapping) || mapping.Neutral != request.GuestMapping)
+            if (!mappings.TryGetValue(request.GuestMapping.Handle, out Mapping? admittedMapping) || admittedMapping.Neutral != request.GuestMapping)
                 return Fail<NeutralExecutableArtifactReceipt>(NeutralVirtualizationStatus.Stale, "Exact guest mapping is absent or stale.");
+            mapping = admittedMapping;
+            if (!mapping.AdmissionPublished)
+                return Fail<NeutralExecutableArtifactReceipt>(NeutralVirtualizationStatus.Denied,
+                    "Exact mapping is retained for cleanup; admission publication was refused.");
             if (pendingGuestUnmaps.Contains(request.GuestMapping.Handle))
                 return Fail<NeutralExecutableArtifactReceipt>(NeutralVirtualizationStatus.Denied,
                     "Guest unmap admission is in flight for this mapping.");
             if (pendingArtifactBinds.Contains(request.GuestMapping.Handle))
                 return Fail<NeutralExecutableArtifactReceipt>(NeutralVirtualizationStatus.Denied,
                     "Executable artifact bind admission is already in flight for this mapping.");
-            var externalRequest = new ExternalChildArtifactBindRequest(mapping.External,
+            if (nextIdentity == 0 || nextIdentity == ulong.MaxValue)
+                return Fail<NeutralExecutableArtifactReceipt>(NeutralVirtualizationStatus.NotInvoked,
+                    "Local artifact identity capacity is exhausted before provider invocation.");
+            if (nextOperation == 0 || nextOperation == ulong.MaxValue)
+                return Fail<NeutralExecutableArtifactReceipt>(NeutralVirtualizationStatus.NotInvoked,
+                    "External artifact-bind operation capacity is exhausted before provider invocation.");
+            reservedIdentity = Next(); // original owner allocation before possible effect, never recycled
+            externalRequest = new ExternalChildArtifactBindRequest(mapping.External,
                 request.ImmutablePackage.ToArray(), request.MaximumExecutionSteps, Op());
-            ExternalChildResult<ExternalChildArtifactBindReceipt> result;
             pendingArtifactBinds.Add(request.GuestMapping.Handle);
+        }
+        try
+        {
+            ExternalChildResult<ExternalChildArtifactBindReceipt> result;
             try { result = childRuntime.BindChildExecutableArtifact(child!.External, externalRequest); }
             catch (Exception exception) when (exception is not StackOverflowException)
             {
-                PinArtifactBindUncertainty(child, mapping);
+                lock (sync) PinArtifactBindUncertainty(child, mapping);
                 return Fail<NeutralExecutableArtifactReceipt>(NeutralVirtualizationStatus.Ambiguous,
                     $"External artifact bind may have taken effect without a receipt: {exception.Message}");
             }
-            finally { pendingArtifactBinds.Remove(request.GuestMapping.Handle); }
-            if (!children.TryGetValue(request.ChildLease.Handle, out Child? returnedChild) || returnedChild != child ||
-                !mappings.TryGetValue(request.GuestMapping.Handle, out Mapping? returnedMapping) || returnedMapping != mapping)
+            lock (sync)
+            {
+            bool continuity = children.TryGetValue(request.ChildLease.Handle, out Child? returnedChild) && returnedChild == child &&
+                mappings.TryGetValue(request.GuestMapping.Handle, out Mapping? returnedMapping) && returnedMapping == mapping;
+            if (!continuity && (result.Outcome != ExternalRuntimeOutcome.Succeeded || result.Receipt is null))
             {
                 PinArtifactBindUncertainty(child, mapping);
                 return Fail<NeutralExecutableArtifactReceipt>(NeutralVirtualizationStatus.Ambiguous,
@@ -484,7 +680,7 @@ public sealed class HybridCpuExecutableChildAdapter : INeutralRuntimeFeatureProv
                 return Fail<NeutralExecutableArtifactReceipt>(NeutralVirtualizationStatus.Ambiguous,
                     "External artifact receipt does not match the exact child, mapping, operation, or provider generation.");
             }
-            var receipt = new NeutralExecutableArtifactReceipt(new(Next()), new(1), request.ChildLease.Handle,
+            var receipt = new NeutralExecutableArtifactReceipt(new(reservedIdentity), new(1), request.ChildLease.Handle,
                 request.ChildLease.Epoch, request.GuestMapping.Handle, request.GuestMapping.Epoch,
                 request.ChildLease.ParentLease.Handle, request.ChildLease.ParentLease.Epoch,
                 externalReceipt.PackageSha256, request.MaximumExecutionSteps);
@@ -495,9 +691,17 @@ public sealed class HybridCpuExecutableChildAdapter : INeutralRuntimeFeatureProv
                 return Fail<NeutralExecutableArtifactReceipt>(NeutralVirtualizationStatus.Ambiguous,
                     "External artifact receipt failed neutral admission validation; dependencies remain pinned.");
             }
-            artifacts.Add(receipt.ArtifactHandle, new(receipt, externalReceipt));
+            artifacts.Add(receipt.ArtifactHandle, new(receipt, externalReceipt) { AdmissionPublished = continuity });
+            if (!continuity)
+            {
+                PinArtifactBindUncertainty(child, mapping);
+                return Fail<NeutralExecutableArtifactReceipt>(NeutralVirtualizationStatus.Ambiguous,
+                    "External artifact bind owner continuity changed; exact receipt retained for cleanup, publication refused.");
+            }
             return Ok(receipt);
+            }
         }
+        finally { lock (sync) pendingArtifactBinds.Remove(request.GuestMapping.Handle); }
     }
 
     private void PinArtifactBindUncertainty(Child child, Mapping mapping)
@@ -542,10 +746,20 @@ public sealed class HybridCpuExecutableChildAdapter : INeutralRuntimeFeatureProv
                     "Executable start requires a Created child.");
             if (!artifacts.TryGetValue(request.Artifact.ArtifactHandle, out Artifact? found) || found.Neutral != request.Artifact)
                 return Fail<NeutralChildExecutionReceipt>(NeutralVirtualizationStatus.Stale, "Artifact admission is absent or stale.");
-            if (pendingChildStarts.Contains(request.ChildLease.Handle) ||
-                pendingChildTransitions.Contains(request.ChildLease.Handle))
+            if (!found.AdmissionPublished)
                 return Fail<NeutralChildExecutionReceipt>(NeutralVirtualizationStatus.Denied,
+                    "Exact artifact receipt is retained for cleanup; admission publication was refused.");
+            if (found.ExecutionReceipt is not null)
+                return Fail<NeutralChildExecutionReceipt>(NeutralVirtualizationStatus.Denied,
+                    "The exact artifact already has an accepted execution receipt; a fresh operation cannot repeat its effect.");
+            if (pendingChildStarts.Contains(request.ChildLease.Handle) ||
+                pendingChildTransitions.Contains(request.ChildLease.Handle) || HasPendingGuestAdmission(request.ChildLease))
+                return Fail<NeutralChildExecutionReceipt>(NeutralVirtualizationStatus.NotInvoked,
                     "Executable start or provider transition admission is already in flight for this child.");
+            if (nextOperation == 0 || nextOperation == ulong.MaxValue)
+                return Fail<NeutralChildExecutionReceipt>(NeutralVirtualizationStatus.NotInvoked,
+                    "External start operation capacity is exhausted before submission or provider invocation.");
+            var operation = Op(); // reserve the exact usable generation before trace/pending/effect
             string correlation = $"hybridcpu-child-start:{request.OperationId.Value}:{request.OperationGeneration.Value}";
             string generationDigest = Digest(FormattableString.Invariant(
                 $"child-start-generation/v2|{request.ChildLease.ParentLease.Handle.Value}|{request.ChildLease.ParentLease.Epoch.Value}|{request.ChildLease.Handle.Value}|{request.ChildLease.Epoch.Value}|{request.Artifact.MappingHandle.Value}|{request.Artifact.MappingEpoch.Value}|{request.Artifact.ArtifactHandle.Value}|{request.Artifact.ArtifactEpoch.Value}|{request.OperationId.Value}|{request.OperationGeneration.Value}|{externalFeatures.Generation}"));
@@ -563,7 +777,6 @@ public sealed class HybridCpuExecutableChildAdapter : INeutralRuntimeFeatureProv
                 return Fail<NeutralChildExecutionReceipt>(NeutralVirtualizationStatus.Denied,
                     "Executable admission changed during trace observation.");
             }
-            var operation = Op();
             ExternalChildResult<ExternalChildExecutionReceipt> result;
             pendingChildStarts.Add(request.ChildLease.Handle);
             try
@@ -581,10 +794,11 @@ public sealed class HybridCpuExecutableChildAdapter : INeutralRuntimeFeatureProv
                     $"External execution may have had an effect without a receipt: {exception.Message}");
             }
             finally { pendingChildStarts.Remove(request.ChildLease.Handle); }
-            if (!children.TryGetValue(request.ChildLease.Handle, out var returnedChild) ||
-                returnedChild != child ||
-                !artifacts.TryGetValue(request.Artifact.ArtifactHandle, out var returnedArtifact) ||
-                returnedArtifact != found)
+            bool continuity = children.TryGetValue(request.ChildLease.Handle, out var returnedChild) &&
+                returnedChild == child &&
+                artifacts.TryGetValue(request.Artifact.ArtifactHandle, out var returnedArtifact) &&
+                returnedArtifact == found;
+            if (!continuity && (result.Outcome != ExternalRuntimeOutcome.Succeeded || result.Receipt is null))
             {
                 if (returnedChild is not null)
                     children[request.ChildLease.Handle] = returnedChild with { State = NeutralChildDomainState.Faulted };
@@ -615,16 +829,26 @@ public sealed class HybridCpuExecutableChildAdapter : INeutralRuntimeFeatureProv
                 externalReceipt.PackageSha256 != found.External.PackageSha256 ||
                 !externalReceipt.IsTerminal)
             {
-                children[request.ChildLease.Handle] = child with { State = NeutralChildDomainState.Faulted };
+                FaultTransitionChild(request.ChildLease.Handle);
                 RecordTrace(events, correlation, 3, SemanticTraceEventKindV1.Quarantined, generationDigest,
                     Digest("external-execution-receipt-mismatch"));
                 return Fail<NeutralChildExecutionReceipt>(NeutralVirtualizationStatus.Ambiguous,
                     "External execution receipt does not match the admitted tuple; child is quarantined.");
             }
             var receipt = ToNeutral(externalReceipt, found, request);
+            found.TupleMatchedExecutionObservation = externalReceipt; // raw original outcome, not accepted completion/charge/closure
             var exact = NeutralChildExecutionContract.ValidateExecutionReceipt(request, receipt);
+            if (exact.IsSuccess) found.ExecutionReceipt = receipt; // provider fact before trace delivery, not permission/release
             if (!exact.IsSuccess)
-                children[request.ChildLease.Handle] = child with { State = NeutralChildDomainState.Faulted };
+                FaultTransitionChild(request.ChildLease.Handle);
+            if (!continuity)
+            {
+                FaultTransitionChild(request.ChildLease.Handle);
+                RecordTrace(events, correlation, 3, SemanticTraceEventKindV1.Quarantined, generationDigest,
+                    Digest("external-start-owner-continuity-lost"));
+                return Fail<NeutralChildExecutionReceipt>(NeutralVirtualizationStatus.Ambiguous,
+                    "External start owner continuity changed; validated receipt retained when exact, publication refused.");
+            }
             RecordTrace(events, correlation, 3,
                 exact.IsSuccess ? SemanticTraceEventKindV1.RetireOrComplete : SemanticTraceEventKindV1.Quarantined,
                 generationDigest,
@@ -649,7 +873,11 @@ public sealed class HybridCpuExecutableChildAdapter : INeutralRuntimeFeatureProv
             if (!ioBindings.TryGetValue(lease.Handle, out Io? io) || io.Neutral != lease)
                 return Fail<NeutralVirtualIoCloseReceipt>(NeutralVirtualizationStatus.Stale, "I/O binding is absent or stale.");
             if (!TryChild(lease.ChildLease, out Child? child, out var failure)) return Fail<NeutralVirtualIoCloseReceipt>(failure);
-            var result = childRuntime.CloseChildVirtualIo(child!.External, io.External.IoHandle, io.External.IoEpoch, Op());
+            if (nextOperation == 0 || nextOperation == ulong.MaxValue)
+                return Fail<NeutralVirtualIoCloseReceipt>(NeutralVirtualizationStatus.Denied,
+                    "External I/O-close operation capacity is exhausted; binding remains pinned.");
+            var operation = Op();
+            var result = childRuntime.CloseChildVirtualIo(child!.External, io.External.IoHandle, io.External.IoEpoch, operation);
             if (result.Outcome != ExternalRuntimeOutcome.Closed || result.Receipt is null || !result.Receipt.IsTerminal)
                 return Fail<NeutralVirtualIoCloseReceipt>(result.Outcome, result.Reason);
             ioBindings.Remove(lease.Handle);
@@ -661,11 +889,17 @@ public sealed class HybridCpuExecutableChildAdapter : INeutralRuntimeFeatureProv
     public NeutralVirtualizationResult<NeutralVirtualEventReceipt> InjectVirtualEvent(NeutralVirtualEventRequest request) =>
         Fail<NeutralVirtualEventReceipt>(NeutralVirtualizationStatus.Unsupported, "Executable event injection is not yet owned by the V3 runner.");
 
-    private bool TryChild(NeutralChildDomainLease lease, out Child? child, out NeutralVirtualizationResult failure)
+    private bool TryChild(NeutralChildDomainLease lease, out Child? child, out NeutralVirtualizationResult failure,
+        bool allowCleanup = false)
     {
         if (!children.TryGetValue(lease.Handle, out child)) { failure = Fail(NeutralVirtualizationStatus.Denied, "Child was not found."); return false; }
         if (child.Neutral.Epoch != lease.Epoch) { failure = Fail(NeutralVirtualizationStatus.Stale, "Child epoch is stale."); return false; }
         if (child.Neutral != lease) { failure = Fail(NeutralVirtualizationStatus.WrongParent, "Child parent or intent differs."); return false; }
+        if (!allowCleanup && !child.AdmissionPublished)
+        {
+            failure = Fail(NeutralVirtualizationStatus.Ambiguous, "Exact child is retained for cleanup; admission publication was refused.");
+            return false;
+        }
         if (pendingChildCloses.Contains(lease.Handle))
         {
             failure = Fail(NeutralVirtualizationStatus.Denied, "Child close admission is in flight.");

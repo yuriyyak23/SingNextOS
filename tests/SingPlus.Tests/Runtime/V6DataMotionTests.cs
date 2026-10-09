@@ -7,6 +7,135 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class V6DataMotionTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void RefusedTemporaryReleaseRetainsExactChargeUntilUseReleaseAndActualTeardown(bool callbackThrows)
+    {
+        var context = Create();
+        RegionUseDescriptor? held = null;
+        var reads = 0;
+        var moved = context.Kernel.ExecuteV6HostDataMotion(context.Source.Process, context.Destination.Process,
+            context.Input, context.Plan, () =>
+            {
+                if (++reads != 2) return 3UL;
+                var temporary = Assert.Single(context.Kernel.Regions.Snapshot(), r =>
+                    r.Owner.DomainId == context.Destination.Domain && r.State == RegionState.Owned);
+                held = context.Kernel.AcquireRegionUse(context.Destination.Process, temporary.Handle,
+                    RegionUseMode.ExclusiveRead, new(0, 64)).Value!;
+                return callbackThrows ? throw new InvalidOperationException("cost fault") : 4UL;
+            }, () => 5UL);
+
+        Assert.Equal(callbackThrows ? KernelError.PlatformUnavailable : KernelError.StaleGeneration, moved.Error);
+        Assert.Contains("cleanup refused (RegionUseConflict)", moved.Message);
+        Assert.Contains(held!.Region.ToString(), moved.Message);
+        Assert.True(context.Input.IsValid);
+        Assert.Equal(64UL, Used(context.Kernel, context.Source));
+        Assert.Equal(64UL, Used(context.Kernel, context.Destination));
+        Assert.True(context.Kernel.Regions.Validate(held.Region,
+            new(context.Destination.Domain, context.Destination.Process.Generation)).IsSuccess);
+        Assert.True(context.Kernel.InvalidateRegionUse(context.Destination.Process, held.Handle).IsSuccess);
+        Assert.False(context.Kernel.TerminateProcess(context.Destination.Process).IsSuccess);
+        Assert.Equal(64UL, Used(context.Kernel, context.Destination));
+        Assert.True(context.Kernel.ReleaseRegionUse(context.Destination.Process, held.Handle).IsSuccess);
+        Assert.True(context.Kernel.TerminateProcess(context.Destination.Process).IsSuccess);
+        Assert.Equal(0UL, Used(context.Kernel, context.Destination));
+        Assert.Equal(RegionState.Released, Assert.Single(context.Kernel.Regions.Snapshot(),
+            r => r.Handle == held.Region).State);
+        Assert.Equal(64UL, Used(context.Kernel, context.Source));
+    }
+
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    public void ProcessExitAtCostCallbackOrSourceReleaseRefusesUsablePublication(bool sourceExit, bool afterCopy)
+    {
+        var context = Create();
+        context.Input.Span.Fill(0x53);
+        var reads = 0;
+        var exited = sourceExit ? context.Source : context.Destination;
+        void Exit()
+        {
+            context.Kernel.BeforeRegionReleaseQualificationHook = null;
+            Assert.True(context.Kernel.TerminateProcess(exited.Process).IsSuccess);
+        }
+        if (afterCopy) context.Kernel.BeforeRegionReleaseQualificationHook = Exit;
+        var moved = context.Kernel.ExecuteV6HostDataMotion(context.Source.Process, context.Destination.Process,
+            context.Input, context.Plan, () =>
+            {
+                if (++reads == 2 && !afterCopy) Exit();
+                return 3UL;
+            }, () => 5UL);
+
+        Assert.Equal(KernelError.StaleHandle, moved.Error);
+        Assert.Equal(!sourceExit && !afterCopy, context.Input.IsValid);
+        if (context.Input.IsValid)
+            Assert.All(context.Input.Span.ToArray(), value => Assert.Equal((byte)0x53, value));
+        Assert.Equal(!sourceExit && !afterCopy ? 64UL : 0UL, Used(context.Kernel, context.Source));
+        Assert.Equal(0UL, Used(context.Kernel, context.Destination));
+        Assert.All(context.Kernel.Regions.SnapshotUses(), use => Assert.Equal(RegionUseState.Released, use.State));
+        Assert.DoesNotContain(context.Kernel.Regions.Snapshot(), r =>
+            r.Owner.DomainId == context.Destination.Domain && r.State != RegionState.Released);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void FinalCostCallbackSourceMutationRefusesCopyAndRefundsDestination(bool destinationCallback)
+    {
+        var context = Create();
+        var before = Used(context.Kernel, context.Source) + Used(context.Kernel, context.Destination);
+        var observations = 0;
+        ulong Observe()
+        {
+            if (++observations == 2)
+            {
+                var write = context.Kernel.AcquireRegionUse(context.Source.Process, context.Input.Handle,
+                    RegionUseMode.ExclusiveWrite, new(0, 64));
+                Assert.True(write.IsSuccess, write.Message);
+                context.Input.Span.Fill(0x7B);
+                Assert.True(context.Kernel.ReleaseRegionUse(context.Source.Process, write.Value!.Handle).IsSuccess);
+            }
+            return destinationCallback ? 5UL : 3UL;
+        }
+        var moved = context.Kernel.ExecuteV6HostDataMotion(context.Source.Process, context.Destination.Process,
+            context.Input, context.Plan, destinationCallback ? () => 3UL : Observe,
+            destinationCallback ? Observe : () => 5UL);
+
+        Assert.Equal(KernelError.StaleGeneration, moved.Error);
+        Assert.True(context.Input.IsValid);
+        Assert.All(context.Input.Span.ToArray(), value => Assert.Equal((byte)0x7B, value));
+        Assert.Equal(before, Used(context.Kernel, context.Source) + Used(context.Kernel, context.Destination));
+        Assert.All(context.Kernel.Regions.SnapshotUses(), use => Assert.Equal(RegionUseState.Released, use.State));
+        Assert.DoesNotContain(context.Kernel.Regions.Snapshot(), r =>
+            r.Owner.DomainId == context.Destination.Domain && r.State != RegionState.Released);
+    }
+
+    [Theory]
+    [InlineData(false, 1)] [InlineData(false, 2)]
+    [InlineData(true, 1)] [InlineData(true, 2)]
+    public void CostGenerationCallbackFaultBeforeCopyPreservesSourceAndRefundsTemporaryMemory(bool destinationFault, int attempt)
+    {
+        var context = Create();
+        context.Input.Span.Fill(0x6C);
+        var before = Used(context.Kernel, context.Source) + Used(context.Kernel, context.Destination);
+        var sourceReads = 0;
+        var destinationReads = 0;
+        var moved = context.Kernel.ExecuteV6HostDataMotion(context.Source.Process, context.Destination.Process,
+            context.Input, context.Plan,
+            () => !destinationFault && ++sourceReads == attempt ? throw new InvalidOperationException("source cost") : 3UL,
+            () => destinationFault && ++destinationReads == attempt ? throw new InvalidOperationException("destination cost") : 5UL);
+
+        Assert.Equal(KernelError.PlatformUnavailable, moved.Error);
+        Assert.True(context.Input.IsValid);
+        Assert.All(context.Input.Span.ToArray(), value => Assert.Equal((byte)0x6C, value));
+        Assert.Equal(before, Used(context.Kernel, context.Source) + Used(context.Kernel, context.Destination));
+        Assert.DoesNotContain(context.Kernel.Regions.Snapshot(), r =>
+            r.Owner.DomainId == context.Destination.Domain && r.State != RegionState.Released);
+        Assert.Empty(context.Kernel.Regions.SnapshotUses());
+    }
+
     [Fact]
     public void HostMoveCopiesThenReleasesSourceAndConservesOwnedMemoryCharge()
     {

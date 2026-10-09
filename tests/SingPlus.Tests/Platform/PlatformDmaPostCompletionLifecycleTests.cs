@@ -8,6 +8,67 @@ namespace SingPlus.Tests.Platform;
 
 public sealed class PlatformDmaPostCompletionLifecycleTests
 {
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)] [InlineData(5)]
+    [InlineData(6)] [InlineData(7)]
+    public void CompletedAcquireOutsideOwnersRetainsKnownReplyAndPreservesCleanup(int fault)
+    {
+        var scenario = CreateScenario(1801, 1810, PlatformDmaDirection.DeviceWritesMemory);
+        var submission = PrepareAndSubmit(scenario);
+        scenario.Provider.CompletionState = PlatformProviderDmaCompletionState.Completed;
+        var completion = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submission).Value!;
+        scenario.Provider.BeforeAcquireReturn = () =>
+        {
+            Assert.False(Monitor.IsEntered(typeof(RuntimeKernel).GetField("_platformMemoryUseGate", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(scenario.Kernel)!));
+            foreach (var name in new[] { "_secureDomainLifecycleGate", "_dmaCompletionGate" })
+                Assert.False(Monitor.IsEntered(typeof(PlatformAuthorityBridge).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(scenario.Kernel.PlatformAuthority)!));
+            if (fault is 0 or 7) scenario.Provider.ThrowIncarnation = true;
+            if (fault == 7) scenario.Provider.ThrowOutOfMemory = true;
+            if (fault == 1) Assert.False(scenario.Kernel.TerminateProcess(scenario.Subject).IsSuccess);
+            if (fault == 2) _ = scenario.Kernel.RevokeCapability(scenario.DeviceCapability);
+            if (fault == 3) Assert.True(scenario.Kernel.PlatformAuthority.ObserveBackendReset().IsSuccess);
+            if (fault == 4) throw new InvalidOperationException("Completed acquire response lost after effect.");
+            if (fault == 6) throw new OutOfMemoryException("Completed acquire outcome lost after effect.");
+            if (fault == 5)
+            {
+                Assert.False(scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(scenario.Subject, submission, completion).IsSuccess);
+                Assert.False(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+            }
+        };
+        var result = scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(scenario.Subject, submission, completion);
+        Assert.Equal(fault is 1 or 2 or 5, result.IsSuccess);
+        scenario.Provider.ThrowIncarnation = false;
+        scenario.Provider.ThrowOutOfMemory = false;
+        scenario.Provider.BeforeAcquireReturn = null;
+        if (fault is 0 or 7)
+        {
+            Assert.True(scenario.Kernel.PlatformAuthority.HasCompletedDmaSubmission(scenario.Grant.GrantId));
+            Assert.False(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+            Assert.True(scenario.Kernel.FinalizePlatformDmaPostCompletionVisibility(scenario.Subject, submission, completion).IsSuccess);
+        }
+        Assert.Equal(1, scenario.Provider.AcquireCalls);
+        if (fault is 3 or 4 or 6)
+        {
+            Assert.False(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+            Assert.False(scenario.Kernel.TerminateProcess(scenario.Subject).IsSuccess);
+            Assert.True(scenario.Kernel.Regions.HasPlatformMappingReservation(scenario.Mapping.Region,
+                new RegionOwner(scenario.Binding.Subject.DomainId, scenario.Subject.Generation)));
+            Assert.Equal(0, scenario.Provider.DmaRevokeCalls);
+        }
+        else if (fault == 1)
+        {
+            var cleanup = scenario.Kernel.ObserveProcessTeardown(scenario.Subject);
+            Assert.True(cleanup.IsSuccess, cleanup.Message);
+            Assert.True(cleanup.Value!.LocalReclaimCompleted);
+            Assert.Equal(RegionState.Released, Assert.Single(scenario.Kernel.Regions.Snapshot()).State);
+        }
+        else
+        {
+            AssertSuccess(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant));
+            AssertSuccess(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping));
+        }
+    }
+
     [Fact]
     public void WriteDmaRequiresPostCompletionAcquireBeforeControlledReleaseAndCpuTransfer()
     {
@@ -1097,7 +1158,23 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
 
         public int CompletionCalls { get; private set; }
         public int AcquireCalls { get; private set; }
-        public PlatformProviderIncarnation CurrentIncarnation { get; private set; } = new(1);
+        private PlatformProviderIncarnation _incarnation = new(1);
+        public bool ThrowIncarnation { get; set; }
+        public bool ThrowOutOfMemory { get; set; }
+        public Action? BeforeAcquireReturn { get; set; }
+        public PlatformProviderIncarnation CurrentIncarnation
+        {
+            get
+            {
+                if (ThrowIncarnation)
+                {
+                    if (ThrowOutOfMemory) throw new OutOfMemoryException("Late completed acquire source unavailable.");
+                    throw new InvalidOperationException("Late completed acquire query unavailable.");
+                }
+                return _incarnation;
+            }
+            private set => _incarnation = value;
+        }
         public bool ResetDuringNextAcquire { get; set; }
         public int DmaRevokeCalls { get; private set; }
         public int MappingRevokeCalls { get; private set; }
@@ -1414,6 +1491,7 @@ public sealed class PlatformDmaPostCompletionLifecycleTests
                 grant.Direction,
                 PlatformMemoryAcquireRequirement.AcquisitionFence,
                 PlatformMemoryAcquireOutcome.AcquisitionFenceSatisfied);
+            BeforeAcquireReturn?.Invoke();
             return AcquireMutation switch
             {
                 AcquireMutation.WrongCycle => PlatformAuthorityResult<PlatformProviderDmaAcquireEvidence>.Ok(

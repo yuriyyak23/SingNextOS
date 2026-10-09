@@ -42,11 +42,14 @@ public sealed partial class RuntimeKernel
         public bool ChannelsClosed { get; set; }
         public bool LocalAuthorizationRevoked { get; set; }
         public int PendingPlatformMappings { get; set; } = mappings.Length;
-        public bool PlatformDomainClosed { get; set; } = domainBinding is null;
+        public bool PlatformDomainClosed { get; set; }
         public bool LocalReclaimCompleted { get; set; }
         public KernelError? BlockingError { get; set; }
         public bool ComposedAuthorityPrepared { get; set; }
         public bool ComposedPreparationInFlight { get; set; }
+        public bool ProgressionInFlight { get; set; } // Progress admission only; not closure evidence.
+        // The last-member decision has committed, but local reclaim may still be pinned.
+        public DomainId? DomainReclaimPending { get; set; }
 
         public ProcessTeardownSnapshot Snapshot => new(
             Handle,
@@ -73,41 +76,29 @@ public sealed partial class RuntimeKernel
     {
         try
         {
-            lock (_platformMemoryUseGate)
-                return ObserveProcessTeardownLocked(handle);
+            return ObserveProcessTeardownCore(handle);
         }
-        finally { EmitProcessTeardownExternalOperationTraces(handle); }
+        finally { FlushIpcBudgetObservations(); EmitProcessTeardownExternalOperationTraces(handle); }
     }
 
-    private KernelResult<ProcessTeardownSnapshot> ObserveProcessTeardownLocked(
-        ProcessHandle handle)
+    private KernelResult<ProcessTeardownSnapshot> ObserveProcessTeardownCore(ProcessHandle handle)
     {
-        if (!_processTeardowns.TryGetValue(handle, out var record))
+        ProcessTeardownRecord record;
+        SingProcess process;
+        lock (_platformMemoryUseGate)
         {
-            var resolved = Processes.Resolve(handle);
-            if (!resolved.IsSuccess)
+            if (!_processTeardowns.TryGetValue(handle, out record!))
             {
-                return KernelResult<ProcessTeardownSnapshot>.Fail(
-                    resolved.Error,
-                    resolved.Message!);
+                var resolved = Processes.Resolve(handle);
+                return KernelResult<ProcessTeardownSnapshot>.Fail(resolved.IsSuccess ? KernelError.InvalidTransition : resolved.Error,
+                    resolved.IsSuccess ? "Process teardown has not started for this process generation." : resolved.Message!);
             }
-
-            return KernelResult<ProcessTeardownSnapshot>.Fail(
-                KernelError.InvalidTransition,
-                "Process teardown has not started for this process generation.");
+            var current = Processes.Resolve(handle);
+            if (!current.IsSuccess) return KernelResult<ProcessTeardownSnapshot>.Fail(current.Error, current.Message!);
+            process = current.Value!;
         }
-
-        var processResult = Processes.Resolve(handle);
-        if (!processResult.IsSuccess)
-        {
-            return KernelResult<ProcessTeardownSnapshot>.Fail(
-                processResult.Error,
-                processResult.Message!);
-        }
-
-        return AdvanceProcessTeardown(processResult.Value!, record);
+        return AdvanceProcessTeardown(process, record);
     }
-
     public KernelResult<ProcessTeardownSnapshot> QueryProcessTeardown(ProcessHandle handle)
     {
         lock (_platformMemoryUseGate)
@@ -137,7 +128,7 @@ public sealed partial class RuntimeKernel
         ProcessState targetTerminalState)
     {
         try { return BeginOrAdvanceProcessTeardownCore(handle, targetTerminalState); }
-        finally { EmitProcessTeardownExternalOperationTraces(handle); }
+        finally { FlushIpcBudgetObservations(); EmitProcessTeardownExternalOperationTraces(handle); }
     }
 
     private KernelResult BeginOrAdvanceProcessTeardownCore(
@@ -171,6 +162,9 @@ public sealed partial class RuntimeKernel
             if (_pendingPlatformMappingAdmissions.ContainsKey(handle) || record.ComposedPreparationInFlight)
                 return KernelResult.Fail(KernelError.PlatformBindingDraining,
                     "Mapping admission or composed preparation must settle before teardown can advance.");
+            if (_virtualDomains.ForOwner(handle).Any(domain => _pendingVirtualTransitions.Contains(domain.Handle)))
+                return KernelResult.Fail(KernelError.PlatformBindingActive,
+                    "Virtual admission/publication must settle before composed cleanup can consume local mappings.");
             prepare = !record.ComposedAuthorityPrepared;
             if (prepare) record.ComposedPreparationInFlight = true;
         }
@@ -199,8 +193,7 @@ public sealed partial class RuntimeKernel
             }
             if (!prepared.IsSuccess) return prepared;
         }
-        lock (_platformMemoryUseGate)
-            return BeginOrAdvanceProcessTeardownLocked(handle, targetTerminalState);
+        return BeginOrAdvanceProcessTeardownResult(handle, targetTerminalState);
     }
 
     private KernelResult<ProcessTeardownRecord> InitializeProcessTeardownLocked(
@@ -243,13 +236,21 @@ public sealed partial class RuntimeKernel
             _ = CapabilityAuthority.Revoke(capabilityId);
         }
         process.ClearCapabilities();
-        _processPlatformBindings.TryGetValue(handle, out var domainBinding);
+        // Kernel routing is correlation; the original bridge owner supplies the cleanup dependency.
+        var hasDomainBinding = PlatformAuthority.TryGetOriginalDomainCleanupBinding(PlatformIdentity(process), out var domainBinding);
+        if (!hasDomainBinding)
+            hasDomainBinding = _processPlatformBindings.TryGetValue(handle, out domainBinding);
         var record = new ProcessTeardownRecord(handle, targetTerminalState,
             mappings.Values.OrderBy(static mapping => mapping.MappingId.Value).ToArray(),
-            _processPlatformBindings.ContainsKey(handle) ? domainBinding : null)
+            hasDomainBinding ? domainBinding : null)
         {
             ChannelsClosed = true,
-            LocalAuthorizationRevoked = true
+            LocalAuthorizationRevoked = true,
+            // A missing consumer route is not original closure or no-effect.
+            PlatformDomainClosed = !hasDomainBinding &&
+                !_pendingPlatformDomainBinds.Contains(handle) &&
+                !PlatformAuthority.HasUnresolvedDomainBindEffect(PlatformIdentity(process)) &&
+                !PlatformAuthority.HasActiveAuthority(PlatformIdentity(process))
         };
         _processTeardowns.Add(handle, record);
         return KernelResult<ProcessTeardownRecord>.Ok(record);
@@ -279,10 +280,12 @@ public sealed partial class RuntimeKernel
         if (!executions.IsSuccess) return executions;
         var secureDomains = CloseSecureDomainsForProcess(handle);
         if (!secureDomains.IsSuccess) return secureDomains;
-        return CloseVirtualDomainsForProcess(handle);
+        // Virtual root closure follows device/CXL/compute progression below.
+        // Preparation alone cannot close a parent with live provider children.
+        return KernelResult.Ok();
     }
 
-    private KernelResult BeginOrAdvanceProcessTeardownLocked(
+    private KernelResult BeginOrAdvanceProcessTeardownResult(
         ProcessHandle handle,
         ProcessState targetTerminalState)
     {
@@ -307,52 +310,57 @@ public sealed partial class RuntimeKernel
     }
 
     private KernelResult<ProcessTeardownSnapshot> BeginOrAdvanceProcessTeardownLifecycle(
-        ProcessHandle handle,
-        ProcessState targetTerminalState)
+        ProcessHandle handle, ProcessState targetTerminalState)
     {
-        if (targetTerminalState is not ProcessState.Exited and not ProcessState.Faulted)
+        SingProcess process;
+        ProcessTeardownRecord record;
+        lock (_platformMemoryUseGate)
         {
-            return KernelResult<ProcessTeardownSnapshot>.Fail(
-                KernelError.InvalidTransition,
-                "Process teardown target must be Exited or Faulted.");
+            if (targetTerminalState is not ProcessState.Exited and not ProcessState.Faulted)
+                return KernelResult<ProcessTeardownSnapshot>.Fail(KernelError.InvalidTransition,
+                    "Process teardown target must be Exited or Faulted.");
+            var current = Processes.Resolve(handle);
+            if (!current.IsSuccess) return KernelResult<ProcessTeardownSnapshot>.Fail(current.Error, current.Message!);
+            process = current.Value!;
+            if (process.State is ProcessState.Exited or ProcessState.Faulted)
+                return KernelResult<ProcessTeardownSnapshot>.Fail(KernelError.InvalidTransition,
+                    $"Cannot begin teardown from terminal state {process.State}.");
+            if (!_processTeardowns.TryGetValue(handle, out record!))
+                return KernelResult<ProcessTeardownSnapshot>.Fail(KernelError.PlatformFaulted,
+                    "Process teardown lifecycle was invoked without its admission-stop record.");
+            if (record.TargetTerminalState != targetTerminalState)
+                return KernelResult<ProcessTeardownSnapshot>.Fail(KernelError.InvalidTransition,
+                    $"Process teardown is already targeting {record.TargetTerminalState}.");
         }
-
-        var resolved = Processes.Resolve(handle);
-        if (!resolved.IsSuccess)
-        {
-            return KernelResult<ProcessTeardownSnapshot>.Fail(
-                resolved.Error,
-                resolved.Message!);
-        }
-
-        var process = resolved.Value!;
-        if (process.State is ProcessState.Exited or ProcessState.Faulted)
-        {
-            return KernelResult<ProcessTeardownSnapshot>.Fail(
-                KernelError.InvalidTransition,
-                $"Cannot begin teardown from terminal state {process.State}.");
-        }
-
-        if (_processTeardowns.TryGetValue(handle, out var existing))
-        {
-            if (existing.TargetTerminalState != targetTerminalState)
-            {
-                return KernelResult<ProcessTeardownSnapshot>.Fail(
-                    KernelError.InvalidTransition,
-                    $"Process teardown is already targeting {existing.TargetTerminalState}.");
-            }
-
-            return AdvanceProcessTeardown(process, existing);
-        }
-
-        return KernelResult<ProcessTeardownSnapshot>.Fail(KernelError.PlatformFaulted,
-            "Process teardown lifecycle was invoked without its admission-stop record.");
+        return AdvanceProcessTeardown(process, record);
     }
-
     private KernelResult<ProcessTeardownSnapshot> AdvanceProcessTeardown(
         SingProcess process,
         ProcessTeardownRecord record)
     {
+        var regionBudgetObservations = new List<BudgetTraceObservation>();
+        lock (_platformMemoryUseGate)
+        {
+            var current = Processes.Resolve(record.Handle);
+            if (!current.IsSuccess || !ReferenceEquals(current.Value, process) ||
+                !_processTeardowns.TryGetValue(record.Handle, out var exact) || !ReferenceEquals(exact, record))
+                return KernelResult<ProcessTeardownSnapshot>.Fail(KernelError.StaleGeneration, "Exact teardown owner is no longer current.");
+            if (record.ProgressionInFlight)
+                return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
+            record.ProgressionInFlight = true;
+        }
+        try
+        {
+        ICxlTeardownParticipant[] participants;
+        PlatformRegionMapping[] mappingSnapshot;
+        PlatformDomainBinding? domainBindingSnapshot;
+        PlatformDomainBinding? trackedDomainSnapshot;
+        PlatformDomainBinding? domainToClose;
+        var identity = PlatformIdentity(process);
+        KernelError? firstBlockingError = null;
+        var pendingMappings = 0;
+        lock (_platformMemoryUseGate)
+        {
         if (!record.ComposedAuthorityPrepared || record.ComposedPreparationInFlight)
         {
             if (record.Phase != ProcessTeardownPhase.PlatformFaulted)
@@ -367,11 +375,23 @@ public sealed partial class RuntimeKernel
             record.BlockingError = null;
             return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
         }
-        var identity = PlatformIdentity(process);
-        KernelError? firstBlockingError = null;
-        var pendingMappings = 0;
-
-        var cxlClosure = CloseCxlResourcesForProcess(record.Handle, new RegionOwner(process.DomainId, process.Generation));
+        participants = _cxlTeardownParticipants.AsEnumerable().Reverse().ToArray();
+        }
+        KernelResult cxlClosure;
+        try { cxlClosure = CloseCxlResourcesForProcess(record.Handle,
+            new RegionOwner(process.DomainId, process.Generation), participants); }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        {
+            cxlClosure = KernelResult.Fail(KernelError.PlatformFaulted,
+                $"CXL progression did not return closure evidence: {exception.Message}");
+        }
+        lock (_platformMemoryUseGate)
+        {
+        var afterCxl = Processes.Resolve(record.Handle);
+        if (!afterCxl.IsSuccess || !ReferenceEquals(afterCxl.Value, process) ||
+            !_processTeardowns.TryGetValue(record.Handle, out var currentCxlRecord) || !ReferenceEquals(currentCxlRecord, record))
+            return KernelResult<ProcessTeardownSnapshot>.Fail(KernelError.StaleGeneration,
+                "Exact process teardown owner changed during CXL progression.");
         if (!cxlClosure.IsSuccess)
         {
             record.Phase = cxlClosure.Error == KernelError.PlatformBindingDraining
@@ -381,6 +401,12 @@ public sealed partial class RuntimeKernel
             return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
         }
 
+        if (!HasCurrentCxlTeardownParticipants(participants))
+        {
+            record.Phase = ProcessTeardownPhase.PlatformDraining;
+            record.BlockingError = null;
+            return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
+        }
         var externalOperationProgress = ExternalOperations.AdvanceForTeardown(
             new RegionOwner(process.DomainId, process.Generation));
         ReconcileReleasedExternalOperationBudgets(record.Handle);
@@ -398,7 +424,15 @@ public sealed partial class RuntimeKernel
             return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
         }
 
+        }
         var computeProgress = AdvancePlatformDsc1ForProcess(record.Handle);
+        lock (_platformMemoryUseGate)
+        {
+        var afterCompute = Processes.Resolve(record.Handle);
+        if (!afterCompute.IsSuccess || !ReferenceEquals(afterCompute.Value, process) ||
+            !_processTeardowns.TryGetValue(record.Handle, out var computeRecord) || !ReferenceEquals(computeRecord, record))
+            return KernelResult<ProcessTeardownSnapshot>.Fail(KernelError.StaleGeneration,
+                "Exact process teardown owner changed during DSC1 progression.");
         if (!computeProgress.IsSuccess)
         {
             if (computeProgress.Error == KernelError.PlatformBindingDraining)
@@ -413,7 +447,20 @@ public sealed partial class RuntimeKernel
             return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
         }
 
+        if (!HasCurrentCxlTeardownParticipants(participants))
+        {
+            record.Phase = ProcessTeardownPhase.PlatformDraining;
+            record.BlockingError = null;
+            return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
+        }
+        }
         var deviceProgress = AdvancePlatformDeviceLeasesForProcess(process, record.Handle);
+        lock (_platformMemoryUseGate)
+        {
+        var fresh = Processes.Resolve(record.Handle);
+        if (!fresh.IsSuccess || !ReferenceEquals(fresh.Value, process) ||
+            !_processTeardowns.TryGetValue(record.Handle, out var exact) || !ReferenceEquals(exact, record))
+            return KernelResult<ProcessTeardownSnapshot>.Fail(KernelError.StaleGeneration, "Teardown owner changed during provider progression.");
         if (!deviceProgress.IsSuccess)
         {
             if (deviceProgress.Error == KernelError.PlatformBindingDraining)
@@ -433,7 +480,50 @@ public sealed partial class RuntimeKernel
             return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
         }
 
+        if (!HasCurrentCxlTeardownParticipants(participants))
+        {
+            record.Phase = ProcessTeardownPhase.PlatformDraining;
+            record.BlockingError = null;
+            return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
+        }
+        }
+        var virtualDomainProgress = CloseVirtualDomainsForProcess(record.Handle);
+        lock (_platformMemoryUseGate)
+        {
+            var afterVirtual = Processes.Resolve(record.Handle);
+            if (!afterVirtual.IsSuccess || !ReferenceEquals(afterVirtual.Value, process) ||
+                !_processTeardowns.TryGetValue(record.Handle, out var virtualRecord) || !ReferenceEquals(virtualRecord, record))
+                return KernelResult<ProcessTeardownSnapshot>.Fail(KernelError.StaleGeneration,
+                    "Exact teardown owner changed during virtual domain closure.");
+            if (!virtualDomainProgress.IsSuccess)
+            {
+                record.Phase = virtualDomainProgress.Error == KernelError.PlatformBindingDraining
+                    ? ProcessTeardownPhase.PlatformDraining : ProcessTeardownPhase.PlatformFaulted;
+                record.BlockingError = virtualDomainProgress.Error == KernelError.PlatformBindingDraining
+                    ? null : virtualDomainProgress.Error;
+                return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
+            }
+            if (!HasCurrentCxlTeardownParticipants(participants))
+            {
+                record.Phase = ProcessTeardownPhase.PlatformDraining;
+                record.BlockingError = null;
+                return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
+            }
+        }
         var borrowGrantProgress = AdvancePlatformBorrowReadGrantsForProcess(record.Handle);
+        lock (_platformMemoryUseGate)
+        {
+        var afterBorrow = Processes.Resolve(record.Handle);
+        if (!afterBorrow.IsSuccess || !ReferenceEquals(afterBorrow.Value, process) ||
+            !_processTeardowns.TryGetValue(record.Handle, out var borrowRecord) || !ReferenceEquals(borrowRecord, record))
+            return KernelResult<ProcessTeardownSnapshot>.Fail(KernelError.StaleGeneration,
+                "Exact process teardown owner changed during borrow progression.");
+        if (!HasCurrentCxlTeardownParticipants(participants))
+        {
+            record.Phase = ProcessTeardownPhase.PlatformDraining;
+            record.BlockingError = null;
+            return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
+        }
         if (!borrowGrantProgress.IsSuccess)
         {
             firstBlockingError ??= borrowGrantProgress.Error;
@@ -443,22 +533,25 @@ public sealed partial class RuntimeKernel
             pendingMappings += borrowGrantProgress.Value;
         }
 
-        foreach (var mapping in record.Mappings)
+        mappingSnapshot = record.Mappings.ToArray();
+        }
+        foreach (var mapping in mappingSnapshot)
         {
             var queried = PlatformAuthority.QueryRegionMappingLifecycle(mapping, identity);
             if (!queried.IsSuccess)
             {
+                lock (_platformMemoryUseGate)
+                {
                 if (queried.Error is KernelError.PlatformBindingNotFound or KernelError.PlatformBindingRevoked &&
                     (!_processPlatformMappings.TryGetValue(record.Handle, out var currentMappings) ||
                      currentMappings.All(current => current != mapping)))
                     continue;
                 firstBlockingError ??= queried.Error;
                 continue;
+                }
             }
 
             var lifecycle = queried.Value!;
-            if (lifecycle.LocalReservationReleased)
-                continue;
 
             KernelResult<PlatformRegionMappingLifecycle> progress;
             switch (lifecycle.PlatformClosure)
@@ -483,6 +576,27 @@ public sealed partial class RuntimeKernel
                     continue;
             }
 
+            // Source getters can invoke arbitrary provider composition. Observe
+            // outside the outer kernel gate, then revalidate the actual process,
+            // teardown record and participant inventory before local release.
+            var releaseSource = progress.IsSuccess &&
+                progress.Value!.PlatformClosure == PlatformExternalClosureState.Closed
+                ? PlatformAuthority.ValidateRegionMappingReleaseSource(mapping, identity)
+                : KernelResult.Ok();
+            var mappingBudgetObservations = new List<BudgetTraceObservation>();
+            try
+            {
+            lock (_platformMemoryUseGate)
+            {
+            var ownerCheck = ValidateProcessMappingProgressionLocked(process, record, mappingSnapshot, participants);
+            if (!ownerCheck.IsSuccess)
+            {
+                if (ownerCheck.Error != KernelError.PlatformBindingDraining)
+                    return KernelResult<ProcessTeardownSnapshot>.Fail(ownerCheck.Error, ownerCheck.Message!);
+                record.Phase = ProcessTeardownPhase.PlatformDraining;
+                record.BlockingError = null;
+                return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
+            }
             if (!progress.IsSuccess)
             {
                 if (progress.Error == KernelError.PlatformBindingDraining)
@@ -508,7 +622,12 @@ public sealed partial class RuntimeKernel
                 continue;
             }
 
-            var finalize = FinalizePlatformRegionMappingClosure(mapping, identity, current);
+            if (!releaseSource.IsSuccess)
+            {
+                firstBlockingError ??= releaseSource.Error;
+                continue;
+            }
+            var finalize = FinalizePlatformRegionMappingClosureLocal(mapping, identity, current, mappingBudgetObservations);
             if (!finalize.IsSuccess)
             {
                 if (finalize.Error == KernelError.PlatformBindingDraining)
@@ -516,8 +635,22 @@ public sealed partial class RuntimeKernel
                 else
                     firstBlockingError ??= finalize.Error;
             }
+            }
+            }
+            finally { EmitBudgetObservations(mappingBudgetObservations); }
         }
 
+        lock (_platformMemoryUseGate)
+        {
+        var suffixOwner = ValidateProcessMappingProgressionLocked(process, record, mappingSnapshot, participants);
+        if (!suffixOwner.IsSuccess)
+        {
+            if (suffixOwner.Error != KernelError.PlatformBindingDraining)
+                return KernelResult<ProcessTeardownSnapshot>.Fail(suffixOwner.Error, suffixOwner.Message!);
+            record.Phase = ProcessTeardownPhase.PlatformDraining;
+            record.BlockingError = null;
+            return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
+        }
         record.PendingPlatformMappings = pendingMappings;
         if (firstBlockingError is { } blockingError)
         {
@@ -533,33 +666,64 @@ public sealed partial class RuntimeKernel
         }
 
         if (_pendingPlatformDomainBinds.Contains(record.Handle) ||
-            PlatformAuthority.HasUnresolvedDomainBindEffect(identity))
+            PlatformAuthority.HasUnresolvedDomainBindEffect(identity) ||
+            (record.DomainBinding is null && PlatformAuthority.HasActiveAuthority(identity)))
         {
             record.Phase = ProcessTeardownPhase.PlatformFaulted;
             record.BlockingError = KernelError.PlatformFaulted;
             return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
         }
 
-        if (!record.PlatformDomainClosed && record.DomainBinding is { } binding)
+        domainBindingSnapshot = record.DomainBinding;
+        trackedDomainSnapshot = _processPlatformBindings.TryGetValue(record.Handle, out var trackedDomain) ? trackedDomain : null;
+        if (trackedDomainSnapshot is { } routedRoot && routedRoot != domainBindingSnapshot)
         {
-            var revokeDomain = PlatformAuthority.RevokeDomain(binding, identity);
-            if (!revokeDomain.IsSuccess)
-            {
-                record.Phase = ProcessTeardownPhase.PlatformFaulted;
-                record.BlockingError = revokeDomain.Error;
-                return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
-            }
-
-            record.PlatformDomainClosed = true;
-            UntrackPlatformBinding(record.Handle, binding);
+            record.Phase = ProcessTeardownPhase.PlatformFaulted;
+            record.BlockingError = KernelError.PlatformFaulted;
+            return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
         }
-        else
+        domainToClose = record.PlatformDomainClosed ? null : record.DomainBinding;
+        }
+        var revokeDomain = domainToClose is { } bindingToClose
+            ? PlatformAuthority.RevokeDomain(bindingToClose, identity) : KernelResult.Ok();
+        lock (_platformMemoryUseGate)
         {
+        var domainOwner = Processes.Resolve(record.Handle);
+        if (!domainOwner.IsSuccess || !ReferenceEquals(domainOwner.Value, process) ||
+            !_processTeardowns.TryGetValue(record.Handle, out var domainRecord) || !ReferenceEquals(domainRecord, record))
+            return KernelResult<ProcessTeardownSnapshot>.Fail(KernelError.StaleGeneration,
+                "Exact process teardown owner changed during parent-domain progression.");
+        var currentTrackedDomain = _processPlatformBindings.TryGetValue(record.Handle, out var trackedAfterDomain)
+            ? (PlatformDomainBinding?)trackedAfterDomain : null;
+        // Accepted exact closure survives a late routing refusal, but cannot close a replacement binding.
+        if (revokeDomain.IsSuccess && record.DomainBinding == domainBindingSnapshot)
             record.PlatformDomainClosed = true;
+        if (record.DomainBinding != domainBindingSnapshot || currentTrackedDomain != trackedDomainSnapshot)
+        {
+            record.Phase = ProcessTeardownPhase.PlatformDraining;
+            record.BlockingError = null;
+            return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
         }
-
+        if (!revokeDomain.IsSuccess)
+        {
+            record.Phase = ProcessTeardownPhase.PlatformFaulted;
+            record.BlockingError = revokeDomain.Error;
+            return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
+        }
+        // Retain the actual accepted closure before a late inventory refusal.
+        // It does not imply Region reclaim or quantitative settlement.
+        record.PlatformDomainClosed = true;
+        if (record.DomainBinding is { } closedBinding) UntrackPlatformBinding(record.Handle, closedBinding);
         record.Phase = ProcessTeardownPhase.PlatformClosed;
-        var cleanup = FinalizeProcessCleanup(process);
+        var afterDomain = ValidateProcessMappingProgressionLocked(process, record, mappingSnapshot, participants);
+        if (!afterDomain.IsSuccess)
+        {
+            if (afterDomain.Error != KernelError.PlatformBindingDraining)
+                return KernelResult<ProcessTeardownSnapshot>.Fail(afterDomain.Error, afterDomain.Message!);
+            record.BlockingError = null;
+            return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
+        }
+        var cleanup = FinalizeProcessCleanup(process, record, regionBudgetObservations);
         if (!cleanup.IsSuccess)
         {
             if (cleanup.Error == KernelError.PlatformBindingDraining)
@@ -590,11 +754,47 @@ public sealed partial class RuntimeKernel
         _processPlatformMmioLeases.Remove(record.Handle);
         _processPlatformDeviceLeases.Remove(record.Handle);
         return KernelResult<ProcessTeardownSnapshot>.Ok(completed);
+        }
+        }
+        finally
+        {
+            lock (_platformMemoryUseGate) record.ProgressionInFlight = false;
+            EmitBudgetObservations(regionBudgetObservations);
+        }
     }
 
-    private KernelResult FinalizeProcessCleanup(SingProcess process)
+    // Existing owners only; called with kernel gate held after provider work.
+    private KernelResult ValidateProcessMappingProgressionLocked(SingProcess process,
+        ProcessTeardownRecord record, PlatformRegionMapping[] mappings, ICxlTeardownParticipant[] participants)
+    {
+        var current = Processes.Resolve(record.Handle);
+        if (!current.IsSuccess || !ReferenceEquals(current.Value, process) ||
+            !_processTeardowns.TryGetValue(record.Handle, out var exact) || !ReferenceEquals(exact, record))
+            return KernelResult.Fail(KernelError.StaleGeneration, "Exact teardown owner changed during mapping progression.");
+        if (!record.Mappings.SequenceEqual(mappings) || _pendingPlatformMappingAdmissions.ContainsKey(record.Handle) ||
+            !HasCurrentCxlTeardownParticipants(participants))
+            return KernelResult.Fail(KernelError.PlatformBindingDraining,
+                "Mapping admission/inventory or CXL participants changed; a fresh progression pass is required.");
+        return KernelResult.Ok();
+    }
+
+    private KernelResult FinalizeProcessCleanup(SingProcess process, ProcessTeardownRecord teardown,
+        List<BudgetTraceObservation> observations)
     {
         var handle = new ProcessHandle(process.ProcessId, process.Generation);
+        var identity = PlatformIdentity(process);
+        if (_processPlatformBindings.ContainsKey(handle))
+            return KernelResult.Fail(KernelError.PlatformFaulted,
+                "A remaining kernel root correlation has not been discharged by exact closure; local reclaim remains pinned.");
+        if (PlatformAuthority.HasUnresolvedDomainBindEffect(identity) || PlatformAuthority.HasActiveAuthority(identity))
+            return KernelResult.Fail(KernelError.PlatformFaulted,
+                "Original platform authority or unresolved admission remains live; missing kernel routing cannot authorize local reclaim.");
+        if (PlatformAuthority.HasUnclosedModelDomainOwner(handle))
+            return KernelResult.Fail(KernelError.PlatformFaulted,
+                "An original model-domain lease remains unclosed; missing local model inventory cannot authorize reclaim.");
+        if (_virtualDomains.HasUnconsumedOriginalOwner(handle))
+            return KernelResult.Fail(KernelError.PlatformFaulted,
+                "Original virtual local cleanup owner remains unconsumed; missing or falsely Closed routing cannot authorize reclaim.");
         if (HasPinnedSecureExecution(handle))
             return KernelResult.Fail(KernelError.PlatformFaulted, "Live or quarantined secure execution forbids local process reclaim.");
         if (_endpointSessionInvocationRegistry is { } invocations &&
@@ -609,18 +809,24 @@ public sealed partial class RuntimeKernel
         var eventsClosed = _kernelEvents.CloseAllForProcess(handle);
         if (!eventsClosed.IsSuccess) return eventsClosed;
 
-        var domainEnded = Domains.Remove(process);
-        if (domainEnded)
+        if (teardown.DomainReclaimPending is null && Domains.Remove(process))
+            teardown.DomainReclaimPending = process.DomainId;
+        if (teardown.DomainReclaimPending is not null)
         {
             CapabilityAuthority.RevokeAllForDomain(process.DomainId);
-            Regions.ReturnAllLoansForBorrowerDomain(process.DomainId);
-            var reclaimed = Regions.ReclaimAllForDomain(process.DomainId);
-            ReleaseReclaimedRegionBudgetsForProcess(handle, reclaimed);
+            var returnedLoans = Regions.ReturnAllLoansForBorrowerDomain(process.DomainId);
+            if (!returnedLoans.IsSuccess) return KernelResult.Fail(returnedLoans.Error, returnedLoans.Message!);
+            Regions.ReleaseLocalBorrowUsesForExitedDomain(process.DomainId);
+            var reclaimed = Regions.TryReclaimAllForDomain(process.DomainId);
+            if (!reclaimed.IsSuccess) return KernelResult.Fail(reclaimed.Error, reclaimed.Message!);
+            var settled = ReleaseReclaimedRegionBudgetsForProcess(handle, process.DomainId, observations);
+            if (!settled.IsSuccess) return settled;
             lock (_requestResponseCorrelationGate)
                 Channels.CloseAllForDomain(process.DomainId);
         }
 
         process.ClearRuntimeResources();
+        teardown.DomainReclaimPending = null;
         return KernelResult.Ok();
     }
 

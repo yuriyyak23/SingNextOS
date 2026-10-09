@@ -117,6 +117,7 @@ public sealed record DeviceResourceSetSnapshot(
 
 public sealed class DeviceResourceSet
 {
+    private readonly object _snapshotGate = new();
     private readonly List<MmioResourceGrant> _mmio = [];
     private readonly List<IrqResourceGrant> _irqs = [];
     private readonly List<PlatformDmaGrant> _activeDmaGrants = [];
@@ -139,21 +140,22 @@ public sealed class DeviceResourceSet
     public string DeviceResourceId { get; }
     public CapabilityId DeviceCapabilityId { get; }
     public PlatformDeviceLease DeviceLease { get; }
-    public IReadOnlyList<MmioResourceGrant> Mmio => _mmio;
-    public IReadOnlyList<IrqResourceGrant> Irqs => _irqs;
+    public IReadOnlyList<MmioResourceGrant> Mmio { get { lock (_snapshotGate) return _mmio.ToArray(); } }
+    public IReadOnlyList<IrqResourceGrant> Irqs { get { lock (_snapshotGate) return _irqs.ToArray(); } }
     public DriverDmaPolicy? DmaPolicy { get; }
-    public IReadOnlyList<PlatformDmaGrant> ActiveDmaGrants => _activeDmaGrants;
+    public IReadOnlyList<PlatformDmaGrant> ActiveDmaGrants { get { lock (_snapshotGate) return _activeDmaGrants.ToArray(); } }
 
-    internal void AddMmio(MmioResourceGrant grant) => _mmio.Add(grant);
-    internal void AddIrq(IrqResourceGrant grant) => _irqs.Add(grant);
-    internal void AddDma(PlatformDmaGrant grant) => _activeDmaGrants.Add(grant);
-    internal void RemoveDma(PlatformDmaGrant grant) =>
-        _activeDmaGrants.RemoveAll(candidate => candidate.GrantId == grant.GrantId);
+    internal void AddMmio(MmioResourceGrant grant) { lock (_snapshotGate) _mmio.Add(grant); }
+    internal void AddIrq(IrqResourceGrant grant) { lock (_snapshotGate) _irqs.Add(grant); }
+    internal void AddDma(PlatformDmaGrant grant) { lock (_snapshotGate) _activeDmaGrants.Add(grant); }
+    internal void RemoveDma(PlatformDmaGrant grant) { lock (_snapshotGate) _activeDmaGrants.RemoveAll(candidate => candidate.GrantId == grant.GrantId); }
 
     internal DeviceResourceSetSnapshot Snapshot
     {
         get
         {
+            lock (_snapshotGate)
+            {
             var mmio = _mmio.Select(static grant =>
             {
                 CapabilityResourceIds.TryParseMmioRegion(grant.CapabilityResourceId, out var resource);
@@ -180,6 +182,7 @@ public sealed class DeviceResourceSet
                 irqs,
                 DmaPolicy,
                 _activeDmaGrants.Count);
+            }
         }
     }
 }

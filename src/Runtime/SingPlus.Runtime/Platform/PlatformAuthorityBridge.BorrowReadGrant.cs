@@ -111,7 +111,7 @@ public sealed partial class PlatformAuthorityBridge
             expectedSubject,
             default,
             slice,
-            retainFaultedHandleOnMalformed: false,
+            retainFaultedHandleOnMalformed: true,
             out retainBorrowReservation);
         if (!mapped.IsSuccess)
         {
@@ -120,6 +120,8 @@ public sealed partial class PlatformAuthorityBridge
                 mapped.Message!);
         }
 
+        lock (_secureDomainLifecycleGate)
+        {
         var grant = new PlatformBorrowReadGrant(
             new PlatformBorrowReadGrantId(_nextBorrowReadGrantId++),
             new PlatformBorrowReadGrantGeneration(1),
@@ -138,6 +140,31 @@ public sealed partial class PlatformAuthorityBridge
                 borrow.Lifetime));
 
         return KernelResult<PlatformBorrowReadGrant>.Ok(grant);
+        }
+    }
+
+    internal KernelResult ValidateBorrowReadGrantPublication(
+        PlatformBorrowReadGrant grant, PlatformDomainIdentity subject, BorrowLeaseAuthoritySnapshot borrow)
+    {
+        lock (_secureDomainLifecycleGate)
+        {
+            var exact = ValidateBorrowReadGrantIdentity(grant, subject);
+            if (!exact.IsSuccess) return KernelResult.Fail(exact.Error, exact.Message!);
+            var record = exact.Value!;
+            if (record.Owner != borrow.Owner || record.Borrower != borrow.Borrower ||
+                record.Grant.BorrowLease != borrow.Handle ||
+                !ReferenceEquals(record.BorrowLifetime, borrow.Lifetime) || !borrow.Lifetime.IsActive)
+                return KernelResult.Fail(KernelError.StaleGeneration, "Borrow publication lost its exact authoritative loan lifetime.");
+            return ValidateExactMapping(record.Mapping, subject);
+        }
+    }
+
+    internal void RefuseBorrowReadGrantPublication(PlatformBorrowReadGrant grant)
+    {
+        lock (_secureDomainLifecycleGate)
+            if (_borrowReadGrants.TryGetValue(grant.GrantId, out var record) && record.Grant == grant &&
+                _mappings.TryGetValue(record.Mapping.Mapping.MappingId, out var mapping))
+                mapping.LocalAuthorizationRevoked = true;
     }
 
     internal KernelResult<PlatformBorrowReadGrantEvidence> PrepareBorrowReadGrantForExternalReader(
@@ -293,38 +320,38 @@ public sealed partial class PlatformAuthorityBridge
         return KernelResult.Ok();
     }
 
-    internal KernelResult MarkBorrowReadGrantReclaimed(
-        PlatformBorrowReadGrant grant,
-        PlatformDomainIdentity expectedSubject)
+    // Kernel holds the existing Region gate before this bridge gate. No provider
+    // callbacks or delegated actions enter this local owner composition.
+    internal KernelResult CommitBorrowReadGrantCompletion(
+        PlatformBorrowReadGrant grant, PlatformDomainIdentity expectedSubject,
+        BorrowLeaseAuthoritySnapshot borrow, RegionAuthority regions)
     {
-        var validation = ValidateBorrowReadGrantIdentity(grant, expectedSubject);
-        if (!validation.IsSuccess)
-            return KernelResult.Fail(validation.Error, validation.Message!);
-
-        var record = validation.Value!;
-        var lifecycle = QueryRegionMappingLifecycle(
-            record.Mapping.Mapping,
-            expectedSubject);
-        if (!lifecycle.IsSuccess)
-            return KernelResult.Fail(lifecycle.Error, lifecycle.Message!);
-        if (lifecycle.Value!.PlatformClosure != PlatformExternalClosureState.Closed)
+        lock (_secureDomainLifecycleGate)
         {
-            return KernelResult.Fail(
-                KernelError.PlatformBindingDraining,
-                "External read-grant metadata cannot be reclaimed before verified closure.");
+            var exact = ValidateBorrowReadGrantLocalAuthority(grant, expectedSubject, borrow);
+            if (!exact.IsSuccess) return exact;
+            var record = _borrowReadGrants[grant.GrantId];
+            var mapping = _mappings[record.Mapping.Mapping.MappingId];
+            var completed = regions.CompleteExternalBorrowReadGrantLocked(borrow);
+            if (!completed.IsSuccess) return completed;
+            // Everything fallible preceded the Region mutation. These are local
+            // metadata consequences of its once-only loan transition.
+            mapping.LocalReservationReleased = true;
+            ForgetExactMappingMetadata(record.Mapping.Mapping);
+            _borrowReadGrants.Remove(grant.GrantId);
+            return KernelResult.Ok();
         }
-
-        var markReleased = MarkRegionReservationReleased(
-            record.Mapping.Mapping,
-            expectedSubject);
-        if (!markReleased.IsSuccess) return markReleased;
-
-        ForgetExactMappingMetadata(record.Mapping.Mapping);
-        _borrowReadGrants.Remove(grant.GrantId);
-        return KernelResult.Ok();
     }
 
     private KernelResult<BorrowReadGrantRecord> ValidateBorrowReadGrantIdentity(
+        PlatformBorrowReadGrant grant,
+        PlatformDomainIdentity expectedSubject)
+    {
+        lock (_secureDomainLifecycleGate)
+            return ValidateBorrowReadGrantIdentityCore(grant, expectedSubject);
+    }
+
+    private KernelResult<BorrowReadGrantRecord> ValidateBorrowReadGrantIdentityCore(
         PlatformBorrowReadGrant grant,
         PlatformDomainIdentity expectedSubject)
     {

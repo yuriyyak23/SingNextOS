@@ -85,8 +85,10 @@ public sealed partial class RuntimeKernel
         if (plan.Mode != DataMotionModeV1.HostCopyThenReleaseSource)
             return KernelResult<V6DataMotionExecution<T>>.Fail(KernelError.PlatformUnsupported,
                 "Only the explicitly bounded host-copy data-motion contour is implemented.");
-        if (currentSourceEstimateGeneration() != plan.SourceEstimateGeneration ||
-            currentDestinationEstimateGeneration() != plan.DestinationEstimateGeneration)
+        var estimates = ValidateEstimates();
+        if (!estimates.IsSuccess)
+            return KernelResult<V6DataMotionExecution<T>>.Fail(estimates.Error, estimates.Message!);
+        if (!estimates.Value)
             return KernelResult<V6DataMotionExecution<T>>.Fail(KernelError.StaleGeneration,
                 "Locality cost evidence changed before data-motion execution.");
         var sourceProcess = Processes.Resolve(source);
@@ -113,17 +115,37 @@ public sealed partial class RuntimeKernel
         RuntimeBufferLease<T>? bufferLease = null;
         try
         {
-            if (currentSourceEstimateGeneration() != plan.SourceEstimateGeneration ||
-                currentDestinationEstimateGeneration() != plan.DestinationEstimateGeneration)
+            estimates = ValidateEstimates();
+            if (!estimates.IsSuccess) return FailAndRelease(estimates.Error, estimates.Message!);
+            if (!estimates.Value)
                 return FailAndRelease(KernelError.StaleGeneration, "Locality cost evidence changed at the final copy sentry.");
-            var acquired = Regions.AcquireUse(input.Handle, owner, RegionUseMode.ExclusiveRead,
-                new RegionUseRange(0, checked((long)exactBytes)));
+            KernelResult<RegionUseDescriptor> acquired;
+            lock (_platformMemoryUseGate)
+            {
+                var accepting = ValidateEffectAdmissionProcess(source);
+                if (accepting.IsSuccess) accepting = ValidateDestination();
+                acquired = accepting.IsSuccess
+                    ? Regions.AcquireUse(input.Handle, owner, RegionUseMode.ExclusiveRead,
+                        new RegionUseRange(0, checked((long)exactBytes)))
+                    : KernelResult<RegionUseDescriptor>.Fail(accepting.Error, accepting.Message!);
+            }
             if (!acquired.IsSuccess) return FailAndRelease(acquired.Error, acquired.Message!);
             pin = acquired.Value!;
+            if (pin.MutationEpoch.Value != plan.SourceMutationGeneration)
+                return FailAndRelease(KernelError.StaleGeneration,
+                    "Source mutation changed before the host-copy read pin was acquired.");
             try { bufferLease = input.ReserveForRuntime(RuntimeBufferAccess.Read); }
             catch (InvalidOperationException exception)
             { return FailAndRelease(KernelError.RegionUseConflict, exception.Message); }
-            bufferLease.ReadOnlySpan.CopyTo(outputBuffer.Span);
+            KernelResult copied;
+            lock (_platformMemoryUseGate)
+            {
+                copied = ValidateEffectAdmissionProcess(source);
+                if (copied.IsSuccess) copied = ValidateDestination();
+                if (copied.IsSuccess)
+                    bufferLease.ReadOnlySpan.CopyTo(outputBuffer.Span);
+            }
+            if (!copied.IsSuccess) return FailAndRelease(copied.Error, copied.Message!);
             bufferLease.Dispose();
             bufferLease = null;
             var releasedPin = Regions.ReleaseUse(pin.Handle, owner);
@@ -137,7 +159,14 @@ public sealed partial class RuntimeKernel
                 [DataMotionLifecycleStateV1.Planned, DataMotionLifecycleStateV1.SourcePinned,
                  DataMotionLifecycleStateV1.Copied, DataMotionLifecycleStateV1.SourceReleased,
                  DataMotionLifecycleStateV1.Completed]).Validate();
-            return KernelResult<V6DataMotionExecution<T>>.Ok(new(outputBuffer, receipt));
+            KernelResult publication;
+            lock (_platformMemoryUseGate)
+            {
+                publication = ValidateDestination();
+                if (publication.IsSuccess)
+                    return KernelResult<V6DataMotionExecution<T>>.Ok(new(outputBuffer, receipt));
+            }
+            return FailAndRelease(publication.Error, publication.Message!);
         }
         finally
         {
@@ -147,8 +176,37 @@ public sealed partial class RuntimeKernel
 
         KernelResult<V6DataMotionExecution<T>> FailAndRelease(KernelError error, string message)
         {
-            _ = ReleaseRegion(destination, outputBuffer);
+            var released = ReleaseRegion(destination, outputBuffer);
+            if (!released.IsSuccess)
+                message += $" Temporary Region {outputBuffer.Handle} cleanup refused ({released.Error}); original owner facts remain authoritative.";
             return KernelResult<V6DataMotionExecution<T>>.Fail(error, message);
+        }
+
+        KernelResult ValidateDestination()
+        {
+            var accepting = ValidateEffectAdmissionProcess(destination);
+            if (!accepting.IsSuccess) return accepting;
+            if (!outputBuffer.IsValid)
+                return KernelResult.Fail(KernelError.InvalidRegionState,
+                    "Data-motion destination ownership changed before commit.");
+            var live = Regions.Validate(outputBuffer.Handle,
+                new RegionOwner(destinationProcess.Value!.DomainId, destination.Generation));
+            return live.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(live.Error, live.Message!);
+        }
+
+        KernelResult<bool> ValidateEstimates()
+        {
+            try
+            {
+                return KernelResult<bool>.Ok(
+                    currentSourceEstimateGeneration() == plan.SourceEstimateGeneration &&
+                    currentDestinationEstimateGeneration() == plan.DestinationEstimateGeneration);
+            }
+            catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+            {
+                return KernelResult<bool>.Fail(KernelError.PlatformUnavailable,
+                    $"Locality cost generation observation failed before copy: {exception.GetType().Name}.");
+            }
         }
     }
 
@@ -165,7 +223,8 @@ public sealed partial class RuntimeKernel
         PlatformDmaGrant destinationGrant,
         PlatformDmaPrepareEvidence destinationPrepare,
         Func<ulong> currentSourceEstimateGeneration,
-        Func<ulong> currentDestinationEstimateGeneration) where T : unmanaged
+        Func<ulong> currentDestinationEstimateGeneration,
+        ISemanticTraceSinkV1? sourceTraceSink = null, ISemanticTraceSinkV1? destinationTraceSink = null) where T : unmanaged
     {
         ArgumentNullException.ThrowIfNull(input);
         ArgumentNullException.ThrowIfNull(output);
@@ -224,35 +283,42 @@ public sealed partial class RuntimeKernel
             return KernelResult<V6DataMotionExecution<T>>.Fail(KernelError.StaleGeneration,
                 "Locality cost evidence changed at the final provider-DMA sentry.");
 
-        var submitted = SubmitV6PlatformDmaCopy(source, sourceGrant, sourcePrepare,
-            destination, destinationGrant, destinationPrepare);
-        V6PlatformDmaCopyExecution execution;
-        if (submitted.IsSuccess)
-            execution = submitted.Value!;
-        else if (submitted.Error == KernelError.PlatformBindingActive)
+        var cleanup = PlatformAuthority.HasCompletedDmaCopyPairForCleanup(sourceGrant, sourcePrepare, PlatformIdentity(sourceProcess.Value!),
+            destinationGrant, destinationPrepare, PlatformIdentity(destinationProcess.Value!), plan.SourceMutationGeneration);
+        if (!cleanup.IsSuccess) return KernelResult<V6DataMotionExecution<T>>.Fail(cleanup.Error, cleanup.Message!);
+        if (!cleanup.Value)
         {
-            var active = GetActiveV6PlatformDmaCopy(
-                source, sourceGrant, destination, destinationGrant);
-            if (!active.IsSuccess)
-                return KernelResult<V6DataMotionExecution<T>>.Fail(active.Error, active.Message!);
-            execution = active.Value!;
-        }
-        else
-            return KernelResult<V6DataMotionExecution<T>>.Fail(submitted.Error, submitted.Message!);
-        var completed = CompleteV6PlatformDmaCopy(source, destination, execution);
-        if (!completed.IsSuccess)
-            return KernelResult<V6DataMotionExecution<T>>.Fail(completed.Error, completed.Message!);
+            var submitted = SubmitV6PlatformDmaCopy(source, sourceGrant, sourcePrepare,
+                destination, destinationGrant, destinationPrepare, sourceTraceSink, destinationTraceSink);
+            V6PlatformDmaCopyExecution execution;
+            if (submitted.IsSuccess)
+                execution = submitted.Value!;
+            else if (submitted.Error == KernelError.PlatformBindingActive)
+            {
+                var active = GetActiveV6PlatformDmaCopy(
+                    source, sourceGrant, destination, destinationGrant);
+                if (!active.IsSuccess)
+                    return KernelResult<V6DataMotionExecution<T>>.Fail(active.Error, active.Message!);
+                execution = active.Value!;
+            }
+            else
+                return KernelResult<V6DataMotionExecution<T>>.Fail(submitted.Error, submitted.Message!);
+            var completed = CompleteV6PlatformDmaCopy(source, destination, execution);
+            if (!completed.IsSuccess)
+                return KernelResult<V6DataMotionExecution<T>>.Fail(completed.Error, completed.Message!);
 
-        var sourceGrantClosed = RevokePlatformDma(source, sourceGrant);
+        }
+
+        var sourceGrantClosed = CloseGrant(source, sourceGrant, true);
         if (!sourceGrantClosed.IsSuccess)
             return KernelResult<V6DataMotionExecution<T>>.Fail(sourceGrantClosed.Error, sourceGrantClosed.Message!);
-        var destinationGrantClosed = RevokePlatformDma(destination, destinationGrant);
+        var destinationGrantClosed = CloseGrant(destination, destinationGrant, false);
         if (!destinationGrantClosed.IsSuccess)
             return KernelResult<V6DataMotionExecution<T>>.Fail(destinationGrantClosed.Error, destinationGrantClosed.Message!);
-        var sourceMappingClosed = RevokePlatformRegionMapping(source, sourceMapping);
+        var sourceMappingClosed = CloseMapping(source, sourceMapping);
         if (!sourceMappingClosed.IsSuccess)
             return KernelResult<V6DataMotionExecution<T>>.Fail(sourceMappingClosed.Error, sourceMappingClosed.Message!);
-        var destinationMappingClosed = RevokePlatformRegionMapping(destination, destinationMapping);
+        var destinationMappingClosed = CloseMapping(destination, destinationMapping);
         if (!destinationMappingClosed.IsSuccess)
             return KernelResult<V6DataMotionExecution<T>>.Fail(destinationMappingClosed.Error,
                 destinationMappingClosed.Message!);
@@ -268,6 +334,21 @@ public sealed partial class RuntimeKernel
              DataMotionLifecycleStateV1.Completed]).Validate();
         return KernelResult<V6DataMotionExecution<T>>.Ok(new(output, receipt));
 
+        KernelResult CloseGrant(ProcessHandle process, PlatformDmaGrant grant, bool sourceLeg)
+        {
+            var closed = RevokePlatformDma(process, grant);
+            if (closed.Error != KernelError.PlatformBindingRevoked) return closed;
+            var fact = PlatformAuthority.ObserveDmaCopyClosure(sourceGrant, PlatformIdentity(sourceProcess.Value!),
+                destinationGrant, PlatformIdentity(destinationProcess.Value!));
+            return fact.IsSuccess && (sourceLeg ? fact.Value.SourceGrantClosed : fact.Value.DestinationGrantClosed)
+                ? KernelResult.Ok() : closed;
+        }
+        KernelResult CloseMapping(ProcessHandle process, PlatformOwnedRegionSliceMapping mapping)
+        {
+            var closed = RevokePlatformRegionMapping(process, mapping);
+            return closed.Error == KernelError.PlatformBindingRevoked
+                ? ObservePlatformRegionMappingRevocation(process, mapping.Mapping) : closed;
+        }
         static bool ExactLeg(
             PlatformOwnedRegionSliceMapping mapping,
             PlatformDmaGrant grant,

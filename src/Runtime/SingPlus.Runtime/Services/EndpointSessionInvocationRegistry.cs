@@ -32,12 +32,16 @@ internal sealed class EndpointSessionInvocationRegistry
         public bool AcceptedResponseCancelled { get; set; }
         public bool FailedSettlementMayHaveEffect { get; set; }
         public bool DonationReturnInProgress { get; set; }
+        public bool DonationBindingInProgress { get; set; } // Admission only.
         public ResponsePublicationStatus? SettlementInProgress { get; set; }
         public ResponsePublicationStatus? TerminalStatus { get; set; }
+        public ResponseEnvelope? SettlementOutcome { get; set; } // Retained outcome, never permission.
         public ResourceDonationBinding? ResourceDonation { get; set; }
     }
 
     private readonly Dictionary<(EndpointSessionId Session, EndpointSessionGeneration SessionGeneration, EndpointSessionInvocationId Invocation), Record> _records = [];
+    // The same authoritative records survive loss of the invocation routing index.
+    private readonly Dictionary<(EndpointSessionId Session, EndpointSessionGeneration SessionGeneration, EndpointSessionInvocationId Invocation), Record> _ownedRecords = [];
     private readonly object _gate = new();
     private readonly object _settlementAdmissionGate;
     private readonly CancellationScopeAuthority _cancellationScopes;
@@ -67,8 +71,10 @@ internal sealed class EndpointSessionInvocationRegistry
         var key = Key(handle);
         lock (_gate)
         {
-            if (_records.TryGetValue(key, out var existing))
+            if (_ownedRecords.TryGetValue(key, out var existing))
             {
+                if (!_records.TryGetValue(key, out var routed) || !ReferenceEquals(routed, existing))
+                    throw new InvalidOperationException("Original invocation owner continuity was lost before registration.");
                 if (existing.Caller != caller ||
                     existing.Service != service ||
                     existing.MessageId != messageId ||
@@ -82,16 +88,48 @@ internal sealed class EndpointSessionInvocationRegistry
                 return existing.Handle;
             }
 
-            _records.Add(key, new Record
+            _ownedRecords.EnsureCapacity(_ownedRecords.Count + 1);
+            _records.EnsureCapacity(_records.Count + 1);
+            var record = new Record
             {
                 Handle = handle,
                 Caller = caller,
                 Service = service,
                 MessageId = messageId,
                 CancellationScope = cancellationScope
-            });
+            };
+            _ownedRecords.Add(key, record);
+            _records.Add(key, record);
         }
         return handle;
+    }
+
+    // Caller holds the kernel correlation gate and supplies the actual queued request.
+    internal KernelResult<EndpointSessionInvocationHandle> PrepareOriginalRequestDelivery(
+        EndpointSessionHandle session, ProcessHandle caller, ProcessHandle service,
+        ulong requestSequence, uint messageId)
+    {
+        var handle = new EndpointSessionInvocationHandle(session,
+            new EndpointSessionInvocationId(requestSequence), new EndpointSessionInvocationGeneration(1));
+        lock (_gate)
+        {
+            // V1 public Send can precede the first session invocation registration.
+            // A retained original owner or any existing route must never be replaced.
+            if (!_ownedRecords.ContainsKey(Key(handle)) && !_records.ContainsKey(Key(handle)))
+                Register(session, caller, service, requestSequence, messageId);
+            var resolved = ResolveForService(handle, service);
+            if (!resolved.IsSuccess)
+                return KernelResult<EndpointSessionInvocationHandle>.Fail(resolved.Error, resolved.Message!);
+            var record = resolved.Value!;
+            if (record.Caller != caller || record.MessageId != messageId)
+                return KernelResult<EndpointSessionInvocationHandle>.Fail(KernelError.PlatformFaulted,
+                    "Queued request does not match its original invocation owner.");
+            if (record.Delivered || record.TerminalStatus is not null ||
+                record.SettlementInProgress is not null || record.FailedSettlementMayHaveEffect)
+                return KernelResult<EndpointSessionInvocationHandle>.Fail(KernelError.ResponseNotPending,
+                    "Original invocation is no longer eligible for queued delivery.");
+            return KernelResult<EndpointSessionInvocationHandle>.Ok(handle);
+        }
     }
 
     internal KernelResult<EndpointSessionInvocationHandle> MarkDelivered(
@@ -136,15 +174,16 @@ internal sealed class EndpointSessionInvocationRegistry
     internal KernelResult BindCancellationScope(
         EndpointSessionInvocationHandle handle,
         ProcessHandle caller,
-        CancellationScopeHandle scope)
+        CancellationScopeHandle scope, long? observedTimestamp = null)
     {
+        var timestamp = observedTimestamp ?? _cancellationScopes.CaptureTimestamp(scope);
         lock (_gate)
         {
             var resolved = ResolveForCaller(handle, caller);
             if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
             if (resolved.Value!.CancellationScope is { } existing && existing != scope)
                 return KernelResult.Fail(KernelError.StaleGeneration, "Invocation is already bound to another cancellation scope generation.");
-            var temporal = _cancellationScopes.Observe(caller, scope);
+            var temporal = _cancellationScopes.Observe(caller, scope, timestamp);
             if (!temporal.IsSuccess) return KernelResult.Fail(temporal.Error, temporal.Message!);
             if (temporal.Value!.Disposition == CancellationDisposition.Stale)
                 return KernelResult.Fail(KernelError.StaleGeneration, "Cancellation scope generation is stale.");
@@ -161,8 +200,9 @@ internal sealed class EndpointSessionInvocationRegistry
     internal KernelResult<CancellationObservation> RequestCancellation(
         EndpointSessionInvocationHandle handle,
         ProcessHandle caller,
-        CancellationScopeHandle scope)
+        CancellationScopeHandle scope, long? observedTimestamp = null)
     {
+        var timestamp = observedTimestamp ?? _cancellationScopes.CaptureTimestamp(scope);
         lock (_gate)
         {
             var resolved = ResolveForCaller(handle, caller);
@@ -170,24 +210,24 @@ internal sealed class EndpointSessionInvocationRegistry
             var record = resolved.Value!;
             if (record.CancellationScope != scope)
                 return KernelResult<CancellationObservation>.Fail(KernelError.StaleGeneration, "Invocation is not bound to the exact cancellation scope generation.");
-            var request = _cancellationScopes.Request(caller, scope);
+            var request = _cancellationScopes.Request(caller, scope, timestamp);
             if (!request.IsSuccess || request.Value!.Disposition == CancellationDisposition.Stale)
                 return request;
             if (record.TerminalStatus == ResponsePublicationStatus.Published)
                 return _cancellationScopes.RecordDisposition(caller, scope,
                     record.FailedSettlementMayHaveEffect
                         ? CancellationDisposition.TooLateEffectMayExist
-                        : CancellationDisposition.CompletedBeforeCancellation);
+                        : CancellationDisposition.CompletedBeforeCancellation, timestamp);
             if (record.TerminalStatus == ResponsePublicationStatus.Cancelled)
                 return _cancellationScopes.RecordDisposition(caller, scope,
                     record.AcceptedResponseCancelled || record.FailedSettlementMayHaveEffect
                     ? CancellationDisposition.TooLateEffectMayExist
                     : record.ServiceAccepted
                         ? CancellationDisposition.ProviderEffectContained
-                        : CancellationDisposition.CancelledBeforeEffect);
+                        : CancellationDisposition.CancelledBeforeEffect, timestamp);
             if (record.FailedSettlementMayHaveEffect ||
                 record.ServiceAccepted && !record.InFlightCancellationAllowed)
-                return _cancellationScopes.RecordDisposition(caller, scope, CancellationDisposition.TooLateEffectMayExist);
+                return _cancellationScopes.RecordDisposition(caller, scope, CancellationDisposition.TooLateEffectMayExist, timestamp);
             record.CancellationRequested = true;
             return request;
         }
@@ -299,9 +339,11 @@ internal sealed class EndpointSessionInvocationRegistry
             handle,
             service,
             status,
-            requireCancellationAccepted: succeeded ? false : null);
+            requireCancellationAccepted: succeeded ? false : null,
+            localCompletionOnly: true);
         if (!reservation.IsSuccess) return KernelResult.Fail(reservation.Error, reservation.Message!);
 
+        (ProcessHandle Caller, CancellationScopeHandle Scope, CancellationDisposition Disposition)? outcome = null;
         lock (_gate)
         {
             var record = reservation.Value!;
@@ -322,10 +364,12 @@ internal sealed class EndpointSessionInvocationRegistry
                         ? CancellationDisposition.TooLateEffectMayExist
                         : CancellationDisposition.CancelledBeforeEffect;
                 if (!succeeded || record.CancellationRequested)
-                    _ = _cancellationScopes.RecordDisposition(record.Caller, scope, disposition);
+                    outcome = (record.Caller, scope, disposition);
             }
-            return KernelResult.Ok();
         }
+        if (outcome is { } observed)
+            _ = _cancellationScopes.RecordDisposition(observed.Caller, observed.Scope, observed.Disposition);
+        return KernelResult.Ok();
     }
 
     private KernelResult<ResponseEnvelope> ExecuteSettlement(
@@ -336,7 +380,19 @@ internal sealed class EndpointSessionInvocationRegistry
         try
         {
             SettlementReservedHook?.Invoke();
-            actionStarted = true;
+            lock (_settlementAdmissionGate)
+            lock (_gate)
+            {
+                var current = Resolve(reservation.Handle);
+                if (!current.IsSuccess || !ReferenceEquals(current.Value, reservation) ||
+                    reservation.SettlementInProgress is null || reservation.FailedSettlementMayHaveEffect)
+                {
+                    reservation.SettlementInProgress = null;
+                    return KernelResult<ResponseEnvelope>.Fail(KernelError.PlatformFaulted,
+                        "Original invocation settlement source was lost before action.");
+                }
+                actionStarted = true;
+            }
             return CompleteSettlement(reservation, action());
         }
         catch
@@ -344,7 +400,7 @@ internal sealed class EndpointSessionInvocationRegistry
             lock (_gate)
             {
                 reservation.SettlementInProgress = null;
-                if (actionStarted)
+                if (actionStarted && reservation.TerminalStatus is null)
                     reservation.FailedSettlementMayHaveEffect = true;
             }
             throw;
@@ -355,7 +411,7 @@ internal sealed class EndpointSessionInvocationRegistry
         EndpointSessionInvocationHandle handle,
         ProcessHandle service,
         ResponsePublicationStatus status,
-        bool? requireCancellationAccepted)
+        bool? requireCancellationAccepted, bool localCompletionOnly = false)
     {
         lock (_settlementAdmissionGate)
         lock (_gate)
@@ -364,7 +420,8 @@ internal sealed class EndpointSessionInvocationRegistry
             if (!resolved.IsSuccess)
                 return KernelResult<Record>.Fail(resolved.Error, resolved.Message!);
             var record = resolved.Value!;
-            if (record.TerminalStatus is not null || record.SettlementInProgress is not null || record.DonationReturnInProgress)
+            if (record.TerminalStatus is not null || record.SettlementInProgress is not null ||
+                record.DonationReturnInProgress || record.FailedSettlementMayHaveEffect && !localCompletionOnly)
                 return KernelResult<Record>.Fail(KernelError.ResponseNotPending, "Endpoint session invocation is already terminal or settlement is in progress.");
             if (!record.Delivered)
                 return KernelResult<Record>.Fail(KernelError.ResponseNotDelivered, "Endpoint session invocation has not been delivered to the service.");
@@ -380,12 +437,25 @@ internal sealed class EndpointSessionInvocationRegistry
         Record reservation,
         KernelResult<ResponseEnvelope> result)
     {
+        (ProcessHandle Caller, CancellationScopeHandle Scope, CancellationDisposition Disposition)? outcome = null;
         lock (_gate)
         {
             if (reservation.SettlementInProgress is not { } status)
                 throw new InvalidOperationException("Endpoint session invocation settlement reservation was lost.");
 
             reservation.SettlementInProgress = null;
+            if (result.IsSuccess)
+            {
+                reservation.SettlementOutcome = result.Value;
+                if (!OwnsOriginalRecord(reservation) || result.Value is not { } envelope ||
+                    envelope.RequestSequence != reservation.Handle.InvocationId.Value ||
+                    envelope.MessageId != reservation.MessageId || envelope.Status != status)
+                {
+                    reservation.FailedSettlementMayHaveEffect = true;
+                    return KernelResult<ResponseEnvelope>.Fail(KernelError.PlatformFaulted,
+                        "Original invocation settlement outcome is not exact.");
+                }
+            }
             if (result.IsSuccess)
             {
                 reservation.TerminalStatus = status;
@@ -401,7 +471,7 @@ internal sealed class EndpointSessionInvocationRegistry
                             ? CancellationDisposition.TooLateEffectMayExist
                             : CancellationDisposition.CancelledBeforeEffect;
                     if (status == ResponsePublicationStatus.Cancelled || reservation.CancellationRequested)
-                        _ = _cancellationScopes.RecordDisposition(reservation.Caller, scope, disposition);
+                        outcome = (reservation.Caller, scope, disposition);
                 }
             }
             else
@@ -410,15 +480,17 @@ internal sealed class EndpointSessionInvocationRegistry
                 // crossed an irreversible response or external-effect boundary.
                 reservation.FailedSettlementMayHaveEffect = true;
             }
-            return result;
         }
+        if (outcome is { } observed)
+            _ = _cancellationScopes.RecordDisposition(observed.Caller, observed.Scope, observed.Disposition);
+        return result;
     }
 
     internal int PendingCount(EndpointSessionHandle session)
     {
         lock (_gate)
         {
-            return _records.Values.Count(record =>
+            return _ownedRecords.Values.Count(record =>
                 record.Handle.Session == session &&
                 (HasUnclosedPossibleEffect(record) || record.TerminalStatus is null ||
                  record.ResourceDonation?.State == ResourceDonationState.Active));
@@ -428,7 +500,7 @@ internal sealed class EndpointSessionInvocationRegistry
     internal int UnclosedPossibleEffectCount(EndpointSessionHandle session)
     {
         lock (_gate)
-            return _records.Values.Count(record =>
+            return _ownedRecords.Values.Count(record =>
                 record.Handle.Session == session && HasUnclosedPossibleEffect(record));
     }
 
@@ -474,9 +546,24 @@ internal sealed class EndpointSessionInvocationRegistry
             var record = resolved.Value!;
             if (record.Service != service)
                 return KernelResult.Fail(KernelError.WrongSessionOwner, "Donation service generation does not match.");
-            if (record.TerminalStatus is not null || record.ResourceDonation is not null ||
+            if (record.DonationBindingInProgress || record.TerminalStatus is not null || record.ResourceDonation is not null ||
                 record.SettlementInProgress is not null || record.FailedSettlementMayHaveEffect)
                 return KernelResult.Fail(KernelError.InvalidTransition, "Invocation cannot admit a new donation binding.");
+            return KernelResult.Ok();
+        }
+    }
+
+    internal KernelResult BeginResourceDonationBinding(EndpointSessionInvocationHandle invocation,
+        ProcessHandle caller, ProcessHandle service, out Action release)
+    {
+        release = static () => { };
+        lock (_gate)
+        {
+            var admission = ValidateResourceDonationBindingAdmission(invocation, caller, service);
+            if (!admission.IsSuccess) return admission;
+            var record = Resolve(invocation).Value!;
+            record.DonationBindingInProgress = true;
+            release = () => { lock (_gate) record.DonationBindingInProgress = false; };
             return KernelResult.Ok();
         }
     }
@@ -499,6 +586,19 @@ internal sealed class EndpointSessionInvocationRegistry
         }
     }
 
+    internal KernelResult<ResourceDonationBinding> BindNestedResourceDonation(
+        ResourceDonationBinding expectedParent, ResourceDonationBinding child)
+    {
+        lock (_gate)
+        {
+            var parent = ResolveResourceDonation(expectedParent.Invocation, expectedParent.Service, requireAdmission: true);
+            if (!parent.IsSuccess) return KernelResult<ResourceDonationBinding>.Fail(parent.Error, parent.Message!);
+            if (!ReferenceEquals(parent.Value, expectedParent) || parent.Value!.State != ResourceDonationState.Bound)
+                return KernelResult<ResourceDonationBinding>.Fail(KernelError.InvalidTransition, "Nested donation parent changed before publication.");
+            return BindResourceDonation(child);
+        }
+    }
+
     internal KernelResult<ResourceDonationBinding> InspectResourceDonation(
         EndpointSessionInvocationHandle invocation, ProcessHandle service, bool requirePreSubmitClosure = false)
     {
@@ -517,14 +617,15 @@ internal sealed class EndpointSessionInvocationRegistry
     }
 
     internal KernelResult<ResourceDonationBinding> ActivateResourceDonation(
-        EndpointSessionInvocationHandle invocation, ProcessHandle service)
+        EndpointSessionInvocationHandle invocation, ProcessHandle service, ResourceDonationBinding? expected = null)
     {
         lock (_gate)
         {
             var resolved = ResolveForService(invocation, service);
             if (!resolved.IsSuccess) return KernelResult<ResourceDonationBinding>.Fail(resolved.Error, resolved.Message!);
             var donation = resolved.Value!.ResourceDonation;
-            if (donation is null || donation.State != ResourceDonationState.Bound)
+            if (donation is null || donation.State != ResourceDonationState.Bound ||
+                expected is not null && !ReferenceEquals(donation, expected))
                 return KernelResult<ResourceDonationBinding>.Fail(KernelError.InvalidTransition,
                     "Only a bound resource donation can cross the possible-submit boundary.");
             if (resolved.Value.DonationReturnInProgress || resolved.Value.TerminalStatus is not null || resolved.Value.SettlementInProgress is not null ||
@@ -619,21 +720,26 @@ internal sealed class EndpointSessionInvocationRegistry
     {
         lock (_gate)
         {
-            var keys = _records.Keys
+            var keys = _ownedRecords.Keys
                 .Where(key => key.Session == session.SessionId && key.SessionGeneration == session.Generation)
                 .ToArray();
             var donations = keys
-                .Select(key => _records[key].ResourceDonation)
+                .Select(key => _ownedRecords[key].ResourceDonation)
                 .Where(donation => donation is not null &&
                     donation.State is ResourceDonationState.Bound or ResourceDonationState.Active)
                 .Cast<ResourceDonationBinding>()
                 .ToArray();
             foreach (var key in keys)
             {
-                if (_records[key].ResourceDonation is { State: ResourceDonationState.Bound or ResourceDonationState.Active } live)
-                    _records[key].ResourceDonation = live with { State = ResourceDonationState.Quarantined };
-                if (!HasUnclosedPossibleEffect(_records[key]))
-                    _records.Remove(key);
+                var record = _ownedRecords[key];
+                if (record.ResourceDonation is { State: ResourceDonationState.Bound or ResourceDonationState.Active } live)
+                    record.ResourceDonation = live with { State = ResourceDonationState.Quarantined };
+                if (!HasUnclosedPossibleEffect(record))
+                {
+                    _ownedRecords.Remove(key);
+                    if (_records.TryGetValue(key, out var routed) && ReferenceEquals(routed, record))
+                        _records.Remove(key);
+                }
             }
             return donations;
         }
@@ -673,10 +779,15 @@ internal sealed class EndpointSessionInvocationRegistry
     {
         if (handle.Generation.Value != 1)
             return KernelResult<Record>.Fail(KernelError.StaleGeneration, "Endpoint session invocation generation is stale.");
-        return _records.TryGetValue(Key(handle), out var record)
+        if (!_records.TryGetValue(Key(handle), out var record))
+            return KernelResult<Record>.Fail(KernelError.ResponseNotPending, "Endpoint session invocation was not found or is no longer tracked.");
+        return record.Handle == handle && OwnsOriginalRecord(record)
             ? KernelResult<Record>.Ok(record)
-            : KernelResult<Record>.Fail(KernelError.ResponseNotPending, "Endpoint session invocation was not found or is no longer tracked.");
+            : KernelResult<Record>.Fail(KernelError.PlatformFaulted, "Original invocation owner continuity was lost.");
     }
+
+    private bool OwnsOriginalRecord(Record record) =>
+        _ownedRecords.TryGetValue(Key(record.Handle), out var original) && ReferenceEquals(original, record);
 
     private static (EndpointSessionId, EndpointSessionGeneration, EndpointSessionInvocationId) Key(EndpointSessionInvocationHandle handle) =>
         (handle.Session.SessionId, handle.Session.Generation, handle.InvocationId);

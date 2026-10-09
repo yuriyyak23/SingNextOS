@@ -341,6 +341,13 @@ public sealed class AdapterBoundaryTests
         Assert.Equal(NeutralVirtualizationStatus.Stale,
             adapter.UnmapGuestRegion(mapping with { Epoch = new(mapping.Epoch.Value + 1) }).Status);
         Assert.Equal(0, injector.UnmapCalls);
+        injector.BeforeUnmapForTest = () =>
+        {
+            var reentry = Task.Run(() => adapter.UnmapGuestRegion(mapping))
+                .WaitAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
+            Assert.Equal(NeutralVirtualizationStatus.Denied, reentry.Status);
+            Assert.Equal(1, injector.UnmapCalls);
+        };
         Assert.True(adapter.UnmapGuestRegion(mapping).IsSuccess);
         Assert.Equal(1, injector.UnmapCalls);
         Assert.True(adapter.CloseChildDomain(child).IsSuccess);
@@ -399,9 +406,11 @@ public sealed class AdapterBoundaryTests
         public bool ForgeClose { get; set; }
         public bool LoseCloseReceipt { get; set; }
         public bool ThrowAfterClose { get; set; }
+        public int? ExactStartWorkForTest { get; set; }
         public bool ForgeStart { get; set; }
         public bool ThrowAfterStart { get; set; }
         public int StartCalls { get; private set; }
+        public Action? BeforeStartForTest { get; set; }
         public Action? AfterStartForTest { get; set; }
         public Action? AfterMapForTest { get; set; }
         public Action? AfterArtifactBindForTest { get; set; }
@@ -459,6 +468,8 @@ public sealed class AdapterBoundaryTests
                 BeforeMapForTest?.Invoke();
             if (method.Name == nameof(IHybridCpuChildDomainRuntimeV3.CreateChildDomain))
                 BeforeCreateForTest?.Invoke();
+            if (method.Name == nameof(IHybridCpuChildDomainRuntimeV3.StartChildExecution))
+                BeforeStartForTest?.Invoke();
             object? result = method.Invoke(Inner, args);
             if (method.Name == nameof(IHybridCpuChildDomainRuntimeV3.BindChildExecutableArtifact))
                 AfterArtifactBindForTest?.Invoke();
@@ -514,6 +525,17 @@ public sealed class AdapterBoundaryTests
                     return bind with { Receipt = receipt with { MappingEpoch = new(receipt.MappingEpoch.Value + 1) } };
                 if (ForgeBindDigest && bind.Receipt is { } digestReceipt)
                     return bind with { Receipt = digestReceipt with { PackageSha256 = new string('a', 64) } };
+            }
+            if (ExactStartWorkForTest is { } work && method.Name == nameof(IHybridCpuChildDomainRuntimeV3.StartChildExecution) &&
+                boundArtifact is { } admittedArtifact)
+            {
+                var operation = ((ExternalChildExecutionStartRequest)args![1]!).Operation;
+                var receipt = new ExternalChildExecutionReceipt(admittedArtifact.ArtifactHandle,
+                    admittedArtifact.ArtifactEpoch, admittedArtifact.ChildHandle, admittedArtifact.ChildEpoch,
+                    admittedArtifact.MappingHandle, admittedArtifact.MappingEpoch, admittedArtifact.Parent,
+                    admittedArtifact.PackageSha256, new(1), work, 1, 0, operation,
+                    admittedArtifact.ContractVersion, admittedArtifact.ManifestGeneration, true);
+                return new ExternalChildResult<ExternalChildExecutionReceipt>(ExternalRuntimeOutcome.Succeeded, receipt, string.Empty);
             }
             if (ForgeStart && method.Name == nameof(IHybridCpuChildDomainRuntimeV3.StartChildExecution) &&
                 boundArtifact is { } artifact)

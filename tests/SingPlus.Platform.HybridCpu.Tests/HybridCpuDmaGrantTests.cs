@@ -6,6 +6,49 @@ namespace SingPlus.Platform.HybridCpu.Tests;
 
 public sealed class HybridCpuDmaGrantTests
 {
+    [Theory]
+    [InlineData(false)][InlineData(true)]
+    public void ForeignDmaOwnerCannotConsumeOriginalKernelClosureOrRegion(bool completed)
+    {
+        var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, ChildClosureTupleTests.RootCloseRuntimeProxy>();
+        var proxy = (ChildClosureTupleTests.RootCloseRuntimeProxy)(object)runtime;
+        var provider = new HybridCpuPlatformAuthorityProvider(runtime);
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = HybridCpuPlatformAuthorityProviderTests.CreateProcess(kernel, 81, 810, 1);
+        var (device, mapping) = CreateAuthorities(kernel, subject);
+        var region = Assert.Single(kernel.Regions.Snapshot());
+        var grant = kernel.BindPlatformDma(subject, device, mapping, 0, 64, PlatformDmaDirection.DeviceReadsMemory).Value!;
+        var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var records = (global::System.Collections.IDictionary)provider.GetType().GetField("_dmaGrants", flags)!.GetValue(provider)!;
+        var original = records.Values.Cast<object>().Single();
+        var providerGrant = (PlatformProviderDmaGrant)original.GetType().GetProperty("Grant")!.GetValue(original)!;
+        var copy = typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+        if (completed)
+        {
+            var (_, otherSubject) = HybridCpuPlatformAuthorityProviderTests.CreateProcess(kernel, 82, 820, 1);
+            var (otherDevice, otherMapping) = CreateAuthorities(kernel, otherSubject);
+            var otherGrant = kernel.BindPlatformDma(otherSubject, otherDevice, otherMapping, 0, 64, PlatformDmaDirection.DeviceReadsMemory).Value!;
+            var otherRecord = records.Values.Cast<object>().Single(x => !ReferenceEquals(x, original));
+            Assert.True(kernel.RevokePlatformDma(otherSubject, otherGrant).IsSuccess);
+            copy.GetType().GetProperty("CloseObservation")!.SetValue(copy,
+                otherRecord.GetType().GetProperty("CloseObservation")!.GetValue(otherRecord));
+            Assert.True(kernel.TerminateProcess(otherSubject).IsSuccess);
+        }
+        records[providerGrant.GrantId] = copy;
+        var closeCalls = proxy.DmaCloseCalls;
+        Assert.False(kernel.RevokePlatformDma(subject, grant).IsSuccess);
+        Assert.Equal(closeCalls, proxy.DmaCloseCalls);
+        Assert.Equal(1, proxy.Runtime.ActiveDmaGrantCount);
+        Assert.False(kernel.TerminateProcess(subject).IsSuccess);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot(), x => x.Handle == region.Handle).State);
+        Assert.Equal(1, proxy.Runtime.ActiveOwnedRegionMappingCount);
+        records[providerGrant.GrantId] = original;
+        Assert.True(provider.RevokeDmaGrant(providerGrant).IsSuccess);
+        Assert.Equal(closeCalls + 1, proxy.DmaCloseCalls);
+        Assert.Equal(0, proxy.Runtime.ActiveDmaGrantCount);
+        Assert.False(kernel.RevokePlatformDma(subject, grant).IsSuccess);
+    }
+
     [Fact]
     public void ExactDeviceAndMappedRegionMaterializeNeutralDmaGrantWithoutSubmit()
     {

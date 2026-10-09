@@ -40,6 +40,7 @@ internal static class V6ExternalOperationTraceProjection
         var expectedDisposition = ExternalOperationDisposition.Active;
         var expectedBoundary = ExternalEffectBoundaryState.NotCrossed;
         var publicationAmbiguous = false;
+        var providerLossObserved = false;
         var cancellationRequested = false;
         var resourceBound = false;
         var resourceCancelled = false;
@@ -59,6 +60,10 @@ internal static class V6ExternalOperationTraceProjection
                 throw new InvalidOperationException("External-operation owner history repeats its Prepared origin.");
             if (priorOwnerState.HasValue && transition.From != priorOwnerState.Value)
                 throw new InvalidOperationException("External-operation transition states are not contiguous.");
+            if (transition.Event == "ProviderLost" && providerLossObserved)
+                throw Unsupported(transition);
+            if (providerLossObserved && transition.Event is "DeviceComplete" or "DeviceComplete:Cancelled" or "DeviceComplete:Faulted")
+                throw new InvalidOperationException("A terminal response cannot replace the existing owner loss fact.");
             if (!HasOwnerWriterGuard(transition, expectedDisposition, snapshot.PublicationPolicy, publicationAmbiguous))
                 throw new InvalidOperationException("External-operation event contradicts its existing owner writer guard.");
             ownerSequence = transition.Sequence;
@@ -107,6 +112,7 @@ internal static class V6ExternalOperationTraceProjection
                         ? ExternalOperationDisposition.Discarded : ExternalOperationDisposition.Faulted;
                     break;
                 case "ProviderLost":
+                    providerLossObserved = true;
                     expectedDisposition = snapshot.PublicationPolicy == ExternalPublicationPolicy.Staged
                         ? ExternalOperationDisposition.ProviderLost : ExternalOperationDisposition.Faulted;
                     break;
@@ -169,6 +175,16 @@ internal static class V6ExternalOperationTraceProjection
                 case "PublicationEffectClosedWithoutPublication" when quarantined && !published:
                     Add(SemanticTraceEventKindV1.EffectClosedWithoutPublication, transition,
                         "effect-closed-without-publication");
+                    break;
+                case "ProviderLost" when submitted && quarantined && !published:
+                    // A distinct committed loss can follow an ambiguous action.
+                    // V1 retains quarantine and the new owner evidence digest.
+                    Add(SemanticTraceEventKindV1.Quarantined, transition, "provider-lost-after-quarantine");
+                    break;
+                case "PublicationEffectAmbiguous" when submitted && quarantined && !published:
+                    // An ambiguous action may follow an existing owner loss.
+                    // Preserve quarantine without inventing
+                    // another effect, settlement, closure or release observation.
                     break;
                 case "ResourceQuarantined" or "ResourceSettlementQuarantined" when submitted:
                     Add(SemanticTraceEventKindV1.ResourceAccountingQuarantined, transition,
@@ -265,8 +281,11 @@ internal static class V6ExternalOperationTraceProjection
             disposition == ExternalOperationDisposition.Completed && !ambiguous,
         "DirectPublicationObserved" => policy == ExternalPublicationPolicy.DirectCoherent &&
             disposition == ExternalOperationDisposition.Completed && !ambiguous,
-        "Visible" or "VisibilityFailed" or "PublicationRevalidationFailed" or
-            "PublicationEffectAmbiguous" => disposition == ExternalOperationDisposition.Completed && !ambiguous,
+        "Visible" or "VisibilityFailed" or "PublicationRevalidationFailed" =>
+            disposition == ExternalOperationDisposition.Completed && !ambiguous,
+        "PublicationEffectAmbiguous" => policy == ExternalPublicationPolicy.Staged && !ambiguous &&
+                (disposition == ExternalOperationDisposition.Completed ||
+                 policy == ExternalPublicationPolicy.Staged && disposition == ExternalOperationDisposition.ProviderLost),
         "CancelledBeforeSubmit" => transition.From is ExternalOperationState.Prepared or ExternalOperationState.Admitted &&
             disposition == ExternalOperationDisposition.Active && !ambiguous,
         "TeardownCancelledBeforeSubmit" => transition.From is ExternalOperationState.Prepared or ExternalOperationState.Admitted &&
@@ -281,9 +300,12 @@ internal static class V6ExternalOperationTraceProjection
             disposition == ExternalOperationDisposition.Completed && policy == ExternalPublicationPolicy.Staged && !ambiguous,
         "DirectWriteCannotBeUndone" => transition.From is ExternalOperationState.DeviceComplete or ExternalOperationState.Visible &&
             disposition == ExternalOperationDisposition.Completed && policy == ExternalPublicationPolicy.DirectCoherent && !ambiguous,
-        "ProviderLost" => transition.From is ExternalOperationState.Submitted or ExternalOperationState.DeviceComplete or ExternalOperationState.Visible && !ambiguous,
+        "ProviderLost" => transition.From is ExternalOperationState.Submitted or ExternalOperationState.DeviceComplete or ExternalOperationState.Visible &&
+            (!ambiguous || transition.From == ExternalOperationState.Visible &&
+             policy == ExternalPublicationPolicy.Staged && disposition == ExternalOperationDisposition.Faulted),
         "PublicationEffectClosedWithoutPublication" => transition.From == ExternalOperationState.Visible &&
-            disposition == ExternalOperationDisposition.Faulted && policy == ExternalPublicationPolicy.Staged && ambiguous,
+            disposition is ExternalOperationDisposition.Faulted or ExternalOperationDisposition.ProviderLost &&
+            policy == ExternalPublicationPolicy.Staged && ambiguous,
         _ => true // Unsupported events remain rejected by the lossless projection switch.
     };
 

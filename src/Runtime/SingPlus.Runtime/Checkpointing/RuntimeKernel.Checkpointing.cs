@@ -36,6 +36,11 @@ public sealed partial class RuntimeKernel
     private readonly object _checkpointGate = new();
     private readonly Dictionary<CheckpointId, CheckpointRecord> _checkpoints = [];
     private ulong _nextCheckpointId = 1;
+    internal Action? BeforeCheckpointPublicationQualificationHook { get; set; }
+    internal Action? BeforeCheckpointDeleteQualificationHook { get; set; }
+    internal Action? BeforeCheckpointRestoreRetirementQualificationHook { get; set; }
+    internal Action? BeforeCheckpointRestoreReceiptQualificationHook { get; set; }
+    internal Action? BeforeCheckpointRestoreRegionQualificationHook { get; set; }
 
     internal CheckpointInspectionRecord[] CheckpointInspectionSnapshot()
     {
@@ -61,12 +66,23 @@ public sealed partial class RuntimeKernel
         IReadOnlyList<CheckpointBufferSource>? buffers = null)
     {
         var authority = ValidateCheckpointAdministration(principal, administrationCapability);
+        if (!authority.IsSuccess)
+            return KernelResult<OrdinaryCheckpointImage>.Fail(authority.Error, authority.Message!);
+        if (logicalState.Length > OrdinaryCheckpointContract.MaximumLogicalStateBytes)
+            return KernelResult<OrdinaryCheckpointImage>.Fail(KernelError.CapacityExhausted,
+                "Logical checkpoint state exceeds the bounded contract maximum.");
+        var exactLogicalState = logicalState.ToArray();
+        var exactBuffers = buffers?.ToArray() ?? [];
+        // Caller enumeration can reenter and revoke administration permission.
+        authority = ValidateCheckpointAdministration(principal, administrationCapability);
         return authority.IsSuccess
-            ? CreateOrdinaryCheckpointCore(component, logicalState, buffers)
+            ? CreateOrdinaryCheckpointCore(principal, administrationCapability, component, exactLogicalState, exactBuffers)
             : KernelResult<OrdinaryCheckpointImage>.Fail(authority.Error, authority.Message!);
     }
 
     private KernelResult<OrdinaryCheckpointImage> CreateOrdinaryCheckpointCore(
+        ProcessHandle principal,
+        CapabilityId administrationCapability,
         ComponentIdentity component,
         ReadOnlyMemory<byte> logicalState,
         IReadOnlyList<CheckpointBufferSource>? buffers)
@@ -140,8 +156,39 @@ public sealed partial class RuntimeKernel
             source.Manifest.ImageDigest, source.Manifest.NormalizedDigest, source.Process, logical,
             regionImages, checkpoint.Resources.ToArray(), string.Empty, Complete: true);
         image = image with { ImageDigest = ComputeCheckpointDigest(image) };
-        checkpoint.Image = Clone(image);
-        checkpoint.State = CheckpointLifecycleState.Committed;
+        var committedImage = Clone(image);
+        BeforeCheckpointPublicationQualificationHook?.Invoke();
+        KernelResult publication;
+        lock (_platformMemoryUseGate)
+        lock (_componentAdmissionGate)
+        {
+            var caller = Processes.Resolve(principal);
+            var currentSource = Processes.Resolve(source.Process);
+            if (!caller.IsSuccess)
+                publication = KernelResult.Fail(caller.Error, caller.Message!);
+            else if (!currentSource.IsSuccess)
+                publication = KernelResult.Fail(currentSource.Error, currentSource.Message!);
+            else if (!EnsureProcessAcceptsNewEffects(caller.Value!).IsSuccess ||
+                !EnsureProcessAcceptsNewEffects(currentSource.Value!).IsSuccess ||
+                !_components.TryGetValue(component, out var current) || !ReferenceEquals(current, source) ||
+                _processTeardowns.ContainsKey(source.Process))
+                publication = KernelResult.Fail(KernelError.InvalidTransition, "Checkpoint source or administrator changed before publication.");
+            else
+                publication = CapabilityAuthority.CommitCheckpointPublication(administrationCapability,
+                    caller.Value!.DomainId, principal.Generation, () =>
+                    {
+                        lock (_checkpointGate)
+                        {
+                            if (checkpoint.State != CheckpointLifecycleState.Validating)
+                                return KernelResult.Fail(KernelError.InvalidTransition, "Checkpoint changed before publication.");
+                            checkpoint.Image = committedImage;
+                            checkpoint.State = CheckpointLifecycleState.Committed;
+                            return KernelResult.Ok();
+                        }
+                    });
+        }
+        if (!publication.IsSuccess)
+            return FailCheckpointAndRelease(checkpoint, publication.Error, publication.Message!);
         RecordTrace(source.Process, TraceEventKind.CheckpointLifecycle, null, "checkpoint",
             checkpoint.Handle.CheckpointId.Value.ToString(), "committed", "validated");
         return KernelResult<OrdinaryCheckpointImage>.Ok(Clone(image));
@@ -190,12 +237,20 @@ public sealed partial class RuntimeKernel
         ComponentAdmissionPlan freshAdmission)
     {
         var authority = ValidateCheckpointAdministration(principal, administrationCapability);
+        if (!authority.IsSuccess)
+            return KernelResult<OrdinaryRestoreResult>.Fail(authority.Error, authority.Message!);
+        ArgumentNullException.ThrowIfNull(image);
+        var exactImage = Clone(image);
+        // Caller image collections may reenter during capture.
+        authority = ValidateCheckpointAdministration(principal, administrationCapability);
         return authority.IsSuccess
-            ? RestoreOrdinaryCheckpointCore(image, freshAdmission)
+            ? RestoreOrdinaryCheckpointCore(principal, administrationCapability, exactImage, freshAdmission)
             : KernelResult<OrdinaryRestoreResult>.Fail(authority.Error, authority.Message!);
     }
 
     private KernelResult<OrdinaryRestoreResult> RestoreOrdinaryCheckpointCore(
+        ProcessHandle principal,
+        CapabilityId administrationCapability,
         OrdinaryCheckpointImage image,
         ComponentAdmissionPlan freshAdmission)
     {
@@ -224,34 +279,112 @@ public sealed partial class RuntimeKernel
         {
             if (existing.Process != image.SourceProcess || existing.State != ComponentLifecycleState.Reclaimable)
                 return KernelResult<OrdinaryRestoreResult>.Fail(KernelError.CheckpointBlocked, "Source component must reach exact reclaimable state before restore.");
-            var retired = RetireReclaimableComponent(image.Component, image.SourceProcess);
+            BeforeCheckpointRestoreRetirementQualificationHook?.Invoke();
+            KernelResult retired;
+            lock (_platformMemoryUseGate)
+            lock (_componentAdmissionGate)
+            {
+                var caller = Processes.Resolve(principal);
+                if (!caller.IsSuccess) retired = KernelResult.Fail(caller.Error, caller.Message!);
+                else if (!EnsureProcessAcceptsNewEffects(caller.Value!).IsSuccess)
+                    retired = KernelResult.Fail(KernelError.InvalidTransition, "Restore administrator no longer accepts effects.");
+                else retired = CapabilityAuthority.CommitCheckpointPublication(administrationCapability,
+                    caller.Value!.DomainId, principal.Generation, () =>
+                    {
+                        lock (_checkpointGate)
+                        {
+                            var current = ResolveCheckpoint(image.Handle);
+                            if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
+                            if (!ReferenceEquals(current.Value, record) || record.State != CheckpointLifecycleState.Committed ||
+                                record.Image is null || record.Image.ImageDigest != image.ImageDigest)
+                                return KernelResult.Fail(KernelError.CheckpointInvalid, "Checkpoint changed before source retirement.");
+                            return RetireReclaimableComponent(image.Component, image.SourceProcess);
+                        }
+                    });
+            }
             if (!retired.IsSuccess) return KernelResult<OrdinaryRestoreResult>.Fail(retired.Error, retired.Message!);
         }
 
-        var admitted = AdmitComponent(freshAdmission);
+        var admitted = AdmitComponentCore(freshAdmission, source: null,
+            restoreCommit: commit => CommitCheckpointRestoreEffect(principal, administrationCapability, record, image, commit));
         if (!admitted.IsSuccess) return KernelResult<OrdinaryRestoreResult>.Fail(admitted.Error, admitted.Message!);
         var restored = new List<OwnedBuffer<byte>>(image.Regions.Count);
         foreach (var region in image.Regions.OrderBy(static item => item.Ordinal))
         {
             if (!string.Equals(Digest(region.Content), region.ContentDigest, StringComparison.Ordinal))
             {
-                _ = FaultComponent(image.Component);
+                _ = FaultComponent(image.Component, admitted.Value!.Process);
                 return KernelResult<OrdinaryRestoreResult>.Fail(KernelError.CheckpointInvalid, "Checkpoint region digest mismatch.");
             }
-            var allocated = AllocateBuffer<byte>(admitted.Value!.Process, region.Content.Length);
+            BeforeCheckpointRestoreRegionQualificationHook?.Invoke();
+            var observations = new List<BudgetTraceObservation>();
+            var allocated = CommitRestoreValue(
+                commit => CommitCheckpointRestoreEffect(principal, administrationCapability, record, image, commit),
+                () =>
+                {
+                    var result = AllocateBufferCore<byte>(admitted.Value!.Process, region.Content.Length, observations);
+                    if (!result.IsSuccess) return result;
+                    region.Content.CopyTo(result.Value!.Span);
+                    restored.Add(result.Value);
+                    return result;
+                });
+            EmitBudgetObservations(observations);
             if (!allocated.IsSuccess)
             {
-                _ = FaultComponent(image.Component);
+                _ = FaultComponent(image.Component, admitted.Value!.Process);
                 return KernelResult<OrdinaryRestoreResult>.Fail(allocated.Error, allocated.Message!);
             }
-            region.Content.CopyTo(allocated.Value!.Span);
-            restored.Add(allocated.Value);
         }
-        var receipt = new OrdinaryRestoreReceipt(image.Handle, image.SourceProcess, image.Component,
-            admitted.Value!.Process, restored.Select(static item => item.Handle).ToArray(), image.LogicalState.ToArray());
+        BeforeCheckpointRestoreReceiptQualificationHook?.Invoke();
+        OrdinaryRestoreReceipt? receipt = null;
+        var publication = CommitCheckpointRestoreEffect(principal, administrationCapability, record, image,
+            () =>
+            {
+                var target = Processes.Resolve(admitted.Value!.Process);
+                if (!target.IsSuccess) return KernelResult.Fail(target.Error, target.Message!);
+                if (target.Value!.State != ProcessState.Running || _processTeardowns.ContainsKey(admitted.Value.Process))
+                    return KernelResult.Fail(KernelError.InvalidTransition, "Restore target is no longer running at receipt publication.");
+                return CommitRunningComponentPublication([admitted.Value.Process], () =>
+                {
+                    receipt = new OrdinaryRestoreReceipt(image.Handle, image.SourceProcess, image.Component,
+                        admitted.Value.Process, restored.Select(static item => item.Handle).ToArray(), image.LogicalState.ToArray());
+                    return KernelResult.Ok();
+                });
+            });
+        if (!publication.IsSuccess)
+        {
+            _ = FaultComponent(image.Component, admitted.Value!.Process);
+            return KernelResult<OrdinaryRestoreResult>.Fail(publication.Error, publication.Message!);
+        }
         RecordTrace(admitted.Value.Process, TraceEventKind.CheckpointLifecycle, null, "checkpoint",
             image.Handle.CheckpointId.Value.ToString(), "restored", "fresh-admission");
-        return KernelResult<OrdinaryRestoreResult>.Ok(new(receipt, admitted.Value, restored));
+        return KernelResult<OrdinaryRestoreResult>.Ok(new(receipt!, admitted.Value, restored));
+    }
+
+    private KernelResult CommitCheckpointRestoreEffect(ProcessHandle principal, CapabilityId administrationCapability,
+        CheckpointRecord record, OrdinaryCheckpointImage image, Func<KernelResult> commit)
+    {
+        lock (_platformMemoryUseGate)
+        lock (_componentAdmissionGate)
+        {
+            var caller = Processes.Resolve(principal);
+            if (!caller.IsSuccess) return KernelResult.Fail(caller.Error, caller.Message!);
+            var effect = EnsureProcessAcceptsNewEffects(caller.Value!);
+            if (!effect.IsSuccess) return effect;
+            return CapabilityAuthority.CommitCheckpointPublication(administrationCapability,
+                caller.Value!.DomainId, principal.Generation, () =>
+                {
+                    lock (_checkpointGate)
+                    {
+                        var current = ResolveCheckpoint(image.Handle);
+                        if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
+                        if (!ReferenceEquals(current.Value, record) || record.State != CheckpointLifecycleState.Committed ||
+                            record.Image is null || record.Image.ImageDigest != image.ImageDigest)
+                            return KernelResult.Fail(KernelError.CheckpointInvalid, "Checkpoint changed before restore owner commit.");
+                        return commit(); // Trusted local allocation/process owner commit only.
+                    }
+                });
+        }
     }
 
     public KernelResult<OrdinaryRestoreResult> CheckpointDrainAndRestore(
@@ -264,13 +397,13 @@ public sealed partial class RuntimeKernel
     {
         var authority = ValidateCheckpointAdministration(principal, administrationCapability);
         if (!authority.IsSuccess) return KernelResult<OrdinaryRestoreResult>.Fail(authority.Error, authority.Message!);
-        var image = CreateOrdinaryCheckpointCore(component, logicalState, buffers);
+        var image = CreateOrdinaryCheckpoint(principal, administrationCapability, component, logicalState, buffers);
         if (!image.IsSuccess) return KernelResult<OrdinaryRestoreResult>.Fail(image.Error, image.Message!);
         var drained = DrainComponent(component);
         if (!drained.IsSuccess) return KernelResult<OrdinaryRestoreResult>.Fail(drained.Error, drained.Message!);
         if (!drained.Value!.Reclaimable)
             return KernelResult<OrdinaryRestoreResult>.Fail(KernelError.CheckpointBlocked, "Source component did not reach exact reclaimable state.");
-        return RestoreOrdinaryCheckpointCore(image.Value!, freshAdmission);
+        return RestoreOrdinaryCheckpoint(principal, administrationCapability, image.Value!, freshAdmission);
     }
 
     public KernelResult DeleteOrdinaryCheckpoint(
@@ -280,8 +413,18 @@ public sealed partial class RuntimeKernel
     {
         var authority = ValidateCheckpointAdministration(principal, administrationCapability);
         if (!authority.IsSuccess) return authority;
-        lock (_checkpointGate)
+        BeforeCheckpointDeleteQualificationHook?.Invoke();
+        lock (_platformMemoryUseGate)
         {
+            var caller = Processes.Resolve(principal);
+            if (!caller.IsSuccess) return KernelResult.Fail(caller.Error, caller.Message!);
+            var effect = EnsureProcessAcceptsNewEffects(caller.Value!);
+            if (!effect.IsSuccess) return effect;
+            return CapabilityAuthority.CommitCheckpointPublication(administrationCapability,
+                caller.Value!.DomainId, principal.Generation, () =>
+            {
+            lock (_checkpointGate)
+            {
             var resolved = ResolveCheckpoint(handle);
             if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
             var record = resolved.Value!;
@@ -295,6 +438,8 @@ public sealed partial class RuntimeKernel
             record.Image = null;
             record.State = CheckpointLifecycleState.Deleted;
             return KernelResult.Ok();
+            }
+            });
         }
     }
 
@@ -392,7 +537,10 @@ public sealed partial class RuntimeKernel
     {
         if (record.StorageReservation is { } reservation)
         {
-            _ = Budgets.Release(record.SourceProcess, reservation);
+            var released = Budgets.Release(record.SourceProcess, reservation);
+            if (!released.IsSuccess)
+                return FailCheckpoint(record, error,
+                    $"{message} Checkpoint storage cleanup refused ({released.Error}); exact reservation remains pinned.");
             record.StorageReservation = null;
         }
         return FailCheckpoint(record, error, message);

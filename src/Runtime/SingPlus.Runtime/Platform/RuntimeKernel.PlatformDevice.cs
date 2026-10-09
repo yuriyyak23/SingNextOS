@@ -13,22 +13,32 @@ public sealed partial class RuntimeKernel
         ProcessHandle subject,
         PlatformDomainBinding binding,
         CapabilityId deviceCapabilityId,
-        PlatformDeviceRights rights)
+        PlatformDeviceRights rights) => BindPlatformDeviceCore(subject, binding, deviceCapabilityId, rights, null);
+
+    private KernelResult<PlatformDeviceLease> BindPlatformDeviceCore(ProcessHandle subject, PlatformDomainBinding binding,
+        CapabilityId deviceCapabilityId, PlatformDeviceRights rights,
+        (ProcessHandle Principal, CapabilityId Capability)? source,
+        Func<Func<KernelResult>, KernelResult>? sourceCommit = null)
     {
         lock (_platformMemoryUseGate)
         {
-            if (!_pendingPlatformDeviceCapabilities.Add(deviceCapabilityId))
-                return KernelResult<PlatformDeviceLease>.Fail(KernelError.PlatformBindingDraining,
+            var pending = sourceCommit is null ? CommitControllerDevice(source, ReservePending) : sourceCommit(ReservePending);
+            KernelResult ReservePending() => _pendingPlatformDeviceCapabilities.Add(deviceCapabilityId)
+                ? KernelResult.Ok() : KernelResult.Fail(KernelError.PlatformBindingDraining,
                     "This capability already has a device admission in flight.");
+            if (!pending.IsSuccess) return KernelResult<PlatformDeviceLease>.Fail(pending.Error, pending.Message!);
         }
-        try { return BindPlatformDeviceLocked(subject, binding, deviceCapabilityId, rights); }
+        try { return BindPlatformDeviceLocked(subject, binding, deviceCapabilityId, rights, source, sourceCommit); }
         finally { lock (_platformMemoryUseGate) _pendingPlatformDeviceCapabilities.Remove(deviceCapabilityId); }
     }
 
     private KernelResult<PlatformDeviceLease> BindPlatformDeviceLocked(
         ProcessHandle subject, PlatformDomainBinding binding, CapabilityId deviceCapabilityId,
-        PlatformDeviceRights rights)
+        PlatformDeviceRights rights, (ProcessHandle Principal, CapabilityId Capability)? controllerSource,
+        Func<Func<KernelResult>, KernelResult>? sourceCommit)
     {
+        KernelResult CommitSource(Func<KernelResult> commit) => sourceCommit is null
+            ? CommitControllerDevice(controllerSource, commit) : sourceCommit(commit);
         var requestValidation = PlatformDeviceLeaseContract.ValidateRequest(
             new PlatformDeviceIdentity("device-validation-placeholder"),
             rights);
@@ -102,13 +112,16 @@ public sealed partial class RuntimeKernel
             device,
             rights, () =>
             {
+                lock (_platformMemoryUseGate)
+                {
                 var current = Processes.Resolve(subject);
                 if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
                 var accepts = EnsureProcessAcceptsNewEffects(current.Value!);
                 if (!accepts.IsSuccess) return accepts;
                 var source = CapabilityAuthority.Validate(deviceCapabilityId, current.Value!.DomainId,
                     subject.Generation, capabilityRights);
-                return source.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(source.Error, source.Message!);
+                return source.IsSuccess ? CommitSource(KernelResult.Ok) : KernelResult.Fail(source.Error, source.Message!);
+                }
             }, (candidate, commit) =>
             {
                 lock (_platformMemoryUseGate)
@@ -117,7 +130,7 @@ public sealed partial class RuntimeKernel
                     if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
                     var accepts = EnsureProcessAcceptsNewEffects(current.Value!);
                     if (!accepts.IsSuccess) return accepts;
-                    return CapabilityAuthority.CommitDeviceLeaseAdmission(deviceCapabilityId,
+                    return CommitSource(() => CapabilityAuthority.CommitDeviceLeaseAdmission(deviceCapabilityId,
                         current.Value!.DomainId, subject.Generation, capabilityRights, descriptor.ResourceId, () =>
                         {
                             var fresh = Processes.Resolve(subject);
@@ -127,28 +140,44 @@ public sealed partial class RuntimeKernel
                             var committed = commit();
                             if (committed.IsSuccess) TrackPlatformDeviceLease(subject, candidate);
                             return committed;
-                        });
+                        }));
                 }
+            }, begin =>
+            {
+                lock (_platformMemoryUseGate) return CommitSource(begin);
             });
         return lease;
+    }
+
+    private KernelResult CommitControllerDevice((ProcessHandle Principal, CapabilityId Capability)? source, Func<KernelResult> commit)
+    {
+        if (source is not { } controller) return commit();
+        var principal = Processes.Resolve(controller.Principal);
+        if (!principal.IsSuccess) return KernelResult.Fail(KernelError.SupervisorDenied, principal.Message!);
+        var effect = EnsureProcessAcceptsNewEffects(principal.Value!);
+        if (!effect.IsSuccess) return KernelResult.Fail(KernelError.SupervisorDenied, effect.Message!);
+        return CapabilityAuthority.CommitSupervisorDeviceBinding(controller.Capability, principal.Value!.DomainId,
+            controller.Principal.Generation, commit);
     }
 
     public KernelResult RevokePlatformDevice(
         ProcessHandle subject,
         PlatformDeviceLease lease)
     {
+        PlatformDomainIdentity identity;
+        Action release;
         lock (_platformMemoryUseGate)
-            return RevokePlatformDeviceLocked(subject, lease);
-    }
-
-    private KernelResult RevokePlatformDeviceLocked(
-        ProcessHandle subject,
-        PlatformDeviceLease lease)
-    {
+        {
         var resolved = Processes.Resolve(subject);
         if (!resolved.IsSuccess)
             return KernelResult.Fail(resolved.Error, resolved.Message!);
+        identity = PlatformIdentity(resolved.Value!);
+        var drain = PlatformAuthority.BeginDeviceChildDrain(lease, identity, out release);
+        if (!drain.IsSuccess) return drain;
+        }
 
+        try
+        {
         var virtualIo = CloseVirtualIoForDevice(subject, lease);
         if (!virtualIo.IsSuccess) return virtualIo;
 
@@ -161,11 +190,12 @@ public sealed partial class RuntimeKernel
         var mmio = AdvancePlatformMmioLeasesForDevice(lease);
         if (!mmio.IsSuccess) return mmio;
 
-        var identity = PlatformIdentity(resolved.Value!);
         var revoke = PlatformAuthority.RevokeDevice(lease, identity);
         if (revoke.IsSuccess)
-            UntrackPlatformDeviceLease(lease);
+            lock (_platformMemoryUseGate) UntrackPlatformDeviceLease(lease);
         return revoke;
+        }
+        finally { release(); }
     }
 
     internal KernelResult CascadePlatformDeviceCapabilityRevocation(CapabilityId capabilityId)
@@ -174,6 +204,12 @@ public sealed partial class RuntimeKernel
         foreach (var lease in PlatformAuthority.BeginDeviceCapabilityRevocation(capabilityId,
                      id => CapabilityAuthority.DependsOnCapability(id, capabilityId)))
         {
+            var virtualIo = CloseVirtualIoForDevice(lease.DomainBinding.Subject.Process, lease);
+            if (!virtualIo.IsSuccess)
+            {
+                firstFailure ??= virtualIo;
+                continue;
+            }
             var dma = AdvancePlatformDmaGrantsForDevice(lease);
             if (!dma.IsSuccess)
             {
@@ -207,10 +243,13 @@ public sealed partial class RuntimeKernel
             UntrackPlatformDeviceLease(lease);
         }
 
+        lock (_platformMemoryUseGate)
+        {
         return firstFailure ?? (_pendingPlatformDeviceCapabilities.Any(
             id => CapabilityAuthority.DependsOnCapability(id, capabilityId))
             ? KernelResult.Fail(KernelError.PlatformBindingDraining, "Device capability admission remains in flight.")
             : KernelResult.Ok());
+        }
     }
 
     private KernelResult AdvancePlatformDeviceLeasesForProcess(
@@ -226,12 +265,10 @@ public sealed partial class RuntimeKernel
         var mmio = AdvancePlatformMmioLeasesForProcess(process, handle);
         if (!mmio.IsSuccess) return mmio;
 
-        if (!_processPlatformDeviceLeases.TryGetValue(handle, out var leases) || leases.Count == 0)
-            return KernelResult.Ok();
-
         var identity = PlatformIdentity(process);
+        var leases = PlatformAuthority.ActiveDeviceLeasesForProcess(identity);
         KernelResult? firstFailure = null;
-        foreach (var lease in leases.ToArray())
+        foreach (var lease in leases)
         {
             var revoke = PlatformAuthority.RevokeDevice(lease, identity);
             if (!revoke.IsSuccess)
@@ -240,7 +277,7 @@ public sealed partial class RuntimeKernel
                 continue;
             }
 
-            UntrackPlatformDeviceLease(lease);
+            lock (_platformMemoryUseGate) UntrackPlatformDeviceLease(lease);
         }
 
         return firstFailure ?? KernelResult.Ok();

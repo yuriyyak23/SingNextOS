@@ -25,10 +25,10 @@ public sealed partial class RuntimeKernel
         ArgumentNullException.ThrowIfNull(payload);
         var semantic = Channels.ValidateV2Semantic(endpoint, messageId, IpcTransferSemantic.Copy);
         if (!semantic.IsSuccess) return KernelResult<IpcV2SendReceipt>.Fail(semantic.Error, semantic.Message!);
-        var temporal = PreflightIpcV2Cancellation(sender, endpoint, messageId, cancellationScope);
+        var temporal = PreflightIpcV2Cancellation(sender, endpoint, messageId, cancellationScope, out var cancellationTimestamp);
         if (!temporal.IsSuccess) return KernelResult<IpcV2SendReceipt>.Fail(temporal.Error, temporal.Message!);
         var sent = Send(sender, receiver, endpoint, messageId, payload.Copy(), capabilities, qosHint, traceContext);
-        CompleteIpcV2Cancellation(sender, cancellationScope, sent.IsSuccess);
+        CompleteIpcV2Cancellation(sender, cancellationScope, sent.IsSuccess, cancellationTimestamp);
         return Receipt(sent, IpcTransferSemantic.Copy, IpcOwnershipDisposition.NotApplicable,
             payload.PayloadSize <= 256 ? IpcTransportPath.SmallCopy : IpcTransportPath.BoundedCopy, traceContext);
     }
@@ -46,10 +46,10 @@ public sealed partial class RuntimeKernel
     {
         var semantic = Channels.ValidateV2Semantic(endpoint, messageId, IpcTransferSemantic.Move);
         if (!semantic.IsSuccess) return KernelResult<IpcV2SendReceipt>.Fail(semantic.Error, semantic.Message!);
-        var temporal = PreflightIpcV2Cancellation(sender, endpoint, messageId, cancellationScope);
+        var temporal = PreflightIpcV2Cancellation(sender, endpoint, messageId, cancellationScope, out var cancellationTimestamp);
         if (!temporal.IsSuccess) return KernelResult<IpcV2SendReceipt>.Fail(temporal.Error, temporal.Message!);
         var sent = Send(sender, receiver, endpoint, messageId, payload, capabilities, qosHint, traceContext);
-        CompleteIpcV2Cancellation(sender, cancellationScope, sent.IsSuccess);
+        CompleteIpcV2Cancellation(sender, cancellationScope, sent.IsSuccess, cancellationTimestamp);
         return Receipt(sent, IpcTransferSemantic.Move, IpcOwnershipDisposition.ReceiverOwned,
             IpcTransportPath.OwnershipTransfer, traceContext);
     }
@@ -67,10 +67,10 @@ public sealed partial class RuntimeKernel
     {
         var semantic = Channels.ValidateV2Semantic(endpoint, messageId, IpcTransferSemantic.BorrowRead);
         if (!semantic.IsSuccess) return KernelResult<IpcV2SendReceipt>.Fail(semantic.Error, semantic.Message!);
-        var temporal = PreflightIpcV2Cancellation(sender, endpoint, messageId, cancellationScope);
+        var temporal = PreflightIpcV2Cancellation(sender, endpoint, messageId, cancellationScope, out var cancellationTimestamp);
         if (!temporal.IsSuccess) return KernelResult<IpcV2SendReceipt>.Fail(temporal.Error, temporal.Message!);
         var sent = Send(sender, receiver, endpoint, messageId, payload, capabilities, qosHint, traceContext);
-        CompleteIpcV2Cancellation(sender, cancellationScope, sent.IsSuccess);
+        CompleteIpcV2Cancellation(sender, cancellationScope, sent.IsSuccess, cancellationTimestamp);
         return Receipt(sent, IpcTransferSemantic.BorrowRead, IpcOwnershipDisposition.BorrowActive,
             IpcTransportPath.ReadOnlyBorrow, traceContext);
     }
@@ -91,7 +91,7 @@ public sealed partial class RuntimeKernel
             return KernelResult<IpcV2SendReceipt>.Fail(KernelError.InvalidMessage, "Scatter/gather segment count or overlap policy is invalid.");
         var semantic = Channels.ValidateV2Semantic(endpoint, messageId, IpcTransferSemantic.ScatterGatherCopy);
         if (!semantic.IsSuccess) return KernelResult<IpcV2SendReceipt>.Fail(semantic.Error, semantic.Message!);
-        var temporal = PreflightIpcV2Cancellation(sender, endpoint, messageId, cancellationScope);
+        var temporal = PreflightIpcV2Cancellation(sender, endpoint, messageId, cancellationScope, out var cancellationTimestamp);
         if (!temporal.IsSuccess) return KernelResult<IpcV2SendReceipt>.Fail(temporal.Error, temporal.Message!);
         var source = Processes.Resolve(sender);
         if (!source.IsSuccess) return KernelResult<IpcV2SendReceipt>.Fail(source.Error, source.Message!);
@@ -123,7 +123,7 @@ public sealed partial class RuntimeKernel
         }
         var payload = new IpcScatterGatherPayload(copied);
         var sent = Send(sender, receiver, endpoint, messageId, payload, capabilities, qosHint, traceContext);
-        CompleteIpcV2Cancellation(sender, cancellationScope, sent.IsSuccess);
+        CompleteIpcV2Cancellation(sender, cancellationScope, sent.IsSuccess, cancellationTimestamp);
         return Receipt(sent, IpcTransferSemantic.ScatterGatherCopy, IpcOwnershipDisposition.NotApplicable,
             IpcTransportPath.ScatterGatherCopy, traceContext);
     }
@@ -141,30 +141,40 @@ public sealed partial class RuntimeKernel
         ProcessHandle sender,
         ChannelEndpointHandle endpoint,
         uint messageId,
-        CancellationScopeHandle? scope)
+        CancellationScopeHandle? scope, out long timestamp)
     {
+        timestamp = 0;
         if (scope is not { } exact) return KernelResult.Ok();
         var bound = CancellationScopes.BindConsumer(sender, exact,
             $"ipc-v2:{endpoint.ChannelId.Value}:{endpoint.EndpointId.Value}:{messageId}");
         if (!bound.IsSuccess) return bound;
-        var observed = CancellationScopes.Observe(sender, exact);
+        timestamp = CancellationScopes.CaptureTimestamp(exact);
+        var observed = CancellationScopes.Observe(sender, exact, timestamp);
         if (!observed.IsSuccess) return KernelResult.Fail(observed.Error, observed.Message!);
         if (!observed.Value!.CancellationRequested) return KernelResult.Ok();
-        _ = CancellationScopes.RecordDisposition(sender, exact, CancellationDisposition.CancelledBeforeEffect);
+        _ = CancellationScopes.RecordDisposition(sender, exact, CancellationDisposition.CancelledBeforeEffect, timestamp);
         return KernelResult.Fail(KernelError.DeadlineExpired, "IPC v2 cancellation was requested before transfer admission; sender authority is unchanged.");
     }
 
     private void CompleteIpcV2Cancellation(
         ProcessHandle sender,
         CancellationScopeHandle? scope,
-        bool admitted)
+        bool admitted, long timestamp)
     {
         if (scope is not { } exact || !admitted) return;
-        var observed = CancellationScopes.Observe(sender, exact);
+        try { timestamp = CancellationScopes.CaptureTimestamp(exact); }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        {
+            // The channel/ownership commit already happened. Failed time observation
+            // cannot erase its receipt or establish no effect/borrow return.
+            _ = CancellationScopes.RecordDisposition(sender, exact, CancellationDisposition.TooLateEffectMayExist, timestamp);
+            return;
+        }
+        var observed = CancellationScopes.Observe(sender, exact, timestamp);
         if (!observed.IsSuccess) return;
         _ = CancellationScopes.RecordDisposition(sender, exact,
             observed.Value!.CancellationRequested
                 ? CancellationDisposition.TooLateEffectMayExist
-                : CancellationDisposition.CompletedBeforeCancellation);
+                : CancellationDisposition.CompletedBeforeCancellation, timestamp);
     }
 }

@@ -10,6 +10,61 @@ namespace SingPlus.Tests.Runtime;
 public sealed class V6MemoryRuntimeEnforcementTests
 {
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void AmbiguousPublicationThenLossRetainsDistinctLiveEvidenceAndIndependentBudgetPin(bool modelClosure)
+    {
+        var c = Create();
+        using var admission = c.Commit;
+        var sink = new CollectingTraceSink();
+        var binding = Submit(c, () => 1, new Runtime(c.BaseBinding), KernelResult.Ok, sink).Value!;
+        Assert.True(c.Kernel.RecordExternalOperationCompletion(c.Principal,
+            new(binding, ExternalOperationCompletionDisposition.Completed)).IsSuccess);
+        Assert.True(c.Kernel.RecordExternalOperationVisibility(c.Principal,
+            new(binding, ExternalVisibilityRequirement.PublicationFence, true)).IsSuccess);
+        ExternalPublicationDecisionV1 decision = default;
+        Assert.Equal(KernelError.ExternalEffectUncontained,
+            c.Kernel.PublishExternalOperation(c.Principal, c.Operation, c.Dependencies,
+                new(ExternalPublicationPolicy.Staged), current =>
+                {
+                    decision = current;
+                    throw new InvalidOperationException("Controlled possible publication.");
+                }).Error);
+        Assert.Single(sink.Events, item => item.Kind == SemanticTraceEventKindV1.Quarantined);
+        Assert.True(c.Kernel.RecordExternalOperationProviderLoss(c.Principal, c.Operation).IsSuccess);
+        Assert.Equal(2, sink.Events.Count(item => item.Kind == SemanticTraceEventKindV1.Quarantined));
+        Assert.Equal(2, sink.Events.Where(item => item.Kind == SemanticTraceEventKindV1.Quarantined)
+            .Select(item => item.EvidenceDigest).Distinct().Count());
+        Assert.All(sink.Events, item => Assert.False(item.AuthorizesExecution || item.AuthorizesEffect || item.AuthorizesPublication));
+        Assert.Contains(sink.Events, item => item.Kind == SemanticTraceEventKindV1.ResourceAccountingQuarantined);
+        var count = sink.Events.Count;
+        Assert.True(c.Kernel.RecordExternalOperationProviderLoss(c.Principal, c.Operation).IsSuccess);
+        Assert.Equal(count, sink.Events.Count);
+        Assert.False(c.Kernel.ReleaseExternalOperation(c.Principal, c.Operation, new(true, true)).IsSuccess);
+        var closureCalls = 0;
+        Assert.False(c.Kernel.ReconcileFailedExternalPublication(c.Principal, c.Operation,
+            decision with { DecisionGeneration = decision.DecisionGeneration + 1 },
+            () => { closureCalls++; return KernelResult.Ok(); }).IsSuccess);
+        Assert.Equal(0, closureCalls);
+        if (modelClosure)
+        {
+            Assert.True(c.Kernel.ReconcileFailedExternalPublication(c.Principal, c.Operation,
+                decision, KernelResult.Ok).IsSuccess);
+            Assert.Contains(sink.Events, item => item.Kind == SemanticTraceEventKindV1.EffectClosedWithoutPublication);
+        }
+        else Assert.DoesNotContain(sink.Events, item => item.Kind == SemanticTraceEventKindV1.EffectClosedWithoutPublication);
+        var snapshot = c.Kernel.QueryExternalOperation(c.Principal, c.Operation).Value!;
+        Assert.Equal(V6ExternalOperationTraceProjection.ProjectPublishedPrefix(snapshot,
+            c.MemoryBinding.ExtensionBinding.Digest.Value), sink.Events);
+        Assert.True(SemanticTraceValidatorV1.Validate(sink.Events).IsValid);
+        Assert.DoesNotContain(sink.Events, item => item.Kind is SemanticTraceEventKindV1.Published or
+            SemanticTraceEventKindV1.Settled or SemanticTraceEventKindV1.Released);
+        Assert.Equal(BudgetReservationState.Quarantined, c.Kernel.Budgets.Query(c.Lease).Value!.State);
+        Assert.False(c.Kernel.ReleaseExternalOperation(c.Principal, c.Operation, new(true, true)).IsSuccess);
+        Assert.False(c.Kernel.TerminateProcess(c.Principal).IsSuccess);
+    }
+
+    [Theory]
     [InlineData(0)]
     [InlineData(1)]
     [InlineData(2)]
@@ -1026,37 +1081,56 @@ public sealed class V6MemoryRuntimeEnforcementTests
         Assert.True(SemanticTraceValidatorV1.Validate(V6ExternalOperationTraceProjection.ProjectPublishedPrefix(
             original, context.MemoryBinding.ExtensionBinding.Digest.Value)).IsValid);
     }
-    [Fact]
-    public void BudgetLossBeforeConsumptionRetainsCommittedSubmitTraceAndReclaimPin()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void BudgetLossBeforeOrAfterOwnerSubmitPreservesActualTraceAndReclaimPin(bool afterOwnerSubmit)
     {
         using var store = new BlockingSubmitJournalStore();
         var context = Create(journalStore: store);
         using var commit = context.Commit;
         var quarantined = false;
-        store.BeforeNextAppend = () => quarantined =
+        void Quarantine() => quarantined =
             context.Kernel.Budgets.QuarantineLease(commit.BudgetOwner, commit.Lease).IsSuccess;
+        if (!afterOwnerSubmit)
+            store.BeforeNextAppend = Quarantine;
         var sink = new CollectingTraceSink();
         var calls = 0;
-        var result = Submit(context, () => 1, new Runtime(context.BaseBinding),
-            () => { calls++; return KernelResult.Ok(); }, sink);
+        var result = afterOwnerSubmit
+            ? context.Kernel.SubmitResourceExternalAdmissionWithBinding(commit, context.Dependencies,
+                _ => { calls++; return KernelResult.Ok(); }, submissionObservation: Quarantine)
+            : Submit(context, () => 1, new Runtime(context.BaseBinding),
+                () => { calls++; return KernelResult.Ok(); }, sink);
         Assert.False(result.IsSuccess);
         Assert.True(quarantined);
         Assert.Equal(0, calls);
         var snapshot = context.Kernel.QueryExternalOperation(context.Principal, context.Operation).Value!;
-        Assert.Equal(ExternalOperationState.Submitted, snapshot.State);
-        Assert.Equal(ExternalOperationDisposition.ProviderLost, snapshot.Disposition);
+        Assert.Equal(afterOwnerSubmit ? ExternalOperationState.Submitted : ExternalOperationState.Admitted, snapshot.State);
+        Assert.Equal(afterOwnerSubmit ? ExternalOperationDisposition.ProviderLost : ExternalOperationDisposition.Cancelled, snapshot.Disposition);
         Assert.Equal(ExternalResourceBindingState.Quarantined,
             context.Kernel.ExternalOperations.QueryResourceBinding(context.Operation).Value!.State);
         Assert.Equal(BudgetReservationState.Quarantined, context.Kernel.QueryBudget(context.Lease).Value!.State);
-        Assert.Equal([SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
-            SemanticTraceEventKindV1.Quarantined, SemanticTraceEventKindV1.ResourceAccountingQuarantined], sink.Events.Select(item => item.Kind));
-        Assert.Equal(V6ExternalOperationTraceProjection.ProjectPublishedPrefix(snapshot,
-            context.MemoryBinding.ExtensionBinding.Digest.Value), sink.Events);
-        Assert.True(SemanticTraceValidatorV1.Validate(sink.Events).IsValid);
-        Assert.False(context.Kernel.ReleaseExternalOperation(context.Principal,
+        if (afterOwnerSubmit)
+        {
+            var projected = V6ExternalOperationTraceProjection.ProjectPublishedPrefix(snapshot,
+                context.MemoryBinding.ExtensionBinding.Digest.Value);
+            Assert.Equal([SemanticTraceEventKindV1.Submit, SemanticTraceEventKindV1.EffectPossible,
+                SemanticTraceEventKindV1.Quarantined, SemanticTraceEventKindV1.ResourceAccountingQuarantined], projected.Select(item => item.Kind));
+            Assert.True(SemanticTraceValidatorV1.Validate(projected).IsValid);
+        }
+        else
+        {
+            Assert.Null(snapshot.Binding);
+            Assert.DoesNotContain(snapshot.Transitions, item => item.To == ExternalOperationState.Submitted);
+            Assert.Equal([SemanticTraceEventKindV1.CancelledBeforeSubmit,
+                SemanticTraceEventKindV1.ResourceAccountingQuarantinedBeforeSubmit], sink.Events.Select(item => item.Kind));
+            Assert.True(SemanticTraceValidatorV1.Validate(sink.Events).IsValid);
+        }
+        Assert.Equal(!afterOwnerSubmit, context.Kernel.ReleaseExternalOperation(context.Principal,
             context.Operation, new(true, false)).IsSuccess);
-        Assert.Equal(ExternalOperationState.Submitted,
+        Assert.Equal(afterOwnerSubmit ? snapshot.State : ExternalOperationState.Released,
             context.Kernel.QueryExternalOperation(context.Principal, context.Operation).Value!.State);
+        Assert.Equal(BudgetReservationState.Quarantined, context.Kernel.QueryBudget(context.Lease).Value!.State);
     }
     [Fact]
     public void ThrowingSubmissionObservationCannotVetoOrCompensateOwnerSubmit()

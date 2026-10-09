@@ -259,6 +259,7 @@ internal sealed record V6TemporalCapacityBinding(
 
 internal sealed class V6TemporalCapacityCoordinator
 {
+    internal Action? BeforeBoundOwnerSubmissionQualificationHook { get; set; }
     private readonly ResourceBudgetAuthority budgets;
     private readonly V6ManagedTemporalCapacityProvider provider;
     private readonly RuntimeKernel? effectKernel;
@@ -569,8 +570,11 @@ internal sealed class V6TemporalCapacityCoordinator
         {
             var operation = binding.ExternalOperation!.Value;
             KernelResult<OperationBinding> ownerSubmit;
-            try { ownerSubmit = effectKernel!.RecordExternalOperationSubmission(binding.Owner,
-                operation, dependencies); }
+            try
+            {
+                BeforeBoundOwnerSubmissionQualificationHook?.Invoke();
+                ownerSubmit = effectKernel!.RecordExternalOperationSubmission(binding.Owner, operation, dependencies);
+            }
             catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
             {
                 ownerSubmit = KernelResult<OperationBinding>.Fail(KernelError.PlatformFaulted,
@@ -612,13 +616,16 @@ internal sealed class V6TemporalCapacityCoordinator
                     var settled = released.IsSuccess
                         ? budgets.SettleLease(current.Owner, current.Budget, [], current.Id)
                         : default;
-                    if (!settled.IsSuccess || !released.IsSuccess)
+                    if (!settled.IsSuccess || !released.IsSuccess ||
+                        settled.Value!.State != BudgetReservationState.Released ||
+                        settled.Value.ChargedAmounts?.Count != 0)
                     {
                         _ = budgets.QuarantineLease(current.Owner, current.Budget);
-                        var quarantined = provider.Quarantine(current.ProviderReservation.Handle);
+                        var quarantined = released.IsSuccess ? default : provider.Quarantine(current.ProviderReservation.Handle);
                         _bindings[current.Id] = current with
                         {
-                            ProviderReservation = quarantined.IsSuccess ? quarantined.Value! : current.ProviderReservation,
+                            ProviderReservation = released.IsSuccess ? released.Value!
+                                : quarantined.IsSuccess ? quarantined.Value! : current.ProviderReservation,
                             State = V6TemporalCapacityOperationState.Quarantined,
                         };
                         return KernelResult<V6TemporalCapacityBinding>.Fail(KernelError.ExternalEffectUncontained,
@@ -752,7 +759,8 @@ internal sealed class V6TemporalCapacityCoordinator
             IReadOnlyList<BudgetAmount> actual = actualComputeNanoseconds == 0
                 ? [] : [new(ServiceBudgetDimension.ComputeTimeNanoseconds, actualComputeNanoseconds)];
             var settled = budgets.SettleLease(binding.Owner, binding.Budget, actual, binding.Id);
-            if (!settled.IsSuccess)
+            if (!settled.IsSuccess || settled.Value!.State != BudgetReservationState.Released ||
+                settled.Value.ChargedAmounts?.SequenceEqual(actual) != true)
             {
                 _ = budgets.QuarantineLease(binding.Owner, binding.Budget);
                 var quarantined = provider.Quarantine(binding.ProviderReservation.Handle);
@@ -762,7 +770,8 @@ internal sealed class V6TemporalCapacityCoordinator
                     State = V6TemporalCapacityOperationState.Quarantined,
                 };
                 _bindings[binding.Id] = binding;
-                return KernelResult<V6TemporalCapacityBinding>.Fail(settled.Error, settled.Message!);
+                return KernelResult<V6TemporalCapacityBinding>.Fail(settled.IsSuccess ? KernelError.StaleGeneration : settled.Error,
+                    settled.IsSuccess ? "The budget owner's terminal charge does not match temporal settlement usage." : settled.Message!);
             }
             var released = provider.Release(binding.ProviderReservation.Handle);
             if (!released.IsSuccess)

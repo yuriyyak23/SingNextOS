@@ -21,6 +21,197 @@ public interface ISipJobRegionMoveConsumer
 
 public sealed class Phase143InlineRegionMoveTests
 {
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public async Task RevokedRequiredSessionCapabilityPreventsQueuedOwnershipAndPairLoan(bool pair)
+    {
+        var kernel = new RuntimeKernel();
+        var caller = TestFixtures.Create(kernel, 8111, 811_100).Handle;
+        var service = TestFixtures.Create(kernel, 8112, 811_200).Handle;
+        RequestPayloadDescriptorV1 request = pair
+            ? new(new OwnershipRequestDescriptorV1("borrow", OwnershipPayloadKind.OwnedBuffer, OwnershipRequestDisposition.Borrow),
+                new OwnershipRequestDescriptorV1("consume", OwnershipPayloadKind.OwnedBuffer, OwnershipRequestDisposition.Consume))
+            : new(RequestPayloadKind.Ownership, "consume", typeof(OwnedBuffer<>).Namespace + ".OwnedBuffer", ownershipPayloadKind: OwnershipPayloadKind.OwnedBuffer);
+        var protocol = new ProtocolDefinitionV1("session-ownership", "1", "Ready", null,
+            [new(1, "Move", consumes: ["consume"], borrows: pair ? ["borrow"] : [], requestPayload: request)], [new(1, "Ready", "Ready")]);
+        var descriptor = kernel.RegisterService(service, "session-ownership", new(protocol.ContractName, "1", protocol.ContractDigest), protocol,
+            requiredCapabilities: [new(ResourceKind.Device, "session:ownership", CapabilityRights.Read)]).Value!;
+        var capability = kernel.MintCapability(new(811_100), caller, ResourceKind.Device, "session:ownership", CapabilityRights.Read).Value!.CapabilityId;
+        var session = kernel.OpenSession(caller, descriptor, [capability]).Value;
+        var endpoint = kernel.EndpointSessions.Resolve(session, caller).Value!.Channel;
+        var before = kernel.Channels.GetEndpoint(endpoint).Value!;
+        var payload = kernel.AllocateBuffer<byte>(caller, 4).Value!;
+        var borrowed = pair ? kernel.AllocateBuffer<byte>(caller, 4).Value! : null;
+        var original = payload.Handle;
+        var gate = typeof(RuntimeKernel).GetField("_platformMemoryUseGate",
+            global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.GetValue(kernel)!;
+        Task<KernelResult<ResponseEnvelope>> pending;
+        lock (gate)
+        {
+            pending = Task.Run(async () => pair
+                ? await kernel.InvokeSessionOwnershipPairAsync(caller, session, 1, borrowed!, payload)
+                : await kernel.InvokeSessionAsync(caller, session, 1, payload));
+            Assert.True(SpinWait.SpinUntil(() => kernel.EndpointSessions.ActivePinCount(session) == 1, TimeSpan.FromSeconds(5)));
+            Assert.True(kernel.RevokeCapability(capability).IsSuccess);
+        }
+        var result = await pending.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(KernelError.MissingCapability, result.Error);
+        Assert.True(payload.IsValid);
+        Assert.Equal(original, payload.Handle);
+        Assert.All(kernel.Regions.Snapshot(), region => Assert.Equal(RegionState.Owned, region.State));
+        Assert.Equal(before, kernel.Channels.GetEndpoint(endpoint).Value);
+        Assert.Equal(0, kernel.EndpointSessions.ActivePinCount(session));
+        Assert.Null(kernel.SnapshotSessionInvocationConsequence(new(session, new(1), new(1))));
+    }
+
+    [Fact]
+    public void ReservedOwnershipResponseCloseRefusesTransferAndConcurrentSettlement()
+    {
+        var kernel = new RuntimeKernel();
+        var caller = TestFixtures.Create(kernel, 8141, 814_100).Handle;
+        var service = TestFixtures.Create(kernel, 8142, 814_200).Handle;
+        var protocol = ISipJobRegionMoveProducerProtocol.CreateDefinition();
+        var descriptor = kernel.RegisterService(service, "reserved-response", new(protocol.ContractName, "1", protocol.ContractDigest),
+            protocol, ISipJobRegionMoveProducerResponseProtocol.Definition).Value!;
+        var session = kernel.OpenSession(caller, descriptor).Value;
+        var invocation = kernel.BeginInlineSessionInvocation(caller, service, session, 1, new SipJobClosedInt(1)).Value!;
+        var buffer = kernel.AllocateBuffer<byte>(service, 4).Value!;
+        var original = buffer.Handle;
+        kernel.SessionInvocationSettlementReservedHook = () =>
+        {
+            var worker = Task.Run(() =>
+            {
+                Assert.Equal(KernelError.ResponseNotPending, kernel.TransferInlineOwnershipResponse(service, invocation, buffer).Error);
+                Assert.Equal(KernelError.ResponseNotPending, kernel.SettleInlineSessionInvocation(service, invocation, false).Error);
+                Assert.Equal(1, kernel.EndpointSessions.ActivePinCount(session));
+                return kernel.CloseSession(caller, session);
+            });
+            Assert.True(worker.Wait(TimeSpan.FromSeconds(5)));
+            Assert.Equal(KernelError.SessionDraining, worker.Result.Error);
+        };
+        var response = kernel.TransferInlineOwnershipResponse(service, invocation, buffer);
+        Assert.Equal(KernelError.SessionClosed, response.Error);
+        Assert.True(buffer.IsValid);
+        Assert.Equal(original, buffer.Handle);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
+        kernel.SessionInvocationSettlementReservedHook = null;
+        Assert.True(kernel.SettleInlineSessionInvocation(service, invocation, false).IsSuccess);
+        Assert.Equal(0, kernel.EndpointSessions.ActivePinCount(session));
+    }
+
+    [Fact]
+    public void InlineMoveBudgetClockObservesCommittedLeaseOutsideAdmissionGates()
+    {
+        var clock = new ResponseClock();
+        var kernel = new RuntimeKernel(null, clock);
+        byte[] image = [3, 4];
+        var manifest = new ServiceManifestV1(new("move-observe"), new("1"),
+            Convert.ToHexString(global::System.Security.Cryptography.SHA256.HashData(image)).ToLowerInvariant(),
+            TestFixtures.Manifest(8172, 817_200),
+            budgetRequests: [new(ServiceBudgetDimension.OwnedMemoryBytes, 4096), new(ServiceBudgetDimension.TraceTelemetryBufferBytes, 8192)],
+            telemetryPolicy: new(ServiceTelemetryVisibility.Self, 8192));
+        var service = kernel.AdmitComponent(new(manifest, image)).Value!.Process;
+        var caller = TestFixtures.Create(kernel, 8171, 817_100).Handle;
+        var protocol = ISipJobRegionMoveConsumerProtocol.CreateDefinition();
+        var descriptor = kernel.RegisterService(service, "move-observe", new(protocol.ContractName, "1", protocol.ContractDigest), protocol).Value!;
+        var session = kernel.OpenSession(caller, descriptor).Value;
+        var buffer = kernel.AllocateBuffer<byte>(caller, 4).Value!;
+        Assert.True(kernel.StartTraceSession(service, 8).IsSuccess);
+        var observed = false;
+        clock.Next = () =>
+        {
+            var worker = Task.Run(() =>
+            {
+                Assert.True(kernel.MintCapability(new(817_200), service, ResourceKind.Device, "observation", CapabilityRights.Read).IsSuccess);
+                return kernel.CloseSession(caller, session);
+            });
+            Assert.True(worker.Wait(TimeSpan.FromSeconds(5)));
+            Assert.Equal(KernelError.SessionDraining, worker.Result.Error);
+            observed = true;
+        };
+        var begun = kernel.BeginInlineMoveSessionInvocation(caller, service, session, 1, buffer);
+        Assert.True(observed);
+        Assert.True(begun.IsSuccess);
+        Assert.False(buffer.IsValid);
+        Assert.True(begun.Value!.Payload.IsValid);
+        Assert.Equal(new RegionOwner(new(817_200), service.Generation), Assert.Single(kernel.Regions.Snapshot()).Owner);
+        Assert.True(kernel.SettleInlineMoveSessionInvocation(service, begun.Value, true).IsSuccess);
+        Assert.Equal(0, kernel.EndpointSessions.ActivePinCount(session));
+    }
+
+    [Fact]
+    public void ResponseBudgetClockRunsAfterCommittedOwnershipAndSettlementOutsideKernelGates()
+    {
+        var clock = new ResponseClock();
+        var kernel = new RuntimeKernel(null, clock);
+        byte[] image = [1, 2];
+        var manifest = new ServiceManifestV1(new("response-pin"), new("1"),
+            Convert.ToHexString(global::System.Security.Cryptography.SHA256.HashData(image)).ToLowerInvariant(),
+            TestFixtures.Manifest(8181, 818_100),
+            budgetRequests: [new(ServiceBudgetDimension.OwnedMemoryBytes, 4096), new(ServiceBudgetDimension.TraceTelemetryBufferBytes, 8192)],
+            telemetryPolicy: new(ServiceTelemetryVisibility.Self, 8192));
+        var caller = kernel.AdmitComponent(new(manifest, image)).Value!.Process;
+        var service = TestFixtures.Create(kernel, 8182, 818_200).Handle;
+        var protocol = ISipJobRegionMoveProducerProtocol.CreateDefinition();
+        var descriptor = kernel.RegisterService(service, "response-pin", new(protocol.ContractName, "1", protocol.ContractDigest),
+            protocol, ISipJobRegionMoveProducerResponseProtocol.Definition).Value!;
+        var session = kernel.OpenSession(caller, descriptor).Value;
+        var invocation = kernel.BeginInlineSessionInvocation(caller, service, session, 1, new SipJobClosedInt(1)).Value!;
+        var buffer = kernel.AllocateBuffer<byte>(service, 4).Value!;
+        var original = buffer.Handle;
+        Assert.True(kernel.StartTraceSession(caller, 8).IsSuccess);
+        var observed = false;
+        clock.Next = () =>
+        {
+            var worker = Task.Run(() => kernel.CloseSession(caller, session));
+            Assert.True(worker.Wait(TimeSpan.FromSeconds(5)));
+            Assert.True(worker.Result.IsSuccess);
+            observed = true;
+        };
+        var response = kernel.TransferInlineOwnershipResponse(service, invocation, buffer);
+        Assert.True(observed);
+        Assert.True(response.IsSuccess);
+        Assert.False(buffer.IsValid);
+        Assert.True(response.Value!.IsValid);
+        Assert.NotEqual(original, response.Value.Handle);
+        Assert.Equal(new RegionOwner(new(818_100), caller.Generation), Assert.Single(kernel.Regions.Snapshot()).Owner);
+        Assert.Equal(0, kernel.EndpointSessions.ActivePinCount(session));
+    }
+
+    private sealed class ResponseClock : TimeProvider
+    {
+        internal Action? Next;
+        public override long GetTimestamp() { var callback = Next; Next = null; callback?.Invoke(); return base.GetTimestamp(); }
+    }
+
+    [Fact]
+    public void RevokedSessionPermissionPreventsOwnershipMoveAndPublication()
+    {
+        var kernel = new RuntimeKernel();
+        var caller = TestFixtures.Create(kernel, 8191, 819_100).Handle;
+        var service = TestFixtures.Create(kernel, 8192, 819_200).Handle;
+        var protocol = ISipJobRegionMoveConsumerProtocol.CreateDefinition();
+        var descriptor = kernel.RegisterService(service, "move-permission",
+            new(protocol.ContractName, "1", protocol.ContractDigest), protocol,
+            requiredCapabilities: [new(ResourceKind.Device, "move:required", CapabilityRights.Read)]).Value!;
+        var capability = kernel.MintCapability(new(819_100), caller, ResourceKind.Device, "move:required", CapabilityRights.Read).Value!.CapabilityId;
+        var session = kernel.OpenSession(caller, descriptor, [capability]).Value;
+        var endpoint = kernel.EndpointSessions.Resolve(session, caller).Value!.Channel;
+        var before = kernel.Channels.GetEndpoint(endpoint).Value!;
+        var buffer = kernel.AllocateBuffer<byte>(caller, 4).Value!;
+        var original = buffer.Handle;
+        Assert.True(kernel.RevokeCapability(capability).IsSuccess);
+        var begun = kernel.BeginInlineMoveSessionInvocation(caller, service, session, 1, buffer);
+        Assert.Equal(KernelError.MissingCapability, begun.Error);
+        Assert.True(buffer.IsValid);
+        Assert.Equal(original, buffer.Handle);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
+        Assert.Equal(new RegionOwner(new(819_100), caller.Generation), Assert.Single(kernel.Regions.Snapshot()).Owner);
+        Assert.Equal(before, kernel.Channels.GetEndpoint(endpoint).Value);
+        Assert.Equal(0, kernel.EndpointSessions.ActivePinCount(session));
+        Assert.Null(kernel.SnapshotSessionInvocationConsequence(new(session, new(1), new(1))));
+    }
+
     [Fact]
     public void NonOwnershipResponseContractCannotSmuggleARegionTransfer()
     {

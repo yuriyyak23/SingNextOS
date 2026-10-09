@@ -9,6 +9,307 @@ namespace SingPlus.Tests.Drivers;
 public sealed class DriverComponentVerticalSliceTests
 {
     [Theory]
+    [InlineData(false, 0)] [InlineData(true, 0)]
+    [InlineData(false, 1)] [InlineData(true, 1)]
+    [InlineData(false, 2)] [InlineData(true, 2)]
+    [InlineData(false, 3)] [InlineData(true, 3)]
+    public void ControllerChildLateRefusalKeepsOriginalCleanupAndPinsGenericFailure(bool irq, int fault)
+    {
+        var status = fault == 1 ? PlatformAuthorityStatus.Denied : PlatformAuthorityStatus.NotAccepted;
+        var provider = new DriverProvider
+        {
+            MmioRevokeStatus = irq ? null : status,
+            IrqRevokeStatus = irq ? status : null
+        };
+        var kernel = new RuntimeKernel(provider);
+        provider.BeforeChildRevoke = () =>
+        {
+            if (fault == 2) throw new InvalidOperationException("Missing exact cleanup reply.");
+            if (fault == 3) kernel.PlatformAuthority.ObserveBackendReset();
+        };
+        var (_, principal) = TestFixtures.Create(kernel, 1928, 19280);
+        Assert.True(kernel.AdmitProcess(principal).IsSuccess);
+        var control = kernel.MintCapability(new DomainId(19280), principal, ResourceKind.KernelService,
+            CapabilityResourceIds.ServiceSupervisor, CapabilityRights.Configure | CapabilityRights.Execute).Value!.CapabilityId;
+        var setup = DriverSetup.Create(1929, 19290);
+        Action lose = () => Assert.True(kernel.CapabilityAuthority.Revoke(control).IsSuccess);
+        if (irq) provider.IrqBindCallback = lose;
+        else provider.MmioBindCallback = lose;
+        Assert.False(kernel.AdmitComponent(setup.Plan(new DomainId(19290)), principal, control).IsSuccess);
+        var pinned = kernel.QueryComponent(setup.Identity).Value!;
+        Assert.False(pinned.Reclaimable);
+        Assert.False(kernel.Processes.ResolveTerminalState(pinned.Process).IsSuccess);
+        Assert.True(kernel.Budgets.HasProcessAccount(pinned.Process));
+        Assert.False(kernel.RetireReclaimableComponent(setup.Identity, pinned.Process).IsSuccess);
+        provider.MmioRevokeStatus = null;
+        provider.IrqRevokeStatus = null;
+        provider.BeforeChildRevoke = null;
+        var (_, unrelated) = TestFixtures.Create(kernel, 1930, 19300);
+        Assert.True(kernel.TerminateProcess(unrelated).IsSuccess);
+        Assert.DoesNotContain(irq ? "revoke-irq" : "revoke-mmio", provider.Log);
+        Assert.False(kernel.Processes.ResolveTerminalState(pinned.Process).IsSuccess);
+        Assert.True(kernel.DrainComponent(setup.Identity).IsSuccess);
+        var closed = false;
+        Assert.Equal(closed, kernel.QueryComponent(setup.Identity).Value!.Reclaimable);
+        Assert.Equal(closed, kernel.Processes.ResolveTerminalState(pinned.Process).IsSuccess);
+        Assert.Equal(1, provider.DeviceBindCalls);
+        Assert.Equal(1, provider.MmioBindCalls);
+        Assert.Equal(irq ? 1 : 0, provider.IrqBindCalls);
+        Assert.Equal(closed ? 1 : 0, provider.Log.Count(value => value == (irq ? "revoke-irq" : "revoke-mmio")));
+        Assert.Equal(closed ? 1 : 0, provider.Log.Count(value => value == "revoke-device"));
+        Assert.Equal(closed ? 1 : 0, provider.Log.Count(value => value == "revoke-domain"));
+        Assert.Equal(closed, kernel.RetireReclaimableComponent(setup.Identity, pinned.Process).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(0, 0)] [InlineData(0, 1)] [InlineData(0, 2)]
+    [InlineData(1, 0)] [InlineData(1, 1)] [InlineData(1, 2)]
+    [InlineData(2, 0)] [InlineData(2, 1)] [InlineData(2, 2)]
+    public void ControllerIrqLossStopsAllocationOrCleansExactEndpointAndBinding(int stage, int fault)
+    {
+        var provider = new DriverProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, principal) = TestFixtures.Create(kernel, 1926, 19260);
+        Assert.True(kernel.AdmitProcess(principal).IsSuccess);
+        var control = kernel.MintCapability(new DomainId(19260), principal, ResourceKind.KernelService,
+            CapabilityResourceIds.ServiceSupervisor, CapabilityRights.Configure | CapabilityRights.Execute).Value!.CapabilityId;
+        var setup = DriverSetup.Create(1927, 19270);
+        var created = false;
+        Action lose = () =>
+        {
+            if (fault == 0) Assert.True(kernel.CapabilityAuthority.Revoke(control).IsSuccess);
+            if (fault == 1) kernel.CapabilityAuthority.RevokeAllForDomain(new DomainId(19260));
+            if (fault == 2) Assert.True(kernel.TerminateProcess(principal).IsSuccess);
+        };
+        kernel.BeforeComponentDriverIrqBindingQualificationHook = endpoint =>
+        {
+            created = true;
+            if (stage == 1) lose();
+        };
+        if (stage == 0) kernel.BeforeComponentDriverIrqEndpointQualificationHook = lose;
+        if (stage == 2) provider.IrqBindCallback = lose;
+        Assert.Equal(KernelError.SupervisorDenied, kernel.AdmitComponent(setup.Plan(new DomainId(19270)), principal, control).Error);
+        Assert.Equal(stage != 0, created);
+        Assert.Equal(stage == 2 ? 1 : 0, provider.IrqBindCalls);
+        Assert.Equal(stage == 2 ? 1 : 0, provider.Log.Count(value => value == "revoke-irq"));
+        Assert.Equal(1, provider.Log.Count(value => value == "revoke-mmio"));
+        Assert.Equal(1, provider.Log.Count(value => value == "revoke-device"));
+        var component = kernel.QueryComponent(setup.Identity).Value!;
+        Assert.Equal(ComponentLifecycleState.Reclaimable, component.State);
+        Assert.True(kernel.Processes.ResolveTerminalState(component.Process).IsSuccess);
+        Assert.True(kernel.RetireReclaimableComponent(setup.Identity, component.Process).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false, 0)] [InlineData(false, 1)] [InlineData(false, 2)]
+    [InlineData(true, 0)] [InlineData(true, 1)] [InlineData(true, 2)]
+    public void ControllerMmioLossStopsFurtherEffectsAndCleansExactLease(bool late, int fault)
+    {
+        var provider = new DriverProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, principal) = TestFixtures.Create(kernel, 1924, 19240);
+        Assert.True(kernel.AdmitProcess(principal).IsSuccess);
+        var control = kernel.MintCapability(new DomainId(19240), principal, ResourceKind.KernelService,
+            CapabilityResourceIds.ServiceSupervisor, CapabilityRights.Configure | CapabilityRights.Execute).Value!.CapabilityId;
+        var setup = DriverSetup.Create(1925, 19250);
+        Action lose = () =>
+        {
+            if (fault == 0) Assert.True(kernel.CapabilityAuthority.Revoke(control).IsSuccess);
+            if (fault == 1) kernel.CapabilityAuthority.RevokeAllForDomain(new DomainId(19240));
+            if (fault == 2) Assert.True(kernel.TerminateProcess(principal).IsSuccess);
+        };
+        if (late) provider.MmioBindCallback = lose;
+        else kernel.BeforeComponentDriverMmioQualificationHook = lose;
+        Assert.Equal(KernelError.SupervisorDenied, kernel.AdmitComponent(setup.Plan(new DomainId(19250)), principal, control).Error);
+        Assert.Equal(1, provider.DeviceBindCalls);
+        Assert.Equal(late ? 1 : 0, provider.MmioBindCalls);
+        Assert.Equal(late ? 1 : 0, provider.Log.Count(value => value == "revoke-mmio"));
+        Assert.Equal(1, provider.Log.Count(value => value == "revoke-device"));
+        Assert.Equal(0, provider.IrqBindCalls);
+        var component = kernel.QueryComponent(setup.Identity).Value!;
+        Assert.Equal(ComponentLifecycleState.Reclaimable, component.State);
+        Assert.True(kernel.Processes.ResolveTerminalState(component.Process).IsSuccess);
+        Assert.True(kernel.RetireReclaimableComponent(setup.Identity, component.Process).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false, 0)] [InlineData(false, 1)] [InlineData(false, 2)]
+    [InlineData(true, 0)] [InlineData(true, 1)] [InlineData(true, 2)]
+    public void ControllerDeviceLossRefusesEarlyOrCleansExactReturnedLease(bool late, int fault)
+    {
+        var provider = new DriverProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, principal) = TestFixtures.Create(kernel, 1920, 19200);
+        Assert.True(kernel.AdmitProcess(principal).IsSuccess);
+        var control = kernel.MintCapability(new DomainId(19200), principal, ResourceKind.KernelService,
+            CapabilityResourceIds.ServiceSupervisor, CapabilityRights.Configure | CapabilityRights.Execute).Value!.CapabilityId;
+        var setup = DriverSetup.Create(1921, 19210);
+        Action lose = () =>
+        {
+            if (fault == 0) Assert.True(kernel.CapabilityAuthority.Revoke(control).IsSuccess);
+            if (fault == 1) kernel.CapabilityAuthority.RevokeAllForDomain(new DomainId(19200));
+            if (fault == 2) Assert.True(kernel.TerminateProcess(principal).IsSuccess);
+        };
+        if (late) provider.DeviceBindCallback = lose;
+        else kernel.BeforeComponentDriverDeviceQualificationHook = lose;
+        Assert.Equal(KernelError.SupervisorDenied, kernel.AdmitComponent(setup.Plan(new DomainId(19210)), principal, control).Error);
+        Assert.Equal(late ? 1 : 0, provider.DeviceBindCalls);
+        Assert.Equal(late ? 1 : 0, provider.Log.Count(value => value == "revoke-device"));
+        Assert.Equal(0, provider.MmioBindCalls);
+        Assert.Equal(0, provider.IrqBindCalls);
+        var component = kernel.QueryComponent(setup.Identity).Value!;
+        Assert.Equal(ComponentLifecycleState.Reclaimable, component.State);
+        Assert.True(kernel.Processes.ResolveTerminalState(component.Process).IsSuccess);
+        Assert.True(kernel.RetireReclaimableComponent(setup.Identity, component.Process).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(PlatformAuthorityStatus.NotAccepted)]
+    [InlineData(PlatformAuthorityStatus.Denied)]
+    public void ControllerDeviceLateRefusalPinsGenericFailedCleanupWithoutRebind(PlatformAuthorityStatus status)
+    {
+        var provider = new DriverProvider { DeviceRevokeStatus = status };
+        var kernel = new RuntimeKernel(provider);
+        var (_, principal) = TestFixtures.Create(kernel, 1922, 19220);
+        Assert.True(kernel.AdmitProcess(principal).IsSuccess);
+        var control = kernel.MintCapability(new DomainId(19220), principal, ResourceKind.KernelService,
+            CapabilityResourceIds.ServiceSupervisor, CapabilityRights.Configure | CapabilityRights.Execute).Value!.CapabilityId;
+        var setup = DriverSetup.Create(1923, 19230);
+        provider.DeviceBindCallback = () => Assert.True(kernel.CapabilityAuthority.Revoke(control).IsSuccess);
+        Assert.Equal(KernelError.PlatformFaulted, kernel.AdmitComponent(setup.Plan(new DomainId(19230)), principal, control).Error);
+        var pinned = kernel.QueryComponent(setup.Identity).Value!;
+        Assert.False(pinned.Reclaimable);
+        Assert.True(kernel.Budgets.HasProcessAccount(pinned.Process));
+        Assert.False(kernel.Processes.ResolveTerminalState(pinned.Process).IsSuccess);
+        Assert.False(kernel.RetireReclaimableComponent(setup.Identity, pinned.Process).IsSuccess);
+        provider.DeviceRevokeStatus = null;
+        Assert.True(kernel.DrainComponent(setup.Identity).IsSuccess);
+        Assert.Equal(1, provider.DeviceBindCalls);
+        var closed = false;
+        Assert.Equal(closed, kernel.QueryComponent(setup.Identity).Value!.Reclaimable);
+        Assert.Equal(closed, kernel.Processes.ResolveTerminalState(pinned.Process).IsSuccess);
+        Assert.True(kernel.Budgets.HasProcessAccount(pinned.Process));
+        Assert.Equal(closed ? 1 : 0, provider.Log.Count(value => value == "revoke-device"));
+        Assert.Equal(closed ? 1 : 0, provider.Log.Count(value => value == "revoke-domain"));
+        Assert.Equal(closed, kernel.RetireReclaimableComponent(setup.Identity, pinned.Process).IsSuccess);
+    }
+
+    [Fact]
+    public void ObserveUsesExactTerminalReceiptWhenActualCleanupRemovesTransientRecordDuringLookup()
+    {
+        var provider = new DriverProvider { ThrowSourceAfterDeviceRevoke = true };
+        var kernel = new RuntimeKernel(provider);
+        _ = TestFixtures.Create(kernel, 1910, 19100);
+        var setup = DriverSetup.Create(1911, 19110);
+        var admitted = kernel.AdmitComponent(setup.Plan(new DomainId(19100))).Value!;
+        var first = kernel.DrainComponent(setup.Identity);
+        Assert.False(first.IsSuccess);
+        Assert.False(kernel.QueryComponent(setup.Identity).Value!.Reclaimable);
+        Assert.True(kernel.QueryProcessTeardown(admitted.Process).IsSuccess);
+        kernel.BeforeComponentTeardownRecordQueryQualificationHook = () =>
+        {
+            kernel.BeforeComponentTeardownRecordQueryQualificationHook = null;
+            provider.ThrowSourceAfterDeviceRevoke = false;
+            provider.ThrowSourceObservation = false;
+            Assert.True(kernel.TerminateProcess(admitted.Process).IsSuccess);
+            Assert.False(kernel.QueryProcessTeardown(admitted.Process).IsSuccess);
+        };
+        var observed = kernel.ObserveComponentTeardown(setup.Identity);
+        Assert.True(observed.IsSuccess, observed.Message);
+        Assert.True(observed.Value!.Reclaimable);
+        Assert.Null(observed.Value.DeviceResources);
+        Assert.False(observed.Value.PlatformAuthorityLive);
+        Assert.Equal(ProcessState.Exited, kernel.Processes.ResolveTerminalState(admitted.Process).Value);
+        Assert.True(kernel.RetireReclaimableComponent(setup.Identity, admitted.Process).IsSuccess);
+        Assert.Equal(1, provider.DeviceBindCalls);
+        Assert.Equal(1, provider.MmioBindCalls);
+        Assert.Equal(1, provider.IrqBindCalls);
+        Assert.Single(provider.Log, item => item == "revoke-device");
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void LateDmaTrackingCannotPublishAfterActualDrainAndPreservesAmbiguousOriginal(bool ambiguous)
+    {
+        var provider = new DriverProvider { DmaRevokeStatus = ambiguous ? PlatformAuthorityStatus.Faulted : null };
+        var kernel = new RuntimeKernel(provider);
+        _ = TestFixtures.Create(kernel, 1900, 19000);
+        var setup = DriverSetup.Create(1901, 19010);
+        var component = kernel.AdmitComponent(setup.Plan(new DomainId(19000))).Value!;
+        var buffer = kernel.AllocateBuffer<byte>(component.Process, 256).Value!;
+        var memory = kernel.MintCapability(component.Domain, component.Process, ResourceKind.MemoryRegion,
+            CapabilityResourceIds.MemoryRegion(buffer.Handle.RegionId), CapabilityRights.Map | CapabilityRights.Read | CapabilityRights.Write).Value!.CapabilityId;
+        var mapping = kernel.MapComponentDriverOwnedRegion(setup.Identity, memory, buffer.Handle, 0, 256,
+            PlatformMemoryAccess.Read | PlatformMemoryAccess.Write).Value!;
+        kernel.BeforeComponentDmaTrackingQualificationHook = () =>
+        {
+            kernel.BeforeComponentDmaTrackingQualificationHook = null;
+            var drained = kernel.DrainComponent(setup.Identity);
+            Assert.Equal(!ambiguous, drained.Value?.Reclaimable == true);
+        };
+        var result = kernel.BindComponentDriverDma(setup.Identity, mapping, 0, 128, PlatformDmaDirection.DeviceReadsMemory);
+        Assert.Equal(ambiguous ? KernelError.InvalidTransition : KernelError.StaleHandle, result.Error);
+        Assert.Equal(1, provider.DmaBindCalls);
+        var snapshot = kernel.QueryComponent(setup.Identity).Value!;
+        Assert.Equal(!ambiguous, snapshot.Reclaimable);
+        if (ambiguous)
+        {
+            Assert.Equal(0, kernel.QueryComponentDeviceResources(setup.Identity).Value!.ActiveDmaGrantCount);
+            Assert.True(kernel.QueryBudget(snapshot.ProcessBudget).IsSuccess);
+            Assert.False(kernel.RetireReclaimableComponent(setup.Identity, component.Process).IsSuccess);
+            Assert.DoesNotContain("revoke-domain", provider.Log);
+        }
+        else
+        {
+            Assert.Equal(KernelError.ComponentNotFound, kernel.QueryComponentDeviceResources(setup.Identity).Error);
+            Assert.True(kernel.RetireReclaimableComponent(setup.Identity, component.Process).IsSuccess);
+        }
+    }
+
+    [Theory]
+    [InlineData(0, false)] [InlineData(1, false)] [InlineData(2, false)]
+    [InlineData(0, true)] [InlineData(1, true)] [InlineData(2, true)]
+    public void LateDriverReceiptTrackingUsesOriginalOwnerCleanupAndPreservesAmbiguousPins(int stage, bool ambiguous)
+    {
+        var provider = new DriverProvider { DeviceRevokeStatus = ambiguous ? PlatformAuthorityStatus.Faulted : null };
+        var kernel = new RuntimeKernel(provider);
+        _ = TestFixtures.Create(kernel, 1890, 18900);
+        var setup = DriverSetup.Create(1891, 18910);
+        var process = new ProcessHandle(setup.Process.ProcessId, setup.Process.Generation);
+        var visited = 0;
+        kernel.BeforeComponentDriverTrackingQualificationHook = () =>
+        {
+            if (visited++ != stage) return;
+            kernel.BeforeComponentDriverTrackingQualificationHook = null;
+            var terminated = kernel.TerminateProcess(process);
+            Assert.Equal(!ambiguous, terminated.IsSuccess);
+        };
+        var result = kernel.AdmitComponent(setup.Plan(new DomainId(18900)));
+        Assert.Equal(ambiguous ? KernelError.PlatformFaulted : KernelError.StaleHandle, result.Error);
+        Assert.Equal(stage + 1, visited);
+        Assert.Equal(1, provider.DeviceBindCalls);
+        Assert.Equal(stage >= 1 ? 1 : 0, provider.MmioBindCalls);
+        Assert.Equal(stage >= 2 ? 1 : 0, provider.IrqBindCalls);
+        var component = kernel.QueryComponent(setup.Identity).Value!;
+        Assert.Equal(!ambiguous, component.Reclaimable);
+        if (ambiguous)
+        {
+            Assert.Equal(ProcessState.Exiting, kernel.Processes.Resolve(process).Value!.State);
+            Assert.True(kernel.QueryProcessTeardown(process).Value!.LocalAuthorizationRevoked);
+            Assert.True(kernel.QueryBudget(component.ProcessBudget).IsSuccess);
+            Assert.DoesNotContain("revoke-domain", provider.Log);
+            Assert.False(kernel.RetireReclaimableComponent(setup.Identity, process).IsSuccess);
+        }
+        else
+        {
+            Assert.Null(component.DeviceResources);
+            Assert.False(component.PlatformAuthorityLive);
+            Assert.Equal(ProcessState.Exited, kernel.Processes.ResolveTerminalState(process).Value);
+            Assert.True(kernel.RetireReclaimableComponent(setup.Identity, process).IsSuccess);
+        }
+    }
+
+    [Theory]
     [InlineData(0)]
     [InlineData(1)]
     [InlineData(2)]
@@ -61,21 +362,12 @@ public sealed class DriverComponentVerticalSliceTests
             provider.ThrowDeviceRevoke = false;
             var observedTeardown = kernel.ObserveComponentTeardown(setup.Identity);
             Assert.True(observedTeardown.IsSuccess);
-            Assert.Equal(closureMode == 2, observedTeardown.Value!.Reclaimable);
-            Assert.Equal(closureMode == 2 ? 2 : 1, observed);
-            if (closureMode == 2)
-            {
-                Assert.Equal(KernelError.StaleHandle, kernel.Processes.Resolve(process).Error);
-                Assert.Null(observedTeardown.Value.DeviceResources);
-                Assert.False(observedTeardown.Value.PlatformAuthorityLive);
-                Assert.Contains("revoke-domain", provider.Log);
-            }
-            else
-            {
-                Assert.Equal(ComponentLifecycleState.Faulted, observedTeardown.Value.State);
-                Assert.True(kernel.QueryBudget(snapshot.ProcessBudget).IsSuccess);
-                Assert.DoesNotContain("revoke-domain", provider.Log);
-            }
+            Assert.False(observedTeardown.Value!.Reclaimable);
+            Assert.Equal(1, observed);
+            Assert.Equal(ComponentLifecycleState.Faulted, observedTeardown.Value.State);
+            Assert.True(kernel.QueryBudget(snapshot.ProcessBudget).IsSuccess);
+            Assert.True(kernel.Processes.Resolve(process).IsSuccess);
+            Assert.DoesNotContain("revoke-domain", provider.Log);
         }
     }
 
@@ -240,6 +532,186 @@ public sealed class DriverComponentVerticalSliceTests
             Assert.DoesNotContain(typeof(IDriverInterruptService).Assembly.GetExportedTypes().Where(type => type.Namespace == "SingPlus.Sip.Drivers"), type => type.Name.Contains(forbidden, StringComparison.OrdinalIgnoreCase));
     }
 
+    [Theory]
+    [InlineData(0, 0)] [InlineData(1, 0)] [InlineData(2, 0)]
+    [InlineData(0, 1)] [InlineData(1, 1)] [InlineData(2, 1)]
+    [InlineData(0, 2)] [InlineData(1, 2)] [InlineData(2, 2)]
+    public void RestoreDeviceChecksExactSourceBeforeEffectAndAfterProviderReceipt(int boundary, int fault)
+    {
+        var provider = new DriverProvider();
+        var kernel = new RuntimeKernel(provider);
+        var admin = TestFixtures.Create(kernel, 19601, 19601).Handle;
+        var cleanup = TestFixtures.Create(kernel, 19602, 19602).Handle;
+        var permission = kernel.MintCapability(new(19601), admin, ResourceKind.KernelService,
+            CapabilityResourceIds.CheckpointAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        var cleanupPermission = kernel.MintCapability(new(19602), cleanup, ResourceKind.KernelService,
+            CapabilityResourceIds.CheckpointAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        byte[] bytes = [1, 2];
+        var identity = new ComponentIdentity("restore-device-source");
+        var originalManifest = new ServiceManifestV1(identity, new("1"), Digest(bytes),
+            TestFixtures.Manifest(19600, 19600, 1, "restore-device-source"),
+            budgetRequests: [new(ServiceBudgetDimension.CheckpointStorageBytes, 4096)],
+            checkpointPolicy: new(ServiceCheckpointMode.PlannedReplacementOnly));
+        var original = kernel.AdmitComponent(new(originalManifest, bytes)).Value!;
+        var image = kernel.CreateOrdinaryCheckpoint(admin, permission, identity, new byte[8]).Value!;
+        Assert.True(kernel.DrainComponent(identity).Value!.Reclaimable);
+        const string device = "device/mock-net0";
+        var requirement = new CapabilityRequirementV1(ResourceKind.Device, device, CapabilityRights.Read);
+        var process = new SingProcessManifestV1(new(19600), new(19600), 2, "restore-device-source",
+            ExecutionRole.Driver, MemoryProfile.SipRegion, [requirement]);
+        var manifest = new ServiceManifestV1(identity, new("1"), Digest(bytes), process,
+            requiresPlatformDomain: true, platformRequirements:
+            [new(ComponentPlatformFeatureFamily.NeutralDomains, PlatformDomainContract.ContractVersion, ComponentPlatformFeatureAvailability.RuntimeAdmission),
+             new(ComponentPlatformFeatureFamily.IoDomainBinding, PlatformDeviceLeaseContract.ContractVersion, ComponentPlatformFeatureAvailability.RuntimeAdmission)]);
+        var plan = new ComponentAdmissionPlan(manifest, bytes, [new(new(19600), requirement)],
+            driverResources: new(device, PlatformDeviceRights.Read, [], []));
+        Action interfere = () =>
+        {
+            if (fault == 0) Assert.True(kernel.RevokeCapability(permission).IsSuccess);
+            else if (fault == 1) Assert.True(kernel.TerminateProcess(admin).IsSuccess);
+            else Assert.True(kernel.DeleteOrdinaryCheckpoint(cleanup, cleanupPermission, image.Handle).IsSuccess);
+        };
+        if (boundary == 1) provider.DeviceBindCallback = interfere;
+        else if (boundary == 2) kernel.BeforeComponentDriverTrackingQualificationHook = interfere;
+        else kernel.BeforeComponentDriverDeviceQualificationHook = interfere;
+        var refused = kernel.RestoreOrdinaryCheckpoint(admin, permission, image, plan);
+        Assert.False(refused.IsSuccess);
+        Assert.Equal(boundary == 0 ? 0 : 1, provider.DeviceBindCalls);
+        Assert.Equal(boundary == 0 ? 0 : 1, provider.Log.Count(item => item == "revoke-device"));
+        Assert.Equal(0, provider.MmioBindCalls);
+        Assert.Equal(0, provider.IrqBindCalls);
+        var failed = kernel.QueryComponent(identity).Value!;
+        Assert.True(failed.Reclaimable);
+        Assert.True(kernel.Processes.ResolveTerminalState(failed.Process).IsSuccess);
+        Assert.True(kernel.RetireReclaimableComponent(identity, failed.Process).IsSuccess);
+        Assert.Equal(boundary == 0 ? 0 : 1, provider.DeviceBindCalls);
+        Assert.Equal(boundary == 0 ? 0 : 1, provider.Log.Count(item => item == "revoke-device"));
+    }
+
+    [Theory]
+    [InlineData(0, 0)] [InlineData(1, 0)] [InlineData(2, 0)]
+    [InlineData(0, 1)] [InlineData(1, 1)] [InlineData(2, 1)]
+    [InlineData(0, 2)] [InlineData(1, 2)] [InlineData(2, 2)]
+    public void RestoreMmioSourceRefusalClosesExactReceiptAndRetainsParentCleanup(int boundary, int fault)
+    {
+        var provider = new DriverProvider();
+        var kernel = new RuntimeKernel(provider);
+        var admin = TestFixtures.Create(kernel, 19701, 19701).Handle;
+        var cleanup = TestFixtures.Create(kernel, 19702, 19702).Handle;
+        var permission = kernel.MintCapability(new(19701), admin, ResourceKind.KernelService,
+            CapabilityResourceIds.CheckpointAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        var cleanupPermission = kernel.MintCapability(new(19702), cleanup, ResourceKind.KernelService,
+            CapabilityResourceIds.CheckpointAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        byte[] bytes = [1, 2];
+        var identity = new ComponentIdentity("restore-mmio-source");
+        var originalManifest = new ServiceManifestV1(identity, new("1"), Digest(bytes),
+            TestFixtures.Manifest(19700, 19700, 1, "restore-mmio-source"),
+            budgetRequests: [new(ServiceBudgetDimension.CheckpointStorageBytes, 4096)],
+            checkpointPolicy: new(ServiceCheckpointMode.PlannedReplacementOnly));
+        var original = kernel.AdmitComponent(new(originalManifest, bytes)).Value!;
+        var image = kernel.CreateOrdinaryCheckpoint(admin, permission, identity, new byte[8]).Value!;
+        Assert.True(kernel.DrainComponent(identity).Value!.Reclaimable);
+        const string device = "device/mock-net0";
+        var requirement = new CapabilityRequirementV1(ResourceKind.Device, device, CapabilityRights.Read | CapabilityRights.Configure);
+        var mmioId = CapabilityResourceIds.MmioRegion(device, "bar0", 4096);
+        var mmioRequirement = new CapabilityRequirementV1(ResourceKind.MmioRegion, mmioId, CapabilityRights.Map | CapabilityRights.Read);
+        var process = new SingProcessManifestV1(new(19700), new(19700), 2, "restore-mmio-source",
+            ExecutionRole.Driver, MemoryProfile.SipRegion, [requirement, mmioRequirement]);
+        var manifest = new ServiceManifestV1(identity, new("1"), Digest(bytes), process,
+            requiresPlatformDomain: true, platformRequirements:
+            [new(ComponentPlatformFeatureFamily.NeutralDomains, PlatformDomainContract.ContractVersion, ComponentPlatformFeatureAvailability.RuntimeAdmission),
+             new(ComponentPlatformFeatureFamily.IoDomainBinding, PlatformDeviceLeaseContract.ContractVersion, ComponentPlatformFeatureAvailability.RuntimeAdmission),
+             new(ComponentPlatformFeatureFamily.MmioMapping, PlatformMmioLeaseContract.ContractVersion, ComponentPlatformFeatureAvailability.RuntimeAdmission)]);
+        var plan = new ComponentAdmissionPlan(manifest, bytes, [new(new(19700), requirement), new(new(19700), mmioRequirement)],
+            driverResources: new(device, PlatformDeviceRights.Read | PlatformDeviceRights.Configure, [new(mmioId, 0, 256, PlatformMmioAccess.Read)], []));
+        Action interfere = () =>
+        {
+            if (fault == 0) Assert.True(kernel.RevokeCapability(permission).IsSuccess);
+            else if (fault == 1) Assert.True(kernel.TerminateProcess(admin).IsSuccess);
+            else Assert.True(kernel.DeleteOrdinaryCheckpoint(cleanup, cleanupPermission, image.Handle).IsSuccess);
+        };
+        if (boundary == 1) provider.MmioBindCallback = interfere;
+        else if (boundary == 2) kernel.BeforeComponentDriverTrackingQualificationHook = () => { if (provider.MmioBindCalls == 1) interfere(); };
+        else kernel.BeforeComponentDriverMmioQualificationHook = interfere;
+        var refused = kernel.RestoreOrdinaryCheckpoint(admin, permission, image, plan);
+        Assert.False(refused.IsSuccess);
+        Assert.Equal(1, provider.DeviceBindCalls);
+        Assert.Equal(1, provider.Log.Count(item => item == "revoke-device"));
+        Assert.Equal(boundary == 0 ? 0 : 1, provider.Log.Count(item => item == "revoke-mmio"));
+        Assert.Equal(boundary == 0 ? 0 : 1, provider.MmioBindCalls);
+        Assert.Equal(0, provider.IrqBindCalls);
+        var failed = kernel.QueryComponent(identity).Value!;
+        Assert.True(failed.Reclaimable);
+        Assert.True(kernel.Processes.ResolveTerminalState(failed.Process).IsSuccess);
+        Assert.True(kernel.RetireReclaimableComponent(identity, failed.Process).IsSuccess);
+        Assert.Equal(1, provider.DeviceBindCalls);
+        Assert.Equal(1, provider.Log.Count(item => item == "revoke-device"));
+        Assert.Equal(boundary == 0 ? 0 : 1, provider.Log.Count(item => item == "revoke-mmio"));
+    }
+
+    [Theory]
+    [InlineData(0, 0)] [InlineData(1, 0)] [InlineData(2, 0)]
+    [InlineData(0, 1)] [InlineData(1, 1)] [InlineData(2, 1)]
+    [InlineData(0, 2)] [InlineData(1, 2)] [InlineData(2, 2)]
+    [InlineData(3, 0)] [InlineData(3, 1)] [InlineData(3, 2)]
+    public void RestoreIrqSourceRefusalClosesExactRouteAndParentWithoutRepeat(int boundary, int fault)
+    {
+        var provider = new DriverProvider();
+        var kernel = new RuntimeKernel(provider);
+        var admin = TestFixtures.Create(kernel, 19801, 19801).Handle;
+        var cleanup = TestFixtures.Create(kernel, 19802, 19802).Handle;
+        var permission = kernel.MintCapability(new(19801), admin, ResourceKind.KernelService,
+            CapabilityResourceIds.CheckpointAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        var cleanupPermission = kernel.MintCapability(new(19802), cleanup, ResourceKind.KernelService,
+            CapabilityResourceIds.CheckpointAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        byte[] bytes = [1, 2];
+        var identity = new ComponentIdentity("restore-irq-source");
+        var originalManifest = new ServiceManifestV1(identity, new("1"), Digest(bytes),
+            TestFixtures.Manifest(19800, 19800, 1, "restore-irq-source"),
+            budgetRequests: [new(ServiceBudgetDimension.CheckpointStorageBytes, 4096)],
+            checkpointPolicy: new(ServiceCheckpointMode.PlannedReplacementOnly));
+        var original = kernel.AdmitComponent(new(originalManifest, bytes)).Value!;
+        var image = kernel.CreateOrdinaryCheckpoint(admin, permission, identity, new byte[8]).Value!;
+        Assert.True(kernel.DrainComponent(identity).Value!.Reclaimable);
+        const string device = "device/mock-net0";
+        var requirement = new CapabilityRequirementV1(ResourceKind.Device, device, CapabilityRights.Read | CapabilityRights.Configure);
+        var irqId = CapabilityResourceIds.Irq(device, "rx0", IrqTriggerMode.Edge);
+        var irqRequirement = new CapabilityRequirementV1(ResourceKind.Irq, irqId, CapabilityRights.Signal);
+        var process = new SingProcessManifestV1(new(19800), new(19800), 2, "restore-irq-source",
+            ExecutionRole.Driver, MemoryProfile.SipRegion, [requirement, irqRequirement]);
+        var manifest = new ServiceManifestV1(identity, new("1"), Digest(bytes), process,
+            requiresPlatformDomain: true, platformRequirements:
+            [new(ComponentPlatformFeatureFamily.NeutralDomains, PlatformDomainContract.ContractVersion, ComponentPlatformFeatureAvailability.RuntimeAdmission),
+             new(ComponentPlatformFeatureFamily.IoDomainBinding, PlatformDeviceLeaseContract.ContractVersion, ComponentPlatformFeatureAvailability.RuntimeAdmission),
+             new(ComponentPlatformFeatureFamily.IrqBinding, PlatformIrqBindingContract.ContractVersion, ComponentPlatformFeatureAvailability.RuntimeAdmission)]);
+        var plan = new ComponentAdmissionPlan(manifest, bytes, [new(new(19800), requirement), new(new(19800), irqRequirement)],
+            driverResources: new(device, PlatformDeviceRights.Read | PlatformDeviceRights.Configure, [], [new(irqId)]));
+        Action interfere = () =>
+        {
+            if (fault == 0) Assert.True(kernel.RevokeCapability(permission).IsSuccess);
+            else if (fault == 1) Assert.True(kernel.TerminateProcess(admin).IsSuccess);
+            else Assert.True(kernel.DeleteOrdinaryCheckpoint(cleanup, cleanupPermission, image.Handle).IsSuccess);
+        };
+        if (boundary == 1) provider.IrqBindCallback = interfere;
+        else if (boundary == 2) kernel.BeforeComponentDriverTrackingQualificationHook = () => { if (provider.IrqBindCalls == 1) interfere(); };
+        else if (boundary == 3) kernel.BeforeComponentDriverIrqEndpointQualificationHook = interfere;
+        else kernel.BeforeComponentDriverIrqBindingQualificationHook = _ => interfere();
+        var refused = kernel.RestoreOrdinaryCheckpoint(admin, permission, image, plan);
+        Assert.False(refused.IsSuccess);
+        Assert.Equal(1, provider.DeviceBindCalls);
+        Assert.Equal(1, provider.Log.Count(item => item == "revoke-device"));
+        Assert.Equal(boundary is 0 or 3 ? 0 : 1, provider.Log.Count(item => item == "revoke-irq"));
+        Assert.Equal(boundary is 0 or 3 ? 0 : 1, provider.IrqBindCalls);
+        Assert.Equal(0, provider.MmioBindCalls);
+        var failed = kernel.QueryComponent(identity).Value!;
+        Assert.True(failed.Reclaimable);
+        Assert.True(kernel.Processes.ResolveTerminalState(failed.Process).IsSuccess);
+        Assert.True(kernel.RetireReclaimableComponent(identity, failed.Process).IsSuccess);
+        Assert.Equal(1, provider.DeviceBindCalls);
+        Assert.Equal(1, provider.Log.Count(item => item == "revoke-device"));
+        Assert.Equal(boundary is 0 or 3 ? 0 : 1, provider.Log.Count(item => item == "revoke-irq"));
+    }
+
     private static void AssertOrdered(IReadOnlyList<string> log, params string[] expected)
     {
         var position = -1;
@@ -351,7 +823,8 @@ public sealed class DriverComponentVerticalSliceTests
         IPlatformIrqBindingProvider,
         IPlatformOwnedRegionMappingProvider,
         IPlatformRegionRevocationProvider,
-        IPlatformDmaGrantProvider
+        IPlatformDmaGrantProvider,
+        IPlatformProviderIncarnationSource
     {
         private readonly Dictionary<PlatformProviderDeviceLeaseId, PlatformProviderDeviceLease> _devices = [];
         private readonly Dictionary<PlatformProviderMmioLeaseId, PlatformProviderMmioLease> _mmio = [];
@@ -369,12 +842,22 @@ public sealed class DriverComponentVerticalSliceTests
         private ulong _nextOperation = 1;
         private ulong _nextIrqSequence = 1;
 
+        public Action? DeviceBindCallback { get; set; }
+        public bool ThrowSourceAfterDeviceRevoke { get; set; }
+        public bool ThrowSourceObservation { get; set; }
+        public PlatformProviderIncarnation CurrentIncarnation => ThrowSourceObservation
+            ? throw new IOException("Temporary source observation failure after exact device close") : new(1);
+        public Action? MmioBindCallback { get; set; }
+        public Action? IrqBindCallback { get; set; }
         public int DeviceBindCalls { get; private set; }
         public int MmioBindCalls { get; private set; }
         public int IrqBindCalls { get; private set; }
         public int DmaBindCalls { get; private set; }
         public PlatformAuthorityStatus? DmaRevokeStatus { get; set; }
         public PlatformAuthorityStatus? DeviceRevokeStatus { get; set; }
+        public PlatformAuthorityStatus? MmioRevokeStatus { get; set; }
+        public PlatformAuthorityStatus? IrqRevokeStatus { get; set; }
+        public Action? BeforeChildRevoke { get; set; }
         public Action? BeforeDeviceRevoke { get; set; }
         public bool ThrowDeviceRevoke { get; set; }
         public List<string> Log { get; } = [];
@@ -422,6 +905,7 @@ public sealed class DriverComponentVerticalSliceTests
                 return PlatformAuthorityResult<PlatformProviderDeviceLease>.Fail(PlatformAuthorityStatus.WrongDomain, "Wrong domain.");
             var lease = new PlatformProviderDeviceLease(new PlatformProviderDeviceLeaseId(_nextDevice++), new PlatformProviderLeaseGeneration(1), domainLease, device, rights);
             _devices.Add(lease.LeaseId, lease);
+            DeviceBindCallback?.Invoke();
             return PlatformAuthorityResult<PlatformProviderDeviceLease>.Ok(lease);
         }
 
@@ -435,6 +919,7 @@ public sealed class DriverComponentVerticalSliceTests
                 return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Denied, "Child device resources remain live.");
             Log.Add("revoke-device");
             _devices.Remove(lease.LeaseId);
+            if (ThrowSourceAfterDeviceRevoke) ThrowSourceObservation = true;
             return PlatformAuthorityResult.Ok();
         }
 
@@ -446,11 +931,15 @@ public sealed class DriverComponentVerticalSliceTests
             if (!_devices.ContainsKey(deviceLease.LeaseId)) return PlatformAuthorityResult<PlatformProviderMmioLease>.Fail(PlatformAuthorityStatus.Revoked, "Device is not live.");
             var lease = new PlatformProviderMmioLease(new PlatformProviderMmioLeaseId(_nextMmio++), new PlatformProviderLeaseGeneration(1), deviceLease, region, range, access);
             _mmio.Add(lease.LeaseId, lease);
+            MmioBindCallback?.Invoke();
             return PlatformAuthorityResult<PlatformProviderMmioLease>.Ok(lease);
         }
 
         public PlatformAuthorityResult RevokeMmio(PlatformProviderMmioLease lease)
         {
+            BeforeChildRevoke?.Invoke();
+            if (MmioRevokeStatus is { } status)
+                return PlatformAuthorityResult.Fail(status, "Injected MMIO closure refusal.");
             Log.Add("revoke-mmio");
             _mmio.Remove(lease.LeaseId);
             return PlatformAuthorityResult.Ok();
@@ -462,6 +951,7 @@ public sealed class DriverComponentVerticalSliceTests
             if (!_devices.ContainsKey(deviceLease.LeaseId)) return PlatformAuthorityResult<PlatformProviderIrqBinding>.Fail(PlatformAuthorityStatus.Revoked, "Device is not live.");
             var binding = new PlatformProviderIrqBinding(new PlatformProviderIrqBindingId(_nextIrq++), new PlatformProviderLeaseGeneration(1), deviceLease, source);
             _irqs.Add(binding.BindingId, binding);
+            IrqBindCallback?.Invoke();
             return PlatformAuthorityResult<PlatformProviderIrqBinding>.Ok(binding);
         }
 
@@ -480,6 +970,9 @@ public sealed class DriverComponentVerticalSliceTests
 
         public PlatformAuthorityResult RevokeInterrupt(PlatformProviderIrqBinding binding)
         {
+            BeforeChildRevoke?.Invoke();
+            if (IrqRevokeStatus is { } status)
+                return PlatformAuthorityResult.Fail(status, "Injected IRQ closure refusal.");
             Log.Add("revoke-irq");
             _pendingIrqs.Remove(binding.BindingId);
             _irqs.Remove(binding.BindingId);

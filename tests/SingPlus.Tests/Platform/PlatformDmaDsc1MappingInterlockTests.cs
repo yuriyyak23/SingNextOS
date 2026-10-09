@@ -12,6 +12,59 @@ public sealed class PlatformDmaDsc1MappingInterlockTests
     private const long OperationLength = 16;
     private const long DisjointDscOffset = 64;
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CapabilityRevokeDsc1CallbackAllowsWorkerAdmissionAndPreservesClosure(bool throwAfterAdmission)
+    {
+        var scenario = CreateScenario(2221, 2410);
+        var submitted = SubmitDsc1(scenario, scenario.First, scenario.Second, DisjointDscOffset);
+        Assert.True(submitted.IsSuccess);
+        var workerAdmitted = false;
+        scenario.Provider.BeforeDsc1Cancel = () =>
+        {
+            Assert.Equal(KernelError.PlatformBindingRevoked,
+                scenario.Kernel.PlatformAuthority.ValidateMapping(
+                    scenario.First.Mapping.Mapping, scenario.Binding.Subject).Error);
+            var worker = Task.Run(() => scenario.Kernel.MintCapability(
+                scenario.Binding.Subject.DomainId, scenario.Subject,
+                ResourceKind.Compute, "compute/revoke-callback", CapabilityRights.Execute));
+            Assert.True(worker.Wait(TimeSpan.FromSeconds(5)));
+            Assert.True(worker.Result.IsSuccess);
+            workerAdmitted = true;
+            if (throwAfterAdmission)
+                throw new InvalidOperationException("Injected cancellation callback failure.");
+        };
+
+        var revoked = scenario.Kernel.RevokeCapability(scenario.First.Capability);
+
+        Assert.True(workerAdmitted);
+        Assert.Equal(1, scenario.Provider.Dsc1CancelCalls);
+        Assert.False(scenario.Kernel.CapabilityAuthority.Validate(scenario.First.Capability,
+            scenario.Binding.Subject.DomainId, scenario.Subject.Generation, CapabilityRights.Map).IsSuccess);
+        Assert.Equal(!throwAfterAdmission, revoked.IsSuccess);
+        if (throwAfterAdmission)
+        {
+            Assert.Equal(KernelError.PlatformFaulted, revoked.Error);
+            Assert.Equal(KernelError.PlatformFaulted,
+                scenario.Kernel.CancelPlatformDsc1Copy(scenario.Subject, submitted.Value!).Error);
+            Assert.Equal(1, scenario.Provider.Dsc1CancelCalls);
+            Assert.Throws<InvalidOperationException>(() => { _ = scenario.First.Buffer.Span.Length; });
+            Assert.Throws<InvalidOperationException>(() => { _ = scenario.Second.Buffer.Span.Length; });
+        }
+        else
+        {
+            Assert.True(scenario.First.Buffer.IsValid);
+            Assert.True(scenario.Second.Buffer.IsValid);
+            Assert.Equal(128, scenario.First.Buffer.Span.Length);
+            Assert.Equal(128, scenario.Second.Buffer.Span.Length);
+        }
+        Assert.True(Task.Run(() => scenario.Kernel.MintCapability(
+            scenario.Binding.Subject.DomainId, scenario.Subject,
+            ResourceKind.Compute, "compute/after-revoke", CapabilityRights.Execute))
+            .Wait(TimeSpan.FromSeconds(5)));
+    }
+
     [Fact]
     public void CapabilityRevokeDeniesMappingBeforeDsc1CancellationCallback()
     {
@@ -534,7 +587,7 @@ public sealed class PlatformDmaDsc1MappingInterlockTests
     [Theory]
     [InlineData(FirstSubmitMechanism.Dma)]
     [InlineData(FirstSubmitMechanism.Dsc1)]
-    public async Task InFlightConflictingSubmitLinearizesAndDenialRollsBackPin(
+    public async Task InFlightConflictingSubmitLinearizesAndDenialPreservesApplicableLifetime(
         FirstSubmitMechanism first)
     {
         var scenario = CreateScenario(2210 + (ulong)first, 2300 + (ulong)first);
@@ -575,7 +628,8 @@ public sealed class PlatformDmaDsc1MappingInterlockTests
             {
                 Assert.True(contenderStarted.Wait(TimeSpan.FromSeconds(5)));
                 await Task.Delay(TimeSpan.FromMilliseconds(100));
-                Assert.False(waitingDsc1.IsCompleted);
+                var pending = await waitingDsc1.WaitAsync(TimeSpan.FromSeconds(5));
+                Assert.Equal(KernelError.PlatformBindingDraining, pending.Error);
                 Assert.False(contenderProviderEntered.IsSet);
             }
             finally
@@ -586,7 +640,8 @@ public sealed class PlatformDmaDsc1MappingInterlockTests
             var denied = await firstTask;
             Assert.False(denied.IsSuccess);
             Assert.Equal(KernelError.PlatformDenied, denied.Error);
-            var accepted = await waitingDsc1;
+            Assert.Equal(KernelError.PlatformBindingDraining, (await waitingDsc1).Error);
+            var accepted = SubmitDsc1(scenario, scenario.First, scenario.Second, DisjointDscOffset);
             Assert.True(accepted.IsSuccess, accepted.Message);
             Assert.True(contenderProviderEntered.IsSet);
             Assert.True(scenario.Kernel.CancelPlatformDsc1Copy(
@@ -632,12 +687,14 @@ public sealed class PlatformDmaDsc1MappingInterlockTests
             Assert.False(rejected.IsSuccess);
             Assert.Equal(KernelError.PlatformBindingActive, rejected.Error);
             Assert.False(contenderProviderEntered.IsSet);
-            var accepted = scenario.Kernel.SubmitPlatformDma(
+            var stillRejected = scenario.Kernel.SubmitPlatformDma(
                 scenario.Subject,
                 dmaGrant,
                 prepared.Value!);
-            Assert.True(accepted.IsSuccess, accepted.Message);
-            Assert.True(contenderProviderEntered.IsSet);
+            Assert.False(stillRejected.IsSuccess);
+            Assert.Equal(KernelError.PlatformFaulted, stillRejected.Error);
+            Assert.False(contenderProviderEntered.IsSet);
+            Assert.False(scenario.Kernel.TerminateProcess(scenario.Subject).IsSuccess);
         }
     }
 
@@ -684,7 +741,8 @@ public sealed class PlatformDmaDsc1MappingInterlockTests
             {
                 Assert.True(contenderStarted.Wait(TimeSpan.FromSeconds(5)));
                 await Task.Delay(TimeSpan.FromMilliseconds(100));
-                Assert.False(waitingDsc1.IsCompleted);
+                var pending = await waitingDsc1.WaitAsync(TimeSpan.FromSeconds(5));
+                Assert.Equal(KernelError.PlatformBindingDraining, pending.Error);
                 Assert.False(contenderProviderEntered.IsSet);
             }
             finally
@@ -696,7 +754,7 @@ public sealed class PlatformDmaDsc1MappingInterlockTests
             Assert.True(accepted.IsSuccess, accepted.Message);
             var rejected = await waitingDsc1;
             Assert.False(rejected.IsSuccess);
-            Assert.Equal(KernelError.PlatformBindingActive, rejected.Error);
+            Assert.Equal(KernelError.PlatformBindingDraining, rejected.Error);
             Assert.False(contenderProviderEntered.IsSet);
             Assert.Equal(0, scenario.Provider.Dsc1SubmitCalls);
             CompleteAndFinalizeDma(scenario, accepted.Value!);

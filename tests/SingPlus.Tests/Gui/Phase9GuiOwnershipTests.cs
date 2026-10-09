@@ -14,6 +14,226 @@ namespace SingPlus.Tests.Gui;
 public sealed class Phase9GuiOwnershipTests
 {
     [Fact]
+    public async Task CompositorSurfaceLastIdentityPublishesOnceAndNextAdmissionHasNoEffect()
+    {
+        var scenario = CreateScenario();
+        var client = ICompositorServiceRuntimeClient.Create(new RuntimeSipClientTransport(scenario.Kernel, scenario.Caller, scenario.Session));
+        typeof(RuntimeCompositorServiceHost).GetField("_nextSurface", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(scenario.Host, ulong.MaxValue);
+        var first = scenario.Kernel.AllocateBuffer<byte>(scenario.Caller, 16).Value!;
+        var registering = client.RegisterSurfaceAsync(new(scenario.Capability, first.Handle, Metadata())).AsTask();
+        Assert.True(scenario.Host.ProcessNext().IsSuccess);
+        var surface = (await registering).Authority.Surface;
+        Assert.Equal(ulong.MaxValue, surface.Identity.Value);
+        var second = scenario.Kernel.AllocateBuffer<byte>(scenario.Caller, 16).Value!;
+        var refused = client.RegisterSurfaceAsync(new(scenario.Capability, second.Handle, Metadata())).AsTask();
+        Assert.Equal(KernelError.CapacityExhausted, scenario.Host.ProcessNext().Error);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => refused.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal(SurfaceLifecycleState.Writable, scenario.Host.GetSurfaceState(surface));
+        var surfaces = (global::System.Collections.IDictionary)typeof(RuntimeCompositorServiceHost)
+            .GetField("_surfaces", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(scenario.Host)!;
+        Assert.Single(surfaces.Keys.Cast<object>());
+        Assert.All(scenario.Kernel.Regions.Snapshot(), region => Assert.Equal(RegionState.Owned, region.State));
+        Assert.True(scenario.Kernel.CloseSession(scenario.Caller, scenario.Session).IsSuccess);
+        Assert.True(scenario.Kernel.TerminateProcess(scenario.Caller).IsSuccess);
+        Assert.All(scenario.Kernel.Regions.Snapshot(), region => Assert.Equal(RegionState.Released, region.State));
+    }
+
+    [Fact]
+    public async Task CompositorPresentLastIdentityRetainsOriginalPrepareAndRefusesNextBeforeLoan()
+    {
+        var scenario = CreateScenario();
+        var client = ICompositorServiceRuntimeClient.Create(new RuntimeSipClientTransport(scenario.Kernel, scenario.Caller, scenario.Session));
+        var buffer = scenario.Kernel.AllocateBuffer<byte>(scenario.Caller, 16).Value!;
+        var registering = client.RegisterSurfaceAsync(new(scenario.Capability, buffer.Handle, Metadata())).AsTask();
+        Assert.True(scenario.Host.ProcessNext().IsSuccess);
+        var surface = (await registering).Authority.Surface;
+        typeof(RuntimeCompositorServiceHost).GetField("_nextOperation", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(scenario.Host, ulong.MaxValue);
+        var prepared = client.PreparePresentAsync(new(surface, PresentTransferMode.ReadLease)).AsTask();
+        scenario.Kernel.SessionInvocationSettlementReservedHook = () =>
+        {
+            Assert.Equal(KernelError.SessionDraining, scenario.Host.ProcessNext().Error);
+            Assert.Equal(SurfaceLifecycleState.Writable, scenario.Host.GetSurfaceState(surface));
+        };
+        Assert.True(scenario.Host.ProcessNext().IsSuccess);
+        await prepared;
+        scenario.Kernel.SessionInvocationSettlementReservedHook = null;
+        var presenting = client.PresentReadLeaseAsync(buffer).AsTask();
+        Assert.True(scenario.Host.AcceptNext().IsSuccess);
+        Assert.True(scenario.Host.CompleteAccepted().IsSuccess);
+        var fence = (await presenting).Fence;
+        Assert.True(fence.Terminal);
+        Assert.Equal(ulong.MaxValue, fence.Operation.Value);
+        var refused = client.PreparePresentAsync(new(surface, PresentTransferMode.ReadLease)).AsTask();
+        Assert.Equal(KernelError.CapacityExhausted, scenario.Host.ProcessNext().Error);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => refused.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal(SurfaceLifecycleState.Writable, scenario.Host.GetSurfaceState(surface));
+        Assert.Equal(RegionState.Owned, Assert.Single(scenario.Kernel.Regions.Snapshot()).State);
+        Assert.True(scenario.Kernel.CloseSession(scenario.Caller, scenario.Session).IsSuccess);
+        Assert.True(scenario.Kernel.TerminateProcess(scenario.Caller).IsSuccess);
+        Assert.Equal(RegionState.Released, Assert.Single(scenario.Kernel.Regions.Snapshot()).State);
+    }
+
+    [Theory]
+    [InlineData(0, false, false)] [InlineData(1, false, false)] [InlineData(2, false, false)]
+    [InlineData(0, true, false)] [InlineData(1, true, false)] [InlineData(2, true, false)]
+    [InlineData(0, true, true)]
+    public async Task ExactCompositorBorrowReturnSurvivesFencePublicationRefusal(int fault, bool afterReservation, bool laterLoan)
+    {
+        var scenario = CreateScenario();
+        var (buffer, surface, present) = await AcceptReadLeasePresent(scenario);
+        var foreign = CreateScenario();
+        var (_, foreignSurface, foreignPresent) = await AcceptReadLeasePresent(foreign);
+        Assert.True(foreign.Host.CompleteAccepted().IsSuccess);
+        Assert.True((await foreignPresent.WaitAsync(TimeSpan.FromSeconds(10))).Fence.Terminal);
+        var registry = (EndpointSessionInvocationRegistry)typeof(RuntimeKernel)
+            .GetProperty("SessionInvocations", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(scenario.Kernel)!;
+        var foreignRegistry = (EndpointSessionInvocationRegistry)typeof(RuntimeKernel)
+            .GetProperty("SessionInvocations", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(foreign.Kernel)!;
+        var routes = (global::System.Collections.IDictionary)typeof(EndpointSessionInvocationRegistry)
+            .GetField("_records", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(registry)!;
+        var foreignRoutes = (global::System.Collections.IDictionary)typeof(EndpointSessionInvocationRegistry)
+            .GetField("_records", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(foreignRegistry)!;
+        var work = typeof(RuntimeCompositorServiceHost).GetField("_accepted", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(scenario.Host)!;
+        var invocation = (EndpointSessionInvocationHandle)work.GetType().GetProperty("Invocation")!.GetValue(work)!;
+        object key = (invocation.Session.SessionId, invocation.Session.Generation, invocation.InvocationId);
+        var original = routes[key]!;
+        void LoseRoute()
+        {
+            if (fault == 0) routes.Remove(key);
+            else routes[key] = fault == 1 ? foreignRoutes[key] : original.GetType()
+                .GetMethod("MemberwiseClone", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(original, null);
+        }
+        if (afterReservation) scenario.Kernel.SessionInvocationSettlementReservedHook = LoseRoute;
+        else LoseRoute();
+        Assert.False(scenario.Host.CompleteAccepted().IsSuccess);
+        Assert.Equal(RegionState.Owned, Assert.Single(scenario.Kernel.Regions.Snapshot()).State);
+        Assert.Equal(SurfaceLifecycleState.Quarantined, scenario.Host.GetSurfaceState(surface));
+        Assert.False(present.IsCompleted);
+        Assert.False(scenario.Kernel.CloseSession(scenario.Caller, scenario.Session).IsSuccess);
+        Assert.Equal(SurfaceLifecycleState.Writable, foreign.Host.GetSurfaceState(foreignSurface));
+        BorrowLeaseHandle? nextLoan = null;
+        if (laterLoan)
+        {
+            var loan = scenario.Kernel.Regions.Loan(buffer.Handle,
+                new RegionOwner(scenario.Kernel.Processes.Resolve(scenario.Caller).Value!.DomainId, scenario.Caller.Generation),
+                new RegionOwner(scenario.Kernel.Processes.Resolve(scenario.Service).Value!.DomainId, scenario.Service.Generation));
+            Assert.True(loan.IsSuccess);
+            nextLoan = loan.Value;
+        }
+        routes[key] = original;
+        scenario.Kernel.SessionInvocationSettlementReservedHook = null;
+        Assert.True(scenario.Host.CompleteAccepted().IsSuccess);
+        var fence = (await present.WaitAsync(TimeSpan.FromSeconds(10))).Fence;
+        Assert.True(fence.Terminal);
+        Assert.Equal(surface, fence.Surface);
+        if (nextLoan is { } fresh)
+        {
+            Assert.Equal(RegionState.Loaned, Assert.Single(scenario.Kernel.Regions.Snapshot()).State);
+            Assert.False(scenario.Kernel.ReleaseRegion(scenario.Caller, buffer).IsSuccess);
+            Assert.True(scenario.Kernel.ReturnBorrow(scenario.Service, fresh).IsSuccess);
+        }
+        Assert.True(scenario.Kernel.CloseSession(scenario.Caller, scenario.Session).IsSuccess);
+        Assert.True(scenario.Kernel.TerminateProcess(scenario.Caller).IsSuccess);
+        Assert.Equal(RegionState.Released, Assert.Single(scenario.Kernel.Regions.Snapshot()).State);
+    }
+
+    private static async Task<(OwnedBuffer<byte> Buffer, SurfaceHandle Surface, Task<ReleaseFenceResponse> Present)> AcceptReadLeasePresent(Scenario scenario)
+    {
+        var client = ICompositorServiceRuntimeClient.Create(new RuntimeSipClientTransport(scenario.Kernel, scenario.Caller, scenario.Session));
+        var buffer = scenario.Kernel.AllocateBuffer<byte>(scenario.Caller, 16).Value!;
+        var registration = client.RegisterSurfaceAsync(new(scenario.Capability, buffer.Handle, Metadata())).AsTask();
+        Assert.True(scenario.Host.ProcessNext().IsSuccess);
+        var surface = (await registration).Authority.Surface;
+        var prepare = client.PreparePresentAsync(new(surface, PresentTransferMode.ReadLease)).AsTask();
+        Assert.True(scenario.Host.ProcessNext().IsSuccess);
+        await prepare;
+        var present = client.PresentReadLeaseAsync(buffer).AsTask();
+        Assert.True(scenario.Host.AcceptNext().IsSuccess);
+        return (buffer, surface, present);
+    }
+
+    [Fact]
+    public async Task CompositorCompletionExceptionRetainsOriginalWorkAndRefusesEffectRetry()
+    {
+        var scenario = CreateScenario();
+        var client = ICompositorServiceRuntimeClient.Create(new RuntimeSipClientTransport(scenario.Kernel, scenario.Caller, scenario.Session));
+        var buffer = scenario.Kernel.AllocateBuffer<byte>(scenario.Caller, 16).Value!;
+        var registration = client.RegisterSurfaceAsync(new(scenario.Capability, buffer.Handle, Metadata())).AsTask();
+        Assert.True(scenario.Host.ProcessNext().IsSuccess);
+        var surface = (await registration).Authority.Surface;
+        var prepare = client.PreparePresentAsync(new(surface, PresentTransferMode.ReadLease)).AsTask();
+        Assert.True(scenario.Host.ProcessNext().IsSuccess);
+        await prepare;
+        var present = client.PresentReadLeaseAsync(buffer).AsTask();
+        Assert.True(scenario.Host.AcceptNext().IsSuccess);
+        var calls = 0;
+        scenario.Kernel.SessionInvocationSettlementReservedHook = () =>
+        {
+            calls++;
+            Assert.Equal(KernelError.SessionDraining, scenario.Host.CompleteAccepted().Error);
+            Assert.Equal(KernelError.SessionDraining, scenario.Host.Drain().Error);
+            throw new InvalidOperationException("Original completion outcome unavailable.");
+        };
+        Assert.Throws<InvalidOperationException>(() => scenario.Host.CompleteAccepted());
+        Assert.Equal(KernelError.ExternalEffectUncontained, scenario.Host.CompleteAccepted().Error);
+        Assert.Equal(KernelError.ExternalEffectUncontained, scenario.Host.AcceptNext().Error);
+        Assert.Equal(KernelError.ExternalEffectUncontained, scenario.Host.Drain().Error);
+        Assert.False(present.IsCompleted);
+        Assert.False(scenario.Kernel.TerminateProcess(scenario.Caller).IsSuccess);
+        Assert.False(scenario.Kernel.QueryProcessTeardown(scenario.Caller).Value.LocalReclaimCompleted);
+        Assert.NotEqual(RegionState.Released, Assert.Single(scenario.Kernel.Regions.Snapshot()).State);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => present.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal(1, calls);
+    }
+
+    [Fact]
+    public async Task OriginalCompositorCompletionRejectsOverlapWithoutRepeatingBorrowRelease()
+    {
+        var scenario = CreateScenario();
+        var client = ICompositorServiceRuntimeClient.Create(new RuntimeSipClientTransport(scenario.Kernel, scenario.Caller, scenario.Session));
+        var buffer = scenario.Kernel.AllocateBuffer<byte>(scenario.Caller, 16).Value!;
+        var registration = client.RegisterSurfaceAsync(new(scenario.Capability, buffer.Handle, Metadata())).AsTask();
+        Assert.True(scenario.Host.ProcessNext().IsSuccess);
+        var surface = (await registration).Authority.Surface;
+        var prepare = client.PreparePresentAsync(new(surface, PresentTransferMode.ReadLease)).AsTask();
+        Assert.True(scenario.Host.ProcessNext().IsSuccess);
+        await prepare;
+        var present = client.PresentReadLeaseAsync(buffer).AsTask();
+        Assert.True(scenario.Host.AcceptNext().IsSuccess);
+        using var release = new ManualResetEventSlim();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        scenario.Kernel.SessionInvocationSettlementReservedHook = () =>
+        {
+            Interlocked.Increment(ref calls);
+            entered.TrySetResult();
+            Assert.True(release.Wait(TimeSpan.FromSeconds(10)));
+        };
+        // This worker intentionally blocks inside a callback; keep unrelated
+        // async session consumers off its scheduling dependency.
+        var completion = Task.Factory.StartNew(scenario.Host.CompleteAccepted,
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(RegionState.Owned, Assert.Single(scenario.Kernel.Regions.Snapshot()).State);
+            Assert.Equal(KernelError.SessionDraining, scenario.Host.CompleteAccepted().Error);
+            Assert.Equal(KernelError.SessionDraining, scenario.Host.AcceptNext().Error);
+            Assert.Equal(KernelError.SessionDraining, scenario.Kernel.CloseSession(scenario.Caller, scenario.Session).Error);
+            Assert.Equal(SurfaceLifecycleState.Presented, scenario.Host.GetSurfaceState(surface));
+            Assert.False(present.IsCompleted);
+        }
+        finally { release.Set(); }
+        Assert.True((await completion.WaitAsync(TimeSpan.FromSeconds(10))).IsSuccess);
+        Assert.True((await present.WaitAsync(TimeSpan.FromSeconds(10))).Fence.Terminal);
+        scenario.Kernel.SessionInvocationSettlementReservedHook = null;
+        Assert.Equal(1, calls);
+        Assert.True(scenario.Kernel.CloseSession(scenario.Caller, scenario.Session).IsSuccess);
+        Assert.True(scenario.Kernel.TerminateProcess(scenario.Caller).IsSuccess);
+        Assert.Equal(RegionState.Released, Assert.Single(scenario.Kernel.Regions.Snapshot()).State);
+    }
+
+    [Fact]
     public async Task CpuReadLeaseUsesGeneratedSessionAndBlocksWritesUntilExactTerminalRelease()
     {
         var scenario = CreateScenario();

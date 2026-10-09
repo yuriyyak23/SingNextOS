@@ -21,9 +21,10 @@ public sealed partial class PlatformAuthorityBridge
     internal KernelResult<PlatformDmaGrant> ResolveDmaSubmissionGrant(
         PlatformDmaSubmission submission, PlatformDomainIdentity expectedSubject)
     {
+        lock (_secureDomainLifecycleGate)
         lock (_dmaCompletionGate)
         {
-            var identity = ValidateDmaSubmissionIdentityLocked(submission, expectedSubject, observeProvider: false);
+            var identity = ValidateDmaSubmissionIdentityLocked(submission, expectedSubject);
             return identity.IsSuccess
                 ? KernelResult<PlatformDmaGrant>.Ok(_dmaGrants[submission.GrantId].Grant)
                 : KernelResult<PlatformDmaGrant>.Fail(identity.Error, identity.Message!);
@@ -36,16 +37,18 @@ public sealed partial class PlatformAuthorityBridge
         PlatformMemoryAccess requestedAccess,
         ulong faultSequence,
         PlatformDomainIdentity expectedSubject,
-        Func<KernelResult> revalidateRegion)
+        Func<Func<KernelResult<PlatformDmaPageFaultResolutionEvidence>>, KernelResult<PlatformDmaPageFaultResolutionEvidence>> ownerCommit)
     {
         DmaSubmissionRecord record;
         PlatformProviderDmaPageFaultRequest request;
         IPlatformDmaPageFaultProvider pageFaultProvider;
         PlatformProviderIncarnation incarnation;
         PlatformBackendEpoch backendEpoch;
+        DmaGrantRecord grantRecord;
+        lock (_secureDomainLifecycleGate)
         lock (_dmaCompletionGate)
         {
-            var identity = ValidateDmaSubmissionIdentityLocked(submission, expectedSubject, observeProvider: false);
+            var identity = ValidateDmaSubmissionIdentityLocked(submission, expectedSubject);
             if (!identity.IsSuccess)
                 return KernelResult<PlatformDmaPageFaultResolutionEvidence>.Fail(identity.Error, identity.Message!);
             record = _activeDmaSubmissions[submission.GrantId];
@@ -59,7 +62,7 @@ public sealed partial class PlatformAuthorityBridge
                 return KernelResult<PlatformDmaPageFaultResolutionEvidence>.Fail(KernelError.PlatformFaulted,
                     "DMA page-fault state is fault-pinned.");
             if (record.PageFaultsInFlight.Contains(faultSequence) ||
-                record.ResolvedPageFaults.Contains(faultSequence))
+                record.ResolvedPageFaults.Contains(faultSequence) || record.KnownPageFaultEvidence.ContainsKey(faultSequence))
                 return KernelResult<PlatformDmaPageFaultResolutionEvidence>.Fail(KernelError.PlatformDenied,
                     "DMA page-fault sequence is already in flight or resolved.");
             if (!_featureManifest.Supports(PlatformFeatureFamily.DmaMapping,
@@ -68,7 +71,7 @@ public sealed partial class PlatformAuthorityBridge
                 _provider is not IPlatformDmaPageFaultProvider exactProvider)
                 return KernelResult<PlatformDmaPageFaultResolutionEvidence>.Fail(KernelError.PlatformUnsupported,
                     "The DMA provider does not expose generation-bound page-fault resolution.");
-            var grantRecord = _dmaGrants[submission.GrantId];
+            grantRecord = _dmaGrants[submission.GrantId];
             request = new(record.ProviderSubmission, grantRecord.ProviderGrant,
                 faultRange, requestedAccess, faultSequence);
             var requestValidation = PlatformDmaPageFaultContract.ValidateRequest(request);
@@ -84,97 +87,74 @@ public sealed partial class PlatformAuthorityBridge
 
         try
         {
-            lock (_dmaCompletionGate)
+            incarnation = CurrentProviderIncarnation();
+            var admitted = Commit(false);
+            if (!admitted.IsSuccess) return admitted;
+            var reply = pageFaultProvider.ResolveDmaPageFault(request);
+            if (!reply.IsSuccess)
             {
-                try { incarnation = CurrentProviderIncarnation(); }
-                catch (Exception exception)
-                {
-                    FaultPinDmaSubmissionLocked(submission.GrantId);
-                    return KernelResult<PlatformDmaPageFaultResolutionEvidence>.Fail(KernelError.PlatformFaulted,
-                        $"DMA page-fault generation read failed; the submitted effect remains pinned: {exception.Message}");
-                }
-                var identity = ValidateDmaSubmissionIdentityLocked(submission, expectedSubject, observeProvider: false);
-                if (BackendEpoch != backendEpoch || _dmaSubmissionFaultPins.Contains(submission.GrantId) ||
-                    !identity.IsSuccess || record.CompletionProven || record.CompletionObservationInFlight ||
-                    incarnation.Value == 0 || incarnation != _dmaGrants[submission.GrantId].ProviderIncarnation)
-                {
-                    FaultPinDmaSubmissionLocked(submission.GrantId);
-                    return KernelResult<PlatformDmaPageFaultResolutionEvidence>.Fail(KernelError.PlatformFaulted,
-                        "DMA page-fault authority changed during generation admission; the effect remains pinned.");
-                }
-                var usable = revalidateRegion();
-                if (!usable.IsSuccess)
-                    return KernelResult<PlatformDmaPageFaultResolutionEvidence>.Fail(usable.Error, usable.Message!);
+                lock (_dmaCompletionGate)
+                    if (reply.Status is PlatformAuthorityStatus.Faulted or PlatformAuthorityStatus.Stale or
+                        PlatformAuthorityStatus.Revoked or PlatformAuthorityStatus.WrongDomain)
+                        FaultPinDmaSubmissionLocked(submission.GrantId);
+                return FromProviderFailure<PlatformDmaPageFaultResolutionEvidence>(reply.Status, reply.Message);
             }
-            PlatformAuthorityResult<PlatformProviderDmaPageFaultEvidence> providerResult;
-            try { providerResult = pageFaultProvider.ResolveDmaPageFault(request); }
-            catch (Exception exception)
+            var valid = PlatformDmaPageFaultContract.ValidateEvidence(request, reply.Value!);
+            if (!valid.IsSuccess)
             {
                 lock (_dmaCompletionGate) FaultPinDmaSubmissionLocked(submission.GrantId);
                 return KernelResult<PlatformDmaPageFaultResolutionEvidence>.Fail(KernelError.PlatformFaulted,
-                    $"The provider threw during DMA page-fault resolution; the mapping remains pinned: {exception.Message}");
+                    valid.Message ?? "Malformed page-fault receipt; original effect remains pinned.");
             }
-
+            // Exact known provider fact; not local publication or closure.
+            lock (_dmaCompletionGate)
+                record.KnownPageFaultEvidence[faultSequence] = (backendEpoch, reply.Value!);
+            lock (_secureDomainLifecycleGate)
             lock (_dmaCompletionGate)
             {
-                if (_dmaSubmissionFaultPins.Contains(submission.GrantId))
+                if (_dmaSubmissionFaultPins.Contains(submission.GrantId) || BackendEpoch != backendEpoch)
                     return KernelResult<PlatformDmaPageFaultResolutionEvidence>.Fail(KernelError.PlatformFaulted,
-                        "DMA page-fault authority became fault-pinned during resolution.");
-                PlatformProviderIncarnation observedIncarnation;
-                try { observedIncarnation = CurrentProviderIncarnation(); }
-                catch (Exception exception)
+                        "Known page-fault fact retained after original authority was fault-pinned.");
+            }
+            try { incarnation = CurrentProviderIncarnation(); }
+            catch (Exception exception) when (exception is not StackOverflowException)
+            {
+                return KernelResult<PlatformDmaPageFaultResolutionEvidence>.Fail(KernelError.PlatformFaulted,
+                    $"Known page-fault receipt retained; source unavailable: {exception.GetType().Name}.");
+            }
+            return Commit(true);
+        }
+        catch (Exception exception) when (exception is not StackOverflowException)
+        {
+            lock (_dmaCompletionGate) FaultPinDmaSubmissionLocked(submission.GrantId);
+            return KernelResult<PlatformDmaPageFaultResolutionEvidence>.Fail(KernelError.PlatformFaulted,
+                $"Page-fault outcome unknown; original effect pinned: {exception.GetType().Name}.");
+        }
+        finally { lock (_dmaCompletionGate) record.PageFaultsInFlight.Remove(faultSequence); }
+
+        KernelResult<PlatformDmaPageFaultResolutionEvidence> Commit(bool publish) => ownerCommit(() =>
+        {
+            lock (_secureDomainLifecycleGate)
+            lock (_dmaCompletionGate)
+            {
+                var exact = ValidateDmaSubmissionIdentityLocked(submission, expectedSubject);
+                if (!exact.IsSuccess || BackendEpoch != backendEpoch || _dmaSubmissionFaultPins.Contains(submission.GrantId) ||
+                    !_activeDmaSubmissions.TryGetValue(submission.GrantId, out var current) || !ReferenceEquals(current, record) ||
+                    !_dmaGrants.TryGetValue(submission.GrantId, out var currentGrant) || !ReferenceEquals(currentGrant, grantRecord) ||
+                    record.CompletionProven || record.CompletionObservationInFlight || !record.PageFaultsInFlight.Contains(faultSequence) ||
+                    incarnation.Value == 0 || incarnation != grantRecord.ProviderIncarnation)
                 {
-                    FaultPinDmaSubmissionLocked(submission.GrantId);
+                    FaultPinDmaSubmissionLocked(submission.GrantId,
+                        incarnation != grantRecord.ProviderIncarnation ? incarnation : null);
                     return KernelResult<PlatformDmaPageFaultResolutionEvidence>.Fail(KernelError.PlatformFaulted,
-                        $"DMA page-fault post-response generation read failed; the effect remains pinned: {exception.Message}");
+                        "Page-fault source/submission changed; original effect remains pinned.");
                 }
-                var stillExact = ValidateDmaSubmissionIdentityLocked(submission, expectedSubject, observeProvider: false);
-                if (!stillExact.IsSuccess || BackendEpoch != backendEpoch ||
-                    _dmaSubmissionFaultPins.Contains(submission.GrantId))
-                {
-                    FaultPinDmaSubmissionLocked(submission.GrantId);
-                    return KernelResult<PlatformDmaPageFaultResolutionEvidence>.Fail(KernelError.PlatformFaulted,
-                        "DMA authority changed during page-fault resolution.");
-                }
-                if (observedIncarnation != incarnation)
-                {
-                    FaultPinDmaSubmissionLocked(submission.GrantId, observedIncarnation);
-                    return KernelResult<PlatformDmaPageFaultResolutionEvidence>.Fail(KernelError.PlatformFaulted,
-                        "DMA provider incarnation changed during page-fault resolution.");
-                }
-                if (record.CompletionObservationInFlight || record.CompletionProven)
-                {
-                    FaultPinDmaSubmissionLocked(submission.GrantId);
-                    return KernelResult<PlatformDmaPageFaultResolutionEvidence>.Fail(KernelError.PlatformFaulted,
-                        "DMA completion raced with page-fault resolution; the mapping remains pinned.");
-                }
-                if (!providerResult.IsSuccess)
-                {
-                    if (providerResult.Status is PlatformAuthorityStatus.Faulted or
-                        PlatformAuthorityStatus.Stale or PlatformAuthorityStatus.Revoked or
-                        PlatformAuthorityStatus.WrongDomain)
-                        FaultPinDmaSubmissionLocked(submission.GrantId);
-                    return FromProviderFailure<PlatformDmaPageFaultResolutionEvidence>(
-                        providerResult.Status, providerResult.Message);
-                }
-                var evidenceValidation = PlatformDmaPageFaultContract.ValidateEvidence(
-                    request, providerResult.Value!);
-                if (!evidenceValidation.IsSuccess)
-                {
-                    FaultPinDmaSubmissionLocked(submission.GrantId);
-                    return KernelResult<PlatformDmaPageFaultResolutionEvidence>.Fail(KernelError.PlatformFaulted,
-                        evidenceValidation.Message ?? "Provider DMA page-fault evidence is malformed.");
-                }
+                if (!publish) return KernelResult<PlatformDmaPageFaultResolutionEvidence>.Ok(default);
                 record.ResolvedPageFaults.Add(faultSequence);
                 return KernelResult<PlatformDmaPageFaultResolutionEvidence>.Ok(new(
-                    submission.OperationId, submission.Generation, submission.GrantId,
-                    submission.GrantGeneration, submission.PreparedCycle, faultRange,
-                    requestedAccess, faultSequence));
+                    submission.OperationId, submission.Generation, submission.GrantId, submission.GrantGeneration,
+                    submission.PreparedCycle, faultRange, requestedAccess, faultSequence));
             }
-        }
-        finally
-        {
-            lock (_dmaCompletionGate) record.PageFaultsInFlight.Remove(faultSequence);
-        }
+        });
     }
 }

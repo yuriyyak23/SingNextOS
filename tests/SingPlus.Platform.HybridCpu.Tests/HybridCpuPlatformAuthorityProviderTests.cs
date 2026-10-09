@@ -6,6 +6,94 @@ namespace SingPlus.Platform.HybridCpu.Tests;
 
 public sealed class HybridCpuPlatformAuthorityProviderTests
 {
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void AliasedForeignRootOwnerCannotAuthorizeOriginalKernelReclaim(bool completed)
+    {
+        var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, ChildClosureTupleTests.RootCloseRuntimeProxy>();
+        var proxy = (ChildClosureTupleTests.RootCloseRuntimeProxy)(object)runtime;
+        var provider = new HybridCpuPlatformAuthorityProvider(runtime);
+        var kernel = new RuntimeKernel(provider);
+        var (_, owner) = CreateProcess(kernel, 60, 600, 1);
+        var region = kernel.AllocateBuffer<byte>(owner, 4096).Value!;
+        Assert.True(kernel.BindPlatformDomain(owner).IsSuccess);
+        var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var domains = (global::System.Collections.IDictionary)provider.GetType().GetField("_domains", flags)!.GetValue(provider)!;
+        var subjects = (global::System.Collections.IDictionary)provider.GetType().GetField("_activeSubjects", flags)!.GetValue(provider)!;
+        var original = Assert.Single(domains.Values.Cast<object>());
+        var lease = (PlatformProviderDomainLease)original.GetType().GetProperty("Lease")!.GetValue(original)!;
+        object? foreignClosure = null;
+        if (completed)
+        {
+            var other = provider.BindDomain(new(new DomainId(601), new ProcessHandle(new ProcessId(61), 1))).Value!;
+            Assert.True(provider.RevokeDomain(other).IsSuccess);
+            foreignClosure = domains[other.LeaseId]!.GetType().GetProperty("RootCloseObservation")!.GetValue(domains[other.LeaseId]);
+        }
+        var calls = proxy.CloseCalls;
+        var foreign = typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+        if (completed) foreign.GetType().GetProperty("RootCloseObservation")!.SetValue(foreign, foreignClosure);
+        domains[lease.LeaseId] = foreign; subjects[lease.Subject] = foreign;
+        Assert.False(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.Equal(calls, proxy.CloseCalls);
+        Assert.Equal(1, proxy.Runtime.ActiveBindingCount);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot(), x => x.Handle == region.Handle).State);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void LostRootBindRouteCannotRepeatOriginalNeutralInvocation(bool lostReply)
+    {
+        var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, ChildClosureTupleTests.RootCloseRuntimeProxy>();
+        var proxy = (ChildClosureTupleTests.RootCloseRuntimeProxy)(object)runtime;
+        var provider = new HybridCpuPlatformAuthorityProvider(runtime);
+        var subject = new PlatformDomainIdentity(new DomainId(602), new ProcessHandle(new ProcessId(62), 1));
+        var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var bindings = (global::System.Collections.IDictionary)provider.GetType().GetField("_rootBinds", flags)!.GetValue(provider)!;
+        object? original = null;
+        proxy.BeforeRootBind = () => { proxy.BeforeRootBind = null; original = bindings[subject]; bindings.Remove(subject); };
+        if (lostReply) proxy.RootBindOutcome = "throw";
+        if (lostReply) Assert.ThrowsAny<Exception>(() => provider.BindDomain(subject));
+        else Assert.False(provider.BindDomain(subject).IsSuccess);
+        Assert.NotNull(original);
+        var lease = (PlatformProviderDomainLease)original.GetType().GetProperty("Lease")!.GetValue(original)!;
+        var originals = (global::System.Collections.IDictionary)provider.GetType().GetField("_originalRootBinds", flags)!.GetValue(provider)!;
+        Assert.Same(original, originals[lease.LeaseId]);
+        Assert.Equal(false, original.GetType().GetProperty("InFlight")!.GetValue(original));
+        Assert.Null(original.GetType().GetProperty("PublishedDomain")!.GetValue(original));
+        var raw = original.GetType().GetProperty("Observation")!.GetValue(original);
+        if (lostReply) Assert.Null(raw);
+        else Assert.True(Assert.IsType<NeutralDomainBindResult>(raw).IsBound);
+        proxy.RootBindOutcome = null;
+        Assert.False(provider.BindDomain(subject).IsSuccess);
+        Assert.Equal(1, proxy.RootBindCalls);
+        Assert.Equal(1, proxy.Runtime.ActiveBindingCount);
+    }
+
+    [Fact]
+    public void MissingSubjectRouteCannotCreateSecondOwnerAndClosedOriginalAllowsFreshBind()
+    {
+        var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, ChildClosureTupleTests.RootCloseRuntimeProxy>();
+        var proxy = (ChildClosureTupleTests.RootCloseRuntimeProxy)(object)runtime;
+        var provider = new HybridCpuPlatformAuthorityProvider(runtime);
+        var subject = new PlatformDomainIdentity(new DomainId(603), new ProcessHandle(new ProcessId(63), 1));
+        var lease = provider.BindDomain(subject).Value!;
+        var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var domains = (global::System.Collections.IDictionary)provider.GetType().GetField("_domains", flags)!.GetValue(provider)!;
+        var subjects = (global::System.Collections.IDictionary)provider.GetType().GetField("_activeSubjects", flags)!.GetValue(provider)!;
+        var original = domains[lease.LeaseId]!;
+        subjects.Remove(subject);
+        Assert.False(provider.BindDomain(subject).IsSuccess);
+        Assert.Equal(1, proxy.RootBindCalls);
+        Assert.Equal(1, proxy.Runtime.ActiveBindingCount);
+        subjects[subject] = original;
+        Assert.True(provider.RevokeDomain(lease).IsSuccess);
+        var fresh = provider.BindDomain(subject);
+        Assert.True(fresh.IsSuccess);
+        Assert.NotEqual(lease.LeaseId, fresh.Value!.LeaseId);
+        Assert.True(provider.RevokeDomain(fresh.Value).IsSuccess);
+        Assert.Equal(0, proxy.Runtime.ActiveBindingCount);
+    }
+
     [Fact]
     public void ProviderBindsTransitionsAndRevokesRealNeutralRuntimeLease()
     {

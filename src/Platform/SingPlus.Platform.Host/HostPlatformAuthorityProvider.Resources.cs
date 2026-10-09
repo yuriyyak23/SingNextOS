@@ -113,6 +113,9 @@ public sealed partial class HostPlatformAuthorityProvider
                 "The host resource usage request does not match the exact submission binding.");
         if (record.TerminalEvidence is { } terminal)
             return PlatformAuthorityResult<PlatformResourceUsageEvidence>.Ok(terminal);
+        if (record.NextReceiptSequence == 0)
+            return PlatformAuthorityResult<PlatformResourceUsageEvidence>.Fail(PlatformAuthorityStatus.Faulted,
+                "Host resource receipt sequence capacity is exhausted; exact binding is retained.");
 
         var operation = ObserveCompletion(binding.Operation);
         if (!operation.IsSuccess)
@@ -123,12 +126,13 @@ public sealed partial class HostPlatformAuthorityProvider
         var amount = state == PlatformResourceReconciliationState.ConservativeWorstCase
             ? binding.Reservation.Envelope.Amount
             : 0UL;
-        var sequence = record.NextReceiptSequence++;
+        var sequence = record.NextReceiptSequence;
         var evidence = new PlatformResourceUsageEvidence(PlatformResourceContract.ContractVersion,
             binding.Reservation, binding.Operation, state, amount, sequence);
         var validation = PlatformResourceContract.ValidateUsageEvidence(binding, evidence);
         if (!validation.IsSuccess)
             return PlatformAuthorityResult<PlatformResourceUsageEvidence>.Fail(validation.Status, validation.Message!);
+        record.NextReceiptSequence = sequence == ulong.MaxValue ? 0 : sequence + 1;
         if (evidence.IsTerminal)
         {
             record.TerminalEvidence = evidence;

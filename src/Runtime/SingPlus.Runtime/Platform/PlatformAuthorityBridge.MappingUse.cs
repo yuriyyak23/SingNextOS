@@ -23,6 +23,7 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDsc1RegionRange source,
         PlatformDsc1RegionRange destination)
     {
+        lock (_secureDomainLifecycleGate)
         lock (_dsc1Gate)
         {
             return ValidateDsc1MappingUseAdmissionLocked(
@@ -89,7 +90,7 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDmaGrant grant)
     {
         var state = CrossMechanismMappingUseState.None;
-        foreach (var record in _dsc1Operations.Values)
+        foreach (var record in OriginalDsc1OperationsLocked())
         {
             if (record.LocalReservationsReleased ||
                 (record.Submission.Source.Mapping != grant.Mapping.Mapping &&
@@ -129,6 +130,12 @@ public sealed partial class PlatformAuthorityBridge
                 if (_dmaSubmissionFaultPins.Contains(grant.GrantId))
                 {
                     state = CrossMechanismMappingUseState.Faulted;
+                    continue;
+                }
+
+                if (grantRecord.SubmissionInFlight)
+                {
+                    state = MostSevere(state, CrossMechanismMappingUseState.Draining);
                     continue;
                 }
 

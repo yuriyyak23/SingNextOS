@@ -5,6 +5,19 @@ namespace SingPlus.Runtime;
 
 public sealed class ChannelRegistry
 {
+    internal readonly record struct BoundedPayloadSnapshot(int Size, int Limit);
+
+    internal BoundedPayloadSnapshot? CaptureInlineCopiedPayload(
+        ChannelEndpointHandle endpoint, uint messageId, object? payload)
+    {
+        var channel = Resolve(endpoint);
+        if (!channel.IsSuccess || !channel.Value!.Protocol.TryGetMessage(messageId, out var message) ||
+            message.RequestPayload.Kind != RequestPayloadKind.Bounded || payload is not IBoundedPayload bounded ||
+            !string.Equals(payload.GetType().FullName ?? payload.GetType().Name,
+                message.RequestPayload.TypeName, StringComparison.Ordinal))
+            return null;
+        return new BoundedPayloadSnapshot(bounded.PayloadSize, bounded.MaxPayloadSize);
+    }
     internal readonly record struct TelemetrySummary(int Channels, int QueuedMessages);
     internal readonly record struct ChannelClosureSnapshot(
         ChannelEndpointHandle Original, ulong CurrentGeneration, bool Closed)
@@ -27,12 +40,24 @@ public sealed class ChannelRegistry
         public ulong Sequence { get; set; }
         public bool Closed { get; set; }
         public Queue<ChannelEnvelope> Queue { get; } = new();
+        public Dictionary<ulong, QueuedLifetime> Lifetimes { get; } = [];
+    }
+
+    private sealed class QueuedLifetime(ChannelRecord owner, ulong sequence)
+    {
+        public ChannelRecord Owner { get; } = owner;
+        public ulong Sequence { get; } = sequence;
+        public bool Ended { get; set; }
+        public bool BudgetAttached { get; set; }
+        public object? OriginalBudgetOwner { get; set; }
     }
 
     private readonly CapabilityAuthority _capabilities;
     private readonly RegionAuthority _regions;
     private readonly Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>> _transferRegion;
     private readonly Dictionary<ChannelId, ChannelRecord> _channels = [];
+    // Existing owner retains the same records; _channels is the endpoint routing index.
+    private readonly Dictionary<ChannelId, ChannelRecord> _ownedChannels = [];
     private ulong _nextChannelId = 1;
 
     internal ChannelRegistry(CapabilityAuthority capabilities, RegionAuthority regions,
@@ -47,7 +72,7 @@ public sealed class ChannelRegistry
 
     internal TelemetrySummary InspectionSummary(ProcessHandle owner)
     {
-        var selected = _channels.Values.Where(record => !record.Closed && (record.LeftOwner == owner || record.RightOwner == owner)).ToArray();
+        var selected = _ownedChannels.Values.Where(record => !record.Closed && (record.LeftOwner == owner || record.RightOwner == owner)).ToArray();
         return new(selected.Length, selected.Sum(static record => record.Queue.Count));
     }
 
@@ -58,6 +83,8 @@ public sealed class ChannelRegistry
         if (_nextChannelId is 0 or ulong.MaxValue)
             return KernelResult<(ChannelEndpointHandle, ChannelEndpointHandle)>.Fail(
                 KernelError.CapacityExhausted, "Channel identity allocator is exhausted.");
+        _ownedChannels.EnsureCapacity(_ownedChannels.Count + 1);
+        _channels.EnsureCapacity(_channels.Count + 1);
         var id = new ChannelId(_nextChannelId++);
         var record = new ChannelRecord
         {
@@ -71,6 +98,7 @@ public sealed class ChannelRegistry
             Capacity = capacity,
             State = protocol.InitialState
         };
+        _ownedChannels.Add(id, record);
         _channels.Add(id, record);
         return KernelResult<(ChannelEndpointHandle, ChannelEndpointHandle)>.Ok(
             (new ChannelEndpointHandle(id, new EndpointId(1), 1), new ChannelEndpointHandle(id, new EndpointId(2), 1)));
@@ -91,6 +119,7 @@ public sealed class ChannelRegistry
     {
         if (original.Generation is 0 or ulong.MaxValue || original.EndpointId.Value is not (1 or 2) ||
             !_channels.TryGetValue(original.ChannelId, out var record) ||
+            !OwnsOriginalChannel(record) ||
             record.Generation != original.Generation + (record.Closed ? 1UL : 0UL))
             return null;
         return new(original, record.Generation, record.Closed);
@@ -124,8 +153,10 @@ public sealed class ChannelRegistry
         ChannelEndpointHandle endpoint,
         uint messageId,
         object? payload,
-        IReadOnlyCollection<CapabilityId>? capabilityIds) =>
-        SendCore(sender, receiver, endpoint, messageId, payload, secondaryPayload: null, capabilityIds);
+        IReadOnlyCollection<CapabilityId>? capabilityIds,
+        BoundedPayloadSnapshot? boundedSnapshot = null,
+        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>>? transferRegion = null) =>
+        SendCore(sender, receiver, endpoint, messageId, payload, secondaryPayload: null, capabilityIds, boundedSnapshot, transferRegion);
 
     internal KernelResult<ChannelEnvelope> SendOwnershipPair(
         SingProcess sender,
@@ -134,8 +165,9 @@ public sealed class ChannelRegistry
         uint messageId,
         object firstOwnershipPayload,
         object secondOwnershipPayload,
-        IReadOnlyCollection<CapabilityId>? capabilityIds) =>
-        SendCore(sender, receiver, endpoint, messageId, firstOwnershipPayload, secondOwnershipPayload, capabilityIds);
+        IReadOnlyCollection<CapabilityId>? capabilityIds,
+        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>>? transferRegion = null) =>
+        SendCore(sender, receiver, endpoint, messageId, firstOwnershipPayload, secondOwnershipPayload, capabilityIds, transferRegion: transferRegion);
 
     // Owner-side transport-elision primitive for the narrow synchronous copied-value
     // contour. It performs the same process/endpoint, schema and protocol transition
@@ -146,7 +178,8 @@ public sealed class ChannelRegistry
         SingProcess receiver,
         ChannelEndpointHandle endpoint,
         uint messageId,
-        object? copiedPayload)
+        object? copiedPayload,
+        BoundedPayloadSnapshot? boundedSnapshot = null)
     {
         var validation = Resolve(endpoint);
         if (!validation.IsSuccess) return KernelResult<ulong>.Fail(validation.Error, validation.Message!);
@@ -166,7 +199,7 @@ public sealed class ChannelRegistry
             return KernelResult<ulong>.Fail(KernelError.MissingCapability, "Inline invocation cannot elide message-attached capability validation.");
         if (!record.Protocol.TryTransition(record.State, messageId, out var transition))
             return KernelResult<ulong>.Fail(KernelError.InvalidProtocolTransition, $"Message {messageId} is illegal in state '{record.State}'.");
-        var payloadValidation = ValidateRequestPayload(message.RequestPayload, copiedPayload, secondaryPayload: null);
+        var payloadValidation = ValidateRequestPayload(message.RequestPayload, copiedPayload, secondaryPayload: null, boundedSnapshot);
         if (!payloadValidation.IsSuccess)
             return KernelResult<ulong>.Fail(payloadValidation.Error, payloadValidation.Message!);
         if (record.Sequence == ulong.MaxValue)
@@ -250,7 +283,8 @@ public sealed class ChannelRegistry
         SingProcess receiver,
         ChannelEndpointHandle endpoint,
         uint messageId,
-        OwnedBuffer<T> payload) where T : unmanaged
+        OwnedBuffer<T> payload,
+        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>>? transferRegion = null) where T : unmanaged
     {
         ArgumentNullException.ThrowIfNull(payload);
         var validation = Resolve(endpoint);
@@ -295,7 +329,7 @@ public sealed class ChannelRegistry
         {
             return KernelResult<InlineMoveProjection<T>>.Fail(KernelError.InvalidRegionState, exception.Message);
         }
-        var transfer = _transferRegion(sender, receiver, oldHandle, null);
+        var transfer = (transferRegion ?? _transferRegion)(sender, receiver, oldHandle, null);
         if (!transfer.IsSuccess)
             return KernelResult<InlineMoveProjection<T>>.Fail(transfer.Error, transfer.Message!);
         var moved = (OwnedBuffer<T>)transferable.TransferForRuntime(transfer.Value);
@@ -315,7 +349,9 @@ public sealed class ChannelRegistry
         uint messageId,
         object? payload,
         object? secondaryPayload,
-        IReadOnlyCollection<CapabilityId>? capabilityIds)
+        IReadOnlyCollection<CapabilityId>? capabilityIds,
+        BoundedPayloadSnapshot? boundedSnapshot = null,
+        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>>? transferRegion = null)
     {
         var validation = Resolve(endpoint);
         if (!validation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(validation.Error, validation.Message!);
@@ -327,9 +363,20 @@ public sealed class ChannelRegistry
         if (record.Queue.Count >= record.Capacity) return KernelResult<ChannelEnvelope>.Fail(KernelError.CapacityExhausted, "Channel capacity is exhausted.");
         if (!record.Protocol.TryGetMessage(messageId, out var message)) return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidMessage, $"Message {messageId} is not part of the protocol.");
         if (!record.Protocol.TryTransition(record.State, messageId, out var transition)) return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidProtocolTransition, $"Message {messageId} is illegal in state '{record.State}'.");
+        if (record.Sequence == ulong.MaxValue || record.Lifetimes.Count == int.MaxValue)
+            return KernelResult<ChannelEnvelope>.Fail(KernelError.CapacityExhausted, "Queued lifetime identity/capacity is exhausted before transfer.");
+        record.Lifetimes.EnsureCapacity(record.Lifetimes.Count + 1);
+        var queuedLifetime = new QueuedLifetime(record, record.Sequence + 1);
+        if (message.RequiredCapabilities.Count != 0)
+            return _capabilities.CommitSessionPublication(sender.DomainId, sender.Generation,
+                capabilityIds?.ToArray() ?? [], message.RequiredCapabilities.ToArray(), CommitMessage);
+        return CommitMessage();
+
+        KernelResult<ChannelEnvelope> CommitMessage()
+        {
         var capabilityValidation = ValidateCapabilities(sender, message, capabilityIds);
         if (!capabilityValidation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(capabilityValidation.Error, capabilityValidation.Message!);
-        var payloadValidation = ValidateRequestPayload(message.RequestPayload, payload, secondaryPayload);
+        var payloadValidation = ValidateRequestPayload(message.RequestPayload, payload, secondaryPayload, boundedSnapshot);
         if (!payloadValidation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(payloadValidation.Error, payloadValidation.Message!);
         if (record.Sequence == ulong.MaxValue)
             return KernelResult<ChannelEnvelope>.Fail(KernelError.CapacityExhausted, "Channel sequence is exhausted.");
@@ -338,7 +385,7 @@ public sealed class ChannelRegistry
         object? queuedSecondaryPayload = secondaryPayload;
         if (message.RequestPayload.Kind == RequestPayloadKind.OwnershipPair)
         {
-            var pair = PrepareOwnershipPair(sender, receiver, message.RequestPayload, payload!, secondaryPayload!);
+            var pair = PrepareOwnershipPair(sender, receiver, message.RequestPayload, payload!, secondaryPayload!, transferRegion);
             if (!pair.IsSuccess)
                 return KernelResult<ChannelEnvelope>.Fail(pair.Error, pair.Message!);
             queuedPayload = pair.Value!.First;
@@ -384,7 +431,7 @@ public sealed class ChannelRegistry
                 {
                     return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidRegionState, exception.Message);
                 }
-                var transfer = _transferRegion(sender, receiver, oldHandle, null);
+                var transfer = (transferRegion ?? _transferRegion)(sender, receiver, oldHandle, null);
                 if (!transfer.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(transfer.Error, transfer.Message!);
                 queuedPayload = owned.TransferForRuntime(transfer.Value);
                 _regions.ReplacePayload(oldHandle, transfer.Value, (ITransferableOwnedPayload)queuedPayload);
@@ -396,8 +443,10 @@ public sealed class ChannelRegistry
         record.Sequence++;
         var envelope = new ChannelEnvelope(record.Sequence, messageId, queuedPayload, queuedSecondaryPayload);
         record.Queue.Enqueue(envelope);
+        record.Lifetimes.Add(envelope.Sequence, queuedLifetime);
         record.State = transition.ToState;
         return KernelResult<ChannelEnvelope>.Ok(envelope);
+        }
     }
 
     private KernelResult<(object First, object Second)> PrepareOwnershipPair(
@@ -405,7 +454,8 @@ public sealed class ChannelRegistry
         SingProcess receiver,
         RequestPayloadDescriptorV1 expected,
         object firstPayload,
-        object secondPayload)
+        object secondPayload,
+        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>>? transferRegion = null)
     {
         var slots = expected.OwnershipPair;
         if (slots.Count != 2 || firstPayload is not ITransferableOwnedPayload first || secondPayload is not ITransferableOwnedPayload second)
@@ -445,7 +495,7 @@ public sealed class ChannelRegistry
         var oldConsumedHandle = consumed.Handle;
         BorrowLeaseHandle? acquiredLease = null;
         object? borrowedLease = null;
-        var transfer = _transferRegion(sender, receiver, oldConsumedHandle, () =>
+        var transfer = (transferRegion ?? _transferRegion)(sender, receiver, oldConsumedHandle, () =>
         {
             var acquired = _regions.AcquireLoan(borrowed.Handle, owner, borrower);
             if (!acquired.IsSuccess) return KernelResult.Fail(acquired.Error, acquired.Message!);
@@ -474,20 +524,38 @@ public sealed class ChannelRegistry
             : KernelResult<(object, object)>.Ok((moved, borrowedLease!));
     }
 
-    internal KernelResult<ChannelEnvelope> Receive(SingProcess receiver, ChannelEndpointHandle endpoint)
+    private KernelResult<ChannelRecord> ResolveQueuedReceiver(SingProcess receiver, ChannelEndpointHandle endpoint)
     {
         var validation = Resolve(endpoint);
-        if (!validation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(validation.Error, validation.Message!);
+        if (!validation.IsSuccess) return validation;
         var record = validation.Value!;
         var owner = endpoint.EndpointId.Value == 1 ? record.LeftOwner : record.RightOwner;
-        if (owner != new ProcessHandle(receiver.ProcessId, receiver.Generation)) return KernelResult<ChannelEnvelope>.Fail(KernelError.WrongEndpointOwner, "Endpoint is not owned by the receiver.");
-        if (record.Queue.Count == 0) return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidMessage, "Channel queue is empty.");
-        return KernelResult<ChannelEnvelope>.Ok(record.Queue.Dequeue());
+        if (owner != new ProcessHandle(receiver.ProcessId, receiver.Generation)) return KernelResult<ChannelRecord>.Fail(KernelError.WrongEndpointOwner, "Endpoint is not owned by the receiver.");
+        if (record.Queue.Count == 0) return KernelResult<ChannelRecord>.Fail(KernelError.InvalidMessage, "Channel queue is empty.");
+        return validation;
+    }
+
+    internal KernelResult<ChannelEnvelope> Peek(SingProcess receiver, ChannelEndpointHandle endpoint)
+    {
+        var validation = ResolveQueuedReceiver(receiver, endpoint);
+        return validation.IsSuccess ? KernelResult<ChannelEnvelope>.Ok(validation.Value!.Queue.Peek())
+            : KernelResult<ChannelEnvelope>.Fail(validation.Error, validation.Message!);
+    }
+
+    internal KernelResult<ChannelEnvelope> Receive(SingProcess receiver, ChannelEndpointHandle endpoint)
+    {
+        var validation = ResolveQueuedReceiver(receiver, endpoint);
+        if (!validation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(validation.Error, validation.Message!);
+        var record = validation.Value!;
+        var envelope = record.Queue.Dequeue();
+        record.Lifetimes[envelope.Sequence].Ended = true;
+        if (!record.Lifetimes[envelope.Sequence].BudgetAttached) record.Lifetimes.Remove(envelope.Sequence);
+        return KernelResult<ChannelEnvelope>.Ok(envelope);
     }
 
     internal void CloseAllForProcess(ProcessHandle owner)
     {
-        var closing = _channels.Values
+        var closing = _ownedChannels.Values
             .Where(record => !record.Closed && (record.LeftOwner == owner || record.RightOwner == owner))
             .OrderBy(static record => record.Id.Value)
             .ToArray();
@@ -498,7 +566,7 @@ public sealed class ChannelRegistry
     {
         if (allowAlreadyClosed && endpoint.Generation is not 0 and not ulong.MaxValue &&
             endpoint.EndpointId.Value is 1 or 2 && _channels.TryGetValue(endpoint.ChannelId, out var closed) &&
-            closed.Closed && closed.Generation == endpoint.Generation + 1)
+            OwnsOriginalChannel(closed) && closed.Closed && closed.Generation == endpoint.Generation + 1)
             return KernelResult.Ok();
         var validation = Resolve(endpoint);
         if (!validation.IsSuccess) return KernelResult.Fail(validation.Error, validation.Message!);
@@ -520,7 +588,7 @@ public sealed class ChannelRegistry
 
     internal void CloseAllForDomain(DomainId domainId)
     {
-        var closing = _channels.Values
+        var closing = _ownedChannels.Values
             .Where(record => !record.Closed && (record.LeftDomain == domainId || record.RightDomain == domainId))
             .OrderBy(static record => record.Id.Value)
             .ToArray();
@@ -534,13 +602,50 @@ public sealed class ChannelRegistry
             record.Closed = true;
             record.Generation++;
             record.Queue.Clear();
+            foreach (var lifetime in record.Lifetimes.Values) lifetime.Ended = true;
+            foreach (var sequence in record.Lifetimes.Where(item => !item.Value.BudgetAttached).Select(item => item.Key).ToArray())
+                record.Lifetimes.Remove(sequence);
             ChannelClosed?.Invoke(record.Id);
         }
     }
 
+    internal object? CaptureQueuedLifetime(ChannelId channel, ulong sequence)
+    {
+        if (!_channels.TryGetValue(channel, out var record) || !OwnsOriginalChannel(record) ||
+            !record.Lifetimes.TryGetValue(sequence, out var fact)) return null;
+        fact.BudgetAttached = true;
+        return fact;
+    }
+
+    internal bool BindOriginalQueuedBudgetOwner(object original, object budgetOwner)
+    {
+        if (original is not QueuedLifetime fact || !_channels.TryGetValue(fact.Owner.Id, out var routed) ||
+            !ReferenceEquals(routed, fact.Owner) || !OwnsOriginalChannel(fact.Owner) ||
+            !fact.Owner.Lifetimes.TryGetValue(fact.Sequence, out var owned) ||
+            !ReferenceEquals(owned, fact) || fact.OriginalBudgetOwner is { } prior && !ReferenceEquals(prior, budgetOwner)) return false;
+        fact.OriginalBudgetOwner = budgetOwner;
+        return true;
+    }
+
+    internal void ConsumeOriginalQueuedLifetime(object? original, ChannelId channel, ulong sequence, object budgetOwner)
+    {
+        if (HasEndedOriginalQueuedLifetime(original, channel, sequence, budgetOwner))
+            ((QueuedLifetime)original!).Owner.Lifetimes.Remove(sequence);
+    }
+
+    internal bool HasEndedOriginalQueuedLifetime(object? original, ChannelId channel, ulong sequence, object budgetOwner) =>
+        original is QueuedLifetime fact && fact.Sequence == sequence && fact.Owner.Id == channel &&
+        ReferenceEquals(fact.OriginalBudgetOwner, budgetOwner) &&
+        OwnsOriginalChannel(fact.Owner) &&
+        fact.Owner.Lifetimes.TryGetValue(sequence, out var owned) && ReferenceEquals(owned, fact) && fact.Ended;
+
+    private bool OwnsOriginalChannel(ChannelRecord record) =>
+        _ownedChannels.TryGetValue(record.Id, out var original) && ReferenceEquals(original, record);
+
     private KernelResult<ChannelRecord> Resolve(ChannelEndpointHandle handle)
     {
         if (!_channels.TryGetValue(handle.ChannelId, out var record)) return KernelResult<ChannelRecord>.Fail(KernelError.ChannelNotFound, "Channel was not found.");
+        if (!OwnsOriginalChannel(record)) return KernelResult<ChannelRecord>.Fail(KernelError.PlatformFaulted, "Original channel owner continuity was lost.");
         if (record.Closed || record.Generation != handle.Generation) return KernelResult<ChannelRecord>.Fail(KernelError.StaleGeneration, "Channel endpoint generation is stale.");
         if (handle.EndpointId.Value is not 1 and not 2) return KernelResult<ChannelRecord>.Fail(KernelError.EndpointNotFound, "Endpoint id is invalid.");
         return KernelResult<ChannelRecord>.Ok(record);
@@ -568,7 +673,8 @@ public sealed class ChannelRegistry
     private static KernelResult ValidateRequestPayload(
         RequestPayloadDescriptorV1 expected,
         object? payload,
-        object? secondaryPayload)
+        object? secondaryPayload,
+        BoundedPayloadSnapshot? boundedSnapshot = null)
     {
         if (expected.Kind != RequestPayloadKind.OwnershipPair && secondaryPayload is not null)
             return KernelResult.Fail(KernelError.UnsupportedPayload, "Only OwnershipPair requests may carry a secondary payload slot.");
@@ -599,12 +705,14 @@ public sealed class ChannelRegistry
                 var boundedTypeName = payload.GetType().FullName ?? payload.GetType().Name;
                 if (!string.Equals(boundedTypeName, expected.TypeName, StringComparison.Ordinal))
                     return KernelResult.Fail(KernelError.UnsupportedPayload, $"Expected bounded payload type {expected.TypeName}, got {boundedTypeName}.");
-                if (bounded.PayloadSize < 0)
+                var size = boundedSnapshot?.Size ?? bounded.PayloadSize;
+                var limit = boundedSnapshot?.Limit ?? bounded.MaxPayloadSize;
+                if (size < 0)
                     return KernelResult.Fail(KernelError.UnsupportedPayload, "Bounded payload size cannot be negative.");
-                if (bounded.MaxPayloadSize != expected.MaxBytes)
-                    return KernelResult.Fail(KernelError.UnsupportedPayload, $"Bounded payload self-reported limit {bounded.MaxPayloadSize} does not match contract MaxBytes {expected.MaxBytes}.");
-                if (bounded.PayloadSize > expected.MaxBytes)
-                    return KernelResult.Fail(KernelError.UnsupportedPayload, $"Bounded payload size {bounded.PayloadSize} exceeds contract MaxBytes {expected.MaxBytes}.");
+                if (limit != expected.MaxBytes)
+                    return KernelResult.Fail(KernelError.UnsupportedPayload, $"Bounded payload self-reported limit {limit} does not match contract MaxBytes {expected.MaxBytes}.");
+                if (size > expected.MaxBytes)
+                    return KernelResult.Fail(KernelError.UnsupportedPayload, $"Bounded payload size {size} exceeds contract MaxBytes {expected.MaxBytes}.");
                 return KernelResult.Ok();
 
             case RequestPayloadKind.Ownership:

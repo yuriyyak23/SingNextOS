@@ -9,6 +9,532 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class Phase05ResourceBudgetTests
 {
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void OriginalChannelOwnerControlsAdmissionAndProcessQueueCleanup(bool absentRoute)
+    {
+        (RuntimeKernel Kernel, ComponentLifecycleSnapshot Sender, ProcessHandle Receiver,
+            (ChannelEndpointHandle Left, ChannelEndpointHandle Right) Channel) Create()
+        {
+            var kernel = new RuntimeKernel();
+            var sender = Admit(kernel, "original-channel-route", 616, 5916,
+                [new(ServiceBudgetDimension.IpcMessages, 2), new(ServiceBudgetDimension.IpcBytes, 64)]).Value!;
+            var receiver = TestFixtures.Create(kernel, 617, 5917).Handle;
+            var channel = kernel.CreateChannel(sender.Process, receiver, IpcBudgetProtocol(), 2).Value!;
+            Assert.True(kernel.Send(sender.Process, receiver, channel.Left, 1).IsSuccess);
+            return (kernel, sender, receiver, channel);
+        }
+        var original = Create();
+        var foreign = Create();
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(ChannelRegistry).GetField("_channels", flags)!.GetValue(original.Kernel.Channels)!;
+        var foreignRoutes = (global::System.Collections.IDictionary)typeof(ChannelRegistry).GetField("_channels", flags)!.GetValue(foreign.Kernel.Channels)!;
+        var id = original.Channel.Left.ChannelId;
+        var originalOwner = routes[id]!;
+        var foreignOwner = foreignRoutes[id]!;
+        if (absentRoute) routes.Remove(id); else routes[id] = foreignOwner;
+        Assert.False(original.Kernel.Send(original.Sender.Process, original.Receiver, original.Channel.Left, 1).IsSuccess);
+        Assert.Equal(1UL, (ulong)originalOwner.GetType().GetProperty("Sequence")!.GetValue(originalOwner)!);
+        Assert.Equal(1UL, (ulong)foreignOwner.GetType().GetProperty("Sequence")!.GetValue(foreignOwner)!);
+        Assert.Equal(1UL, Usage(original.Kernel.QueryBudget(original.Sender.ProcessBudget).Value!, ServiceBudgetDimension.IpcMessages).Used);
+        Assert.True(original.Kernel.TerminateProcess(original.Receiver).IsSuccess);
+        Assert.True((bool)originalOwner.GetType().GetProperty("Closed")!.GetValue(originalOwner)!);
+        Assert.False((bool)foreignOwner.GetType().GetProperty("Closed")!.GetValue(foreignOwner)!);
+        Assert.Equal(0UL, Usage(original.Kernel.QueryBudget(original.Sender.ProcessBudget).Value!, ServiceBudgetDimension.IpcMessages).Used);
+        Assert.Equal(1UL, Usage(foreign.Kernel.QueryBudget(foreign.Sender.ProcessBudget).Value!, ServiceBudgetDimension.IpcMessages).Used);
+        Assert.True(foreign.Kernel.Channels.Close(foreign.Channel.Left).IsSuccess);
+        routes[id] = foreignOwner;
+        Assert.False(original.Kernel.Channels.Close(original.Channel.Left, allowAlreadyClosed: true).IsSuccess);
+        routes[id] = originalOwner;
+        Assert.True(original.Kernel.Channels.Close(original.Channel.Left, allowAlreadyClosed: true).IsSuccess);
+        Assert.Equal(0UL, Usage(original.Kernel.QueryBudget(original.Sender.ProcessBudget).Value!, ServiceBudgetDimension.IpcMessages).Used);
+    }
+
+    [Fact]
+    public void ForeignCompletedChannelOwnerCannotConsumeOriginalQueuedCharge()
+    {
+        (RuntimeKernel Kernel, ComponentLifecycleSnapshot Sender, ProcessHandle Receiver,
+            (ChannelEndpointHandle Left, ChannelEndpointHandle Right) Channel, ChannelEnvelope Envelope) Create()
+        {
+            var kernel = new RuntimeKernel();
+            var sender = Admit(kernel, "same-ipc-owner", 614, 5914,
+                [new(ServiceBudgetDimension.IpcMessages, 1), new(ServiceBudgetDimension.IpcBytes, 32)]).Value!;
+            var receiver = TestFixtures.Create(kernel, 615, 5915).Handle;
+            var channel = kernel.CreateChannel(sender.Process, receiver, IpcBudgetProtocol(), 2).Value!;
+            var envelope = kernel.Send(sender.Process, receiver, channel.Left, 1).Value!;
+            return (kernel, sender, receiver, channel, envelope);
+        }
+        var original = Create();
+        var foreign = Create();
+        Assert.Equal(original.Channel.Left, foreign.Channel.Left);
+        Assert.Equal(original.Envelope.Sequence, foreign.Envelope.Sequence);
+        var key = (original.Channel.Left.ChannelId, original.Envelope.Sequence);
+        var charge = IpcCharges(original.Kernel)[key];
+        var foreignCharge = IpcCharges(foreign.Kernel)[key];
+        Assert.Equal(charge, foreignCharge);
+        Assert.True(foreign.Kernel.Budgets.QuarantineLease(foreign.Sender.Process, foreignCharge.Reservation).IsSuccess);
+        Assert.True(foreign.Kernel.Channels.Close(foreign.Channel.Left).IsSuccess);
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(ChannelRegistry).GetField("_channels", flags)!.GetValue(original.Kernel.Channels)!;
+        var foreignRoutes = (global::System.Collections.IDictionary)typeof(ChannelRegistry).GetField("_channels", flags)!.GetValue(foreign.Kernel.Channels)!;
+        var originalOwner = routes[key.ChannelId]!;
+        var reservations = (global::System.Collections.IDictionary)typeof(ResourceBudgetAuthority).GetField("_reservations", flags)!.GetValue(original.Kernel.Budgets)!;
+        var foreignReservations = (global::System.Collections.IDictionary)typeof(ResourceBudgetAuthority).GetField("_reservations", flags)!.GetValue(foreign.Kernel.Budgets)!;
+        var record = reservations[charge.Reservation.ReservationId]!;
+        var source = record.GetType().GetProperty("OriginalQueuedLifetime")!;
+        var originalFact = source.GetValue(record)!;
+        source.SetValue(record, source.GetValue(foreignReservations[foreignCharge.Reservation.ReservationId]!));
+        routes[key.ChannelId] = foreignRoutes[key.ChannelId];
+        Assert.True(original.Kernel.TerminateProcess(original.Receiver).IsSuccess);
+        Assert.Equal(BudgetReservationState.Active, original.Kernel.QueryBudget(charge.Reservation).Value!.State);
+        Assert.Equal(1UL, Usage(original.Kernel.QueryBudget(original.Sender.ProcessBudget).Value!, ServiceBudgetDimension.IpcMessages).Used);
+        Assert.True((bool)originalFact.GetType().GetProperty("Ended")!.GetValue(originalFact)!);
+        source.SetValue(record, originalFact);
+        routes[key.ChannelId] = originalOwner;
+        Assert.True(original.Kernel.TerminateProcess(original.Sender.Process).IsSuccess);
+        Assert.Equal(BudgetReservationState.Released, original.Kernel.QueryBudget(charge.Reservation).Value!.State);
+        Assert.Equal(0UL, Usage(original.Kernel.QueryBudget(original.Sender.ProcessBudget).Value!, ServiceBudgetDimension.IpcMessages).Used);
+        Assert.Equal(BudgetReservationState.Quarantined, foreign.Kernel.QueryBudget(foreignCharge.Reservation).Value!.State);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void QueuedChargeTeardownTraceRunsAfterOwnerCommitWithoutRepeatingDebit(bool throws)
+    {
+        var clock = new QueuedChargeClock();
+        var kernel = new RuntimeKernel(platformProvider: null, timeProvider: clock);
+        var sender = Admit(kernel, "ipc-trace-owner", 612, 5912,
+            [new(ServiceBudgetDimension.IpcMessages, 1), new(ServiceBudgetDimension.IpcBytes, 32)]).Value!;
+        var receiver = TestFixtures.Create(kernel, 613, 5913).Handle;
+        var channel = kernel.CreateChannel(sender.Process, receiver, IpcBudgetProtocol(), 2).Value!;
+        var sent = kernel.Send(sender.Process, receiver, channel.Left, 1).Value!;
+        var charge = IpcCharges(kernel)[(channel.Left.ChannelId, sent.Sequence)];
+        Assert.True(kernel.StartTraceSession(sender.Process, 32).IsSuccess);
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var memoryGate = typeof(RuntimeKernel).GetField("_platformMemoryUseGate", flags)!.GetValue(kernel)!;
+        var correlationGate = typeof(RuntimeKernel).GetField("_requestResponseCorrelationGate", flags)!.GetValue(kernel)!;
+        var budgetGate = typeof(ResourceBudgetAuthority).GetField("_gate", flags)!.GetValue(kernel.Budgets)!;
+        var observed = 0;
+        clock.Callback = () =>
+        {
+            if (kernel.QueryBudget(charge.Reservation).Value!.State != BudgetReservationState.Released) return;
+            Assert.False(Monitor.IsEntered(memoryGate));
+            Assert.False(Monitor.IsEntered(correlationGate));
+            Assert.False(Monitor.IsEntered(budgetGate));
+            observed++;
+            clock.Callback = null;
+            if (throws) throw new InvalidOperationException("Observation cannot undo exact charge release.");
+            Assert.True(kernel.Channels.Close(channel.Left, allowAlreadyClosed: true).IsSuccess);
+        };
+        Assert.True(kernel.TerminateProcess(receiver).IsSuccess);
+        Assert.Equal(1, observed);
+        Assert.Equal(BudgetReservationState.Released, kernel.QueryBudget(charge.Reservation).Value!.State);
+        Assert.Equal(0UL, Usage(kernel.QueryBudget(sender.ProcessBudget).Value!, ServiceBudgetDimension.IpcMessages).Used);
+        Assert.Empty(IpcCharges(kernel));
+    }
+
+    private sealed class QueuedChargeClock : TimeProvider
+    {
+        public Action? Callback { get; set; }
+        public override long GetTimestamp() { Callback?.Invoke(); return 1; }
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void ForeignQueuedChargeRouteCannotConsumeAnotherOriginalMessage(int fault)
+    {
+        var kernel = new RuntimeKernel();
+        var sender = Admit(kernel, "foreign-ipc-route", 610, 5910,
+            [new(ServiceBudgetDimension.IpcMessages, 2), new(ServiceBudgetDimension.IpcBytes, 64)]).Value!;
+        var receiver = TestFixtures.Create(kernel, 611, 5911).Handle;
+        var first = kernel.CreateChannel(sender.Process, receiver, IpcBudgetProtocol(), 2).Value!;
+        var second = kernel.CreateChannel(sender.Process, receiver, IpcBudgetProtocol(), 2).Value!;
+        var one = kernel.Send(sender.Process, receiver, first.Left, 1).Value!;
+        var two = kernel.Send(sender.Process, receiver, second.Left, 1).Value!;
+        var key = (first.Left.ChannelId, one.Sequence);
+        var original = IpcCharges(kernel)[key];
+        var other = IpcCharges(kernel)[(second.Left.ChannelId, two.Sequence)];
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var reservations = (global::System.Collections.IDictionary)typeof(ResourceBudgetAuthority).GetField("_reservations", flags)!.GetValue(kernel.Budgets)!;
+        var record = reservations[original.Reservation.ReservationId]!;
+        var lifetime = record.GetType().GetProperty("OriginalQueuedLifetime")!;
+        var fact = lifetime.GetValue(record)!;
+        if (fault == 0) IpcCharges(kernel)[key] = other;
+        if (fault == 1) lifetime.SetValue(record, typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(fact, null));
+        if (fault == 2) lifetime.SetValue(record, null);
+        Assert.True(kernel.Receive(receiver, first.Right).IsSuccess);
+        Assert.Equal(BudgetReservationState.Active, kernel.QueryBudget(original.Reservation).Value!.State);
+        Assert.Equal(BudgetReservationState.Active, kernel.QueryBudget(other.Reservation).Value!.State);
+        Assert.Equal(2UL, Usage(kernel.QueryBudget(sender.ProcessBudget).Value!, ServiceBudgetDimension.IpcMessages).Used);
+        IpcCharges(kernel)[key] = original;
+        lifetime.SetValue(record, fact);
+        Assert.True(kernel.Channels.Close(first.Left).IsSuccess);
+        Assert.Equal(BudgetReservationState.Released, kernel.QueryBudget(original.Reservation).Value!.State);
+        Assert.Equal(BudgetReservationState.Active, kernel.QueryBudget(other.Reservation).Value!.State);
+        Assert.True(kernel.Receive(receiver, second.Right).IsSuccess);
+        Assert.Equal(0UL, Usage(kernel.QueryBudget(sender.ProcessBudget).Value!, ServiceBudgetDimension.IpcMessages).Used);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)]
+    public void AbsentIpcChargeRouteStillConsumesOriginalEndedQueueLifetime(int path)
+    {
+        var kernel = new RuntimeKernel();
+        var sender = Admit(kernel, "lost-ipc-route", 598, 5908,
+            [new(ServiceBudgetDimension.IpcMessages, 1), new(ServiceBudgetDimension.IpcBytes, 32)]).Value!;
+        var receiver = TestFixtures.Create(kernel, 599, 5909).Handle;
+        var channel = kernel.CreateChannel(sender.Process, receiver, IpcBudgetProtocol(), 2).Value!;
+        var sent = kernel.Send(sender.Process, receiver, channel.Left, 1);
+        Assert.True(sent.IsSuccess, sent.Message);
+        var key = (channel.Left.ChannelId, sent.Value!.Sequence);
+        var original = IpcCharges(kernel)[key];
+        IpcCharges(kernel).Remove(key);
+        if (path == 0) Assert.True(kernel.Receive(receiver, channel.Right).IsSuccess);
+        else if (path == 1) Assert.True(kernel.TerminateProcess(sender.Process).IsSuccess);
+        else if (path == 2) Assert.True(kernel.TerminateProcess(receiver).IsSuccess);
+        else Assert.True(kernel.Channels.Close(channel.Left).IsSuccess);
+        Assert.Equal(BudgetReservationState.Released, kernel.QueryBudget(original.Reservation).Value!.State);
+        Assert.Equal(0UL, Usage(kernel.QueryBudget(sender.ProcessBudget).Value!, ServiceBudgetDimension.IpcMessages).Used);
+        Assert.Equal(0UL, Usage(kernel.QueryBudget(sender.ProcessBudget).Value!, ServiceBudgetDimension.IpcBytes).Used);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void IpcTransferRechecksOriginalChargeAfterPreparation(bool foreignRoute)
+    {
+        var kernel = new RuntimeKernel();
+        var source = Admit(kernel, "callback-source", 596, 5906,
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 8)]).Value!;
+        var target = Admit(kernel, "callback-target", 597, 5907,
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 4)]).Value!;
+        var buffer = kernel.AllocateBuffer<byte>(source.Process, 4).Value!;
+        var outside = kernel.AllocateBuffer<byte>(source.Process, 4).Value!;
+        var routes = RegionCharges(kernel);
+        var original = routes[buffer.Handle];
+        var before = kernel.Regions.Snapshot().ToArray();
+        var call = typeof(RuntimeKernel).GetMethod("TransferRegionForIpc", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var result = (KernelResult<RegionHandle>)call.Invoke(kernel,
+            [kernel.Processes.Resolve(source.Process).Value!, kernel.Processes.Resolve(target.Process).Value!, buffer.Handle,
+                (Func<KernelResult>)(() =>
+                {
+                    if (foreignRoute) routes[buffer.Handle] = routes[outside.Handle];
+                    else routes.Remove(buffer.Handle);
+                    return KernelResult.Ok();
+                })])!;
+        if (foreignRoute)
+        {
+            Assert.Equal(KernelError.PlatformFaulted, result.Error);
+            Assert.Equal(before, kernel.Regions.Snapshot());
+            Assert.Equal(0UL, Usage(kernel.QueryBudget(target.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+            Assert.Equal(8UL, Usage(kernel.QueryBudget(source.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+            routes[buffer.Handle] = original;
+        }
+        else
+        {
+            Assert.True(result.IsSuccess, result.Message);
+            Assert.Equal(4UL, Usage(kernel.QueryBudget(source.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+            Assert.Equal(4UL, Usage(kernel.QueryBudget(target.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+            Assert.Equal(target.Process, routes[result.Value].Owner);
+            Assert.False(routes.ContainsKey(buffer.Handle));
+        }
+        Assert.True(kernel.TerminateProcess(source.Process).IsSuccess);
+        Assert.True(kernel.TerminateProcess(target.Process).IsSuccess);
+        Assert.Equal(0UL, Usage(kernel.QueryBudget(source.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.Equal(0UL, Usage(kernel.QueryBudget(target.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void ForeignRegionChargeRouteCannotRefundAnotherLiveRegion(bool scalar)
+    {
+        var kernel = new RuntimeKernel();
+        var source = Admit(kernel, "foreign-route-source", 594, 5904,
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 8)]).Value!;
+        var target = Admit(kernel, "foreign-route-target", 595, 5905,
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 4)]).Value!;
+        var outside = kernel.AllocateBuffer<byte>(source.Process, 4).Value!;
+        var buffer = scalar ? null : kernel.AllocateBuffer<byte>(source.Process, 4).Value!;
+        var region = scalar ? kernel.AllocateRegion(source.Process, 7).Value! : null;
+        var handle = region?.Handle ?? buffer!.Handle;
+        var routes = RegionCharges(kernel);
+        var original = routes[handle];
+        var foreign = routes[outside.Handle];
+        routes[handle] = foreign;
+        var before = kernel.Regions.Snapshot().ToArray();
+        var transfer = scalar ? kernel.TransferRegion(source.Process, target.Process, region!).Error
+            : kernel.TransferRegion(source.Process, target.Process, buffer!).Error;
+        Assert.Equal(KernelError.PlatformFaulted, transfer);
+        Assert.Equal(before, kernel.Regions.Snapshot());
+        Assert.Equal(0UL, Usage(kernel.QueryBudget(target.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.True((scalar ? kernel.ReleaseRegion(source.Process, region!) : kernel.ReleaseRegion(source.Process, buffer!)).IsSuccess);
+        Assert.Equal(BudgetReservationState.Reserved, kernel.QueryBudget(foreign.Reservation).Value!.State);
+        Assert.Equal(8UL, Usage(kernel.QueryBudget(source.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        routes[handle] = original;
+        Assert.True(kernel.TerminateProcess(source.Process).IsSuccess);
+        Assert.Equal(0UL, Usage(kernel.QueryBudget(source.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void LostOriginalRegionChargeRouteCannotAdmitUnbudgetedTransfer(int path)
+    {
+        var kernel = new RuntimeKernel();
+        var source = Admit(kernel, "lost-transfer-source", 591, 5901,
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 4)]).Value!;
+        var target = TestFixtures.Create(kernel, 592, 5902);
+        var buffer = path == 0 ? null : kernel.AllocateBuffer<byte>(source.Process, 4).Value!;
+        var scalar = path == 0 ? kernel.AllocateRegion(source.Process, 7).Value! : null;
+        var region = scalar?.Handle ?? buffer!.Handle;
+        RegionCharges(kernel).Remove(region);
+        var before = Assert.Single(kernel.Regions.Snapshot());
+        KernelError error;
+        if (path == 0) error = kernel.TransferRegion(source.Process, target.Handle, scalar!).Error;
+        else if (path == 1) error = kernel.TransferRegion(source.Process, target.Handle, buffer!).Error;
+        else
+        {
+            var sourceProcess = kernel.Processes.Resolve(source.Process).Value!;
+            var call = typeof(RuntimeKernel).GetMethod("TransferRegionForIpc", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var result = (KernelResult<RegionHandle>)call.Invoke(kernel,
+                [sourceProcess, target.Process, region, null])!;
+            error = result.Error;
+        }
+        Assert.Equal(KernelError.BudgetNotConfigured, error);
+        Assert.Equal(before, Assert.Single(kernel.Regions.Snapshot()));
+        Assert.Equal(4UL, Usage(kernel.QueryBudget(source.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void DirectRegionReleaseConsumesOriginalChargeWithoutRoutingIndex(bool scalar)
+    {
+        var kernel = new RuntimeKernel();
+        var source = Admit(kernel, "lost-release-source", 593, 5903,
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 4)]).Value!;
+        var buffer = scalar ? null : kernel.AllocateBuffer<byte>(source.Process, 4).Value!;
+        var region = scalar ? kernel.AllocateRegion(source.Process, 7).Value! : null;
+        var handle = region?.Handle ?? buffer!.Handle;
+        RegionCharges(kernel).Remove(handle);
+        Assert.True((scalar ? kernel.ReleaseRegion(source.Process, region!) : kernel.ReleaseRegion(source.Process, buffer!)).IsSuccess);
+        Assert.Equal(RegionState.Released, Assert.Single(kernel.Regions.Snapshot()).State);
+        Assert.Equal(0UL, Usage(kernel.QueryBudget(source.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void SettlementCapturesCallerOnceOutsideLockAndRechecksOwnerBeforeCharge(int fault)
+    {
+        var kernel = new RuntimeKernel();
+        var component = Admit(kernel, "settlement-input", 1093, 1094,
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 100)]).Value!;
+        var lease = kernel.Budgets.Reserve(component.Process,
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 40)],
+            BudgetReservationLifetime.ExternalEffect, AdmissionQosHint.None).Value!.Reservation;
+        Assert.True(kernel.Budgets.BindLease(component.Process, lease).IsSuccess);
+        Assert.True(kernel.Budgets.BeginConsumption(component.Process, lease).IsSuccess);
+        var input = new ChangingSettlementAmounts(() =>
+        {
+            var query = Task.Run(() => kernel.QueryBudget(component.ProcessBudget));
+            Assert.True(query.Wait(TimeSpan.FromSeconds(5)), "Caller enumeration ran under budget owner lock.");
+            Assert.True(query.Result.IsSuccess);
+            if (fault == 1) Assert.True(kernel.Budgets.QuarantineLease(component.Process, lease).IsSuccess);
+            if (fault == 2) throw new InvalidOperationException("Caller usage unavailable.");
+        });
+        if (fault == 2)
+            Assert.Throws<InvalidOperationException>(() => kernel.Budgets.SettleLease(component.Process, lease, input));
+        else
+            Assert.Equal(fault == 0, kernel.Budgets.SettleLease(component.Process, lease, input).IsSuccess);
+        Assert.Equal(1, input.Enumerations);
+        if (fault != 0)
+        {
+            Assert.Equal(40UL, Usage(kernel.QueryBudget(component.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+            if (fault == 1) Assert.True(kernel.Budgets.ReconcileLease(component.Process, lease).IsSuccess);
+        }
+        var settled = kernel.Budgets.SettleLease(component.Process, lease,
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 7)]).Value!;
+        Assert.Equal(new BudgetAmount(ServiceBudgetDimension.OwnedMemoryBytes, 7), Assert.Single(settled.ChargedAmounts!));
+        Assert.Equal(7UL, Usage(kernel.QueryBudget(component.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.True(kernel.DrainComponent(new("settlement-input"), component.Process).IsSuccess);
+        Assert.True(kernel.RetireReclaimableComponent(new("settlement-input"), component.Process).IsSuccess);
+        Assert.Equal(7UL, Usage(kernel.QueryBudget(kernel.Budgets.SystemBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+    }
+
+    private sealed class ChangingSettlementAmounts(Action callback) : IReadOnlyList<BudgetAmount>
+    {
+        public int Enumerations { get; private set; }
+        public int Count => 1;
+        public BudgetAmount this[int index] => new(ServiceBudgetDimension.OwnedMemoryBytes, 7);
+        public IEnumerator<BudgetAmount> GetEnumerator()
+        {
+            Enumerations++;
+            callback();
+            yield return new(ServiceBudgetDimension.OwnedMemoryBytes, Enumerations == 1 ? 7UL : 90UL);
+        }
+        global::System.Collections.IEnumerator global::System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+    }
+
+    [Theory]
+    [InlineData(0UL)] [InlineData(10UL)]
+    public void ActualComponentRetirementPreservesTerminalChargeWithoutLiveReservationPin(ulong charge)
+    {
+        var kernel = new RuntimeKernel();
+        var component = Admit(kernel, "terminal-retirement", 1091, 1092,
+            [new(ServiceBudgetDimension.ComputeTimeNanoseconds, 100)]).Value!;
+        var lease = kernel.Budgets.Reserve(component.Process,
+            [new(ServiceBudgetDimension.ComputeTimeNanoseconds, 40)],
+            BudgetReservationLifetime.ExternalEffect, AdmissionQosHint.None).Value!.Reservation;
+        Assert.True(kernel.Budgets.BindLease(component.Process, lease).IsSuccess);
+        Assert.True(kernel.Budgets.BeginConsumption(component.Process, lease).IsSuccess);
+        var settled = kernel.Budgets.SettleLease(component.Process, lease,
+            charge == 0 ? [] : [new(ServiceBudgetDimension.ComputeTimeNanoseconds, charge)]).Value!;
+        var rootBefore = Usage(kernel.QueryBudget(kernel.Budgets.SystemBudget).Value!, ServiceBudgetDimension.ComputeTimeNanoseconds).Used;
+        Assert.Equal(charge, rootBefore);
+        Assert.True(kernel.DrainComponent(new("terminal-retirement"), component.Process).IsSuccess);
+        Assert.Equal(ComponentLifecycleState.Reclaimable, kernel.ObserveComponentTeardown(new("terminal-retirement")).Value!.State);
+        Assert.Equal(KernelError.StaleGeneration,
+            kernel.RetireReclaimableComponent(new("terminal-retirement"), component.Process with { Generation = component.Process.Generation + 1 }).Error);
+        Assert.True(kernel.QueryBudget(component.ProcessBudget).IsSuccess);
+        Assert.True(kernel.RetireReclaimableComponent(new("terminal-retirement"), component.Process).IsSuccess);
+        Assert.False(kernel.Budgets.HasProcessAccount(component.Process));
+        Assert.Equal(KernelError.StaleGeneration, kernel.QueryBudget(component.ProcessBudget).Error);
+        Assert.Equal(KernelError.StaleGeneration, kernel.QueryBudget(component.ServiceBudget).Error);
+        Assert.Equal(KernelError.ComponentNotFound, kernel.QueryComponent(new("terminal-retirement")).Error);
+        BudgetSnapshotAssertions.Equal(settled, kernel.Budgets.Query(lease).Value!);
+        Assert.Equal(rootBefore, Usage(kernel.QueryBudget(kernel.Budgets.SystemBudget).Value!, ServiceBudgetDimension.ComputeTimeNanoseconds).Used);
+    }
+
+    [Theory]
+    [InlineData(false, false)] [InlineData(false, true)]
+    [InlineData(true, false)] [InlineData(true, true)]
+    public async Task ReturnedRegionOwnerCannotMakeOldChargeCleanupConsumeNewGeneration(bool scalar, bool reverseSettlement)
+    {
+        var kernel = new RuntimeKernel();
+        var source = Admit(kernel, "aba-source", 601, 6001,
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 8)]).Value!;
+        var peer = Admit(kernel, "aba-peer", 602, 6002,
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 8)]).Value!;
+        var scalarRegion = scalar ? kernel.AllocateRegion(source.Process, 7).Value! : null;
+        var buffer = scalar ? null : kernel.AllocateBuffer<byte>(source.Process, 4).Value!;
+        var old = scalar ? scalarRegion!.Handle : buffer!.Handle;
+        var routes = RegionCharges(kernel);
+        var oldCharge = routes[old];
+        Assert.True(kernel.Budgets.QuarantineLease(source.Process, oldCharge.Reservation).IsSuccess);
+        if (scalar) scalarRegion = kernel.TransferRegion(source.Process, peer.Process, scalarRegion!).Value!;
+        else buffer = kernel.TransferRegion(source.Process, peer.Process, buffer!).Value!;
+        var middle = scalar ? scalarRegion!.Handle : buffer!.Handle;
+        var middleCharge = routes[middle];
+        Assert.True(kernel.Budgets.QuarantineLease(peer.Process, middleCharge.Reservation).IsSuccess);
+        if (scalar) scalarRegion = kernel.TransferRegion(peer.Process, source.Process, scalarRegion!).Value!;
+        else buffer = kernel.TransferRegion(peer.Process, source.Process, buffer!).Value!;
+        var current = scalar ? scalarRegion!.Handle : buffer!.Handle;
+        var currentCharge = routes[current];
+        var descriptor = kernel.Regions.Snapshot().Single(item => item.Handle == current);
+        Assert.Equal(old.RegionId, current.RegionId);
+        Assert.Equal(old.Generation.Value + 2, current.Generation.Value);
+        Assert.NotEqual(oldCharge.Reservation, currentCharge.Reservation);
+        Assert.False(kernel.Regions.HasEndedAccountingLifetime(current));
+        Assert.True(kernel.Regions.HasEndedAccountingLifetime(old));
+        Assert.True(kernel.Regions.HasEndedAccountingLifetime(middle));
+        var order = reverseSettlement ? new[] { middleCharge, oldCharge } : new[] { oldCharge, middleCharge };
+        foreach (var charge in order)
+        {
+            Assert.False(kernel.ReleaseBudget(charge.Owner, charge.Reservation).IsSuccess);
+            Assert.True(kernel.Budgets.ReconcileLease(charge.Owner, charge.Reservation).IsSuccess);
+            Assert.True(kernel.Budgets.SettleLease(charge.Owner, charge.Reservation, []).IsSuccess);
+        }
+        var released = await Task.WhenAll(order.Select(charge => Task.Run(() =>
+            kernel.ReleaseBudget(charge.Owner, charge.Reservation)))).WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.All(released, result => Assert.True(result.IsSuccess));
+        Assert.False(routes.ContainsKey(old));
+        Assert.False(routes.ContainsKey(middle));
+        Assert.Equal(currentCharge, routes[current]);
+        Assert.Equal(descriptor, kernel.Regions.Snapshot().Single(item => item.Handle == current));
+        Assert.Equal(4UL, Usage(kernel.QueryBudget(source.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.Equal(0UL, Usage(kernel.QueryBudget(peer.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.True(kernel.ReleaseBudget(source.Process, oldCharge.Reservation).IsSuccess);
+        Assert.Equal(currentCharge, routes[current]);
+        Assert.False(kernel.ReleaseBudget(source.Process, currentCharge.Reservation).IsSuccess);
+        Assert.True(kernel.TerminateProcess(peer.Process).IsSuccess);
+        Assert.True(kernel.TerminateProcess(source.Process).IsSuccess);
+        Assert.False(routes.ContainsKey(current));
+    }
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void SettledTransferredGenerationRetryCannotReleaseCurrentRegionOrCharge(bool scalar)
+    {
+        var kernel = new RuntimeKernel();
+        var source = Admit(kernel, "old-routing", 591, 5901,
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 4)]).Value!;
+        var target = Admit(kernel, "new-routing", 592, 5902,
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 4)]).Value!;
+        var scalarRegion = scalar ? kernel.AllocateRegion(source.Process, 7).Value! : null;
+        var buffer = scalar ? null : kernel.AllocateBuffer<byte>(source.Process, 4).Value!;
+        var old = scalar ? scalarRegion!.Handle : buffer!.Handle;
+        var routes = RegionCharges(kernel);
+        var charge = routes[old];
+        Assert.False(kernel.Regions.HasEndedAccountingLifetime(old));
+        Assert.False(kernel.Regions.HasEndedAccountingLifetime(new(old.RegionId, new(0))));
+        Assert.True(kernel.Budgets.QuarantineLease(source.Process, charge.Reservation).IsSuccess);
+        var moved = scalar ? kernel.TransferRegion(source.Process, target.Process, scalarRegion!).Value!.Handle
+            : kernel.TransferRegion(source.Process, target.Process, buffer!).Value!.Handle;
+        var currentCharge = routes[moved];
+        var current = kernel.Regions.Snapshot().Single(item => item.Handle == moved);
+        Assert.True(kernel.Regions.HasEndedAccountingLifetime(old));
+        Assert.False(kernel.Regions.HasEndedAccountingLifetime(moved));
+        Assert.False(kernel.Regions.HasEndedAccountingLifetime(new(moved.RegionId, new(moved.Generation.Value + 1))));
+        Assert.False(kernel.ReleaseBudget(source.Process, charge.Reservation).IsSuccess);
+        Assert.Equal(charge, routes[old]);
+        Assert.True(kernel.Budgets.ReconcileLease(source.Process, charge.Reservation).IsSuccess);
+        Assert.True(kernel.Budgets.SettleLease(source.Process, charge.Reservation, []).IsSuccess);
+        Assert.False(kernel.ReleaseBudget(target.Process, charge.Reservation).IsSuccess);
+        Assert.Equal(charge, routes[old]);
+        for (var retry = 0; retry < 2; retry++)
+        {
+            Assert.True(kernel.ReleaseBudget(source.Process, charge.Reservation).IsSuccess);
+            Assert.False(routes.ContainsKey(old));
+            Assert.Equal(currentCharge, routes[moved]);
+            Assert.Equal(current, kernel.Regions.Snapshot().Single(item => item.Handle == moved));
+            Assert.Equal(4UL, Usage(kernel.QueryBudget(target.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        }
+        Assert.True(kernel.TerminateProcess(source.Process).IsSuccess);
+        Assert.True(kernel.TerminateProcess(target.Process).IsSuccess);
+    }
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void ExactReleasedBudgetRetryRetiresOnlyEndedRegionRouting(bool reclaim)
+    {
+        var kernel = new RuntimeKernel();
+        var source = Admit(kernel, "retry-source", 581, 5801,
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 4)]).Value!;
+        var other = Admit(kernel, "retry-other", 582, 5802,
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 4)]).Value!;
+        var region = kernel.AllocateBuffer<byte>(source.Process, 4).Value!.Handle;
+        var outside = kernel.AllocateBuffer<byte>(other.Process, 4).Value!.Handle;
+        var routes = RegionCharges(kernel);
+        var charge = routes[region];
+        var outsideCharge = routes[outside];
+        Assert.True(kernel.Budgets.QuarantineLease(source.Process, charge.Reservation).IsSuccess);
+        if (reclaim) Assert.True(kernel.TerminateProcess(source.Process).IsSuccess);
+        Assert.False(kernel.ReleaseBudget(source.Process, charge.Reservation).IsSuccess);
+        Assert.Equal(charge, routes[region]);
+        Assert.True(kernel.Budgets.ReconcileLease(source.Process, charge.Reservation).IsSuccess);
+        Assert.False(kernel.ReleaseBudget(source.Process, charge.Reservation).IsSuccess);
+        Assert.Equal(charge, routes[region]);
+        Assert.True(kernel.Budgets.SettleLease(source.Process, charge.Reservation, []).IsSuccess);
+        var wrong = source.Process with { Generation = source.Process.Generation + 1 };
+        Assert.False(kernel.ReleaseBudget(wrong, charge.Reservation).IsSuccess);
+        Assert.Equal(charge, routes[region]);
+        for (var retry = 0; retry < 2; retry++)
+        {
+            Assert.True(kernel.ReleaseBudget(source.Process, charge.Reservation).IsSuccess);
+            Assert.Equal(!reclaim, routes.ContainsKey(region));
+            Assert.Equal(outsideCharge, routes[outside]);
+            Assert.Equal(4UL, Usage(kernel.QueryBudget(other.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        }
+        Assert.Equal(reclaim ? RegionState.Released : RegionState.Owned,
+            kernel.Regions.Snapshot().Single(item => item.Handle == region).State);
+        if (!reclaim) Assert.True(kernel.TerminateProcess(source.Process).IsSuccess);
+        Assert.True(kernel.TerminateProcess(other.Process).IsSuccess);
+    }
     [Fact]
     public void HierarchyRetirementCannotRetireUnrelatedServiceOrSharedChild()
     {
@@ -691,6 +1217,45 @@ public sealed class Phase05ResourceBudgetTests
         Assert.False((scalar ? kernel.ReleaseRegion(owner.Process, region!) : kernel.ReleaseRegion(owner.Process, buffer!)).IsSuccess);
         Assert.Equal(charge, Assert.Single(RegionCharges(kernel)).Value);
         Assert.Equal(4UL, Usage(kernel.QueryBudget(owner.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+    }
+
+    [Theory]
+    [InlineData(false, false)] [InlineData(true, false)]
+    [InlineData(false, true)] [InlineData(true, true)]
+    public void CohortRegionReleaseRoutesOriginalPayerAndRetainsRefusedCharge(bool scalar, bool quarantine)
+    {
+        var kernel = new RuntimeKernel();
+        var payer = Admit(kernel, "cohort-release-payer", 574, 5704,
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 4)]).Value!;
+        var peer = Admit(kernel, "cohort-release-peer", 575, 5704,
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 4)]).Value!;
+        var buffer = scalar ? null : kernel.AllocateBuffer<byte>(payer.Process, 4).Value!;
+        var region = scalar ? kernel.AllocateRegion(payer.Process, 7).Value! : null;
+        var handle = scalar ? region!.Handle : buffer!.Handle;
+        var charge = RegionCharges(kernel)[handle];
+        Assert.Equal(payer.Process, charge.Owner);
+        if (quarantine) Assert.True(kernel.Budgets.QuarantineLease(payer.Process, charge.Reservation).IsSuccess);
+        var released = scalar ? kernel.ReleaseRegion(peer.Process, region!) : kernel.ReleaseRegion(peer.Process, buffer!);
+        Assert.True(released.IsSuccess, released.Message);
+        Assert.Equal(RegionState.Released, kernel.Regions.Snapshot().Single(r => r.Handle == handle).State);
+        Assert.False((scalar ? kernel.ReleaseRegion(peer.Process, region!) : kernel.ReleaseRegion(peer.Process, buffer!)).IsSuccess);
+        Assert.Equal(0UL, Usage(kernel.QueryBudget(peer.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        if (quarantine)
+        {
+            Assert.Equal(charge, Assert.Single(RegionCharges(kernel)).Value);
+            Assert.Equal(BudgetReservationState.Quarantined, kernel.QueryBudget(charge.Reservation).Value!.State);
+            Assert.Equal(4UL, Usage(kernel.QueryBudget(payer.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+            Assert.False(kernel.ReleaseBudget(peer.Process, charge.Reservation).IsSuccess);
+            Assert.True(kernel.Budgets.ReconcileLease(payer.Process, charge.Reservation).IsSuccess);
+            Assert.False(kernel.ReleaseBudget(payer.Process, charge.Reservation).IsSuccess);
+            Assert.Equal(BudgetReservationState.Reconciled, kernel.QueryBudget(charge.Reservation).Value!.State);
+            Assert.Equal(charge, Assert.Single(RegionCharges(kernel)).Value);
+            Assert.Equal(4UL, Usage(kernel.QueryBudget(payer.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
+            return; // Region release does not manufacture quantitative settlement.
+        }
+        Assert.Empty(RegionCharges(kernel));
+        Assert.Equal(BudgetReservationState.Released, kernel.QueryBudget(charge.Reservation).Value!.State);
+        Assert.Equal(0UL, Usage(kernel.QueryBudget(payer.ProcessBudget).Value!, ServiceBudgetDimension.OwnedMemoryBytes).Used);
     }
 
     private static Dictionary<RegionHandle, (ProcessHandle Owner, BudgetReservationHandle Reservation)> RegionCharges(RuntimeKernel kernel) =>

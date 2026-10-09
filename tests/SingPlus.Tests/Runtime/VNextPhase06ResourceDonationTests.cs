@@ -16,6 +16,277 @@ internal interface IVNextP06DonatedResourceService
 
 public sealed class VNextPhase06ResourceDonationTests
 {
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)] [InlineData(5)] [InlineData(6)]
+    public void PossibleSubmitClockOwnerLossDoesNotMutatePostCallbackFacts(int fault)
+    {
+        var clock = new DonationClock();
+        var setup = Create(timeProvider: clock, resourceGeneration: 7);
+        var invocation = Begin(setup.Kernel, setup.Caller, setup.Service, setup.Session);
+        var donation = setup.Kernel.BindResourceDonation(setup.Caller, setup.Service,
+            invocation.Context.Invocation, setup.SourceGrant, 7, Requirement(40), Envelope(40), AdmissionQosHint.None).Value!;
+        BudgetReservationState observed = BudgetReservationState.Reserved;
+        ulong used = 40;
+        Action faultAction = () =>
+        {
+            if (fault is 0 or 6) Assert.True(setup.Kernel.CapabilityAuthority.Revoke(donation.DerivedGrant).IsSuccess);
+            if (fault == 1)
+            {
+                var stopped = setup.Kernel.TerminateProcess(setup.Service);
+                Assert.True(stopped.IsSuccess || stopped.Error == KernelError.PlatformBindingDraining, stopped.Message);
+            }
+            if (fault == 2) Assert.Equal(KernelError.SessionDraining, setup.Kernel.CloseSession(setup.Caller, setup.Session).Error);
+            if (fault == 4) Assert.True(setup.Kernel.SettleInlineSessionInvocation(setup.Service, invocation, false).IsSuccess);
+            if (fault == 5) Assert.True(setup.Kernel.Budgets.CancelLeasePreSubmit(setup.Caller, donation.Lease).IsSuccess);
+            observed = setup.Kernel.QueryBudget(donation.Lease).Value!.State;
+            used = Used(setup);
+            if (fault == 3) throw new InvalidOperationException("Clock failure before consumption.");
+        };
+        clock.Callback = fault == 6 ? () => clock.Callback = faultAction : faultAction;
+        Assert.False(setup.Kernel.MarkResourceDonationPossibleSubmit(setup.Service, invocation.Context.Invocation).IsSuccess);
+        Assert.Equal(observed, setup.Kernel.QueryBudget(donation.Lease).Value!.State);
+        Assert.Equal(used, Used(setup));
+        if (fault == 3)
+        {
+            Assert.True(setup.Kernel.MarkResourceDonationPossibleSubmit(setup.Service, invocation.Context.Invocation).IsSuccess);
+            Assert.Equal(BudgetReservationState.Consuming, setup.Kernel.QueryBudget(donation.Lease).Value!.State);
+            Assert.Equal(40UL, Used(setup));
+        }
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void PossibleSubmitClockWorkerReentryHasOneWinnerWithoutCorrelationDeadlock(bool returnDonation)
+    {
+        var clock = new DonationClock();
+        var setup = Create(timeProvider: clock);
+        var invocation = Begin(setup.Kernel, setup.Caller, setup.Service, setup.Session);
+        var donation = setup.Kernel.BindResourceDonation(setup.Caller, setup.Service,
+            invocation.Context.Invocation, setup.SourceGrant, 1, Requirement(40), Envelope(40), AdmissionQosHint.None).Value!;
+        clock.Callback = () =>
+        {
+            var worker = Task.Run(() => returnDonation
+                ? setup.Kernel.CloseResourceDonation(setup.Service, invocation.Context.Invocation, submitMayHaveOccurred: false)
+                : setup.Kernel.MarkResourceDonationPossibleSubmit(setup.Service, invocation.Context.Invocation));
+            Assert.True(worker.Wait(TimeSpan.FromSeconds(5)), "Clock callback held correlation or owner commit lock.");
+            Assert.True(worker.Result.IsSuccess, worker.Result.Message);
+        };
+        Assert.False(setup.Kernel.MarkResourceDonationPossibleSubmit(setup.Service, invocation.Context.Invocation).IsSuccess);
+        Assert.Equal(returnDonation ? BudgetReservationState.CancelledPreSubmit : BudgetReservationState.Consuming,
+            setup.Kernel.QueryBudget(donation.Lease).Value!.State);
+        Assert.Equal(returnDonation ? 0UL : 40UL, Used(setup));
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void NonDefaultDonationGenerationReachesPossibleSubmitAndRetainsUnknownEffect(bool nested)
+    {
+        var setup = Create(includeDownstream: nested, resourceGeneration: 7);
+        var parentInvocation = Begin(setup.Kernel, setup.Caller, setup.Service, setup.Session);
+        var parent = setup.Kernel.BindResourceDonation(setup.Caller, setup.Service,
+            parentInvocation.Context.Invocation, setup.SourceGrant, 7, Requirement(100), Envelope(100),
+            AdmissionQosHint.LatencySensitive).Value!;
+        var donation = parent;
+        var invocation = parentInvocation;
+        var service = setup.Service;
+        if (nested)
+        {
+            invocation = Begin(setup.Kernel, setup.Service, setup.Downstream, setup.DownstreamSession);
+            donation = setup.Kernel.DeriveNestedResourceDonation(setup.Service, setup.Downstream,
+                parent.Invocation, invocation.Context.Invocation, Envelope(30), ResourceAssuranceV1.AccountingOnly,
+                AdmissionQosHint.Background).Value!;
+            service = setup.Downstream;
+        }
+        Assert.Equal(7UL, donation.ResourceGrantGeneration);
+        Assert.True(setup.Kernel.MarkResourceDonationPossibleSubmit(service, invocation.Context.Invocation).IsSuccess);
+        Assert.Equal(BudgetReservationState.Consuming, setup.Kernel.QueryBudget(donation.Lease).Value!.State);
+        Assert.Equal(100UL, Used(setup));
+        Assert.True(setup.Kernel.CloseResourceDonation(service, invocation.Context.Invocation, submitMayHaveOccurred: true).IsSuccess);
+        Assert.Equal(BudgetReservationState.Quarantined, setup.Kernel.QueryBudget(donation.Lease).Value!.State);
+        Assert.Equal(100UL, Used(setup));
+    }
+
+    [Theory]
+    [InlineData(0UL)] [InlineData(1UL)] [InlineData(6UL)]
+    public void WrongDonationSourceGenerationCannotAllocateOrConsumeAndExactRetryWorks(ulong wrongGeneration)
+    {
+        var setup = Create(resourceGeneration: 7);
+        var invocation = Begin(setup.Kernel, setup.Caller, setup.Service, setup.Session);
+        var records = setup.Kernel.CapabilityAuthority.InspectionSnapshot().Length;
+        Assert.Equal(KernelError.StaleGeneration, setup.Kernel.BindResourceDonation(setup.Caller, setup.Service,
+            invocation.Context.Invocation, setup.SourceGrant, wrongGeneration, Requirement(10), Envelope(10),
+            AdmissionQosHint.None).Error);
+        Assert.Equal(records, setup.Kernel.CapabilityAuthority.InspectionSnapshot().Length);
+        Assert.Equal(0UL, Used(setup));
+        Assert.False(setup.Kernel.MarkResourceDonationPossibleSubmit(setup.Service, invocation.Context.Invocation).IsSuccess);
+        Assert.True(setup.Kernel.BindResourceDonation(setup.Caller, setup.Service,
+            invocation.Context.Invocation, setup.SourceGrant, 7, Requirement(10), Envelope(10), AdmissionQosHint.None).IsSuccess);
+        Assert.True(setup.Kernel.MarkResourceDonationPossibleSubmit(setup.Service, invocation.Context.Invocation).IsSuccess);
+        Assert.Equal(10UL, Used(setup));
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)] [InlineData(5)] [InlineData(6)] [InlineData(7)] [InlineData(8)]
+    public void NestedFinalOwnerLossCannotDebitParentOrPublishChild(int fault)
+    {
+        var setup = Create(includeDownstream: true);
+        var parentInvocation = Begin(setup.Kernel, setup.Caller, setup.Service, setup.Session);
+        var parent = setup.Kernel.BindResourceDonation(setup.Caller, setup.Service,
+            parentInvocation.Context.Invocation, setup.SourceGrant, 1, Requirement(100), Envelope(100),
+            AdmissionQosHint.LatencySensitive).Value!;
+        var childInvocation = Begin(setup.Kernel, setup.Service, setup.Downstream, setup.DownstreamSession);
+        CapabilityId prepared = default;
+        setup.Kernel.BeforeNestedDonationPublicationQualificationHook = grant =>
+        {
+            prepared = grant;
+            Assert.Equal(100UL, Assert.Single(setup.Kernel.QueryBudget(parent.Lease).Value!.Amounts).Amount);
+            if (fault == 0) Assert.True(setup.Kernel.CapabilityAuthority.Revoke(parent.DerivedGrant).IsSuccess);
+            if (fault == 1) Assert.True(setup.Kernel.CapabilityAuthority.Revoke(grant).IsSuccess);
+            if (fault == 2) Assert.True(setup.Kernel.TerminateProcess(setup.Downstream).IsSuccess);
+            if (fault == 3) throw new InvalidOperationException("Nested preparation interrupted.");
+            if (fault == 4)
+            {
+                childInvocation.Dispose();
+                Assert.True(setup.Kernel.CloseSession(setup.Service, setup.DownstreamSession).IsSuccess);
+            }
+            if (fault == 5)
+                Assert.True(setup.Kernel.MarkResourceDonationPossibleSubmit(setup.Service, parent.Invocation).IsSuccess);
+            if (fault == 6)
+                Assert.True(setup.Kernel.SettleInlineSessionInvocation(setup.Downstream, childInvocation, false).IsSuccess);
+            if (fault == 7) Assert.True(setup.Kernel.TerminateProcess(setup.Service).IsSuccess);
+            if (fault == 8) Assert.True(setup.Kernel.Budgets.CancelLeasePreSubmit(setup.Caller, parent.Lease).IsSuccess);
+        };
+        Assert.False(setup.Kernel.DeriveNestedResourceDonation(setup.Service, setup.Downstream,
+            parent.Invocation, childInvocation.Context.Invocation, Envelope(30), ResourceAssuranceV1.AccountingOnly,
+            AdmissionQosHint.Background).IsSuccess);
+        Assert.Equal(100UL, Assert.Single(setup.Kernel.QueryBudget(parent.Lease).Value!.Amounts).Amount);
+        Assert.Equal(fault == 8 ? 0UL : 100UL, Used(setup));
+        Assert.False(setup.Kernel.CapabilityAuthority.ValidateResourceUse(prepared, setup.DownstreamDomain,
+            setup.Downstream.Generation, 1, Envelope(30)).IsSuccess);
+        Assert.False(setup.Kernel.MarkResourceDonationPossibleSubmit(setup.Downstream, childInvocation.Context.Invocation).IsSuccess);
+        if (fault == 3)
+        {
+            setup.Kernel.BeforeNestedDonationPublicationQualificationHook = null;
+            Assert.True(setup.Kernel.DeriveNestedResourceDonation(setup.Service, setup.Downstream,
+                parent.Invocation, childInvocation.Context.Invocation, Envelope(30), ResourceAssuranceV1.AccountingOnly,
+                AdmissionQosHint.Background).IsSuccess);
+            Assert.Equal(70UL, Assert.Single(setup.Kernel.QueryBudget(parent.Lease).Value!.Amounts).Amount);
+            Assert.Equal(100UL, Used(setup));
+        }
+    }
+
+    [Fact]
+    public void NestedPreparationAllowsWorkerReentryWithoutSecondSplit()
+    {
+        var setup = Create(includeDownstream: true);
+        var parentInvocation = Begin(setup.Kernel, setup.Caller, setup.Service, setup.Session);
+        var parent = setup.Kernel.BindResourceDonation(setup.Caller, setup.Service,
+            parentInvocation.Context.Invocation, setup.SourceGrant, 1, Requirement(100), Envelope(100),
+            AdmissionQosHint.LatencySensitive).Value!;
+        var child = Begin(setup.Kernel, setup.Service, setup.Downstream, setup.DownstreamSession);
+        setup.Kernel.BeforeNestedDonationPublicationQualificationHook = _ =>
+        {
+            var reentry = Task.Run(() => setup.Kernel.DeriveNestedResourceDonation(setup.Service, setup.Downstream,
+                parent.Invocation, child.Context.Invocation, Envelope(30), ResourceAssuranceV1.AccountingOnly,
+                AdmissionQosHint.Background));
+            Assert.True(reentry.Wait(TimeSpan.FromSeconds(5)), "Nested preparation held correlation gate.");
+            Assert.Equal(KernelError.InvalidTransition, reentry.Result.Error);
+        };
+        Assert.True(setup.Kernel.DeriveNestedResourceDonation(setup.Service, setup.Downstream,
+            parent.Invocation, child.Context.Invocation, Envelope(30), ResourceAssuranceV1.AccountingOnly,
+            AdmissionQosHint.Background).IsSuccess);
+        Assert.Equal(70UL, Assert.Single(setup.Kernel.QueryBudget(parent.Lease).Value!.Amounts).Amount);
+        Assert.Equal(100UL, Used(setup));
+    }
+
+    [Fact]
+    public void FinalDonationClockCallbackReentryAndSourceRevocationCannotPublish()
+    {
+        var clock = new DonationClock();
+        var setup = Create(timeProvider: clock);
+        var invocation = Begin(setup.Kernel, setup.Caller, setup.Service, setup.Session);
+        setup.Kernel.BeforeDonationPublicationQualificationHook = binding => clock.Callback = () =>
+        {
+            var reentry = Task.Run(() => setup.Kernel.BindResourceDonation(setup.Caller, setup.Service,
+                invocation.Context.Invocation, setup.SourceGrant, 1, Requirement(10), Envelope(10), AdmissionQosHint.None));
+            Assert.True(reentry.Wait(TimeSpan.FromSeconds(5)), "Actual resource clock callback held a correlation lock.");
+            Assert.Equal(KernelError.InvalidTransition, reentry.Result.Error);
+            Assert.True(setup.Kernel.CapabilityAuthority.Revoke(setup.SourceGrant).IsSuccess);
+        };
+        Assert.Equal(KernelError.CapabilityRevoked, setup.Kernel.BindResourceDonation(setup.Caller, setup.Service,
+            invocation.Context.Invocation, setup.SourceGrant, 1, Requirement(10), Envelope(10), AdmissionQosHint.None).Error);
+        Assert.Equal(0UL, Used(setup));
+        Assert.False(setup.Kernel.MarkResourceDonationPossibleSubmit(setup.Service, invocation.Context.Invocation).IsSuccess);
+    }
+
+    private sealed class DonationClock : TimeProvider
+    {
+        internal Action? Callback;
+        public override DateTimeOffset GetUtcNow()
+        {
+            Interlocked.Exchange(ref Callback, null)?.Invoke();
+            return DateTimeOffset.UnixEpoch;
+        }
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)] [InlineData(5)] [InlineData(6)]
+    public void InitialDonationFinalOwnerLossRefusesBindingAndCancelsExactLocalFacts(int fault)
+    {
+        var setup = Create();
+        var invocation = Begin(setup.Kernel, setup.Caller, setup.Service, setup.Session);
+        ResourceDonationBinding? prepared = null;
+        setup.Kernel.BeforeDonationPublicationQualificationHook = binding =>
+        {
+            prepared = binding;
+            if (fault == 0) Assert.True(setup.Kernel.CapabilityAuthority.Revoke(setup.SourceGrant).IsSuccess);
+            if (fault == 1) Assert.True(setup.Kernel.CapabilityAuthority.Revoke(binding.DerivedGrant).IsSuccess);
+            if (fault == 2) Assert.True(setup.Kernel.TerminateProcess(setup.Caller).IsSuccess);
+            if (fault == 3) Assert.True(setup.Kernel.TerminateProcess(setup.Service).IsSuccess);
+            if (fault == 4) Assert.True(setup.Kernel.Budgets.CancelLeasePreSubmit(setup.Caller, binding.Lease).IsSuccess);
+            if (fault == 5) throw new InvalidOperationException("Interrupted publication.");
+            if (fault == 6)
+            {
+                invocation.Dispose();
+                Assert.True(setup.Kernel.CloseSession(setup.Caller, setup.Session).IsSuccess);
+            }
+        };
+        var result = setup.Kernel.BindResourceDonation(setup.Caller, setup.Service,
+            invocation.Context.Invocation, setup.SourceGrant, 1, Requirement(10), Envelope(10), AdmissionQosHint.None);
+        Assert.False(result.IsSuccess);
+        Assert.NotNull(prepared);
+        Assert.False(setup.Kernel.MarkResourceDonationPossibleSubmit(setup.Service, invocation.Context.Invocation).IsSuccess);
+        Assert.Equal(BudgetReservationState.CancelledPreSubmit, setup.Kernel.QueryBudget(prepared.Lease).Value!.State);
+        Assert.Equal(0UL, Used(setup));
+        Assert.False(setup.Kernel.CapabilityAuthority.ValidateResourceUse(prepared.DerivedGrant, setup.ServiceDomain,
+            setup.Service.Generation, 1, Envelope(10)).IsSuccess);
+        if (fault is 4 or 5)
+        {
+            setup.Kernel.BeforeDonationPublicationQualificationHook = null;
+            Assert.True(setup.Kernel.BindResourceDonation(setup.Caller, setup.Service,
+                invocation.Context.Invocation, setup.SourceGrant, 1, Requirement(10), Envelope(10), AdmissionQosHint.None).IsSuccess);
+            Assert.Equal(10UL, Used(setup));
+        }
+    }
+
+    [Fact]
+    public void InitialDonationPreparationCallbackRunsOutsideCorrelationLockAndRefusesReentry()
+    {
+        var setup = Create();
+        var invocation = Begin(setup.Kernel, setup.Caller, setup.Service, setup.Session);
+        setup.Kernel.BeforeDonationPublicationQualificationHook = binding =>
+        {
+            var reentry = Task.Run(() => setup.Kernel.BindResourceDonation(setup.Caller, setup.Service,
+                invocation.Context.Invocation, setup.SourceGrant, 1, Requirement(10), Envelope(10), AdmissionQosHint.None));
+            Assert.True(reentry.Wait(TimeSpan.FromSeconds(5)), "Donation callback held correlation owner lock.");
+            Assert.Equal(KernelError.InvalidTransition, reentry.Result.Error);
+            Assert.Equal(10UL, Used(setup));
+        };
+        Assert.True(setup.Kernel.BindResourceDonation(setup.Caller, setup.Service,
+            invocation.Context.Invocation, setup.SourceGrant, 1, Requirement(10), Envelope(10), AdmissionQosHint.None).IsSuccess);
+        Assert.Equal(10UL, Used(setup));
+    }
+
     [Fact]
     public void RevokedDonationCannotBeginConsumptionAndBudgetRemainsReserved()
     {
@@ -83,17 +354,14 @@ public sealed class VNextPhase06ResourceDonationTests
     }
 
     [Theory]
-    [InlineData(0)]
-    [InlineData(1)]
-    [InlineData(2)]
-    [InlineData(3)]
-    [InlineData(4)]
-    public void GeneratedSentryConsumesExactInvocationDonationWithoutSecondCharge(int revokePoint)
+    [InlineData(0, 1UL)] [InlineData(1, 1UL)] [InlineData(2, 1UL)] [InlineData(3, 1UL)] [InlineData(4, 1UL)]
+    [InlineData(0, 7UL)] [InlineData(1, 7UL)] [InlineData(2, 7UL)] [InlineData(3, 7UL)] [InlineData(4, 7UL)]
+    public void GeneratedSentryConsumesExactInvocationDonationWithoutSecondCharge(int revokePoint, ulong resourceGeneration)
     {
-        var setup = Create();
+        var setup = Create(resourceGeneration: resourceGeneration);
         var invocation = Begin(setup.Kernel, setup.Caller, setup.Service, setup.Session);
         var donation = setup.Kernel.BindResourceDonation(setup.Caller, setup.Service,
-            invocation.Context.Invocation, setup.SourceGrant, 1, Requirement(10), Envelope(10),
+            invocation.Context.Invocation, setup.SourceGrant, resourceGeneration, Requirement(10), Envelope(10),
             AdmissionQosHint.None).Value!;
         var effect = setup.Kernel.CapabilityAuthority.Mint(setup.ServiceDomain, setup.ServiceDomain,
             ResourceKind.Compute, "compute:effect", CapabilityRights.Execute, setup.Service.Generation,
@@ -482,9 +750,9 @@ public sealed class VNextPhase06ResourceDonationTests
         Assert.True(setup.Kernel.SettleInlineSessionInvocation(setup.Service, invocation, false).IsSuccess);
     }
 
-    private static Setup Create(bool includeDownstream = false)
+    private static Setup Create(bool includeDownstream = false, TimeProvider? timeProvider = null, ulong resourceGeneration = 1)
     {
-        var kernel = new RuntimeKernel();
+        var kernel = new RuntimeKernel(null, timeProvider);
         var admin = TestFixtures.Create(kernel, 960, 1960).Handle;
         var caller = TestFixtures.Create(kernel, 961, 1961).Handle;
         var service = TestFixtures.Create(kernel, 962, 1962).Handle;
@@ -496,7 +764,7 @@ public sealed class VNextPhase06ResourceDonationTests
         Assert.True(kernel.AdmitProcessBudget(admin, administration, service, "p06-service",
             [new(ServiceBudgetDimension.OwnedMemoryBytes, 64)]).IsSuccess);
         var source = kernel.CapabilityAuthority.Mint(new(1961), new(1961), ResourceKind.Compute,
-            "resource-use:compute-time", CapabilityRights.Delegate, caller.Generation, 1,
+            "resource-use:compute-time", CapabilityRights.Delegate, caller.Generation, resourceGeneration,
             range: null, session: null, quota: 100, delegationDepth: 4,
             resourceUse: new(1, Envelope(100), 0, long.MaxValue,
                 ResourceAssuranceV1.RuntimeEnforced, 3)).Value!.CapabilityId;

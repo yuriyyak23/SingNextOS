@@ -107,6 +107,21 @@ public sealed class ComputePlanner(RegionAuthority regions)
     {
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(currentCandidates);
+        if (plan.Intent is null || plan.RequiredRegionUses is null)
+            return KernelResult.Fail(KernelError.InvalidMessage, "Compute plan requires an intent and exact operand uses.");
+        var intentValidation = ValidateIntent(plan.Intent);
+        if (!intentValidation.IsSuccess) return intentValidation;
+        if (!Enum.IsDefined(plan.PublicationPath) ||
+            (plan.Intent.PublicationPreference == ComputePublicationPreference.StagedRequired &&
+             plan.PublicationPath != ComputePublicationPath.Staged) ||
+            (plan.Intent.PublicationPreference == ComputePublicationPreference.DirectRequired &&
+             plan.PublicationPath != ComputePublicationPath.DirectCoherent))
+            return KernelResult.Fail(KernelError.InvalidMessage,
+                "Compute plan publication path does not satisfy its mandatory intent.");
+        // A plan is descriptive input, never authority. Recompute the exact operand roles/ranges.
+        if (!plan.RequiredRegionUses.SequenceEqual(RequiredUses(plan.Intent, plan.PublicationPath)))
+            return KernelResult.Fail(KernelError.InvalidMessage,
+                "Compute plan RegionUse requests do not match its exact intent operands and publication path.");
         var providers = currentCandidates.Where(candidate => candidate.ProviderId == plan.ProviderId).Take(2).ToArray();
         if (providers.Length > 1)
             return KernelResult.Fail(KernelError.InvalidMessage,
@@ -125,7 +140,16 @@ public sealed class ComputePlanner(RegionAuthority regions)
                 : regions.ProbeUse(use.Region, principal, use.Mode, use.Range);
             if (!probe.IsSuccess) return probe;
         }
-        return ValidateGraph(plan.Dependencies);
+        if (plan.Dependencies is null)
+            return KernelResult.Fail(KernelError.InvalidMessage, "Compute plan requires an exact dependency graph.");
+        var graph = ValidateGraph(plan.Dependencies);
+        if (!graph.IsSuccess) return graph;
+        var expectedPath = plan.PublicationPath == ComputePublicationPath.Staged
+            ? ComputeDependencyKind.StagedOutputReady : ComputeDependencyKind.DirectOutputBinding;
+        return plan.Dependencies.Nodes.Any(node => node.Kind == expectedPath)
+            ? KernelResult.Ok()
+            : KernelResult.Fail(KernelError.InvalidMessage,
+                "Compute dependency graph output path does not match the admitted publication path.");
     }
 
     public static KernelResult ValidateGraph(ComputeDependencyGraph graph)

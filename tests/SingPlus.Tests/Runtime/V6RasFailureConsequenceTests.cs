@@ -7,6 +7,114 @@ namespace SingPlus.Tests.Runtime;
 public sealed class V6RasFailureConsequenceTests
 {
     [Theory]
+    [InlineData(false, 1UL)] [InlineData(true, 1UL)]
+    [InlineData(false, 7UL)] [InlineData(true, 7UL)]
+    public async Task SharedDomainOverlappingTeardownRetainsLastReclaimAndBothCharges(bool damageSecond, ulong secondGeneration)
+    {
+        var kernel = new RuntimeKernel();
+        var first = TestFixtures.Create(kernel, 8710, 8720).Handle;
+        var second = TestFixtures.Create(kernel, 8711, 8720, secondGeneration).Handle;
+        var firstBudget = kernel.Budgets.CreateProcessHierarchy(first, "shared-first", "first",
+            [new BudgetAmount(ServiceBudgetDimension.OwnedMemoryBytes, 128)]).Value;
+        var secondBudget = kernel.Budgets.CreateProcessHierarchy(second, "shared-second", "second",
+            [new BudgetAmount(ServiceBudgetDimension.OwnedMemoryBytes, 128)]).Value;
+        var firstRegion = kernel.AllocateBuffer<byte>(first, 32).Value!;
+        var secondRegion = kernel.AllocateBuffer<byte>(second, 32).Value!;
+        var owner = new RegionOwner(new(8720), damageSecond ? secondGeneration : first.Generation);
+        var damage = kernel.Regions.QuarantineSubrange((damageSecond ? secondRegion : firstRegion).Handle,
+            owner, Evidence(new(4, 4))).Value!;
+        var before = kernel.Regions.Snapshot().ToArray();
+        var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var a = Task.Run(async () => { await start.Task; return kernel.TerminateProcess(first); });
+        var b = Task.Run(async () => { await start.Task; return kernel.TerminateProcess(second); });
+        start.SetResult();
+        var results = await Task.WhenAll(a, b).WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Single(results, result => result.IsSuccess);
+        Assert.Single(results, result => result.Error == KernelError.Quarantined);
+        var pending = results[0].IsSuccess ? second : first;
+        var retired = results[0].IsSuccess ? first : second;
+        Assert.False(kernel.Processes.Resolve(retired).IsSuccess);
+        Assert.True(kernel.Processes.Resolve(pending).IsSuccess);
+        Assert.False(kernel.QueryProcessTeardown(pending).Value.LocalReclaimCompleted);
+        Assert.Equal(before, kernel.Regions.Snapshot());
+        foreach (var account in new[] { firstBudget.ProcessBudget, secondBudget.ProcessBudget })
+            Assert.Contains(kernel.QueryBudget(account).Value!.Usage, usage => usage.Dimension == ServiceBudgetDimension.OwnedMemoryBytes && usage.Used == 32);
+        Assert.Equal(KernelError.PlatformBindingDraining, kernel.CreateProcess(TestFixtures.Manifest(8712, 8720)).Error);
+        Assert.Equal(KernelError.Quarantined, kernel.TerminateProcess(pending).Error);
+        var wrongOwner = new RegionOwner(new(8720), damageSecond && secondGeneration != 1 ? 1UL : 7UL);
+        Assert.False(kernel.Regions.RecordAuthoritativeBackingReplacement(wrongOwner, Replacement(damage)).IsSuccess);
+        Assert.Equal(damage, Assert.Single(kernel.Regions.SnapshotDamage()));
+        Assert.True(kernel.Regions.RecordAuthoritativeBackingReplacement(owner, Replacement(damage)).IsSuccess);
+        Assert.True(kernel.TerminateProcess(pending).IsSuccess);
+        Assert.All(kernel.Regions.Snapshot(), region => Assert.Equal(RegionState.Released, region.State));
+        foreach (var account in new[] { firstBudget.ProcessBudget, secondBudget.ProcessBudget })
+            Assert.All(kernel.QueryBudget(account).Value!.Usage, usage => Assert.Equal(0UL, usage.Used));
+        Assert.True(kernel.CreateProcess(TestFixtures.Manifest(8712, 8720)).IsSuccess);
+        Assert.True(kernel.TerminateProcess(new(new(8712), 1)).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void DomainRejoinCannotHidePendingDamagedRegionReclaim(bool reuseProcessId)
+    {
+        var c = Create();
+        var damage = c.Kernel.Regions.QuarantineSubrange(c.Buffer.Handle, c.Owner, Evidence(new(4, 4))).Value!;
+        Assert.Equal(KernelError.Quarantined, c.Kernel.TerminateProcess(c.Process).Error);
+        Assert.False(c.Kernel.Domains.Contains(c.Owner.DomainId));
+        var manifest = TestFixtures.Manifest(reuseProcessId ? c.Process.ProcessId.Value : 8611,
+            c.Owner.DomainId.Value, reuseProcessId ? 2UL : 1UL);
+        var before = c.Kernel.Processes.Snapshot().ToArray();
+        Assert.Equal(KernelError.PlatformBindingDraining, c.Kernel.CreateProcess(manifest).Error);
+        Assert.Equal(before, c.Kernel.Processes.Snapshot());
+        Assert.False(c.Kernel.Domains.Contains(c.Owner.DomainId));
+        var unrelated = TestFixtures.Create(c.Kernel, 8612, 8621).Handle;
+        Assert.True(c.Kernel.TerminateProcess(unrelated).IsSuccess);
+        Assert.Equal(KernelError.Quarantined, c.Kernel.TerminateProcess(c.Process).Error);
+        Assert.False(c.Kernel.QueryProcessTeardown(c.Process).Value.LocalReclaimCompleted);
+        Assert.Equal(damage, Assert.Single(c.Kernel.Regions.SnapshotDamage()));
+        Assert.True(c.Kernel.Regions.RecordAuthoritativeBackingReplacement(c.Owner, Replacement(damage)).IsSuccess);
+        Assert.True(c.Kernel.TerminateProcess(c.Process).IsSuccess);
+        Assert.True(c.Kernel.CreateProcess(manifest).IsSuccess);
+        var next = new ProcessHandle(manifest.ProcessId, manifest.Generation);
+        Assert.True(c.Kernel.Domains.Contains(c.Owner.DomainId));
+        Assert.False(c.Kernel.Processes.Resolve(c.Process).IsSuccess);
+        Assert.True(c.Kernel.TerminateProcess(next).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void DamagedDomainTeardownRefusesAtomicallyAndRetriesAfterExactReplacement(bool damageSecond)
+    {
+        var c = Create();
+        var budget = c.Kernel.Budgets.CreateProcessHierarchy(c.Process, "ras-teardown", "ras-process",
+            [new BudgetAmount(ServiceBudgetDimension.OwnedMemoryBytes, 128)]).Value;
+        var second = c.Kernel.AllocateBuffer<byte>(c.Process, 32).Value!;
+        var charged = c.Kernel.QueryBudget(budget.ProcessBudget).Value!.Usage.ToArray();
+        Assert.Contains(charged, usage => usage.Dimension == ServiceBudgetDimension.OwnedMemoryBytes && usage.Used == 32);
+        var target = damageSecond ? second : c.Buffer;
+        var damage = c.Kernel.Regions.QuarantineSubrange(target.Handle, c.Owner, Evidence(new(4, 4))).Value!;
+        var before = c.Kernel.Regions.Snapshot().ToArray();
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            Assert.Equal(KernelError.Quarantined, c.Kernel.TerminateProcess(c.Process).Error);
+            var teardown = c.Kernel.QueryProcessTeardown(c.Process).Value;
+            Assert.False(teardown.LocalReclaimCompleted);
+            Assert.True(teardown.PlatformDomainClosed);
+            Assert.Equal(KernelError.Quarantined, teardown.BlockingError);
+            Assert.Equal(before, c.Kernel.Regions.Snapshot());
+            Assert.Equal(damage, Assert.Single(c.Kernel.Regions.SnapshotDamage()));
+            Assert.True(c.Kernel.Processes.Resolve(c.Process).IsSuccess);
+            Assert.Equal(charged, c.Kernel.QueryBudget(budget.ProcessBudget).Value!.Usage);
+        }
+        Assert.True(c.Kernel.Regions.RecordAuthoritativeBackingReplacement(c.Owner, Replacement(damage)).IsSuccess);
+        Assert.True(c.Kernel.TerminateProcess(c.Process).IsSuccess);
+        Assert.Empty(c.Kernel.Regions.SnapshotDamage());
+        Assert.All(c.Kernel.Regions.Snapshot(), region => Assert.Equal(RegionState.Released, region.State));
+        Assert.False(c.Kernel.Processes.Resolve(c.Process).IsSuccess);
+        Assert.All(c.Kernel.QueryBudget(budget.ProcessBudget).Value!.Usage, usage => Assert.Equal(0UL, usage.Used));
+    }
+
+    [Theory]
     [InlineData(false)]
     [InlineData(true)]
     public void GenerationAdvanceCannotResetObservationSequenceOrClearDamage(bool exhausted)

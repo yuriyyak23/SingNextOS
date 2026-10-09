@@ -47,11 +47,11 @@ public sealed class RuntimeComputeServiceHost
 
         public KernelError? AbortError { get; set; }
         public string? AbortMessage { get; set; }
+        public KernelResult? AdmissionRefusal { get; set; }
         public bool CancellationRequested { get; set; }
+        public bool CancelledBeforeProviderInvocation { get; init; }
 
-        public bool StagingMappingCloseStarted { get; set; }
         public bool StagingMappingClosed { get; set; }
-        public bool DestinationMappingCloseStarted { get; set; }
         public bool DestinationMappingClosed { get; set; }
         public bool StagingCapabilityRevoked { get; set; }
         public bool DestinationCapabilityRevoked { get; set; }
@@ -69,6 +69,7 @@ public sealed class RuntimeComputeServiceHost
     private readonly Dsc1ComputeCapability _platformComputeCapability;
     private readonly DomainId _serviceDomain;
     private PendingCopy? _pending;
+    private int _progressing;
 
     private RuntimeComputeServiceHost(
         RuntimeKernel kernel,
@@ -226,7 +227,9 @@ public sealed class RuntimeComputeServiceHost
     /// the current provider permits. Only one request is admitted at a time so the
     /// service adds no queue or scheduler authority beyond the existing channel.
     /// </summary>
-    public KernelResult ProcessNextCopy()
+    public KernelResult ProcessNextCopy() => Progress(ProcessNextCopyCore);
+
+    private KernelResult ProcessNextCopyCore()
     {
         if (_pending is not null)
         {
@@ -251,12 +254,15 @@ public sealed class RuntimeComputeServiceHost
                 "The ComputeService runtime received a request that is not the exact generated Copy ownership pair.");
         }
 
+        var pending = new PendingCopy(request.Sequence, sourceBorrow, destination, invocation);
+        _pending = pending;
+
         if (invocation is { } exactInvocation)
         {
             if (received.Value.CancellationRequested)
             {
                 var acceptedCancellation = _kernel.AcceptSessionCancellation(_service, exactInvocation);
-                if (!acceptedCancellation.IsSuccess) return acceptedCancellation;
+                if (!acceptedCancellation.IsSuccess) return RetainRefusal(acceptedCancellation);
                 return SettleDeliveredCancellation(request.Sequence, exactInvocation, sourceBorrow, destination);
             }
 
@@ -272,30 +278,23 @@ public sealed class RuntimeComputeServiceHost
                     if (cancellation.IsSuccess && cancellation.Value)
                     {
                         var acceptedCancellation = _kernel.AcceptSessionCancellation(_service, exactInvocation);
-                        if (!acceptedCancellation.IsSuccess) return acceptedCancellation;
+                        if (!acceptedCancellation.IsSuccess) return RetainRefusal(acceptedCancellation);
                         return SettleDeliveredCancellation(request.Sequence, exactInvocation, sourceBorrow, destination);
                     }
                 }
-                return accepted;
+                return RetainRefusal(accepted);
             }
 
             var postAcceptanceCancellation = _kernel.QuerySessionCancellation(_service, exactInvocation);
             if (!postAcceptanceCancellation.IsSuccess)
-                return KernelResult.Fail(postAcceptanceCancellation.Error, postAcceptanceCancellation.Message!);
+                return RetainRefusal(KernelResult.Fail(postAcceptanceCancellation.Error, postAcceptanceCancellation.Message!));
             if (postAcceptanceCancellation.Value)
             {
                 var acceptedCancellation = _kernel.AcceptSessionCancellation(_service, exactInvocation);
-                if (!acceptedCancellation.IsSuccess) return acceptedCancellation;
+                if (!acceptedCancellation.IsSuccess) return RetainRefusal(acceptedCancellation);
                 return SettleDeliveredCancellation(request.Sequence, exactInvocation, sourceBorrow, destination);
             }
         }
-
-        var pending = new PendingCopy(
-            request.Sequence,
-            sourceBorrow,
-            destination,
-            invocation);
-        _pending = pending;
 
         var setup = PrepareAndSubmit(pending);
         if (!setup.IsSuccess)
@@ -310,7 +309,13 @@ public sealed class RuntimeComputeServiceHost
                 return setup;
         }
 
-        return AdvancePendingCopy();
+        return AdvancePendingCopyCore();
+
+        KernelResult RetainRefusal(KernelResult refusal)
+        {
+            pending.AdmissionRefusal = refusal;
+            return refusal;
+        }
     }
 
     /// <summary>
@@ -318,7 +323,9 @@ public sealed class RuntimeComputeServiceHost
     /// PlatformBindingDraining result means the exact request remains pending and
     /// neither the source borrow nor destination response authority has returned.
     /// </summary>
-    public KernelResult AdvancePendingCopy()
+    public KernelResult AdvancePendingCopy() => Progress(AdvancePendingCopyCore);
+
+    private KernelResult AdvancePendingCopyCore()
     {
         var pending = _pending;
         if (pending is null)
@@ -328,6 +335,7 @@ public sealed class RuntimeComputeServiceHost
                 "The ComputeService host has no pending Copy request.");
         }
 
+        if (pending.AdmissionRefusal is { } refusal) return refusal;
         if (pending.AbortError == KernelError.PlatformFaulted)
         {
             return KernelResult.Fail(
@@ -339,7 +347,7 @@ public sealed class RuntimeComputeServiceHost
         var callerCancellation = ObserveCallerCancellation(pending);
         if (!callerCancellation.IsSuccess) return callerCancellation;
 
-        if (pending.AbortError is null && pending.Outcome is null)
+        if (!pending.CancelledBeforeProviderInvocation && pending.AbortError is null && pending.Outcome is null)
         {
             if (pending.Submission is not { } submission)
             {
@@ -379,7 +387,9 @@ public sealed class RuntimeComputeServiceHost
     /// returns, the correlated response is cancelled and service-owned destination
     /// authority is released locally.
     /// </summary>
-    public KernelResult CancelPendingCopy()
+    public KernelResult CancelPendingCopy() => Progress(CancelPendingCopyCore);
+
+    private KernelResult CancelPendingCopyCore()
     {
         var pending = _pending;
         if (pending is null)
@@ -389,8 +399,9 @@ public sealed class RuntimeComputeServiceHost
                 "The ComputeService host has no pending Copy request to cancel.");
         }
 
+        if (pending.AdmissionRefusal is { } refusal) return refusal;
         if (pending.AbortError == KernelError.PlatformFaulted ||
-            pending.Submission is null && pending.AbortError is null)
+            !pending.CancelledBeforeProviderInvocation && pending.Submission is null && pending.AbortError is null)
         {
             return KernelResult.Fail(
                 KernelError.PlatformFaulted,
@@ -398,7 +409,16 @@ public sealed class RuntimeComputeServiceHost
         }
 
         pending.CancellationRequested = true;
-        return AdvancePendingCopy();
+        return AdvancePendingCopyCore();
+    }
+
+    private KernelResult Progress(Func<KernelResult> advance)
+    {
+        if (Interlocked.CompareExchange(ref _progressing, 1, 0) != 0)
+            return KernelResult.Fail(KernelError.InvalidTransition,
+                "The ComputeService host is already progressing its exact request.");
+        try { return advance(); }
+        finally { Volatile.Write(ref _progressing, 0); }
     }
 
     private KernelResult ObserveCallerCancellation(PendingCopy pending)
@@ -441,11 +461,12 @@ public sealed class RuntimeComputeServiceHost
         BorrowLease<byte> sourceBorrow,
         OwnedBuffer<byte> destination)
     {
-        var returned = _kernel.ReturnBorrow(_service, sourceBorrow.Handle);
-        if (!returned.IsSuccess) return returned;
-        var cancelled = FinalizeResponse(requestSequence, invocation, publish: false, payload: null);
-        if (!cancelled.IsSuccess) return KernelResult.Fail(cancelled.Error, cancelled.Message!);
-        return _kernel.ReleaseRegion(_service, destination);
+        _pending = new PendingCopy(requestSequence, sourceBorrow, destination, invocation)
+        {
+            CancellationRequested = true,
+            CancelledBeforeProviderInvocation = true
+        };
+        return AdvancePendingCopyCore();
     }
 
     private KernelResult<ResponseEnvelope> FinalizeResponse(
@@ -649,25 +670,11 @@ public sealed class RuntimeComputeServiceHost
             : pending.DestinationMappingClosed;
         if (closed) return KernelResult.Ok();
 
-        var started = source
-            ? pending.StagingMappingCloseStarted
-            : pending.DestinationMappingCloseStarted;
-
-        KernelResult closure;
-        if (!started)
-        {
-            if (source) pending.StagingMappingCloseStarted = true;
-            else pending.DestinationMappingCloseStarted = true;
-            closure = _kernel.RevokePlatformRegionMapping(
-                _service,
-                mapping.Value);
-        }
-        else
-        {
-            closure = _kernel.ObservePlatformRegionMappingRevocation(
-                _service,
-                mapping.Value);
-        }
+        var current = _kernel.QueryPlatformRegionMappingLifecycle(_service, mapping.Value);
+        if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
+        var closure = current.Value.PlatformClosure == PlatformExternalClosureState.Active
+            ? _kernel.RevokePlatformRegionMapping(_service, mapping.Value)
+            : _kernel.ObservePlatformRegionMappingRevocation(_service, mapping.Value);
 
         if (!closure.IsSuccess) return closure;
 

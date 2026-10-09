@@ -51,6 +51,9 @@ public sealed class ProjectDependencyBoundaryTests
     public void ExternalRuntimeContractsPackageIsReferencedOnlyByRuntimeAndExecutableAdapter()
     {
         var consumers = Directory.EnumerateFiles(RepositoryRoot, "*.csproj", SearchOption.AllDirectories)
+            // Evidence snapshots are attribution inputs, not active build/package consumers.
+            .Where(path => !Path.GetRelativePath(RepositoryRoot, path).Replace('\\', '/')
+                .StartsWith("artifacts/", StringComparison.OrdinalIgnoreCase))
             .Where(path => !path.Contains("\\obj\\", StringComparison.OrdinalIgnoreCase) &&
                            !path.Contains("\\bin\\", StringComparison.OrdinalIgnoreCase))
             .Where(path => XDocument.Load(path).Descendants("PackageReference")
@@ -97,6 +100,8 @@ public sealed class ProjectDependencyBoundaryTests
     public void ConcreteExternalRuntimePackageIsReferencedOnlyByExecutableAdapter()
     {
         var consumers = Directory.EnumerateFiles(RepositoryRoot, "*.csproj", SearchOption.AllDirectories)
+            .Where(path => !Path.GetRelativePath(RepositoryRoot, path).Replace('\\', '/')
+                .StartsWith("artifacts/", StringComparison.OrdinalIgnoreCase))
             .Where(path => !path.Contains("\\obj\\", StringComparison.OrdinalIgnoreCase) &&
                            !path.Contains("\\bin\\", StringComparison.OrdinalIgnoreCase))
             .Where(path => XDocument.Load(path).Descendants("PackageReference")

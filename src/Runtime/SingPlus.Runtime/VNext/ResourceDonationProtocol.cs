@@ -24,7 +24,11 @@ internal sealed record ResourceDonationBinding(
     ResourceAssuranceV1 AssuranceCeiling,
     AdmissionQosHint PriorityCeiling,
     string Provenance,
-    ResourceDonationState State = ResourceDonationState.Bound);
+    ResourceDonationState State = ResourceDonationState.Bound)
+{
+    // Immutable source correlation, never permission. Zero remains unknown/deny.
+    internal ulong ResourceGrantGeneration { get; init; }
+}
 
 public sealed partial class RuntimeKernel
 {
@@ -57,7 +61,7 @@ public sealed partial class RuntimeKernel
 
         var admitted = PrepareResourceExternalAdmission(service,
             effectBinding.EffectCapability, effectBinding.EffectResourceKind, effectBinding.EffectResourceId,
-            effectBinding.EffectResourceGeneration, donation.Value.DerivedGrant, 1, requested,
+            effectBinding.EffectResourceGeneration, donation.Value.DerivedGrant, donation.Value.ResourceGrantGeneration, requested,
             effectBinding.Operation, effectBinding.Dependencies, donation.Value.ChargingOwner, donation.Value.Lease);
         return admitted.IsSuccess
             ? GeneratedSipResourceAdmission.Success(admitted.Value!, providerSubmit =>
@@ -85,6 +89,8 @@ public sealed partial class RuntimeKernel
             : GeneratedSipResourceAdmission.Failure((int)admitted.Error, admitted.Message!);
     }
 
+    internal Action<ResourceDonationBinding>? BeforeDonationPublicationQualificationHook { get; set; }
+
     internal KernelResult<ResourceDonationBinding> BindResourceDonation(
         ProcessHandle caller,
         ProcessHandle service,
@@ -95,7 +101,12 @@ public sealed partial class RuntimeKernel
         ResourceEnvelopeV1 donatedEnvelope,
         AdmissionQosHint priorityCeiling)
     {
+        Action release;
+        KernelResult pending;
         lock (_requestResponseCorrelationGate)
+            pending = SessionInvocations.BeginResourceDonationBinding(invocation, caller, service, out release);
+        if (!pending.IsSuccess) return KernelResult<ResourceDonationBinding>.Fail(pending.Error, pending.Message!);
+        try
         {
         if (requirement.DonationPolicy != SipResourceDonationPolicyV1.AcceptNarrowed)
             return KernelResult<ResourceDonationBinding>.Fail(KernelError.DelegationDenied,
@@ -132,10 +143,6 @@ public sealed partial class RuntimeKernel
         if (source.Value!.AssuranceCeiling > requirement.AssuranceCeiling)
             return KernelResult<ResourceDonationBinding>.Fail(KernelError.DelegationDenied,
                 "Donation assurance exceeds the generated contract ceiling.");
-        var invocationAdmission = SessionInvocations.ValidateResourceDonationBindingAdmission(invocation, caller, service);
-        if (!invocationAdmission.IsSuccess)
-            return KernelResult<ResourceDonationBinding>.Fail(invocationAdmission.Error, invocationAdmission.Message!);
-
         var delegated = CapabilityAuthority.Delegate(sourceGrant, callerProcess.Value.DomainId,
             serviceProcess.Value!.DomainId, CapabilityRights.Delegate, service.Generation, constraints => constraints with
             {
@@ -166,14 +173,55 @@ public sealed partial class RuntimeKernel
         var binding = new ResourceDonationBinding(invocation, caller, service, sourceGrant,
             delegated.Value!.CapabilityId, caller, reserved.Value!.Reservation, envelope,
             requirement.AssuranceCeiling, priorityCeiling,
-            $"{caller.ProcessId.Value}:{caller.Generation}->{service.ProcessId.Value}:{service.Generation}@{invocation.Session.SessionId.Value}:{invocation.Session.Generation.Value}:{invocation.InvocationId.Value}:{invocation.Generation.Value}");
-        var bound = SessionInvocations.BindResourceDonation(binding);
-        if (bound.IsSuccess) return bound;
-        _ = Budgets.CancelLeasePreSubmit(caller, binding.Lease);
-        _ = CapabilityAuthority.Revoke(binding.DerivedGrant);
-        return KernelResult<ResourceDonationBinding>.Fail(bound.Error, bound.Message!);
+            $"{caller.ProcessId.Value}:{caller.Generation}->{service.ProcessId.Value}:{service.Generation}@{invocation.Session.SessionId.Value}:{invocation.Session.Generation.Value}:{invocation.InvocationId.Value}:{invocation.Generation.Value}")
+            { ResourceGrantGeneration = sourceGrantGeneration };
+        var published = false;
+        try
+        {
+            BeforeDonationPublicationQualificationHook?.Invoke(binding);
+            var sessionTime = EndpointSessions.ReadDonationPublicationTime();
+            var commit = CapabilityAuthority.CommitResourceDonationPublication(sourceGrant, callerProcess.Value.DomainId,
+                caller.Generation, sourceGrantGeneration, binding.DerivedGrant, serviceProcess.Value.DomainId,
+                service.Generation, sourceGrantGeneration, envelope, ownerCommit =>
+                {
+                    lock (_platformMemoryUseGate)
+                    {
+                        var currentCaller = Processes.Resolve(caller);
+                        var currentService = Processes.Resolve(service);
+                        if (!currentCaller.IsSuccess || !currentService.IsSuccess ||
+                            !ReferenceEquals(currentCaller.Value, callerProcess.Value) ||
+                            !ReferenceEquals(currentService.Value, serviceProcess.Value))
+                            return KernelResult.Fail(KernelError.StaleGeneration, "Donation process incarnation changed.");
+                        var callerEffect = EnsureProcessAcceptsNewEffects(currentCaller.Value!);
+                        if (!callerEffect.IsSuccess) return callerEffect;
+                        var serviceEffect = EnsureProcessAcceptsNewEffects(currentService.Value!);
+                        return serviceEffect.IsSuccess ? ownerCommit() : serviceEffect;
+                    }
+                }, () => EndpointSessions.CommitDonationPublication(session.Value!, sessionTime,
+                    () => Budgets.CommitReservedDonation(caller, binding.Lease, () =>
+                {
+                    var bound = SessionInvocations.BindResourceDonation(binding);
+                    return bound.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(bound.Error, bound.Message!);
+                })));
+            if (!commit.IsSuccess) return KernelResult<ResourceDonationBinding>.Fail(commit.Error, commit.Message!);
+            published = true;
+            return KernelResult<ResourceDonationBinding>.Ok(binding);
         }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        { return KernelResult<ResourceDonationBinding>.Fail(KernelError.PlatformFaulted, $"Donation publication interrupted: {exception.Message}"); }
+        finally
+        {
+            if (!published)
+            {
+                _ = Budgets.CancelLeasePreSubmit(caller, binding.Lease);
+                _ = CapabilityAuthority.Revoke(binding.DerivedGrant);
+            }
+        }
+        }
+        finally { release(); }
     }
+
+    internal Action<CapabilityId>? BeforeNestedDonationPublicationQualificationHook { get; set; }
 
     internal KernelResult<ResourceDonationBinding> DeriveNestedResourceDonation(
         ProcessHandle server,
@@ -184,8 +232,8 @@ public sealed partial class RuntimeKernel
         ResourceAssuranceV1 assuranceCeiling,
         AdmissionQosHint priorityCeiling)
     {
-        lock (_requestResponseCorrelationGate)
-        {
+        Action release;
+        KernelResult pending;
         var parent = SessionInvocations.ResolveResourceDonation(parentInvocation, server, requireAdmission: true);
         if (!parent.IsSuccess) return KernelResult<ResourceDonationBinding>.Fail(parent.Error, parent.Message!);
         var source = parent.Value!;
@@ -197,10 +245,11 @@ public sealed partial class RuntimeKernel
             PriorityRank(priorityCeiling) > PriorityRank(source.PriorityCeiling))
             return KernelResult<ResourceDonationBinding>.Fail(KernelError.DelegationDenied,
                 "Nested donation may only narrow amount, assurance, priority and semantic scope.");
-        var childAdmission = SessionInvocations.ValidateResourceDonationBindingAdmission(
-            downstreamInvocation, server, downstream);
-        if (!childAdmission.IsSuccess)
-            return KernelResult<ResourceDonationBinding>.Fail(childAdmission.Error, childAdmission.Message!);
+        lock (_requestResponseCorrelationGate)
+            pending = SessionInvocations.BeginResourceDonationBinding(downstreamInvocation, server, downstream, out release);
+        if (!pending.IsSuccess) return KernelResult<ResourceDonationBinding>.Fail(pending.Error, pending.Message!);
+        try
+        {
         var session = ResolveSession(server, downstreamInvocation.Session);
         if (!session.IsSuccess || session.Value!.Service != downstream)
             return KernelResult<ResourceDonationBinding>.Fail(session.Error == KernelError.None ? KernelError.WrongSessionOwner : session.Error,
@@ -210,6 +259,14 @@ public sealed partial class RuntimeKernel
         if (!serverProcess.IsSuccess || !downstreamProcess.IsSuccess)
             return KernelResult<ResourceDonationBinding>.Fail(KernelError.StaleGeneration, "Nested donation process generation is stale.");
 
+        var sourceHandle = CapabilityAuthority.GetHandleV2(source.DerivedGrant, serverProcess.Value!.DomainId, server.Generation);
+        if (!sourceHandle.IsSuccess) return KernelResult<ResourceDonationBinding>.Fail(sourceHandle.Error, sourceHandle.Message!);
+        var sourceIdentity = CapabilityAuthority.Validate(sourceHandle.Value!, serverProcess.Value.DomainId,
+            server.Generation, CapabilityRights.Delegate);
+        if (!sourceIdentity.IsSuccess) return KernelResult<ResourceDonationBinding>.Fail(sourceIdentity.Error, sourceIdentity.Message!);
+        var resourceGeneration = sourceIdentity.Value!.ResourceGeneration;
+        if (resourceGeneration != source.ResourceGrantGeneration)
+            return KernelResult<ResourceDonationBinding>.Fail(KernelError.StaleGeneration, "Donation source resource generation does not match its original binding.");
         var delegated = CapabilityAuthority.Delegate(source.DerivedGrant, serverProcess.Value!.DomainId,
             downstreamProcess.Value!.DomainId, CapabilityRights.Delegate, downstream.Generation, constraints => constraints with
             {
@@ -228,22 +285,47 @@ public sealed partial class RuntimeKernel
             _ = CapabilityAuthority.Revoke(delegated.Value!.CapabilityId);
             return KernelResult<ResourceDonationBinding>.Fail(budgetAmounts.Error, budgetAmounts.Message!);
         }
-        var split = Budgets.SplitLease(source.ChargingOwner, source.Lease, budgetAmounts.Value!);
-        if (!split.IsSuccess)
+        ResourceDonationBinding? published = null;
+        try
         {
-            _ = CapabilityAuthority.Revoke(delegated.Value!.CapabilityId);
-            return KernelResult<ResourceDonationBinding>.Fail(split.Error, split.Message!);
+            BeforeNestedDonationPublicationQualificationHook?.Invoke(delegated.Value!.CapabilityId);
+            var sessionTime = EndpointSessions.ReadDonationPublicationTime();
+            var commit = CapabilityAuthority.CommitResourceDonationPublication(source.DerivedGrant,
+                serverProcess.Value.DomainId, server.Generation, resourceGeneration, delegated.Value!.CapabilityId,
+                downstreamProcess.Value!.DomainId, downstream.Generation, resourceGeneration, envelope, ownerCommit =>
+                {
+                    lock (_platformMemoryUseGate)
+                    {
+                        var currentServer = Processes.Resolve(server);
+                        var currentDownstream = Processes.Resolve(downstream);
+                        if (!currentServer.IsSuccess || !currentDownstream.IsSuccess ||
+                            !ReferenceEquals(currentServer.Value, serverProcess.Value) ||
+                            !ReferenceEquals(currentDownstream.Value, downstreamProcess.Value))
+                            return KernelResult.Fail(KernelError.StaleGeneration, "Nested donation process incarnation changed.");
+                        var serverEffect = EnsureProcessAcceptsNewEffects(currentServer.Value!);
+                        if (!serverEffect.IsSuccess) return serverEffect;
+                        var downstreamEffect = EnsureProcessAcceptsNewEffects(currentDownstream.Value!);
+                        return downstreamEffect.IsSuccess ? ownerCommit() : downstreamEffect;
+                    }
+                }, () => EndpointSessions.CommitDonationPublication(session.Value!, sessionTime, () =>
+                {
+                    var result = Budgets.SplitDonationAndPublish(source.ChargingOwner, source.Lease, budgetAmounts.Value!, lease =>
+                        SessionInvocations.BindNestedResourceDonation(source, new ResourceDonationBinding(
+                            downstreamInvocation, server, downstream, source.DerivedGrant, delegated.Value!.CapabilityId,
+                            source.ChargingOwner, lease, envelope, assuranceCeiling, priorityCeiling,
+                            $"{source.Provenance}/{server.ProcessId.Value}:{server.Generation}->{downstream.ProcessId.Value}:{downstream.Generation}@{downstreamInvocation.Session.SessionId.Value}:{downstreamInvocation.Session.Generation.Value}:{downstreamInvocation.InvocationId.Value}:{downstreamInvocation.Generation.Value}")
+                            { ResourceGrantGeneration = resourceGeneration }));
+                    if (result.IsSuccess) published = result.Value!;
+                    return result.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(result.Error, result.Message!);
+                }));
+            return commit.IsSuccess ? KernelResult<ResourceDonationBinding>.Ok(published!)
+                : KernelResult<ResourceDonationBinding>.Fail(commit.Error, commit.Message!);
         }
-        var binding = new ResourceDonationBinding(downstreamInvocation, server, downstream,
-            source.DerivedGrant, delegated.Value!.CapabilityId, source.ChargingOwner, split.Value!.Reservation,
-            envelope, assuranceCeiling, priorityCeiling,
-            $"{source.Provenance}/{server.ProcessId.Value}:{server.Generation}->{downstream.ProcessId.Value}:{downstream.Generation}@{downstreamInvocation.Session.SessionId.Value}:{downstreamInvocation.Session.Generation.Value}:{downstreamInvocation.InvocationId.Value}:{downstreamInvocation.Generation.Value}");
-        var bound = SessionInvocations.BindResourceDonation(binding);
-        if (bound.IsSuccess) return bound;
-        _ = Budgets.CancelLeasePreSubmit(source.ChargingOwner, binding.Lease);
-        _ = CapabilityAuthority.Revoke(binding.DerivedGrant);
-        return KernelResult<ResourceDonationBinding>.Fail(bound.Error, bound.Message!);
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        { return KernelResult<ResourceDonationBinding>.Fail(KernelError.PlatformFaulted, $"Nested donation publication interrupted: {exception.Message}"); }
+        finally { if (published is null) _ = CapabilityAuthority.Revoke(delegated.Value!.CapabilityId); }
         }
+        finally { release(); }
     }
 
     internal KernelResult CloseResourceDonation(ProcessHandle service, EndpointSessionInvocationHandle invocation, bool submitMayHaveOccurred)
@@ -269,28 +351,37 @@ public sealed partial class RuntimeKernel
     internal KernelResult MarkResourceDonationPossibleSubmit(
         ProcessHandle service, EndpointSessionInvocationHandle invocation)
     {
-        lock (_requestResponseCorrelationGate)
-        {
         var donation = SessionInvocations.ResolveResourceDonation(invocation, service, requireAdmission: true);
         if (!donation.IsSuccess) return KernelResult.Fail(donation.Error, donation.Message!);
         var process = Processes.Resolve(service);
         if (!process.IsSuccess) return KernelResult.Fail(process.Error, process.Message!);
-        var permission = CapabilityAuthority.ValidateResourceUse(donation.Value!.DerivedGrant,
-            process.Value!.DomainId, service.Generation, 1, donation.Value.Envelope);
-        if (!permission.IsSuccess) return KernelResult.Fail(permission.Error, permission.Message!);
-        var bound = Budgets.BindLease(donation.Value!.ChargingOwner, donation.Value.Lease);
-        if (!bound.IsSuccess) return KernelResult.Fail(bound.Error, bound.Message!);
-        var consuming = Budgets.BeginConsumption(donation.Value.ChargingOwner, donation.Value.Lease);
-        if (!consuming.IsSuccess)
+        var session = EndpointSessions.ResolveForService(invocation.Session, service);
+        if (!session.IsSuccess) return KernelResult.Fail(session.Error, session.Message!);
+        try
         {
-            _ = Budgets.QuarantineLease(donation.Value.ChargingOwner, donation.Value.Lease);
-            return KernelResult.Fail(consuming.Error, consuming.Message!);
+            var exact = donation.Value!;
+            var sessionTime = default(DateTimeOffset);
+            return CapabilityAuthority.CommitDonationConsumption(exact.DerivedGrant, process.Value!.DomainId,
+                service.Generation, exact.ResourceGrantGeneration, exact.Envelope, ownerCommit =>
+                {
+                    sessionTime = EndpointSessions.ReadDonationPublicationTime();
+                    lock (_platformMemoryUseGate)
+                    {
+                        var current = Processes.Resolve(service);
+                        if (!current.IsSuccess || !ReferenceEquals(current.Value, process.Value))
+                            return KernelResult.Fail(KernelError.StaleGeneration, "Donation consumer incarnation changed.");
+                        var accepts = EnsureProcessAcceptsNewEffects(current.Value!);
+                        return accepts.IsSuccess ? ownerCommit() : accepts;
+                    }
+                }, () => EndpointSessions.CommitDonationPublication(session.Value!, sessionTime,
+                    () => Budgets.CommitDonationConsumption(exact.ChargingOwner, exact.Lease, () =>
+                    {
+                        var active = SessionInvocations.ActivateResourceDonation(invocation, service, exact);
+                        return active.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(active.Error, active.Message!);
+                    })));
         }
-        var active = SessionInvocations.ActivateResourceDonation(invocation, service);
-        if (active.IsSuccess) return KernelResult.Ok();
-        _ = Budgets.QuarantineLease(donation.Value.ChargingOwner, donation.Value.Lease);
-        return KernelResult.Fail(active.Error, active.Message!);
-        }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        { return KernelResult.Fail(KernelError.PlatformFaulted, $"Donation consumption interrupted: {exception.Message}"); }
     }
 
     private void CloseSessionResourceDonations(EndpointSessionHandle session)

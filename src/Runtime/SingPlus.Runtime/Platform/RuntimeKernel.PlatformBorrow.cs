@@ -1,5 +1,6 @@
 using SingPlus.Contracts;
 using SingPlus.Platform;
+using SingPlus.Sip;
 
 namespace SingPlus.Runtime;
 
@@ -13,7 +14,13 @@ public sealed partial class RuntimeKernel
         long offset,
         long length)
     {
-        var ownerProcess = Processes.Resolve(owner);
+        KernelResult<SingProcess> ownerProcess, borrowerProcess;
+        RegionOwner ownerIdentity, borrowerIdentity;
+        PlatformDomainIdentity platformSubject;
+        BorrowLeaseAuthoritySnapshot snapshot;
+        lock (_platformMemoryUseGate)
+        {
+        ownerProcess = Processes.Resolve(owner);
         if (!ownerProcess.IsSuccess)
         {
             return KernelResult<PlatformBorrowReadGrant>.Fail(
@@ -29,7 +36,7 @@ public sealed partial class RuntimeKernel
                 ownerEffect.Message!);
         }
 
-        var borrowerProcess = Processes.Resolve(borrower);
+        borrowerProcess = Processes.Resolve(borrower);
         if (!borrowerProcess.IsSuccess)
         {
             return KernelResult<PlatformBorrowReadGrant>.Fail(
@@ -45,10 +52,10 @@ public sealed partial class RuntimeKernel
                 borrowerEffect.Message!);
         }
 
-        var ownerIdentity = new RegionOwner(
+        ownerIdentity = new RegionOwner(
             ownerProcess.Value!.DomainId,
             owner.Generation);
-        var borrowerIdentity = new RegionOwner(
+        borrowerIdentity = new RegionOwner(
             borrowerProcess.Value!.DomainId,
             borrower.Generation);
         var borrowValidation = Regions.ValidateBorrowLease(
@@ -62,7 +69,7 @@ public sealed partial class RuntimeKernel
                 borrowValidation.Message!);
         }
 
-        var platformSubject = PlatformIdentity(ownerProcess.Value);
+        platformSubject = PlatformIdentity(ownerProcess.Value);
         var bindingValidation = PlatformAuthority.ValidateDomain(
             externalDomain,
             platformSubject);
@@ -73,7 +80,7 @@ public sealed partial class RuntimeKernel
                 bindingValidation.Message!);
         }
 
-        var snapshot = borrowValidation.Value!;
+        snapshot = borrowValidation.Value!;
         var sliceValidation = PlatformOwnedRegionMappingContract.ValidateSlice(
             new PlatformRegionSlice(
                 new PlatformRegionIdentity(
@@ -100,6 +107,7 @@ public sealed partial class RuntimeKernel
                 reservation.Error,
                 reservation.Message!);
         }
+        }
 
         var grant = PlatformAuthority.CreateBorrowReadGrant(
             externalDomain,
@@ -119,34 +127,91 @@ public sealed partial class RuntimeKernel
             return grant;
         }
 
-        TrackPlatformBorrowReadGrant(owner, borrower, grant.Value!);
-        return grant;
+        lock (_platformMemoryUseGate)
+        {
+            // This is the existing cleanup lifetime, even when public admission
+            // is refused. It never upgrades a receipt to permission.
+            TrackPlatformBorrowReadGrant(owner, borrower, grant.Value!);
+            var publication = ValidatePlatformBorrowCreationPublication(owner, borrower,
+                ownerProcess.Value!, borrowerProcess.Value!, snapshot, grant.Value!);
+            if (!publication.IsSuccess)
+            {
+                PlatformAuthority.RefuseBorrowReadGrantPublication(grant.Value!);
+                return KernelResult<PlatformBorrowReadGrant>.Fail(publication.Error, publication.Message!);
+            }
+            return grant;
+        }
+    }
+
+    private KernelResult ValidatePlatformBorrowCreationPublication(
+        ProcessHandle owner, ProcessHandle borrower, SingProcess expectedOwner, SingProcess expectedBorrower,
+        BorrowLeaseAuthoritySnapshot admitted, PlatformBorrowReadGrant grant, bool readerPublication = false)
+    {
+        var currentOwner = Processes.Resolve(owner);
+        var currentBorrower = Processes.Resolve(borrower);
+        if (!currentOwner.IsSuccess) return KernelResult.Fail(currentOwner.Error, currentOwner.Message!);
+        if (!currentBorrower.IsSuccess) return KernelResult.Fail(currentBorrower.Error, currentBorrower.Message!);
+        if (!ReferenceEquals(currentOwner.Value, expectedOwner) || !ReferenceEquals(currentBorrower.Value, expectedBorrower))
+            return KernelResult.Fail(KernelError.StaleGeneration, "Borrow creation process incarnation changed before publication.");
+        var ownerEffect = EnsureProcessAcceptsNewEffects(currentOwner.Value!);
+        if (!ownerEffect.IsSuccess) return ownerEffect;
+        var borrowerEffect = EnsureProcessAcceptsNewEffects(currentBorrower.Value!);
+        if (!borrowerEffect.IsSuccess) return borrowerEffect;
+        var gate = Regions.GetExternalBorrowCompletionGate(admitted);
+        if (!gate.IsSuccess) return KernelResult.Fail(gate.Error, gate.Message!);
+        lock (gate.Value!)
+        {
+            var exact = Regions.ValidateBorrowLease(admitted.Handle, admitted.Owner, admitted.Borrower);
+            if (!exact.IsSuccess) return KernelResult.Fail(exact.Error, exact.Message!);
+            if (!ReferenceEquals(exact.Value!.Lifetime, admitted.Lifetime))
+                return KernelResult.Fail(KernelError.StaleGeneration, "Borrow creation loan lifetime changed before publication.");
+            if (readerPublication)
+            {
+                var usable = Regions.ValidateExternalBorrowReaderPublicationLocked(admitted);
+                if (!usable.IsSuccess) return usable;
+            }
+            return PlatformAuthority.ValidateBorrowReadGrantPublication(grant, PlatformIdentity(currentOwner.Value!), exact.Value!);
+        }
     }
 
     public KernelResult<PlatformBorrowReadGrantEvidence> PreparePlatformBorrowReadGrantForExternalReader(
         ProcessHandle owner,
         PlatformBorrowReadGrant grant)
     {
-        var ownerProcess = Processes.Resolve(owner);
-        if (!ownerProcess.IsSuccess)
+        TrackedPlatformBorrowReadGrant tracked;
+        SingProcess ownerProcess, borrowerProcess;
+        BorrowLeaseAuthoritySnapshot admitted;
+        lock (_platformMemoryUseGate)
         {
-            return KernelResult<PlatformBorrowReadGrantEvidence>.Fail(
-                ownerProcess.Error,
-                ownerProcess.Message!);
+            if (!_platformBorrowReadGrants.TryGetValue(grant.GrantId, out tracked!) ||
+                tracked.Grant != grant || tracked.Owner != owner)
+                return KernelResult<PlatformBorrowReadGrantEvidence>.Fail(KernelError.PlatformBindingNotFound, "Exact borrow reader cleanup tracking was not found.");
+            var resolvedOwner = Processes.Resolve(owner);
+            var resolvedBorrower = Processes.Resolve(tracked.Borrower);
+            if (!resolvedOwner.IsSuccess) return KernelResult<PlatformBorrowReadGrantEvidence>.Fail(resolvedOwner.Error, resolvedOwner.Message!);
+            if (!resolvedBorrower.IsSuccess) return KernelResult<PlatformBorrowReadGrantEvidence>.Fail(resolvedBorrower.Error, resolvedBorrower.Message!);
+            ownerProcess = resolvedOwner.Value!;
+            borrowerProcess = resolvedBorrower.Value!;
+            var borrow = Regions.ValidateBorrowLease(grant.BorrowLease,
+                new RegionOwner(ownerProcess.DomainId, owner.Generation),
+                new RegionOwner(borrowerProcess.DomainId, tracked.Borrower.Generation));
+            if (!borrow.IsSuccess) return KernelResult<PlatformBorrowReadGrantEvidence>.Fail(borrow.Error, borrow.Message!);
+            admitted = borrow.Value!;
+            var ready = ValidatePlatformBorrowCreationPublication(owner, tracked.Borrower,
+                ownerProcess, borrowerProcess, admitted, grant, readerPublication: true);
+            if (!ready.IsSuccess) return KernelResult<PlatformBorrowReadGrantEvidence>.Fail(ready.Error, ready.Message!);
         }
 
-        var effect = EnsureProcessAcceptsNewEffects(ownerProcess.Value!);
-        if (!effect.IsSuccess)
+        var evidence = PlatformAuthority.PrepareBorrowReadGrantForExternalReader(grant, PlatformIdentity(ownerProcess));
+        if (!evidence.IsSuccess) return evidence;
+        lock (_platformMemoryUseGate)
         {
-            return KernelResult<PlatformBorrowReadGrantEvidence>.Fail(
-                effect.Error,
-                effect.Message!);
+            if (!_platformBorrowReadGrants.TryGetValue(grant.GrantId, out var current) || !ReferenceEquals(current, tracked))
+                return KernelResult<PlatformBorrowReadGrantEvidence>.Fail(KernelError.StaleGeneration, "Borrow reader tracking changed before publication.");
+            var ready = ValidatePlatformBorrowCreationPublication(owner, tracked.Borrower,
+                ownerProcess, borrowerProcess, admitted, grant, readerPublication: true);
+            return ready.IsSuccess ? evidence : KernelResult<PlatformBorrowReadGrantEvidence>.Fail(ready.Error, ready.Message!);
         }
-
-        var subject = PlatformIdentity(ownerProcess.Value!);
-        return PlatformAuthority.PrepareBorrowReadGrantForExternalReader(
-            grant,
-            subject);
     }
 
     public KernelResult<PlatformBorrowReadGrantLifecycle> QueryPlatformBorrowReadGrantLifecycle(
@@ -206,6 +271,12 @@ public sealed partial class RuntimeKernel
             return KernelResult.Fail(currentBorrow.Error, currentBorrow.Message!);
 
         var subject = PlatformIdentity(ownerProcess.Value);
+        TrackedPlatformBorrowReadGrant tracked;
+        lock (_platformMemoryUseGate)
+        {
+            if (!_platformBorrowReadGrants.TryGetValue(grant.GrantId, out tracked!))
+                return KernelResult.Fail(KernelError.PlatformBindingNotFound, "The external borrow grant is not tracked.");
+        }
         var lifecycle = PlatformAuthority.QueryBorrowReadGrantLifecycle(
             grant,
             subject);
@@ -247,43 +318,6 @@ public sealed partial class RuntimeKernel
                 "The external read grant is draining; CPU borrow completion remains forbidden.");
         }
 
-        var revalidatedBorrow = Regions.ValidateBorrowLease(
-            borrowLease,
-            ownerIdentity,
-            borrowerIdentity);
-        if (!revalidatedBorrow.IsSuccess)
-            return KernelResult.Fail(revalidatedBorrow.Error, revalidatedBorrow.Message!);
-
-        var exactValidation = PlatformAuthority.ValidateBorrowReadGrantLocalAuthority(
-            grant,
-            subject,
-            revalidatedBorrow.Value!);
-        if (!exactValidation.IsSuccess) return exactValidation;
-
-        var releaseReservation = Regions.ReleaseExternalBorrowReadGrantReservation(
-            borrowLease,
-            ownerIdentity,
-            borrowerIdentity,
-            revalidatedBorrow.Value!.Lifetime);
-        if (!releaseReservation.IsSuccess) return releaseReservation;
-
-        var reclaimGrant = PlatformAuthority.MarkBorrowReadGrantReclaimed(
-            grant,
-            subject);
-        if (!reclaimGrant.IsSuccess)
-        {
-            _ = Regions.ReserveExternalBorrowReadGrant(
-                borrowLease,
-                ownerIdentity,
-                borrowerIdentity);
-            return reclaimGrant;
-        }
-
-        var returned = Regions.ReturnLoan(
-            borrowLease,
-            borrowerIdentity);
-        if (returned.IsSuccess)
-            UntrackPlatformBorrowReadGrant(grant);
-        return returned;
+        return CommitTrackedPlatformBorrowCompletion(tracked, ownerProcess.Value!, borrowerProcess.Value!, allowExiting: false);
     }
 }
