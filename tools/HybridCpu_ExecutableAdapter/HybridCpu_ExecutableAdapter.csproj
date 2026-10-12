@@ -10,8 +10,8 @@
     <RestoreLockedMode Condition="'$(CI)' == 'true'">true</RestoreLockedMode>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="HybridCPU.ExternalRuntime.Contracts" Version="[1.14.0]" />
-    <PackageReference Include="HybridCPU.ExternalRuntime" Version="[1.6.0]" />
+    <PackageReference Include="HybridCPU.ExternalRuntime.Contracts" Version="[1.35.0]" />
+    <PackageReference Include="HybridCPU.ExternalRuntime" Version="[1.24.0]" />
     <ProjectReference Include="../../contracts/SingPlus.Contracts/SingPlus.Contracts.csproj" />
     <ProjectReference Include="../Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Contracts/HybridCPU_NeutralRuntime.Contracts.csproj" />
     <ProjectReference Include="Boot.Contracts/HybridCpu.Boot.Contracts.csproj" />
@@ -28,3 +28,13 @@
       Text="Direct sibling HybridCPU-v2 project references are forbidden; use a versioned external facade/package." />
   </Target>
 </Project>
+
+
+
+
+
+
+
+
+
+

@@ -7,6 +7,46 @@ namespace SingPlus.Tests.Platform;
 
 public sealed class PlatformIrqBindingTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CompletionRouteLossClearsOriginalReservationWithoutRepeatingAck(bool foreignRoute)
+    {
+        var provider = new IrqProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = TestFixtures.Create(kernel, 1401, 1901);
+        var region = kernel.AllocateRegion(subject, 4096).Value!;
+        var (device, capability, endpoint) = CreateAuthorities(kernel, subject, "device/event-route-loss", "route-loss", IrqTriggerMode.Edge);
+        var binding = kernel.BindPlatformInterrupt(subject, device, capability, endpoint).Value!;
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var registry = typeof(RuntimeKernel).GetField("_kernelEvents", flags)!.GetValue(kernel)!;
+        var routes = (global::System.Collections.IDictionary)registry.GetType().GetField("_endpoints", flags)!.GetValue(registry)!;
+        var original = routes[endpoint.EndpointId]!;
+        var foreign = TestFixtures.Create(kernel, 1402, 1902).Handle;
+        var foreignEndpoint = kernel.CreateKernelEventEndpoint(foreign).Value!;
+        var foreignRecord = routes[foreignEndpoint.EndpointId]!;
+        provider.AfterIrqCompleteEffect = () =>
+        {
+            if (foreignRoute) routes[endpoint.EndpointId] = foreignRecord;
+            else routes.Remove(endpoint.EndpointId);
+        };
+        Assert.True(provider.Signal("route-loss"));
+        Assert.False(kernel.PollPlatformInterrupt(subject, binding).IsSuccess);
+        Assert.Null(original.GetType().GetProperty("Staged")!.GetValue(original));
+        Assert.False(provider.IsPending("route-loss"));
+        provider.AfterIrqCompleteEffect = null;
+        Assert.False(kernel.PollPlatformInterrupt(subject, binding).IsSuccess);
+        Assert.Equal(1, provider.CompleteCalls);
+        routes[endpoint.EndpointId] = original;
+        Assert.False(kernel.RevokePlatformInterrupt(subject, binding).IsSuccess);
+        Assert.False(kernel.CloseKernelEventEndpoint(subject, endpoint).IsSuccess);
+        Assert.False(kernel.TerminateProcess(subject).IsSuccess);
+        Assert.False(kernel.QueryProcessTeardown(subject).Value!.LocalReclaimCompleted);
+        Assert.Equal(RegionState.Owned, kernel.Regions.Snapshot().Single(r => r.Handle == region.Handle).State);
+        Assert.Equal(1, provider.CompleteCalls);
+        Assert.Equal("Active", foreignRecord.GetType().GetProperty("State")!.GetValue(foreignRecord)!.ToString());
+        Assert.Equal(KernelError.ResponseNotAvailable, kernel.ConsumeKernelEvent(foreign, foreignEndpoint).Error);
+    }
     [Fact]
     public void ExhaustedEventSequenceRepeatedlyRefusesBeforeActualIrqCompletion()
     {
@@ -388,7 +428,7 @@ public sealed class PlatformIrqBindingTests
         }
         else Assert.False(bind.IsSuccess);
         Assert.Equal(outcome == 3, kernel.CloseKernelEventEndpoint(subject, endpoint).IsSuccess);
-        Assert.Equal(outcome is 0 or 3 ? 1 : 0, provider.IrqRevokeCalls);
+        Assert.Equal(outcome == 3 ? 1 : 0, provider.IrqRevokeCalls);
     }
 
     [Theory]
@@ -468,7 +508,7 @@ public sealed class PlatformIrqBindingTests
 
     [Theory]
     [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)]
-    public void MalformedIrqCompensationRetainsRawFactWithoutOriginalClosure(int outcome)
+    public void MalformedIrqNeverCompensatesReturnedObjectAndRetainsOriginalPin(int outcome)
     {
         var provider = new IrqProvider { RewriteBindReceipt = receipt => receipt with { Source = new("foreign", receipt.Source.Trigger) } };
         var kernel = new RuntimeKernel(provider);
@@ -482,22 +522,11 @@ public sealed class PlatformIrqBindingTests
         if (outcome == 1) provider.IrqRevokeStatus = PlatformAuthorityStatus.NotAccepted;
         if (outcome == 2) provider.IrqRevokeStatus = (PlatformAuthorityStatus)999;
         if (outcome == 3) provider.AfterIrqRevokeEffect = () => throw new IOException("Compensation reply lost after provider effect.");
-        provider.BeforeIrqRevokeEffect = () =>
-        {
-            Assert.Equal(true, Read("MalformedIrqCleanupMayHaveEffect"));
-            Assert.NotNull(Read("MalformedIrqReceipt"));
-            Assert.False(Monitor.IsEntered(typeof(PlatformAuthorityBridge).GetField("_secureDomainLifecycleGate", flags)!.GetValue(kernel.PlatformAuthority)!));
-            Assert.False(kernel.RevokePlatformDevice(subject, device).IsSuccess);
-        };
+        provider.BeforeIrqRevokeEffect = () => throw new InvalidOperationException("A malformed returned object must never select a closure effect.");
         Assert.Equal(KernelError.PlatformFaulted, kernel.BindPlatformInterrupt(subject, device, capability, endpoint).Error);
-        Assert.Equal(true, Read("MalformedIrqCleanupMayHaveEffect"));
-        if (outcome == 3) Assert.Null(Read("MalformedIrqCleanupObservation"));
-        else
-        {
-            var raw = Assert.IsType<PlatformAuthorityResult>(Read("MalformedIrqCleanupObservation"));
-            if (outcome == 0) Assert.True(raw.IsSuccess);
-            else Assert.Equal(outcome == 1 ? PlatformAuthorityStatus.NotAccepted : (PlatformAuthorityStatus)999, raw.Status);
-        }
+        Assert.NotNull(Read("MalformedIrqReceipt"));
+        Assert.Equal(false, Read("MalformedIrqCleanupMayHaveEffect"));
+        Assert.Null(Read("MalformedIrqCleanupObservation"));
         Assert.Equal(false, Read("ProviderClosureConfirmed"));
         Assert.True(kernel.PlatformAuthority.HasUnresolvedIrqEffect(id => id == capability,
             ((KernelEventRegistry)typeof(RuntimeKernel).GetField("_kernelEvents", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel)!).SnapshotIrqSources()));
@@ -505,14 +534,14 @@ public sealed class PlatformIrqBindingTests
         provider.AfterIrqRevokeEffect = null;
         Assert.False(kernel.RevokeCapability(capability).IsSuccess);
         Assert.False(kernel.TerminateProcess(subject).IsSuccess);
-        Assert.Equal(1, provider.IrqRevokeCalls);
+        Assert.Equal(0, provider.IrqRevokeCalls);
         Assert.Equal(0, provider.DeviceRevokeCalls);
         Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
     }
 
     [Theory]
     [InlineData(false)] [InlineData(true)]
-    public void MalformedIrqCompensationRefusesReplacedParentBeforeCallback(bool domainOwner)
+    public void MalformedIrqReturnedObjectNeverTargetsReplacedParent(bool domainOwner)
     {
         var provider = new IrqProvider { RewriteBindReceipt = receipt => receipt with { Source = new("foreign", receipt.Source.Trigger) } };
         var kernel = new RuntimeKernel(provider);
@@ -526,23 +555,18 @@ public sealed class PlatformIrqBindingTests
         object key = domainOwner ? device.DomainBinding.BindingId : device.LeaseId;
         var original = facts[key]!;
         var replaced = false;
-        provider.BeforeIrqBindEffect = () =>
+        provider.RewriteBindReceipt = receipt =>
         {
-            var reads = 0;
-            provider.IncarnationRead = () =>
-            {
-                if (++reads != 2) return;
-                provider.IncarnationRead = null;
-                facts[key] = original.GetType().GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
-                replaced = true;
-            };
+            facts[key] = original.GetType().GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+            replaced = true;
+            return receipt with { Source = new("foreign",receipt.Source.Trigger) };
         };
         Assert.Equal(KernelError.PlatformFaulted, kernel.BindPlatformInterrupt(subject, device, capability, endpoint).Error);
         Assert.True(replaced);
         Assert.Equal(0, provider.IrqRevokeCalls);
         Assert.Equal(false, deviceOwner.GetType().GetProperty("MalformedIrqCleanupMayHaveEffect")!.GetValue(deviceOwner));
         Assert.Null(deviceOwner.GetType().GetProperty("MalformedIrqCleanupObservation")!.GetValue(deviceOwner));
-        Assert.NotNull(deviceOwner.GetType().GetProperty("MalformedIrqReceipt")!.GetValue(deviceOwner));
+        Assert.NotNull(deviceOwner.GetType().GetProperty("IrqBindObservation")!.GetValue(deviceOwner));
         Assert.False(kernel.TerminateProcess(subject).IsSuccess);
         Assert.Equal(0, provider.DeviceRevokeCalls);
         Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
@@ -1511,7 +1535,7 @@ public sealed class PlatformIrqBindingTests
     }
     [Theory]
     [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)]
-    public void MalformedReceiptSuccessfulCleanupNeverClosesOriginalAdmission(int mutation)
+    public void MalformedReceiptNeverSelectsForeignCleanupOrClosesOriginalAdmission(int mutation)
     {
         var provider = new IrqProvider();
         provider.RewriteBindReceipt = receipt => mutation switch
@@ -1527,7 +1551,7 @@ public sealed class PlatformIrqBindingTests
             "device/malformed-success", "signal", IrqTriggerMode.Edge);
         Assert.Equal(KernelError.PlatformFaulted,
             kernel.BindPlatformInterrupt(subject, device, capability, endpoint).Error);
-        Assert.Equal(1, provider.IrqRevokeCalls);
+        Assert.Equal(0, provider.IrqRevokeCalls);
         Assert.True(kernel.PlatformAuthority.HasUnresolvedIrqEffect(id => id == capability,
             ((KernelEventRegistry)typeof(RuntimeKernel).GetField("_kernelEvents", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel)!).SnapshotIrqSources()));
         Assert.Empty(kernel.PlatformAuthority.ActiveIrqBindingsForDevice(device));
@@ -1535,7 +1559,7 @@ public sealed class PlatformIrqBindingTests
         Assert.False(kernel.RevokePlatformDevice(subject, device).IsSuccess);
         Assert.False(kernel.TerminateProcess(subject).IsSuccess);
         Assert.Equal(0, provider.DeviceRevokeCalls);
-        Assert.Equal(1, provider.IrqRevokeCalls);
+        Assert.Equal(0, provider.IrqRevokeCalls);
         Assert.True(kernel.Processes.Resolve(subject).IsSuccess);
     }
     [Theory]
@@ -2366,7 +2390,7 @@ public sealed class PlatformIrqBindingTests
 
         Assert.Equal(KernelError.PlatformFaulted,
             kernel.BindPlatformInterrupt(subject, device, capability, endpoint).Error);
-        Assert.Equal(1, provider.IrqRevokeCalls);
+        Assert.Equal(0, provider.IrqRevokeCalls);
         provider.IrqRevokeStatus = null;
         provider.ThrowOnIrqRevoke = false;
         Assert.Equal(KernelError.PlatformFaulted, kernel.RevokePlatformDevice(subject, device).Error);

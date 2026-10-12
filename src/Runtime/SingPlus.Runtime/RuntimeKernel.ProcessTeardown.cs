@@ -227,7 +227,7 @@ public sealed partial class RuntimeKernel
             foreach (var mapping in trackedMappings) mappings[mapping.MappingId] = mapping;
         foreach (var capabilityId in process.Capabilities.Items)
         {
-            foreach (var mapping in PlatformAuthority.BeginCapabilityRevocation(capabilityId, id => CapabilityAuthority.DependsOnCapability(id, capabilityId)))
+            foreach (var mapping in PlatformAuthority.BeginCapabilityRevocation(capabilityId, id => CapabilityAuthority.DependsOnCapability(id, capabilityId), processCleanupSubject: PlatformIdentity(process)))
                 mappings[mapping.MappingId] = mapping;
             _ = PlatformAuthority.BeginIrqCapabilityRevocation(capabilityId, id => CapabilityAuthority.DependsOnCapability(id, capabilityId));
             _ = PlatformAuthority.BeginMmioCapabilityRevocation(capabilityId, id => CapabilityAuthority.DependsOnCapability(id, capabilityId));
@@ -376,6 +376,28 @@ public sealed partial class RuntimeKernel
             return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
         }
         participants = _cxlTeardownParticipants.AsEnumerable().Reverse().ToArray();
+        }
+        var admissionResolution = PlatformAuthority.ResolveOriginalAdmissionsForCleanup(identity);
+        lock (_platformMemoryUseGate)
+        {
+            var afterResolution = Processes.Resolve(record.Handle);
+            if (!afterResolution.IsSuccess || !ReferenceEquals(afterResolution.Value, process) ||
+                !_processTeardowns.TryGetValue(record.Handle, out var originalTeardown) || !ReferenceEquals(originalTeardown, record))
+                return KernelResult<ProcessTeardownSnapshot>.Fail(KernelError.StaleGeneration, "Original process/teardown owner changed during admission resolution.");
+            if (!admissionResolution.IsSuccess)
+            {
+                record.Phase = admissionResolution.Error == KernelError.PlatformBindingDraining ? ProcessTeardownPhase.PlatformDraining : ProcessTeardownPhase.PlatformFaulted;
+                record.BlockingError = admissionResolution.Error;
+                return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
+            }
+            if (record.DomainBinding is null && PlatformAuthority.TryGetOriginalDomainCleanupBinding(identity, out var recovered))
+            {
+                if (_processPlatformBindings.TryGetValue(record.Handle, out var routed) && routed != recovered)
+                    return KernelResult<ProcessTeardownSnapshot>.Fail(KernelError.PlatformFaulted, "Cleanup resolution cannot replace a foreign kernel root route.");
+                record.DomainBinding = recovered;
+                record.PlatformDomainClosed = false;
+                TrackPlatformBinding(record.Handle, recovered, executionAttached: false);
+            }
         }
         KernelResult cxlClosure;
         try { cxlClosure = CloseCxlResourcesForProcess(record.Handle,
@@ -569,6 +591,11 @@ public sealed partial class RuntimeKernel
                     progress = KernelResult<PlatformRegionMappingLifecycle>.Ok(lifecycle);
                     break;
                 case PlatformExternalClosureState.Faulted:
+                    if (lifecycle.AdmissionNoEffectProven)
+                    {
+                        progress = KernelResult<PlatformRegionMappingLifecycle>.Ok(lifecycle);
+                        break;
+                    }
                     firstBlockingError ??= KernelError.PlatformFaulted;
                     continue;
                 default:
@@ -580,7 +607,7 @@ public sealed partial class RuntimeKernel
             // outside the outer kernel gate, then revalidate the actual process,
             // teardown record and participant inventory before local release.
             var releaseSource = progress.IsSuccess &&
-                progress.Value!.PlatformClosure == PlatformExternalClosureState.Closed
+                (progress.Value!.PlatformClosure == PlatformExternalClosureState.Closed || progress.Value.AdmissionNoEffectProven)
                 ? PlatformAuthority.ValidateRegionMappingReleaseSource(mapping, identity)
                 : KernelResult.Ok();
             var mappingBudgetObservations = new List<BudgetTraceObservation>();
@@ -610,13 +637,13 @@ public sealed partial class RuntimeKernel
             }
 
             var current = progress.Value!;
-            if (current.PlatformClosure == PlatformExternalClosureState.Faulted)
+            if (current.PlatformClosure == PlatformExternalClosureState.Faulted && !current.AdmissionNoEffectProven)
             {
                 firstBlockingError ??= KernelError.PlatformFaulted;
                 continue;
             }
 
-            if (current.PlatformClosure != PlatformExternalClosureState.Closed)
+            if (current.PlatformClosure != PlatformExternalClosureState.Closed && !current.AdmissionNoEffectProven)
             {
                 pendingMappings++;
                 continue;

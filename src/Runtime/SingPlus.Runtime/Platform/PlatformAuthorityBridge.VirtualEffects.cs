@@ -13,6 +13,13 @@ public sealed partial class PlatformAuthorityBridge
         public DomainRecord OriginalRoot { get; } = root;
         public PlatformBackendEpoch AdmissionEpoch { get; } = epoch;
         public PlatformAuthorityResult<TOutcome>? Observation { get; set; }
+        public PlatformOriginalVirtualEventRequest? EventOriginal { get; init; }
+        public PlatformOriginalVirtualEventClosure? EventCleanupRaw { get; set; }
+        public ChildDeliveryInvocation<TRequest, TOutcome>? OwnerSelf { get; private set; }
+        public void EstablishSelf() => OwnerSelf = this;
+        public PlatformChildDomainState AdmittedChildState { get; init; }
+        public long AdmittedChildRevision { get; init; }
+        public long? OwnFaultRevision { get; set; }
     }
 
     internal KernelResult<PlatformVirtualEventReceipt> InjectChildEvent(
@@ -33,20 +40,30 @@ public sealed partial class PlatformAuthorityBridge
             return FromProviderFailure<PlatformVirtualEventReceipt>(requestValidation.Status, requestValidation.Message);
         PlatformBackendEpoch backendEpoch = default;
         DomainRecord originalRoot = null!;
+        long childRevision = 0;
+        PlatformChildDomainState admittedChildState = default;
         KernelResult Begin()
         {
           lock (_secureDomainLifecycleGate)
           {
             var lineage = ValidateActiveChildLineage(record);
             if (!lineage.IsSuccess) return lineage;
-            if (record.TransitionInFlight || !PlatformVirtualEventContract.ValidateRequest(request, record.State).IsSuccess)
+            if (record.PendingChildEffects == int.MaxValue)
+                return KernelResult.Fail(KernelError.CapacityExhausted, "Child event interlock capacity is exhausted.");
+            if (record.TransitionInFlight || record.PendingChildEffects != 0 || record.EventInvocations.Any(x =>
+                x.Observation is not { IsSuccess: true } known || !PlatformVirtualEventContract.ValidateReceipt(x.Request, known.Value).IsSuccess) ||
+                !PlatformVirtualEventContract.ValidateRequest(request, record.State).IsSuccess)
                 return KernelResult.Fail(KernelError.PlatformBindingActive,
                     "Child lifecycle changed before virtual-event injection.");
             KernelResult CommitAdmission()
             {
-                if (record.PendingChildEffects == int.MaxValue)
+                if (record.PendingChildEffects == int.MaxValue || record.EventsIssued == ulong.MaxValue ||
+                    record.EventsConsumed > record.EventsIssued || record.EventsIssued - record.EventsConsumed != (ulong)record.EventInvocations.Count)
                     return KernelResult.Fail(KernelError.CapacityExhausted, "Child event interlock capacity is exhausted.");
                 originalRoot = _domains[child.ParentBinding.BindingId];
+                record.EventInvocations.EnsureCapacity(record.EventInvocations.Count + 1);
+                childRevision = record.LifecycleRevision;
+                admittedChildState = record.State;
                 record.PendingChildEffects++;
                 backendEpoch = BackendEpoch;
                 return KernelResult.Ok();
@@ -61,6 +78,9 @@ public sealed partial class PlatformAuthorityBridge
             KernelResult ValidateSource(PlatformProviderIncarnation source)
             {
                 if (source.Value == 0 || source != originalRoot.ProviderIncarnation ||
+                    record.LifecycleRevisionExhausted || record.LifecycleRevision != childRevision || record.State != admittedChildState ||
+                    record.EventsConsumed > record.EventsIssued || record.EventsIssued - record.EventsConsumed != (ulong)record.EventInvocations.Count ||
+                    record.EventInvocations.Any(x => !ReferenceEquals(x.OwnerSelf, x)) ||
                     BackendEpoch != backendEpoch || originalRoot.BackendEpoch != backendEpoch || _backendEpochExhausted ||
                     !_domains.TryGetValue(child.ParentBinding.BindingId, out var root) || !ReferenceEquals(root, originalRoot) ||
                     root.Binding != child.ParentBinding || root.ProviderLease != record.ProviderLease.ParentDomainLease ||
@@ -92,12 +112,15 @@ public sealed partial class PlatformAuthorityBridge
             var final = admissionConsumer is null ? FinalAdmission() : admissionConsumer(FinalAdmission);
             if (!final.IsSuccess) return KernelResult<PlatformVirtualEventReceipt>.Fail(final.Error, final.Message!);
             PlatformAuthorityResult<PlatformVirtualEventReceipt> result;
-            var invocation = new ChildDeliveryInvocation<PlatformVirtualEventRequest, PlatformVirtualEventReceipt>(request, originalRoot, backendEpoch);
-            lock (_secureDomainLifecycleGate) record.EventInvocations.Add(invocation);
-            try { result = provider.InjectVirtualEvent(invocation.Request); }
+            var invocation = new ChildDeliveryInvocation<PlatformVirtualEventRequest, PlatformVirtualEventReceipt>(request, originalRoot, backendEpoch)
+            { EventOriginal = provider is IPlatformOriginalVirtualEventProvider ? new(request) : null,
+                AdmittedChildState = admittedChildState, AdmittedChildRevision = childRevision };
+            invocation.EstablishSelf();
+            lock (_secureDomainLifecycleGate) { record.EventInvocations.Add(invocation); record.EventsIssued++; }
+            try { result = invocation.EventOriginal is { } original ? ((IPlatformOriginalVirtualEventProvider)provider).InjectOriginalVirtualEvent(original) : provider.InjectVirtualEvent(invocation.Request); }
             catch (Exception exception) when (exception is not StackOverflowException)
             {
-                lock (_secureDomainLifecycleGate) record.State = PlatformChildDomainState.Faulted;
+                lock (_secureDomainLifecycleGate) MarkOriginalEventFault(record, invocation);
                 return KernelResult<PlatformVirtualEventReceipt>.Fail(KernelError.PlatformFaulted,
                     $"Virtual-event injection may have taken effect without a receipt: {exception.Message}");
             }
@@ -107,14 +130,14 @@ public sealed partial class PlatformAuthorityBridge
                 invocation.Observation = result;
                 if (!result.IsSuccess)
                 {
-                    record.State = PlatformChildDomainState.Faulted;
+                    MarkOriginalEventFault(record, invocation);
                     return FromProviderFailure<PlatformVirtualEventReceipt>(result.Status, result.Message);
                 }
                 evidence = result.Value!;
                 var validation = PlatformVirtualEventContract.ValidateReceipt(request, evidence);
                 if (!validation.IsSuccess || evidence.Sequence <= record.LastEventSequence)
                 {
-                    record.State = PlatformChildDomainState.Faulted;
+                    MarkOriginalEventFault(record, invocation);
                     return KernelResult<PlatformVirtualEventReceipt>.Fail(KernelError.PlatformFaulted,
                         validation.IsSuccess ? "Virtual-event evidence sequence is stale or replayed." : validation.Message!);
                 }
@@ -155,7 +178,12 @@ public sealed partial class PlatformAuthorityBridge
                 return KernelResult<PlatformVirtualEventReceipt>.Fail(KernelError.PlatformFaulted, "Original delivery was not committed by the publication consumer.");
             // The successful publication consumer owns its result. Keep only pending or
             // unpublished provider outcomes here; ordinary traffic is not a history ledger.
-            lock (_secureDomainLifecycleGate) record.EventInvocations.Remove(invocation);
+            lock (_secureDomainLifecycleGate)
+            {
+                if (!record.EventInvocations.Remove(invocation))
+                    return KernelResult<PlatformVirtualEventReceipt>.Fail(KernelError.PlatformFaulted, "Original delivery inventory lost after publication.");
+                record.EventsConsumed++;
+            }
             return KernelResult<PlatformVirtualEventReceipt>.Ok(evidence);
         }
         finally { lock (_secureDomainLifecycleGate) record.PendingChildEffects--; }
@@ -166,6 +194,8 @@ public sealed partial class PlatformAuthorityBridge
         Func<Func<KernelResult>, KernelResult>? sourceCommitConsumer = null,
         Func<Func<Func<KernelResult>, KernelResult>, KernelResult>? completionConsumer = null)
     {
+        if (_provider is IPlatformExecutionTerminalProvider terminalProvider)
+            return ObserveOriginalExecutionTrap(child, terminalProvider, admissionConsumer, sourceCommitConsumer, completionConsumer);
         var resolved = ResolveChild(child);
         if (!resolved.IsSuccess) return KernelResult<PlatformVirtualTrapEvidence>.Fail(resolved.Error, resolved.Message!);
         if (!SupportsChildFeature(PlatformFeatureFamily.ChildTrapDelivery, PlatformVirtualTrapContract.ContractVersion) ||

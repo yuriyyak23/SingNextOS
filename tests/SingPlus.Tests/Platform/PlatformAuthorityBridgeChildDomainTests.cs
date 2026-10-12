@@ -2005,9 +2005,16 @@ public sealed class PlatformAuthorityBridgeChildDomainTests
             Assert.Equal(ulong.MaxValue - 1, result.Value!.BindingId.Value);
             Assert.True(bridge.RevokeChildVirtualIo(result.Value).IsSuccess);
         }
-        Assert.Equal(KernelError.CapacityExhausted, bridge.BindChildVirtualIo(child, device, new(PlatformDeviceRights.Read, 512)).Error);
+        Assert.Equal(notAccepted ? KernelError.PlatformFaulted : KernelError.CapacityExhausted, bridge.BindChildVirtualIo(child, device, new(PlatformDeviceRights.Read, 512)).Error);
         Assert.Equal(ulong.MaxValue, counter.GetValue(bridge));
         Assert.Equal(notAccepted ? 0 : 1, provider.VirtualIoRevokeCalls);
+        if (notAccepted)
+        {
+            Assert.False(bridge.RevokeDevice(device, subject).IsSuccess);
+            Assert.False(bridge.CloseChildDomain(child).IsSuccess);
+            Assert.False(bridge.RevokeDomain(root, subject).IsSuccess);
+            return; // V1 NotAccepted has no exact no-effect guarantee; original intent/parents stay pinned.
+        }
         Assert.True(bridge.RevokeDevice(device, subject).IsSuccess);
         Assert.True(bridge.TransitionChildDomain(child, PlatformChildDomainTransition.BeginDrain).IsSuccess);
         Assert.True(bridge.CloseChildDomain(child).IsSuccess);
@@ -3570,7 +3577,7 @@ public sealed class PlatformAuthorityBridgeChildDomainTests
             Assert.Equal(KernelError.PlatformFaulted,
                 bridge.MapChildGuestRegion(child, mapping,
                     new(0, 4096), PlatformGuestMemoryAccess.Read).Error);
-            Assert.Equal(1, provider.GuestUnmapCalls);
+            Assert.Equal(0, provider.GuestUnmapCalls); // A malformed returned lease is not the original cleanup target.
             Assert.Equal(KernelError.PlatformFaulted, bridge.ValidateMapping(mapping, owner).Error);
         }
 
@@ -3906,7 +3913,7 @@ public sealed class PlatformAuthorityBridgeChildDomainTests
     }
 
     [Theory]
-    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)] [InlineData(5)]
     public async Task VirtualIoGuestEventRequiresExactPublishedOperation(int fault)
     {
         var provider = new ChildProvider();
@@ -3962,9 +3969,16 @@ public sealed class PlatformAuthorityBridgeChildDomainTests
             if (fault == 3) Assert.Equal(KernelError.PlatformBindingActive,
                 kernel.RevokeCapability(deviceCapability.CapabilityId).Error);
         };
+        object? ioOwner = null;
+        if (fault == 5)
+        {
+            var records = (global::System.Collections.IDictionary)IoField(kernel, "_virtualIo");
+            ioOwner = records[virtualIo.Id]!;
+            ioOwner.GetType().GetProperty("PendingEvents", global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.SetValue(ioOwner, int.MaxValue);
+        }
         var published = kernel.PublishVirtualIoEvent(owner, virtualIo, prepared.Operation,
             authority.EventCapability, endpoint);
-        if (fault is 1 or 2 or 3)
+        if (fault is 1 or 2 or 3 or 5)
         {
             Assert.False(published.IsSuccess);
             Assert.False(waiting.IsCompleted);
@@ -3976,8 +3990,15 @@ public sealed class PlatformAuthorityBridgeChildDomainTests
             Assert.True(published.IsSuccess, published.Message);
             Assert.True((await waiting).IsSuccess);
         }
-        Assert.Equal(fault == 1 ? 0 : 1, provider.EventCalls);
-        if (fault is 1 or 2 or 3)
+        Assert.Equal(fault is 1 or 5 ? 0 : 1, provider.EventCalls);
+        if (fault == 5)
+        {
+            Assert.Equal(KernelError.CapacityExhausted, published.Error);
+            var pending = ioOwner!.GetType().GetProperty("PendingEvents", global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!;
+            Assert.Equal(int.MaxValue, pending.GetValue(ioOwner));
+            pending.SetValue(ioOwner, 0);
+        }
+        if (fault is 1 or 2 or 3 or 5)
         {
             // Independent Events authority may use the endpoint after the refused I/O event.
             provider.BeforeChildEvent = null;

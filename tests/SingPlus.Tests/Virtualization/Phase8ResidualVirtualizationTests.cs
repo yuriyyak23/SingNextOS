@@ -11,6 +11,140 @@ namespace SingPlus.Tests.Virtualization;
 
 public sealed class Phase8ResidualVirtualizationTests
 {
+    [Fact]
+    public void NestedOriginalCleanupReleasesRegionAndConsumesAttachedChargeOnce()
+    {
+        var s = CreateScenario(); var parent = CreateConfiguredRoot(s);
+        var admin = TestFixtures.Create(s.Kernel, 99, 999).Handle;
+        var budgetCap = s.Kernel.MintCapability(new(999), admin, ResourceKind.KernelService,
+            CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        var budget = s.Kernel.AdmitProcessBudget(admin, budgetCap, s.Owner, "nested-cleanup", [new(ServiceBudgetDimension.OwnedMemoryBytes, 512)]).Value!.ProcessBudget;
+        var region = s.Kernel.AllocateBuffer<byte>(s.Owner, 512).Value!;
+        var created = s.Kernel.CreateNestedVirtualDomain(s.Owner, parent.Domain, parent.ConfigureCapability,
+            new(new(1, 4096), VirtualDomainAuthorityClass.Lifecycle));
+        Assert.True(created.IsSuccess, created.Message);
+        Assert.Equal(512UL, s.Kernel.QueryBudget(budget).Value!.Usage.Single(x => x.Dimension == ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(x => x.Handle == region.Handle).State);
+        Assert.Equal(0UL, s.Kernel.QueryBudget(budget).Value!.Usage.Single(x => x.Dimension == ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.Equal(2, s.Provider.ChildCloseCalls);
+        Assert.Equal(1, s.Provider.NestedCloseCalls);
+        Assert.False(s.Kernel.Processes.Resolve(s.Owner).IsSuccess);
+        Assert.False(s.Kernel.QueryProcessTeardown(s.Owner).IsSuccess); // Completed owner has retired; no live teardown record.
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void NestedPendingHistoryLossOrCopyKeepsOriginalRegionPinned(bool copied)
+    {
+        var s = CreateScenario(); var parent = CreateConfiguredRoot(s);
+        var region = s.Kernel.AllocateBuffer<byte>(s.Owner, 512).Value!;
+        var local = Assert.Single(((VirtualDomainAuthority)ArtifactField(s.Kernel, "_virtualDomains")).ForOwner(s.Owner));
+        var routes = (global::System.Collections.IDictionary)ArtifactField(s.Kernel.PlatformAuthority, "_childBindings");
+        var owner = routes[local.ChildBinding!.Value.BindingId]!;
+        var history = (global::System.Collections.IList)owner.GetType().GetProperty("NestedCreateInvocations")!.GetValue(owner)!;
+        s.Provider.AfterNestedMaterialize = () =>
+        {
+            var original = Assert.Single(history.Cast<object>());
+            if (copied) history[0] = typeof(object).GetMethod("MemberwiseClone", global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.Invoke(original, null)!;
+            else history.Clear();
+        };
+        Assert.False(s.Kernel.CreateNestedVirtualDomain(s.Owner, parent.Domain, parent.ConfigureCapability,
+            new(new(1, 4096), VirtualDomainAuthorityClass.Lifecycle)).IsSuccess);
+        Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(1, s.Provider.NestedCreateCalls);
+        Assert.Equal(0, s.Provider.ChildCloseCalls);
+        Assert.Equal(0, owner.GetType().GetProperty("PendingChildEffects")!.GetValue(owner));
+        Assert.Equal(RegionState.Owned, s.Kernel.Regions.Snapshot().Single(x => x.Handle == region.Handle).State);
+    }
+
+    [Fact]
+    public void MalformedNestedReplyCannotCloseAnotherActualKernelDomain()
+    {
+        var s = CreateScenario(); var parent = CreateConfiguredRoot(s);
+        var foreignOwner = TestFixtures.Create(s.Kernel, 502, 5002).Handle;
+        var foreignCreate = s.Kernel.MintCapability(new(5002), foreignOwner, ResourceKind.Virtualization,
+            VirtualizationResourceIds.Create, CapabilityRights.Configure).Value!.CapabilityId;
+        var foreignResult = s.Kernel.CreateVirtualDomain(foreignOwner, foreignCreate, new(1, 4096));
+        Assert.True(foreignResult.IsSuccess, foreignResult.Message);
+        var foreign = foreignResult.Value!;
+        var admin = TestFixtures.Create(s.Kernel, 99, 999).Handle;
+        var budgetCap = s.Kernel.MintCapability(new(999), admin, ResourceKind.KernelService,
+            CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        var budget = s.Kernel.AdmitProcessBudget(admin, budgetCap, s.Owner, "nested-original", [new(ServiceBudgetDimension.OwnedMemoryBytes, 512)]).Value!.ProcessBudget;
+        var region = s.Kernel.AllocateBuffer<byte>(s.Owner, 512).Value!;
+        var authority = (VirtualDomainAuthority)ArtifactField(s.Kernel, "_virtualDomains");
+        var foreignBinding = Assert.Single(authority.ForOwner(foreignOwner), x => x.Handle == foreign.Domain).ChildBinding!.Value;
+        var routes = (global::System.Collections.IDictionary)ArtifactField(s.Kernel.PlatformAuthority, "_childBindings");
+        var foreignLease = (PlatformProviderChildDomainLease)routes[foreignBinding.BindingId]!.GetType().GetProperty("ProviderLease")!.GetValue(routes[foreignBinding.BindingId])!;
+        s.Provider.NestedReceiptMutation = reply => reply with { ChildLease = foreignLease, ImmediateParentLeaseId = new(ulong.MaxValue) };
+        Assert.False(s.Kernel.CreateNestedVirtualDomain(s.Owner, parent.Domain, parent.ConfigureCapability,
+            new(new(1, 4096), VirtualDomainAuthorityClass.Lifecycle)).IsSuccess);
+        Assert.Equal(0, s.Provider.ChildCloseCalls);
+        Assert.Equal(VirtualDomainState.Created, s.Kernel.QueryVirtualDomain(foreignOwner, foreign.Domain).Value);
+        Assert.True(s.Kernel.DestroyVirtualDomain(foreignOwner, foreign.Domain, foreign.ConfigureCapability).IsSuccess);
+        Assert.Equal(1, s.Provider.ChildCloseCalls);
+        Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(1, s.Provider.NestedCreateCalls);
+        Assert.Equal(1, s.Provider.ChildCloseCalls);
+        Assert.Equal(RegionState.Owned, s.Kernel.Regions.Snapshot().Single(x => x.Handle == region.Handle).State);
+        Assert.Equal(512UL, s.Kernel.QueryBudget(budget).Value!.Usage.Single(x => x.Dimension == ServiceBudgetDimension.OwnedMemoryBytes).Used);
+    }
+
+    [Theory]
+    [InlineData(false, false)] [InlineData(false, true)]
+    [InlineData(true, false)] [InlineData(true, true)]
+    public void NestedFinalCommitRejectsSameValueParentRevisionAndExhaustion(bool late, bool exhausted)
+    {
+        var s = CreateScenario(); var parent = CreateConfiguredRoot(s);
+        var region = s.Kernel.AllocateBuffer<byte>(s.Owner, 512).Value!;
+        var local = Assert.Single(((VirtualDomainAuthority)ArtifactField(s.Kernel, "_virtualDomains")).ForOwner(s.Owner));
+        var routes = (global::System.Collections.IDictionary)ArtifactField(s.Kernel.PlatformAuthority, "_childBindings");
+        var original = routes[local.ChildBinding!.Value.BindingId]!;
+        void Change()
+        {
+            Assert.False(global::System.Threading.Monitor.IsEntered(ArtifactField(s.Kernel.PlatformAuthority, "_secureDomainLifecycleGate")));
+            if (exhausted) original.GetType().GetField("_lifecycleRevisionExhausted", global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.SetValue(original, 1);
+            else original.GetType().GetProperty("State")!.SetValue(original, original.GetType().GetProperty("State")!.GetValue(original));
+        }
+        if (late) s.Provider.AfterNestedMaterialize = Change;
+        else s.Provider.BeforeIncarnationRead = () => { s.Provider.BeforeIncarnationRead = null; Change(); };
+        Assert.False(s.Kernel.CreateNestedVirtualDomain(s.Owner, parent.Domain, parent.ConfigureCapability,
+            new(new(1, 4096), VirtualDomainAuthorityClass.Lifecycle)).IsSuccess);
+        Assert.Equal(late ? 1 : 0, s.Provider.NestedCreateCalls);
+        Assert.Equal(0, original.GetType().GetProperty("PendingChildEffects")!.GetValue(original));
+        Assert.DoesNotContain(((VirtualDomainAuthority)ArtifactField(s.Kernel, "_virtualDomains")).ForOwner(s.Owner), x => x.ParentDomain == parent.Domain && x.AuthorityPublished);
+        Assert.Equal(RegionState.Owned, s.Kernel.Regions.Snapshot().Single(x => x.Handle == region.Handle).State);
+    }
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void NestedPublicationRequiresTheCapturedLocalParentRevision(int fault)
+    {
+        var s = CreateScenario(); var parent = CreateConfiguredRoot(s);
+        var authority = (VirtualDomainAuthority)ArtifactField(s.Kernel, "_virtualDomains");
+        var original = Assert.Single(authority.ForOwner(s.Owner));
+        var state = original.State;
+        var region = s.Kernel.AllocateBuffer<byte>(s.Owner, 128).Value!;
+        s.Provider.AfterNestedMaterialize = () =>
+        {
+            if (fault == 1) original.State = VirtualDomainState.Quarantined;
+            if (fault == 2) original.AuthorityPublished = true; else original.State = state;
+        };
+        var result = s.Kernel.CreateNestedVirtualDomain(s.Owner, parent.Domain, parent.ConfigureCapability,
+            new(new(1, 4096), VirtualDomainAuthorityClass.Lifecycle | VirtualDomainAuthorityClass.GuestMemory));
+        Assert.False(result.IsSuccess);
+        var nested = Assert.Single(authority.ForOwner(s.Owner), x => x.ParentDomain == parent.Domain);
+        Assert.False(nested.AuthorityPublished);
+        Assert.Empty(nested.Capabilities);
+        Assert.Equal(RegionState.Owned, s.Kernel.Regions.Snapshot().Single(x => x.Handle == region.Handle).State);
+        s.Provider.AfterNestedMaterialize = null;
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(1, s.Provider.NestedCloseCalls);
+        Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(x => x.Handle == region.Handle).State);
+    }
+
     [Theory]
     [InlineData(false)] [InlineData(true)]
     public void NestedCreateCanonicalRootLossRetainsOriginalInvocationAndBacking(bool foreign)
@@ -1935,7 +2069,7 @@ public sealed class Phase8ResidualVirtualizationTests
     }
 
     [Fact]
-    public void NestedPublicationRechecksDrainingAncestorAndRetainsActualLateReceipt()
+    public void NestedCreationHoldsEveryAncestorUntilFinalPublication()
     {
         var provider = new NestedProvider(null, false, false, false, false, false);
         var bridge = new PlatformAuthorityBridge(provider);
@@ -1947,17 +2081,16 @@ public sealed class Phase8ResidualVirtualizationTests
         provider.AfterNestedMaterialize = () =>
         {
             Assert.False(global::System.Threading.Monitor.IsEntered(ArtifactField(bridge, "_secureDomainLifecycleGate")));
-            Assert.True(bridge.TransitionChildDomain(ancestor, PlatformChildDomainTransition.BeginDrain).IsSuccess);
+            Assert.Equal(KernelError.PlatformBindingActive, bridge.TransitionChildDomain(ancestor, PlatformChildDomainTransition.BeginDrain).Error);
         };
-        Assert.Equal(KernelError.PlatformFaulted, bridge.CreateNestedChildDomain(parent, subject.Process, intent).Error);
+        var created = bridge.CreateNestedChildDomain(parent, subject.Process, intent);
+        Assert.True(created.IsSuccess, created.Message);
         var children = (global::System.Collections.IDictionary)ArtifactField(bridge, "_childBindings");
-        Assert.Equal(2, children.Count);
+        Assert.Equal(3, children.Count);
         var record = children.Values.Cast<object>().Single(r => Equals(r.GetType().GetProperty("Binding")!.GetValue(r), parent));
-        var fact = Assert.Single(((global::System.Collections.IEnumerable)record.GetType().GetProperty("UnpublishedNestedCreates")!.GetValue(record)!).Cast<object>());
-        var receipt = (PlatformProviderNestedDomainLease)fact.GetType().GetProperty("Receipt")!.GetValue(fact)!;
-        Assert.Equal(provider.LastNestedLease, receipt.ChildLease);
+        Assert.Empty(((global::System.Collections.IEnumerable)record.GetType().GetProperty("UnpublishedNestedCreates")!.GetValue(record)!).Cast<object>());
         Assert.Equal(0, record.GetType().GetProperty("PendingChildEffects")!.GetValue(record));
-        Assert.Equal(KernelError.PlatformBindingActive, bridge.CloseChildDomain(ancestor).Error);
+        Assert.Equal(KernelError.PlatformDenied, bridge.CloseChildDomain(ancestor).Error);
         Assert.Equal(KernelError.PlatformBindingActive, bridge.RevokeDomain(root, subject).Error);
         Assert.Equal(0, provider.NestedCloseCalls);
         Assert.Equal(2, provider.NestedCreateCalls);
@@ -1968,7 +2101,7 @@ public sealed class Phase8ResidualVirtualizationTests
     [InlineData(1)]
     [InlineData(2)]
     [InlineData(3)]
-    public void NestedReceiptFactsRetainMalformedCompensationAndDoNotInventUnknownReceipts(int fault)
+    public void NestedReceiptFactsRetainMalformedWithoutReturnedLeaseCompensation(int fault)
     {
         var provider = new NestedProvider(fault == 2 ? PlatformAuthorityStatus.NotAccepted :
             fault == 3 ? PlatformAuthorityStatus.Faulted : null, false, false, false, fault == 1, false);
@@ -1990,7 +2123,7 @@ public sealed class Phase8ResidualVirtualizationTests
         {
             Assert.Equal(KernelError.PlatformFaulted, bridge.CloseChildDomain(parent).Error);
             Assert.Equal(KernelError.PlatformBindingActive, bridge.RevokeDomain(root, subject).Error);
-            Assert.Equal(fault == 1 ? 1 : 0, provider.NestedCloseCalls);
+            Assert.Equal(0, provider.NestedCloseCalls);
             Assert.DoesNotContain("parent-close", provider.CallLog);
             return;
         }
@@ -2046,7 +2179,7 @@ public sealed class Phase8ResidualVirtualizationTests
         Assert.Equal(KernelError.PlatformFaulted, bridge.CloseChildDomain(parent).Error);
         Assert.True(bridge.TryGetQuarantinedDomainBinding(subject, out var current));
         Assert.Equal(KernelError.PlatformBindingActive, bridge.RevokeDomain(current, subject).Error);
-        Assert.Equal(fault == 1 ? 1 : 0, provider.NestedCloseCalls);
+        Assert.Equal(0, provider.NestedCloseCalls);
         Assert.DoesNotContain("parent-close", provider.CallLog);
     }
 
@@ -2155,8 +2288,13 @@ public sealed class Phase8ResidualVirtualizationTests
         var region = s.Kernel.AllocateRegion(s.Owner, 4096).Value!;
         var capability = s.Kernel.MintCapability(new DomainId(5001), s.Owner, ResourceKind.MemoryRegion,
             CapabilityResourceIds.MemoryRegion(region.Handle.RegionId), CapabilityRights.Map | CapabilityRights.Read).Value!.CapabilityId;
-        s.Provider.AfterGuestMap = () => Assert.True(s.Kernel.PlatformAuthority.TransitionChildDomain(
-            parent.ChildBinding!.Value, PlatformChildDomainTransition.BeginDrain).IsSuccess);
+        s.Provider.AfterGuestMap = () =>
+        {
+            Assert.False(s.Kernel.PlatformAuthority.TransitionChildDomain(parent.ChildBinding!.Value, PlatformChildDomainTransition.BeginDrain).IsSuccess);
+            var routes = (global::System.Collections.IDictionary)ArtifactField(s.Kernel.PlatformAuthority, "_childBindings");
+            var original = routes[parent.ChildBinding.Value.BindingId]!;
+            original.GetType().GetProperty("State")!.SetValue(original, PlatformChildDomainState.Draining);
+        };
         if (lostClosure) s.Provider.BeforeGuestUnmap = () => throw new InvalidOperationException("closure receipt lost");
         Assert.False(s.Kernel.MapGuestRegion(s.Owner, leaf.Domain, leaf.MemoryCapability, capability,
             region.Handle, new(0, 4096), GuestMemoryAccess.Read).IsSuccess);
@@ -2193,7 +2331,16 @@ public sealed class Phase8ResidualVirtualizationTests
         var region = new PlatformRegionIdentity(new(new RegionId(5), new RegionGeneration(1)),
             new(new DomainId(1), subject.ProcessGeneration), 4096);
         var mapping = bridge.MapOwnedRegion(root, subject, new CapabilityId(8), region, PlatformMemoryAccess.Read).Value!;
-        Action drain = () => Assert.True(bridge.TransitionChildDomain(parent, PlatformChildDomainTransition.BeginDrain).IsSuccess);
+        Action drain = () =>
+        {
+            var transition = bridge.TransitionChildDomain(parent, PlatformChildDomainTransition.BeginDrain);
+            Assert.Equal(!during, transition.IsSuccess);
+            if (during)
+            {
+                var routes = (global::System.Collections.IDictionary)ArtifactField(bridge, "_childBindings");
+                routes[parent.BindingId]!.GetType().GetProperty("State")!.SetValue(routes[parent.BindingId], PlatformChildDomainState.Draining);
+            }
+        };
         if (during) provider.AfterGuestMap = drain; else drain();
         Assert.False(bridge.MapChildGuestRegion(child, mapping, new(0, 4096), PlatformGuestMemoryAccess.Read).IsSuccess);
         Assert.Equal(during ? 1 : 0, provider.GuestMapCalls);
@@ -4245,7 +4392,7 @@ public sealed class Phase8ResidualVirtualizationTests
             if (fault == 5) Assert.True(bridge.ObserveBackendReset().IsSuccess);
         };
         Assert.False(bridge.CreateNestedChildDomain(parent, subject.Process, intent).IsSuccess);
-        Assert.True(pinBeforeCallback);
+        Assert.False(pinBeforeCallback);
         Assert.Same(original, Assert.Single(children.Values.Cast<object>()));
         Assert.True((bool)original.GetType().GetProperty("NestedCreateMayHaveEffect")!.GetValue(original)!);
         Assert.Equal(0, original.GetType().GetProperty("PendingChildEffects")!.GetValue(original));
@@ -4253,7 +4400,7 @@ public sealed class Phase8ResidualVirtualizationTests
         Assert.Equal(parent, fact.GetType().GetProperty("Parent")!.GetValue(fact));
         Assert.Equal(epoch, fact.GetType().GetProperty("AdmissionEpoch")!.GetValue(fact));
         Assert.Equal(new PlatformNestedDomainRequest((PlatformProviderChildDomainLease)original.GetType().GetProperty("ProviderLease")!.GetValue(original)!, intent), fact.GetType().GetProperty("Request")!.GetValue(fact));
-        Assert.Equal(fault is 0 or 5, fact.GetType().GetProperty("ReturnedClosureReceipt")!.GetValue(fact) is not null);
+        Assert.Null(fact.GetType().GetProperty("ReturnedClosureReceipt")!.GetValue(fact));
         provider.BeforeChildClose = null;
         Assert.False(bridge.CloseChildDomain(parent).IsSuccess);
         var roots = (global::System.Collections.IDictionary)ArtifactField(bridge, "_domains");
@@ -4262,7 +4409,7 @@ public sealed class Phase8ResidualVirtualizationTests
         Assert.Equal(KernelError.PlatformBindingActive, bridge.RevokeDomain(retained, subject).Error);
         Assert.Equal(KernelError.PlatformBindingActive, bridge.RevokeDomain(retained, subject).Error);
         Assert.Equal(1, provider.NestedCreateCalls);
-        Assert.Equal(1, provider.ChildCloseCalls);
+        Assert.Equal(0, provider.ChildCloseCalls);
     }
 
     [Theory]
@@ -4286,7 +4433,7 @@ public sealed class Phase8ResidualVirtualizationTests
         Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
         Assert.False(s.Kernel.QueryProcessTeardown(s.Owner).Value!.LocalReclaimCompleted);
         Assert.Equal(RegionState.Owned, Assert.Single(s.Kernel.Regions.Snapshot(), x => x.Handle == region.Handle).State);
-        Assert.Equal(1, s.Provider.ChildCloseCalls);
+        Assert.Equal(0, s.Provider.ChildCloseCalls);
         var children = (global::System.Collections.IDictionary)ArtifactField(s.Kernel.PlatformAuthority, "_childBindings");
         var original = Assert.Single(children.Values.Cast<object>());
         Assert.True((bool)original.GetType().GetProperty("NestedCreateMayHaveEffect")!.GetValue(original)!);
@@ -4511,7 +4658,7 @@ public sealed class Phase8ResidualVirtualizationTests
 
     [Theory]
     [InlineData(false)] [InlineData(true)]
-    public void NestedSourceGetterAncestorDrainRefusesEffectOrPublicationAndPreservesKnownCleanup(bool late)
+    public void NestedSourceGetterAncestorDrainRefusesWhileLineageIsHeld(bool late)
     {
         var s = CreateScenario();
         var bridge = s.Kernel.PlatformAuthority;
@@ -4524,19 +4671,19 @@ public sealed class Phase8ResidualVirtualizationTests
         {
             s.Provider.BeforeIncarnationRead = null;
             Assert.False(global::System.Threading.Monitor.IsEntered(ArtifactField(bridge, "_secureDomainLifecycleGate")));
-            Assert.True(bridge.TransitionChildDomain(ancestor, PlatformChildDomainTransition.BeginDrain).IsSuccess);
+            Assert.Equal(KernelError.PlatformBindingActive, bridge.TransitionChildDomain(ancestor, PlatformChildDomainTransition.BeginDrain).Error);
         };
         if (late) s.Provider.AfterNestedMaterialize = install; else install();
         PlatformChildBinding? cleanup = null;
-        Assert.False(bridge.CreateNestedChildDomain(parent, subject.Process, intent,
+        Assert.True(bridge.CreateNestedChildDomain(parent, subject.Process, intent,
             cleanupConsumer: binding =>
             {
                 cleanup = binding;
                 Assert.False(bridge.TransitionChildDomain(binding, PlatformChildDomainTransition.Start).IsSuccess);
             }).IsSuccess);
         s.Provider.AfterNestedMaterialize = null;
-        Assert.Equal(late ? 2 : 1, s.Provider.NestedCreateCalls);
-        Assert.Equal(late, cleanup.HasValue);
+        Assert.Equal(2, s.Provider.NestedCreateCalls);
+        Assert.True(cleanup.HasValue);
         if (cleanup.HasValue)
         {
             Assert.True(bridge.TransitionChildDomain(cleanup.Value, PlatformChildDomainTransition.BeginDrain).IsSuccess);
@@ -4544,6 +4691,7 @@ public sealed class Phase8ResidualVirtualizationTests
         }
         Assert.True(bridge.TransitionChildDomain(parent, PlatformChildDomainTransition.BeginDrain).IsSuccess);
         Assert.True(bridge.CloseChildDomain(parent).IsSuccess);
+        Assert.True(bridge.TransitionChildDomain(ancestor, PlatformChildDomainTransition.BeginDrain).IsSuccess);
         Assert.True(bridge.CloseChildDomain(ancestor).IsSuccess);
         Assert.True(bridge.RevokeDomain(root, subject).IsSuccess);
     }
@@ -4746,7 +4894,7 @@ public sealed class Phase8ResidualVirtualizationTests
             region.Handle, new(0, 4096), GuestMemoryAccess.Read).IsSuccess);
         s.Provider.BeforeGuestUnmap = null;
         Assert.Equal(1, s.Provider.GuestMapCalls);
-        Assert.Equal(1, s.Provider.GuestUnmapCalls);
+        Assert.Equal(0, s.Provider.GuestUnmapCalls);
         var mappings = (global::System.Collections.IDictionary)ArtifactField(s.Kernel.PlatformAuthority, "_mappings");
         var parent = Assert.Single(mappings.Values.Cast<object>());
         var fact = Assert.Single(((global::System.Collections.IEnumerable)parent.GetType().GetProperty("UnpublishedGuestMaps")!.GetValue(parent)!).Cast<object>());
@@ -4754,7 +4902,7 @@ public sealed class Phase8ResidualVirtualizationTests
         Assert.Equal(parent.GetType().GetProperty("Mapping")!.GetValue(parent), fact.GetType().GetProperty("ParentMapping")!.GetValue(fact));
         Assert.Equal(s.Provider.LastGuestRequest, fact.GetType().GetProperty("Request")!.GetValue(fact));
         Assert.Equal(s.Provider.LastGuestLease, fact.GetType().GetProperty("Receipt")!.GetValue(fact));
-        Assert.Equal(fault is not (1 or 2), fact.GetType().GetProperty("ReturnedClosureReceipt")!.GetValue(fact) is not null);
+        Assert.Null(fact.GetType().GetProperty("ReturnedClosureReceipt")!.GetValue(fact));
         Assert.Equal(0, parent.GetType().GetProperty("PendingGuestMaps")!.GetValue(parent));
         Assert.Equal(VirtualDomainState.Quarantined, local.State);
         Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
@@ -4763,7 +4911,7 @@ public sealed class Phase8ResidualVirtualizationTests
         Assert.Equal(RegionState.Owned, Assert.Single(s.Kernel.Regions.Snapshot(), x => x.Handle == region.Handle).State);
         Assert.Equal(0, s.Provider.ChildCloseCalls);
         Assert.DoesNotContain("mapping-close", s.Provider.CallLog);
-        Assert.Equal(1, s.Provider.GuestUnmapCalls);
+        Assert.Equal(0, s.Provider.GuestUnmapCalls);
     }
 
     [Theory]
@@ -4978,6 +5126,7 @@ public sealed class Phase8ResidualVirtualizationTests
         public int NestedCreateCalls { get; private set; }
         public bool ThrowAfterNestedMaterialize { get; set; }
         public Action? AfterNestedMaterialize { get; set; }
+        public Func<PlatformProviderNestedDomainLease, PlatformProviderNestedDomainLease>? NestedReceiptMutation { get; set; }
         public PlatformAuthorityStatus? NestedReplyStatus { get; set; }
         public Action? BeforeChildTransition { get; set; }
         public PlatformAuthorityStatus? ChildTransitionStatus { get; set; }
@@ -5090,9 +5239,10 @@ public sealed class Phase8ResidualVirtualizationTests
                 return PlatformAuthorityResult<PlatformProviderNestedDomainLease>.Fail(replyStatus, "Failed original nested reply after materialization.");
             if (ThrowAfterNestedMaterialize)
                 throw new InvalidOperationException("Nested child materialized without receipt.");
-            return PlatformAuthorityResult<PlatformProviderNestedDomainLease>.Ok(new(returnedLease,
+            var receipt = new PlatformProviderNestedDomainLease(returnedLease,
                 _wrongNestedImmediateParent ? new PlatformProviderChildDomainLeaseId(999) : request.ParentChildLease.LeaseId,
-                request.ParentChildLease.Generation));
+                request.ParentChildLease.Generation);
+            return PlatformAuthorityResult<PlatformProviderNestedDomainLease>.Ok(NestedReceiptMutation is null ? receipt : NestedReceiptMutation(receipt));
         }
 
         public PlatformAuthorityResult TransitionChildDomain(PlatformProviderChildDomainLease lease,

@@ -11,7 +11,7 @@ public sealed class HybridCpuOwnedRegionMappingTests
     {
         var runtime = new NeutralDomainRuntimeFacade();
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
-        var domain = provider.BindDomain(new(new DomainId(48), new ProcessHandle(new ProcessId(480), 1))).Value!;
+        var domain = provider.BindDomain(new PlatformDomainIdentity(new DomainId(48), new ProcessHandle(new ProcessId(480), 1))).Value!;
         PlatformRegionRevocationTicket Close(ulong id)
         {
             var region = new PlatformRegionIdentity(new(new(id), new(1)), new(domain.Subject.DomainId, domain.Subject.ProcessGeneration), 4096);
@@ -82,7 +82,7 @@ public sealed class HybridCpuOwnedRegionMappingTests
     {
         var runtime = new NeutralDomainRuntimeFacade();
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
-        var domain = provider.BindDomain(new(new DomainId(47), new ProcessHandle(new ProcessId(470), 1))).Value!;
+        var domain = provider.BindDomain(new PlatformDomainIdentity(new DomainId(47), new ProcessHandle(new ProcessId(470), 1))).Value!;
         var mappings = Enumerable.Range(1, 33).Select(id => provider.MapOwnedRegionSlice(domain,
             new(new(new(new((ulong)id), new(1)), new(domain.Subject.DomainId, domain.Subject.ProcessGeneration), 4096),
                 0, 4096, PlatformMemoryAccess.Read)).Value!).ToArray();
@@ -112,7 +112,7 @@ public sealed class HybridCpuOwnedRegionMappingTests
     {
         var runtime = new NeutralDomainRuntimeFacade();
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
-        var domain = provider.BindDomain(new(new DomainId(45), new ProcessHandle(new ProcessId(450), 1))).Value!;
+        var domain = provider.BindDomain(new PlatformDomainIdentity(new DomainId(45), new ProcessHandle(new ProcessId(450), 1))).Value!;
         var region = new PlatformRegionIdentity(new(new(45), new(1)), new(domain.Subject.DomainId, domain.Subject.ProcessGeneration), 4096);
         var mapped = provider.MapOwnedRegionSlice(domain, new(region, 0, 4096, PlatformMemoryAccess.Read)).Value!;
         var ticket = provider.BeginRegionMappingRevocation(mapped.Lease, PlatformRegionRevocationPolicy.DrainBeforeRevoke).Value!;
@@ -139,7 +139,7 @@ public sealed class HybridCpuOwnedRegionMappingTests
             ChildClosureTupleTests.RootCloseRuntimeProxy>();
         var proxy = (ChildClosureTupleTests.RootCloseRuntimeProxy)(object)runtime;
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
-        var domain = provider.BindDomain(new(new DomainId(43), new ProcessHandle(new ProcessId(430), 1))).Value!;
+        var domain = provider.BindDomain(new PlatformDomainIdentity(new DomainId(43), new ProcessHandle(new ProcessId(430), 1))).Value!;
         var region = new PlatformRegionIdentity(new(new(43), new(1)), new(domain.Subject.DomainId, domain.Subject.ProcessGeneration), 4096);
         var mapped = provider.MapOwnedRegionSlice(domain, new(region, 0, 4096, PlatformMemoryAccess.Read)).Value!;
         var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
@@ -172,7 +172,7 @@ public sealed class HybridCpuOwnedRegionMappingTests
             ChildClosureTupleTests.RootCloseRuntimeProxy>();
         var proxy = (ChildClosureTupleTests.RootCloseRuntimeProxy)(object)runtime;
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
-        var domain = provider.BindDomain(new(new DomainId(44), new ProcessHandle(new ProcessId(440), 1))).Value!;
+        var domain = provider.BindDomain(new PlatformDomainIdentity(new DomainId(44), new ProcessHandle(new ProcessId(440), 1))).Value!;
         var region = new PlatformRegionIdentity(new(new(44), new(1)), new(domain.Subject.DomainId, domain.Subject.ProcessGeneration), 4096);
         var mapped = provider.MapOwnedRegionSlice(domain, new(region, 0, 4096, PlatformMemoryAccess.Read)).Value!;
         Assert.True(provider.RevokeRegionMapping(mapped.Lease, PlatformRegionRevocationPolicy.DrainBeforeRevoke).IsSuccess);

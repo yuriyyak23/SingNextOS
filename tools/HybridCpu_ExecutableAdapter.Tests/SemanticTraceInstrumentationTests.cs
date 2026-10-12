@@ -49,14 +49,18 @@ public sealed class SemanticTraceInstrumentationTests
         injector.BeforeCloseForTest = null;
         Assert.True(replaced);
         Assert.Equal(1, injector.CloseCalls);
-        var retained = owners[lease.Handle]!;
+        var foreign = owners[lease.Handle]!;
+        Assert.Null(foreign.GetType().GetProperty("CloseReceipt")!.GetValue(foreign));
+        Assert.NotEqual(NeutralVirtualizationStatus.Success, adapter.CloseChildDomain(lease).Status);
+        owners[lease.Handle] = original;
+        var retained = original;
         var receiptProperty = retained.GetType().GetProperty("CloseReceipt")!;
         var receipt = receiptProperty.GetValue(retained);
         Assert.True((bool)retained.GetType().GetProperty("CloseMayHaveEffect")!.GetValue(retained)!);
         Assert.Equal(NeutralChildDomainState.Faulted, retained.GetType().GetProperty("State")!.GetValue(retained));
         Assert.Empty(((System.Collections.IEnumerable)typeof(HybridCpuExecutableChildAdapter)
             .GetField("pendingChildCloses", flags)!.GetValue(adapter)!).Cast<object>());
-        if (fault == "exact")
+        if (fault is "exact" or "tuple")
         {
             var exact = Assert.IsType<ExternalChildDomainCloseReceipt>(receipt);
             Assert.True(exact.IsTerminal);
@@ -143,7 +147,11 @@ public sealed class SemanticTraceInstrumentationTests
         injector.BeforeUnmapForTest = null;
         Assert.True(replaced);
         Assert.Equal(1, injector.UnmapCalls);
-        var retained = owners[lease.Handle]!;
+        var foreign = owners[lease.Handle]!;
+        Assert.Null(foreign.GetType().GetProperty("ClosureReceipt")!.GetValue(foreign));
+        Assert.NotEqual(NeutralVirtualizationStatus.Success, adapter.UnmapGuestRegion(lease).Status);
+        owners[lease.Handle] = original;
+        var retained = original;
         var receiptProperty = retained.GetType().GetProperty("ClosureReceipt")!;
         var receipt = receiptProperty.GetValue(retained);
         Assert.True((bool)retained.GetType().GetProperty("ClosureMayHaveEffect")!.GetValue(retained)!);
@@ -151,7 +159,7 @@ public sealed class SemanticTraceInstrumentationTests
             .GetField("pendingGuestUnmaps", flags)!.GetValue(adapter)!).Cast<object>());
         Assert.Equal(NeutralVirtualizationStatus.Ambiguous,
             adapter.TransitionChildDomain(child, NeutralChildDomainTransition.BeginDrain).Status);
-        if (fault == "exact")
+        if (fault is "exact" or "tuple")
         {
             var exact = Assert.IsType<ExternalGuestMemoryUnmapReceipt>(receipt);
             Assert.True(exact.IsTerminal);
@@ -354,10 +362,8 @@ public sealed class SemanticTraceInstrumentationTests
         var owners = (System.Collections.IDictionary)typeof(HybridCpuExecutableChildAdapter)
             .GetField("children", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(adapter)!;
         var original = owners[lease.Handle]!;
-        var replacement = original.GetType().GetMethod("<Clone>$")!.Invoke(original, null)!;
-        replacement.GetType().GetProperty("GuestMapMayHaveEffect")!.SetValue(replacement, true);
-        replacement.GetType().GetProperty("State")!.SetValue(replacement, NeutralChildDomainState.Faulted);
-        owners[lease.Handle] = replacement;
+        original.GetType().GetProperty("GuestMapMayHaveEffect")!.SetValue(original, true);
+        original.GetType().GetProperty("State")!.SetValue(original, NeutralChildDomainState.Faulted);
     }
 
     private static void InjectDrainingOwnerReplacement(HybridCpuExecutableChildAdapter adapter, NeutralChildDomainLease lease)
@@ -365,9 +371,7 @@ public sealed class SemanticTraceInstrumentationTests
         var owners = (System.Collections.IDictionary)typeof(HybridCpuExecutableChildAdapter)
             .GetField("children", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(adapter)!;
         var original = owners[lease.Handle]!;
-        var replacement = original.GetType().GetMethod("<Clone>$")!.Invoke(original, null)!;
-        replacement.GetType().GetProperty("State")!.SetValue(replacement, NeutralChildDomainState.Draining);
-        owners[lease.Handle] = replacement;
+        original.GetType().GetProperty("State")!.SetValue(original, NeutralChildDomainState.Draining);
     }
 
     [Theory]
@@ -458,7 +462,7 @@ public sealed class SemanticTraceInstrumentationTests
         {
             Assert.True(reserved); Assert.Equal(NeutralVirtualizationStatus.Denied, nested);
             if (unmap) Assert.Empty(owners);
-            else Assert.NotSame(original, owners.Values.Cast<object>().Single());
+            else Assert.Same(original, owners.Values.Cast<object>().Single());
         }
         else
         {

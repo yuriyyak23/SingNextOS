@@ -19,22 +19,44 @@ public sealed record CxlMemoryPlacementSnapshot(
 /// <summary>Tracks Type-3 backing while the application retains ordinary region ownership.</summary>
 public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant, ISecureGuestBackingAuthority
 {
-    private sealed class Record(CxlMemoryPlacementSnapshot snapshot, RegionOwner owner, RegionBackingLeaseHandle backingLease,
-        CxlEndpointSnapshot endpoint, CxlFabricBinding fabric, CxlMemoryBinding memory)
+    private sealed class Record
     {
-        public CxlMemoryPlacementSnapshot Snapshot { get; set; } = snapshot;
-        public RegionOwner Owner { get; } = owner;
-        public RegionBackingLeaseHandle BackingLease { get; } = backingLease;
-        public CxlEndpointSnapshot Endpoint { get; } = endpoint;
-        public CxlFabricBinding Fabric { get; } = fabric;
-        public CxlMemoryBinding Memory { get; } = memory;
+        public Record(CxlMemoryPlacementSnapshot snapshot, RegionOwner owner, RegionBackingLeaseHandle backingLease,
+            CxlEndpointSnapshot endpoint, CxlFabricBinding fabric, CxlMemoryBinding memory, CxlAuthorityBridge.BackingCleanupSources cleanup)
+        { OwnerSelf = this; OriginalId = snapshot.PlacementId; OriginalRegion = snapshot.Region; Snapshot = snapshot;
+          Owner = owner; BackingLease = backingLease; Endpoint = endpoint; Fabric = fabric; Memory = memory; CleanupSources = cleanup; }
+        public Record OwnerSelf { get; }
+        public CxlMemoryPlacementId OriginalId { get; }
+        public RegionHandle OriginalRegion { get; }
+        private CxlMemoryPlacementSnapshot _snapshot = null!;
+        public CxlMemoryPlacementSnapshot Snapshot
+        {
+            get => _snapshot;
+            set { if (CloseInFlight) ClosureSourceChanged = true;
+                if (SourceRevision == ulong.MaxValue) RevisionExhausted = true; else SourceRevision++;
+                _snapshot = value; }
+        }
+        public ulong SourceRevision { get; private set; }
+        public bool RevisionExhausted { get; private set; }
+        public bool ClosureSourceChanged { get; set; }
+        public bool ClosureConsumed { get; set; }
+        public RegionOwner Owner { get; }
+        public RegionBackingLeaseHandle BackingLease { get; }
+        public CxlEndpointSnapshot Endpoint { get; }
+        public CxlFabricBinding Fabric { get; }
+        public CxlMemoryBinding Memory { get; }
+        public CxlAuthorityBridge.BackingCleanupSources CleanupSources { get; }
+        public bool CreationInFlight { get; set; } = true;
         public bool CloseInFlight { get; set; }
-        // Exact successful step results consumed by this existing lifecycle owner.
-        // Absence, failure and exception never populate these closure facts.
         public CxlMemoryBinding? ClosedMemory { get; set; }
         public CxlFabricBinding? ClosedFabric { get; set; }
     }
-
+    private readonly List<Record> _placementOwners = new();
+    private bool IsOriginalPlacement(Record record) => ReferenceEquals(record.OwnerSelf, record) &&
+        _placementOwners.Any(owner => ReferenceEquals(owner, record)) &&
+        _placements.TryGetValue(record.OriginalId, out var routed) && ReferenceEquals(routed, record) &&
+        record.Snapshot.PlacementId == record.OriginalId && record.Snapshot.Region == record.OriginalRegion;
+    private static bool HasCompletedPlacement(Record record) => ReferenceEquals(record.OwnerSelf, record) && record.ClosureConsumed;
     private readonly RegionAuthority _regions;
     private readonly RuntimeKernel _kernel;
     private readonly CxlAuthorityBridge _bridge;
@@ -124,6 +146,20 @@ public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant, ISecureGu
         }
         var snapshot = new CxlMemoryPlacementSnapshot(id, region, endpoint.EndpointId, endpoint.DeviceGeneration,
             fabric.Value!.Generation, memory.Value!.BindingId, memory.Value.Generation, persistence, CxlMemoryPlacementState.Active);
+        var cleanup = _bridge.CaptureBackingCleanupSources(memory.Value!, fabric.Value!);
+        if (!cleanup.IsSuccess) return KernelResult<CxlMemoryPlacementSnapshot>.Fail(KernelError.ExternalEffectUncontained,
+            "Known backing remains pinned without original cleanup sources.");
+        var record = new Record(snapshot with { State = CxlMemoryPlacementState.Quarantined }, owner,
+            backing.Handle, endpoint, fabric.Value!, memory.Value!, cleanup.Value);
+        CxlMemoryPlacementSnapshot staged;
+        ulong stagedRevision;
+        lock (_gate)
+        {
+            _placementOwners.EnsureCapacity(_placementOwners.Count + 1);
+            _placementOwners.Add(record);
+            _placements.Add(id, record);
+            staged = record.Snapshot; stagedRevision = record.SourceRevision;
+        }
         KernelResult published;
         try
         {
@@ -138,8 +174,13 @@ public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant, ISecureGu
             published = !source.IsSuccess ? KernelResult.Fail(source.Error, source.Message!) : source.Value!(() =>
             {
                 lock (_gate)
-                    _placements.Add(id, new(snapshot, owner, backing.Handle, endpoint, fabric.Value, memory.Value));
-                return KernelResult.Ok();
+                {
+                    if (!IsOriginalPlacement(record) || record.RevisionExhausted || record.SourceRevision != stagedRevision ||
+                        !ReferenceEquals(record.Snapshot, staged) || record.CloseInFlight || record.ClosureConsumed)
+                        return KernelResult.Fail(KernelError.StaleGeneration, "Original placement changed before publication.");
+                    record.Snapshot = snapshot;
+                    return KernelResult.Ok();
+                }
             });
         }
         catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
@@ -147,11 +188,10 @@ public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant, ISecureGu
             published = KernelResult.Fail(KernelError.ExternalEffectUncontained,
                 $"Placement source observation failed after a known memory receipt: {exception.Message}");
         }
+        finally { lock (_gate) record.CreationInFlight = false; }
         if (!published.IsSuccess)
         {
-            lock (_gate)
-                _placements.Add(id, new(snapshot with { State = CxlMemoryPlacementState.Quarantined },
-                    owner, backing.Handle, endpoint, fabric.Value, memory.Value));
+            lock (_gate) if (!record.ClosureConsumed) record.Snapshot = record.Snapshot with { State = CxlMemoryPlacementState.Quarantined };
             return KernelResult<CxlMemoryPlacementSnapshot>.Fail(KernelError.ExternalEffectUncontained,
                 "Late placement receipt is retained for closure; changed source cannot publish Active placement.");
         }
@@ -160,23 +200,25 @@ public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant, ISecureGu
 
     internal Action<CxlMemoryBinding>? AfterPlacementReceipt { get; set; }
     internal Action? BeforePlacementPublication { get; set; }
+    internal Action? BeforePlacementClosureLocalCommit { get; set; }
 
     public KernelResult<CxlMemoryPlacementSnapshot> Refresh(CxlMemoryPlacementId placementId)
     {
         Record record;
         CxlMemoryPlacementSnapshot admitted;
+        ulong admittedRevision;
         lock (_gate)
         {
-            if (!_placements.TryGetValue(placementId, out record!))
+            if (!_placements.TryGetValue(placementId, out record!) || !IsOriginalPlacement(record))
                 return KernelResult<CxlMemoryPlacementSnapshot>.Fail(KernelError.PlatformBindingNotFound, "Type-3 placement does not exist.");
-            admitted = record.Snapshot;
+            admitted = record.Snapshot; admittedRevision = record.SourceRevision;
             if (admitted.State != CxlMemoryPlacementState.Active)
                 return KernelResult<CxlMemoryPlacementSnapshot>.Ok(admitted);
         }
         var validation = _bridge.RevalidateBacking(record.Owner, record.BackingLease, record.Endpoint, record.Fabric, record.Memory);
         lock (_gate)
         {
-            if (!ReferenceEquals(record.Snapshot, admitted))
+            if (!IsOriginalPlacement(record) || record.RevisionExhausted || record.SourceRevision != admittedRevision || !ReferenceEquals(record.Snapshot, admitted))
                 return KernelResult<CxlMemoryPlacementSnapshot>.Fail(KernelError.StaleGeneration,
                     "Type-3 placement changed during refresh.");
             if (!validation.IsSuccess)
@@ -191,7 +233,7 @@ public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant, ISecureGu
     public KernelResult<CxlMemoryPlacementSnapshot> Query(CxlMemoryPlacementId placementId)
     {
         lock (_gate)
-            return _placements.TryGetValue(placementId, out var record)
+            return _placements.TryGetValue(placementId, out var record) && IsOriginalPlacement(record)
                 ? KernelResult<CxlMemoryPlacementSnapshot>.Ok(record.Snapshot)
                 : KernelResult<CxlMemoryPlacementSnapshot>.Fail(KernelError.PlatformBindingNotFound, "Type-3 placement does not exist.");
     }
@@ -206,9 +248,10 @@ public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant, ISecureGu
         ArgumentNullException.ThrowIfNull(provider);
         Record record;
         CxlMemoryPlacementSnapshot admittedPlacement;
+        ulong admittedRevision;
         lock (_gate)
         {
-            if (!_placements.TryGetValue(placementId, out record!))
+            if (!_placements.TryGetValue(placementId, out record!) || !IsOriginalPlacement(record))
                 return KernelResult<RegionDamageDescriptorV1>.Fail(KernelError.PlatformBindingNotFound,
                     "Type-3 placement does not exist.");
             if (record.Owner != owner)
@@ -217,13 +260,13 @@ public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant, ISecureGu
             if (record.Snapshot.State != CxlMemoryPlacementState.Active)
                 return KernelResult<RegionDamageDescriptorV1>.Fail(KernelError.InvalidTransition,
                     "Only an active Type-3 placement can accept new health evidence.");
-            admittedPlacement = record.Snapshot;
+            admittedPlacement = record.Snapshot; admittedRevision = record.SourceRevision;
         }
         var live = _bridge.RevalidateBacking(record.Owner, record.BackingLease,
             record.Endpoint, record.Fabric, record.Memory);
         lock (_gate)
         {
-            if (!ReferenceEquals(record.Snapshot, admittedPlacement))
+            if (!IsOriginalPlacement(record) || record.RevisionExhausted || record.SourceRevision != admittedRevision || !ReferenceEquals(record.Snapshot, admittedPlacement))
                 return KernelResult<RegionDamageDescriptorV1>.Fail(KernelError.StaleGeneration,
                     "Type-3 placement changed during initial backing revalidation.");
             if (!live.IsSuccess)
@@ -249,7 +292,7 @@ public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant, ISecureGu
             return KernelResult<RegionDamageDescriptorV1>.Fail(MapHealthStatus(observed.Status),
                 observed.Message ?? "Type-3 health observation failed.");
         lock (_gate)
-            if (!ReferenceEquals(record.Snapshot, admittedPlacement))
+            if (!IsOriginalPlacement(record) || record.RevisionExhausted || record.SourceRevision != admittedRevision || !ReferenceEquals(record.Snapshot, admittedPlacement))
                 return KernelResult<RegionDamageDescriptorV1>.Fail(KernelError.StaleGeneration,
                     "Type-3 placement changed during health observation; fresh admission is required.");
         var observation = observed.Value;
@@ -272,7 +315,7 @@ public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant, ISecureGu
         {
           lock (_gate)
           {
-            if (!ReferenceEquals(record.Snapshot, admittedPlacement))
+            if (!IsOriginalPlacement(record) || record.RevisionExhausted || record.SourceRevision != admittedRevision || !ReferenceEquals(record.Snapshot, admittedPlacement))
                 return KernelResult.Fail(KernelError.StaleGeneration,
                     "Type-3 placement changed during final backing revalidation.");
             if (!finalBacking.IsSuccess)
@@ -294,11 +337,18 @@ public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant, ISecureGu
     public KernelResult Close(CxlMemoryPlacementId placementId)
     {
         Record record;
+        ulong closingRevision;
         lock (_gate)
         {
-            if (!_placements.TryGetValue(placementId, out record!)) return KernelResult.Ok();
-            if (record.Snapshot.State == CxlMemoryPlacementState.Released) return KernelResult.Ok();
-            if (record.CloseInFlight)
+            if (!_placements.TryGetValue(placementId, out record!) || !IsOriginalPlacement(record))
+            {
+                var completed = _placementOwners.SingleOrDefault(owner => owner.OriginalId == placementId && HasCompletedPlacement(owner));
+                return completed is not null ? KernelResult.Ok() : KernelResult.Fail(KernelError.StaleGeneration, "Original placement route is unavailable.");
+            }
+            if (HasCompletedPlacement(record)) return KernelResult.Ok();
+            if (record.Snapshot.State == CxlMemoryPlacementState.Released)
+                return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Released placement projection lacks original consumption.");
+            if (record.CreationInFlight || record.CloseInFlight)
                 return KernelResult.Fail(KernelError.PlatformBindingDraining,
                     "Type-3 closure is already in flight.");
             // A Type-3 lease backs the existing guest mapping. Do not drop it while
@@ -308,6 +358,8 @@ public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant, ISecureGu
             var admission = _regions.BeginBackingClosure(record.BackingLease, record.Owner);
             if (!admission.IsSuccess) return admission;
             record.Snapshot = record.Snapshot with { State = CxlMemoryPlacementState.Draining };
+            closingRevision = record.SourceRevision;
+            record.ClosureSourceChanged = false;
             record.CloseInFlight = true;
         }
         var closed = false;
@@ -315,10 +367,16 @@ public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant, ISecureGu
         {
             CxlMemoryBinding? closedMemory;
             CxlFabricBinding? closedFabric;
+            closedMemory = _bridge.ConsumedOriginalMemoryClosure(record.CleanupSources);
+            closedFabric = _bridge.ConsumedOriginalFabricClosure(record.CleanupSources);
             lock (_gate)
             {
-                closedMemory = record.ClosedMemory;
-                closedFabric = record.ClosedFabric;
+                if (!IsOriginalPlacement(record)) return KernelResult.Fail(KernelError.StaleGeneration, "Placement changed before closure.");
+                if (record.ClosedMemory is not null && record.ClosedMemory != closedMemory ||
+                    record.ClosedFabric is not null && record.ClosedFabric != closedFabric)
+                    return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Local closure projection lacks original backing consumption.");
+                if (closedMemory is not null) record.ClosedMemory = closedMemory;
+                if (closedFabric is not null) record.ClosedFabric = closedFabric;
             }
             if (closedMemory is null)
             {
@@ -327,6 +385,8 @@ public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant, ISecureGu
                     ? currentMemory.Value : record.Memory;
                 var memory = _bridge.ReleaseMemory(exactMemory);
                 if (!memory.IsSuccess) return memory;
+                var consumedMemory = _bridge.ConsumedOriginalMemoryClosure(record.CleanupSources);
+                if (consumedMemory != exactMemory) return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Original memory closure was not consumed.");
                 lock (_gate) record.ClosedMemory = exactMemory;
             }
             if (closedFabric is null)
@@ -336,12 +396,20 @@ public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant, ISecureGu
                     ? currentFabric.Value : record.Fabric;
                 var fabric = _bridge.ReleaseFabric(exactFabric);
                 if (!fabric.IsSuccess) return fabric;
+                var consumedFabric = _bridge.ConsumedOriginalFabricClosure(record.CleanupSources);
+                if (consumedFabric != exactFabric) return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Original fabric closure was not consumed.");
                 lock (_gate) record.ClosedFabric = exactFabric;
             }
-            var backing = _regions.ReleaseBacking(record.BackingLease, record.Owner);
-            if (!backing.IsSuccess) return backing;
+            BeforePlacementClosureLocalCommit?.Invoke();
             lock (_gate)
+            {
+                if (!IsOriginalPlacement(record) || record.SourceRevision != closingRevision || record.ClosureSourceChanged)
+                    return KernelResult.Fail(KernelError.StaleGeneration, "Original placement changed before local backing consumption.");
+                var backing = _regions.ReleaseBacking(record.BackingLease, record.Owner);
+                if (!backing.IsSuccess) return backing;
+                record.ClosureConsumed = true;
                 record.Snapshot = record.Snapshot with { State = CxlMemoryPlacementState.Released };
+            }
             closed = true;
             return KernelResult.Ok();
         }
@@ -354,7 +422,7 @@ public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant, ISecureGu
         {
             lock (_gate)
             {
-                if (!closed)
+                if (!closed && !record.ClosureConsumed)
                     record.Snapshot = record.Snapshot with { State = CxlMemoryPlacementState.Quarantined };
                 record.CloseInFlight = false;
             }
@@ -365,8 +433,8 @@ public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant, ISecureGu
     {
         CxlMemoryPlacementId[] placements;
         lock (_gate)
-            placements = _placements.Values.Where(item => item.Owner == owner && item.Snapshot.State != CxlMemoryPlacementState.Released)
-                .Select(item => item.Snapshot.PlacementId).ToArray();
+            placements = _placementOwners.Where(item => item.Owner == owner && !HasCompletedPlacement(item))
+                .Select(item => item.OriginalId).ToArray();
         foreach (var placement in placements)
         {
             var closed = Close(placement);
@@ -379,8 +447,8 @@ public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant, ISecureGu
     {
         CxlMemoryPlacementId[] placements;
         lock (_gate)
-            placements = _placements.Values.Where(x => x.Owner == owner && x.Snapshot.Region == region)
-                .Select(item => item.Snapshot.PlacementId).ToArray();
+            placements = _placementOwners.Where(x => x.Owner == owner && x.OriginalRegion == region && !HasCompletedPlacement(x))
+                .Select(item => item.OriginalId).ToArray();
         foreach (var placement in placements)
         {
             var validation = Refresh(placement);
@@ -398,10 +466,12 @@ public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant, ISecureGu
         backing = null;
         Record[] records;
         CxlMemoryPlacementSnapshot[] snapshots;
+        ulong[] revisions;
         lock (_gate)
         {
-            records = _placements.Values.Where(x => x.Owner == owner && x.Snapshot.Region == region).ToArray();
+            records = _placementOwners.Where(x => x.Owner == owner && x.OriginalRegion == region && !HasCompletedPlacement(x)).ToArray();
             snapshots = records.Select(x => x.Snapshot).ToArray();
+            revisions = records.Select(x => x.SourceRevision).ToArray();
         }
         foreach (var record in records)
         {
@@ -421,9 +491,9 @@ public sealed class CxlType3MemoryAuthority : ICxlTeardownParticipant, ISecureGu
         {
             lock (_gate)
             {
-                var current = _placements.Values.Where(x => x.Owner == owner && x.Snapshot.Region == region).ToArray();
+                var current = _placementOwners.Where(x => x.Owner == owner && x.OriginalRegion == region && !HasCompletedPlacement(x)).ToArray();
                 if (!current.SequenceEqual(records) || records.Where((record, index) =>
-                    !ReferenceEquals(record.Snapshot, snapshots[index]) || record.CloseInFlight ||
+                    !IsOriginalPlacement(record) || record.RevisionExhausted || record.SourceRevision != revisions[index] || !ReferenceEquals(record.Snapshot, snapshots[index]) || record.CreationInFlight || record.CloseInFlight ||
                     record.Snapshot.State != CxlMemoryPlacementState.Active).Any())
                     return KernelResult.Fail(KernelError.StaleGeneration, "Exact Type-3 placement stopped or changed before secure guest commit.");
                 return commit(); // Trusted pure owner transition only; no provider callbacks.

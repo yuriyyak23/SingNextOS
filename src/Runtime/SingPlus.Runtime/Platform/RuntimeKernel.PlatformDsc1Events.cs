@@ -15,78 +15,93 @@ public sealed partial class RuntimeKernel
         PlatformDsc1CopySubmission submission,
         KernelEventEndpoint eventEndpoint)
     {
-        lock (_platformMemoryUseGate)
+        Action? notify = null;
+        Func<KernelResult>? rollbackOriginal = null;
+        bool localConsumed = false;
+        try
         {
-            var resolved = Processes.Resolve(subject);
-            if (!resolved.IsSuccess)
+            lock (_platformMemoryUseGate)
             {
-                return KernelResult<PlatformDsc1CopyReceipt>.Fail(
-                    resolved.Error,
-                    resolved.Message!);
-            }
+                var resolved = Processes.Resolve(subject);
+                if (!resolved.IsSuccess)
+                {
+                    return KernelResult<PlatformDsc1CopyReceipt>.Fail(
+                        resolved.Error,
+                        resolved.Message!);
+                }
 
-            if (resolved.Value!.State == ProcessState.Exiting)
-            {
-                return KernelResult<PlatformDsc1CopyReceipt>.Fail(
-                    KernelError.InvalidTransition,
-                    "An Exiting process cannot accept new DSC1 terminal-event delivery; use endpoint-free observation or cancellation to drain the operation.");
-            }
+                if (resolved.Value!.State == ProcessState.Exiting)
+                {
+                    return KernelResult<PlatformDsc1CopyReceipt>.Fail(
+                        KernelError.InvalidTransition,
+                        "An Exiting process cannot accept new DSC1 terminal-event delivery; use endpoint-free observation or cancellation to drain the operation.");
+                }
 
-            var endpointValidation = _kernelEvents.Validate(subject, eventEndpoint);
-            if (!endpointValidation.IsSuccess)
-            {
-                return KernelResult<PlatformDsc1CopyReceipt>.Fail(
-                    endpointValidation.Error,
-                    endpointValidation.Message!);
-            }
+                var endpointValidation = _kernelEvents.Validate(subject, eventEndpoint);
+                if (!endpointValidation.IsSuccess)
+                {
+                    return KernelResult<PlatformDsc1CopyReceipt>.Fail(
+                        endpointValidation.Error,
+                        endpointValidation.Message!);
+                }
 
-            // Reject stale, forged and cross-process continuations before reserving
-            // event capacity or reaching the provider.
-            var payload = ResolveDsc1Payload(subject, submission);
-            if (!payload.IsSuccess)
-            {
-                return KernelResult<PlatformDsc1CopyReceipt>.Fail(
-                    payload.Error,
-                    payload.Message!);
-            }
+                // Reject stale, forged and cross-process continuations before reserving
+                // event capacity or reaching the provider.
+                var payload = ResolveDsc1Payload(subject, submission);
+                if (!payload.IsSuccess)
+                {
+                    return KernelResult<PlatformDsc1CopyReceipt>.Fail(
+                        payload.Error,
+                        payload.Message!);
+                }
 
-            var staged = _kernelEvents.Stage(
-                subject,
-                eventEndpoint,
-                KernelEventClass.Completion,
-                Dsc1TerminalEventSource(submission));
-            if (!staged.IsSuccess)
-            {
-                return KernelResult<PlatformDsc1CopyReceipt>.Fail(
-                    staged.Error,
-                    staged.Message!);
-            }
+                var staged = _kernelEvents.Stage(
+                    subject,
+                    eventEndpoint,
+                    KernelEventClass.Completion,
+                    Dsc1TerminalEventSource(submission), out rollbackOriginal);
+                if (!staged.IsSuccess)
+                {
+                    return KernelResult<PlatformDsc1CopyReceipt>.Fail(
+                        staged.Error,
+                        staged.Message!);
+                }
 
-            // Finalization publishes Completed output (or settles Cancelled without
-            // output) and releases the exact reservations before a waiter can wake.
-            var terminal = ObservePlatformDsc1CopyLocked(subject, submission);
-            if (!terminal.IsSuccess)
-            {
-                var rollback = _kernelEvents.RollbackExact(subject, staged.Value!);
-                if (!rollback.IsSuccess)
+                // Finalization publishes Completed output (or settles Cancelled without
+                // output) and releases the exact reservations before a waiter can wake.
+                var terminal = ObservePlatformDsc1CopyLocked(subject, submission);
+                if (!terminal.IsSuccess)
+                {
+                    var rollback = rollbackOriginal!();
+                    localConsumed = rollback.IsSuccess;
+                    if (!rollback.IsSuccess)
+                    {
+                        return KernelResult<PlatformDsc1CopyReceipt>.Fail(
+                            KernelError.PlatformFaulted,
+                            "DSC1 terminal observation failed and the exact staged local event could not be rolled back.");
+                    }
+
+                    return terminal;
+                }
+
+                var committed = _kernelEvents.CommitExactDeferred(subject, staged.Value!, out notify);
+                localConsumed = committed.IsSuccess;
+                if (!committed.IsSuccess)
                 {
                     return KernelResult<PlatformDsc1CopyReceipt>.Fail(
                         KernelError.PlatformFaulted,
-                        "DSC1 terminal observation failed and the exact staged local event could not be rolled back.");
+                        "DSC1 terminal state was settled but the exact staged local event could not be committed.");
                 }
 
                 return terminal;
             }
-
-            var committed = _kernelEvents.CommitExact(subject, staged.Value!);
-            if (!committed.IsSuccess)
-            {
-                return KernelResult<PlatformDsc1CopyReceipt>.Fail(
-                    KernelError.PlatformFaulted,
-                    "DSC1 terminal state was settled but the exact staged local event could not be committed.");
-            }
-
-            return terminal;
+        }
+        finally
+        {
+            // This consumes only the exact local visibility reservation; it never
+            // grants completion, output publication or backing release authority.
+            if (!localConsumed) _ = rollbackOriginal?.Invoke();
+            notify?.Invoke();
         }
     }
 

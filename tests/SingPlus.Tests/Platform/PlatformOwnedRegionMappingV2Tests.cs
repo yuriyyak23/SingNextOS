@@ -8,6 +8,166 @@ namespace SingPlus.Tests.Platform;
 public sealed class PlatformOwnedRegionMappingV2Tests
 {
     [Theory]
+    [InlineData("exact")] [InlineData("source")] [InlineData("owner")]
+    [InlineData("denied")] [InlineData("faulted")] [InlineData("malformed")] [InlineData("next-throw")]
+    public void OriginalNoEffectBeginIsConsumedWithoutClosureOrQuantitativeRefund(string fault)
+    {
+        var provider = new ResolvingMappingProvider
+        {
+            BeginRefusalBeforeEffect = fault == "denied" ? PlatformAuthorityStatus.Denied :
+                fault == "faulted" ? PlatformAuthorityStatus.Faulted : PlatformAuthorityStatus.NotAccepted,
+            MalformedRefusalTicket = fault == "malformed"
+        };
+        BudgetAccountHandle budget = default;
+        var s = CreateMappedRegion(758, 1100, (kernel, owner) =>
+        {
+            var admin = TestFixtures.Create(kernel, 99, 999).Handle;
+            var cap = kernel.MintCapability(new DomainId(999), admin, ResourceKind.KernelService,
+                CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+            budget = kernel.AdmitProcessBudget(admin, cap, owner, "no-effect-begin",
+                [new(ServiceBudgetDimension.OwnedMemoryBytes, 1024), new(ServiceBudgetDimension.PinnedMappedMemoryBytes, 256)]).Value!.ProcessBudget;
+        }, provider);
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_mappings", flags)!.GetValue(s.Kernel.PlatformAuthority)!;
+        var original = routes[s.Mapping.Mapping.MappingId]!;
+        var gate = typeof(PlatformAuthorityBridge).GetField("_secureDomainLifecycleGate", flags)!.GetValue(s.Kernel.PlatformAuthority)!;
+        provider.BeforeBegin = () => provider.BeforeIncarnationRead = () =>
+        {
+            Assert.False(Monitor.IsEntered(gate));
+            Assert.NotNull(original.GetType().GetProperty("RevocationBeginObservation")!.GetValue(original));
+            Assert.False(s.Kernel.RevokePlatformRegionMapping(s.Owner, s.Mapping).IsSuccess);
+            if (fault == "owner") routes[s.Mapping.Mapping.MappingId] = typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+            if (fault == "source") provider.ThrowIncarnation = true;
+        };
+        Assert.False(s.Kernel.RevokePlatformRegionMapping(s.Owner, s.Mapping).IsSuccess);
+        Assert.Equal(1, provider.BeginCalls);
+        Assert.Equal(128UL, s.Kernel.QueryBudget(budget).Value!.Usage.Single(x => x.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used);
+        Assert.Equal(RegionState.Owned, s.Kernel.Regions.Snapshot().Single(r => r.Handle == s.Mapping.Region).State);
+        provider.BeforeBegin = null;
+        provider.BeforeIncarnationRead = null;
+        provider.ThrowIncarnation = false;
+        routes[s.Mapping.Mapping.MappingId] = original;
+        Assert.False(s.Kernel.ObservePlatformRegionMappingRevocation(s.Owner, s.Mapping.Mapping).IsSuccess);
+        Assert.Equal(1, provider.BeginCalls);
+        provider.BeginRefusalBeforeEffect = null;
+        provider.MalformedRefusalTicket = false;
+        if (fault == "next-throw")
+        {
+            provider.BeforeBegin = () => throw new IOException("Next original invocation outcome lost.");
+            Assert.False(s.Kernel.RevokePlatformRegionMapping(s.Owner, s.Mapping).IsSuccess);
+            provider.BeforeBegin = null;
+            Assert.False(s.Kernel.RevokePlatformRegionMapping(s.Owner, s.Mapping).IsSuccess);
+            Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+            Assert.Equal(2, provider.BeginCalls);
+            Assert.Equal(128UL, s.Kernel.QueryBudget(budget).Value!.Usage.Single(x => x.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used);
+            Assert.Equal(RegionState.Owned, s.Kernel.Regions.Snapshot().Single(r => r.Handle == s.Mapping.Region).State);
+            return;
+        }
+        var retried = s.Kernel.RevokePlatformRegionMapping(s.Owner, s.Mapping);
+        var exact = fault is "exact" or "source" or "owner";
+        Assert.Equal(exact, retried.IsSuccess);
+        Assert.Equal(exact ? 0UL : 128UL, s.Kernel.QueryBudget(budget).Value!.Usage.Single(x => x.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used);
+        Assert.Equal(exact ? 2 : 1, provider.BeginCalls);
+        Assert.Equal(exact, s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(exact ? RegionState.Released : RegionState.Owned,
+            s.Kernel.Regions.Snapshot().Single(r => r.Handle == s.Mapping.Region).State);
+        if (exact) Assert.Equal(0, provider.ResolveCalls);
+    }
+
+    [Fact]
+    public async Task OriginalResolutionOverlapCannotRepeatBeginOrReclaimBeforeExactConsumption()
+    {
+        var provider = new ResolvingMappingProvider { BeginFailureAfterOperation = PlatformAuthorityStatus.Faulted };
+        var s = CreateMappedRegion(742, 1084, selectedProvider: provider);
+        Assert.False(s.Kernel.RevokePlatformRegionMapping(s.Owner, s.Mapping).IsSuccess);
+        using var entered = new ManualResetEventSlim(); using var release = new ManualResetEventSlim();
+        provider.BeforeResolve = () =>
+        {
+            entered.Set();
+            if (!release.Wait(TimeSpan.FromSeconds(6))) throw new TimeoutException("Original resolution pause expired");
+        };
+        var work = Task.Run(() => s.Kernel.ObservePlatformRegionMappingRevocation(s.Owner, s.Mapping.Mapping));
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+            await Task.Run(() =>
+            {
+                Assert.False(s.Kernel.RevokePlatformRegionMapping(s.Owner, s.Mapping).IsSuccess);
+                Assert.False(s.Kernel.ObservePlatformRegionMappingRevocation(s.Owner, s.Mapping.Mapping).IsSuccess);
+                Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+                Assert.Equal(RegionState.Owned, s.Kernel.Regions.Snapshot().Single(r => r.Handle == s.Mapping.Region).State);
+                Assert.Equal(1, provider.BeginCalls);
+                Assert.Equal(1, provider.ResolveCalls);
+            }).WaitAsync(TimeSpan.FromSeconds(3));
+        }
+        finally { release.Set(); }
+        Assert.True((await work.WaitAsync(TimeSpan.FromSeconds(5))).IsSuccess);
+        provider.BeforeResolve = null;
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(r => r.Handle == s.Mapping.Region).State);
+        Assert.Equal(1, provider.BeginCalls);
+        Assert.Equal(1, provider.ResolveCalls);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void ResolutionRetainsOriginalRawFactAcrossLateSourceOrCanonicalOwnerLoss(bool ownerLoss)
+    {
+        var provider = new ResolvingMappingProvider { BeginFailureAfterOperation = PlatformAuthorityStatus.Faulted };
+        var s = CreateMappedRegion(741, 1083, selectedProvider: provider);
+        Assert.False(s.Kernel.RevokePlatformRegionMapping(s.Owner, s.Mapping).IsSuccess);
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_mappings", flags)!.GetValue(s.Kernel.PlatformAuthority)!;
+        var original = routes[s.Mapping.Mapping.MappingId]!;
+        provider.BeforeResolve = () =>
+        {
+            Assert.False(s.Kernel.ObservePlatformRegionMappingRevocation(s.Owner, s.Mapping.Mapping).IsSuccess);
+            if (ownerLoss) routes[s.Mapping.Mapping.MappingId] = typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+            else provider.ThrowIncarnation = true;
+        };
+        Assert.False(s.Kernel.ObservePlatformRegionMappingRevocation(s.Owner, s.Mapping.Mapping).IsSuccess);
+        Assert.NotNull(original.GetType().GetProperty("RevocationResolutionObservation")!.GetValue(original));
+        Assert.Equal(PlatformAuthorityStatus.Faulted, ((PlatformAuthorityResult<PlatformRegionRevocationTicket>)original.GetType().GetProperty("RevocationBeginObservation")!.GetValue(original)!).Status);
+        Assert.True(s.Kernel.Regions.HasPlatformMappingReservation(s.Mapping.Region, new RegionOwner(s.Mapping.Mapping.DomainBinding.Subject.DomainId, s.Owner.Generation)));
+        provider.BeforeResolve = null;
+        provider.ThrowIncarnation = false;
+        routes[s.Mapping.Mapping.MappingId] = original; // Same surviving owner; no reboot claim.
+        Assert.True(s.Kernel.ObservePlatformRegionMappingRevocation(s.Owner, s.Mapping.Mapping).IsSuccess);
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(r => r.Handle == s.Mapping.Region).State);
+        Assert.Equal(1, provider.BeginCalls);
+        Assert.Equal(1, provider.ResolveCalls);
+    }
+
+    [Theory]
+    [InlineData("exact")] [InlineData("wrong")] [InlineData("unknown")] [InlineData("throw")] [InlineData("source")]
+    public void LostOriginalBeginResolutionConsumesExactChargeAndBackingOrKeepsPins(string fault)
+    {
+        var provider = new ResolvingMappingProvider { ResolutionFault = fault, BeginFailureAfterOperation = PlatformAuthorityStatus.Faulted };
+        BudgetAccountHandle budget = default;
+        var s = CreateMappedRegion(740, 1082, (kernel, owner) =>
+        {
+            var admin = TestFixtures.Create(kernel, 99, 999).Handle;
+            var capability = kernel.MintCapability(new DomainId(999), admin, ResourceKind.KernelService,
+                CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+            budget = kernel.AdmitProcessBudget(admin, capability, owner, "original-begin-resolution",
+                [new(ServiceBudgetDimension.OwnedMemoryBytes, 1024), new(ServiceBudgetDimension.PinnedMappedMemoryBytes, 256)]).Value!.ProcessBudget;
+        }, provider);
+        Assert.False(s.Kernel.RevokePlatformRegionMapping(s.Owner, s.Mapping).IsSuccess);
+        Assert.Equal(1, provider.BeginCalls);
+        Assert.Equal(128UL, s.Kernel.QueryBudget(budget).Value!.Usage.Single(x => x.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used);
+        if (fault == "source") provider.BeforeResolve = () => provider.Incarnation = new(2);
+        var observed = s.Kernel.ObservePlatformRegionMappingRevocation(s.Owner, s.Mapping.Mapping);
+        Assert.Equal(fault == "exact", observed.IsSuccess);
+        Assert.Equal(fault == "exact" ? 0UL : 128UL, s.Kernel.QueryBudget(budget).Value!.Usage.Single(x => x.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used);
+        Assert.Equal(fault == "exact", s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(fault == "exact" ? RegionState.Released : RegionState.Owned,
+            s.Kernel.Regions.Snapshot().Single(r => r.Handle == s.Mapping.Region).State);
+        Assert.Equal(1, provider.BeginCalls);
+        Assert.Equal(fault == "exact" ? 1 : 0, provider.ObserveCalls);
+    }
+
+    [Theory]
     [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)]
     public void ForeignCompletedRegionFactCannotConsumeOriginalOwnedMemoryCharge(int fault)
     {
@@ -3071,9 +3231,9 @@ public sealed class PlatformOwnedRegionMappingV2Tests
 
     private static (RuntimeKernel Kernel, ExactMappingProvider Provider, ProcessHandle Owner,
         PlatformOwnedRegionSliceMapping Mapping) CreateMappedRegion(ulong processId, ulong domainId,
-            Action<RuntimeKernel, ProcessHandle>? beforeAllocation = null)
+            Action<RuntimeKernel, ProcessHandle>? beforeAllocation = null, ExactMappingProvider? selectedProvider = null)
     {
-        var provider = new ExactMappingProvider();
+        var provider = selectedProvider ?? new ExactMappingProvider();
         var kernel = new RuntimeKernel(provider);
         var (_, owner) = TestFixtures.Create(kernel, processId, domainId);
         beforeAllocation?.Invoke(kernel, owner);
@@ -3101,7 +3261,7 @@ public sealed class PlatformOwnedRegionMappingV2Tests
         return capability.Value!.CapabilityId;
     }
 
-    private sealed class ExactMappingProvider :
+    private class ExactMappingProvider :
         IPlatformAuthorityProvider,
         IPlatformFeatureProvider,
         IPlatformOwnedRegionMappingProvider,
@@ -3112,7 +3272,7 @@ public sealed class PlatformOwnedRegionMappingV2Tests
         private PlatformProviderDomainLease? _domain;
         private PlatformProviderRegionMappingLease? _mapping;
         private PlatformRegionSlice? _slice;
-        private PlatformOperationIdentity? _operation;
+        protected PlatformOperationIdentity? _operation;
         private ulong _nextMapping = 1;
         private ulong _nextOperation = 1;
 
@@ -3130,6 +3290,8 @@ public sealed class PlatformOwnedRegionMappingV2Tests
             }
         }
         public PlatformAuthorityStatus? BeginFailureAfterOperation { get; set; }
+        public PlatformAuthorityStatus? BeginRefusalBeforeEffect { get; set; }
+        public bool MalformedRefusalTicket { get; set; }
         public int BeginCalls { get; private set; }
         public int ObserveCalls { get; private set; }
         public int DomainRevokeCalls { get; private set; }
@@ -3249,6 +3411,10 @@ public sealed class PlatformOwnedRegionMappingV2Tests
             if (_mapping != mapping)
                 return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Fail(
                     PlatformAuthorityStatus.Denied, "Wrong mapping.");
+            if (BeginRefusalBeforeEffect is { } refusal)
+                return new(refusal, MalformedRefusalTicket
+                    ? new(mapping.MappingId, mapping.Generation, new(new(777), new(1), mapping.DomainLease)) : default,
+                    "Original invocation refused without effect.");
             var operation = new PlatformOperationIdentity(
                 new PlatformOperationId(_nextOperation++), new PlatformOperationGeneration(1),
                 mapping.DomainLease);
@@ -3274,6 +3440,30 @@ public sealed class PlatformOwnedRegionMappingV2Tests
             return PlatformAuthorityResult<PlatformCompletionReceipt>.Ok(
                 new PlatformCompletionReceipt(operation.OperationId, generation,
                     operation.DomainLease, CompletionState));
+        }
+    }
+
+    private sealed class ResolvingMappingProvider : ExactMappingProvider, IPlatformRegionRevocationResolutionProvider, IPlatformRegionRevocationNoEffectProvider
+    {
+        private PlatformRegionRevocationRequest? _request;
+        public int ResolveCalls { get; private set; }
+        public string ResolutionFault { get; set; } = "exact";
+        public Action? BeforeResolve { get; set; }
+        public PlatformAuthorityResult<PlatformRegionRevocationTicket> BeginRegionMappingRevocation(PlatformRegionRevocationRequest request)
+        {
+            _request = request;
+            return BeginRegionMappingRevocation(request.Mapping, request.Policy);
+        }
+        public PlatformAuthorityResult<PlatformRegionRevocationResolution> ResolveRegionMappingRevocation(PlatformRegionRevocationRequest request)
+        {
+            ResolveCalls++;
+            BeforeResolve?.Invoke();
+            if (ResolutionFault == "throw") throw new IOException("Resolution reply unavailable");
+            if (_request != request || _operation is not { } operation || ResolutionFault == "unknown")
+                return PlatformAuthorityResult<PlatformRegionRevocationResolution>.Fail(PlatformAuthorityStatus.Faulted, "Original outcome unknown");
+            var returned = ResolutionFault == "wrong" ? request with { InvocationId = Guid.NewGuid() } : request;
+            return PlatformAuthorityResult<PlatformRegionRevocationResolution>.Ok(new(returned,
+                new(request.Mapping.MappingId, request.Mapping.Generation, operation)));
         }
     }
 }

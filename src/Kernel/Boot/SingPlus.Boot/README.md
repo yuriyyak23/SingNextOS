@@ -262,8 +262,51 @@ Scripts/snake-showcase.txt exercises growth, collision, restart and cleanup.
 The game owns a generated ISnakeService contract. Inputs and responses contain
 bounded primitive values; the board is a fixed three-word bitset. Each step
 passes through generated client, RuntimeSipClientTransport, real runtime session
-acceptance, generated dispatcher and runtime response publication. State belongs
-to the service instance. The trusted implementation runs cooperatively on host
-CLR; this does not execute an arbitrary admitted DLL or SipJob. Console input and
+acceptance, generated dispatcher and runtime response publication. Game state belongs to a restricted Windows child process. A trusted parent broker owns a runtime-accounted snapshot Region; this does not execute an arbitrary admitted DLL or SipJob. Console input and
 rendering belong to Boot. --budget and --trace use the existing runtime paths.
 Q, EOF and invocation errors close the session and reclaim game processes.
+## Snake restricted child integration (2026-10-11)
+
+Snake runs in Samples/Snake.Child, a separate .NET process without RuntimeKernel.
+Samples/Snake contains the bounded contract, generated dispatcher and game logic.
+Samples/Snake.Host is the trusted parent broker. Boot retains console/timing and
+lifecycle orchestration. Build outputs deploy the child into snake-child alongside
+Boot and the executable checks.
+
+The parent uses existing RuntimeKernel capabilities, service registration, session
+admission, request receive/acceptance and response publication. Only a monotonic
+sequence and bounded direction/frame cross two inherited anonymous pipes. Replies
+are checked before publication. Startup and reply waits are bounded. Launch failure
+does not fall back to execution in the parent.
+
+Windows launches the child suspended under a restricted low-integrity token with
+privileges disabled; the launcher verifies integrity before resuming it in a Job.
+The Job permits one process, caps committed memory at 512 MiB and CPU at 20%,
+restricts UI operations and kills its process on close. Only the two pipe handles
+are inherited. The environment contains SystemRoot and disables .NET diagnostics;
+parent environment variables are not passed through.
+
+The SIP/SipRegion runtime owner holds a 160-Int32 snapshot Region (640 budgeted
+bytes), allocated by RuntimeKernel.AllocateBuffer and refunded on release. Actual
+game state and CLR allocations are private child memory, outside runtime budget
+accounting and constrained by the Windows Job. Stop joins the broker and confirms
+child termination before releasing the snapshot and reclaiming runtime processes.
+An exited child refuses further dispatch and its failure remains visible.
+A failure after runtime acceptance can leave an invocation unresolved; cleanup
+reports runtime refusal instead of fabricating a response or rollback.
+
+    pwsh -File Scripts/Play-Snake.ps1
+    pwsh -File Scripts/Play-Snake.ps1 -Demo
+    pwsh -File Scripts/Test-Snake.ps1
+
+Checks cover separate child PID, growth, cancellation before enqueue, capability
+revocation without new dispatch, exact snapshot charge/refund, forced idle child
+exit, retained failure, confirmed child death, idempotent stop, restart, traces and
+reclaim. The ASCII showcase covers collision/restart/quit.
+
+This is Windows host containment, not AppContainer: file reads and network access
+are not comprehensively denied. It is not verified-image execution binding,
+HybridCPU-v2 execution or SingNextOS hardware isolation. The trusted build output
+is launched through the installed dotnet host; no verifier-to-image binding is
+claimed. ResourceScheduler does not schedule child instructions. OS, runtime,
+ISE/HybridCPU sources and backend providers are unchanged by this integration.

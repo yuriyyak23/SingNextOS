@@ -1,4 +1,4 @@
-using SingPlus.Contracts;
+﻿using SingPlus.Contracts;
 using SingPlus.Platform;
 
 namespace SingPlus.Runtime;
@@ -42,27 +42,41 @@ internal sealed class CxlDeviceReservation(PlatformDeviceLease lease)
 
 public sealed partial class PlatformAuthorityBridge
 {
-    private sealed class DeviceLeaseRecord(
-        PlatformDeviceLease lease,
-        PlatformProviderDeviceLease providerLease,
-        CapabilityId authorityCapabilityId,
-        PlatformProviderIncarnation providerIncarnation,
-        PlatformBackendEpoch backendEpoch)
+    private sealed class DeviceLeaseRecord
     {
-        public PlatformDeviceLease Lease { get; } = lease;
-        public PlatformProviderDeviceLease ProviderLease { get; } = providerLease;
-        public CapabilityId AuthorityCapabilityId { get; } = authorityCapabilityId;
-        public PlatformProviderIncarnation ProviderIncarnation { get; } = providerIncarnation;
-        public PlatformBackendEpoch BackendEpoch { get; } = backendEpoch;
+        public DeviceLeaseRecord(PlatformDeviceLease lease,PlatformProviderDeviceLease providerLease,CapabilityId authorityCapabilityId,PlatformProviderIncarnation providerIncarnation,PlatformBackendEpoch backendEpoch)
+        { OwnerSelf = this; Lease = lease; ProviderLease = providerLease; AuthorityCapabilityId = authorityCapabilityId; ProviderIncarnation = providerIncarnation; BackendEpoch = backendEpoch; }
+        public DeviceLeaseRecord OwnerSelf { get; }
+        public PlatformDeviceLease Lease { get; }
+        private PlatformProviderDeviceLease _providerLease;
+        private bool _platformClosed;
+        public ulong SourceRevision { get; private set; }
+        public bool SourceExhausted { get; private set; }
+        private void Advance() { if (SourceRevision == ulong.MaxValue) SourceExhausted = true; else SourceRevision++; }
+        public PlatformProviderDeviceLease ProviderLease { get => _providerLease; set { Advance(); _providerLease = value; } }
+        public CapabilityId AuthorityCapabilityId { get; }
+        public PlatformProviderIncarnation ProviderIncarnation { get; }
+        public PlatformBackendEpoch BackendEpoch { get; }
         public PlatformAuthorityResult<PlatformProviderDeviceLease>? BindObservation { get; set; }
-        public DomainRecord? BindParentSource { get; init; } // Original cleanup route, never permission.
+        public OriginalDeviceBindInvocation? OriginalBind { get; init; }
+        public bool CleanupOnly { get; init; }
+        public DomainRecord? BindParentSource { get; init; }
         public bool LocalAuthorizationRevoked { get; set; }
-        public bool PlatformClosed { get; set; }
-        public bool ProviderClosureConfirmed { get; set; } // Exact reply, not local release.
+        public bool PlatformClosed { get => _platformClosed; set { Advance(); _platformClosed = value; } }
+        public bool ProviderClosureConfirmed { get; set; }
         public bool RevokeMayHaveEffect { get; set; }
         public PlatformAuthorityResult? RevokeObservation { get; set; }
-        public DomainRecord? RevokeParent { get; set; } // Original cleanup source, never authority.
+        public DomainRecord? RevokeParent { get; set; }
         public bool FaultPinned { get; set; }
+        public List<OriginalMmioMapInvocation> OriginalMmioMaps { get; } = [];
+        public ulong OriginalMmioMapsIssued { get; set; }
+        public bool OwnMmioMapUncertain { get; set; }
+        public List<OriginalIrqBindInvocation> OriginalIrqBinds { get; } = [];
+        public ulong OriginalIrqBindsIssued { get; set; }
+        public bool OwnIrqBindUncertain { get; set; }
+        public bool OwnCloseUncertain { get; set; }
+        public OriginalDeviceCloseInvocation? OriginalClose { get; set; }
+        public List<OriginalDeviceCloseInvocation> CloseHistory { get; } = [];
         public int PendingIrqBinds { get; set; }
         public CapabilityId? UnresolvedIrqCapabilityId { get; set; }
         public bool IrqBindMayHaveEffect { get; set; }
@@ -75,6 +89,8 @@ public sealed partial class PlatformAuthorityBridge
         public PlatformAuthorityResult? MalformedIrqCleanupObservation { get; set; }
         public int PendingMmioBinds { get; set; }
         public int PendingVirtualIoBinds { get; set; }
+        public List<VirtualIoBindInvocationFact> VirtualIoBindInvocations { get; } = [];
+        public ulong VirtualIoBindInvocationsIssued { get; set; }
         public List<UnpublishedVirtualIoBindReceipt> UnpublishedVirtualIoBinds { get; } = [];
         public CapabilityId? UnresolvedMmioCapabilityId { get; set; }
         public bool MmioMapMayHaveEffect { get; set; }
@@ -97,7 +113,7 @@ public sealed partial class PlatformAuthorityBridge
 
     private bool TryGetOriginalDeviceRecord(PlatformDeviceLeaseId id, out DeviceLeaseRecord record) =>
         _deviceLeases.TryGetValue(id, out record!) &&
-        _originalDeviceOwners.TryGetValue(id, out var original) && ReferenceEquals(original, record);
+        _originalDeviceOwners.TryGetValue(id, out var original) && ReferenceEquals(original, record) && ReferenceEquals(record.OwnerSelf,record);
 
     private IEnumerable<DeviceLeaseRecord> DeviceDependencyRecordsLocked() =>
         _originalDeviceOwners.Values.Concat(_deviceLeases.Values).Distinct<DeviceLeaseRecord>(ReferenceEqualityComparer.Instance);
@@ -140,11 +156,12 @@ public sealed partial class PlatformAuthorityBridge
         PlatformProviderIncarnation providerIncarnation;
         PlatformBackendEpoch backendEpoch = default;
         PlatformDeviceLeaseId localLeaseId = default;
+        OriginalDeviceBindInvocation? originalBind = null;
         KernelResult Begin()
         {
         lock (_secureDomainLifecycleGate)
         {
-            if (DeviceDependencyRecordsLocked().Any(record => !record.PlatformClosed &&
+            if (DeviceDependencyRecordsLocked().Any(record => !HasConsumedOriginalDeviceClosure(record) &&
                     record.Lease.DomainBinding.BindingId == binding.BindingId && record.Lease.Device == device))
                 return KernelResult.Fail(KernelError.PlatformBindingActive,
                     "The exact semantic device already has a live platform lease in this domain binding.");
@@ -165,6 +182,11 @@ public sealed partial class PlatformAuthorityBridge
             localLeaseId = new(_nextDeviceLeaseId++);
             domainRecord.PendingDeviceBinds++;
             backendEpoch = BackendEpoch;
+            if (deviceProvider is IPlatformOriginalDeviceProvider)
+            {
+                originalBind = new(domainRecord,new(domainRecord.ProviderLease,device,rights),new(localLeaseId,new(1),binding,device,rights),authorityCapabilityId);
+                domainRecord.OriginalDeviceBinds.Add(originalBind); // Original request/fact before effect.
+            }
             return KernelResult.Ok();
         }
         }
@@ -176,7 +198,7 @@ public sealed partial class PlatformAuthorityBridge
             catch (Exception exception) when (exception is not StackOverflowException)
             {
                 domainRecord.DeviceBindMayHaveEffect = true;
-                QuarantineDomain(domainRecord);
+                QuarantineOriginalDeviceBindLocked(domainRecord,originalBind);
                 return KernelResult<PlatformDeviceLease>.Fail(KernelError.PlatformFaulted,
                     $"Device admission generation read failed; the parent remains quarantined: {exception.Message}");
             }
@@ -190,7 +212,7 @@ public sealed partial class PlatformAuthorityBridge
                     domainRecord.AuthorityState != DomainAuthorityState.Active || domainRecord.ParentRevokeMayHaveEffect)
                 {
                     domainRecord.DeviceBindMayHaveEffect = true;
-                    QuarantineDomain(domainRecord);
+                    QuarantineOriginalDeviceBindLocked(domainRecord,originalBind);
                     return KernelResult<PlatformDeviceLease>.Fail(KernelError.PlatformFaulted,
                         "Parent/device admission continuity changed during generation observation.");
                 }
@@ -205,10 +227,12 @@ public sealed partial class PlatformAuthorityBridge
             PlatformAuthorityResult<PlatformProviderDeviceLease> providerResult;
             try
             {
-                providerResult = deviceProvider.BindDevice(
-                    domainRecord.ProviderLease,
-                    device,
-                    rights);
+                if (originalBind is not null)
+                {
+                    lock (_secureDomainLifecycleGate) originalBind.Invoked = true;
+                    providerResult = ((IPlatformOriginalDeviceProvider)deviceProvider).BindDevice(originalBind.Request);
+                }
+                else providerResult = deviceProvider.BindDevice(domainRecord.ProviderLease,device,rights);
             }
             catch (Exception exception) when (exception is not StackOverflowException)
             {
@@ -217,12 +241,12 @@ public sealed partial class PlatformAuthorityBridge
                 lock (_secureDomainLifecycleGate)
                 {
                     domainRecord.DeviceBindMayHaveEffect = true;
-                    QuarantineDomain(domainRecord);
+                    QuarantineOriginalDeviceBindLocked(domainRecord,originalBind);
                 }
                 return KernelResult<PlatformDeviceLease>.Fail(KernelError.PlatformFaulted,
                     $"Device binding may have taken effect without a receipt: {exception.Message}");
             }
-            lock (_secureDomainLifecycleGate) domainRecord.DeviceBindObservation = providerResult;
+            lock (_secureDomainLifecycleGate) { domainRecord.DeviceBindObservation = providerResult; if (originalBind is not null) originalBind.RawObservation = providerResult; }
             var generationStable = false;
             try
             {
@@ -239,7 +263,7 @@ public sealed partial class PlatformAuthorityBridge
                 lock (_secureDomainLifecycleGate)
                 {
                     domainRecord.DeviceBindMayHaveEffect = true;
-                    QuarantineDomain(domainRecord);
+                    QuarantineOriginalDeviceBindLocked(domainRecord,originalBind);
                 }
                 return KernelResult<PlatformDeviceLease>.Fail(KernelError.PlatformFaulted,
                     "Provider generation changed during device binding; the domain remains quarantined.");
@@ -249,7 +273,7 @@ public sealed partial class PlatformAuthorityBridge
                 lock (_secureDomainLifecycleGate)
                 {
                     domainRecord.DeviceBindMayHaveEffect = true;
-                    QuarantineDomain(domainRecord);
+                    QuarantineOriginalDeviceBindLocked(domainRecord,originalBind);
                 }
 
                 return FromProviderFailure<PlatformDeviceLease>(
@@ -260,7 +284,8 @@ public sealed partial class PlatformAuthorityBridge
             var providerLease = providerResult.Value!;
             var lease = new PlatformDeviceLease(localLeaseId, new(1), binding, device, rights);
             var leaseRecord = new DeviceLeaseRecord(lease, providerLease, authorityCapabilityId,
-                providerIncarnation, backendEpoch) { FaultPinned = !generationStable, BindParentSource = domainRecord };
+                providerIncarnation, backendEpoch) { FaultPinned = !generationStable, BindParentSource = domainRecord, OriginalBind = originalBind };
+            if (originalBind is not null) { lock (_secureDomainLifecycleGate) originalBind.LocalDevice = leaseRecord; }
             authorization = revalidateAuthorization();
             var providerValidation = PlatformDeviceLeaseContract.ValidateLease(
                 domainRecord.ProviderLease, device, rights, providerLease);
@@ -284,6 +309,7 @@ public sealed partial class PlatformAuthorityBridge
                             "Original device owner index changed before publication; known original outcome remains pinned.");
                     _deviceLeases.Add(lease.LeaseId, leaseRecord);
                     TransferDeviceBindObservationLocked(domainRecord, leaseRecord);
+                    if (originalBind is not null) originalBind.Published = true;
                     return KernelResult.Ok();
                 }
             });
@@ -300,57 +326,24 @@ public sealed partial class PlatformAuthorityBridge
                     _originalDeviceOwners.TryAdd(lease.LeaseId, leaseRecord);
                     _deviceLeases.Add(lease.LeaseId, leaseRecord);
                     if (!malformed) TransferDeviceBindObservationLocked(domainRecord, leaseRecord);
-                    if (malformed) QuarantineDomain(domainRecord);
+                    if (malformed) QuarantineOriginalDeviceBindLocked(domainRecord,originalBind);
                 }
                 var cleanupProven = false;
                 try
                 {
-                    var sourceCurrent = ValidateDeviceClosureGeneration(leaseRecord);
-                    bool cleanupAdmitted;
-                    lock (_secureDomainLifecycleGate)
-                    {
-                        cleanupAdmitted = sourceCurrent && !_backendEpochExhausted && BackendEpoch == backendEpoch &&
-                            TryGetOriginalDeviceRecord(lease.LeaseId, out var exactDevice) && ReferenceEquals(exactDevice, leaseRecord) &&
-                            TryGetCanonicalRootRecord(binding.BindingId, out var exactParent) && ReferenceEquals(exactParent, domainRecord) &&
-                            !domainRecord.ParentRevokeMayHaveEffect && leaseRecord.ClosureInFlight;
-                        if (cleanupAdmitted)
-                        {
-                            leaseRecord.RevokeParent = domainRecord;
-                            leaseRecord.RevokeMayHaveEffect = true;
-                        }
-                    }
-                    if (cleanupAdmitted)
-                    {
-                        var cleanup = deviceProvider.RevokeDevice(providerLease);
-                        lock (_secureDomainLifecycleGate) leaseRecord.RevokeObservation = cleanup;
-                        if (!malformed && cleanup.IsSuccess)
-                        {
-                            lock (_secureDomainLifecycleGate) leaseRecord.ProviderClosureConfirmed = true;
-                            cleanupProven = CompleteKnownDeviceClosure(leaseRecord).IsSuccess;
-                        }
-                        else PinAmbiguousDeviceClosure(leaseRecord, domainRecord);
-                    }
-                    else PinAmbiguousDeviceClosure(leaseRecord, domainRecord);
-                }
-                catch (Exception exception) when (exception is not StackOverflowException)
-                {
-                    PinAmbiguousDeviceClosure(leaseRecord, domainRecord);
+                    if (!malformed) cleanupProven = RevokeDeviceCore(leaseRecord,lease,binding.Subject).IsSuccess;
+                    else PinAmbiguousDeviceClosure(leaseRecord,domainRecord);
                 }
                 finally { lock (_secureDomainLifecycleGate) leaseRecord.ClosureInFlight = false; }
                 lock (_secureDomainLifecycleGate)
                 {
-                    if (cleanupProven) _deviceLeases.Remove(lease.LeaseId);
-                    else if (leaseRecord.FaultPinned || leaseRecord.BackendEpoch != BackendEpoch ||
-                        !leaseRecord.ProviderClosureConfirmed)
-                    {
-                        leaseRecord.FaultPinned = true;
-                        QuarantineDomain(domainRecord);
-                    }
+                    if (!cleanupProven && (leaseRecord.FaultPinned || !leaseRecord.ProviderClosureConfirmed || leaseRecord.BackendEpoch != BackendEpoch)) QuarantineOriginalDeviceBindLocked(domainRecord,originalBind);
+                    else if (originalBind is not null) ConsumeOriginalDeviceBindLocked(originalBind);
                 }
                 return KernelResult<PlatformDeviceLease>.Fail(rejection.Error, rejection.Message!);
             }
         }
-        finally { lock (_secureDomainLifecycleGate) domainRecord.PendingDeviceBinds--; }
+        finally { lock (_secureDomainLifecycleGate) { domainRecord.PendingDeviceBinds--; if (originalBind is not null) originalBind.InFlight = false; } }
     }
 
     private static void TransferDeviceBindObservationLocked(DomainRecord domain, DeviceLeaseRecord device)
@@ -381,11 +374,11 @@ public sealed partial class PlatformAuthorityBridge
             if (record.PendingIrqBinds != 0 || record.PendingMmioBinds != 0 || record.ClosureInFlight || record.CxlChildren.Count != 0)
                 return KernelResult.Fail(KernelError.PlatformBindingActive,
                     "Device closure requires completed IRQ/MMIO admission and exact CXL child closure.");
-            if (record.PendingVirtualIoBinds != 0 || _virtualIoBindings.Values.Any(x =>
-                    x.Binding.ParentDevice == lease && x.Closure != PlatformExternalClosureState.Closed))
+            if (record.PendingVirtualIoBinds != 0 || HasOriginalIoInvocationPins(record) || _virtualIoOwners.Any(x =>
+                    x.Binding.ParentDevice == lease && !HasConsumedVirtualIo(x)))
                 return KernelResult.Fail(KernelError.PlatformBindingActive,
                     "Device closure requires completed virtual-I/O admission and exact child closure.");
-            if (record.RevokeMayHaveEffect && !record.ProviderClosureConfirmed)
+            if (record.RevokeMayHaveEffect && !record.ProviderClosureConfirmed && _provider is not IPlatformOriginalDeviceProvider)
                 return KernelResult.Fail(KernelError.PlatformFaulted, "Original device closure remains ambiguous; repeat refused.");
             record.ClosureInFlight = true;
         }
@@ -397,75 +390,83 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDeviceLease lease,
         PlatformDomainIdentity expectedSubject)
     {
-        bool knownClosure;
-        DomainRecord parent;
+        OriginalDeviceCloseInvocation fact;
         lock (_secureDomainLifecycleGate)
         {
-            var validation = ValidateDeviceLeaseIdentity(lease, expectedSubject);
-            if (!validation.IsSuccess) return validation;
-            if (!TryGetOriginalDeviceRecord(lease.LeaseId, out var current) || !ReferenceEquals(current, record) ||
-                !record.ClosureInFlight)
-                return KernelResult.Fail(KernelError.PlatformFaulted, "Original device cleanup owner changed before closure.");
-            if (record.PlatformClosed)
-                return KernelResult.Fail(KernelError.PlatformBindingRevoked, "The platform device lease has already been closed.");
-            if (record.FaultPinned)
-                return KernelResult.Fail(KernelError.PlatformFaulted, "The device lease is fault-pinned and cannot prove provider closure.");
-            knownClosure = record.ProviderClosureConfirmed;
-            parent = _domains[lease.DomainBinding.BindingId];
+            if (!TryGetOriginalDeviceRecord(lease.LeaseId,out var current) || !ReferenceEquals(current,record) || record.Lease != lease || !record.ClosureInFlight || record.PlatformClosed || record.FaultPinned ||
+                !_domains.TryGetValue(lease.DomainBinding.BindingId,out var parent) || !ReferenceEquals(parent,record.BindParentSource))
+                return KernelResult.Fail(KernelError.PlatformFaulted,"Original device owner/source unavailable before closure.");
+            fact = record.OriginalClose ?? new(record,parent);
+            if (record.OriginalClose is null) { record.CloseHistory.Add(fact); record.OriginalClose = fact; }
+            if (!Exact() || fact.Invoked && fact.RawObservation is not { IsSuccess: true } &&
+                !(_provider is IPlatformDeviceRevocationNoEffectProvider && fact.RawObservation is { Status: PlatformAuthorityStatus.NotAccepted }) && _provider is not IPlatformOriginalDeviceProvider)
+                return KernelResult.Fail(KernelError.PlatformFaulted,"Original device Close outcome unknown; no repeat.");
         }
-        if (knownClosure) return CompleteKnownDeviceClosure(record);
-        if (_provider is not IPlatformDeviceLeaseProvider deviceProvider)
+        if (_provider is not IPlatformDeviceLeaseProvider deviceProvider) return KernelResult.Fail(KernelError.PlatformFaulted,"Original device provider absent.");
+        try
         {
-            return KernelResult.Fail(
-                KernelError.PlatformFaulted,
-                "The provider that materialized the device lease no longer exposes device closure.");
+            var source = CurrentProviderIncarnation();
+            bool invoke;
+            lock (_secureDomainLifecycleGate)
+            {
+                if (!Current(source)) return KernelResult.Fail(KernelError.PlatformFaulted,"Original device source changed before Close.");
+                invoke = !fact.Invoked;
+                if (invoke) { fact.Invoked = true; record.RevokeMayHaveEffect = true; record.RevokeParent = fact.Parent; }
+            }
+            if (invoke)
+            {
+                var raw = deviceProvider.RevokeDevice(fact.Lease);
+                lock (_secureDomainLifecycleGate) { fact.RawObservation = raw; record.RevokeObservation = raw; if (raw.IsSuccess) record.ProviderClosureConfirmed = true; }
+            }
+            else if (fact.RawObservation is not { IsSuccess: true } &&
+                !(deviceProvider is IPlatformDeviceRevocationNoEffectProvider && fact.RawObservation is { Status: PlatformAuthorityStatus.NotAccepted }))
+            {
+                var raw = ((IPlatformOriginalDeviceProvider)deviceProvider).ResolveDeviceRevocation(fact.Lease);
+                lock (_secureDomainLifecycleGate) fact.RawResolution = raw; // Pure raw before callback.
+            }
+            source = CurrentProviderIncarnation();
+            lock (_secureDomainLifecycleGate)
+            {
+                if (!Current(source)) { if (source.Value != 0 || !HasExactDeviceCloseOwnersLocked(record)) PinAmbiguousDeviceClosure(record,fact.Parent); return KernelResult.Fail(KernelError.PlatformFaulted,"Original device outcome retained without final current source."); }
+                if (deviceProvider is IPlatformDeviceRevocationNoEffectProvider && fact.RawObservation is { Status: PlatformAuthorityStatus.NotAccepted } noEffect)
+                {
+                    fact.NoEffectConsumed = true; record.OriginalClose = null; record.RevokeMayHaveEffect = false; record.OwnCloseUncertain = false;
+                    return FromProviderFailure(noEffect.Status,noEffect.Message); // Device remains open; no synthetic closure.
+                }
+                if (fact.RawObservation is not { IsSuccess: true } && fact.RawResolution is not { IsSuccess: true })
+                { record.OwnCloseUncertain = true; if (deviceProvider is not IPlatformOriginalDeviceProvider) record.FaultPinned = true; return KernelResult.Fail(KernelError.PlatformFaulted,"Original device Close response unknown; no repeat."); }
+                fact.Consumed = true; record.ProviderClosureConfirmed = true; record.LocalAuthorizationRevoked = true; record.OwnCloseUncertain = false; record.PlatformClosed = true;
+                return KernelResult.Ok();
+            }
         }
-
-        if (!ValidateDeviceClosureGeneration(record))
-            return KernelResult.Fail(KernelError.PlatformFaulted,
-                "The device provider or local backend generation changed before closure; the lease remains pinned.");
-
-        lock (_secureDomainLifecycleGate)
-        {
-            var identity = ValidateDeviceLeaseIdentity(lease, expectedSubject);
-            if (!identity.IsSuccess) return identity;
-            if (!TryGetOriginalDeviceRecord(lease.LeaseId, out var current) || !ReferenceEquals(current, record) ||
-                !TryGetCanonicalRootRecord(lease.DomainBinding.BindingId, out var exactParent) || !ReferenceEquals(exactParent, parent) ||
-                !record.ClosureInFlight || record.FaultPinned || record.PlatformClosed ||
-                BackendEpoch != record.BackendEpoch || _backendEpochExhausted)
-                return KernelResult.Fail(KernelError.PlatformFaulted,
-                    "Original device cleanup admission changed during source observation; provider effect refused.");
-            record.RevokeMayHaveEffect = true;
-            record.RevokeParent = parent;
-        }
-        PlatformAuthorityResult providerResult;
-        try { providerResult = deviceProvider.RevokeDevice(record.ProviderLease); }
         catch (Exception exception) when (exception is not StackOverflowException)
         {
-            PinAmbiguousDeviceClosure(record, parent);
-            return KernelResult.Fail(KernelError.PlatformFaulted,
-                $"The device provider threw during closure; the lease remains pinned: {exception.Message}");
+            lock (_secureDomainLifecycleGate)
+                if (fact.RawObservation is not { IsSuccess: true } || !HasExactDeviceCloseOwnersLocked(record) || BackendEpoch != fact.Epoch || _backendEpochExhausted)
+                    PinAmbiguousDeviceClosure(record,fact.Parent);
+            return KernelResult.Fail(KernelError.PlatformFaulted,"Original device Close retained without repeat: "+exception.Message);
         }
-        lock (_secureDomainLifecycleGate) record.RevokeObservation = providerResult;
-        if (!providerResult.IsSuccess)
+        bool Exact() => ReferenceEquals(record.OwnerSelf,record) && ReferenceEquals(record.OriginalClose,fact) && ReferenceEquals(fact.OwnerSelf,fact) && ReferenceEquals(fact.Source,record) &&
+            record.CloseHistory.Any(old => ReferenceEquals(old,fact)) && fact.Lease == record.ProviderLease;
+        bool Current(PlatformProviderIncarnation source)
         {
-            PinAmbiguousDeviceClosure(record, parent);
-            return KernelResult.Fail(KernelError.PlatformFaulted,
-                "Device closure lacks exact containment evidence; original reply and lease remain pinned.");
+            if (source.Value != 0 && source != record.ProviderIncarnation || BackendEpoch != fact.Epoch || record.SourceRevision != fact.Revision || record.SourceExhausted) fact.SourceChanged = true;
+            return !fact.SourceChanged && source.Value != 0 && source == record.ProviderIncarnation && !_backendEpochExhausted && IsBindReceiptExact() && Exact() &&
+                TryGetOriginalDeviceRecord(lease.LeaseId,out var original) && ReferenceEquals(original,record) && record.ClosureInFlight && !record.FaultPinned && !HasConsumedOriginalDeviceClosure(record) &&
+                TryGetCanonicalRootRecord(lease.DomainBinding.BindingId,out var root) && ReferenceEquals(root,fact.Parent) && !root.ParentRevokeInFlight && !root.ParentRevokeMayHaveEffect &&
+                (root.AuthorityState == DomainAuthorityState.Active || record.CleanupOnly && record.OriginalBind is { } bind && OriginalDeviceBindSources(bind,source));
         }
-
-        lock (_secureDomainLifecycleGate)
-        {
-            record.ProviderClosureConfirmed = true;
-            record.LocalAuthorizationRevoked = true;
-        }
-        return CompleteKnownDeviceClosure(record);
+        bool IsBindReceiptExact() => PlatformDeviceLeaseContract.ValidateLease(fact.Parent.ProviderLease,lease.Device,lease.Rights,fact.Lease).IsSuccess &&
+            (record.BindObservation is { IsSuccess: true } raw && raw.Value == fact.Lease || record.OriginalBind?.RawResolution is { IsSuccess: true } resolved &&
+                ReferenceEquals(resolved.Value.Request,record.OriginalBind.Request) && !resolved.Value.NoEffectGuaranteed && resolved.Value.CleanupLease == fact.Lease);
     }
 
     private void PinAmbiguousDeviceClosure(DeviceLeaseRecord record, DomainRecord parent)
     {
         lock (_secureDomainLifecycleGate)
         {
+            if (_provider is IPlatformOriginalDeviceProvider && record.OriginalClose is { } fact && ReferenceEquals(fact.OwnerSelf,fact) && ReferenceEquals(fact.Source,record))
+            { record.OwnCloseUncertain = true; return; }
             record.FaultPinned = true;
             if (!TryGetOriginalDeviceRecord(record.Lease.LeaseId, out var exact) || !ReferenceEquals(exact, record))
             {
@@ -564,9 +565,9 @@ public sealed partial class PlatformAuthorityBridge
                 "The platform device lease has been closed.");
         }
 
-        if (record.FaultPinned)
+        if (record.CleanupOnly || record.OwnMmioMapUncertain || record.OwnIrqBindUncertain || record.OriginalClose is not null || record.OwnCloseUncertain || record.FaultPinned)
             return KernelResult.Fail(KernelError.PlatformFaulted,
-                "The platform device lease is fault-pinned and cannot authorize effects.");
+                "The original device is cleanup-only, closing or uncertain and cannot authorize effects.");
 
         return KernelResult.Ok();
     }
@@ -675,7 +676,7 @@ public sealed partial class PlatformAuthorityBridge
         {
             var affected = DeviceDependencyRecordsLocked()
                 .Where(record =>
-                    !record.PlatformClosed &&
+                    !HasConsumedOriginalDeviceClosure(record) &&
                     dependsOnRevokedCapability(record.AuthorityCapabilityId))
                 .OrderBy(record => record.Lease.LeaseId.Value)
                 .ToArray();
@@ -691,14 +692,14 @@ public sealed partial class PlatformAuthorityBridge
     {
         lock (_secureDomainLifecycleGate)
             return DeviceDependencyRecordsLocked().Any(record =>
-            !record.PlatformClosed &&
+            !HasConsumedOriginalDeviceClosure(record) &&
             record.Lease.DomainBinding.BindingId == binding.BindingId);
     }
 
     internal IReadOnlyList<PlatformDeviceLease> ActiveDeviceLeasesForProcess(PlatformDomainIdentity subject)
     {
         lock (_secureDomainLifecycleGate)
-            return DeviceDependencyRecordsLocked().Where(record => !record.PlatformClosed &&
+            return DeviceDependencyRecordsLocked().Where(record => !HasConsumedOriginalDeviceClosure(record) &&
                 record.Lease.DomainBinding.Subject == subject).OrderBy(record => record.Lease.LeaseId.Value)
                 .Select(record => record.Lease).ToArray();
     }
@@ -709,7 +710,7 @@ public sealed partial class PlatformAuthorityBridge
         lock (_secureDomainLifecycleGate)
             return DeviceDependencyRecordsLocked()
             .Where(record =>
-                !record.PlatformClosed &&
+                !HasConsumedOriginalDeviceClosure(record) &&
                 record.Lease.DomainBinding.BindingId == binding.BindingId)
             .OrderBy(record => record.Lease.LeaseId.Value)
             .Select(static record => record.Lease)
@@ -741,6 +742,8 @@ public sealed partial class PlatformAuthorityBridge
                 "The platform device lease identity is malformed.");
         }
 
+        if (record.CleanupOnly && record.OriginalBind is { } bind && OriginalDeviceBindSources(bind,record.ProviderIncarnation))
+            return ValidateDomainIdentity(lease.DomainBinding,expectedSubject);
         return ValidateDomain(lease.DomainBinding, expectedSubject);
     }
 

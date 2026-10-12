@@ -57,7 +57,8 @@ public sealed class Phase501PlatformContractTests
             PlatformVirtualEventContract.ValidateRequest(request, PlatformChildDomainState.Draining).Status);
 
         Assert.Equal(
-            ["MemoryFault", "IllegalInstruction", "Hypercall", "ExternalEvent", "Timer", "Preemption", "DeviceOrIoFault"],
+            ["MemoryFault", "IllegalInstruction", "Hypercall", "ExternalEvent", "Timer", "Preemption", "DeviceOrIoFault",
+                "ExecutionBudgetExhausted", "KernelRejected", "ExecutionFailure"],
             Enum.GetNames<PlatformVirtualTrapKind>());
         Assert.True(PlatformVirtualTrapContract.ValidateEvidence(child,
             new(child.LeaseId, child.Generation, child.ParentDomainLease.LeaseId, child.ParentDomainLease.Generation, 1, PlatformVirtualTrapKind.MemoryFault)).IsSuccess);

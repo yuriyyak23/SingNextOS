@@ -8,6 +8,92 @@ namespace SingPlus.Tests.Platform;
 public sealed class PlatformAuthorityBridgeTests
 {
     [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)]
+    public void OriginalRootBindOutcomeRetainsFactAndActualBacking(int outcome)
+    {
+        var provider = new RootSourceProvider { Outcome = outcome };
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 1360, 1791);
+        kernel.AllocateRegion(owner, 128);
+        var subject = new PlatformDomainIdentity(process.DomainId, owner);
+        object? original = null;
+        var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var pending = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_pendingDomainBinds", flags)!.GetValue(kernel.PlatformAuthority)!;
+        var unresolved = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_unresolvedDomainBinds", flags)!.GetValue(kernel.PlatformAuthority)!;
+        provider.DuringBind = () =>
+        {
+            original = pending[subject]!;
+            Assert.True((bool)original.GetType().GetProperty("EffectMayHaveOccurred")!.GetValue(original)!);
+            Assert.False(kernel.BindPlatformDomain(owner).IsSuccess);
+            if (outcome == 3) Assert.True(kernel.PlatformAuthority.ObserveBackendReset().IsSuccess);
+        };
+        Assert.False(kernel.BindPlatformDomain(owner).IsSuccess);
+        Assert.Equal(1, provider.BindCalls);
+        Assert.False(pending.Contains(subject));
+        if (outcome == 4)
+        {
+            Assert.False(unresolved.Contains(subject));
+            Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+            Assert.Equal(RegionState.Released, Assert.Single(kernel.Regions.Snapshot()).State);
+            return;
+        }
+        Assert.Same(original, unresolved[subject]);
+        var observation = original!.GetType().GetProperty("Observation")!.GetValue(original);
+        if (outcome == 1) Assert.Null(observation);
+        else Assert.NotNull(observation);
+        if (outcome == 2) Assert.NotNull(original.GetType().GetProperty("ReturnedCleanupObservation")!.GetValue(original));
+        Assert.False(kernel.BindPlatformDomain(owner).IsSuccess);
+        Assert.False(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.Equal(1, provider.BindCalls);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
+    }
+    [Fact]
+    public void ResetBeforeOriginalRootBindEffectDoesNotPinActualReclaim()
+    {
+        var provider = new RootSourceProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 1359, 1790);
+        kernel.AllocateRegion(owner, 128);
+        provider.BeforeSource = () =>
+        {
+            provider.BeforeSource = null;
+            Assert.True(kernel.PlatformAuthority.ObserveBackendReset().IsSuccess);
+        };
+        Assert.False(kernel.BindPlatformDomain(owner).IsSuccess);
+        Assert.Equal(0, provider.BindCalls);
+        Assert.False(kernel.PlatformAuthority.HasUnresolvedDomainBindEffect(new(process.DomainId, owner)));
+        Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.Equal(RegionState.Released, Assert.Single(kernel.Regions.Snapshot()).State);
+    }
+
+    private sealed class RootSourceProvider : IPlatformAuthorityProvider, IPlatformFeatureProvider, IPlatformProviderIncarnationSource
+    {
+        private readonly HostPlatformAuthorityProvider host = new();
+        public Action? BeforeSource { get; set; }
+        public Action? DuringBind { get; set; }
+        public int Outcome { get; init; } = -1;
+        public int BindCalls { get; private set; }
+        public PlatformProviderIncarnation CurrentIncarnation { get { BeforeSource?.Invoke(); return new(1); } }
+        public PlatformProviderDescriptor Descriptor => host.Descriptor;
+        public PlatformFeatureManifest QueryFeatures() => host.QueryFeatures();
+        public PlatformAuthorityResult<PlatformProviderDomainLease> BindDomain(PlatformDomainIdentity subject)
+        {
+            BindCalls++;
+            var result = Outcome == 4 ? PlatformAuthorityResult<PlatformProviderDomainLease>.Fail(PlatformAuthorityStatus.NotAccepted, "No invocation accepted.") : host.BindDomain(subject);
+            DuringBind?.Invoke();
+            return Outcome switch
+            {
+                0 => PlatformAuthorityResult<PlatformProviderDomainLease>.Fail(PlatformAuthorityStatus.Denied, "Original outcome failed after effect."),
+                1 => throw new IOException("Original response lost."),
+                2 => PlatformAuthorityResult<PlatformProviderDomainLease>.Ok(result.Value! with { LeaseId = new(0) }),
+                _ => result
+            };
+        }
+        public PlatformAuthorityResult RevokeDomain(PlatformProviderDomainLease lease) => host.RevokeDomain(lease);
+        public PlatformAuthorityResult<PlatformProviderRegionMappingLease> MapOwnedRegion(PlatformProviderDomainLease d, PlatformRegionIdentity r, PlatformMemoryAccess a) => host.MapOwnedRegion(d, r, a);
+        public PlatformAuthorityResult RevokeRegionMapping(PlatformProviderRegionMappingLease m, PlatformRegionRevocationPolicy p) => host.RevokeRegionMapping(m, p);
+    }
+    [Theory]
     [InlineData(0, 0)] [InlineData(0, 1)] [InlineData(0, 2)]
     [InlineData(1, 0)] [InlineData(1, 1)] [InlineData(1, 2)]
     [InlineData(2, 0)] [InlineData(2, 1)] [InlineData(2, 2)]

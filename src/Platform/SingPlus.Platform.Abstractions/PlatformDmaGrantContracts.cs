@@ -158,3 +158,42 @@ public interface IPlatformDmaGrantProvider
 
     PlatformAuthorityResult RevokeDmaGrant(PlatformProviderDmaGrant grant);
 }
+
+/// <summary>Optional exact guarantee: NotAccepted on BindDmaGrant proves this invocation
+/// performed no effect. It proves neither closure of a different invocation nor release.</summary>
+public interface IPlatformDmaGrantAdmissionNoEffectProvider : IPlatformDmaGrantProvider { }
+/// <summary>Optional exact guarantee: NotAccepted on RevokeDmaGrant proves this invocation
+/// performed no effect. The existing admitted grant remains open.</summary>
+public interface IPlatformDmaGrantRevocationNoEffectProvider : IPlatformDmaGrantProvider { }
+
+/// <summary>Pure surviving original lifetime lookup. Success proves the exact admitted
+/// grant closed at its producing owner. Missing/failure/NotAccepted never proves closure
+/// or no-effect. Lookup cannot initiate or repeat revocation.</summary>
+public interface IPlatformDmaGrantRevocationResolutionProvider : IPlatformDmaGrantProvider
+{
+    PlatformAuthorityResult ResolveDmaGrantRevocation(PlatformProviderDmaGrant grant);
+}
+
+/// <summary>Optional surviving-original guarantee: NotAccepted from the pure resolution
+/// proves only that the retained revocation invocation performed no effect. It is not
+/// grant closure and cannot discharge independent users. The producer retains original
+/// request/raw/source continuity and consumes no-effect only after exact source checks;
+/// lookup never starts another revocation. Without this opt-in, NotAccepted is unknown.</summary>
+public interface IPlatformDmaGrantRevocationResolutionNoEffectProvider : IPlatformDmaGrantRevocationResolutionProvider { }
+
+/// <summary>Opaque original request identity, retained by existing admission owners;
+/// neither an authority object nor a durable token.</summary>
+public sealed class PlatformOriginalDmaGrantBindRequest(PlatformDmaGrantRequest request)
+{
+    public Guid InvocationId { get; } = Guid.NewGuid();
+    public PlatformDmaGrantRequest Request { get; } = request;
+}
+/// <summary>Exactly one of no-effect or cleanup-only grant is returned. Neither grants
+/// DMA permission. The original request reference must match; absence is unknown.</summary>
+public readonly record struct PlatformOriginalDmaGrantBindResolution(PlatformOriginalDmaGrantBindRequest Request,
+    bool NoEffectGuaranteed, PlatformProviderDmaGrant? CleanupGrant);
+public interface IPlatformOriginalDmaGrantProvider : IPlatformDmaGrantProvider
+{
+    PlatformAuthorityResult<PlatformProviderDmaGrant> BindDmaGrant(PlatformOriginalDmaGrantBindRequest request);
+    PlatformAuthorityResult<PlatformOriginalDmaGrantBindResolution> ResolveDmaGrantBind(PlatformOriginalDmaGrantBindRequest request);
+}

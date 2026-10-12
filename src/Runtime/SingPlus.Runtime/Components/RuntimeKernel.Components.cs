@@ -774,6 +774,9 @@ public sealed partial class RuntimeKernel
                 return KernelResult<EndpointSessionHandle>.Fail(closed.Error, closed.Message!);
         }
 
+        // Observe after preflight/old closure, outside owner commit locks.
+        BeforeComponentDependencySessionQualificationHook?.Invoke();
+
         lock (_platformMemoryUseGate)
         lock (_componentAdmissionGate)
         {

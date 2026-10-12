@@ -88,7 +88,7 @@ public sealed class IrqDeliveryContinuityTests
         var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, ChildClosureTupleTests.RootCloseRuntimeProxy>();
         var proxy = (ChildClosureTupleTests.RootCloseRuntimeProxy)(object)runtime;
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         var device = provider.BindDevice(parent, new("irq-device"), PlatformDeviceRights.Read | PlatformDeviceRights.Configure).Value!;
         var binding = provider.BindInterrupt(device, new("irq", PlatformInterruptTrigger.Edge)).Value!;
         var records = (global::System.Collections.IDictionary)provider.GetType().GetField("_irqBindings",

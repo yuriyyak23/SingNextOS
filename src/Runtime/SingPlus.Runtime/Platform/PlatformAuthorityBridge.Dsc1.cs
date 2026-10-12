@@ -546,7 +546,7 @@ public sealed partial class PlatformAuthorityBridge
 
     internal KernelResult CommitDsc1LocalReservationRelease(
         PlatformDsc1CopySubmission submission,
-        Action<bool> consume)
+        Func<bool,KernelResult> consume)
     {
         lock (_secureDomainLifecycleGate)
         lock (_dsc1Gate)
@@ -570,7 +570,8 @@ public sealed partial class PlatformAuthorityBridge
             }
             // Trusted local buffer/registry mutation, with the kernel memory gate
             // held. No provider/composition/notification callback enters this gate.
-            consume(record.PublicationAdmitted);
+            var consumed=consume(record.PublicationAdmitted);
+            if(!consumed.IsSuccess)return consumed;
             record.LocalReservationsReleased = true;
             _dsc1Operations.Remove(submission.SubmissionId);
             record.OriginalDomain.Dsc1Operations.Remove(record);

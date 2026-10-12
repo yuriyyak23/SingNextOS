@@ -18,23 +18,49 @@ public sealed partial class PlatformAuthorityBridge
     private sealed record UnpublishedSecureRegionReceipt(PlatformRegionMapping Mapping,
         PlatformProviderRegionMappingLease AdmittedMapping, PlatformSecureRegionClass RequestedClass,
         PlatformBackendEpoch AdmissionEpoch, PlatformProviderSecureRegionBinding Receipt);
-    private sealed record SecureDomainRecord(SecureDomainBinding Binding, PlatformProviderSecureDomainLease ProviderLease)
+    private sealed class SecureDomainRecord
     {
+        private readonly object _sourceGate;
+        public SecureDomainRecord(SecureDomainBinding binding, PlatformProviderSecureDomainLease providerLease, object sourceGate)
+        { Binding = binding; ProviderLease = providerLease; OriginalOwner = this; _sourceGate = sourceGate; }
+        public SecureDomainBinding Binding { get; }
+        public PlatformProviderSecureDomainLease ProviderLease { get; }
+        public SecureDomainRecord OriginalOwner { get; }
         // Immutable admitted evidence projection; never permission or a replacement receipt.
         public string ProvenPropertiesKey { get; init; } = "";
         public Dictionary<PlatformRegionMappingId, SecureRegionBindInvocationFact> RegionBindInvocations { get; } = [];
+        public Dictionary<PlatformRegionMappingId, SecureRegionBindInvocationFact> RegionBindingOwners { get; } = [];
         public Dictionary<PlatformRegionMappingId, PlatformAuthorityResult<PlatformProviderSecureRegionBinding>> RegionBindObservations { get; } = [];
         public Dictionary<PlatformRegionMappingId, MappingRecord> RegionMappingSources { get; } = [];
         public Dictionary<PlatformRegionMappingId, PlatformProviderSecureRegionBinding> Regions { get; } = [];
         public Dictionary<PlatformRegionMappingId, UnpublishedSecureRegionReceipt> UnpublishedRegionReceipts { get; } = [];
         public HashSet<PlatformRegionMappingId> QuarantinedRegions { get; } = [];
-        public bool TerminalQuarantined { get; set; }
+        private bool _terminalQuarantined;
+        public long TerminalRevision { get; private set; }
+        public bool TerminalRevisionExhausted { get; private set; }
+        public bool TerminalQuarantined
+        {
+            get { lock (_sourceGate) return _terminalQuarantined; }
+            set
+            {
+                lock (_sourceGate)
+                {
+                if (TerminalRevision == long.MaxValue) TerminalRevisionExhausted = true;
+                else TerminalRevision++;
+                _terminalQuarantined = value;
+                }
+            }
+        }
         public PlatformAuthorityResult<PlatformProviderSecureDomainLease>? CreateObservation { get; set; }
         public DomainRecord? CreateSource { get; init; }
         public bool TransitionInFlight { get; set; }
         public SecureTransitionInvocationFact? LastTransitionInvocation { get; set; }
         public bool RevokeInFlight { get; set; }
+        public bool RevokeInvoked { get; set; }
+        public SecureClosureInvocationFact? ClosureQuarantineOwner { get; set; }
+        public HashSet<SecureRegionBindInvocationFact> RegionCloseInvoked { get; } = [];
         public bool ClosureConsumed { get; set; }
+        public bool CleanupOnly { get; set; }
         public SecureDomainRevokeInvocationFact? RevokeInvocation { get; set; }
         public HashSet<PlatformRegionMappingId> RegionMutationsInFlight { get; } = [];
         public SecureDomainClosureReceiptFact? LastClosureReceipt { get; set; }
@@ -42,49 +68,68 @@ public sealed partial class PlatformAuthorityBridge
         public List<SecureRegionClosureInvocationFact> RegionClosureInvocations { get; } = [];
         public bool Quarantined => TerminalQuarantined || QuarantinedRegions.Count != 0;
     }
-    private sealed class SecureRegionBindInvocationFact(SecureDomainRecord source, PlatformRegionMapping mapping,
-        PlatformProviderRegionMappingLease admittedMapping, PlatformSecureRegionClass regionClass, PlatformBackendEpoch epoch)
+    private sealed class SecureRegionBindInvocationFact
     {
-        public SecureDomainRecord Source { get; } = source;
-        public PlatformRegionMapping Mapping { get; } = mapping;
-        public PlatformProviderRegionMappingLease AdmittedMapping { get; } = admittedMapping;
-        public PlatformSecureRegionClass RegionClass { get; } = regionClass;
-        public PlatformBackendEpoch Epoch { get; } = epoch;
+        public SecureRegionBindInvocationFact(SecureDomainRecord source, PlatformRegionMapping mapping,
+            PlatformProviderRegionMappingLease admittedMapping, PlatformSecureRegionClass regionClass, PlatformBackendEpoch epoch)
+        { OriginalOwner = this; Source = source; Mapping = mapping; AdmittedMapping = admittedMapping; RegionClass = regionClass; Epoch = epoch; }
+        public SecureRegionBindInvocationFact OriginalOwner { get; }
+        public SecureDomainRecord Source { get; }
+        public PlatformRegionMapping Mapping { get; }
+        public PlatformProviderRegionMappingLease AdmittedMapping { get; }
+        public PlatformSecureRegionClass RegionClass { get; }
+        public PlatformBackendEpoch Epoch { get; }
         public PlatformAuthorityResult<PlatformProviderSecureRegionBinding>? Observation { get; set; }
         public PlatformAuthorityResult<PlatformSecureRegionClosureReceipt>? ReturnedObjectCleanup { get; set; }
     }
     // Original invocation correlation; neither a permission nor closure proof.
-    private sealed class SecureTransitionInvocationFact(SecureDomainRecord source,
-        PlatformSecureDomainTransition transition, PlatformBackendEpoch epoch)
+    private sealed class SecureTransitionInvocationFact
     {
-        public SecureDomainRecord Source { get; } = source;
-        public PlatformProviderSecureDomainLease AdmittedLease { get; } = source.ProviderLease;
-        public PlatformSecureDomainTransition Transition { get; } = transition;
-        public PlatformBackendEpoch Epoch { get; } = epoch;
+        public SecureTransitionInvocationFact(SecureDomainRecord source, PlatformSecureDomainTransition transition, PlatformBackendEpoch epoch)
+        { Source = source; AdmittedLease = source.ProviderLease; Transition = transition; Epoch = epoch; OriginalOwner = this; }
+        public SecureTransitionInvocationFact OriginalOwner { get; }
+        public SecureDomainRecord Source { get; }
+        public PlatformProviderSecureDomainLease AdmittedLease { get; }
+        public PlatformSecureDomainTransition Transition { get; }
+        public PlatformBackendEpoch Epoch { get; }
         public PlatformAuthorityResult<PlatformSecureDomainTransitionReceipt>? Observation { get; set; }
+        public bool Published { get; set; }
+        public long? CleanupQuarantineRevision { get; set; }
+        public bool CleanupConsumed { get; set; }
     }
     // Cleanup correlation only; raw replies do not prove exact closure or continuity.
     private sealed record SecureDomainClosureReceiptFact(PlatformProviderSecureDomainLease AdmittedLease,
         PlatformBackendEpoch AdmissionEpoch, PlatformSecureDomainClosureReceipt Receipt);
-    private sealed class SecureDomainRevokeInvocationFact(SecureDomainRecord source, PlatformBackendEpoch epoch)
+    private abstract class SecureClosureInvocationFact
     {
-        public SecureDomainRecord Source { get; } = source;
-        public PlatformProviderSecureDomainLease AdmittedLease { get; } = source.ProviderLease;
-        public DomainRecord? ParentSource { get; } = source.CreateSource;
-        public PlatformBackendEpoch Epoch { get; } = epoch;
+        protected SecureClosureInvocationFact(SecureDomainRecord source, PlatformBackendEpoch epoch)
+        { OriginalOwner = this; Source = source; ParentSource = source.CreateSource; Epoch = epoch; }
+        public SecureClosureInvocationFact OriginalOwner { get; }
+        public SecureDomainRecord Source { get; }
+        public DomainRecord? ParentSource { get; }
+        public PlatformBackendEpoch Epoch { get; }
+        public bool ValidatedClosed { get; set; }
+        public long? OwnQuarantineRevision { get; set; }
+        public bool Consumed { get; set; }
+    }
+    private sealed class SecureDomainRevokeInvocationFact : SecureClosureInvocationFact
+    {
+        public SecureDomainRevokeInvocationFact(SecureDomainRecord source, PlatformBackendEpoch epoch) : base(source, epoch)
+        { AdmittedLease = source.ProviderLease; }
+        public PlatformProviderSecureDomainLease AdmittedLease { get; }
         public PlatformAuthorityResult<PlatformSecureDomainClosureReceipt>? Observation { get; set; }
     }
     private sealed record SecureRegionClosureReceiptFact(PlatformProviderSecureRegionBinding AdmittedBinding,
         PlatformBackendEpoch AdmissionEpoch, PlatformSecureRegionClosureReceipt Receipt);
     // Preserve original cleanup attempts across V1 retries; raw responses are not closure authority.
-    private sealed class SecureRegionClosureInvocationFact(SecureDomainRecord source, MappingRecord mappingSource,
-        PlatformProviderSecureRegionBinding admittedBinding, PlatformBackendEpoch epoch)
+    private sealed class SecureRegionClosureInvocationFact : SecureClosureInvocationFact
     {
-        public SecureDomainRecord Source { get; } = source;
-        public MappingRecord MappingSource { get; } = mappingSource;
-        public DomainRecord? ParentSource { get; } = source.CreateSource;
-        public PlatformProviderSecureRegionBinding AdmittedBinding { get; } = admittedBinding;
-        public PlatformBackendEpoch Epoch { get; } = epoch;
+        public SecureRegionClosureInvocationFact(SecureDomainRecord source, MappingRecord mappingSource,
+            PlatformProviderSecureRegionBinding admittedBinding, PlatformBackendEpoch epoch, SecureRegionBindInvocationFact bindingSource) : base(source, epoch)
+        { MappingSource = mappingSource; AdmittedBinding = admittedBinding; BindingSource = bindingSource; }
+        public SecureRegionBindInvocationFact BindingSource { get; }
+        public MappingRecord MappingSource { get; }
+        public PlatformProviderSecureRegionBinding AdmittedBinding { get; }
         public PlatformAuthorityResult<PlatformSecureRegionClosureReceipt>? Observation { get; set; }
     }
     private readonly Dictionary<SecureDomainBindingId, SecureDomainRecord> _secureDomains = [];
@@ -249,7 +294,7 @@ public sealed partial class PlatformAuthorityBridge
                     if (!exactlyClosed)
                     {
                         var quarantined = reservedBinding;
-                        var retained = new SecureDomainRecord(quarantined, lease) { TerminalQuarantined = true, CreateSource = originalParent };
+                        var retained = new SecureDomainRecord(quarantined, lease, _secureDomainLifecycleGate) { TerminalQuarantined = true, CreateSource = originalParent };
                         _originalSecureOwners.Add(quarantined.BindingId, retained);
                         _secureDomains.Add(quarantined.BindingId, retained);
                     }
@@ -270,7 +315,7 @@ public sealed partial class PlatformAuthorityBridge
                         "Parent or backend changed before secure-domain publication; possible effect remains pinned.");
                 }
                 var binding = reservedBinding;
-                var published = new SecureDomainRecord(binding, lease) { CreateObservation = invocation!.Observation,
+                var published = new SecureDomainRecord(binding, lease, _secureDomainLifecycleGate) { CreateObservation = invocation!.Observation,
                     CreateSource = originalParent, ProvenPropertiesKey = provenPropertiesKey };
                 _originalSecureOwners.Add(binding.BindingId, published);
                 _secureDomains.Add(binding.BindingId, published);
@@ -380,12 +425,76 @@ public sealed partial class PlatformAuthorityBridge
         }
     }
 
-    internal void QuarantineSecureDomainLocalTransition(SecureDomainBinding binding)
+    internal void QuarantineSecureDomainLocalTransition(SecureDomainBinding binding, bool knownLocalSourceRefusal = false)
     {
         lock (_secureDomainLifecycleGate)
         {
-            if (_secureDomains.TryGetValue(binding.BindingId, out var record) && record.Binding == binding)
+            if (_originalSecureOwners.TryGetValue(binding.BindingId, out var record) && record.Binding == binding)
+            {
+                var eligible = knownLocalSourceRefusal && !record.Quarantined &&
+                    record.LastTransitionInvocation is { Published: true, Transition: PlatformSecureDomainTransition.BeginDrain } fact &&
+                    ReferenceEquals(fact.OriginalOwner, fact) && ReferenceEquals(fact.Source, record);
                 record.TerminalQuarantined = true;
+                if (eligible && !record.TerminalRevisionExhausted)
+                    record.LastTransitionInvocation!.CleanupQuarantineRevision = record.TerminalRevision;
+            }
+        }
+    }
+
+    // Pure consumption of a previously published original acknowledgement. Revoke still supplies closure.
+    private static bool HasConsumedSecureDrainContinuity(SecureDomainRecord record) => !record.CleanupOnly ||
+        (record.LastTransitionInvocation is { Published: true, CleanupConsumed: true, Observation: { } observation } fact &&
+         ReferenceEquals(fact.OriginalOwner, fact) && ReferenceEquals(fact.Source, record) &&
+         !record.TerminalRevisionExhausted && fact.CleanupQuarantineRevision == record.TerminalRevision &&
+         fact.Transition == PlatformSecureDomainTransition.BeginDrain && fact.AdmittedLease == record.ProviderLease &&
+         observation.IsSuccess && observation.Value.Domain == fact.AdmittedLease &&
+         observation.Value.Transition == fact.Transition && observation.Value.Accepted);
+
+    internal KernelResult<bool> ConsumeKnownSecureDrainForCleanup(SecureDomainBinding binding)
+    {
+        lock (_secureDomainLifecycleGate)
+        {
+            var initial = ResolveSecure(binding);
+            if (!initial.IsSuccess) return KernelResult<bool>.Fail(initial.Error, initial.Message!);
+            // Ordinary teardown retains its existing fresh admission path and query boundaries.
+            if (!initial.Value!.Quarantined && !initial.Value.CleanupOnly)
+                return KernelResult<bool>.Ok(false);
+        }
+        PlatformProviderIncarnation incarnation;
+        try { incarnation = CurrentProviderIncarnation(); }
+        catch (Exception exception) when (exception is not StackOverflowException)
+        { return KernelResult<bool>.Fail(KernelError.PlatformFaulted, "Secure cleanup source is unavailable."); }
+        lock (_secureDomainLifecycleGate)
+        {
+            var resolved = ResolveSecure(binding);
+            if (!resolved.IsSuccess) return KernelResult<bool>.Fail(resolved.Error, resolved.Message!);
+            var record = resolved.Value!;
+            var fact = record.LastTransitionInvocation;
+            if (record.TransitionInFlight || record.RevokeInFlight || record.RegionMutationsInFlight.Count != 0)
+                return KernelResult<bool>.Fail(KernelError.PlatformBindingActive, "Secure cleanup must wait for original invocations.");
+            if (record.CreateSource is not { } source || incarnation.Value == 0 || incarnation != source.ProviderIncarnation ||
+                _backendEpochExhausted || source.BackendEpoch != BackendEpoch ||
+                !TryGetCanonicalRootRecord(binding.Parent.BindingId, out var parent) || !ReferenceEquals(parent, source) ||
+                parent.ProviderLease != record.ProviderLease.Parent || !ValidateDomain(binding.Parent, binding.Parent.Subject).IsSuccess)
+                return KernelResult<bool>.Fail(KernelError.PlatformFaulted, "Original secure cleanup source changed.");
+            var known = fact is { Published: true, Observation: { } observation } &&
+                ReferenceEquals(fact.OriginalOwner, fact) && ReferenceEquals(fact.Source, record) && fact.Epoch == BackendEpoch && fact.AdmittedLease == record.ProviderLease &&
+                observation.IsSuccess && observation.Value.Domain == fact.AdmittedLease &&
+                observation.Value.Transition == fact.Transition && observation.Value.Accepted;
+            if (record.CleanupOnly && (!known || fact is not { CleanupConsumed: true } ||
+                record.TerminalRevisionExhausted || fact.CleanupQuarantineRevision != record.TerminalRevision))
+                return KernelResult<bool>.Fail(KernelError.PlatformFaulted, "Consumed original drain continuity changed; no transition may repeat.");
+            if (record.Quarantined)
+            {
+                if (!known || record.QuarantinedRegions.Count != 0 || record.RevokeInvocation is not null ||
+                    record.TerminalRevisionExhausted || fact!.CleanupQuarantineRevision != record.TerminalRevision)
+                    return KernelResult<bool>.Fail(KernelError.PlatformFaulted, "Independent or unknown secure outcome remains pinned.");
+                record.TerminalQuarantined = false;
+                fact.CleanupConsumed = true;
+                fact.CleanupQuarantineRevision = record.TerminalRevision;
+                record.CleanupOnly = true;
+            }
+            return KernelResult<bool>.Ok(known && fact!.Transition == PlatformSecureDomainTransition.BeginDrain);
         }
     }
 
@@ -403,6 +512,7 @@ public sealed partial class PlatformAuthorityBridge
             var secure = ResolveSecure(binding);
             if (!secure.IsSuccess) return KernelResult.Fail(secure.Error, secure.Message!);
             record = secure.Value!;
+            if (record.CleanupOnly) return KernelResult.Fail(KernelError.PlatformFaulted, "Secure domain permits original cleanup only.");
             if (record.Quarantined) return KernelResult.Fail(KernelError.PlatformFaulted, "Secure domain is quarantined.");
             if (record.TransitionInFlight || record.RevokeInFlight || record.RegionMutationsInFlight.Contains(mapping.MappingId))
                 return KernelResult.Fail(KernelError.PlatformBindingActive, "Secure-domain transition, revoke, or exact mapping mutation is in flight.");
@@ -543,6 +653,7 @@ public sealed partial class PlatformAuthorityBridge
                         "Secure-region bind lost backend continuity before binding publication.");
                 }
                 record.Regions.Add(mapping.MappingId, providerBinding);
+                record.RegionBindingOwners.Add(mapping.MappingId, invocation);
                 record.RegionMappingSources[mapping.MappingId] = originalMapping;
                 record.RegionBindObservations[mapping.MappingId] = result;
                 record.RegionBindInvocations.Remove(mapping.MappingId);
@@ -566,22 +677,31 @@ public sealed partial class PlatformAuthorityBridge
     }
 
     internal KernelResult UnbindSecureRegion(SecureDomainBinding binding, PlatformRegionMapping mapping,
-        Func<Func<Func<KernelResult>, KernelResult>, KernelResult>? completionConsumer = null)
+        Func<Func<Func<KernelResult>, KernelResult>, KernelResult>? completionConsumer = null, object? originalBindingSource = null)
     {
+        var retained = ConsumeOriginalSecureRegionClosure(binding, mapping, completionConsumer, originalBindingSource);
+        if (!retained.IsSuccess) return KernelResult.Fail(retained.Error, retained.Message!);
+        if (retained.Value) return KernelResult.Ok();
         SecureDomainRecord record;
         PlatformProviderSecureRegionBinding providerBinding;
         PlatformBackendEpoch backendEpoch;
         MappingRecord originalMapping;
+        SecureRegionBindInvocationFact originalBinding;
         lock (_secureDomainLifecycleGate)
         {
             var secure = ResolveSecure(binding);
             if (!secure.IsSuccess) return KernelResult.Fail(secure.Error, secure.Message!);
             record = secure.Value!;
+            if (!record.RegionBindingOwners.TryGetValue(mapping.MappingId, out var bindingOwner) ||
+                !OriginalSecureRegionBindingCurrent(record, bindingOwner) ||
+                originalBindingSource is not null && !ReferenceEquals(originalBindingSource, bindingOwner))
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Original secure-region binding source changed.");
             if (!record.Regions.TryGetValue(mapping.MappingId, out providerBinding))
                 return KernelResult.Fail(KernelError.PlatformBindingNotFound, "Secure-region binding was not found.");
             if (!_mappings.TryGetValue(mapping.MappingId, out var mapped) || mapped.Mapping != mapping)
                 return KernelResult.Fail(KernelError.StaleGeneration, "Exact secure-region mapping is absent or stale.");
             originalMapping = mapped;
+            originalBinding = bindingOwner;
             if (record.TerminalQuarantined)
                 return KernelResult.Fail(KernelError.PlatformFaulted, "Secure domain is quarantined.");
             if (record.TransitionInFlight || record.RevokeInFlight || record.RegionMutationsInFlight.Contains(mapping.MappingId))
@@ -601,7 +721,7 @@ public sealed partial class PlatformAuthorityBridge
                 }
                 catch (Exception exception) when (exception is not StackOverflowException) { return false; }
             }
-            bool OriginalOwnersCurrent() => BackendEpoch == backendEpoch && !_backendEpochExhausted &&
+            bool OriginalOwnersCurrent() => OriginalSecureRegionBindingCurrent(record, originalBinding) && BackendEpoch == backendEpoch && !_backendEpochExhausted &&
                 _secureDomains.TryGetValue(binding.BindingId, out var currentSecure) && IsOriginalSecureOwner(record) && ReferenceEquals(currentSecure, record) &&
                 _mappings.TryGetValue(mapping.MappingId, out var currentMapping) && ReferenceEquals(currentMapping, originalMapping) &&
                 originalMapping.BackendEpoch == backendEpoch && record.CreateSource is { } parent &&
@@ -613,8 +733,9 @@ public sealed partial class PlatformAuthorityBridge
             {
                 if (!sourceCurrent || !OriginalOwnersCurrent())
                     return KernelResult.Fail(KernelError.PlatformFaulted, "Secure-region cleanup source changed before provider invocation.");
-                invocation = new(record, originalMapping, providerBinding, backendEpoch);
+                invocation = new(record, originalMapping, providerBinding, backendEpoch, originalBinding);
                 record.RegionClosureInvocations.Add(invocation);
+                record.RegionCloseInvoked.Add(originalBinding);
             }
             PlatformAuthorityResult<PlatformSecureRegionClosureReceipt> result;
             try { result = ((IPlatformSecureComputeProvider)_provider!).UnbindSecureRegion(providerBinding); }
@@ -654,6 +775,7 @@ public sealed partial class PlatformAuthorityBridge
                     record.QuarantinedRegions.Add(mapping.MappingId);
                     return KernelResult.Fail(KernelError.PlatformFaulted, "Provider secure-region closure receipt is malformed.");
                 }
+                invocation.ValidatedClosed = true;
             }
             sourceCurrent = SourceCurrent();
             var committed = false;
@@ -668,20 +790,22 @@ public sealed partial class PlatformAuthorityBridge
                         (completionConsumer is not null && (!ValidateDomain(binding.Parent, binding.Parent.Subject).IsSuccess ||
                             record.QuarantinedRegions.Any(id => id != mapping.MappingId))))
                     {
-                        record.TerminalQuarantined = true;
+                        QuarantineSecureClosure(record, invocation);
                         record.QuarantinedRegions.Add(mapping.MappingId);
                         return KernelResult.Fail(KernelError.PlatformFaulted, "Exact secure-region closure changed before local completion.");
                     }
                     var completed = commit();
                     if (!completed.IsSuccess)
                     {
-                        record.TerminalQuarantined = true;
+                        QuarantineSecureClosure(record, invocation);
                         record.QuarantinedRegions.Add(mapping.MappingId);
                         return completed;
                     }
                     record.Regions.Remove(mapping.MappingId);
+                    record.RegionBindingOwners.Remove(mapping.MappingId);
                     record.RegionMappingSources.Remove(mapping.MappingId);
                     record.QuarantinedRegions.Remove(mapping.MappingId);
+                    invocation.Consumed = true;
                     committed = true;
                     return KernelResult.Ok();
                 }
@@ -693,7 +817,7 @@ public sealed partial class PlatformAuthorityBridge
                 {
                     if (!completed.IsSuccess || !committed)
                     {
-                        record.TerminalQuarantined = true;
+                        QuarantineSecureClosure(record, invocation);
                         record.QuarantinedRegions.Add(mapping.MappingId);
                         return completed.IsSuccess
                             ? KernelResult.Fail(KernelError.PlatformFaulted, "Secure-region local completion was not committed.") : completed;
@@ -705,7 +829,7 @@ public sealed partial class PlatformAuthorityBridge
             {
                 lock (_secureDomainLifecycleGate)
                 {
-                    record.TerminalQuarantined = true;
+                    QuarantineSecureClosure(record, invocation);
                     record.QuarantinedRegions.Add(mapping.MappingId);
                 }
                 return KernelResult.Fail(KernelError.PlatformFaulted, $"Known secure-region closure could not complete locally: {exception.Message}");
@@ -734,6 +858,7 @@ public sealed partial class PlatformAuthorityBridge
             var secure = ResolveSecure(binding);
             if (!secure.IsSuccess) return KernelResult.Fail(secure.Error, secure.Message!);
             if (secure.Value!.Quarantined) return KernelResult.Fail(KernelError.PlatformFaulted, "Secure domain is quarantined.");
+            if (secure.Value.CleanupOnly) return KernelResult.Fail(KernelError.PlatformFaulted, "Consumed original drain cannot repeat or authorize active transitions.");
             if (!Enum.IsDefined(transition)) return KernelResult.Fail(KernelError.PlatformDenied, "Secure-domain transition is invalid.");
             if (secure.Value.TransitionInFlight)
                 return KernelResult.Fail(KernelError.PlatformBindingActive, "Secure-domain transition is already in flight.");
@@ -794,6 +919,7 @@ public sealed partial class PlatformAuthorityBridge
                     if (!result.IsSuccess) { record.TerminalQuarantined = true; return FromProviderFailure(result.Status, result.Message); }
                     if (result.Value.Domain != record.ProviderLease || result.Value.Transition != transition || !result.Value.Accepted)
                     { record.TerminalQuarantined = true; return KernelResult.Fail(KernelError.PlatformFaulted, "Provider secure-domain transition receipt is malformed."); }
+                    invocation!.Published = true;
                     return KernelResult.Ok();
                 }
             }
@@ -816,6 +942,9 @@ public sealed partial class PlatformAuthorityBridge
     internal KernelResult RevokeSecureDomain(SecureDomainBinding binding,
         Func<Func<Func<KernelResult>, KernelResult>, KernelResult>? completionConsumer = null)
     {
+        var retained = ConsumeOriginalSecureDomainClosure(binding, completionConsumer);
+        if (!retained.IsSuccess) return KernelResult.Fail(retained.Error, retained.Message!);
+        if (retained.Value) return KernelResult.Ok();
         KernelResult<SecureDomainRecord> secure;
         PlatformBackendEpoch backendEpoch;
         lock (_secureDomainLifecycleGate)
@@ -847,6 +976,7 @@ public sealed partial class PlatformAuthorityBridge
         }
         bool OriginalOwnersCurrent() => BackendEpoch == backendEpoch && !_backendEpochExhausted &&
             _secureDomains.TryGetValue(binding.BindingId, out var owner) && IsOriginalSecureOwner(secure.Value) && ReferenceEquals(owner, secure.Value) &&
+            HasConsumedSecureDrainContinuity(secure.Value) &&
             originalParent is not null && TryGetCanonicalRootRecord(binding.Parent.BindingId, out var parent) &&
             ReferenceEquals(parent, originalParent) && parent.BackendEpoch == backendEpoch &&
             parent.ProviderLease == secure.Value.ProviderLease.Parent && !parent.ParentRevokeMayHaveEffect;
@@ -856,6 +986,7 @@ public sealed partial class PlatformAuthorityBridge
             if (!sourceCurrent || !OriginalOwnersCurrent())
                 return KernelResult.Fail(KernelError.PlatformFaulted, "Secure-domain revoke source changed before provider invocation.");
             secure.Value.RevokeInvocation = new(secure.Value, backendEpoch);
+            secure.Value.RevokeInvoked = true;
         }
         PlatformAuthorityResult<PlatformSecureDomainClosureReceipt> result;
         try { result = ((IPlatformSecureComputeProvider)_provider!).RevokeSecureDomain(secure.Value.ProviderLease); }
@@ -887,6 +1018,7 @@ public sealed partial class PlatformAuthorityBridge
             if (!result.IsSuccess) { secure.Value.TerminalQuarantined = true; return FromProviderFailure(result.Status, result.Message); }
             if (!IsExactClosure(result, secure.Value.ProviderLease))
             { secure.Value.TerminalQuarantined = true; return KernelResult.Fail(KernelError.PlatformFaulted, "Provider secure-domain closure receipt is malformed."); }
+            secure.Value.RevokeInvocation!.ValidatedClosed = true;
             // Keep the admission interlock through required local completion.
             secure.Value.RevokeInFlight = true;
         }
@@ -900,13 +1032,14 @@ public sealed partial class PlatformAuthorityBridge
                     !_secureDomains.TryGetValue(binding.BindingId, out var current) ||
                     (!IsOriginalSecureOwner(secure.Value) || !ReferenceEquals(current, secure.Value)))
                 {
-                    secure.Value.TerminalQuarantined = true;
+                    QuarantineSecureClosure(secure.Value, secure.Value.RevokeInvocation!);
                     return KernelResult.Fail(KernelError.PlatformFaulted,
                         "Secure-domain closure changed before local completion.");
                 }
                 var completed = commit();
-                if (!completed.IsSuccess) { secure.Value.TerminalQuarantined = true; return completed; }
+                if (!completed.IsSuccess) { QuarantineSecureClosure(secure.Value, secure.Value.RevokeInvocation!); return completed; }
                 secure.Value.ClosureConsumed = true;
+                secure.Value.RevokeInvocation!.Consumed = true;
                 _secureDomains.Remove(binding.BindingId);
                 committed = true;
                 return KernelResult.Ok();
@@ -919,7 +1052,7 @@ public sealed partial class PlatformAuthorityBridge
             {
                 if (!completed.IsSuccess || !committed)
                 {
-                    secure.Value!.TerminalQuarantined = true;
+                    QuarantineSecureClosure(secure.Value!, secure.Value.RevokeInvocation!);
                     return completed.IsSuccess
                         ? KernelResult.Fail(KernelError.PlatformFaulted, "Secure-domain local completion was not committed.")
                         : completed;
@@ -929,7 +1062,7 @@ public sealed partial class PlatformAuthorityBridge
         }
         catch (Exception exception) when (exception is not StackOverflowException and not OutOfMemoryException)
         {
-            lock (_secureDomainLifecycleGate) secure.Value!.TerminalQuarantined = true;
+            lock (_secureDomainLifecycleGate) QuarantineSecureClosure(secure.Value!, secure.Value.RevokeInvocation!);
             return KernelResult.Fail(KernelError.PlatformFaulted,
                 $"Known secure-domain closure could not complete locally: {exception.Message}");
         }
@@ -946,7 +1079,7 @@ public sealed partial class PlatformAuthorityBridge
         result.IsSuccess && result.Value.Domain == lease && result.Value.Closed;
 
     private bool IsOriginalSecureOwner(SecureDomainRecord record) =>
-        _originalSecureOwners.TryGetValue(record.Binding.BindingId, out var original) && ReferenceEquals(original, record);
+        ReferenceEquals(record.OriginalOwner, record) && _originalSecureOwners.TryGetValue(record.Binding.BindingId, out var original) && ReferenceEquals(original, record);
 
     private IEnumerable<SecureDomainRecord> SecureDependencyRecordsLocked() =>
         _originalSecureOwners.Values.Concat(_secureDomains.Values).Distinct<SecureDomainRecord>(ReferenceEqualityComparer.Instance);
@@ -955,7 +1088,7 @@ public sealed partial class PlatformAuthorityBridge
     {
         if (!_secureDomains.TryGetValue(binding.BindingId, out var record))
             return KernelResult<SecureDomainRecord>.Fail(KernelError.PlatformBindingNotFound, "Secure-domain binding was not found.");
-        if (record.Binding != binding || record.ClosureConsumed ||
+        if (record.Binding != binding || record.ClosureConsumed || !IsOriginalSecureOwner(record) ||
             !_originalSecureOwners.TryGetValue(binding.BindingId, out var original) || !ReferenceEquals(original, record))
             return KernelResult<SecureDomainRecord>.Fail(KernelError.StaleGeneration, "Secure-domain binding is stale or belongs to another parent.");
         return KernelResult<SecureDomainRecord>.Ok(record);

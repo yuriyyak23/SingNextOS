@@ -293,6 +293,18 @@ public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanag
 
 internal sealed class RuntimeBufferLease<T> : IDisposable where T : unmanaged
 {
+    private sealed class ByteMemory(RuntimeBufferLease<T> owner) : System.Buffers.MemoryManager<byte>
+    {
+        public override Span<byte> GetSpan()
+        {
+            owner.EnsureAccess(owner._access);
+            return System.Runtime.InteropServices.MemoryMarshal.AsBytes(owner._storage.Data.AsSpan());
+        }
+        public override System.Buffers.MemoryHandle Pin(int elementIndex = 0) => throw new NotSupportedException("Managed runtime backing does not expose native pointers.");
+        public override void Unpin() { }
+        protected override void Dispose(bool disposing) { }
+    }
+
     private readonly OwnedBuffer<T>.Storage _storage;
     private readonly RuntimeBufferReservationLifetime _lifetime;
     private readonly RuntimeBufferAccess _access;
@@ -309,6 +321,9 @@ internal sealed class RuntimeBufferLease<T> : IDisposable where T : unmanaged
     }
 
     internal bool IsActive => _lifetime.IsActive && _storage.IsAlive;
+
+    internal ReadOnlyMemory<byte> ReadOnlyBytes { get { EnsureAccess(RuntimeBufferAccess.Read); return new ByteMemory(this).Memory; } }
+    internal Memory<byte> WritableBytes { get { EnsureAccess(RuntimeBufferAccess.Write); return new ByteMemory(this).Memory; } }
 
     internal ReadOnlySpan<T> ReadOnlySpan
     {

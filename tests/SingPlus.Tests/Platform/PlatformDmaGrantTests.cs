@@ -7,6 +7,170 @@ namespace SingPlus.Tests.Platform;
 
 public sealed class PlatformDmaGrantTests
 {
+    [Fact]
+    public void ResolutionNotAcceptedWithoutOptionalGuaranteeRetainsOriginalGrantAndCharge()
+    {
+        var provider = new UnqualifiedResolutionDmaProvider { DmaRevokeStatus = PlatformAuthorityStatus.Faulted };
+        BudgetAccountHandle budget = default;
+        var s = CreateScenario(1347,1447,PlatformDeviceRights.Read | PlatformDeviceRights.Configure,PlatformMemoryAccess.Read,
+            (kernel,subject) => budget = AttachOriginalDmaBudget(kernel,subject),provider);
+        Assert.True(s.Kernel.BindPlatformDma(s.Subject,s.Device,s.Mapping,0,64,PlatformDmaDirection.DeviceReadsMemory).IsSuccess);
+        Assert.False(s.Kernel.TerminateProcess(s.Subject).IsSuccess);
+        Assert.False(s.Kernel.TerminateProcess(s.Subject).IsSuccess);
+        Assert.Equal(1,provider.DmaRevokeCalls); Assert.True(provider.ResolveCalls > 0); Assert.Equal(0,provider.MappingRevokeCalls);
+        Assert.Equal(RegionState.Owned,s.Kernel.Regions.Snapshot().Single(r => r.Handle == s.Mapping.Region).State);
+        Assert.Equal(512UL,s.Kernel.QueryBudget(budget).Value!.Usage.Single(u => u.Dimension == ServiceBudgetDimension.OwnedMemoryBytes).Used);
+    }
+    private sealed class UnqualifiedResolutionDmaProvider : DmaProvider, IPlatformDmaGrantRevocationResolutionProvider, IPlatformDmaGrantRevocationNoEffectProvider
+    {
+        public int ResolveCalls { get; private set; }
+        public PlatformAuthorityResult ResolveDmaGrantRevocation(PlatformProviderDmaGrant grant)
+        { ResolveCalls++; return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.NotAccepted,"No optional resolution no-effect guarantee"); }
+    }
+
+    [Fact]
+    public void OriginalDmaConsumedLifetimeCannotRepinFromLocalProjections()
+    {
+        var s = CreateScenario(1341, 1441, PlatformDeviceRights.Read | PlatformDeviceRights.Configure, PlatformMemoryAccess.Read);
+        var grant = s.Kernel.BindPlatformDma(s.Subject, s.Device, s.Mapping, 0, 64, PlatformDmaDirection.DeviceReadsMemory).Value!;
+        Assert.True(s.Kernel.RevokePlatformDma(s.Subject, grant).IsSuccess);
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_dmaGrants", flags)!.GetValue(s.Kernel.PlatformAuthority)!;
+        var original = routes[grant.GrantId]!;
+        original.GetType().GetProperty("PlatformClosed")!.SetValue(original, false);
+        original.GetType().GetProperty("ProviderGrant")!.SetValue(original, default(PlatformProviderDmaGrant));
+        routes.Remove(grant.GrantId);
+        var tracked = (global::System.Collections.IDictionary)typeof(RuntimeKernel).GetField("_processPlatformDmaGrants", flags)!.GetValue(s.Kernel)!;
+        tracked[s.Subject] = new List<PlatformDmaGrant> { grant };
+        Assert.True(s.Kernel.TerminateProcess(s.Subject).IsSuccess);
+        Assert.Equal(1, s.Provider.DmaRevokeCalls);
+        Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(region => region.Handle == s.Mapping.Region).State);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void OriginalDmaBindCannotPublishAfterEqualOrAbaSourceWrite(bool aba)
+    {
+        var s = CreateScenario(1342, 1442, PlatformDeviceRights.Read | PlatformDeviceRights.Configure, PlatformMemoryAccess.Read);
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        s.Provider.AfterBind = () => s.Provider.QueryObserver = () =>
+        {
+            s.Provider.QueryObserver = null;
+            var routes = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_dmaGrants", flags)!.GetValue(s.Kernel.PlatformAuthority)!;
+            var original = Assert.Single(routes.Values.Cast<object>());
+            var state = original.GetType().GetProperty("PlatformClosed")!;
+            if (aba) state.SetValue(original, true);
+            state.SetValue(original, false);
+        };
+        Assert.False(s.Kernel.BindPlatformDma(s.Subject, s.Device, s.Mapping, 0, 64, PlatformDmaDirection.DeviceReadsMemory).IsSuccess);
+        Assert.Equal(1, s.Provider.DmaBindCalls); Assert.Equal(1, s.Provider.DmaRevokeCalls);
+        Assert.True(s.Kernel.TerminateProcess(s.Subject).IsSuccess);
+        Assert.Equal(1, s.Provider.DmaRevokeCalls);
+    }
+
+    private static BudgetAccountHandle AttachOriginalDmaBudget(RuntimeKernel kernel, ProcessHandle subject)
+    {
+        var admin = TestFixtures.Create(kernel, 97, 997).Handle;
+        var cap = kernel.MintCapability(new(997), admin, ResourceKind.KernelService,
+            CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        return kernel.AdmitProcessBudget(admin, cap, subject, "original-dma-grant",
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 512)]).Value!.ProcessBudget;
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)] [InlineData(5)]
+    public void OriginalDmaKnownClosureConsumesOnlySameFactAndAttachedCharge(int fault)
+    {
+        BudgetAccountHandle budget = default;
+        var s = CreateScenario(1339, 1439, PlatformDeviceRights.Read | PlatformDeviceRights.Configure, PlatformMemoryAccess.Read,
+            (kernel, subject) => budget = AttachOriginalDmaBudget(kernel, subject));
+        var grant = s.Kernel.BindPlatformDma(s.Subject, s.Device, s.Mapping, 0, 64, PlatformDmaDirection.DeviceReadsMemory).Value!;
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_dmaGrants", flags)!.GetValue(s.Kernel.PlatformAuthority)!;
+        var original = routes[grant.GrantId]!;
+        s.Provider.BeforeRevoke = () => s.Provider.QueryObserver = () =>
+        {
+            s.Provider.QueryObserver = null;
+            routes[grant.GrantId] = typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+        };
+        Assert.False(s.Kernel.RevokePlatformDma(s.Subject, grant).IsSuccess);
+        Assert.Equal(1, s.Provider.DmaRevokeCalls);
+        Assert.Equal(512UL, s.Kernel.QueryBudget(budget).Value!.Usage.Single(x => x.Dimension == ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        s.Provider.BeforeRevoke = null; routes[grant.GrantId] = original;
+        var property = original.GetType().GetProperty("OriginalClosure")!;
+        var fact = property.GetValue(original)!;
+        Assert.NotNull(fact.GetType().GetProperty("RawObservation")!.GetValue(fact));
+        Assert.False((bool)original.GetType().GetProperty("ClosureInFlight")!.GetValue(original)!);
+        if (fault == 1) property.SetValue(original, typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(fact, null));
+        if (fault == 2) fact.GetType().GetProperty("RawObservation")!.SetValue(fact, null);
+        if (fault == 3) original.GetType().GetProperty("ProviderGrant")!.SetValue(original, original.GetType().GetProperty("ProviderGrant")!.GetValue(original));
+        if (fault == 4)
+        {
+            original.GetType().GetProperty("PlatformClosed")!.SetValue(original, true);
+            original.GetType().GetProperty("PlatformClosed")!.SetValue(original, false);
+        }
+        if (fault == 5) original.GetType().GetProperty("KnownClosureGrant")!.SetValue(original, null);
+        var retry = s.Kernel.TerminateProcess(s.Subject);
+        Assert.Equal(fault is 0 or 5, retry.IsSuccess);
+        Assert.Equal(1, s.Provider.DmaRevokeCalls);
+        Assert.Equal(fault is 0 or 5 ? 0UL : 512UL, s.Kernel.QueryBudget(budget).Value!.Usage.Single(x => x.Dimension == ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.Equal(fault is 0 or 5 ? RegionState.Released : RegionState.Owned,
+            s.Kernel.Regions.Snapshot().Single(region => region.Handle == s.Mapping.Region).State);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void OriginalDmaUnknownClosureRetainsAttachedChargeAfterHealthyRetry(bool lostReply)
+    {
+        BudgetAccountHandle budget = default;
+        var s = CreateScenario(1340, 1440, PlatformDeviceRights.Read | PlatformDeviceRights.Configure, PlatformMemoryAccess.Read,
+            (kernel, subject) => budget = AttachOriginalDmaBudget(kernel, subject));
+        var grant = s.Kernel.BindPlatformDma(s.Subject, s.Device, s.Mapping, 0, 64, PlatformDmaDirection.DeviceReadsMemory).Value!;
+        if (lostReply) s.Provider.ThrowAfterRevoke = true; else s.Provider.DmaRevokeStatus = PlatformAuthorityStatus.Unavailable;
+        Assert.False(s.Kernel.TerminateProcess(s.Subject).IsSuccess);
+        s.Provider.ThrowAfterRevoke = false; s.Provider.DmaRevokeStatus = null;
+        Assert.False(s.Kernel.TerminateProcess(s.Subject).IsSuccess);
+        Assert.False(s.Kernel.PreparePlatformDmaForDevice(s.Subject, grant).IsSuccess);
+        Assert.Equal(1, s.Provider.DmaRevokeCalls); Assert.Equal(0, s.Provider.MappingRevokeCalls);
+        Assert.Equal(512UL, s.Kernel.QueryBudget(budget).Value!.Usage.Single(x => x.Dimension == ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.Equal(RegionState.Owned, s.Kernel.Regions.Snapshot().Single(region => region.Handle == s.Mapping.Region).State);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void OriginalDmaGrantInventoryCannotDisappearBeforeActualMappingReclaim(int fault)
+    {
+        var s = CreateScenario(1337, 1437, PlatformDeviceRights.Read | PlatformDeviceRights.Configure, PlatformMemoryAccess.Read);
+        var grant = s.Kernel.BindPlatformDma(s.Subject, s.Device, s.Mapping, 0, 64, PlatformDmaDirection.DeviceReadsMemory).Value!;
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_dmaGrants", flags)!.GetValue(s.Kernel.PlatformAuthority)!;
+        var original = routes[grant.GrantId]!;
+        if (fault == 0) routes.Remove(grant.GrantId);
+        if (fault == 1) routes[grant.GrantId] = typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+        if (fault == 2) original.GetType().GetProperty("PlatformClosed")!.SetValue(original, true);
+        Assert.False(s.Kernel.RevokePlatformRegionMapping(s.Subject, s.Mapping).IsSuccess);
+        Assert.Equal(0, s.Provider.DmaRevokeCalls); Assert.Equal(0, s.Provider.MappingRevokeCalls);
+        Assert.False(s.Kernel.QueryPlatformRegionMappingLifecycle(s.Subject, s.Mapping.Mapping).Value!.LocalReservationReleased);
+        routes[grant.GrantId] = original;
+        original.GetType().GetProperty("PlatformClosed")!.SetValue(original, false);
+        Assert.True(s.Kernel.TerminateProcess(s.Subject).IsSuccess);
+        Assert.Equal(1, s.Provider.DmaRevokeCalls);
+        Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(region => region.Handle == s.Mapping.Region).State);
+    }
+
+    [Fact]
+    public void OriginalDmaGenericNotAcceptedIsNotNoEffectForActualReclaim()
+    {
+        var s = CreateScenario(1338, 1438, PlatformDeviceRights.Read | PlatformDeviceRights.Configure, PlatformMemoryAccess.Read);
+        var grant = s.Kernel.BindPlatformDma(s.Subject, s.Device, s.Mapping, 0, 64, PlatformDmaDirection.DeviceReadsMemory).Value!;
+        s.Provider.DmaRevokeStatus = PlatformAuthorityStatus.NotAccepted;
+        Assert.False(s.Kernel.RevokePlatformDma(s.Subject, grant).IsSuccess);
+        s.Provider.DmaRevokeStatus = null;
+        Assert.False(s.Kernel.TerminateProcess(s.Subject).IsSuccess);
+        Assert.Equal(1, s.Provider.DmaRevokeCalls); Assert.Equal(0, s.Provider.MappingRevokeCalls);
+        Assert.False(s.Kernel.QueryProcessTeardown(s.Subject).Value!.LocalReclaimCompleted);
+    }
+
     [Theory]
     [InlineData("absent")][InlineData("replacement")][InlineData("pending")]
     public void DmaCleanupSourceChangeRefusesProviderEffectAndMappingRelease(string fault)
@@ -153,24 +317,16 @@ public sealed class PlatformDmaGrantTests
         scenario.Provider.MalformedGrantCase = mutation;
         if (cleanup == 1) scenario.Provider.DmaRevokeStatus = PlatformAuthorityStatus.Faulted;
         scenario.Provider.ThrowAfterRevoke = cleanup == 2;
-        var originalPinObserved = false;
-        scenario.Provider.BeforeRevoke = () =>
-        {
-            var pins = (global::System.Collections.IEnumerable)typeof(PlatformAuthorityBridge)
-                .GetField("_dmaSubmissionFaultPins", BindingFlags.Instance | BindingFlags.NonPublic)!
-                .GetValue(scenario.Kernel.PlatformAuthority)!;
-            originalPinObserved = pins.Cast<object>().Any();
-            Assert.Equal(KernelError.PlatformBindingDraining,
-                scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).Error);
-        };
         Assert.Equal(KernelError.PlatformFaulted, scenario.Kernel.BindPlatformDma(scenario.Subject,
             scenario.Device, scenario.Mapping, 0, 64, PlatformDmaDirection.DeviceReadsMemory).Error);
-        Assert.True(originalPinObserved);
+        var pins = (global::System.Collections.IEnumerable)typeof(PlatformAuthorityBridge)
+            .GetField("_dmaSubmissionFaultPins", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(scenario.Kernel.PlatformAuthority)!;
+        Assert.NotEmpty(pins.Cast<object>());
         scenario.Provider.BeforeRevoke = null;
         Assert.False(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
         Assert.False(scenario.Kernel.RevokePlatformDevice(scenario.Subject, scenario.Device).IsSuccess);
         Assert.False(scenario.Kernel.TerminateProcess(scenario.Subject).IsSuccess);
-        Assert.Equal(1, scenario.Provider.DmaRevokeCalls);
+        Assert.Equal(0, scenario.Provider.DmaRevokeCalls);
         Assert.Equal(0, scenario.Provider.MappingRevokeCalls);
         Assert.True(scenario.Kernel.Processes.Resolve(scenario.Subject).IsSuccess);
     }
@@ -641,7 +797,7 @@ public sealed class PlatformDmaGrantTests
     }
 
     [Fact]
-    public void ExplicitNotAcceptedGrantClosureCanRetryWithoutReclaimingEarly()
+    public void GenericNotAcceptedGrantClosureCannotRetryOrReclaim()
     {
         var scenario = CreateScenario(1311, 1410,
             PlatformDeviceRights.Read | PlatformDeviceRights.Configure,
@@ -653,9 +809,9 @@ public sealed class PlatformDmaGrantTests
         Assert.False(scenario.Kernel.RevokePlatformDma(scenario.Subject, grant).IsSuccess);
         Assert.False(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
         scenario.Provider.DmaRevokeStatus = null;
-        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, grant).IsSuccess);
-        Assert.Equal(3, scenario.Provider.DmaRevokeCalls);
-        Assert.True(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+        Assert.False(scenario.Kernel.RevokePlatformDma(scenario.Subject, grant).IsSuccess);
+        Assert.Equal(1, scenario.Provider.DmaRevokeCalls);
+        Assert.False(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
     }
 
     [Fact]
@@ -740,7 +896,7 @@ public sealed class PlatformDmaGrantTests
             scenario.Mapping, 0, 32, PlatformDmaDirection.DeviceReadsMemory);
 
         Assert.Equal(KernelError.PlatformFaulted, bind.Error);
-        Assert.Equal(1, scenario.Provider.DmaRevokeCalls);
+        Assert.Equal(0, scenario.Provider.DmaRevokeCalls);
         var revoke = scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping);
         Assert.False(revoke.IsSuccess);
         Assert.Equal(0, scenario.Provider.MappingRevokeCalls);
@@ -759,7 +915,7 @@ public sealed class PlatformDmaGrantTests
             scenario.Mapping, 0, 32, PlatformDmaDirection.DeviceReadsMemory);
 
         Assert.Equal(KernelError.PlatformFaulted, bind.Error);
-        Assert.Equal(1, scenario.Provider.DmaRevokeCalls);
+        Assert.Equal(0, scenario.Provider.DmaRevokeCalls);
         Assert.Equal(KernelError.PlatformFaulted,
             scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).Error);
         Assert.Equal(0, scenario.Provider.MappingRevokeCalls);
@@ -770,9 +926,9 @@ public sealed class PlatformDmaGrantTests
         ulong processId,
         ulong domainId,
         PlatformDeviceRights deviceRights,
-        PlatformMemoryAccess mappingAccess)
+        PlatformMemoryAccess mappingAccess, Action<RuntimeKernel, ProcessHandle>? beforeAllocation = null, DmaProvider? providerOverride = null)
     {
-        var provider = new DmaProvider();
+        var provider = providerOverride ?? new DmaProvider();
         var kernel = new RuntimeKernel(provider);
         var (_, subject) = TestFixtures.Create(kernel, processId, domainId);
         var binding = kernel.BindPlatformDomain(subject).Value!;
@@ -789,6 +945,7 @@ public sealed class PlatformDmaGrantTests
             deviceCapability,
             deviceRights).Value!;
 
+        beforeAllocation?.Invoke(kernel, subject);
         var region = kernel.AllocateBuffer<byte>(subject, 512).Value!;
         var regionRights = CapabilityRights.Map;
         if ((mappingAccess & PlatformMemoryAccess.Read) != 0) regionRights |= CapabilityRights.Read;
@@ -846,7 +1003,7 @@ public sealed class PlatformDmaGrantTests
         PlatformDeviceLease Device,
         PlatformOwnedRegionSliceMapping Mapping);
 
-    private sealed class DmaProvider :
+    private class DmaProvider :
         IPlatformAuthorityProvider,
         IPlatformFeatureProvider,
         IPlatformDeviceLeaseProvider,

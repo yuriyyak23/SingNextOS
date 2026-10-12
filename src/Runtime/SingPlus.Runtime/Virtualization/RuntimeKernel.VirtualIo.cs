@@ -9,21 +9,51 @@ internal readonly record struct VirtualIoBinding(ulong Id, ulong Generation);
 public sealed partial class RuntimeKernel
 {
     private enum VirtualIoState { Staged, Active, Closing, Quarantined, Closed }
-    private sealed class VirtualIoRecord(VirtualIoBinding binding, ProcessHandle owner, VirtualDomainHandle domain,
-        PlatformVirtualIoBinding platform, SecureExecutionBinding? secureExecution, PlatformDeviceRights rights)
+    private sealed class VirtualIoRecord
     {
-        internal VirtualIoBinding Binding { get; } = binding;
-        internal ProcessHandle Owner { get; } = owner;
-        internal VirtualDomainHandle Domain { get; } = domain;
-        internal PlatformVirtualIoBinding Platform { get; } = platform;
-        internal SecureExecutionBinding? SecureExecution { get; } = secureExecution;
-        internal PlatformDeviceRights Rights { get; } = rights;
+        private readonly object _gate;
+        private VirtualIoState _state = VirtualIoState.Staged;
+        internal VirtualIoRecord(VirtualIoBinding binding, ProcessHandle owner, VirtualDomainHandle domain,
+            PlatformVirtualIoBinding platform, SecureExecutionBinding? secureExecution, PlatformDeviceRights rights, object gate, BudgetReservationHandle? backingReservation = null)
+        { OriginalOwner = this; Binding = binding; Owner = owner; Domain = domain; Platform = platform;
+          SecureExecution = secureExecution; Rights = rights; _gate = gate; BackingReservation = backingReservation; BackingChargeExpected = backingReservation is not null; }
+        internal VirtualIoRecord OriginalOwner { get; }
+        internal VirtualIoBinding Binding { get; }
+        internal ProcessHandle Owner { get; }
+        internal VirtualDomainHandle Domain { get; }
+        internal PlatformVirtualIoBinding Platform { get; set; }
+        internal BudgetReservationHandle? BackingReservation { get; set; }
+        internal bool BackingChargeExpected { get; }
+        internal object? BackingChargeOwner { get; set; }
+        internal bool BackingChargeBound { get; set; }
+        internal bool PlatformKnown { get; set; }
+        internal PlatformOriginalVirtualIoBindRequest? OriginalBindRequest { get; set; }
+        internal bool OwnNoEffect { get; set; }
+        internal SecureExecutionBinding? SecureExecution { get; }
+        internal PlatformDeviceRights Rights { get; }
         internal int PendingEvents { get; set; }
-        internal VirtualIoState State { get; set; } = VirtualIoState.Staged;
+        internal List<KernelIoTransferFact> Transfers { get; } = [];
+        internal ulong TransfersIssued { get; set; }
+        internal bool TransferInFlight { get; set; }
+        internal bool CloseInFlight { get; set; }
+        internal bool ClosureConsumed { get; set; }
+        internal bool ClosureSourceChanged { get; set; }
+        internal long SourceRevision { get; private set; }
+        internal bool SourceRevisionExhausted { get; private set; }
+        internal VirtualIoState State
+        {
+            get { lock (_gate) return _state; }
+            set { lock (_gate) { if (CloseInFlight) ClosureSourceChanged = true; if (SourceRevision == long.MaxValue) SourceRevisionExhausted = true; else SourceRevision++; _state = value; } }
+        }
     }
 
     private readonly object _virtualIoGate = new();
     private readonly Dictionary<ulong, VirtualIoRecord> _virtualIo = [];
+    private readonly List<VirtualIoRecord> _virtualIoOwners = [];
+    private bool HasOriginalVirtualIo(VirtualIoRecord record) => ReferenceEquals(record.OriginalOwner, record) &&
+        _virtualIoOwners.Any(x => ReferenceEquals(x, record)) && _virtualIo.TryGetValue(record.Binding.Id, out var route) && ReferenceEquals(route, record);
+    private static bool HasCompletedVirtualIo(VirtualIoRecord record) => ReferenceEquals(record.OriginalOwner, record) && record.ClosureConsumed;
+    internal Action? BeforeVirtualIoClosureLocalCommit { get; set; }
     private ulong _nextVirtualIoId = 1;
 
     internal KernelResult<VirtualIoBinding> BindVirtualIo(ProcessHandle owner, VirtualDomainHandle domain,
@@ -44,43 +74,99 @@ public sealed partial class RuntimeKernel
         }
         var process = Processes.Resolve(owner);
         if (!process.IsSuccess) return KernelResult<VirtualIoBinding>.Fail(process.Error, process.Message!);
+        SecureEffectSource? secureSource = null;
+        if (secureExecution is { } secureBinding)
+        {
+            var captured = CaptureSecureComputeSource(owner, secureBinding);
+            if (!captured.IsSuccess) return KernelResult<VirtualIoBinding>.Fail(captured.Error, captured.Message!);
+            secureSource = captured.Value;
+        }
         var source = PlatformAuthority.DeviceEffectSource(device, PlatformIdentity(process.Value!));
         if (!source.IsSuccess) return KernelResult<VirtualIoBinding>.Fail(source.Error, source.Message!);
+        var backing = PlatformAuthority.DescribeVirtualIoPrivateBackingBytes(profile); // Provider callback before owner/authorization commit gates.
+        if (!backing.IsSuccess) return KernelResult<VirtualIoBinding>.Fail(backing.Error, backing.Message!);
         VirtualIoRecord? record = null;
         PlatformVirtualIoBinding? known = null;
         VirtualIoRecord Retain(PlatformVirtualIoBinding platform)
         {
             lock (_virtualIoGate)
             {
-                if (record is not null) return record;
-                record = new(new(_nextVirtualIoId++, 1), owner, domain, platform, secureExecution, profile.Rights);
-                _virtualIo.Add(record.Binding.Id, record);
-                return record;
+                if (record is not null)
+                {
+                    if (record.PlatformKnown && record.Platform != platform) throw new InvalidOperationException("Original I/O platform identity cannot change.");
+                    record.Platform = platform; record.PlatformKnown = true; return record;
+                }
+                throw new InvalidOperationException("Original I/O admission owner must precede provider invocation.");
             }
         }
         var result = UseVirtualDeliverySource(owner, domain, source.Value, virtualRecord.Value!, child,
             ToDeviceCapabilityRights(profile.Rights), device.Device.ResourceId, virtualRecord.Value!.State,
             (fresh, sourceCommit) =>
             {
+                KernelResult FreshSecure(Func<KernelResult> commit) => fresh(() => secureSource is null ? commit() : CommitSecureEffectSource(secureSource, commit));
+                KernelResult SourceSecure(Func<KernelResult> commit) => sourceCommit(() => secureSource is null ? commit() : CommitSecureEffectSource(secureSource, commit));
+                var reserved = FreshSecure(() =>
+                {
+                    lock (_virtualIoGate)
+                    {
+                        if (_nextVirtualIoId is 0 or ulong.MaxValue || profile.MaximumDmaTransferBytes <= 0)
+                            return KernelResult.Fail(KernelError.CapacityExhausted, "Original I/O backing admission capacity unavailable.");
+                        if (_virtualIoOwners.Any(x => x.Owner == owner && x.Domain == domain && !HasCompletedVirtualIo(x) && x.State is VirtualIoState.Staged or VirtualIoState.Quarantined))
+                            return KernelResult.Fail(KernelError.PlatformBindingActive, "Original unknown I/O admission must resolve before another reservation/effect.");
+                        _virtualIoOwners.EnsureCapacity(_virtualIoOwners.Count + 1); _virtualIo.EnsureCapacity(_virtualIo.Count + 1);
+                        var budget = backing.Value == 0 ? KernelResult<BudgetReservationSnapshot?>.Ok(null) :
+                            Budgets.ReserveIfAttached(owner, [new(ServiceBudgetDimension.OwnedMemoryBytes, backing.Value)], BudgetReservationLifetime.LocalResource, AdmissionQosHint.None);
+                        if (!budget.IsSuccess) return KernelResult.Fail(budget.Error, budget.Message!);
+                        record = new(new(_nextVirtualIoId++, 1), owner, domain, default, secureExecution, profile.Rights, _virtualIoGate, budget.Value?.Reservation);
+                        _virtualIoOwners.Add(record); _virtualIo.Add(record.Binding.Id, record);
+                        if (record.BackingReservation is { } reservation)
+                        {
+                            var charge = Budgets.BindOriginalVirtualIoCharge(owner, reservation, record);
+                            if (!charge.IsSuccess) return KernelResult.Fail(charge.Error, charge.Message!);
+                            record.BackingChargeOwner = charge.Value;
+                        }
+                        record.BackingChargeBound = true;
+                        return KernelResult.Ok();
+                    }
+                });
+                if (!reserved.IsSuccess) return reserved;
                 var bound = PlatformAuthority.BindChildVirtualIo(child, device, profile, out known,
-                    fresh, sourceCommit, (platform, commit) =>
+                    FreshSecure, SourceSecure, (platform, commit) =>
                     {
                         var staged = Retain(platform);
+                        var stagedRevision = staged.SourceRevision;
                         var composed = RevalidateComposedDomain(owner, virtualDomain: domain);
                         if (!composed.IsSuccess) return composed;
                         var secureCurrent = secureExecution is { } execution
                             ? RevalidateSecureExecution(execution) : KernelResult.Ok();
                         if (!secureCurrent.IsSuccess) return secureCurrent;
-                        return fresh(() => commit(() =>
+                        return FreshSecure(() => commit(() =>
                         {
                             lock (_virtualIoGate)
                             {
-                                if (staged.State != VirtualIoState.Staged)
+                                if (!HasOriginalVirtualIo(staged) || staged.SourceRevisionExhausted || staged.SourceRevision != stagedRevision || staged.State != VirtualIoState.Staged)
                                     return KernelResult.Fail(KernelError.InvalidTransition, "Virtual-I/O staging changed before publication.");
                                 staged.State = VirtualIoState.Active;
                                 return KernelResult.Ok();
                             }
                         }));
+                    }, noEffectConsumer: () =>
+                    {
+                        lock (_virtualIoGate)
+                        {
+                            if (record is null || !HasOriginalVirtualIo(record)) return;
+                            record.OwnNoEffect = true;
+                            if (!ConsumeVirtualIoBackingCharge(record).IsSuccess) return;
+                            record.ClosureConsumed = true; record.State = VirtualIoState.Closed;
+                        }
+                    }, originalInvocationConsumer: request =>
+                    {
+                        lock (_virtualIoGate)
+                        {
+                            if (record is null || !HasOriginalVirtualIo(record) || record.OriginalBindRequest is not null)
+                                throw new InvalidOperationException("Original kernel invocation retention unavailable.");
+                            record.OriginalBindRequest = request;
+                        }
                     });
                 return bound.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(bound.Error, bound.Message!);
             }, deviceSource: true);
@@ -102,11 +188,13 @@ public sealed partial class RuntimeKernel
         VirtualDomainHandle? expectedDomain)
     {
         VirtualIoRecord record;
+        long localRevision;
         lock (_virtualIoGate)
         {
-            if (!_virtualIo.TryGetValue(binding.Id, out record!) || record.Binding != binding)
+            if (!_virtualIo.TryGetValue(binding.Id, out record!) || !HasOriginalVirtualIo(record) || record.Binding != binding)
                 return KernelResult.Fail(KernelError.StaleGeneration, "Exact virtual-I/O identity/generation is required.");
-            if (record.Owner != owner || record.State != VirtualIoState.Active)
+            localRevision = record.SourceRevision;
+            if (record.SourceRevisionExhausted || record.Owner != owner || record.State != VirtualIoState.Active)
                 return KernelResult.Fail(KernelError.PlatformFaulted, "Virtual-I/O is not admitting effects.");
             if (expectedDomain is { } exactDomain && record.Domain != exactDomain)
                 return KernelResult.Fail(KernelError.WrongPlatformDomain,
@@ -114,6 +202,16 @@ public sealed partial class RuntimeKernel
         }
         var domain = _virtualDomains.Resolve(owner, record.Domain);
         var expected = domain.IsSuccess ? domain.Value!.State : default;
+        if (!domain.IsSuccess) return KernelResult.Fail(domain.Error, domain.Message!);
+        var effectSource = _virtualDomains.CaptureEffectSource(domain.Value!, expected);
+        if (!effectSource.IsSuccess) return KernelResult.Fail(effectSource.Error, effectSource.Message!);
+        SecureEffectSource? secureSource = null;
+        if (record.SecureExecution is { } secureBinding)
+        {
+            var captured = CaptureSecureComputeSource(owner, secureBinding);
+            if (!captured.IsSuccess) return KernelResult.Fail(captured.Error, captured.Message!);
+            secureSource = captured.Value;
+        }
         var device = PlatformAuthority.DeviceEffectSource(record.Platform.ParentDevice, record.Platform.ParentDevice.DomainBinding.Subject);
         var secure = record.SecureExecution is { } execution ? RevalidateSecureExecution(execution) : KernelResult.Ok();
         if (domain.IsSuccess && domain.Value!.ChildBinding == record.Platform.Child && device.IsSuccess && secure.IsSuccess)
@@ -133,10 +231,10 @@ public sealed partial class RuntimeKernel
                     () => _virtualDomains.CommitEffectAdmission(current.Value, expected, () =>
                     {
                         lock (_virtualIoGate)
-                            return record.State == VirtualIoState.Active
+                            return HasOriginalVirtualIo(record) && !record.SourceRevisionExhausted && record.SourceRevision == localRevision && record.State == VirtualIoState.Active && (secureSource is null || CommitSecureEffectSource(secureSource, KernelResult.Ok).IsSuccess)
                                 ? KernelResult.Ok()
                                 : KernelResult.Fail(KernelError.PlatformBindingDraining, "Virtual-I/O changed during source revalidation.");
-                    }));
+                    }, effectSource.Value!));
             }
         }
         lock (_virtualIoGate) record.State = VirtualIoState.Quarantined;
@@ -151,11 +249,13 @@ public sealed partial class RuntimeKernel
         ExternalOperationHandle operation, CapabilityId eventCapability, KernelEventEndpoint endpoint)
     {
         VirtualIoRecord record;
+        long localRevision;
         lock (_virtualIoGate)
         {
-            if (!_virtualIo.TryGetValue(binding.Id, out record!) || record.Binding != binding)
+            if (!_virtualIo.TryGetValue(binding.Id, out record!) || !HasOriginalVirtualIo(record) || record.Binding != binding)
                 return KernelResult.Fail(KernelError.StaleGeneration, "Exact virtual-I/O identity/generation is required for event publication.");
-            if (record.Owner != owner || record.State != VirtualIoState.Active)
+            localRevision = record.SourceRevision;
+            if (record.SourceRevisionExhausted || record.Owner != owner || record.State != VirtualIoState.Active)
                 return KernelResult.Fail(KernelError.PlatformFaulted, "Virtual-I/O is not admitting guest-visible events.");
         }
 
@@ -172,8 +272,10 @@ public sealed partial class RuntimeKernel
         if (!source.IsSuccess) return KernelResult.Fail(source.Error, source.Message!);
         lock (_virtualIoGate)
         {
-            if (record.State != VirtualIoState.Active)
+            if (!HasOriginalVirtualIo(record) || record.SourceRevisionExhausted || record.SourceRevision != localRevision || record.State != VirtualIoState.Active)
                 return KernelResult.Fail(KernelError.PlatformBindingDraining, "Virtual-I/O stopped before event admission.");
+            if (record.PendingEvents == int.MaxValue)
+                return KernelResult.Fail(KernelError.CapacityExhausted, "Virtual-I/O event interlock capacity exhausted.");
             record.PendingEvents++;
         }
         KernelResult CommitDeviceSource(Func<KernelResult> commit) =>
@@ -181,7 +283,7 @@ public sealed partial class RuntimeKernel
                 ToDeviceCapabilityRights(record.Rights), record.Platform.ParentDevice.Device.ResourceId, () =>
                 {
                     lock (_virtualIoGate)
-                        return record.State == VirtualIoState.Active ? commit()
+                        return HasOriginalVirtualIo(record) && !record.SourceRevisionExhausted && record.SourceRevision == localRevision && record.State == VirtualIoState.Active ? commit()
                             : KernelResult.Fail(KernelError.PlatformBindingDraining, "Virtual-I/O changed before event publication.");
                 });
         try { return InjectVirtualEvent(owner, record.Domain, eventCapability, endpoint, CommitDeviceSource); }
@@ -191,27 +293,96 @@ public sealed partial class RuntimeKernel
     internal KernelResult CloseVirtualIo(VirtualIoBinding binding)
     {
         VirtualIoRecord record;
+        long revision;
         lock (_virtualIoGate)
         {
-            if (!_virtualIo.TryGetValue(binding.Id, out record!) || record.Binding != binding)
-                return KernelResult.Fail(KernelError.StaleGeneration, "Exact virtual-I/O identity/generation is required for closure.");
-            if (record.State == VirtualIoState.Closed) return KernelResult.Ok();
-            if (record.PendingEvents != 0)
+            if (!_virtualIo.TryGetValue(binding.Id, out record!) || !HasOriginalVirtualIo(record) || record.Binding != binding)
+                return KernelResult.Fail(KernelError.StaleGeneration, "Original Virtual-I/O identity required for closure.");
+            if (HasCompletedVirtualIo(record)) return KernelResult.Ok();
+            if (record.OwnNoEffect)
+            {
+                var released = ConsumeVirtualIoBackingCharge(record);
+                if (!released.IsSuccess) return released;
+                record.ClosureConsumed = true; record.State = VirtualIoState.Closed; return KernelResult.Ok();
+            }
+            if (record.State == VirtualIoState.Closed)
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Closed projection is not original Virtual-I/O completion.");
+            if (record.PendingEvents != 0 || record.TransferInFlight)
                 return KernelResult.Fail(KernelError.PlatformBindingActive, "Virtual-I/O event admission/publication remains pending.");
-            if (HasVirtualComputePin(binding))
-                return KernelResult.Fail(KernelError.PlatformBindingDraining, "Virtual-I/O remains pinned by virtualized provider work.");
-            if (record.State == VirtualIoState.Closing) return KernelResult.Fail(KernelError.PlatformBindingDraining, "Virtual-I/O close is in flight.");
+            if (record.CloseInFlight || record.State == VirtualIoState.Closing || HasVirtualComputePin(binding))
+                return KernelResult.Fail(KernelError.PlatformBindingDraining, "Original Virtual-I/O work/closure remains pending.");
             record.State = VirtualIoState.Closing;
+            revision = record.SourceRevision;
+            record.ClosureSourceChanged = false;
+            record.CloseInFlight = true;
         }
-        KernelResult close;
-        try { close = PlatformAuthority.RevokeChildVirtualIo(record.Platform); }
-        catch (Exception) { close = KernelResult.Fail(KernelError.PlatformFaulted, "Virtual-I/O provider close threw."); }
-        lock (_virtualIoGate) record.State = close.IsSuccess ? VirtualIoState.Closed : VirtualIoState.Quarantined;
-        return close;
+        var close = KernelResult.Fail(KernelError.PlatformFaulted, "Original Virtual-I/O closure not completed.");
+        try
+        {
+            KernelResult Consume(Func<Func<KernelResult>, KernelResult> bridgeCommit)
+            {
+                BeforeVirtualIoClosureLocalCommit?.Invoke();
+                return bridgeCommit(() =>
+                {
+                    lock (_virtualIoGate)
+                    {
+                        if (!HasOriginalVirtualIo(record) || record.State != VirtualIoState.Closing ||
+                            record.ClosureSourceChanged || record.SourceRevision != revision)
+                            return KernelResult.Fail(KernelError.PlatformFaulted, "Original local Virtual-I/O closure source changed.");
+                        var released = ConsumeVirtualIoBackingCharge(record);
+                        if (!released.IsSuccess) return released;
+                        record.ClosureConsumed = true;
+                        record.State = VirtualIoState.Closed;
+                        return KernelResult.Ok();
+                    }
+                });
+            }
+            close = !record.PlatformKnown && record.OriginalBindRequest is { } original
+                ? PlatformAuthority.CleanupOriginalVirtualIoBind(original, Consume)
+                : PlatformAuthority.RevokeChildVirtualIo(record.Platform, Consume);
+            return close;
+        }
+        catch (Exception exception) when (exception is not StackOverflowException and not OutOfMemoryException)
+        { return KernelResult.Fail(KernelError.PlatformFaulted, "Original Virtual-I/O Close interrupted; facts/pins retained."); }
+        finally
+        {
+            lock (_virtualIoGate)
+            {
+                if (!close.IsSuccess && !record.ClosureConsumed) record.State = VirtualIoState.Quarantined;
+                record.CloseInFlight = false;
+            }
+        }
     }
 
     private KernelResult CloseVirtualIoForDomain(ProcessHandle owner, VirtualDomainHandle domain) =>
         CloseVirtualIoWhere(x => x.Owner == owner && x.Domain == domain);
+
+    private KernelResult ConsumeVirtualIoBackingCharge(VirtualIoRecord record)
+    {
+        if (!HasOriginalVirtualIo(record) || !record.BackingChargeBound ||
+            record.BackingChargeExpected != (record.BackingReservation is not null) || record.BackingChargeExpected != (record.BackingChargeOwner is not null))
+            return KernelResult.Fail(KernelError.PlatformFaulted, "Original I/O charge association/route is unknown or changed.");
+        if(!HasKernelIoTransferHistory(record))
+            return KernelResult.Fail(KernelError.PlatformFaulted,"Original transfer charge history unavailable.");
+        foreach(var transfer in record.Transfers)
+        {
+            if(transfer.Consumed) continue;
+            if(!ReferenceEquals(transfer.Io,record) || (transfer.Reservation is not null)!=(transfer.ChargeOwner is not null))
+                return KernelResult.Fail(KernelError.PlatformFaulted,"Original snapshot charge route changed.");
+            if(transfer.SessionEffectBound && !transfer.SessionClosureConsumed && transfer.SessionInvocation is { } invocation)
+            {
+                var contained=SessionInvocations.ConsumeVirtualIoTransferClosure(invocation,record.Owner,transfer);
+                if(!contained.IsSuccess)return contained;
+                transfer.SessionClosureConsumed=true;
+            }
+            var consumed = transfer.Reservation is { } snapshot
+                ? Budgets.ConsumeOriginalVirtualIoCharge(record.Owner,snapshot,transfer,transfer.ChargeOwner) : KernelResult.Ok();
+            if(!consumed.IsSuccess)return consumed;
+            transfer.Consumed=true;
+        }
+        return record.BackingReservation is { } reservation
+            ? Budgets.ConsumeOriginalVirtualIoCharge(record.Owner, reservation, record, record.BackingChargeOwner) : KernelResult.Ok();
+    }
 
     private KernelResult CloseVirtualIoForDevice(ProcessHandle owner, PlatformDeviceLease device) =>
         CloseVirtualIoWhere(x => x.Owner == owner && x.Platform.ParentDevice == device);
@@ -222,13 +393,13 @@ public sealed partial class RuntimeKernel
     private bool HasVirtualIoForSecureExecution(SecureExecutionBinding binding)
     {
         lock (_virtualIoGate)
-            return _virtualIo.Values.Any(x => x.SecureExecution == binding && x.State != VirtualIoState.Closed);
+            return _virtualIoOwners.Any(x => x.SecureExecution == binding && !HasCompletedVirtualIo(x));
     }
 
     private KernelResult CloseVirtualIoWhere(Func<VirtualIoRecord, bool> predicate)
     {
         VirtualIoBinding[] bindings;
-        lock (_virtualIoGate) bindings = _virtualIo.Values.Where(x => x.State != VirtualIoState.Closed && predicate(x)).Select(x => x.Binding).ToArray();
+        lock (_virtualIoGate) bindings = _virtualIoOwners.Where(x => !HasCompletedVirtualIo(x) && predicate(x)).Select(x => x.Binding).ToArray();
         foreach (var binding in bindings) { var close = CloseVirtualIo(binding); if (!close.IsSuccess) return close; }
         return KernelResult.Ok();
     }
@@ -236,7 +407,7 @@ public sealed partial class RuntimeKernel
     private void QuarantineVirtualIoForBackendReset()
     {
         lock (_virtualIoGate)
-            foreach (var record in _virtualIo.Values)
-                if (record.State != VirtualIoState.Closed) record.State = VirtualIoState.Quarantined;
+            foreach (var record in _virtualIoOwners)
+                if (!HasCompletedVirtualIo(record)) record.State = VirtualIoState.Quarantined;
     }
 }

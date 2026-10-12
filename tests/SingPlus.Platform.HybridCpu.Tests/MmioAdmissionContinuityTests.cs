@@ -40,7 +40,7 @@ public sealed class MmioAdmissionContinuityTests
         var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, ChildClosureTupleTests.RootCloseRuntimeProxy>();
         var proxy = (ChildClosureTupleTests.RootCloseRuntimeProxy)(object)runtime;
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         var device = provider.BindDevice(parent, new("mmio-device"), PlatformDeviceRights.Read).Value!;
         return (provider, proxy, parent, device);
     }

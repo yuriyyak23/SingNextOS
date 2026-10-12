@@ -135,7 +135,7 @@ public sealed partial class PlatformAuthorityBridge
             if (!identity.IsSuccess)
                 return KernelResult<DmaGrantClosureObservationV1>.Fail(identity.Error, identity.Message!);
             var record = _dmaGrants[grant.GrantId];
-            if (!record.PlatformClosed)
+            if (!HasConsumedOriginalDmaClosure(record))
                 return KernelResult<DmaGrantClosureObservationV1>.Fail(KernelError.PlatformBindingDraining,
                     "Exact grant closure has not committed.");
             if (record.LastVisibleTrace is not { } visible ||

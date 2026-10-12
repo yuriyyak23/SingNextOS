@@ -12,11 +12,21 @@ public sealed partial class PlatformAuthorityBridge
         VirtualDomainBindingGeneration Generation,
         ProcessHandle Owner);
 
+    private sealed class ModelCreateInvocationFact(PlatformDomainIdentity owner, PlatformVirtualDomainProfile profile, PlatformBackendEpoch epoch)
+    {
+        public PlatformDomainIdentity Owner { get; } = owner;
+        public PlatformVirtualDomainProfile Profile { get; } = profile;
+        public PlatformBackendEpoch AdmissionEpoch { get; } = epoch;
+        public PlatformProviderIncarnation ProviderIncarnation { get; set; }
+        public bool EffectMayHaveOccurred { get; set; }
+        public PlatformAuthorityResult<PlatformProviderVirtualDomainLease>? Observation { get; set; }
+    }
     private sealed record VirtualDomainRecord(
         VirtualDomainBinding Binding,
         PlatformProviderVirtualDomainLease ProviderLease)
     {
         public PlatformBackendEpoch CreatedInEpoch { get; init; }
+        public ModelCreateInvocationFact? CreateInvocation { get; init; }
         public PlatformProviderIncarnation ProviderIncarnation { get; init; }
         public bool Quarantined { get; set; }
         public bool ReceiptValid { get; init; }
@@ -34,8 +44,8 @@ public sealed partial class PlatformAuthorityBridge
     // Stable index to the same authoritative owner; routing/reset copies never become permission.
     private readonly Dictionary<VirtualDomainBindingId, VirtualDomainRecord> _originalVirtualDomainOwners = [];
     // Admission and unresolved effects belong to the same existing model-domain owner.
-    private readonly HashSet<PlatformDomainIdentity> _pendingVirtualDomainCreates = [];
-    private readonly Dictionary<PlatformDomainIdentity, PlatformBackendEpoch> _unresolvedVirtualDomainCreates = [];
+    private readonly Dictionary<PlatformDomainIdentity, ModelCreateInvocationFact> _pendingVirtualDomainCreates = [];
+    private readonly Dictionary<PlatformDomainIdentity, ModelCreateInvocationFact> _unresolvedVirtualDomainCreates = [];
     private ulong _nextVirtualDomainBindingId = 1;
 
     internal bool HasUnclosedModelDomainOwner(ProcessHandle owner)
@@ -48,7 +58,7 @@ public sealed partial class PlatformAuthorityBridge
     internal bool HasUnresolvedVirtualDomainCreate(PlatformDomainIdentity owner)
     {
         lock (_secureDomainLifecycleGate)
-            return _pendingVirtualDomainCreates.Contains(owner) || _unresolvedVirtualDomainCreates.ContainsKey(owner);
+            return _pendingVirtualDomainCreates.ContainsKey(owner) || _unresolvedVirtualDomainCreates.ContainsKey(owner);
     }
 
     internal KernelResult<VirtualDomainBinding> CreateVirtualDomain(
@@ -67,6 +77,7 @@ public sealed partial class PlatformAuthorityBridge
         if (profile.VirtualProcessorCount <= 0 || profile.VirtualProcessorCount > 256 || profile.MaximumGuestMemoryBytes <= 0)
             return KernelResult<VirtualDomainBinding>.Fail(KernelError.PlatformDenied, "Model-domain profile is outside local bounds.");
         PlatformBackendEpoch epoch = default;
+        ModelCreateInvocationFact invocation = null!;
         VirtualDomainBinding binding = default;
         KernelResult Begin()
         {
@@ -74,7 +85,7 @@ public sealed partial class PlatformAuthorityBridge
             {
                 if (_backendEpochExhausted || _nextVirtualDomainBindingId == ulong.MaxValue)
                     return KernelResult.Fail(KernelError.CapacityExhausted, "Model-domain generation space is exhausted.");
-                if (_pendingVirtualDomainCreates.Contains(owner))
+                if (_pendingVirtualDomainCreates.ContainsKey(owner))
                     return KernelResult.Fail(KernelError.PlatformBindingActive, "Model-domain creation is pending for this exact subject.");
                 if (_unresolvedVirtualDomainCreates.ContainsKey(owner))
                     return KernelResult.Fail(KernelError.PlatformFaulted, "Model-domain creation has an unresolved effect for this exact subject.");
@@ -82,7 +93,8 @@ public sealed partial class PlatformAuthorityBridge
                 {
                     epoch = BackendEpoch;
                     binding = new(new(_nextVirtualDomainBindingId++), new(1), owner.Process);
-                    _pendingVirtualDomainCreates.Add(owner);
+                    invocation = new(owner, profile, epoch);
+                    _pendingVirtualDomainCreates.Add(owner, invocation);
                     return KernelResult.Ok();
                 }
                 return sourceCommitConsumer is null ? Commit() : sourceCommitConsumer(Commit);
@@ -96,22 +108,39 @@ public sealed partial class PlatformAuthorityBridge
             try { source = CurrentProviderIncarnation(); }
             catch (Exception exception) when (exception is not StackOverflowException)
             { return KernelResult<VirtualDomainBinding>.Fail(KernelError.PlatformFaulted, "Model create source unavailable before effect."); }
-            lock (_secureDomainLifecycleGate)
-                if (source.Value == 0 || BackendEpoch != epoch || _backendEpochExhausted)
-                    return KernelResult<VirtualDomainBinding>.Fail(KernelError.PlatformFaulted, "Model create original source changed before effect.");
+            KernelResult AdmitEffect()
+            {
+                lock (_secureDomainLifecycleGate)
+                {
+                    if (source.Value == 0 || BackendEpoch != epoch || _backendEpochExhausted ||
+                        !_pendingVirtualDomainCreates.TryGetValue(owner, out var pending) || !ReferenceEquals(pending, invocation))
+                        return KernelResult.Fail(KernelError.PlatformFaulted, "Model create original source changed before effect.");
+                    KernelResult Commit()
+                    {
+                        invocation.ProviderIncarnation = source;
+                        invocation.EffectMayHaveOccurred = true;
+                        return KernelResult.Ok();
+                    }
+                    return sourceCommitConsumer is null ? Commit() : sourceCommitConsumer(Commit);
+                }
+            }
+            var effectAdmission = admissionConsumer is null ? AdmitEffect() : admissionConsumer(AdmitEffect);
+            if (!effectAdmission.IsSuccess)
+                return KernelResult<VirtualDomainBinding>.Fail(effectAdmission.Error, effectAdmission.Message!);
             PlatformAuthorityResult<PlatformProviderVirtualDomainLease> result;
             try { result = provider.CreateVirtualDomain(owner, profile); }
             catch (Exception exception) when (exception is not StackOverflowException)
             {
-                lock (_secureDomainLifecycleGate) _unresolvedVirtualDomainCreates.TryAdd(owner, epoch);
+                lock (_secureDomainLifecycleGate) _unresolvedVirtualDomainCreates.TryAdd(owner, invocation);
                 return KernelResult<VirtualDomainBinding>.Fail(KernelError.PlatformFaulted,
                     $"Model creation may have taken effect without a lease: {exception.Message}");
             }
+            lock (_secureDomainLifecycleGate) invocation.Observation = result;
             if (!result.IsSuccess)
             {
                 lock (_secureDomainLifecycleGate)
                     if (result.Status != PlatformAuthorityStatus.NotAccepted || BackendEpoch != epoch)
-                        _unresolvedVirtualDomainCreates.TryAdd(owner, epoch);
+                        _unresolvedVirtualDomainCreates.TryAdd(owner, invocation);
                 return FromProviderFailure<VirtualDomainBinding>(result.Status, result.Message);
             }
             var lease = result.Value!;
@@ -121,13 +150,13 @@ public sealed partial class PlatformAuthorityBridge
             {
                 record = new(binding, lease)
                 {
-                    CreatedInEpoch = epoch, ProviderIncarnation = source, ReceiptValid = valid,
+                    CreateInvocation = invocation, CreatedInEpoch = epoch, ProviderIncarnation = source, ReceiptValid = valid,
                     Quarantined = !valid || BackendEpoch != epoch || _backendEpochExhausted
                 };
                 _virtualDomainBindings.Add(binding.BindingId, record);
                 _originalVirtualDomainOwners.Add(binding.BindingId, record);
                 if (!valid || BackendEpoch != epoch || _backendEpochExhausted)
-                    _unresolvedVirtualDomainCreates.TryAdd(owner, epoch);
+                    _unresolvedVirtualDomainCreates.TryAdd(owner, invocation);
             }
             try { cleanupConsumer?.Invoke(binding); }
             catch (Exception exception) when (exception is not StackOverflowException)
@@ -135,7 +164,7 @@ public sealed partial class PlatformAuthorityBridge
                 lock (_secureDomainLifecycleGate)
                 {
                     record.Quarantined = true;
-                    _unresolvedVirtualDomainCreates.TryAdd(owner, epoch);
+                    _unresolvedVirtualDomainCreates.TryAdd(owner, invocation);
                 }
                 return KernelResult<VirtualDomainBinding>.Fail(KernelError.PlatformFaulted, "Original model cleanup binding could not reach its consumer.");
             }
@@ -153,7 +182,7 @@ public sealed partial class PlatformAuthorityBridge
                     !_originalVirtualDomainOwners.TryGetValue(binding.BindingId, out var original) || !ReferenceEquals(original, record))
                 {
                     record.Quarantined = true;
-                    _unresolvedVirtualDomainCreates.TryAdd(owner, epoch);
+                    _unresolvedVirtualDomainCreates.TryAdd(owner, invocation);
                     return KernelResult<VirtualDomainBinding>.Fail(KernelError.PlatformFaulted, "Known model lease lost original source continuity before publication.");
                 }
             }
@@ -163,7 +192,7 @@ public sealed partial class PlatformAuthorityBridge
             try { completed = completionConsumer is null ? CommitLocal(KernelResult.Ok) : completionConsumer(binding, CommitLocal); }
             catch (Exception exception) when (exception is not StackOverflowException)
             {
-                lock (_secureDomainLifecycleGate) _unresolvedVirtualDomainCreates.TryAdd(owner, epoch);
+                lock (_secureDomainLifecycleGate) _unresolvedVirtualDomainCreates.TryAdd(owner, invocation);
                 completed = KernelResult.Fail(KernelError.PlatformFaulted, $"Model receipt could not reach its local consumer: {exception.Message}");
             }
             if (!completed.IsSuccess)
@@ -363,7 +392,7 @@ public sealed partial class PlatformAuthorityBridge
             record = current.Value!;
             if (!record.ReceiptValid || record.CloseMayHaveEffect && !record.ProviderClosureConfirmed || record.TransitionMayHaveEffect)
                 return KernelResult.Fail(KernelError.PlatformFaulted, "Model-domain lease lacks unambiguous closure evidence.");
-            if (record.CloseInFlight || record.TransitionInFlight || _pendingVirtualDomainCreates.Any(x => x.Process == binding.Owner))
+            if (record.CloseInFlight || record.TransitionInFlight || _pendingVirtualDomainCreates.Keys.Any(x => x.Process == binding.Owner))
                 return KernelResult.Fail(KernelError.PlatformBindingActive, "Model-domain creation or close is pending.");
             record.CloseInFlight = true;
             record.Quarantined = true;
@@ -417,6 +446,9 @@ public sealed partial class PlatformAuthorityBridge
                         _virtualDomainBindings.Remove(binding.BindingId);
                         if (_originalVirtualDomainOwners.TryGetValue(binding.BindingId, out var original) && ReferenceEquals(original, record))
                             _originalVirtualDomainOwners.Remove(binding.BindingId);
+                        if (record.CreateInvocation is { } created &&
+                            _unresolvedVirtualDomainCreates.TryGetValue(created.Owner, out var retained) && ReferenceEquals(retained, created))
+                            _unresolvedVirtualDomainCreates.Remove(created.Owner);
                         return KernelResult.Ok();
                     }); // Trusted local owner commit, preserving bridge -> virtual-owner lock order.
                 }

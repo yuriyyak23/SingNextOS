@@ -56,6 +56,7 @@ public sealed partial class PlatformAuthorityBridge
         DmaVisibilityState visibilityState;
         PlatformBackendEpoch backendEpoch;
         PlatformProviderIncarnation expectedIncarnation;
+        DmaVisibilityOwnerInvocation? visibilityInvocation = null;
         lock (_secureDomainLifecycleGate)
         lock (_dmaCompletionGate)
         {
@@ -154,7 +155,20 @@ public sealed partial class PlatformAuthorityBridge
                 providerResult = hasKnown ? PlatformAuthorityResult<PlatformProviderDmaAcquireEvidence>.Ok(visibilityState.KnownAcquireEvidence!.Value) : default;
             }
             if (!hasKnown)
+            {
+                var canContain = _provider is IPlatformDmaVisibilityClosureProvider closure && closure.CanCloseOriginalDmaVisibility(providerGrant);
+                lock (_secureDomainLifecycleGate)
+                lock (_dmaCompletionGate)
+                {
+                    if (!VisibilityTupleRemainsExact(incarnation)) return RefuseSource(incarnation);
+                    if (!OriginalVisibilityHistoryIntact(grantRecord)) throw new InvalidOperationException("Original visibility history lost.");
+                    if (grantRecord.VisibilityIssued == ulong.MaxValue) return KernelResult<PlatformDmaPostCompletionVisibilityEvidence>.Fail(KernelError.CapacityExhausted,"Visibility history exhausted before effect.");
+                    visibilityInvocation = new(grantRecord,true,backendEpoch,canContain);
+                    grantRecord.VisibilityHistory.Add(visibilityInvocation); grantRecord.VisibilityIssued++; visibilityInvocation.Invoked = true;
+                }
                 providerResult = visibilityProvider.AcquireDmaGrantVisibility(providerGrant);
+                lock (_dmaCompletionGate) visibilityInvocation.RawAcquire = providerResult; // Before late callbacks.
+            }
             if (providerResult.IsSuccess)
             {
                 var valid = PlatformDmaVisibilityContract.ValidateAcquireEvidence(providerGrant, visibilityState.ProviderCycle, providerResult.Value!);
@@ -174,7 +188,8 @@ public sealed partial class PlatformAuthorityBridge
                 lock (_dmaCompletionGate)
                     if (providerResult.Status is PlatformAuthorityStatus.Faulted or PlatformAuthorityStatus.Stale or PlatformAuthorityStatus.Revoked or PlatformAuthorityStatus.WrongDomain)
                     {
-                        FaultPinDmaSubmissionLocked(submission.GrantId);
+                        if (providerResult.Status == PlatformAuthorityStatus.Faulted) PinVisibilityUnknown();
+                        else FaultPinDmaSubmissionLocked(submission.GrantId);
                         return KernelResult<PlatformDmaPostCompletionVisibilityEvidence>.Fail(KernelError.PlatformFaulted, providerResult.Message ?? "Acquire lost exact provider identity.");
                     }
                 return FromProviderFailure<PlatformDmaPostCompletionVisibilityEvidence>(providerResult.Status, providerResult.Message);
@@ -189,10 +204,17 @@ public sealed partial class PlatformAuthorityBridge
         }
         catch (Exception exception) when (exception is not StackOverflowException)
         {
-            lock (_dmaCompletionGate) FaultPinDmaSubmissionLocked(submission.GrantId);
+            lock (_dmaCompletionGate) PinVisibilityUnknown();
             return KernelResult<PlatformDmaPostCompletionVisibilityEvidence>.Fail(KernelError.PlatformFaulted, $"Completed visibility outcome unknown; mapping pinned: {exception.GetType().Name}.");
         }
         finally { lock (_dmaCompletionGate) grantRecord.AcquisitionInFlight = false; }
+
+        void PinVisibilityUnknown()
+        {
+            PinOriginalDmaVisibilityLocked(grantRecord,visibilityInvocation);
+            if (grantRecord.OwnVisibilityUncertain && grantRecord.OriginalCopy is { Invoked: true, LifetimeConsumed: false } original &&
+                (ReferenceEquals(original.AcceptedSource,record) || ReferenceEquals(original.AcceptedDestination,record))) original.Uncertain = true;
+        }
 
         bool VisibilityTupleRemainsExact(PlatformProviderIncarnation incarnation) =>
             ValidateDmaSubmissionIdentityLocked(submission, expectedSubject).IsSuccess &&

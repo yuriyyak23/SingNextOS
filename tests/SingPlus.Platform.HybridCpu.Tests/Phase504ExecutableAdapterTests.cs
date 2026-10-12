@@ -8,7 +8,7 @@ namespace SingPlus.Platform.HybridCpu.Tests;
 public sealed class Phase504ExecutableAdapterTests
 {
     [Fact]
-    public void ExplicitAdapterCompositionKeepsUnboundVirtualIoAndAggregateDomainUnavailable()
+    public void ExplicitLoanCompositionAdmitsPrivateVirtualIoAndKeepsAggregateDomainUnavailable()
     {
         var provider = new HybridCpuPlatformAuthorityProvider(
             new NeutralDomainRuntimeFacade(), new HybridCpuExecutableChildAdapter());
@@ -18,9 +18,9 @@ public sealed class Phase504ExecutableAdapterTests
             features.Resolve(PlatformFeatureFamily.VirtualizationDomains).Availability);
         Assert.Equal(PlatformFeatureAvailability.Executable,
             features.Resolve(PlatformFeatureFamily.ChildExecutableArtifact).Availability);
-        Assert.Equal(PlatformFeatureAvailability.Unavailable,
+        Assert.Equal(PlatformFeatureAvailability.RuntimeAdmission,
             features.Resolve(PlatformFeatureFamily.BoundedVirtualIo).Availability);
-        Assert.Equal(PlatformFeatureAvailability.Unavailable,
+        Assert.Equal(PlatformFeatureAvailability.RuntimeAdmission,
             features.Resolve(PlatformFeatureFamily.NestedDomains).Availability);
         Assert.Equal(PlatformFeatureAvailability.Unavailable,
             features.Resolve(PlatformFeatureFamily.ChildTrapDelivery).Availability);
@@ -34,7 +34,7 @@ public sealed class Phase504ExecutableAdapterTests
             features.Resolve(PlatformFeatureFamily.VmxCompatibility).Availability);
         Assert.Equal(HybridCpuChildDomainAdapterReadiness.Ready,
             provider.QueryChildDomainAdapterStatus().Readiness);
-        Assert.False(provider.QueryChildDomainAdapterStatus().HasVirtualIo);
+        Assert.True(provider.QueryChildDomainAdapterStatus().HasVirtualIo);
     }
 
     [Fact]
@@ -43,6 +43,8 @@ public sealed class Phase504ExecutableAdapterTests
         var provider = new HybridCpuPlatformAuthorityProvider();
         Assert.Equal(PlatformFeatureAvailability.Unavailable,
             provider.QueryFeatures().Resolve(PlatformFeatureFamily.VirtualizationDomains).Availability);
+        Assert.Equal(PlatformFeatureAvailability.Unavailable,
+            provider.QueryFeatures().Resolve(PlatformFeatureFamily.NestedDomains).Availability);
         Assert.Equal(HybridCpuChildDomainAdapterReadiness.ExternalBlocked,
             provider.QueryChildDomainAdapterStatus().Readiness);
     }

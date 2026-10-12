@@ -78,9 +78,12 @@ public sealed partial class PlatformAuthorityBridge
         var previous = BackendEpoch;
         if (!exhausted) _backendEpoch++;
         var current = BackendEpoch;
-        foreach (var subject in _pendingVirtualDomainCreates) _unresolvedVirtualDomainCreates.TryAdd(subject, previous);
-        foreach (var subject in _pendingDomainBinds)
-            _unresolvedDomainBinds.Add(subject);
+        foreach (var invocation in _pendingVirtualDomainCreates.Values)
+            if (invocation.EffectMayHaveOccurred)
+                _unresolvedVirtualDomainCreates.TryAdd(invocation.Owner, invocation);
+        foreach (var invocation in _pendingDomainBinds.Values)
+            if (invocation.EffectMayHaveOccurred)
+                _unresolvedDomainBinds.TryAdd(invocation.Subject, invocation);
 
         var faultPinnedMappings = 0;
         foreach (var record in _mappings.Values)
@@ -146,9 +149,9 @@ public sealed partial class PlatformAuthorityBridge
                 record.Closure = PlatformExternalClosureState.Faulted;
         }
 
-        foreach (var record in _virtualIoBindings.Values)
+        foreach (var record in _virtualIoOwners)
         {
-            if (record.Closure != PlatformExternalClosureState.Closed)
+            if (!HasConsumedVirtualIo(record))
                 record.Closure = PlatformExternalClosureState.Faulted;
         }
 

@@ -11,7 +11,7 @@ public sealed class ParentAdmissionContinuityTests
         var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, ChildClosureTupleTests.RootCloseRuntimeProxy>();
         var proxy = (ChildClosureTupleTests.RootCloseRuntimeProxy)(object)runtime;
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         var device = provider.BindDevice(parent, new("parent-source"), PlatformDeviceRights.Read | PlatformDeviceRights.Configure).Value!;
         var region = new PlatformRegionIdentity(new RegionHandle(new RegionId(9), new RegionGeneration(4)),
             new RegionOwner(parent.Subject.DomainId, parent.Subject.ProcessGeneration), 4096);
@@ -39,7 +39,7 @@ public sealed class ParentAdmissionContinuityTests
         var restore = LoseParent(provider, parent, absent);
         Assert.False(provider.BindInterrupt(device, new("irq", PlatformInterruptTrigger.Edge)).IsSuccess);
         Assert.False(provider.MapMmio(device, new("mmio", 4096), new(0, 64), PlatformMmioAccess.Read).IsSuccess);
-        Assert.False(provider.BindDmaGrant(new(device, mapping.Lease, mapping.Slice, new(0, 64), PlatformDmaDirection.DeviceReadsMemory)).IsSuccess);
+        Assert.False(provider.BindDmaGrant(new PlatformDmaGrantRequest(device, mapping.Lease, mapping.Slice, new(0, 64), PlatformDmaDirection.DeviceReadsMemory)).IsSuccess);
         Assert.False(provider.PrepareRegionMappingForConsumer(new(mapping.Lease, mapping.Slice,
             PlatformMemoryConsumerClass.ExternalExecutionDomain, PlatformMemoryVisibilityRequirement.PublicationFence)).IsSuccess);
         Assert.False(provider.BeginRegionMappingRevocation(mapping.Lease, PlatformRegionRevocationPolicy.DrainBeforeRevoke).IsSuccess);

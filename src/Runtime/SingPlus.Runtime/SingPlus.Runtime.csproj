@@ -8,7 +8,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="HybridCPU.ExternalRuntime.Contracts" Version="[1.14.0]" />
+    <PackageReference Include="HybridCPU.ExternalRuntime.Contracts" Version="[1.35.0]" />
   </ItemGroup>
 
   <PropertyGroup>
@@ -20,3 +20,8 @@
   </PropertyGroup>
 
 </Project>
+
+
+
+
+

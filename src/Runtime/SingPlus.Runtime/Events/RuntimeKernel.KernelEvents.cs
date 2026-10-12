@@ -88,6 +88,8 @@ public sealed partial class RuntimeKernel
         var validation = _kernelEvents.Validate(subject, endpoint);
         if (!validation.IsSuccess) return validation;
 
+        var original = PlatformAuthority.ResolveOriginalIrqBindsForCleanup(PlatformIdentity(resolved.Value!));
+        if (!original.IsSuccess) return original;
         var routes = AdvancePlatformIrqBindingsForEndpoint(endpoint);
         if (!routes.IsSuccess) return routes;
 

@@ -10,6 +10,96 @@ namespace SingPlus.Tests.Platform;
 public sealed class PlatformDsc1ComputeTests
 {
     [Theory]
+    [InlineData(64UL,false)] [InlineData(96UL,false)] [InlineData(96UL,true)]
+    public void Dsc1PrivateSnapshotReservesBeforeProviderAndReclaimsOnlyAtExactClosure(ulong limit,bool lostCharge)
+    {
+        var provider=new HostPlatformAuthorityProvider(deferDsc1Completion:true);
+        BudgetAccountHandle budget=default;
+        var scenario=CreateScenario(provider,2191,2291,32,(kernel,owner)=>
+        {
+            var admin=TestFixtures.Create(kernel,98,980).Handle;
+            var cap=kernel.MintCapability(new(980),admin,ResourceKind.KernelService,CapabilityResourceIds.BudgetAdministration,CapabilityRights.Configure).Value!.CapabilityId;
+            budget=kernel.AdmitProcessBudget(admin,cap,owner,"dsc1-snapshot",[new(ServiceBudgetDimension.OwnedMemoryBytes,limit)]).Value!.ProcessBudget;
+        });
+        ulong Used()=>scenario.Kernel.QueryBudget(budget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used;
+        var submitted=SubmitWhole(scenario);
+        if(limit==64)
+        {
+            Assert.False(submitted.IsSuccess);Assert.Equal(KernelError.BudgetExceeded,submitted.Error);
+            Assert.Equal(0,provider.SubmitDsc1CopyCallCount);Assert.Equal(64UL,Used());
+            Assert.Equal(32,scenario.Source.Span.Length);Assert.Equal(32,scenario.Destination.Span.Length);
+        }
+        else
+        {
+            Assert.True(submitted.IsSuccess,submitted.Message);Assert.Equal(1,provider.SubmitDsc1CopyCallCount);Assert.Equal(96UL,Used());
+            Assert.False(scenario.Kernel.ObservePlatformDsc1Copy(scenario.Subject,submitted.Value).IsSuccess);
+            Assert.Equal(96UL,Used());
+            if(lostCharge)
+            {
+                var flags=BindingFlags.Instance|BindingFlags.NonPublic;
+                var records=(global::System.Collections.IDictionary)scenario.Kernel.GetType().GetField("_dsc1PayloadOperations",flags)!.GetValue(scenario.Kernel)!;
+                var payload=records[submitted.Value.SubmissionId]!;
+                var link=payload.GetType().GetProperty("StagedOutputCharge")!;var original=link.GetValue(payload);
+                link.SetValue(payload,null);
+                Assert.False(scenario.Kernel.CancelPlatformDsc1Copy(scenario.Subject,submitted.Value).IsSuccess);
+                Assert.Equal(96UL,Used());Assert.Equal(1,provider.CancelDsc1CallCount);
+                Assert.Throws<InvalidOperationException>(()=>{_=scenario.Destination.Span.Length;});
+                link.SetValue(payload,original);
+            }
+            Assert.True(scenario.Kernel.CancelPlatformDsc1Copy(scenario.Subject,submitted.Value).IsSuccess);
+            Assert.Equal(1,provider.CancelDsc1CallCount);
+            Assert.Equal(64UL,Used());
+        }
+        Assert.True(scenario.Kernel.TerminateProcess(scenario.Subject).IsSuccess);Assert.Equal(0UL,Used());
+        Assert.All(scenario.Kernel.Regions.Snapshot(),r=>Assert.Equal(RegionState.Released,r.State));
+    }
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void TerminalEventRouteLossConsumesOriginalReservationAndPreservesForeignEndpoint(bool foreignRoute)
+    {
+        var provider = new FaultInjectingDsc1Provider(deferDsc1Completion: false);
+        Func<ulong> pinned = null!, owned = null!;
+        var scenario = CreateScenario(provider, 2189, 2289, 32, (kernel, owner) =>
+        {
+            var admin = TestFixtures.Create(kernel, 98, 980).Handle;
+            var cap = kernel.MintCapability(new DomainId(980), admin, ResourceKind.KernelService,
+                CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+            var budget = kernel.AdmitProcessBudget(admin, cap, owner, "dsc1-event-refusal",
+                [new(ServiceBudgetDimension.OwnedMemoryBytes, 96), new(ServiceBudgetDimension.PinnedMappedMemoryBytes, 64)])
+                .Value!.ProcessBudget;
+            pinned = () => kernel.QueryBudget(budget).Value!.Usage.Single(u => u.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used;
+            owned = () => kernel.QueryBudget(budget).Value!.Usage.Single(u => u.Dimension == ServiceBudgetDimension.OwnedMemoryBytes).Used;
+        });
+        scenario.Source.Span.Fill(0x6A);
+        var submission = SubmitWhole(scenario).Value!;
+        var endpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        var foreign = TestFixtures.Create(scenario.Kernel, 2190, 2290).Handle;
+        var foreignEndpoint = scenario.Kernel.CreateKernelEventEndpoint(foreign).Value!;
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var registry = typeof(RuntimeKernel).GetField("_kernelEvents", flags)!.GetValue(scenario.Kernel)!;
+        var routes = (global::System.Collections.IDictionary)registry.GetType().GetField("_endpoints", flags)!.GetValue(registry)!;
+        var original = routes[endpoint.EndpointId]!;
+        var other = routes[foreignEndpoint.EndpointId]!;
+        provider.BeforeObservation = () =>
+        {
+            if (foreignRoute) routes[endpoint.EndpointId] = other;
+            else routes.Remove(endpoint.EndpointId);
+        };
+        var refused = scenario.Kernel.ObservePlatformDsc1Copy(scenario.Subject, submission, endpoint);
+        Assert.False(refused.IsSuccess);
+        Assert.Null(original.GetType().GetProperty("Staged")!.GetValue(original));
+        Assert.Equal(1, provider.ObserveCalls);
+        Assert.All(scenario.Destination.Span.ToArray(), value => Assert.Equal((byte)0x6A, value));
+        Assert.Equal(64UL, owned());
+        routes[endpoint.EndpointId] = original;
+        Assert.True(scenario.Kernel.CloseKernelEventEndpoint(scenario.Subject, endpoint).IsSuccess);
+        Assert.True(scenario.Kernel.TerminateProcess(scenario.Subject).IsSuccess);
+        Assert.Equal(0UL, pinned()); Assert.Equal(0UL, owned());
+        Assert.Equal("Active", other.GetType().GetProperty("State")!.GetValue(other)!.ToString());
+        Assert.Equal(KernelError.ResponseNotAvailable, scenario.Kernel.ConsumeKernelEvent(foreign, foreignEndpoint).Error);
+    }
+    [Theory]
     [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)]
     public void ProcessDsc1StageRunsCallbacksOutsideBothGatesAndRetainsActualClosure(int fault)
     {
@@ -688,7 +778,7 @@ public sealed class PlatformDsc1ComputeTests
             var administration = kernel.MintCapability(new DomainId(980), admin, ResourceKind.KernelService,
                 CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
             var budget = kernel.AdmitProcessBudget(admin, administration, owner, "dsc1-final-consumption",
-                [new(ServiceBudgetDimension.OwnedMemoryBytes, 64), new(ServiceBudgetDimension.PinnedMappedMemoryBytes, 64)])
+                [new(ServiceBudgetDimension.OwnedMemoryBytes, 96), new(ServiceBudgetDimension.PinnedMappedMemoryBytes, 64)])
                 .Value!.ProcessBudget;
             pinned = () => kernel.QueryBudget(budget).Value!.Usage.Single(u => u.Dimension == ServiceBudgetDimension.PinnedMappedMemoryBytes).Used;
             owned = () => kernel.QueryBudget(budget).Value!.Usage.Single(u => u.Dimension == ServiceBudgetDimension.OwnedMemoryBytes).Used;
@@ -726,7 +816,7 @@ public sealed class PlatformDsc1ComputeTests
         Assert.Equal(0, provider.ActiveOriginalSubmissions);
         Assert.Equal(1, provider.CancelCalls);
         Assert.Throws<InvalidOperationException>(() => { _ = scenario.Destination.Span.Length; });
-        Assert.Equal(64UL, owned());
+        Assert.Equal(96UL, owned());
         Assert.Equal(64UL, pinned());
         domains[scenario.Binding.BindingId] = originalDomain;
         mappings[scenario.SourceMapping.MappingId] = originalMapping;

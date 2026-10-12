@@ -467,13 +467,33 @@ public sealed partial class RuntimeKernel
             capabilityId,
             slice,
             retainFaultedHandleOnMalformed: true,
-            out var retainReservation);
+            out var retainReservation, out var faultedMapping);
         if (!mapping.IsSuccess)
         {
             if (!retainReservation)
             {
                 _ = Regions.ReleasePlatformMappingReservation(region, ownerIdentity);
                 _ = ReleaseAttachedBudget(owner, budget.Value);
+            }
+            else if (faultedMapping is { } cleanup)
+            {
+                lock (_platformMemoryUseGate)
+                {
+                    var current = Processes.Resolve(owner);
+                    if (current.IsSuccess && ReferenceEquals(current.Value, process))
+                    {
+                        TrackPlatformMapping(owner, cleanup);
+                        lock (Budgets.MappingReservationPublicationGate)
+                        {
+                            var bound = PlatformAuthority.BindOriginalMappingBudgetOwner(cleanup, budget.Value is not null, originalBudgetOwner);
+                            if (bound.IsSuccess && (budget.Value is null || Budgets.BindOriginalMappingChargeOwnerLocked(originalBudgetOwner, bound.Value!).IsSuccess))
+                            {
+                                if (budget.Value is { } reservationOwner)
+                                    _mappingBudgetReservations.TryAdd(cleanup.MappingId, (owner, reservationOwner));
+                            }
+                        }
+                    }
+                }
             }
             return mapping;
         }
@@ -704,14 +724,14 @@ public sealed partial class RuntimeKernel
         var fresh = PlatformAuthority.QueryRegionMappingLifecycle(mapping, identity);
         if (!fresh.IsSuccess) return KernelResult.Fail(fresh.Error, fresh.Message!);
         lifecycle = fresh.Value!;
-        if (lifecycle.PlatformClosure == PlatformExternalClosureState.Faulted)
+        if (lifecycle.PlatformClosure == PlatformExternalClosureState.Faulted && !lifecycle.AdmissionNoEffectProven)
         {
             return KernelResult.Fail(
                 KernelError.PlatformFaulted,
                 "The platform region mapping closure faulted; local reclaim remains forbidden.");
         }
 
-        if (lifecycle.PlatformClosure != PlatformExternalClosureState.Closed)
+        if (lifecycle.PlatformClosure != PlatformExternalClosureState.Closed && !lifecycle.AdmissionNoEffectProven)
         {
             return KernelResult.Fail(
                 KernelError.PlatformBindingDraining,
@@ -726,11 +746,6 @@ public sealed partial class RuntimeKernel
             PlatformAuthority.ForgetExactMappingMetadata(mapping);
             return KernelResult.Ok();
         }
-
-        var bindingValidation = PlatformAuthority.ValidateDomain(
-            mapping.DomainBinding,
-            identity);
-        if (!bindingValidation.IsSuccess) return bindingValidation;
 
         var owner = new RegionOwner(identity.DomainId, identity.ProcessGeneration);
         var gate = Regions.GetPlatformMappingCompletionGate(mapping.Region, owner);

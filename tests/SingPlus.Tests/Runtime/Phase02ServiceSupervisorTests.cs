@@ -224,6 +224,8 @@ public sealed class Phase02ServiceSupervisorTests
             .GetValue(s.Kernel.EndpointSessions)!;
         var allocator = s.Kernel.Channels.GetType().GetField("_nextChannelId", BindingFlags.Instance | BindingFlags.NonPublic)!;
         var beforeAllocation = (ulong)allocator.GetValue(s.Kernel.Channels)!;
+        var pastPreflight = 0;
+        s.Kernel.BeforeComponentDependencySessionQualificationHook = () => Volatile.Write(ref pastPreflight, 1);
         var lifecycleGate = s.Kernel.GetType().GetField("_platformMemoryUseGate", BindingFlags.Instance | BindingFlags.NonPublic)!
             .GetValue(s.Kernel)!;
         using var release = new ManualResetEventSlim();
@@ -243,6 +245,7 @@ public sealed class Phase02ServiceSupervisorTests
             // Observation coordinates the test only; it grants no permission or closure.
             Assert.True(await Task.Run(() => SpinWait.SpinUntil(() =>
             {
+                if (Volatile.Read(ref pastPreflight) == 0) return false;
                 if (!Monitor.TryEnter(lifecycleGate)) return true;
                 Monitor.Exit(lifecycleGate);
                 return false;

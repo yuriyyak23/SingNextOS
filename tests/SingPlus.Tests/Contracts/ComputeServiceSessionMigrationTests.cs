@@ -48,7 +48,7 @@ public sealed class ComputeServiceSessionMigrationTests
         var serviceManifest = new ServiceManifestV1(
             new ComponentIdentity("compute-service"), new ComponentVersion("1"), Digest(image),
             TestFixtures.Manifest(901, 9010, capabilities: [internalCompute]), [serviceRegistration], requiresPlatformDomain: true,
-            budgetRequests: [new(ServiceBudgetDimension.OwnedMemoryBytes, 64), new(ServiceBudgetDimension.ExternalOperations, 4), new(ServiceBudgetDimension.IpcMessages, 4), new(ServiceBudgetDimension.IpcBytes, 4096)]);
+            budgetRequests: [new(ServiceBudgetDimension.OwnedMemoryBytes, 96), new(ServiceBudgetDimension.ExternalOperations, 4), new(ServiceBudgetDimension.IpcMessages, 4), new(ServiceBudgetDimension.IpcBytes, 4096)]);
         var component = kernel.AdmitComponent(new ComponentAdmissionPlan(
             serviceManifest, image,
             [new ComponentCapabilityGrant(new DomainId(9000), internalCompute)],
@@ -64,7 +64,7 @@ public sealed class ComputeServiceSessionMigrationTests
         var discovered = Assert.Single(kernel.ResolveByContract(contract).Value!);
         var session = kernel.OpenSession(caller, discovered, [callerCompute]).Value;
         var host = RuntimeComputeServiceHost.CreateForComponent(kernel, serviceManifest.Identity, session).Value!;
-        var client = IComputeServiceRuntimeClient.Create(new RuntimeSipClientTransport(kernel, caller, session));
+        var client = ComputeServiceClient.Create(new RuntimeSipClientTransport(kernel, caller, session));
 
         var pending = client.CopyAsync(source, destination).AsTask();
         Assert.True(host.ProcessNextCopy().IsSuccess);
@@ -169,7 +169,7 @@ public sealed class ComputeServiceSessionMigrationTests
         var internalCompute = new CapabilityRequirementV1(ResourceKind.Compute, CapabilityResourceIds.Dsc1Copy, CapabilityRights.Execute);
         var image = new byte[] { 9, 2, 0 };
         var manifest = new ServiceManifestV1(new ComponentIdentity("compute-session-test"), new ComponentVersion("1"), Digest(image), TestFixtures.Manifest(921, 9210, capabilities: [internalCompute]), [registration], requiresPlatformDomain: true,
-            budgetRequests: [new(ServiceBudgetDimension.OwnedMemoryBytes, 64), new(ServiceBudgetDimension.ExternalOperations, 4), new(ServiceBudgetDimension.IpcMessages, 4), new(ServiceBudgetDimension.IpcBytes, 4096)]);
+            budgetRequests: [new(ServiceBudgetDimension.OwnedMemoryBytes, 96), new(ServiceBudgetDimension.ExternalOperations, 4), new(ServiceBudgetDimension.IpcMessages, 4), new(ServiceBudgetDimension.IpcBytes, 4096)]);
         var admitted = kernel.AdmitComponent(new ComponentAdmissionPlan(manifest, image, [new ComponentCapabilityGrant(new DomainId(9200), internalCompute)], [new ComponentProvidedServiceRegistration(registration, protocol, IComputeServiceResponseProtocol.Definition, [internalCompute])]));
         Assert.True(admitted.IsSuccess, admitted.Message);
         var caller = TestFixtures.Create(kernel, 922, 9220).Handle;

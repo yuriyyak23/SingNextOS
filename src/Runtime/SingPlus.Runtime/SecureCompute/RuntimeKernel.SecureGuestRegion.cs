@@ -9,21 +9,44 @@ internal readonly record struct SecureGuestRegionBinding(ulong Id, ulong Generat
 public sealed partial class RuntimeKernel
 {
     private enum SecureGuestRegionState { Binding, Active, Closing, Quarantined, Closed }
-    private sealed class SecureGuestRegionRecord(SecureGuestRegionBinding binding, ProcessHandle owner,
-        SecureExecutionBinding execution, GuestRegionMapping mapping, PlatformRegionMapping parent,
-        PlatformSecureRegionClass regionClass)
+    private sealed class SecureGuestRegionRecord
     {
-        internal SecureGuestRegionBinding Binding { get; } = binding;
-        internal ProcessHandle Owner { get; } = owner;
-        internal SecureExecutionBinding Execution { get; } = execution;
-        internal GuestRegionMapping Mapping { get; } = mapping;
-        internal PlatformRegionMapping Parent { get; } = parent;
-        internal PlatformSecureRegionClass RegionClass { get; } = regionClass;
-        internal SecureGuestRegionState State { get; set; } = SecureGuestRegionState.Binding;
+        private readonly object _gate;
+        private SecureGuestRegionState _state = SecureGuestRegionState.Binding;
+        internal SecureGuestRegionRecord(SecureGuestRegionBinding binding, ProcessHandle owner,
+            SecureExecutionBinding execution, SecureExecutionRecord executionSource, GuestRegionMapping mapping,
+            PlatformRegionMapping parent, PlatformSecureRegionClass regionClass, object gate)
+        { OriginalOwner = this; Binding = binding; Owner = owner; Execution = execution; ExecutionSource = executionSource;
+          Mapping = mapping; Parent = parent; RegionClass = regionClass; _gate = gate; }
+        internal SecureGuestRegionRecord OriginalOwner { get; }
+        internal SecureGuestRegionBinding Binding { get; }
+        internal ProcessHandle Owner { get; }
+        internal SecureExecutionBinding Execution { get; }
+        internal SecureExecutionRecord ExecutionSource { get; }
+        internal GuestRegionMapping Mapping { get; }
+        internal PlatformRegionMapping Parent { get; }
+        internal PlatformSecureRegionClass RegionClass { get; }
+        internal object? OriginalRegionBindingSource { get; set; }
+        internal bool ClosureConsumed { get; set; }
+        internal bool CloseInFlight { get; set; }
+        internal bool ClosureSourceChanged { get; set; }
+        internal long SourceRevision { get; private set; }
+        internal bool SourceRevisionExhausted { get; private set; }
+        internal SecureGuestRegionState State
+        {
+            get { lock (_gate) return _state; }
+            set { lock (_gate) { if (CloseInFlight) ClosureSourceChanged = true; if (SourceRevision == long.MaxValue) SourceRevisionExhausted = true; else SourceRevision++; _state = value; } }
+        }
     }
 
     private readonly object _secureGuestRegionGate = new();
     private readonly Dictionary<ulong, SecureGuestRegionRecord> _secureGuestRegions = [];
+    private readonly List<SecureGuestRegionRecord> _secureGuestRegionOwners = [];
+    private bool HasOriginalSecureGuestRegion(SecureGuestRegionRecord record) =>
+        ReferenceEquals(record.OriginalOwner, record) && _secureGuestRegionOwners.Any(x => ReferenceEquals(x, record)) &&
+        _secureGuestRegions.TryGetValue(record.Binding.Id, out var route) && ReferenceEquals(route, record);
+    private static bool HasCompletedSecureGuestRegion(SecureGuestRegionRecord record) =>
+        ReferenceEquals(record.OriginalOwner, record) && record.ClosureConsumed;
     private ulong _nextSecureGuestRegionId = 1;
     // Controlled fault seams outside all source/owner commit locks.
     internal Action? BeforeSecureGuestRegionAdmission { get; set; }
@@ -48,6 +71,11 @@ public sealed partial class RuntimeKernel
         var virtualRecord = _virtualDomains.Resolve(owner, executionRecord.Value!.Request.Context.Virtual);
         if (!virtualRecord.IsSuccess) return KernelResult<SecureGuestRegionBinding>.Fail(virtualRecord.Error, virtualRecord.Message!);
         var virtualValue = virtualRecord.Value!;
+        var expected = virtualValue.State;
+        var effectSource = _virtualDomains.CaptureEffectSource(virtualValue, expected);
+        if (!effectSource.IsSuccess) return KernelResult<SecureGuestRegionBinding>.Fail(effectSource.Error, effectSource.Message!);
+        var secureSource = CaptureSecureComputeSource(owner, execution);
+        if (!secureSource.IsSuccess) return KernelResult<SecureGuestRegionBinding>.Fail(secureSource.Error, secureSource.Message!);
         var mapping = _virtualDomains.ResolveMapping(virtualValue, guestMapping);
         if (!mapping.IsSuccess) return KernelResult<SecureGuestRegionBinding>.Fail(mapping.Error, mapping.Message!);
         if (!virtualValue.PlatformMappings.TryGetValue(guestMapping.MappingId, out var platform) ||
@@ -61,7 +89,6 @@ public sealed partial class RuntimeKernel
         if (!backing.IsSuccess) return KernelResult<SecureGuestRegionBinding>.Fail(backing.Error, backing.Message!);
         var sources = _virtualDomains.ResolveMappingSource(virtualValue, guestMapping);
         if (!sources.IsSuccess) return KernelResult<SecureGuestRegionBinding>.Fail(sources.Error, sources.Message!);
-        var expected = virtualValue.State;
         var rights = CapabilityRights.Map |
             ((mapping.Value.Access & GuestMemoryAccess.Read) != 0 ? CapabilityRights.Read : CapabilityRights.None) |
             ((mapping.Value.Access & GuestMemoryAccess.Write) != 0 ? CapabilityRights.Write : CapabilityRights.None) |
@@ -71,7 +98,7 @@ public sealed partial class RuntimeKernel
         KernelResult CommitSources(bool begin, Func<KernelResult> commit)
         {
             lock (_platformMemoryUseGate)
-                return CommitComposedDomainSources(owner, mapping.Value.Domain, () =>
+                return CommitSecureEffectSource(secureSource.Value!, () => CommitComposedDomainSources(owner, mapping.Value.Domain, () =>
                     CapabilityAuthority.CommitVirtualDomainEffect(sources.Value.Memory, process.Value.DomainId, owner.Generation,
                         CapabilityRights.Map, VirtualizationResourceIds.Memory(mapping.Value.Domain.DomainId), () =>
                     CapabilityAuthority.CommitGuestRegionSource(sources.Value.Region, process.Value.DomainId, owner.Generation,
@@ -81,7 +108,7 @@ public sealed partial class RuntimeKernel
                         var current = _virtualDomains.ResolveMapping(virtualValue, guestMapping);
                         var source = _virtualDomains.ResolveMappingSource(virtualValue, guestMapping);
                         if (!_secureExecutions.TryGetValue(execution.Id, out var exact) ||
-                            !ReferenceEquals(exact, executionRecord.Value) || exact.Request.Binding != execution ||
+                            !HasOriginalSecureExecution(exact) || !ReferenceEquals(exact, executionRecord.Value) || exact.Request.Binding != execution ||
                             exact.State != SecureExecutionState.Active || !current.IsSuccess || current.Value != mapping.Value ||
                             !source.IsSuccess || source.Value != sources.Value ||
                             !virtualValue.PlatformMappings.TryGetValue(guestMapping.MappingId, out var currentPlatform) || currentPlatform != platform)
@@ -89,7 +116,7 @@ public sealed partial class RuntimeKernel
                         if (!begin) return publishPending!(() => backing.Value!(commit));
                         return PlatformAuthority.CommitSecureGuestMapping(platform.Guest, platform.Parent, true,
                             () => backing.Value!(commit), out endPending, out publishPending);
-                    }))));
+                    }, effectSource.Value!)))));
         }
         SecureGuestRegionRecord? record = null;
         try { BeforeSecureGuestRegionAdmission?.Invoke(); }
@@ -99,12 +126,14 @@ public sealed partial class RuntimeKernel
         {
             lock (_secureGuestRegionGate)
             {
-                if (_secureGuestRegions.Values.Any(x => x.State != SecureGuestRegionState.Closed &&
+                if (_secureGuestRegionOwners.Any(x => !HasCompletedSecureGuestRegion(x) &&
                     x.Owner == owner && x.Mapping.Mapping == guestMapping))
                     return KernelResult.Fail(KernelError.PlatformBindingActive, "The exact guest mapping already has a live or quarantined secure overlay.");
                 if (_nextSecureGuestRegionId is 0 or ulong.MaxValue)
                     return KernelResult.Fail(KernelError.CapacityExhausted, "Secure guest identities cannot wrap or be reused.");
-                record = new(new(_nextSecureGuestRegionId++, 1), owner, execution, mapping.Value!, platform.Parent, regionClass);
+                _secureGuestRegionOwners.EnsureCapacity(_secureGuestRegionOwners.Count + 1);
+                record = new(new(_nextSecureGuestRegionId++, 1), owner, execution, executionRecord.Value!, mapping.Value!, platform.Parent, regionClass, _secureGuestRegionGate);
+                _secureGuestRegionOwners.Add(record);
                 _secureGuestRegions.Add(record.Binding.Id, record);
                 return KernelResult.Ok();
             }
@@ -112,6 +141,7 @@ public sealed partial class RuntimeKernel
         if (!admission.IsSuccess) return KernelResult<SecureGuestRegionBinding>.Fail(admission.Error, admission.Message!);
         try
         {
+            var admittedRevision = record!.SourceRevision;
             KernelResult bound;
             try { bound = PlatformAuthority.BindSecureRegion(executionRecord.Value.Request.Context.SecureBinding, platform.Parent, regionClass); }
             catch (Exception exception) when (exception is not StackOverflowException)
@@ -121,23 +151,31 @@ public sealed partial class RuntimeKernel
                 lock (_secureGuestRegionGate) record!.State = SecureGuestRegionState.Quarantined;
                 return KernelResult<SecureGuestRegionBinding>.Fail(bound.Error, bound.Message!);
             }
+            var bindingSource = PlatformAuthority.CaptureOriginalSecureRegionBinding(executionRecord.Value.Request.Context.SecureBinding, platform.Parent);
+            if (!bindingSource.IsSuccess)
+            {
+                lock (_secureGuestRegionGate) record!.State = SecureGuestRegionState.Quarantined;
+                return KernelResult<SecureGuestRegionBinding>.Fail(bindingSource.Error, bindingSource.Message!);
+            }
+            record!.OriginalRegionBindingSource = bindingSource.Value;
             KernelResult publication;
             try
             {
                 publication = RevalidateSecureGuestLineage(record!);
                 if (publication.IsSuccess) publication = RevalidateSecureGuestBackings(regionOwner, record!.Mapping.Region);
                 BeforeSecureGuestRegionPublication?.Invoke();
-                if (publication.IsSuccess) publication = CommitSources(false, () =>
+                if (publication.IsSuccess) publication = PlatformAuthority.CommitOriginalSecureRegionBinding(bindingSource.Value!, () => CommitSources(false, () =>
                 {
                     lock (_secureGuestRegionGate)
                     {
                         if (!_secureGuestRegions.TryGetValue(record!.Binding.Id, out var exact) ||
-                            !ReferenceEquals(exact, record) || record.State != SecureGuestRegionState.Binding)
+                            !HasOriginalSecureGuestRegion(record) || !ReferenceEquals(exact, record) || record.State != SecureGuestRegionState.Binding ||
+                            record.SourceRevisionExhausted || record.SourceRevision != admittedRevision)
                             return KernelResult.Fail(KernelError.StaleGeneration, "Secure guest pending owner changed.");
                         record.State = SecureGuestRegionState.Active;
                         return KernelResult.Ok();
                     }
-                });
+                }));
             }
             catch (Exception exception) when (exception is not StackOverflowException)
             { publication = KernelResult.Fail(KernelError.PlatformFaulted, $"Secure guest publication failed: {exception.Message}"); }
@@ -154,21 +192,32 @@ public sealed partial class RuntimeKernel
     internal KernelResult CloseSecureGuestRegion(SecureGuestRegionBinding binding)
     {
         SecureGuestRegionRecord record;
+        long closingRevision;
         lock (_secureGuestRegionGate)
         {
-            if (!_secureGuestRegions.TryGetValue(binding.Id, out record!) || record.Binding != binding)
+            if (!_secureGuestRegions.TryGetValue(binding.Id, out record!) || !HasOriginalSecureGuestRegion(record) || record.Binding != binding)
                 return KernelResult.Fail(KernelError.StaleGeneration, "Exact secure guest overlay identity/generation is required.");
-            if (record.State == SecureGuestRegionState.Closed) return KernelResult.Ok();
-            if (record.State is SecureGuestRegionState.Binding or SecureGuestRegionState.Closing)
+            if (HasCompletedSecureGuestRegion(record)) return KernelResult.Ok();
+            if (record.State == SecureGuestRegionState.Closed)
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Closed projection is not original overlay completion.");
+            if (record.CloseInFlight || record.State is SecureGuestRegionState.Binding or SecureGuestRegionState.Closing)
                 return KernelResult.Fail(KernelError.PlatformBindingDraining, "Secure guest overlay provider call is in flight.");
             record.State = SecureGuestRegionState.Closing;
+            closingRevision = record.SourceRevision;
+            record.ClosureSourceChanged = false;
+            record.CloseInFlight = true;
         }
-        var execution = ResolveSecureGuestExecution(record.Owner, record.Execution, allowQuarantined: true);
-        KernelResult close;
+        var originalBindingSource = record.OriginalRegionBindingSource;
+        var close = KernelResult.Fail(KernelError.PlatformFaulted, "Original secure guest closure has not completed.");
         try
         {
-            close = !execution.IsSuccess
+            var execution = ResolveSecureGuestExecution(record.Owner, record.Execution, allowQuarantined: true);
+            close = originalBindingSource is null
+                ? KernelResult.Fail(KernelError.PlatformFaulted, "Original secure guest binding fact unavailable.")
+                : !execution.IsSuccess
                 ? KernelResult.Fail(execution.Error, execution.Message!)
+                : !ReferenceEquals(execution.Value, record.ExecutionSource)
+                ? KernelResult.Fail(KernelError.PlatformFaulted, "Original secure execution source changed.")
                 : PlatformAuthority.UnbindSecureRegion(execution.Value!.Request.Context.SecureBinding, record.Parent, bridgeCommit =>
                 {
                     BeforeSecureGuestRegionClosureLocalCommit?.Invoke();
@@ -178,23 +227,30 @@ public sealed partial class RuntimeKernel
                             lock (_secureGuestRegionGate)
                             {
                                 if (!_secureGuestRegions.TryGetValue(binding.Id, out var current) ||
-                                    !ReferenceEquals(current, record) || current.Binding != binding || record.State != SecureGuestRegionState.Closing)
+                                    !HasOriginalSecureGuestRegion(record) || !ReferenceEquals(current, record) || current.Binding != binding ||
+                                    record.State != SecureGuestRegionState.Closing || record.ClosureSourceChanged || record.SourceRevision != closingRevision ||
+                                    !ReferenceEquals(record.OriginalRegionBindingSource, originalBindingSource))
                                     return KernelResult.Fail(KernelError.StaleGeneration, "Exact secure guest closure owner changed before completion.");
+                                record.ClosureConsumed = true;
                                 record.State = SecureGuestRegionState.Closed;
                                 return KernelResult.Ok();
                             }
                         });
-                });
+                }, originalBindingSource);
         }
-        catch (Exception)
+        catch (Exception exception) when (exception is not StackOverflowException and not OutOfMemoryException)
         {
             close = KernelResult.Fail(KernelError.PlatformFaulted, "Secure guest provider close threw; overlay is quarantined.");
         }
-        lock (_secureGuestRegionGate)
+        finally
         {
-            if (!close.IsSuccess) record.State = SecureGuestRegionState.Quarantined;
-            return close.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(close.Error, close.Message!);
+            lock (_secureGuestRegionGate)
+            {
+                if (!close.IsSuccess && !record.ClosureConsumed) record.State = SecureGuestRegionState.Quarantined;
+                record.CloseInFlight = false;
+            }
         }
+        return close.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(close.Error, close.Message!);
     }
 
     private KernelResult<SecureExecutionRecord> ResolveSecureGuestExecution(ProcessHandle owner,
@@ -202,7 +258,7 @@ public sealed partial class RuntimeKernel
     {
         lock (_secureExecutionGate)
         {
-            if (!_secureExecutions.TryGetValue(binding.Id, out var record) || record.Request.Binding != binding)
+            if (!_secureExecutions.TryGetValue(binding.Id, out var record) || !HasOriginalSecureExecution(record) || record.Request.Binding != binding)
                 return KernelResult<SecureExecutionRecord>.Fail(KernelError.StaleGeneration, "Exact secure execution identity/generation is required.");
             if (record.Owner != owner) return KernelResult<SecureExecutionRecord>.Fail(KernelError.WrongPlatformDomain, "Secure execution belongs to another process.");
             if (!allowQuarantined && record.State != SecureExecutionState.Active)
@@ -231,7 +287,7 @@ public sealed partial class RuntimeKernel
     {
         SecureGuestRegionBinding[] bindings;
         lock (_secureGuestRegionGate)
-            bindings = _secureGuestRegions.Values.Where(x => x.Owner == owner && x.State != SecureGuestRegionState.Closed &&
+            bindings = _secureGuestRegionOwners.Where(x => x.Owner == owner && !HasCompletedSecureGuestRegion(x) &&
                 x.Mapping.Mapping == mapping).Select(x => x.Binding).ToArray();
         foreach (var binding in bindings)
         {
@@ -244,7 +300,7 @@ public sealed partial class RuntimeKernel
     private bool HasSecureGuestRegionsForExecution(SecureExecutionBinding binding)
     {
         lock (_secureGuestRegionGate)
-            return _secureGuestRegions.Values.Any(x => x.Execution == binding && x.State != SecureGuestRegionState.Closed);
+            return _secureGuestRegionOwners.Any(x => x.Execution == binding && !HasCompletedSecureGuestRegion(x));
     }
 
     private KernelResult CloseSecureGuestRegionsForProcess(ProcessHandle owner) =>
@@ -257,7 +313,7 @@ public sealed partial class RuntimeKernel
     {
         SecureGuestRegionBinding[] bindings;
         lock (_secureGuestRegionGate)
-            bindings = _secureGuestRegions.Values.Where(x => x.State != SecureGuestRegionState.Closed && predicate(x))
+            bindings = _secureGuestRegionOwners.Where(x => !HasCompletedSecureGuestRegion(x) && predicate(x))
                 .Select(x => x.Binding).ToArray();
         foreach (var binding in bindings)
         {
@@ -271,12 +327,8 @@ public sealed partial class RuntimeKernel
     {
         SecureGuestRegionRecord[] candidates;
         lock (_secureGuestRegionGate)
-            candidates = _secureGuestRegions.Values.Where(x => x.Owner == owner && x.State != SecureGuestRegionState.Closed).ToArray();
-        var bindings = candidates.Where(x =>
-        {
-            var execution = ResolveSecureGuestExecution(x.Owner, x.Execution, allowQuarantined: true);
-            return execution.IsSuccess && execution.Value!.Request.Context.Secure == domain;
-        }).Select(x => x.Binding).ToArray();
+            candidates = _secureGuestRegionOwners.Where(x => x.Owner == owner && !HasCompletedSecureGuestRegion(x)).ToArray();
+        var bindings = candidates.Where(x => x.ExecutionSource.Request.Context.Secure == domain).Select(x => x.Binding).ToArray();
         foreach (var binding in bindings)
         {
             var close = CloseSecureGuestRegion(binding);

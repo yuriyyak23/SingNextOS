@@ -1,8 +1,8 @@
-using YAKSys_Hybrid_CPU.Core;
+﻿using YAKSys_Hybrid_CPU.Core;
 
 namespace SingPlus.Platform.HybridCpu;
 
-public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformDmaVisibilityProvider
+public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformDmaVisibilityProvider, IPlatformDmaVisibilityClosureProvider
 {
     private sealed class ProviderDmaVisibilityState(
         PlatformProviderDmaVisibilityCycle providerCycle,
@@ -17,17 +17,34 @@ public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformDmaVis
         _dmaVisibilityStates = [];
     private ulong _nextProviderDmaVisibilityCycle = 1;
 
-    private sealed class DmaVisibilityInvocation(bool acquire, DmaSource source,
-        ProviderDmaVisibilityState? state, PlatformProviderDmaVisibilityCycle cycle)
+    private sealed class DmaVisibilityInvocation
     {
-        public bool Acquire { get; } = acquire;
-        public DmaSource Source { get; } = source;
-        public ProviderDmaVisibilityState? State { get; } = state;
-        public PlatformProviderDmaVisibilityCycle Cycle { get; } = cycle;
-        public PlatformProviderDmaVisibilityCycle OriginalProviderCycle { get; } = state?.ProviderCycle ?? default;
-        public NeutralDmaVisibilityCycle OriginalNeutralCycle { get; } = state?.NeutralCycle ?? default;
-        public bool OriginalAcquired { get; } = state?.Acquired ?? false;
+        public DmaVisibilityInvocation(bool acquire, DmaSource source, ProviderDmaVisibilityState? state, PlatformProviderDmaVisibilityCycle cycle)
+        { OwnerSelf = this; Acquire = acquire; Source = source; State = state; Cycle = cycle; OriginalProviderCycle = state?.ProviderCycle ?? default; OriginalNeutralCycle = state?.NeutralCycle ?? default; OriginalAcquired = state?.Acquired ?? false; }
+        public DmaVisibilityInvocation OwnerSelf { get; }
+        public bool Acquire { get; }
+        public DmaSource Source { get; }
+        public ProviderDmaVisibilityState? State { get; }
+        public PlatformProviderDmaVisibilityCycle Cycle { get; }
+        public PlatformProviderDmaVisibilityCycle OriginalProviderCycle { get; }
+        public NeutralDmaVisibilityCycle OriginalNeutralCycle { get; }
+        public bool OriginalAcquired { get; }
         public object? Observation { get; set; }
+        public NeutralOriginalDmaVisibilityRequest? NativeRequest { get; set; }
+        public NeutralOriginalDmaVisibilityObservation? NativeObservation { get; set; }
+        public NeutralOriginalDmaVisibilityObservation? NativeValidation { get; set; }
+        public bool Invoked { get; set; }
+        public bool NoEffectConsumed { get; set; }
+    }
+
+    public bool CanCloseOriginalDmaVisibility(PlatformProviderDmaGrant grant)
+    {
+        lock (_childCreateCommitGate)
+            return _runtime is INeutralOriginalDmaVisibilityProvider && _originalDmaGrants.TryGetValue(grant.GrantId,out var owner) &&
+                ReferenceEquals(owner.OwnerSelf,owner) && owner.Grant == grant && _dmaGrants.TryGetValue(grant.GrantId,out var routed) && ReferenceEquals(routed,owner) &&
+                owner.AdmissionSource is { } admission && ReferenceEquals(admission.OwnerSelf,admission) && admission.NativeRequest is { } request &&
+                admission.NativeObservation is { SourceFenceMatched: true, NoEffectGuaranteed: false } raw && raw.Request == request &&
+                raw.Observation is { IsGranted: true } && raw.Observation.Grant == owner.HybridCpuGrant;
     }
 
     public PlatformAuthorityResult<PlatformProviderDmaPrepareEvidence> PrepareDmaGrantVisibility(PlatformProviderDmaGrant grant)
@@ -59,6 +76,9 @@ public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformDmaVis
             var validation = ValidateProviderDmaGrantForVisibility(grant);
             if (!validation.IsSuccess) return PlatformAuthorityResult<PlatformProviderDmaVisibilityCycle>.Fail(validation.Status, validation.Message!);
             record = _dmaGrants[grant.GrantId];
+            if (record.CopyFact is { } copy && !copy.NoEffectConsumed && (copy.InFlight || !acquire &&
+                (!copy.SourceCompletionObserved || !copy.DestinationCompletionObserved || !copy.DestinationCycle.Acquired)))
+                return Fail("Original copy bytes/cycles are retained; visibility effect refused.");
             if (record.VisibilityInFlight || record.VisibilityUnknown)
                 return Fail("Original DMA visibility invocation is pending or unknown; repeat refused.");
             _dmaVisibilityStates.TryGetValue(grant.GrantId, out var routedState);
@@ -88,16 +108,64 @@ public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformDmaVis
                     return Fail("DMA visibility cycle capacity exhausted before neutral effect.");
                 if (!acquire) _dmaVisibilityStates.EnsureCapacity(_dmaVisibilityStates.Count + 1);
                 invocation = new(acquire, source, state, acquire ? state!.ProviderCycle : new(_nextProviderDmaVisibilityCycle++));
+                record.VisibilityHistory.Add(invocation);
                 record.VisibilityInvocation = invocation;
             }
+            if (!ReferenceEquals(invocation.OwnerSelf,invocation) || !record.VisibilityHistory.Any(old => ReferenceEquals(old,invocation)))
+                return Fail("Original DMA visibility invocation owner was substituted.");
             record.VisibilityInFlight = true;
         }
         try
         {
             object? observation;
-            try { observation = invocation.Observation ?? (acquire
-                ? (object?)_runtime.AcquireDmaVisibility(record.HybridCpuGrant)
-                : _runtime.PrepareDmaVisibility(record.HybridCpuGrant)); }
+            try
+            {
+                if (_runtime is INeutralOriginalDmaVisibilityProvider original && record.AdmissionSource?.NativeRequest is { } bind &&
+                    _originalNativeMappingIncarnation is { } incarnation)
+                {
+                    NeutralOriginalDmaVisibilityRequest request; bool invoke;
+                    lock (_childCreateCommitGate)
+                    {
+                        invocation.NativeRequest ??= new(Guid.NewGuid(),incarnation,bind.InvocationId,record.HybridCpuGrant,acquire,acquire ? invocation.OriginalNeutralCycle : default);
+                        request = invocation.NativeRequest.Value; invoke = !invocation.Invoked;
+                        if (invoke) invocation.Invoked = true;
+                        if (!invoke && invocation.NativeObservation is null) return Fail("Original visibility reply unknown; repeat refused, exact grant cleanup only.");
+                    }
+                    var raw = invocation.NativeObservation ?? (acquire ? original.AcquireDmaVisibility(request) : original.PrepareDmaVisibility(request));
+                    lock (_childCreateCommitGate)
+                    {
+                        invocation.NativeObservation = raw; invocation.Observation = acquire ? raw.Acquire : raw.Prepare; // Before source callback.
+                        if (raw.Request != request || !raw.SourceFenceMatched && !raw.NoEffectGuaranteed ||
+                            acquire && (raw.Acquire is null || raw.Prepare is not null) || !acquire && (raw.Prepare is null || raw.Acquire is not null) ||
+                            raw.NoEffectGuaranteed && (raw.Prepare is { IsPrepared: true } || raw.Acquire is { IsAcquired: true }))
+                        { record.VisibilityUnknown = true; return Fail("Original visibility response foreign/malformed; cleanup only."); }
+                        if (raw.NoEffectGuaranteed)
+                        {
+                            invocation.NoEffectConsumed = true; record.VisibilityInvocation = null;
+                            return PlatformAuthorityResult<PlatformProviderDmaVisibilityCycle>.Fail(PlatformAuthorityStatus.NotAccepted,"Original visibility invocation exact no-effect; grant remains open.");
+                        }
+                    }
+                    var source = ValidateOriginalNativeMappingSource();
+                    if (!source.IsSuccess) return Fail(source.Message ?? "Original visibility source lost after effect.");
+                    var current = original.ResolveDmaVisibility(request);
+                    lock (_childCreateCommitGate) invocation.NativeValidation = current; // Retained before callback.
+                    var after = ValidateOriginalNativeMappingSource();
+                    if (!after.IsSuccess || current is null || current.Value != raw) return Fail("Original native visibility owner/cycle changed before publication.");
+                    var final = original.ResolveDmaVisibility(request); // Fresh owner/cycle after the intervening source callback.
+                    lock (_childCreateCommitGate) invocation.NativeValidation = final;
+                    if (final is null || final.Value != raw) return Fail("Original native visibility owner changed after source callback.");
+                    observation = invocation.Observation;
+                }
+                else
+                {
+                    lock (_childCreateCommitGate)
+                    {
+                        if (invocation.Invoked && invocation.Observation is null) return Fail("Legacy visibility outcome unknown; no repeat.");
+                        invocation.Invoked = true;
+                    }
+                    observation = invocation.Observation ?? (acquire ? (object?)_runtime.AcquireDmaVisibility(record.HybridCpuGrant) : _runtime.PrepareDmaVisibility(record.HybridCpuGrant));
+                }
+            }
             catch { lock (_childCreateCommitGate) record.VisibilityUnknown = true; throw; }
             lock (_childCreateCommitGate)
             {
@@ -166,7 +234,7 @@ public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformDmaVis
                 "The provider DMA grant does not exist.");
         }
 
-        if (!_originalDmaGrants.TryGetValue(grant.GrantId, out var original) || !ReferenceEquals(original, record))
+        if (!ReferenceEquals(record.OwnerSelf,record) || !_originalDmaGrants.TryGetValue(grant.GrantId, out var original) || !ReferenceEquals(original, record))
             return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Original DMA owner is not current before visibility.");
 
         if (record.Grant.Generation != grant.Generation)
@@ -182,6 +250,9 @@ public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformDmaVis
                 PlatformAuthorityStatus.Faulted,
                 "The provider DMA grant identity is malformed.");
         }
+
+        if (record.CleanupOnly)
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Denied, "Original DMA cleanup outcome cannot admit visibility or use.");
 
         if (record.Revoked)
         {

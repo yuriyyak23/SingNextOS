@@ -4,9 +4,9 @@
     "net11.0": {
       "HybridCPU.ExternalRuntime.Contracts": {
         "type": "Direct",
-        "requested": "[1.14.0, 1.14.0]",
-        "resolved": "1.14.0",
-        "contentHash": "wLH8suR5xnj9C0CmqKTvUBSp2fLQsnS18ELZbILGosnGU3KIRJTZykX6bfvL/IWNOFOzGmQVvKI3q7irmjeM/Q=="
+        "requested": "[1.35.0, 1.35.0]",
+        "resolved": "1.35.0",
+        "contentHash": "ijdklm2Ta2lg37UcFFwoW1pXR12XerINhpgC7eHW3KY9LopfEJkKlcCwc9jHh0SgumuFqNFqN4eIoF+WdLg5fQ=="
       },
       "hybridcpu.boot.contracts": {
         "type": "Project"

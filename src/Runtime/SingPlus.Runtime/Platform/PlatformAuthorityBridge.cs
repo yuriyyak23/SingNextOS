@@ -1,4 +1,4 @@
-using SingPlus.Contracts;
+﻿using SingPlus.Contracts;
 using SingPlus.Platform;
 
 namespace SingPlus.Runtime;
@@ -34,12 +34,27 @@ public readonly record struct PlatformRegionMappingLifecycle(
     PlatformExternalClosureState PlatformClosure,
     bool LocalReservationReleased)
 {
+    public bool AdmissionNoEffectProven { get; init; }
     public bool LocalReclaimAllowed =>
-        PlatformClosure == PlatformExternalClosureState.Closed && LocalReservationReleased;
+        (PlatformClosure == PlatformExternalClosureState.Closed || AdmissionNoEffectProven) && LocalReservationReleased;
 }
 
 public sealed partial class PlatformAuthorityBridge
 {
+    // Original local invocation fact; optional provider request correlation, never durable admission.
+    private sealed class RootBindInvocationFact(PlatformDomainIdentity subject, PlatformBackendEpoch epoch)
+    {
+        public PlatformDomainIdentity Subject { get; } = subject;
+        public PlatformBackendEpoch AdmissionEpoch { get; } = epoch;
+        public PlatformProviderIncarnation ProviderIncarnation { get; set; }
+        public PlatformDomainBindRequest? Request { get; set; }
+        public PlatformAuthorityResult<PlatformDomainBindResolution>? ResolutionObservation { get; set; }
+        public bool ResolutionInFlight { get; set; }
+        public DomainRecord? CleanupOwner { get; set; }
+        public bool EffectMayHaveOccurred { get; set; }
+        public PlatformAuthorityResult<PlatformProviderDomainLease>? Observation { get; set; }
+        public PlatformAuthorityResult? ReturnedCleanupObservation { get; set; }
+    }
     private enum DomainAuthorityState
     {
         Active = 0,
@@ -53,14 +68,25 @@ public sealed partial class PlatformAuthorityBridge
     {
         public PlatformDomainBinding Binding { get; } = binding;
         public PlatformProviderDomainLease ProviderLease { get; } = providerLease;
+        public RootBindInvocationFact? BindInvocation { get; init; }
         public PlatformProviderIncarnation ProviderIncarnation { get; init; }
         public PlatformBackendEpoch BackendEpoch { get; init; }
         public bool ParentRevokeInFlight { get; set; }
         public bool ProviderClosureConfirmed { get; set; }
         public PlatformAuthorityResult? RootRevokeObservation { get; set; }
-        public DomainAuthorityState AuthorityState { get; set; }
+        private DomainAuthorityState _authorityState;
+        private long _authorityRevision;
+        private int _authorityRevisionExhausted;
+        public long AuthorityRevision => Volatile.Read(ref _authorityRevision);
+        public bool AuthorityRevisionExhausted => Volatile.Read(ref _authorityRevisionExhausted) != 0;
+        public DomainAuthorityState AuthorityState
+        {
+            get => _authorityState;
+            set { AdvanceExecutableSourceRevision(ref _authorityRevision, ref _authorityRevisionExhausted); _authorityState = value; }
+        }
         public bool SecureCreateMayHaveEffect { get; set; }
         public bool DeviceBindMayHaveEffect { get; set; }
+        public List<OriginalDeviceBindInvocation> OriginalDeviceBinds { get; } = [];
         public PlatformAuthorityResult<PlatformProviderDeviceLease>? DeviceBindObservation { get; set; }
         public CapabilityId? DeviceBindCapabilityId { get; set; }
         public PlatformDeviceIdentity? DeviceBindDevice { get; set; }
@@ -98,15 +124,29 @@ public sealed partial class PlatformAuthorityBridge
     {
         public DomainRecord? OriginalDomain { get; set; }
         public PlatformRegionMapping Mapping { get; } = mapping;
-        public PlatformProviderRegionMappingLease ProviderLease { get; } = providerLease;
+        public PlatformProviderRegionMappingLease ProviderLease { get; set; } = providerLease;
+        public PlatformOwnedRegionMapRequest? AdmissionRequest { get; init; }
+        public PlatformAuthorityResult<PlatformOwnedRegionMapResolution>? AdmissionResolutionObservation { get; set; }
+        public bool AdmissionNoEffectProven { get; set; }
         public CapabilityId AuthorityCapabilityId { get; } = authorityCapabilityId;
         public PlatformProviderIncarnation ProviderIncarnation { get; } = providerIncarnation;
         public PlatformBackendEpoch BackendEpoch { get; } = backendEpoch;
         public bool LocalAuthorizationRevoked { get; set; }
-        public PlatformExternalClosureState ClosureState { get; set; } =
-            PlatformExternalClosureState.Active;
+        public bool OriginalPermissionRetiredForCleanup { get; set; }
+        private PlatformExternalClosureState _closureState = PlatformExternalClosureState.Active;
+        private long _lifecycleRevision;
+        private int _lifecycleRevisionExhausted;
+        public long LifecycleRevision => Volatile.Read(ref _lifecycleRevision);
+        public bool LifecycleRevisionExhausted => Volatile.Read(ref _lifecycleRevisionExhausted) != 0;
+        public PlatformExternalClosureState ClosureState
+        {
+            get => _closureState;
+            set { AdvanceExecutableSourceRevision(ref _lifecycleRevision, ref _lifecycleRevisionExhausted); _closureState = value; }
+        }
         public PlatformOperationIdentity? ClosureOperation { get; set; }
         public PlatformAuthorityResult<PlatformRegionRevocationTicket>? RevocationBeginObservation { get; set; }
+        public PlatformRegionRevocationRequest? RevocationRequest { get; set; }
+        public PlatformAuthorityResult<PlatformRegionRevocationResolution>? RevocationResolutionObservation { get; set; }
         public bool LegacyRevokeMayHaveEffect { get; set; }
         public PlatformAuthorityResult? LegacyRevokeObservation { get; set; }
         public PlatformCompletionReceipt? KnownClosureReceipt { get; set; }
@@ -115,6 +155,7 @@ public sealed partial class PlatformAuthorityBridge
         public bool KernelBudgetBindingKnown { get; set; }
         public bool ExpectsBudgetReservation { get; set; }
         public object? OriginalBudgetReservationOwner { get; set; }
+        public ulong MaximumPrivateExecutableDataBytes { get; set; }
         public PlatformAuthorityResult<PlatformRegionAcquireResult>? AcquireObservation { get; set; }
         public bool AcquireInFlight { get; set; }
         public bool AcquireUncertain { get; set; }
@@ -128,7 +169,7 @@ public sealed partial class PlatformAuthorityBridge
             Mapping,
             LocalAuthorizationRevoked,
             ClosureState,
-            LocalReservationReleased);
+            LocalReservationReleased) { AdmissionNoEffectProven = HasValidatedAdmissionNoEffect(this) };
     }
 
     private readonly IPlatformAuthorityProvider? _provider;
@@ -138,8 +179,8 @@ public sealed partial class PlatformAuthorityBridge
     private readonly Dictionary<PlatformRegionMappingId, MappingRecord> _mappings = [];
     // Existing subject index retains the original owner, independently of current domain routing.
     private readonly Dictionary<PlatformDomainIdentity, DomainRecord> _activeSubjects = [];
-    private readonly HashSet<PlatformDomainIdentity> _pendingDomainBinds = [];
-    private readonly HashSet<PlatformDomainIdentity> _unresolvedDomainBinds = [];
+    private readonly Dictionary<PlatformDomainIdentity, RootBindInvocationFact> _pendingDomainBinds = [];
+    private readonly Dictionary<PlatformDomainIdentity, RootBindInvocationFact> _unresolvedDomainBinds = [];
     private ulong _nextDomainBindingId = 1;
     private ulong _nextMappingId = 1;
 
@@ -205,6 +246,7 @@ public sealed partial class PlatformAuthorityBridge
         }
 
         PlatformBackendEpoch backendEpoch = default;
+        RootBindInvocationFact originalInvocation = null!;
         KernelResult Begin()
         {
         lock (_secureDomainLifecycleGate)
@@ -215,17 +257,18 @@ public sealed partial class PlatformAuthorityBridge
             if (HasActiveAuthority(subject))
                 return KernelResult.Fail(KernelError.PlatformFaulted,
                     "The original subject still owns a live platform fact; a missing canonical route cannot admit a replacement root.");
-            if (_pendingDomainBinds.Contains(subject))
+            if (_pendingDomainBinds.ContainsKey(subject))
                 return KernelResult.Fail(KernelError.PlatformBindingActive,
                     "The local subject already has platform binding admission in flight.");
-            if (_unresolvedDomainBinds.Contains(subject))
+            if (_unresolvedDomainBinds.ContainsKey(subject))
                 return KernelResult.Fail(KernelError.PlatformFaulted,
                     "The local subject has an unresolved possible provider domain binding.");
             if (_backendEpochExhausted) return KernelResult.Fail(KernelError.CapacityExhausted, "Backend epoch exhausted before root admission.");
             KernelResult CommitAdmission()
             {
-                _pendingDomainBinds.Add(subject);
                 backendEpoch = BackendEpoch;
+                originalInvocation = new(subject, backendEpoch);
+                _pendingDomainBinds.Add(subject, originalInvocation);
                 return KernelResult.Ok();
             }
             return sourceCommitConsumer is null ? CommitAdmission() : sourceCommitConsumer(CommitAdmission);
@@ -246,20 +289,33 @@ public sealed partial class PlatformAuthorityBridge
         }
         var invocation = invocationConsumer?.Invoke() ?? KernelResult.Ok();
         if (!invocation.IsSuccess) return KernelResult<PlatformDomainBinding>.Fail(invocation.Error, invocation.Message!);
+        lock (_secureDomainLifecycleGate)
+        {
+            if (_backendEpochExhausted || BackendEpoch != backendEpoch ||
+                !_pendingDomainBinds.TryGetValue(subject, out var pending) || !ReferenceEquals(pending, originalInvocation))
+                return KernelResult<PlatformDomainBinding>.Fail(KernelError.PlatformFaulted,
+                    "Original root admission changed before effect; no provider invocation occurred.");
+            originalInvocation.ProviderIncarnation = providerIncarnation;
+            if (_provider is IPlatformOriginalAdmissionResolutionProvider)
+                originalInvocation.Request = new(Guid.NewGuid(), subject);
+            originalInvocation.EffectMayHaveOccurred = true;
+        }
         PlatformAuthorityResult<PlatformProviderDomainLease> providerResult;
-        try { providerResult = _provider.BindDomain(subject); }
+        try { providerResult = originalInvocation.Request is { } request && _provider is IPlatformOriginalAdmissionResolutionProvider capable
+                ? capable.BindDomain(request) : _provider.BindDomain(subject); }
         catch (Exception exception) when (exception is not StackOverflowException)
         {
-            lock (_secureDomainLifecycleGate) _unresolvedDomainBinds.Add(subject);
+            lock (_secureDomainLifecycleGate) _unresolvedDomainBinds.TryAdd(subject, originalInvocation);
             return KernelResult<PlatformDomainBinding>.Fail(KernelError.PlatformFaulted,
                 "Root binding may have taken effect without an exact lease; original subject remains pinned.");
         }
+        lock (_secureDomainLifecycleGate) originalInvocation.Observation = providerResult;
         if (!providerResult.IsSuccess)
         {
             lock (_secureDomainLifecycleGate)
             {
                 if (BackendEpoch != backendEpoch || providerResult.Status != PlatformAuthorityStatus.NotAccepted)
-                    _unresolvedDomainBinds.Add(subject);
+                    _unresolvedDomainBinds.TryAdd(subject, originalInvocation);
             }
             return FromProviderFailure<PlatformDomainBinding>(providerResult.Status, providerResult.Message);
         }
@@ -270,7 +326,7 @@ public sealed partial class PlatformAuthorityBridge
             var leaseMessage = leaseValidation.Message ??
                 "The platform provider returned malformed domain authority.";
             // Malformed returned authority cannot prove original subject closure.
-            lock (_secureDomainLifecycleGate) _unresolvedDomainBinds.Add(subject);
+            lock (_secureDomainLifecycleGate) _unresolvedDomainBinds.TryAdd(subject, originalInvocation);
             PlatformAuthorityResult cleanup;
             try { cleanup = _provider.RevokeDomain(providerLease); }
             catch (Exception exception) when (exception is not StackOverflowException)
@@ -278,6 +334,7 @@ public sealed partial class PlatformAuthorityBridge
                 cleanup = PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted,
                     $"Malformed domain cleanup receipt was lost: {exception.Message}");
             }
+            lock (_secureDomainLifecycleGate) originalInvocation.ReturnedCleanupObservation = cleanup;
             if (!cleanup.IsSuccess)
             {
                 lock (_secureDomainLifecycleGate)
@@ -308,7 +365,7 @@ public sealed partial class PlatformAuthorityBridge
         lock (_secureDomainLifecycleGate)
         {
             if (BackendEpoch != backendEpoch || _backendEpochExhausted || currentSource != providerIncarnation ||
-                currentSource.Value == 0 || _unresolvedDomainBinds.Contains(subject) ||
+                currentSource.Value == 0 || _unresolvedDomainBinds.ContainsKey(subject) ||
                 !_domains.TryGetValue(published.BindingId, out var routed) || !ReferenceEquals(routed, publishedOwner) ||
                 !_activeSubjects.TryGetValue(subject, out var original) || !ReferenceEquals(original, publishedOwner))
                 return KernelResult<PlatformDomainBinding>.Fail(KernelError.PlatformFaulted,
@@ -382,7 +439,7 @@ public sealed partial class PlatformAuthorityBridge
     internal bool HasUnresolvedDomainBindEffect(PlatformDomainIdentity subject)
     {
         lock (_secureDomainLifecycleGate)
-            return _pendingDomainBinds.Contains(subject) || _unresolvedDomainBinds.Contains(subject);
+            return _pendingDomainBinds.ContainsKey(subject) || _unresolvedDomainBinds.ContainsKey(subject);
     }
 
     // A cleanup route to the existing authoritative owner, never an execution attachment.
@@ -436,6 +493,23 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDomainBinding binding,
         PlatformDomainIdentity expectedSubject)
     {
+        var irqCleanup = ResolveOriginalIrqBindsForCleanup(expectedSubject);
+        if (!irqCleanup.IsSuccess) return irqCleanup;
+        var mmioCleanup = ResolveOriginalMmioMapsForCleanup(expectedSubject);
+        if (!mmioCleanup.IsSuccess) return mmioCleanup;
+        var deviceCleanup = ResolveOriginalDeviceBindsForCleanup(expectedSubject);
+        if (!deviceCleanup.IsSuccess) return deviceCleanup;
+        var createCleanup = ResolveOriginalChildCreatesForRootCleanup(binding, expectedSubject);
+        if (!createCleanup.IsSuccess) return createCleanup;
+        DomainRecord? noEffectOwner;
+        lock (_secureDomainLifecycleGate)
+            noEffectOwner = _provider is IPlatformDomainRevocationNoEffectProvider && _domains.TryGetValue(binding.BindingId, out var retained) && retained.ParentRevokeMayHaveEffect &&
+                retained.RootRevokeObservation is { Status: PlatformAuthorityStatus.NotAccepted } ? retained : null;
+        if (noEffectOwner is not null)
+        {
+            var consumed = ConsumeRootRevokeNotAccepted(noEffectOwner, binding, expectedSubject);
+            if (!consumed.IsSuccess) return consumed;
+        }
         DomainRecord record;
         PlatformBackendEpoch backendEpoch;
         lock (_secureDomainLifecycleGate)
@@ -482,7 +556,7 @@ public sealed partial class PlatformAuthorityBridge
                     "Child creation and authority must have exact closure before the parent platform domain.");
             if (record.ParentRevokeInFlight)
                 return KernelResult.Fail(KernelError.PlatformBindingActive, "Root revoke is already in flight.");
-            if (record.ParentRevokeMayHaveEffect && !record.ProviderClosureConfirmed)
+            if (record.ParentRevokeMayHaveEffect && !record.ProviderClosureConfirmed && _provider is not IPlatformOriginalDomainClosureProvider)
                 return KernelResult.Fail(KernelError.PlatformFaulted,
                     "Parent-domain revoke may have taken effect without exact closure evidence.");
             if (record.AuthorityState == DomainAuthorityState.Closed)
@@ -513,18 +587,24 @@ public sealed partial class PlatformAuthorityBridge
             catch (Exception exception) when (exception is not StackOverflowException)
             { return KernelResult.Fail(KernelError.PlatformFaulted, "Root cleanup source unavailable; original owner retained."); }
             bool invokeRevoke;
+            bool resolveRevoke;
             lock (_secureDomainLifecycleGate)
             {
                 var exact = ValidateRootCleanupSourceLocked(record, binding, expectedSubject, backendEpoch, source);
                 if (!exact.IsSuccess) return exact;
                 invokeRevoke = !record.ProviderClosureConfirmed;
+                resolveRevoke = record.ParentRevokeMayHaveEffect;
                 // Reset replacement must observe the intent admitted against this exact owner.
                 if (invokeRevoke) record.ParentRevokeMayHaveEffect = true;
             }
             if (invokeRevoke)
             {
                 PlatformAuthorityResult result;
-                try { result = _provider!.RevokeDomain(record.ProviderLease); }
+                try { result = resolveRevoke
+                    ? _provider is IPlatformOriginalDomainClosureContinuationProvider continuation
+                        ? continuation.ContinueOriginalDomainClosure(record.ProviderLease)
+                        : ((IPlatformOriginalDomainClosureProvider)_provider!).ResolveDomainClosure(record.ProviderLease)
+                    : _provider!.RevokeDomain(record.ProviderLease); }
                 catch (Exception exception) when (exception is not StackOverflowException)
                 { return KernelResult.Fail(KernelError.PlatformFaulted, "Root revoke outcome unknown; original owner remains pinned."); }
                 lock (_secureDomainLifecycleGate)
@@ -539,7 +619,7 @@ public sealed partial class PlatformAuthorityBridge
                         var owner = CurrentOriginalRootOwnerLocked(record);
                         if (owner is not null) owner.ProviderClosureConfirmed = true;
                     }
-                    else
+                    else if (_provider is not IPlatformDomainRevocationNoEffectProvider || result.Status != PlatformAuthorityStatus.NotAccepted)
                     {
                         // A failed response cannot prove no effect or permit another original invocation.
                         return FromProviderFailure(result.Status, result.Message);
@@ -553,6 +633,12 @@ public sealed partial class PlatformAuthorityBridge
             {
                 var exact = ValidateRootCleanupSourceLocked(record, binding, expectedSubject, backendEpoch, source);
                 if (!exact.IsSuccess) return exact;
+                if (_provider is IPlatformDomainRevocationNoEffectProvider && !record.ProviderClosureConfirmed && record.RootRevokeObservation is { Status: PlatformAuthorityStatus.NotAccepted } noEffect)
+                {
+                    record.ParentRevokeMayHaveEffect = false;
+                    record.RootRevokeObservation = null; // Consumed invocation, never evidence for a later call.
+                    return FromProviderFailure(noEffect.Status, noEffect.Message);
+                }
                 CloseDomain(record);
                 return KernelResult.Ok();
             }
@@ -577,6 +663,25 @@ public sealed partial class PlatformAuthorityBridge
         return null;
     }
     // Identity continuity only. Permission, source generation and lifecycle checks remain independent.
+    private KernelResult ConsumeRootRevokeNotAccepted(DomainRecord record, PlatformDomainBinding binding, PlatformDomainIdentity subject)
+    {
+        PlatformProviderIncarnation source;
+        try { source = CurrentProviderIncarnation(); }
+        catch (Exception exception) when (exception is not StackOverflowException)
+        { return KernelResult.Fail(KernelError.PlatformFaulted, "Known no-effect root response retained while source is unavailable."); }
+        lock (_secureDomainLifecycleGate)
+        {
+            var exact = ValidateRootCleanupSourceLocked(record, binding, subject, record.BackendEpoch, source);
+            if (!exact.IsSuccess) return exact;
+            if (record.ParentRevokeInFlight || record.ProviderClosureConfirmed ||
+                record.RootRevokeObservation is not { Status: PlatformAuthorityStatus.NotAccepted })
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Original no-effect root response changed before consumption.");
+            record.ParentRevokeMayHaveEffect = false;
+            record.RootRevokeObservation = null;
+            return KernelResult.Ok();
+        }
+    }
+
     private bool TryGetCanonicalRootRecord(PlatformDomainBindingId id, out DomainRecord record)
     {
         lock (_secureDomainLifecycleGate)
@@ -1021,8 +1126,7 @@ public sealed partial class PlatformAuthorityBridge
     private KernelResult ValidateMappingClosureIdentityLocked(PlatformRegionMapping mapping, PlatformDomainIdentity subject)
     {
         var active = ValidateMappingIdentity(mapping, subject);
-        return active.IsSuccess || !_mappings.TryGetValue(mapping.MappingId, out var record) || !record.LocalReservationReleased
-            ? active : ValidateMappingIdentity(mapping, subject, requireActiveDomain: false);
+        return active.IsSuccess ? active : ValidateMappingIdentity(mapping, subject, requireActiveDomain: false);
     }
     private KernelResult<PlatformRegionMappingLifecycle> RunMappingClosureTransition(
         PlatformRegionMapping mapping, PlatformDomainIdentity subject,
@@ -1057,6 +1161,13 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDomainIdentity expectedSubject,
         PlatformRegionRevocationPolicy policy, MappingRecord record)
     {
+        if (record.ClosureState == PlatformExternalClosureState.Faulted && HasKnownMappingRevokeNotAccepted(record))
+        {
+            var consumed = ConsumeMappingRevokeNotAccepted(record, mapping, expectedSubject);
+            if (!consumed.IsSuccess) return KernelResult<PlatformRegionMappingLifecycle>.Fail(consumed.Error, consumed.Message!);
+        }
+        if (record.ClosureState == PlatformExternalClosureState.Faulted && record.ClosureOperation is null && record.RevocationRequest is not null)
+            return ObserveRegionMappingRevocationCore(mapping, expectedSubject, record);
         if (HasActiveSecureRegion(mapping.MappingId))
             return KernelResult<PlatformRegionMappingLifecycle>.Fail(KernelError.PlatformBindingActive, "Secure-region binding must close before mapping revocation.");
         KernelResult validation;
@@ -1076,7 +1187,7 @@ public sealed partial class PlatformAuthorityBridge
         lock (_secureDomainLifecycleGate)
         {
             if (record.LocalReservationReleased ||
-                record.ClosureState == PlatformExternalClosureState.Closed)
+                record.ClosureState == PlatformExternalClosureState.Closed || HasValidatedAdmissionNoEffect(record))
             {
                 return KernelResult<PlatformRegionMappingLifecycle>.Fail(
                     KernelError.PlatformBindingRevoked,
@@ -1162,10 +1273,22 @@ public sealed partial class PlatformAuthorityBridge
         }
 
         PlatformAuthorityResult<PlatformRegionRevocationTicket> beginResult;
+        PlatformRegionRevocationRequest? request = null;
+        if (revocationProvider is IPlatformRegionRevocationResolutionProvider)
+        {
+            lock (_secureDomainLifecycleGate)
+            {
+                var exactOwner = ValidateMappingCleanupOwnerLocked(record, mapping, expectedSubject);
+                if (!exactOwner.IsSuccess) return KernelResult<PlatformRegionMappingLifecycle>.Fail(exactOwner.Error, exactOwner.Message!);
+                request = new(Guid.NewGuid(), record.ProviderLease, policy);
+                record.RevocationRequest = request;
+            }
+        }
         try
         {
-            beginResult = revocationProvider.BeginRegionMappingRevocation(
-                record.ProviderLease, policy);
+            beginResult = request is { } originalRequest
+                ? ((IPlatformRegionRevocationResolutionProvider)revocationProvider).BeginRegionMappingRevocation(originalRequest)
+                : revocationProvider.BeginRegionMappingRevocation(record.ProviderLease, policy);
         }
         catch (Exception exception)
         {
@@ -1178,6 +1301,12 @@ public sealed partial class PlatformAuthorityBridge
         {
             // Generic terminal status does not prove no effect for the original invocation.
             lock (_secureDomainLifecycleGate) record.ClosureState = PlatformExternalClosureState.Faulted;
+
+            if (HasKnownMappingRevokeNotAccepted(record))
+            {
+                var consumed = ConsumeMappingRevokeNotAccepted(record, mapping, expectedSubject);
+                if (!consumed.IsSuccess) return KernelResult<PlatformRegionMappingLifecycle>.Fail(consumed.Error, consumed.Message!);
+            }
 
             return FromProviderFailure<PlatformRegionMappingLifecycle>(
                 beginResult.Status,
@@ -1207,6 +1336,16 @@ public sealed partial class PlatformAuthorityBridge
         PlatformRegionMapping mapping,
         PlatformDomainIdentity expectedSubject, MappingRecord record)
     {
+        if (record.ClosureState == PlatformExternalClosureState.Faulted && HasKnownMappingRevokeNotAccepted(record))
+        {
+            var consumed = ConsumeMappingRevokeNotAccepted(record, mapping, expectedSubject);
+            if (!consumed.IsSuccess) return KernelResult<PlatformRegionMappingLifecycle>.Fail(consumed.Error, consumed.Message!);
+        }
+        if (record.ClosureState == PlatformExternalClosureState.Faulted && record.ClosureOperation is null && record.RevocationRequest is not null)
+        {
+            var recovered = ResolveOriginalRegionRevocation(record, mapping, expectedSubject);
+            if (!recovered.IsSuccess) return KernelResult<PlatformRegionMappingLifecycle>.Fail(recovered.Error, recovered.Message!);
+        }
         lock (_secureDomainLifecycleGate)
         {
             var validation = ValidateMappingCleanupOwnerLocked(record, mapping, expectedSubject);
@@ -1334,7 +1473,7 @@ public sealed partial class PlatformAuthorityBridge
                 !ReferenceEquals(current, record))
                 return KernelResult<PlatformRegionMappingLifecycle>.Fail(KernelError.PlatformFaulted,
                     "Exact mapping closure owner or source changed before local commit; reclaim remains pinned.");
-            var exact = ValidateMappingIdentity(record.Mapping, record.Mapping.DomainBinding.Subject);
+            var exact = ValidateMappingIdentity(record.Mapping, record.Mapping.DomainBinding.Subject, requireActiveDomain: false);
             if (!exact.IsSuccess)
                 return KernelResult<PlatformRegionMappingLifecycle>.Fail(exact.Error, exact.Message!);
             if (HasUnclosedGuestDependency(record))
@@ -1361,7 +1500,7 @@ public sealed partial class PlatformAuthorityBridge
             // domain admission quarantine. Exact tuple is still mandatory;
             // ordinary ValidateMapping continues to require active permission.
             var cleanup = ValidateMappingIdentity(mapping, expectedSubject, requireActiveDomain: false);
-            if (!cleanup.IsSuccess || !_mappings[mapping.MappingId].LocalReservationReleased)
+            if (!cleanup.IsSuccess)
             return KernelResult<PlatformRegionMappingLifecycle>.Fail(
                 validation.Error,
                 validation.Message!);
@@ -1380,7 +1519,7 @@ public sealed partial class PlatformAuthorityBridge
         MappingRecord record;
         lock (_secureDomainLifecycleGate)
         {
-            var exact = ValidateMappingIdentity(mapping, subject);
+            var exact = ValidateMappingIdentity(mapping, subject, requireActiveDomain: false);
             if (!exact.IsSuccess)
             {
                 var cleanup = ValidateMappingIdentity(mapping, subject, requireActiveDomain: false);
@@ -1392,9 +1531,9 @@ public sealed partial class PlatformAuthorityBridge
             if (record.LocalReservationReleased) return KernelResult.Ok();
             if (HasUnclosedGuestDependency(record))
                 return KernelResult.Fail(KernelError.PlatformBindingActive, "Original guest dependency still pins mapping reclaim.");
-            if (record.ClosureState == PlatformExternalClosureState.Faulted)
+            if (record.ClosureState == PlatformExternalClosureState.Faulted && !HasValidatedAdmissionNoEffect(record))
                 return KernelResult.Fail(KernelError.PlatformFaulted, "Mapping reclaim remains fault-pinned.");
-            if (record.ClosureState != PlatformExternalClosureState.Closed)
+            if (record.ClosureState != PlatformExternalClosureState.Closed && !HasValidatedAdmissionNoEffect(record))
                 return KernelResult.Fail(KernelError.PlatformBindingDraining, "Mapping closure must precede reclaim.");
         }
 
@@ -1413,17 +1552,17 @@ public sealed partial class PlatformAuthorityBridge
             if (record.LocalReservationReleased) return KernelResult.Ok();
             if (_backendEpochExhausted || BackendEpoch != record.BackendEpoch ||
                 source.Value == 0 || source != record.ProviderIncarnation ||
-                record.ClosureState == PlatformExternalClosureState.Faulted)
+                (record.ClosureState == PlatformExternalClosureState.Faulted && !HasValidatedAdmissionNoEffect(record)))
             {
                 record.ClosureState = PlatformExternalClosureState.Faulted;
                 return KernelResult.Fail(KernelError.PlatformFaulted,
                     "Mapping release source changed; original cleanup receipt is retained and reclaim remains pinned.");
             }
-            var exact = ValidateMappingIdentity(mapping, subject);
+            var exact = ValidateMappingIdentity(mapping, subject, requireActiveDomain: false);
             if (!exact.IsSuccess) return exact;
             if (HasUnclosedGuestDependency(record))
                 return KernelResult.Fail(KernelError.PlatformBindingActive, "Original guest dependency changed during release source observation.");
-            return record.ClosureState == PlatformExternalClosureState.Closed
+            return record.ClosureState == PlatformExternalClosureState.Closed || HasValidatedAdmissionNoEffect(record)
                 ? KernelResult.Ok()
                 : KernelResult.Fail(KernelError.PlatformBindingDraining, "Mapping closure changed before reclaim.");
         }
@@ -1447,6 +1586,78 @@ public sealed partial class PlatformAuthorityBridge
         record.ClosureState = PlatformExternalClosureState.Faulted;
         return KernelResult.Fail(KernelError.PlatformFaulted,
             "The mapping provider or local backend generation changed; local reservation remains pinned.");
+    }
+
+    private bool HasKnownMappingRevokeNotAccepted(MappingRecord record) =>
+        _provider is IPlatformRegionRevocationNoEffectProvider &&
+        record.ClosureOperation is null && record.RevocationBeginObservation is { Status: PlatformAuthorityStatus.NotAccepted } observed &&
+        observed.Value == default(PlatformRegionRevocationTicket);
+
+    private KernelResult ConsumeMappingRevokeNotAccepted(MappingRecord record, PlatformRegionMapping mapping, PlatformDomainIdentity subject)
+    {
+        var source = ValidateMappingClosureGeneration(record);
+        if (!source.IsSuccess) return source;
+        lock (_secureDomainLifecycleGate)
+        {
+            var exact = ValidateMappingCleanupOwnerLocked(record, mapping, subject);
+            if (!exact.IsSuccess) return exact;
+            if (!HasKnownMappingRevokeNotAccepted(record) || record.LocalReservationReleased ||
+                _backendEpochExhausted || BackendEpoch != record.BackendEpoch ||
+                record.ClosureState is not (PlatformExternalClosureState.Faulted or PlatformExternalClosureState.Draining))
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Original no-effect mapping response changed before consumption.");
+            record.RevocationRequest = null;
+            record.RevocationBeginObservation = null;
+            record.ClosureState = PlatformExternalClosureState.Active;
+            return KernelResult.Ok(); // No mapping closure or quantitative release.
+        }
+    }
+
+    private KernelResult ResolveOriginalRegionRevocation(MappingRecord record, PlatformRegionMapping mapping,
+        PlatformDomainIdentity expectedSubject)
+    {
+        if (_provider is not IPlatformRegionRevocationResolutionProvider provider)
+            return KernelResult.Fail(KernelError.PlatformFaulted, "Original revocation request cannot be resolved by this provider.");
+        var source = ValidateMappingClosureGeneration(record);
+        if (!source.IsSuccess) return source;
+        PlatformRegionRevocationRequest request;
+        PlatformAuthorityResult<PlatformRegionRevocationResolution>? retained;
+        lock (_secureDomainLifecycleGate)
+        {
+            var exact = ValidateMappingCleanupOwnerLocked(record, mapping, expectedSubject);
+            if (!exact.IsSuccess) return exact;
+            if (record.RevocationRequest is not { } original || HasUnclosedGuestDependency(record) || HasActiveSecureRegion(mapping.MappingId))
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Original request/dependencies unavailable for resolution.");
+            request = original;
+            retained = record.RevocationResolutionObservation;
+        }
+        PlatformAuthorityResult<PlatformRegionRevocationResolution> observed;
+        if (retained is { IsSuccess: true } known) observed = known;
+        else
+        {
+            try { observed = provider.ResolveRegionMappingRevocation(request); }
+            catch (Exception exception) when (exception is not StackOverflowException)
+            { return KernelResult.Fail(KernelError.PlatformFaulted, $"Original response resolution unavailable: {exception.Message}"); }
+            lock (_secureDomainLifecycleGate) record.RevocationResolutionObservation = observed;
+        }
+        if (!observed.IsSuccess) return FromProviderFailure(observed.Status, observed.Message);
+        var resolution = observed.Value!;
+        if (resolution.Request != request)
+            return KernelResult.Fail(KernelError.PlatformFaulted, "Resolution belongs to another original request.");
+        var ticket = PlatformRegionRevocationContract.ValidateTicket(record.ProviderLease, resolution.Ticket);
+        if (!ticket.IsSuccess) return FromProviderFailure(ticket.Status, ticket.Message);
+        source = ValidateMappingClosureGeneration(record);
+        if (!source.IsSuccess) return source;
+        lock (_secureDomainLifecycleGate)
+        {
+            var exact = ValidateMappingCleanupOwnerLocked(record, mapping, expectedSubject);
+            if (!exact.IsSuccess) return exact;
+            if (record.RevocationRequest != request || BackendEpoch != record.BackendEpoch || _backendEpochExhausted ||
+                record.LocalReservationReleased || HasUnclosedGuestDependency(record) || HasActiveSecureRegion(mapping.MappingId))
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Original response retained without final source/dependency continuity.");
+            record.ClosureOperation = resolution.Ticket.Operation;
+            record.ClosureState = PlatformExternalClosureState.Draining;
+            return KernelResult.Ok();
+        }
     }
 
     private bool TryCloseMalformedMappingLease(
@@ -1478,15 +1689,15 @@ public sealed partial class PlatformAuthorityBridge
     {
         lock (_secureDomainLifecycleGate)
         {
-        var validation = ValidateMappingIdentity(mapping, expectedSubject);
+        var validation = ValidateMappingIdentity(mapping, expectedSubject, requireActiveDomain: false);
         if (!validation.IsSuccess) return validation;
 
         var record = _mappings[mapping.MappingId];
         if (_backendEpochExhausted || BackendEpoch != record.BackendEpoch ||
-            record.ClosureState == PlatformExternalClosureState.Faulted)
+            (record.ClosureState == PlatformExternalClosureState.Faulted && !HasValidatedAdmissionNoEffect(record)))
             return KernelResult.Fail(KernelError.PlatformFaulted,
                 "Exact mapping source changed before local release; Region reservation remains pinned.");
-        if (record.ClosureState != PlatformExternalClosureState.Closed)
+        if (record.ClosureState != PlatformExternalClosureState.Closed && !HasValidatedAdmissionNoEffect(record))
         {
             return KernelResult.Fail(
                 KernelError.PlatformBindingDraining,
@@ -1563,7 +1774,7 @@ public sealed partial class PlatformAuthorityBridge
         }
     }
 
-    internal IReadOnlyList<PlatformRegionMapping> BeginCapabilityRevocation(CapabilityId capabilityId, Func<CapabilityId, bool> dependsOnRevokedCapability)
+    internal IReadOnlyList<PlatformRegionMapping> BeginCapabilityRevocation(CapabilityId capabilityId, Func<CapabilityId, bool> dependsOnRevokedCapability, PlatformDomainIdentity? processCleanupSubject = null)
     {
         lock (_secureDomainLifecycleGate)
         {
@@ -1572,7 +1783,11 @@ public sealed partial class PlatformAuthorityBridge
                 .OrderBy(static m => m.Mapping.MappingId.Value)
                 .ToArray();
             foreach (var record in affected)
+            {
+                if (processCleanupSubject is { } subject && record.Mapping.DomainBinding.Subject == subject && !record.LocalAuthorizationRevoked)
+                    record.OriginalPermissionRetiredForCleanup = true;
                 record.LocalAuthorizationRevoked = true;
+            }
             return affected.Select(static m => m.Mapping).ToArray();
         }
     }
@@ -1621,11 +1836,19 @@ public sealed partial class PlatformAuthorityBridge
 
     private static bool HasValidatedMappingClosureFact(MappingRecord record) =>
         record.ClosureOperation is { } operation &&
-        record.RevocationBeginObservation is { IsSuccess: true } begin &&
-        PlatformRegionRevocationContract.ValidateTicket(record.ProviderLease, begin.Value!).IsSuccess &&
-        begin.Value!.Operation == operation &&
+        HasValidatedMappingRevocationTicket(record, operation) &&
         record.KnownClosureReceipt is { State: PlatformCompletionState.Closed } receipt &&
         PlatformCompletionContract.ValidateReceiptIdentity(operation, receipt).IsSuccess;
+
+    private static bool HasValidatedMappingRevocationTicket(MappingRecord record, PlatformOperationIdentity operation)
+    {
+        if (record.RevocationBeginObservation is { IsSuccess: true } begin)
+            return PlatformRegionRevocationContract.ValidateTicket(record.ProviderLease, begin.Value!).IsSuccess && begin.Value!.Operation == operation;
+        return record.RevocationRequest is { } request &&
+            record.RevocationResolutionObservation is { IsSuccess: true } resolved && resolved.Value!.Request == request &&
+            PlatformRegionRevocationContract.ValidateTicket(record.ProviderLease, resolved.Value!.Ticket).IsSuccess &&
+            resolved.Value!.Ticket.Operation == operation;
+    }
 
     private void AddOriginalMappingRecordLocked(DomainRecord original, PlatformRegionMappingId id, MappingRecord record)
     {
@@ -1635,7 +1858,7 @@ public sealed partial class PlatformAuthorityBridge
     }
 
     internal KernelResult<object> BindOriginalMappingBudgetOwner(
-        PlatformRegionMapping mapping, bool expectsReservation, object? originalOwner)
+        PlatformRegionMapping mapping, bool expectsReservation, object? originalOwner, ulong maximumPrivateDataBytes = 0)
     {
         lock (_secureDomainLifecycleGate)
         {
@@ -1646,26 +1869,27 @@ public sealed partial class PlatformAuthorityBridge
                 !original.MappingRecords.Any(owned => ReferenceEquals(owned, record)))
                 return KernelResult<object>.Fail(KernelError.PlatformFaulted, "Original mapping owner was lost before charge binding.");
             if (record.KernelBudgetBindingKnown)
-                return record.ExpectsBudgetReservation == expectsReservation && ReferenceEquals(record.OriginalBudgetReservationOwner, originalOwner)
+                return record.ExpectsBudgetReservation == expectsReservation && ReferenceEquals(record.OriginalBudgetReservationOwner, originalOwner) && record.MaximumPrivateExecutableDataBytes == maximumPrivateDataBytes
                     ? KernelResult<object>.Ok(record)
                     : KernelResult<object>.Fail(KernelError.PlatformFaulted, "Original mapping charge binding cannot be replaced.");
             record.KernelBudgetBindingKnown = true;
             record.ExpectsBudgetReservation = expectsReservation;
             record.OriginalBudgetReservationOwner = originalOwner;
+            record.MaximumPrivateExecutableDataBytes = maximumPrivateDataBytes;
             return KernelResult<object>.Ok(record);
         }
     }
 
-    internal KernelResult<(bool Known, bool Expected, object? Owner, object MappingOwner)> QueryOriginalMappingBudgetOwner(PlatformRegionMapping mapping)
+    internal KernelResult<(bool Known, bool Expected, object? Owner, object MappingOwner, ulong PrivateDataQuota)> QueryOriginalMappingBudgetOwner(PlatformRegionMapping mapping)
     {
         lock (_secureDomainLifecycleGate)
         {
             var identity = ValidateMappingIdentity(mapping, mapping.DomainBinding.Subject, requireActiveDomain: false);
-            if (!identity.IsSuccess) return KernelResult<(bool, bool, object?, object)>.Fail(identity.Error, identity.Message!);
+            if (!identity.IsSuccess) return KernelResult<(bool, bool, object?, object, ulong)>.Fail(identity.Error, identity.Message!);
             var record = _mappings[mapping.MappingId];
-            return KernelResult<(bool, bool, object?, object)>.Ok((record.KernelBudgetBindingKnown,
+            return KernelResult<(bool, bool, object?, object, ulong)>.Ok((record.KernelBudgetBindingKnown,
                 record.ExpectsBudgetReservation || record.OriginalBudgetReservationOwner is not null,
-                record.OriginalBudgetReservationOwner, record));
+                record.OriginalBudgetReservationOwner, record, record.MaximumPrivateExecutableDataBytes));
         }
     }
 
@@ -1732,7 +1956,7 @@ public sealed partial class PlatformAuthorityBridge
                     consumedOriginal.MappingRecords.Any(owned => ReferenceEquals(owned, record)) &&
                     ((_domains.TryGetValue(mapping.DomainBinding.BindingId, out var consumedParent) && ReferenceEquals(consumedParent, consumedOriginal)) ||
                      (_activeSubjects.TryGetValue(expectedSubject, out var consumedCanonical) && ReferenceEquals(consumedCanonical, consumedOriginal)));
-                return retained && record.ClosureState == PlatformExternalClosureState.Closed && HasValidatedMappingClosureFact(record)
+                return retained && ((record.ClosureState == PlatformExternalClosureState.Closed && HasValidatedMappingClosureFact(record)) || HasValidatedAdmissionNoEffect(record))
                     ? KernelResult.Ok()
                     : KernelResult.Fail(KernelError.PlatformFaulted, "Consumed mapping lost its original owner or exact closure fact.");
             }
@@ -1757,7 +1981,8 @@ public sealed partial class PlatformAuthorityBridge
     private PlatformDomainBinding AddDomainRecord(
         PlatformDomainIdentity subject,
         PlatformProviderDomainLease providerLease,
-        DomainAuthorityState authorityState, PlatformProviderIncarnation providerIncarnation, PlatformBackendEpoch backendEpoch)
+        DomainAuthorityState authorityState, PlatformProviderIncarnation providerIncarnation, PlatformBackendEpoch backendEpoch,
+        RootBindInvocationFact? originalInvocation = null)
     {
         var binding = new PlatformDomainBinding(
             new PlatformDomainBindingId(_nextDomainBindingId++),
@@ -1765,6 +1990,7 @@ public sealed partial class PlatformAuthorityBridge
             subject);
         var record = new DomainRecord(binding, providerLease)
         {
+            BindInvocation = originalInvocation ?? _pendingDomainBinds.GetValueOrDefault(subject),
             AuthorityState = authorityState,
             ProviderIncarnation = providerIncarnation,
             BackendEpoch = backendEpoch,

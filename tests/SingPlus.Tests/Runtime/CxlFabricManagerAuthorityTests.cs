@@ -7,6 +7,116 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class CxlFabricManagerAuthorityTests
 {
+    [Fact]
+    public void OriginalFabricBeginSurvivesLateRouteLossAndCompletesWithoutSecondBegin()
+    {
+        CompletionHook? hook = null;
+        var s = CreateScenario(providerFactory: model => hook = new(model));
+        const global::System.Reflection.BindingFlags flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(CxlFabricManagerAuthority).GetField("_bindings", flags)!.GetValue(s.Manager)!;
+        var original = routes[s.Binding.BindingId]!;
+        hook!.AfterBegin = () =>
+        {
+            Assert.False(Monitor.IsEntered(typeof(CxlFabricManagerAuthority).GetField("_gate", flags)!.GetValue(s.Manager)!));
+            routes[s.Binding.BindingId] = typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+        };
+        Assert.False(s.Manager.BeginReconfiguration(s.Binding).IsSuccess);
+        Assert.Equal(1, hook.BeginCalls);
+        Assert.Equal(CxlFabricResourceState.Draining, s.Model.QueryResource(s.Binding.BindingId).Value!.State);
+        routes[s.Binding.BindingId] = original; hook.AfterBegin = null;
+        var completed = s.Manager.CompleteReconfiguration(s.Binding.BindingId);
+        Assert.True(completed.IsSuccess, completed.Message);
+        Assert.Equal(1, hook.BeginCalls); Assert.Equal(1, hook.Calls);
+        Assert.True(s.Manager.ValidateAdmission(completed.Value!.Binding).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)]
+    public void OriginalFabricCompletionCannotConsumeCopiedHistoryOrIndependentRevision(int fault)
+    {
+        CompletionHook? hook = null;
+        var s = CreateScenario(providerFactory: model => hook = new(model));
+        Assert.True(s.Manager.BeginReconfiguration(s.Binding).IsSuccess);
+        const global::System.Reflection.BindingFlags flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(CxlFabricManagerAuthority).GetField("_bindings", flags)!.GetValue(s.Manager)!;
+        var original = routes[s.Binding.BindingId]!;
+        hook!.QueryTransform = _ => PlatformAuthorityResult<CxlFabricResourceSnapshot>.Fail(PlatformAuthorityStatus.Unavailable, "late query lost");
+        Assert.False(s.Manager.CompleteReconfiguration(s.Binding.BindingId).IsSuccess);
+        hook.QueryTransform = null;
+        var property = original.GetType().GetProperty("Completion")!;
+        var fact = property.GetValue(original)!;
+        if (fault == 0) property.SetValue(original, typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(fact, null));
+        if (fault == 1) fact.GetType().GetProperty("RawObservation")!.SetValue(fact, null);
+        if (fault == 2) original.GetType().GetProperty("State")!.SetValue(original, CxlFabricResourceState.Faulted);
+        if (fault == 3) original.GetType().GetProperty("Ticket")!.SetValue(original,
+            ((CxlFabricReconfigurationTicket)original.GetType().GetProperty("Ticket")!.GetValue(original)!) with { });
+        Assert.False(s.Manager.CompleteReconfiguration(s.Binding.BindingId).IsSuccess);
+        Assert.Equal(1, hook.Calls);
+        Assert.False(s.Manager.ValidateAdmission(s.Model.Query(s.Binding.BindingId).Value!).IsSuccess);
+        Assert.False((bool)original.GetType().GetProperty("CompletionInFlight")!.GetValue(original)!);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void OriginalFabricCompletionConsumesKnownReplacementAfterQueryLossWithoutRepeatingEffect(bool throws)
+    {
+        CompletionHook? hook = null;
+        var s = CreateScenario(providerFactory: model => hook = new(model));
+        Assert.True(s.Manager.BeginReconfiguration(s.Binding).IsSuccess);
+        hook!.QueryTransform = result => throws ? throw new IOException("original completion source reply lost")
+            : PlatformAuthorityResult<CxlFabricResourceSnapshot>.Fail(PlatformAuthorityStatus.Unavailable, "source unavailable");
+        Assert.False(s.Manager.CompleteReconfiguration(s.Binding.BindingId).IsSuccess);
+        Assert.Equal(1, hook.Calls);
+        Assert.Equal(new CxlFabricBindingGeneration(s.Binding.Generation.Value + 1), s.Model.Query(s.Binding.BindingId).Value!.Generation);
+        hook.QueryTransform = null;
+        var result = s.Manager.CompleteReconfiguration(s.Binding.BindingId);
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.Equal(1, hook.Calls);
+        Assert.True(s.Manager.ValidateAdmission(result.Value!.Binding).IsSuccess);
+        Assert.False(s.Manager.ValidateAdmission(s.Binding).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void OriginalFabricUnknownCompletionCannotRepeatAfterLocalStateRestoration(bool lostReply)
+    {
+        CompletionHook? hook = null;
+        var s = CreateScenario(providerFactory: model => hook = new(model));
+        Assert.True(s.Manager.BeginReconfiguration(s.Binding).IsSuccess);
+        if (lostReply) hook!.AfterComplete = () => throw new IOException("original Complete reply lost");
+        else hook!.CompletionFailure = PlatformAuthorityStatus.Unavailable;
+        Assert.False(s.Manager.CompleteReconfiguration(s.Binding.BindingId).IsSuccess);
+        const global::System.Reflection.BindingFlags flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(CxlFabricManagerAuthority).GetField("_bindings", flags)!.GetValue(s.Manager)!;
+        var record = routes[s.Binding.BindingId]!;
+        record.GetType().GetProperty("State")!.SetValue(record, CxlFabricResourceState.Draining);
+        hook!.AfterComplete = null; hook.CompletionFailure = null;
+        Assert.False(s.Manager.CompleteReconfiguration(s.Binding.BindingId).IsSuccess);
+        Assert.Equal(1, hook.Calls);
+        Assert.False(s.Manager.ValidateAdmission(s.Binding).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void OriginalFabricAdmissionRefusesCopiedOrEqualWrittenOwnerAcrossProviderQuery(bool copied)
+    {
+        CompletionHook? hook = null;
+        var s = CreateScenario(providerFactory: model => hook = new(model));
+        const global::System.Reflection.BindingFlags flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(CxlFabricManagerAuthority).GetField("_bindings", flags)!.GetValue(s.Manager)!;
+        var original = routes[s.Binding.BindingId]!;
+        hook!.AfterQuery = () =>
+        {
+            if (copied) routes[s.Binding.BindingId] = typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+            else original.GetType().GetProperty("State")!.SetValue(original, CxlFabricResourceState.Bound);
+        };
+        var effects = 0;
+        var result = s.Manager.ExecuteAdmission(s.Binding, () => { effects++; return KernelResult<int>.Ok(1); });
+        Assert.False(result.IsSuccess); Assert.Equal(0, effects);
+        hook.AfterQuery = null; routes[s.Binding.BindingId] = original;
+        Assert.True(s.Manager.ValidateAdmission(s.Binding).IsSuccess);
+    }
+
     [Theory]
     [InlineData(false)] [InlineData(true)]
     public void LateUnavailableSourceRefusesActualFmReconfigurationEffectAndPreservesPendingFacts(bool completion)
@@ -131,8 +241,15 @@ public sealed class CxlFabricManagerAuthorityTests
         }
         else
         {
-            Assert.Equal(KernelError.InvalidTransition, retry.Error);
+            Assert.Equal(fault == 5 ? KernelError.ExternalEffectUncontained : KernelError.PlatformUnavailable, retry.Error);
             Assert.Equal(1, hook.Calls);
+            if (fault != 5)
+            {
+                var fresh = s.Manager.CompleteReconfiguration(s.Binding.BindingId);
+                Assert.True(fresh.IsSuccess, fresh.Message);
+                Assert.Equal(2, hook.Calls);
+                Assert.True(s.Manager.ValidateAdmission(fresh.Value!.Binding).IsSuccess);
+            }
         }
     }
     [Theory]
@@ -520,7 +637,9 @@ public sealed class CxlFabricManagerAuthorityTests
         Assert.Equal(receipt, BindingFact(s.Manager, s.Binding.BindingId, "LastCompletionReceipt"));
         Assert.Equal(s.Binding, BindingFact(s.Manager, s.Binding.BindingId, "Binding"));
         Assert.Equal(KernelError.PlatformBindingDraining, s.Manager.ValidateAdmission(receipt).Error);
-        Assert.Equal(KernelError.InvalidTransition, s.Manager.CompleteReconfiguration(s.Binding.BindingId).Error);
+        Assert.True(s.Manager.CompleteReconfiguration(s.Binding.BindingId).IsSuccess);
+        Assert.True(s.Manager.ValidateAdmission(receipt).IsSuccess);
+        Assert.False(s.Manager.ValidateAdmission(s.Binding).IsSuccess);
         Assert.Equal(1, hook.Calls);
     }
 
@@ -613,7 +732,7 @@ public sealed class CxlFabricManagerAuthorityTests
         var completed = s.Manager.CompleteReconfiguration(s.Binding.BindingId);
         Assert.Equal(KernelError.PlatformFaulted, completed.Error);
         Assert.Equal(KernelError.PlatformBindingDraining, s.Manager.ValidateAdmission(s.Binding).Error);
-        Assert.Equal(KernelError.InvalidTransition, s.Manager.CompleteReconfiguration(s.Binding.BindingId).Error);
+        Assert.Equal(KernelError.PlatformFaulted, s.Manager.CompleteReconfiguration(s.Binding.BindingId).Error);
         Assert.Equal(1, hook.Calls);
     }
 
@@ -628,7 +747,8 @@ public sealed class CxlFabricManagerAuthorityTests
         var rebound = s.Model.Query(s.Binding.BindingId).Value!;
         Assert.NotEqual(s.Binding, rebound);
         Assert.Equal(KernelError.PlatformBindingDraining, s.Manager.ValidateAdmission(rebound).Error);
-        Assert.Equal(KernelError.InvalidTransition, s.Manager.CompleteReconfiguration(s.Binding.BindingId).Error);
+        Assert.Equal(KernelError.ExternalEffectUncontained, s.Manager.CompleteReconfiguration(s.Binding.BindingId).Error);
+        Assert.Equal(1, hook.Calls);
     }
 
     [Fact]
@@ -859,6 +979,8 @@ public sealed class CxlFabricManagerAuthorityTests
         public Func<PlatformAuthorityResult<CxlFabricResourceSnapshot>, PlatformAuthorityResult<CxlFabricResourceSnapshot>>? QueryTransform { get; set; }
         public Action? BeforeComplete { get; set; }
         public Action? BeforeBegin { get; set; }
+        public Action? AfterBegin { get; set; }
+        public int BeginCalls { get; private set; }
         public Action? AfterComplete { get; set; }
         public Action? AfterQuery { get; set; }
         public Action? AfterAssign { get; set; }
@@ -900,6 +1022,7 @@ public sealed class CxlFabricManagerAuthorityTests
         }
         public PlatformAuthorityResult<CxlFabricReconfigurationTicket> BeginReconfiguration(CxlFabricBinding binding)
         {
+            BeginCalls++;
             BeforeBegin?.Invoke();
             if (RejectBegin)
             {
@@ -907,6 +1030,7 @@ public sealed class CxlFabricManagerAuthorityTests
                 return PlatformAuthorityResult<CxlFabricReconfigurationTicket>.Fail(PlatformAuthorityStatus.NotAccepted, "zero effect rejection");
             }
             var result = inner.BeginReconfiguration(binding);
+            AfterBegin?.Invoke();
             return result.IsSuccess && BeginTransform is not null
                 ? PlatformAuthorityResult<CxlFabricReconfigurationTicket>.Ok(BeginTransform(result.Value!)) : result;
         }

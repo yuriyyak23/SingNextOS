@@ -1,4 +1,4 @@
-using SingPlus.Contracts;
+﻿using SingPlus.Contracts;
 using SingPlus.Platform;
 using SingPlus.Sip;
 
@@ -266,10 +266,15 @@ public sealed partial class RuntimeKernel
         if (!mmio.IsSuccess) return mmio;
 
         var identity = PlatformIdentity(process);
-        var leases = PlatformAuthority.ActiveDeviceLeasesForProcess(identity);
+        var originalBinds = PlatformAuthority.ResolveOriginalDeviceBindsForCleanup(identity);
+        if (!originalBinds.IsSuccess) return originalBinds;
+        PlatformDeviceLease[] leases;
+        lock (_platformMemoryUseGate)
+        { _processPlatformDeviceLeases.TryGetValue(handle,out var tracked); leases = (tracked ?? []).Concat(PlatformAuthority.ActiveDeviceLeasesForProcess(identity)).Distinct().ToArray(); }
         KernelResult? firstFailure = null;
         foreach (var lease in leases)
         {
+            if (PlatformAuthority.IsOriginalDeviceClosureConsumed(lease,identity)) { lock (_platformMemoryUseGate) UntrackPlatformDeviceLease(lease); continue; }
             var revoke = PlatformAuthority.RevokeDevice(lease, identity);
             if (!revoke.IsSuccess)
             {

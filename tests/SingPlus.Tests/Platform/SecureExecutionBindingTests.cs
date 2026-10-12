@@ -9,6 +9,706 @@ namespace SingPlus.Tests.Platform;
 
 public sealed class SecureExecutionBindingTests
 {
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void VirtualType2OriginalIoRevisionRefusesLateSubmitAndRetainsActualReleaseCleanup(bool aba)
+    {
+        var effects = 0;
+        var c = CreateComposedWorkload(afterSubmit: (kernel, _, _) =>
+        {
+            effects++;
+            var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+            var routes = (global::System.Collections.IDictionary)typeof(RuntimeKernel).GetField("_virtualIo", flags)!.GetValue(kernel)!;
+            var record = routes.Values.Cast<object>().Single(); var state = record.GetType().GetProperty("State", flags)!;
+            var active = state.GetValue(record)!;
+            if (aba) state.SetValue(record, Enum.Parse(state.PropertyType, "Quarantined"));
+            state.SetValue(record, active);
+        });
+        Assert.Equal(1, effects);
+        Assert.False(c.SubmissionResult.IsSuccess);
+        Assert.Equal(KernelError.ExternalEffectUncontained, c.SubmissionResult.Error);
+        Assert.False(c.Bridge.ReleaseFabric(c.Fabric).IsSuccess);
+        Assert.False(c.Memory.Close(c.OutputPlacement.PlacementId).IsSuccess);
+        Assert.True(c.Manager.BeginReconfiguration(c.Fabric).IsSuccess);
+        var replacement = c.Manager.CompleteReconfiguration(c.Fabric.BindingId);
+        Assert.True(replacement.IsSuccess, replacement.Message);
+        CloseComposedWorkload(c, replacement.Value!.Binding);
+        Assert.Equal(1, effects);
+        Assert.Equal(1, c.Base.Provider.VirtualIoCloseCalls);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void VirtualType2OriginalIoRevisionRefusesPublicationAfterCallbackAndKeepsConsequencesPinned(bool aba)
+    {
+        var c = CreateComposedWorkload(); var callbacks = 0;
+        var result = c.Service.CompleteVisiblePublish(c.Base.Owner, c.Execution, [c.Candidate], () =>
+        {
+            callbacks++;
+            var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+            var routes = (global::System.Collections.IDictionary)typeof(RuntimeKernel).GetField("_virtualIo", flags)!.GetValue(c.Base.Kernel)!;
+            var record = routes[c.VirtualIo.Id]!; var state = record.GetType().GetProperty("State", flags)!;
+            var active = state.GetValue(record)!;
+            if (aba) state.SetValue(record, Enum.Parse(state.PropertyType, "Quarantined"));
+            state.SetValue(record, active);
+        });
+        Assert.Equal(1, callbacks); Assert.False(result.IsSuccess);
+        var operation = c.Base.Kernel.QueryExternalOperation(c.Base.Owner, c.Execution.Operation).Value!;
+        Assert.NotEqual(ExternalOperationState.Published, operation.State);
+        Assert.NotEqual(ExternalOperationState.Released, operation.State);
+        Assert.False(c.Memory.Close(c.OutputPlacement.PlacementId).IsSuccess);
+        Assert.Equal(0, c.Base.Provider.EventEffects);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)]
+    public void VirtualIoCompletedOriginalHandoffAndMutableRevalidationKeepTheirBoundaries(int fault)
+    {
+        var s = Create(); var execution = Bind(s).Value;
+        var process = s.Kernel.Processes.Resolve(s.Owner).Value!;
+        var cap = s.Kernel.MintCapability(process.DomainId, s.Owner, ResourceKind.Device,
+            "device:secure-virtual-type2", CapabilityRights.Read | CapabilityRights.Write | CapabilityRights.Configure).Value!;
+        var device = s.Kernel.BindPlatformDevice(s.Owner, s.Parent, cap.CapabilityId,
+            PlatformDeviceRights.Read | PlatformDeviceRights.Write | PlatformDeviceRights.Configure).Value!;
+        var io = s.Kernel.BindVirtualIo(s.Owner, s.Virtual.Domain, device,
+            new(PlatformDeviceRights.Read | PlatformDeviceRights.Write, 4096), execution).Value;
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(RuntimeKernel).GetField("_virtualIo", flags)!.GetValue(s.Kernel)!;
+        var original = routes[io.Id]!; var state = original.GetType().GetProperty("State", flags)!;
+        if (fault is 0 or 1)
+        {
+            var platform = (PlatformVirtualIoBinding)original.GetType().GetProperty("Platform", flags)!.GetValue(original)!;
+            Assert.True(s.Kernel.PlatformAuthority.RevokeChildVirtualIo(platform).IsSuccess);
+            var bridgeRoutes = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_virtualIoBindings", flags)!.GetValue(s.Kernel.PlatformAuthority)!;
+            var key = bridgeRoutes.Keys.Cast<object>().Single();
+            if (fault == 0) bridgeRoutes.Remove(key);
+            else bridgeRoutes[key] = typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(bridgeRoutes[key], null)!;
+        }
+        else
+        {
+            s.Provider.DuringIncarnation = () =>
+            {
+                var active = state.GetValue(original)!;
+                if (fault == 3) state.SetValue(original, Enum.Parse(state.PropertyType, "Quarantined"));
+                state.SetValue(original, active);
+            };
+            Assert.False(s.Kernel.RevalidateVirtualIo(s.Owner, io).IsSuccess);
+            s.Provider.DuringIncarnation = null;
+            Assert.Equal(0, s.Provider.VirtualIoCloseCalls);
+        }
+        Assert.True(s.Kernel.CloseVirtualIo(io).IsSuccess);
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(1, s.Provider.VirtualIoCloseCalls);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void OriginalOverlayAndVirtualIoClosureConsumeAttachedChargeOnlyAfterExactLocalCleanup(bool overlayFault)
+    {
+        BudgetAccountHandle account = default;
+        var o = OverlayScenario(beforeAllocation: s =>
+        {
+            var admin = TestFixtures.Create(s.Kernel, 98, 998).Handle;
+            var cap = s.Kernel.MintCapability(new(998), admin, ResourceKind.KernelService,
+                CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+            account = s.Kernel.AdmitProcessBudget(admin, cap, s.Owner, "composed-original-cleanup",
+                [new(ServiceBudgetDimension.OwnedMemoryBytes, 64)]).Value!.ProcessBudget;
+        });
+        var s = o.S;
+        var overlay = s.Kernel.BindSecureGuestRegion(s.Owner, o.Execution, o.Mapping.Mapping, PlatformSecureRegionClass.Private).Value;
+        var process = s.Kernel.Processes.Resolve(s.Owner).Value!;
+        var cap = s.Kernel.MintCapability(process.DomainId, s.Owner, ResourceKind.Device,
+            "device:secure-virtual-type2", CapabilityRights.Read | CapabilityRights.Write | CapabilityRights.Configure).Value!;
+        var device = s.Kernel.BindPlatformDevice(s.Owner, s.Parent, cap.CapabilityId,
+            PlatformDeviceRights.Read | PlatformDeviceRights.Write | PlatformDeviceRights.Configure).Value!;
+        var io = s.Kernel.BindVirtualIo(s.Owner, s.Virtual.Domain, device,
+            new(PlatformDeviceRights.Read | PlatformDeviceRights.Write, 4096), o.Execution).Value;
+        if (overlayFault) s.Kernel.BeforeSecureGuestRegionClosureLocalCommit = () => throw new IOException("overlay local consumption lost");
+        else s.Kernel.BeforeVirtualIoClosureLocalCommit = () => throw new IOException("Io local consumption lost");
+        Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(64UL, s.Kernel.QueryBudget(account).Value!.Usage.Single(x => x.Dimension == ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.Equal(RegionState.Owned, s.Kernel.Regions.Snapshot().Single(x => x.Handle == o.Mapping.Region).State);
+        s.Kernel.BeforeSecureGuestRegionClosureLocalCommit = null; s.Kernel.BeforeVirtualIoClosureLocalCommit = null;
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(1, s.Provider.VirtualIoCloseCalls);
+        Assert.Equal(1, s.Provider.OverlayCloseOrder.Count(x => x == "secure"));
+        Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(x => x.Handle == o.Mapping.Region).State);
+        Assert.Equal(0UL, s.Kernel.QueryBudget(account).Value!.Usage.Single(x => x.Dimension == ServiceBudgetDimension.OwnedMemoryBytes).Used);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)] [InlineData(5)]
+    [InlineData(6)] [InlineData(7)] [InlineData(8)] [InlineData(9)] [InlineData(10)] [InlineData(11)]
+    [InlineData(12)] [InlineData(13)]
+    public void OriginalVirtualIoCloseRetainsUnknownAndConsumesKnownLocalFaultWithoutRepeatingEffect(int fault)
+    {
+        var s = Create(); var execution = Bind(s).Value;
+        var process = s.Kernel.Processes.Resolve(s.Owner).Value!;
+        var cap = s.Kernel.MintCapability(process.DomainId, s.Owner, ResourceKind.Device,
+            "device:secure-virtual-type2", CapabilityRights.Read | CapabilityRights.Write | CapabilityRights.Configure).Value!;
+        var device = s.Kernel.BindPlatformDevice(s.Owner, s.Parent, cap.CapabilityId,
+            PlatformDeviceRights.Read | PlatformDeviceRights.Write | PlatformDeviceRights.Configure).Value!;
+        var io = s.Kernel.BindVirtualIo(s.Owner, s.Virtual.Domain, device,
+            new(PlatformDeviceRights.Read | PlatformDeviceRights.Write, 4096), execution).Value;
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        object Clone(object value) => typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(value, null)!;
+        var routes = (global::System.Collections.IDictionary)typeof(RuntimeKernel).GetField("_virtualIo", flags)!.GetValue(s.Kernel)!;
+        var local = routes[io.Id]!; var state = local.GetType().GetProperty("State", flags)!;
+        var bridgeRoutes = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_virtualIoBindings", flags)!.GetValue(s.Kernel.PlatformAuthority)!;
+        var bridgeRecord = bridgeRoutes.Values.Cast<object>().Single();
+        if (fault <= 3) s.Provider.VirtualIoClosureFault = fault;
+        else s.Kernel.BeforeVirtualIoClosureLocalCommit = () =>
+        {
+            Assert.False(s.Kernel.CloseVirtualIo(io).IsSuccess);
+            if (fault == 4) throw new IOException("local commit lost");
+            if (fault == 5) state.SetValue(local, state.GetValue(local));
+            if (fault == 6) { state.SetValue(local, Enum.Parse(state.PropertyType, "Active")); state.SetValue(local, Enum.Parse(state.PropertyType, "Closing")); }
+            if (fault == 7) routes[io.Id] = Clone(local);
+            if (fault >= 8) throw new IOException("retain original closure for corruption test");
+        };
+        Assert.False(s.Kernel.CloseVirtualIo(io).IsSuccess);
+        Assert.False((bool)local.GetType().GetProperty("CloseInFlight", flags)!.GetValue(local)!);
+        routes[io.Id] = local; s.Kernel.BeforeVirtualIoClosureLocalCommit = null; s.Provider.VirtualIoClosureFault = -1;
+        var close = bridgeRecord.GetType().GetProperty("CloseInvocation")!.GetValue(bridgeRecord)!;
+        if (fault == 8) bridgeRecord.GetType().GetProperty("CloseInvocation")!.SetValue(bridgeRecord, Clone(close));
+        if (fault == 9) bridgeRecord.GetType().GetProperty("CloseInvocation")!.SetValue(bridgeRecord, null);
+        if (fault == 10) close.GetType().GetProperty("Observation")!.SetValue(close, null);
+        if (fault == 11) state.SetValue(local, Enum.Parse(state.PropertyType, "Closed"));
+        if (fault == 12) local.GetType().GetProperty("SourceRevision", flags)!.SetValue(local, long.MaxValue);
+        var canConsume = fault is 4 or 5 or 6 or 7 or 12 or 13;
+        Assert.Equal(canConsume, s.Kernel.CloseVirtualIo(io).IsSuccess);
+        Assert.Equal(canConsume, s.Kernel.CloseSecureExecution(execution).IsSuccess);
+        Assert.Equal(canConsume, s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(1, s.Provider.VirtualIoCloseCalls);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)] [InlineData(5)]
+    public void OriginalVirtualIoDependencyAndClosureCannotBeReplacedByRouteOrClosedProjection(int fault)
+    {
+        var s = Create(); var execution = Bind(s).Value;
+        var buffer = s.Kernel.AllocateBuffer<byte>(s.Owner, 64).Value!;
+        var process = s.Kernel.Processes.Resolve(s.Owner).Value!;
+        var cap = s.Kernel.MintCapability(process.DomainId, s.Owner, ResourceKind.Device,
+            "device:secure-virtual-type2", CapabilityRights.Read | CapabilityRights.Write | CapabilityRights.Configure).Value!;
+        var device = s.Kernel.BindPlatformDevice(s.Owner, s.Parent, cap.CapabilityId,
+            PlatformDeviceRights.Read | PlatformDeviceRights.Write | PlatformDeviceRights.Configure).Value!;
+        var io = s.Kernel.BindVirtualIo(s.Owner, s.Virtual.Domain, device,
+            new(PlatformDeviceRights.Read | PlatformDeviceRights.Write, 4096), execution).Value;
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        object Clone(object value) => typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(value, null)!;
+        var routes = (global::System.Collections.IDictionary)typeof(RuntimeKernel).GetField("_virtualIo", flags)!.GetValue(s.Kernel)!;
+        var original = routes[io.Id]!;
+        var state = original.GetType().GetProperty("State", flags)!;
+        if (fault == 0) state.SetValue(original, Enum.Parse(state.PropertyType, "Closed"));
+        if (fault == 1) routes.Remove(io.Id);
+        if (fault is 2 or 3)
+        {
+            var copy = Clone(original); if (fault == 3) state.SetValue(copy, Enum.Parse(state.PropertyType, "Closed")); routes[io.Id] = copy;
+        }
+        if (fault is 4 or 5)
+        {
+            var bridgeRoutes = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_virtualIoBindings", flags)!.GetValue(s.Kernel.PlatformAuthority)!;
+            var key = bridgeRoutes.Keys.Cast<object>().Single(); var record = bridgeRoutes[key]!;
+            if (fault == 4) bridgeRoutes[key] = Clone(record);
+            else record.GetType().GetProperty("Closure")!.SetValue(record, PlatformExternalClosureState.Closed);
+        }
+        Assert.False(s.Kernel.CloseVirtualIo(io).IsSuccess);
+        Assert.False(s.Kernel.CloseSecureExecution(execution).IsSuccess);
+        Assert.Equal(0, s.Provider.CloseCalls);
+        Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(RegionState.Owned, s.Kernel.Regions.Snapshot().Single(x => x.Handle == buffer.Handle).State);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)] [InlineData(5)]
+    [InlineData(6)] [InlineData(7)] [InlineData(8)] [InlineData(9)] [InlineData(10)]
+    public void OriginalSecureGuestClosureAndPublicationCarryLocalRevisionAndExactConsumption(int fault)
+    {
+        var o = OverlayScenario(); var s = o.S;
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(RuntimeKernel).GetField("_secureGuestRegions", flags)!.GetValue(s.Kernel)!;
+        object Clone(object value) => typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(value, null)!;
+        if (fault is 0 or 1 or 2)
+        {
+            s.Provider.DuringSecureRegionBind = () =>
+            {
+                var record = routes.Values.Cast<object>().Single(); var state = record.GetType().GetProperty("State", flags)!;
+                var admitted = state.GetValue(record)!;
+                if (fault == 1) state.SetValue(record, Enum.Parse(state.PropertyType, "Active"));
+                if (fault == 2) record.GetType().GetProperty("SourceRevision", flags)!.SetValue(record, long.MaxValue);
+                state.SetValue(record, admitted);
+            };
+            Assert.False(s.Kernel.BindSecureGuestRegion(s.Owner, o.Execution, o.Mapping.Mapping, PlatformSecureRegionClass.Private).IsSuccess);
+            s.Provider.DuringSecureRegionBind = null;
+            Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+            Assert.Equal(1, s.Provider.SecureRegionBindCalls);
+            Assert.Equal(1, s.Provider.OverlayCloseOrder.Count(x => x == "secure"));
+            Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(x => x.Handle == o.Mapping.Region).State);
+            return;
+        }
+        var overlay = s.Kernel.BindSecureGuestRegion(s.Owner, o.Execution, o.Mapping.Mapping, PlatformSecureRegionClass.Private).Value;
+        var original = routes[overlay.Id]!; var localState = original.GetType().GetProperty("State", flags)!;
+        if (fault == 3) original.GetType().GetProperty("SourceRevision", flags)!.SetValue(original, long.MaxValue);
+        if (fault is 4 or 5 or 6 or 7)
+        {
+            s.Kernel.BeforeSecureGuestRegionClosureLocalCommit = () =>
+            {
+                Assert.False(s.Kernel.CloseSecureGuestRegion(overlay).IsSuccess);
+                if (fault == 4) localState.SetValue(original, localState.GetValue(original));
+                if (fault == 5) { localState.SetValue(original, Enum.Parse(localState.PropertyType, "Active")); localState.SetValue(original, Enum.Parse(localState.PropertyType, "Closing")); }
+                if (fault == 6) routes[overlay.Id] = Clone(original);
+                if (fault == 7) throw new IOException("local consumption interrupted");
+            };
+            Assert.False(s.Kernel.CloseSecureGuestRegion(overlay).IsSuccess);
+            Assert.Equal(RegionState.Owned, s.Kernel.Regions.Snapshot().Single(x => x.Handle == o.Mapping.Region).State);
+            Assert.False((bool)original.GetType().GetProperty("CloseInFlight", flags)!.GetValue(original)!);
+            routes[overlay.Id] = original; s.Kernel.BeforeSecureGuestRegionClosureLocalCommit = null;
+        }
+        Assert.True(s.Kernel.CloseSecureGuestRegion(overlay).IsSuccess);
+        Assert.True((bool)original.GetType().GetProperty("ClosureConsumed", flags)!.GetValue(original)!);
+        if (fault == 8) routes.Remove(overlay.Id);
+        if (fault == 9) { var copy = Clone(original); localState.SetValue(copy, Enum.Parse(localState.PropertyType, "Active")); routes[overlay.Id] = copy; }
+        if (fault == 10) localState.SetValue(original, Enum.Parse(localState.PropertyType, "Active"));
+        Assert.True(s.Kernel.CloseSecureExecution(o.Execution).IsSuccess);
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(1, s.Provider.OverlayCloseOrder.Count(x => x == "secure"));
+        Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(x => x.Handle == o.Mapping.Region).State);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)]
+    public void OriginalSecureGuestOverlayCannotHideItsDependencyOrTransferClosureToRouteCopy(int fault)
+    {
+        var o = OverlayScenario(); var s = o.S;
+        var overlay = s.Kernel.BindSecureGuestRegion(s.Owner, o.Execution, o.Mapping.Mapping, PlatformSecureRegionClass.Private).Value;
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(RuntimeKernel).GetField("_secureGuestRegions", flags)!.GetValue(s.Kernel)!;
+        var original = routes[overlay.Id]!;
+        var state = original.GetType().GetProperty("State", flags)!;
+        if (fault == 0) state.SetValue(original, Enum.Parse(state.PropertyType, "Closed"));
+        if (fault == 1) routes.Remove(overlay.Id);
+        if (fault is 2 or 3)
+        {
+            var copy = typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+            if (fault == 3) state.SetValue(copy, Enum.Parse(state.PropertyType, "Closed"));
+            routes[overlay.Id] = copy;
+        }
+        if (fault == 2) Assert.False(s.Kernel.CloseSecureGuestRegion(overlay).IsSuccess);
+        Assert.False(s.Kernel.CloseSecureExecution(o.Execution).IsSuccess);
+        Assert.Equal(0, s.Provider.CloseCalls);
+        Assert.Empty(s.Provider.OverlayCloseOrder);
+        Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(RegionState.Owned, s.Kernel.Regions.Snapshot().Single(x => x.Handle == o.Mapping.Region).State);
+    }
+
+    [Fact]
+    public void SecureGuestOriginalClosedBindingCannotConsumeAnEqualTupleNewBinding()
+    {
+        var o = OverlayScenario(); var s = o.S;
+        var overlay = s.Kernel.BindSecureGuestRegion(s.Owner, o.Execution, o.Mapping.Mapping, PlatformSecureRegionClass.Private).Value;
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var overlays = (global::System.Collections.IDictionary)typeof(RuntimeKernel).GetField("_secureGuestRegions", flags)!.GetValue(s.Kernel)!;
+        var local = overlays[overlay.Id]!;
+        var parent = (PlatformRegionMapping)local.GetType().GetProperty("Parent", flags)!.GetValue(local)!;
+        var bridge = s.Kernel.PlatformAuthority;
+        var domains = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_secureDomains", flags)!.GetValue(bridge)!;
+        var domain = domains.Values.Cast<object>().Single();
+        var binding = (PlatformAuthorityBridge.SecureDomainBinding)domain.GetType().GetProperty("Binding")!.GetValue(domain)!;
+        var oldFact = local.GetType().GetProperty("OriginalRegionBindingSource", flags)!.GetValue(local)!;
+        Assert.True(bridge.UnbindSecureRegion(binding, parent).IsSuccess);
+        Assert.True(bridge.BindSecureRegion(binding, parent, PlatformSecureRegionClass.Private).IsSuccess);
+        var owners = (global::System.Collections.IDictionary)domain.GetType().GetProperty("RegionBindingOwners")!.GetValue(domain)!;
+        var newerFact = owners[parent.MappingId]!;
+        Assert.NotSame(oldFact, newerFact);
+        Assert.Equal(oldFact.GetType().GetProperty("Observation")!.GetValue(oldFact), newerFact.GetType().GetProperty("Observation")!.GetValue(newerFact));
+        Assert.True(s.Kernel.CloseSecureGuestRegion(overlay).IsSuccess);
+        Assert.Same(newerFact, owners[parent.MappingId]);
+        Assert.Equal(1, s.Provider.OverlayCloseOrder.Count(x => x == "secure"));
+        Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(RegionState.Owned, s.Kernel.Regions.Snapshot().Single(x => x.Handle == o.Mapping.Region).State);
+        Assert.True(bridge.UnbindSecureRegion(binding, parent).IsSuccess);
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(2, s.Provider.OverlayCloseOrder.Count(x => x == "secure"));
+        Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(x => x.Handle == o.Mapping.Region).State);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)]
+    [InlineData(5)] [InlineData(6)] [InlineData(7)] [InlineData(8)]
+    public void OriginalSecureExecutionClosureSurvivesPartialConsumptionAndRejectsClosedProjection(int fault)
+    {
+        var s = Create(); var buffer = s.Kernel.AllocateBuffer<byte>(s.Owner, 128).Value!;
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(RuntimeKernel).GetField("_secureExecutions", flags)!.GetValue(s.Kernel)!;
+        object Clone(object value) => typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(value, null)!;
+        if (fault is 7 or 8)
+        {
+            object? admitted = null;
+            s.Provider.DuringBind = () =>
+            {
+                admitted = routes[s.Provider.LastRequest.Binding.Id]!;
+                if (fault == 7) routes[s.Provider.LastRequest.Binding.Id] = Clone(admitted);
+                else routes.Remove(s.Provider.LastRequest.Binding.Id);
+            };
+            Assert.False(Bind(s).IsSuccess);
+            Assert.Equal(1, s.Provider.BindCalls); Assert.Equal(0, s.Provider.CloseCalls);
+            Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+            Assert.NotNull(admitted!.GetType().GetField("BindObservation", flags)!.GetValue(admitted));
+            routes[s.Provider.LastRequest.Binding.Id] = admitted; s.Provider.DuringBind = null;
+            Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+            Assert.Equal(1, s.Provider.CloseCalls);
+            Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(x => x.Handle == buffer.Handle).State);
+            return;
+        }
+        var binding = Bind(s).Value; var original = routes[binding.Id]!;
+        var state = original.GetType().GetField("State", flags)!;
+        if (fault is 5 or 6)
+        {
+            Assert.True(s.Kernel.CloseSecureExecution(binding).IsSuccess);
+            if (fault == 5) routes.Remove(binding.Id);
+            else
+            {
+                var foreign = Clone(original); state.SetValue(foreign, Enum.Parse(state.FieldType, "Active")); routes[binding.Id] = foreign;
+            }
+            Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+            Assert.Equal(1, s.Provider.CloseCalls);
+            Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(x => x.Handle == buffer.Handle).State);
+            return;
+        }
+        if (fault == 0) s.Provider.ClosureFault = 0;
+        else s.Provider.DuringClose = () =>
+        {
+            Assert.True((bool)original.GetType().GetField("CloseInvoked", flags)!.GetValue(original)!);
+            Assert.True((bool)original.GetType().GetField("CloseInFlight", flags)!.GetValue(original)!);
+            var fact = original.GetType().GetField("CloseInvocation", flags)!.GetValue(original)!;
+            Assert.Null(fact.GetType().GetField("Observation", flags)!.GetValue(fact));
+            if (fault == 1)
+            {
+                state.SetValue(original, Enum.Parse(state.FieldType, "Closed"));
+                Assert.False(s.Kernel.CloseSecureExecution(binding).IsSuccess);
+            }
+            else routes[binding.Id] = Clone(original);
+        };
+        Assert.False(s.Kernel.CloseSecureExecution(binding).IsSuccess);
+        Assert.False((bool)original.GetType().GetField("CloseInFlight", flags)!.GetValue(original)!);
+        routes[binding.Id] = original; s.Provider.DuringClose = null; s.Provider.ClosureFault = -1;
+        var factField = original.GetType().GetField("CloseInvocation", flags)!; var retained = factField.GetValue(original)!;
+        if (fault == 0) state.SetValue(original, Enum.Parse(state.FieldType, "Closed"));
+        if (fault == 2) factField.SetValue(original, Clone(retained));
+        if (fault == 3) factField.SetValue(original, null);
+        if (fault == 4) retained.GetType().GetField("Observation", flags)!.SetValue(retained, null);
+        if (fault != 1)
+        {
+            Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+            Assert.Equal(RegionState.Owned, s.Kernel.Regions.Snapshot().Single(x => x.Handle == buffer.Handle).State);
+        }
+        if (fault is 1 or 2 or 3)
+        {
+            factField.SetValue(original, retained);
+            Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+            Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(x => x.Handle == buffer.Handle).State);
+        }
+        else Assert.False(s.Kernel.CloseSecureExecution(binding).IsSuccess);
+        Assert.Equal(1, s.Provider.CloseCalls);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)]
+    public void OriginalSecureExecutionRoutingCannotReplaceOrHideBackingDependency(int fault)
+    {
+        var s = Create();
+        var admin = TestFixtures.Create(s.Kernel, 990, 991).Handle;
+        var capability = s.Kernel.MintCapability(new(991), admin, ResourceKind.KernelService,
+            CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        var budget = s.Kernel.AdmitProcessBudget(admin, capability, s.Owner, "secure-owner", [new(ServiceBudgetDimension.OwnedMemoryBytes, 128)]).Value!.ProcessBudget;
+        var buffer = s.Kernel.AllocateBuffer<byte>(s.Owner, 128).Value!;
+        var binding = Bind(s).Value;
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(RuntimeKernel).GetField("_secureExecutions", flags)!.GetValue(s.Kernel)!;
+        var original = routes[binding.Id]!;
+        object Clone() => typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+        if (fault == 0) routes[binding.Id] = Clone();
+        if (fault == 1) routes.Remove(binding.Id);
+        if (fault == 2)
+        {
+            var foreign = Clone(); var state = foreign.GetType().GetField("State", flags)!;
+            state.SetValue(foreign, Enum.Parse(state.FieldType, "Closed")); routes[binding.Id] = foreign;
+        }
+        if (fault == 3) s.Provider.DuringRevalidation = () => routes[binding.Id] = Clone();
+        if (fault != 4) Assert.False(s.Kernel.RevalidateSecureExecution(binding).IsSuccess);
+        else
+        {
+            s.Provider.DuringClose = () => routes[binding.Id] = Clone();
+            Assert.False(s.Kernel.CloseSecureExecution(binding).IsSuccess);
+        }
+        Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(RegionState.Owned, s.Kernel.Regions.Snapshot().Single(x => x.Handle == buffer.Handle).State);
+        Assert.Equal(128UL, s.Kernel.QueryBudget(budget).Value!.Usage.Single(x => x.Dimension == ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        routes[binding.Id] = original; s.Provider.DuringRevalidation = null; s.Provider.DuringClose = null;
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(1, s.Provider.CloseCalls);
+        Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(x => x.Handle == buffer.Handle).State);
+        Assert.Equal(0UL, s.Kernel.QueryBudget(budget).Value!.Usage.Single(x => x.Dimension == ServiceBudgetDimension.OwnedMemoryBytes).Used);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)] [InlineData(5)] [InlineData(6)]
+    public void OriginalUnknownSecureExecutionCloseMustRemainPinnedWithoutRepeatingProviderEffect(int fault)
+    {
+        var s = Create(); var buffer = s.Kernel.AllocateBuffer<byte>(s.Owner, 128).Value!; var binding = Bind(s).Value;
+        s.Provider.ClosureFault = fault;
+        Assert.False(s.Kernel.CloseSecureExecution(binding).IsSuccess);
+        s.Provider.ClosureFault = -1;
+        Assert.False(s.Kernel.CloseSecureExecution(binding).IsSuccess);
+        Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(1, s.Provider.CloseCalls);
+        Assert.Equal(RegionState.Owned, s.Kernel.Regions.Snapshot().Single(x => x.Handle == buffer.Handle).State);
+    }
+
+    private static object OriginalSecureLocal(RuntimeKernel kernel, SecureDomainHandle domain) =>
+        ((global::System.Collections.IDictionary)typeof(RuntimeKernel).GetField("_secureDomainRecords", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel)!)[domain.DomainId]!;
+    private static void MutateSecureLocal(object record, string property, bool aba)
+    {
+        var member = record.GetType().GetProperty(property)!; var original = member.GetValue(record)!;
+        if (aba) member.SetValue(record, property == "State" ? (object)SecureDomainState.Parked : (ulong)original + 1);
+        member.SetValue(record, original);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void AClonedLocalSecureRouteCannotBecomeAnOriginalCompositionOwner(bool late)
+    {
+        var s = Create(); var region = s.Kernel.AllocateBuffer<byte>(s.Owner, 128).Value!;
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(RuntimeKernel).GetField("_secureDomainRecords", flags)!.GetValue(s.Kernel)!;
+        var original = routes[s.Secure.Domain.DomainId]!;
+        void Replace() => routes[s.Secure.Domain.DomainId] = typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+        if (late) s.Provider.DuringBind = Replace; else Replace();
+        Assert.False(Bind(s).IsSuccess);
+        Assert.Equal(late ? 1 : 0, s.Provider.BindCalls);
+        Assert.False(Bind(s).IsSuccess); Assert.Equal(late ? 1 : 0, s.Provider.BindCalls);
+        routes[s.Secure.Domain.DomainId] = original; s.Provider.DuringBind = null;
+        Assert.Equal(late ? 1 : 0, s.Provider.CloseCalls);
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(x => x.Handle == region.Handle).State);
+    }
+
+    [Fact]
+    public void ExhaustedSecureRevisionRefusesAdmissionButDoesNotInvalidateExactLifetimeCleanup()
+    {
+        var s = Create(); var region = s.Kernel.AllocateBuffer<byte>(s.Owner, 128).Value!;
+        var local = OriginalSecureLocal(s.Kernel, s.Secure.Domain);
+        local.GetType().GetField("_sourceRevision", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(local, long.MaxValue);
+        MutateSecureLocal(local, "State", false);
+        Assert.False(Bind(s).IsSuccess); Assert.Equal(0, s.Provider.BindCalls);
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(x => x.Handle == region.Handle).State);
+    }
+
+    [Fact]
+    public void ActualVirtualIoBindCannotRecaptureAnEqualSecureRevisionAfterItsProviderEffect()
+    {
+        var s = Create(); var execution = Bind(s).Value;
+        var process = s.Kernel.Processes.Resolve(s.Owner).Value!;
+        var cap = s.Kernel.MintCapability(process.DomainId, s.Owner, ResourceKind.Device,
+            "device:secure-virtual-type2", CapabilityRights.Read | CapabilityRights.Write | CapabilityRights.Configure).Value!;
+        var device = s.Kernel.BindPlatformDevice(s.Owner, s.Parent, cap.CapabilityId,
+            PlatformDeviceRights.Read | PlatformDeviceRights.Write | PlatformDeviceRights.Configure).Value!;
+        var calls = 0;
+        s.Provider.DuringVirtualIoBind = () => { calls++; MutateSecureLocal(OriginalSecureLocal(s.Kernel, s.Secure.Domain), "State", false); };
+        Assert.False(s.Kernel.BindVirtualIo(s.Owner, s.Virtual.Domain, device,
+            new(PlatformDeviceRights.Read | PlatformDeviceRights.Write, 4096), execution).IsSuccess);
+        Assert.Equal(1, calls); s.Provider.DuringVirtualIoBind = null;
+        Assert.True(s.Kernel.CloseSecureExecution(execution).IsSuccess);
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+    }
+
+    [Fact]
+    public void ActualType2SubmitRetainsItsOriginalSecureBaselineAfterKnownAcceptance()
+    {
+        var calls = 0;
+        var c = CreateComposedWorkload(afterSubmit: (kernel, _, _) =>
+        {
+            calls++;
+            var routes = (global::System.Collections.IDictionary)typeof(RuntimeKernel).GetField("_secureDomainRecords", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel)!;
+            MutateSecureLocal(Assert.Single(routes.Values.Cast<object>()), "ProtectionGeneration", true);
+        });
+        Assert.Equal(1, calls); Assert.False(c.SubmissionResult.IsSuccess);
+        Assert.Equal(KernelError.ExternalEffectUncontained, c.SubmissionResult.Error);
+        Assert.False(c.Bridge.ReleaseFabric(c.Fabric).IsSuccess);
+        Assert.False(c.Memory.Close(c.OutputPlacement.PlacementId).IsSuccess);
+        Assert.True(c.Manager.BeginReconfiguration(c.Fabric).IsSuccess);
+        var replacement = c.Manager.CompleteReconfiguration(c.Fabric.BindingId);
+        Assert.True(replacement.IsSuccess, replacement.Message);
+        CloseComposedWorkload(c, replacement.Value!.Binding);
+        Assert.All(c.Base.Kernel.Regions.Snapshot(), region => Assert.Equal(RegionState.Released, region.State));
+    }
+
+    [Theory]
+    [InlineData("State", false)] [InlineData("PolicyGeneration", true)]
+    public void ActualGuestEventPublicationKeepsTheOriginalComposedSecureRevision(string property, bool aba)
+    {
+        var s = Create(); var binding = Bind(s).Value;
+        var region = s.Kernel.AllocateBuffer<byte>(s.Owner, 128).Value!;
+        var endpoint = s.Kernel.CreateKernelEventEndpoint(s.Owner).Value!;
+        s.Provider.DuringEvent = () => MutateSecureLocal(OriginalSecureLocal(s.Kernel, s.Secure.Domain), property, aba);
+        Assert.False(s.Kernel.InjectVirtualEvent(s.Owner, s.Virtual.Domain, s.Virtual.EventCapability, endpoint).IsSuccess);
+        Assert.Equal(1, s.Provider.EventEffects);
+        s.Provider.DuringEvent = null;
+        Assert.False(s.Kernel.InjectVirtualEvent(s.Owner, s.Virtual.Domain, s.Virtual.EventCapability, endpoint).IsSuccess);
+        Assert.Equal(1, s.Provider.EventEffects);
+        Assert.True(s.Kernel.CloseSecureExecution(binding).IsSuccess);
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(x => x.Handle == region.Handle).State);
+    }
+
+    [Theory]
+    [InlineData("State", false)] [InlineData("State", true)]
+    [InlineData("PolicyGeneration", false)] [InlineData("PolicyGeneration", true)]
+    [InlineData("ProtectionGeneration", false)] [InlineData("ProtectionGeneration", true)]
+    public void ActualComputePublicationKeepsOriginalSecureRevisionAcrossItsServiceCallback(string property, bool aba)
+    {
+        var c = CreateComposedWorkload(); var s = c.Base;
+        var local = OriginalSecureLocal(s.Kernel, s.Secure.Domain);
+        s.Kernel.ExternalPublicationBeforeAdmissionQualificationHook = () => MutateSecureLocal(local, property, aba);
+        var published = false;
+        KernelResult<ExternalOperationSnapshot> result;
+        try { result = c.Service.CompleteVisiblePublish(s.Owner, c.Execution, [c.Candidate], () => published = true); }
+        finally { s.Kernel.ExternalPublicationBeforeAdmissionQualificationHook = null; }
+        Assert.False(result.IsSuccess); Assert.False(published);
+        var operation = s.Kernel.QueryExternalOperation(s.Owner, c.Execution.Operation).Value!;
+        Assert.Equal(ExternalOperationState.Released, operation.State);
+        Assert.NotEqual(ExternalOperationDisposition.Published, operation.Disposition);
+        Assert.Equal(0, s.Provider.EventEffects);
+        CloseComposedWorkload(c, c.Fabric);
+        Assert.All(s.Kernel.Regions.Snapshot(), region => Assert.Equal(RegionState.Released, region.State));
+    }
+
+    [Theory]
+    [InlineData(false, "State")] [InlineData(true, "State")]
+    [InlineData(false, "ProtectionGeneration")] [InlineData(true, "ProtectionGeneration")]
+    public void SecureGuestPublicationRequiresItsCapturedOriginalSecureSource(bool late, string property)
+    {
+        var o = OverlayScenario(); var s = o.S;
+        var local = OriginalSecureLocal(s.Kernel, s.Secure.Domain);
+        void Change() => MutateSecureLocal(local, property, true);
+        if (late) s.Kernel.BeforeSecureGuestRegionPublication = Change; else s.Kernel.BeforeSecureGuestRegionAdmission = Change;
+        Assert.False(s.Kernel.BindSecureGuestRegion(s.Owner, o.Execution, o.Mapping.Mapping, PlatformSecureRegionClass.Private).IsSuccess);
+        Assert.Equal(late ? 1 : 0, s.Provider.SecureRegionBindCalls);
+        AssertOverlayPendingBalanced(s);
+        s.Kernel.BeforeSecureGuestRegionPublication = null; s.Kernel.BeforeSecureGuestRegionAdmission = null;
+        if (late) Assert.True(s.Kernel.CloseSecureGuestRegion(RetainedOverlay(s)).IsSuccess);
+        Assert.True(s.Kernel.CloseGuestRegionMapping(s.Owner, s.Virtual.Domain, s.Virtual.MemoryCapability, o.Mapping.Mapping).IsSuccess);
+        Assert.True(s.Kernel.CloseSecureExecution(o.Execution).IsSuccess);
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.All(s.Kernel.Regions.Snapshot(), region => Assert.Equal(RegionState.Released, region.State));
+    }
+
+    [Theory]
+    [InlineData(false, "State")] [InlineData(true, "State")]
+    [InlineData(false, "PolicyGeneration")] [InlineData(true, "ProtectionGeneration")]
+    public void SecureExecutionBindAndRevalidationRefuseLocalEqualWriteOrAba(bool revalidate, string property)
+    {
+        var s = Create(); var region = s.Kernel.AllocateBuffer<byte>(s.Owner, 128).Value!;
+        var local = OriginalSecureLocal(s.Kernel, s.Secure.Domain);
+        void Change() => MutateSecureLocal(local, property, true);
+        if (revalidate)
+        {
+            var bound = Bind(s).Value;
+            s.Provider.DuringRevalidation = Change;
+            Assert.False(s.Kernel.RevalidateSecureExecution(bound).IsSuccess);
+            s.Provider.DuringRevalidation = null;
+            Assert.True(s.Kernel.CloseSecureExecution(bound).IsSuccess);
+        }
+        else
+        {
+            s.Provider.DuringBind = Change;
+            Assert.False(Bind(s).IsSuccess); s.Provider.DuringBind = null;
+        }
+        Assert.Equal(1, s.Provider.BindCalls); Assert.Equal(1, s.Provider.CloseCalls);
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(x => x.Handle == region.Handle).State);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void ActualVirtualComputePublicationRefusesAnEqualLocalRevisionWrite(bool publicationBit)
+    {
+        var c = CreateComposedWorkload();
+        var authority = (VirtualDomainAuthority)typeof(RuntimeKernel).GetField("_virtualDomains", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(c.Base.Kernel)!;
+        var local = Assert.Single(authority.ForOwner(c.Base.Owner));
+        c.Base.Kernel.ExternalPublicationBeforeAdmissionQualificationHook = () =>
+        { if (publicationBit) local.AuthorityPublished = local.AuthorityPublished; else local.State = local.State; };
+        var published = false;
+        KernelResult<ExternalOperationSnapshot> result;
+        try { result = c.Service.CompleteVisiblePublish(c.Base.Owner, c.Execution, [c.Candidate], () => published = true); }
+        finally { c.Base.Kernel.ExternalPublicationBeforeAdmissionQualificationHook = null; }
+        Assert.False(result.IsSuccess);
+        Assert.False(published);
+        var operation = c.Base.Kernel.QueryExternalOperation(c.Base.Owner, c.Execution.Operation).Value!;
+        Assert.NotEqual(ExternalOperationDisposition.Published, operation.Disposition);
+        Assert.Equal(ExternalOperationState.Released, operation.State);
+        Assert.Equal(0, c.Base.Provider.EventEffects);
+        CloseComposedWorkload(c, c.Fabric);
+        Assert.All(c.Base.Kernel.Regions.Snapshot(), region => Assert.Equal(RegionState.Released, region.State));
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void SecureGuestBindKeepsOriginalVirtualRevisionThroughLocalPublication(bool late)
+    {
+        var o = OverlayScenario(); var s = o.S;
+        var authority = (VirtualDomainAuthority)typeof(RuntimeKernel).GetField("_virtualDomains", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(s.Kernel)!;
+        var local = Assert.Single(authority.ForOwner(s.Owner));
+        void Change() => local.State = local.State;
+        if (late) s.Kernel.BeforeSecureGuestRegionPublication = Change; else s.Kernel.BeforeSecureGuestRegionAdmission = Change;
+        Assert.False(s.Kernel.BindSecureGuestRegion(s.Owner, o.Execution, o.Mapping.Mapping, PlatformSecureRegionClass.Private).IsSuccess);
+        Assert.Equal(late ? 1 : 0, s.Provider.SecureRegionBindCalls);
+        AssertOverlayPendingBalanced(s);
+        s.Kernel.BeforeSecureGuestRegionPublication = null; s.Kernel.BeforeSecureGuestRegionAdmission = null;
+        if (late) Assert.True(s.Kernel.CloseSecureGuestRegion(RetainedOverlay(s)).IsSuccess);
+        Assert.True(s.Kernel.CloseGuestRegionMapping(s.Owner, s.Virtual.Domain, s.Virtual.MemoryCapability, o.Mapping.Mapping).IsSuccess);
+        Assert.True(s.Kernel.CloseSecureExecution(o.Execution).IsSuccess);
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.All(s.Kernel.Regions.Snapshot(), region => Assert.Equal(RegionState.Released, region.State));
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)]
+    public void OriginalVirtualRevisionIsRequiredAcrossActualSecureBindAndRevalidation(int fault)
+    {
+        var s = Create();
+        var region = s.Kernel.AllocateBuffer<byte>(s.Owner, 128).Value!;
+        var authority = (VirtualDomainAuthority)typeof(RuntimeKernel).GetField("_virtualDomains", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(s.Kernel)!;
+        var local = Assert.Single(authority.ForOwner(s.Owner));
+        void Change()
+        {
+            if (fault % 2 == 0) local.State = local.State;
+            else local.AuthorityPublished = local.AuthorityPublished;
+        }
+        if (fault < 2)
+        {
+            s.Provider.DuringBind = Change;
+            Assert.False(Bind(s).IsSuccess);
+            Assert.Equal(1, s.Provider.BindCalls);
+            Assert.Equal(1, s.Provider.CloseCalls); // Same admitted receipt, existing exact cleanup.
+            s.Provider.DuringBind = null;
+        }
+        else
+        {
+            var bound = Bind(s).Value;
+            s.Provider.DuringRevalidation = Change;
+            Assert.False(s.Kernel.RevalidateSecureExecution(bound).IsSuccess);
+            s.Provider.DuringRevalidation = null;
+            Assert.True(s.Kernel.CloseSecureExecution(bound).IsSuccess);
+            Assert.Equal(1, s.Provider.BindCalls);
+            Assert.Equal(1, s.Provider.CloseCalls);
+        }
+        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(x => x.Handle == region.Handle).State);
+    }
+
     private sealed class ObservedSecureProperties(Action observe) : IReadOnlyList<SecureProperty>
     {
         public int Count { get { observe(); return 1; } }
@@ -285,7 +985,17 @@ public sealed class SecureExecutionBindingTests
         s.Provider.SecureRegionClosureFault = false;
         // Restore the exact original owner for cleanup positive; this is not durable routing.
         lock (gate) routes[key] = original;
-        if (retained is { } overlay) Assert.True(s.Kernel.CloseSecureGuestRegion(overlay).IsSuccess);
+        if (retained is { } overlay)
+        {
+            Assert.False(s.Kernel.CloseSecureGuestRegion(overlay).IsSuccess);
+            Assert.False(s.Kernel.CloseSecureExecution(execution).IsSuccess);
+            Assert.False(s.Kernel.CloseGuestRegionMapping(s.Owner, s.Virtual.Domain, s.Virtual.MemoryCapability, guest.Mapping).IsSuccess);
+            Assert.False(memory.Close(placement.PlacementId).IsSuccess);
+            Assert.Equal(1, s.Provider.OverlayCloseOrder.Count(x => x == "secure"));
+            Assert.Equal(RegionState.Owned, s.Kernel.Regions.Snapshot().Single(x => x.Handle == buffer.Handle).State);
+            AssertOverlayPendingBalanced(s);
+            return;
+        }
         Assert.True(s.Kernel.CloseSecureExecution(execution).IsSuccess);
         Assert.True(s.Kernel.CloseGuestRegionMapping(s.Owner, s.Virtual.Domain, s.Virtual.MemoryCapability, guest.Mapping).IsSuccess);
         Assert.True(memory.Close(placement.PlacementId).IsSuccess);
@@ -388,8 +1098,8 @@ public sealed class SecureExecutionBindingTests
             Assert.Equal(returned, (SecureExecutionClosure)fact.GetType().GetProperty("Receipt")!.GetValue(fact)!);
             Assert.Equal(0, s.Provider.SecureCloses); Assert.Equal(0, s.Provider.ChildCloses);
             s.Provider.ClosureTransform = null;
-            Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
-            Assert.Equal(2, s.Provider.CloseCalls);
+            Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+            Assert.Equal(1, s.Provider.CloseCalls);
             return trace.ToArray();
         }
         var a = Observe(998); var b = Observe(999);
@@ -470,8 +1180,8 @@ public sealed class SecureExecutionBindingTests
         Assert.True(queried); Assert.False(locked); Assert.Empty(trace);
         Assert.Equal(1, s.Provider.CloseCalls);
         s.Provider.ClosureTransform = null;
-        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
-        Assert.Equal(returnedClosure ? 2 : 1, s.Provider.CloseCalls);
+        Assert.Equal(!returnedClosure, s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(1, s.Provider.CloseCalls);
     }
 
     [Theory]
@@ -540,15 +1250,15 @@ public sealed class SecureExecutionBindingTests
             Assert.Equal(0, s.Provider.ChildCloses);
             s.Provider.ClosureFault = -1;
         }
-        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
-        Assert.Equal(refuseClosure ? 3 : 1, s.Provider.CloseCalls);
+        Assert.Equal(!refuseClosure, s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(1, s.Provider.CloseCalls);
         Assert.Equal(refuseClosure ? 3 : 1, trace.Select(e => e.OperationCorrelation).Distinct().Count());
         foreach (var group in trace.GroupBy(e => e.OperationCorrelation))
         {
             Assert.Equal(new ulong[] { 1, 2, 3 }, group.Select(e => e.Sequence));
             Assert.True(SemanticTraceValidatorV1.Validate(group).IsValid);
         }
-        Assert.Equal(SemanticTraceEventKindV1.RetireOrComplete, trace[^1].Kind);
+        Assert.Equal(refuseClosure ? SemanticTraceEventKindV1.Quarantined : SemanticTraceEventKindV1.RetireOrComplete, trace[^1].Kind);
         Assert.All(trace, e => { Assert.False(e.AuthorizesEffect); Assert.False(e.AuthorizesPublication); });
     }
 
@@ -581,8 +1291,8 @@ public sealed class SecureExecutionBindingTests
             Assert.Equal(0, s.Provider.SecureCloses);
             Assert.Equal(0, s.Provider.ChildCloses);
             s.Provider.ClosureFault = -1;
-            Assert.Equal(secure, Destroy().IsSuccess);
-            Assert.Equal(2, s.Provider.CloseCalls);
+            Assert.False(Destroy().IsSuccess);
+            Assert.Equal(1, s.Provider.CloseCalls);
         }
         Assert.Equal(refuse ? 2 : 1, trace.Select(e => e.OperationCorrelation).Distinct().Count());
         foreach (var group in trace.GroupBy(e => e.OperationCorrelation))
@@ -590,12 +1300,12 @@ public sealed class SecureExecutionBindingTests
             Assert.Equal(new ulong[] { 1, 2, 3 }, group.Select(e => e.Sequence));
             Assert.True(SemanticTraceValidatorV1.Validate(group).IsValid);
         }
-        Assert.Equal(SemanticTraceEventKindV1.RetireOrComplete, trace[^1].Kind);
+        Assert.Equal(refuse ? SemanticTraceEventKindV1.Quarantined : SemanticTraceEventKindV1.RetireOrComplete, trace[^1].Kind);
         Assert.All(trace, e => { Assert.False(e.AuthorizesEffect); Assert.False(e.AuthorizesPublication); });
         if (!secure)
-            Assert.True(s.Kernel.DestroySecureDomain(s.Owner, s.Secure.Domain, s.Secure.ConfigureCapability).IsSuccess);
-        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
-        Assert.Equal(refuse ? 2 : 1, s.Provider.CloseCalls);
+            Assert.Equal(!refuse, s.Kernel.DestroySecureDomain(s.Owner, s.Secure.Domain, s.Secure.ConfigureCapability).IsSuccess);
+        Assert.Equal(!refuse, s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(1, s.Provider.CloseCalls);
     }
 
     [Theory]
@@ -632,15 +1342,16 @@ public sealed class SecureExecutionBindingTests
             Assert.Equal(0, s.Provider.SecureCloses);
             Assert.Equal(0, s.Provider.ChildCloses);
             s.Provider.ClosureFault = -1;
-            Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
-            Assert.Equal(2, s.Provider.CloseCalls);
+            Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+            Assert.Equal(1, s.Provider.CloseCalls);
             Assert.Equal(2, trace.Select(e => e.OperationCorrelation).Distinct().Count());
         }
-        Assert.Null(sinkField.GetValue(record));
+        if (fault == 3) Assert.Same(sink, sinkField.GetValue(record));
+        else Assert.Null(sinkField.GetValue(record));
         Assert.Equal(fault is 1 or 2 ? 1 : fault == 3 ? 6 : 3, calls);
         foreach (var group in trace.GroupBy(e => e.OperationCorrelation))
             Assert.True(SemanticTraceValidatorV1.Validate(group).IsValid);
-        if (trace.Count != 0) Assert.Equal(SemanticTraceEventKindV1.RetireOrComplete, trace[^1].Kind);
+        if (trace.Count != 0) Assert.Equal(fault == 3 ? SemanticTraceEventKindV1.Quarantined : SemanticTraceEventKindV1.RetireOrComplete, trace[^1].Kind);
         Assert.All(trace, e => Assert.False(e.AuthorizesEffect));
     }
 
@@ -700,18 +1411,18 @@ public sealed class SecureExecutionBindingTests
             return !rejectOuter;
         }));
         Assert.False(result.IsSuccess);
-        Assert.True(retry.IsSuccess);
-        Assert.Equal(2, s.Provider.CloseCalls);
+        Assert.False(retry.IsSuccess);
+        Assert.Equal(1, s.Provider.CloseCalls);
         Assert.Equal(rejectOuter ? 1 : 3, outer.Count);
-        Assert.Equal(SemanticTraceEventKindV1.RetireOrComplete, inner[^1].Kind);
+        Assert.Equal(SemanticTraceEventKindV1.Quarantined, inner[^1].Kind);
         if (!rejectOuter) Assert.Equal(SemanticTraceEventKindV1.Quarantined, outer[^1].Kind);
         Assert.True(SemanticTraceValidatorV1.Validate(outer).IsValid);
         Assert.True(SemanticTraceValidatorV1.Validate(inner).IsValid);
         Assert.NotEqual(outer[0].OperationCorrelation, inner[0].OperationCorrelation);
         Assert.All(outer.Concat(inner), e => Assert.False(e.AuthorizesEffect));
-        Assert.True(s.Kernel.CloseSecureExecution(binding).IsSuccess);
-        Assert.Equal(2, s.Provider.CloseCalls);
-        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.False(s.Kernel.CloseSecureExecution(binding).IsSuccess);
+        Assert.Equal(1, s.Provider.CloseCalls);
+        Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
     }
 
     [Theory]
@@ -745,15 +1456,15 @@ public sealed class SecureExecutionBindingTests
             await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
             s.Provider.ClosureFault = -1;
             second = await Task.Run(() => s.Kernel.CloseSecureExecution(binding, sink)).WaitAsync(TimeSpan.FromSeconds(10));
-            Assert.True(second.IsSuccess);
+            Assert.False(second.IsSuccess);
             Assert.False(first.IsCompleted);
-            if (terminateDuringFlush) Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+            if (terminateDuringFlush) Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
         }
         finally { release.Set(); }
         Assert.False((await first.WaitAsync(TimeSpan.FromSeconds(10))).IsSuccess);
         Assert.True(released);
         Assert.False(heldOwnerLock);
-        Assert.Equal(2, s.Provider.CloseCalls);
+        Assert.Equal(1, s.Provider.CloseCalls);
         var stream = events.ToArray();
         var grouped = stream.GroupBy(e => e.OperationCorrelation).ToArray();
         Assert.Equal(2, grouped.Length);
@@ -761,11 +1472,11 @@ public sealed class SecureExecutionBindingTests
         {
             Assert.Equal(new ulong[] { 1, 2, 3 }, group.Select(e => e.Sequence));
             Assert.True(SemanticTraceValidatorV1.Validate(group).IsValid);
-            Assert.Equal(group.Key == firstCorrelation ? SemanticTraceEventKindV1.Quarantined : SemanticTraceEventKindV1.RetireOrComplete, group.Last().Kind);
+            Assert.Equal(SemanticTraceEventKindV1.Quarantined, group.Last().Kind);
         }
         Assert.Equal(SemanticTraceValidationStatusV1.MixedOperation, SemanticTraceValidatorV1.Validate(stream).Status);
         Assert.All(stream, e => { Assert.False(e.AuthorizesExecution); Assert.False(e.AuthorizesEffect); Assert.False(e.AuthorizesPublication); });
-        if (!terminateDuringFlush) Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        if (!terminateDuringFlush) Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
     }
 
     [Theory]
@@ -886,10 +1597,9 @@ public sealed class SecureExecutionBindingTests
         Assert.Equal(0, s.Provider.ChildCloses);
         s.Provider.DuringClose = null;
         s.Provider.ClosureFault = -1;
-        Assert.True(s.Kernel.CloseSecureExecution(binding).IsSuccess);
-        Assert.Equal(fault is 0 or 1 ? 1 : 2, s.Provider.CloseCalls);
-        if (fault is 2 or 3 or 4) Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
-        else Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(fault is 0 or 1, s.Kernel.CloseSecureExecution(binding).IsSuccess);
+        Assert.Equal(1, s.Provider.CloseCalls);
+        Assert.Equal(fault is 0 or 1, s.Kernel.TerminateProcess(s.Owner).IsSuccess);
     }
 
     [Theory]
@@ -993,10 +1703,12 @@ public sealed class SecureExecutionBindingTests
         }
         model.ReleaseFails = false;
         Assert.False(((ICxlTeardownParticipant)c.Service).CloseForProcess(c.Base.Owner, owner).IsSuccess);
-        Assert.Equal(c.Execution.Submission, Assert.Single(releases.SuccessfulReleases));
+        if (releaseFails) Assert.Empty(releases.SuccessfulReleases);
+        else Assert.Equal(c.Execution.Submission, Assert.Single(releases.SuccessfulReleases));
         // Known accelerator closure does not settle the independent possible CPU publication.
         Assert.False(((ICxlTeardownParticipant)c.Service).CloseForProcess(c.Base.Owner, owner).IsSuccess);
-        Assert.Single(releases.SuccessfulReleases);
+        if (releaseFails) Assert.Empty(releases.SuccessfulReleases);
+        else Assert.Single(releases.SuccessfulReleases);
         Assert.NotEqual(ExternalOperationState.Released, c.Base.Kernel.ExternalOperations.Query(c.Execution.Operation).Value!.State);
         Assert.False(c.Base.Kernel.CloseGuestRegionMapping(c.Base.Owner, c.Base.Virtual.Domain,
             c.Base.Virtual.MemoryCapability, c.OutputGuest.Mapping).IsSuccess);
@@ -1265,10 +1977,11 @@ public sealed class SecureExecutionBindingTests
         Assert.Single(c.Base.Kernel.Regions.SnapshotDamage());
     }
 
-    private static (Scenario S, GuestRegionMapping Mapping, CapabilityId Region, SecureExecutionBinding Execution) OverlayScenario(bool unknownBacking = false)
+    private static (Scenario S, GuestRegionMapping Mapping, CapabilityId Region, SecureExecutionBinding Execution) OverlayScenario(bool unknownBacking = false, Action<Scenario>? beforeAllocation = null)
     {
         var s = Create();
         var process = s.Kernel.Processes.Resolve(s.Owner).Value!;
+        beforeAllocation?.Invoke(s);
         var buffer = s.Kernel.AllocateBuffer<byte>(s.Owner, 64).Value!;
         if (unknownBacking) Assert.True(s.Kernel.Regions.ReserveBacking(buffer.Handle, new(process.DomainId, s.Owner.Generation)).IsSuccess);
         var region = s.Kernel.MintCapability(process.DomainId, s.Owner, ResourceKind.MemoryRegion,
@@ -1513,7 +2226,7 @@ public sealed class SecureExecutionBindingTests
     }
 
     [Fact]
-    public void SecureGuestLateRefusalPinsKnownReceiptUntilActualClosureRetry()
+    public void SecureGuestLateRefusalPinsKnownBindUntilOriginalUnknownClosureCanBeResolved()
     {
         var o = OverlayScenario(); var s = o.S;
         s.Kernel.BeforeSecureGuestRegionPublication = () =>
@@ -1527,10 +2240,10 @@ public sealed class SecureExecutionBindingTests
         Assert.False(s.Kernel.CloseGuestRegionMapping(s.Owner, s.Virtual.Domain, s.Virtual.MemoryCapability, o.Mapping.Mapping).IsSuccess);
         Assert.Equal(0, s.Provider.CloseCalls);
         s.Provider.SecureRegionClosureFault = false;
-        Assert.True(s.Kernel.CloseSecureGuestRegion(retained).IsSuccess);
-        // Successful overlay closure does not clear the independently quarantined composition.
-        Assert.True(s.Kernel.CloseSecureExecution(o.Execution).IsSuccess);
-        Assert.True(s.Kernel.CloseGuestRegionMapping(s.Owner, s.Virtual.Domain, s.Virtual.MemoryCapability, o.Mapping.Mapping).IsSuccess);
+        Assert.False(s.Kernel.CloseSecureGuestRegion(retained).IsSuccess);
+        Assert.False(s.Kernel.CloseSecureExecution(o.Execution).IsSuccess);
+        Assert.False(s.Kernel.CloseGuestRegionMapping(s.Owner, s.Virtual.Domain, s.Virtual.MemoryCapability, o.Mapping.Mapping).IsSuccess);
+        Assert.Equal(1, s.Provider.OverlayCloseOrder.Count(x => x == "secure"));
         AssertOverlayPendingBalanced(s);
     }
 
@@ -2032,7 +2745,7 @@ public sealed class SecureExecutionBindingTests
 
     [Theory]
     [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)] [InlineData(5)] [InlineData(6)]
-    public void AmbiguousClosurePinsProcessAndDomainsUntilExactRecovery(int fault)
+    public void AmbiguousClosurePinsProcessAndDomainsWithoutAnOriginalResolutionContract(int fault)
     {
         var s = Create(); var binding = Bind(s).Value;
         s.Provider.ClosureFault = fault;
@@ -2044,23 +2757,22 @@ public sealed class SecureExecutionBindingTests
         Assert.Equal(0, s.Provider.SecureCloses);
         Assert.Equal(0, s.Provider.ChildCloses);
         s.Provider.ClosureFault = -1;
-        Assert.True(s.Kernel.CloseSecureExecution(binding).IsSuccess);
-        var calls = s.Provider.CloseCalls;
-        Assert.True(s.Kernel.CloseSecureExecution(binding).IsSuccess);
-        Assert.Equal(calls, s.Provider.CloseCalls);
-        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
-        Assert.Equal(new[] { "execution", "secure", "child" }, s.Provider.TerminalOrder);
+        Assert.False(s.Kernel.CloseSecureExecution(binding).IsSuccess);
+        Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(1, s.Provider.CloseCalls);
+        Assert.Empty(s.Provider.TerminalOrder);
     }
 
     [Fact]
-    public void AmbiguousAdmissionAndLostResponseRemainRecoverableByExactRequest()
+    public void AmbiguousAdmissionAndLostCloseResponseKeepTheOriginalRequestPinned()
     {
         var s = Create(); s.Provider.AdmissionFault = 5; s.Provider.ClosureFault = 0;
         Assert.False(Bind(s).IsSuccess);
         Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
         s.Provider.ClosureFault = -1;
-        Assert.True(s.Kernel.CloseSecureExecution(s.Provider.LastRequest.Binding).IsSuccess);
-        Assert.True(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.False(s.Kernel.CloseSecureExecution(s.Provider.LastRequest.Binding).IsSuccess);
+        Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
+        Assert.Equal(1, s.Provider.CloseCalls);
     }
 
     [Fact]
@@ -2206,15 +2918,17 @@ public sealed class SecureExecutionBindingTests
         Assert.False(s.Kernel.CloseGuestRegionMapping(s.Owner, s.Virtual.Domain, s.Virtual.MemoryCapability, guest.Mapping).IsSuccess);
         Assert.False(s.Kernel.TerminateProcess(s.Owner).IsSuccess);
         s.Provider.SecureRegionClosureFault = false;
-        Assert.True(s.Kernel.CloseSecureGuestRegion(overlay).IsSuccess);
+        Assert.False(s.Kernel.CloseSecureGuestRegion(overlay).IsSuccess);
         var terminalCloseCalls = s.Provider.OverlayCloseOrder.Count(item => item == "secure");
-        Assert.True(s.Kernel.CloseSecureGuestRegion(overlay).IsSuccess);
-        Assert.True(terminalCloseCalls >= 2);
+        Assert.False(s.Kernel.CloseSecureGuestRegion(overlay).IsSuccess);
+        Assert.Equal(1, terminalCloseCalls);
         Assert.Equal(terminalCloseCalls, s.Provider.OverlayCloseOrder.Count(item => item == "secure"));
     }
 
-    [Fact]
-    public async Task SecureVirtualizedType3BackedType2WorkloadPublishesEventBeforeExactClosure()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SecureVirtualizedType3BackedType2WorkloadPublishesEventBeforeExactClosure(bool waiterBeforePublication)
     {
         var s = Create();
         var process = s.Kernel.Processes.Resolve(s.Owner).Value!;
@@ -2288,6 +3002,10 @@ public sealed class SecureExecutionBindingTests
         var execution = service.SubmitVirtualized(s.Owner, plan, [candidate], context, subject, device,
             endpoint, fabric, 1, securityAuthority: new(bridge, security), securityPolicy: policy).Value!;
         var guestEvent = s.Kernel.CreateKernelEventEndpoint(s.Owner).Value!;
+        using var cancellation = new CancellationTokenSource();
+        var waiter = waiterBeforePublication
+            ? s.Kernel.WaitForKernelEventAsync(s.Owner, guestEvent, cancellation.Token).AsTask() : null;
+        if (waiter is not null) Assert.False(waiter.IsCompleted);
 
         Assert.Equal(KernelError.InvalidTransition, s.Kernel.PublishVirtualIoEvent(s.Owner, virtualIo,
             execution.Operation, s.Virtual.EventCapability, guestEvent).Error);
@@ -2297,8 +3015,13 @@ public sealed class SecureExecutionBindingTests
         Assert.True(completed.IsSuccess, completed.Message);
         Assert.Equal(ExternalOperationState.Released, completed.Value!.State);
         Assert.Equal(input.Span.ToArray(), output.Span.ToArray());
-        Assert.True((await s.Kernel.WaitForKernelEventAsync(s.Owner, guestEvent)).IsSuccess);
+        cancellation.Cancel(); // A committed original delivery belongs to its waiter even after cancellation.
+        var delivered = waiter is null ? await s.Kernel.WaitForKernelEventAsync(s.Owner, guestEvent) : await waiter;
+        Assert.True(delivered.IsSuccess, delivered.Message);
+        Assert.False(s.Kernel.ConsumeKernelEvent(s.Owner, guestEvent).IsSuccess);
         Assert.Equal(1, s.Provider.EventEffects);
+        Assert.All(s.Kernel.Regions.Snapshot().Where(r => r.Handle == input.Handle || r.Handle == output.Handle),
+            r => Assert.Equal(RegionState.Owned, r.State));
 
         Assert.True(s.Kernel.CloseVirtualIo(virtualIo).IsSuccess);
         Assert.True(s.Kernel.CloseSecureGuestRegion(inputSecure).IsSuccess);
@@ -2322,6 +3045,8 @@ public sealed class SecureExecutionBindingTests
         Assert.True(virtualClose.IsSuccess, virtualClose.Message);
         var finalTeardown = s.Kernel.TerminateProcess(s.Owner);
         Assert.True(finalTeardown.IsSuccess, finalTeardown.Message);
+        Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(r => r.Handle == input.Handle).State);
+        Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(r => r.Handle == output.Handle).State);
     }
 
     [Fact]
@@ -2975,10 +3700,18 @@ public sealed class SecureExecutionBindingTests
             return PlatformAuthorityResult<PlatformProviderVirtualIoLease>.Ok(new(new(_nextGuest++), new(1),
                 request.ChildLease, request.ParentDeviceLease, request.Profile));
         }
-        public PlatformAuthorityResult<PlatformVirtualIoClosureReceipt> RevokeVirtualIo(PlatformProviderVirtualIoLease lease) =>
-            PlatformAuthorityResult<PlatformVirtualIoClosureReceipt>.Ok(new(lease.LeaseId, lease.Generation,
+        public int VirtualIoCloseCalls;
+        public int VirtualIoClosureFault = -1;
+        public Action? DuringVirtualIoClose;
+        public PlatformAuthorityResult<PlatformVirtualIoClosureReceipt> RevokeVirtualIo(PlatformProviderVirtualIoLease lease)
+        {
+            CheckLocks?.Invoke(); VirtualIoCloseCalls++; DuringVirtualIoClose?.Invoke();
+            if (VirtualIoClosureFault == 0) return PlatformAuthorityResult<PlatformVirtualIoClosureReceipt>.Fail(PlatformAuthorityStatus.Unavailable, "unknown original Close");
+            if (VirtualIoClosureFault == 1) throw new OperationCanceledException("lost reply");
+            return PlatformAuthorityResult<PlatformVirtualIoClosureReceipt>.Ok(new(VirtualIoClosureFault == 3 ? new(999) : lease.LeaseId, lease.Generation,
                 lease.ChildLease.LeaseId, lease.ChildLease.Generation, lease.ChildLease.ParentDomainLease.LeaseId,
-                lease.ChildLease.ParentDomainLease.Generation, true));
+                lease.ChildLease.ParentDomainLease.Generation, VirtualIoClosureFault != 2));
+        }
         public PlatformAuthorityResult<PlatformProviderGuestRegionMappingLease> MapGuestRegion(PlatformGuestRegionMappingRequest request) =>
             PlatformAuthorityResult<PlatformProviderGuestRegionMappingLease>.Ok(new(new(_nextGuest++), new(1), request.ChildLease, request.ParentMapping.Lease, request.GuestRange, request.Access));
         public PlatformAuthorityResult<PlatformGuestRegionMappingClosureReceipt> UnmapGuestRegion(PlatformProviderGuestRegionMappingLease lease)

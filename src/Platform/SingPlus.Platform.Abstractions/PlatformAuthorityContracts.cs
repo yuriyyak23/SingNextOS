@@ -178,3 +178,8 @@ public interface IPlatformAuthorityProvider
         PlatformProviderRegionMappingLease mapping,
         PlatformRegionRevocationPolicy policy);
 }
+
+/// <summary>Optional guarantee: RevokeDomain NotAccepted proves zero effect of
+/// that invocation. It is admission evidence, never domain closure. Providers
+/// returning NotAccepted after a possible effect must not implement this contract.</summary>
+public interface IPlatformDomainRevocationNoEffectProvider : IPlatformAuthorityProvider { }

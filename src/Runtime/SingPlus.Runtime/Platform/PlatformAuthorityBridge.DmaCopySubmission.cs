@@ -172,7 +172,8 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDomainIdentity destinationSubject, ulong destinationMutationGeneration,
         Func<Func<KernelResult<PlatformDmaCopyPairSubmission>>, KernelResult<PlatformDmaCopyPairSubmission>> ownerCommit,
         ISemanticTraceSinkV1? sourceSink, ISemanticTraceSinkV1? destinationSink,
-        out DmaTraceObserver? sourceTrace, out DmaTraceObserver? destinationTrace)
+        out DmaTraceObserver? sourceTrace, out DmaTraceObserver? destinationTrace,
+        PlatformDmaCopyBacking? backing = null, Action? effectBoundary = null, Action? noEffectBoundary = null)
     {
         sourceTrace = destinationTrace = null;
         DmaTraceObserver? sourceObservation = null, destinationObservation = null;
@@ -185,6 +186,7 @@ public sealed partial class PlatformAuthorityBridge
         PlatformProviderDmaCopySubmitRequest request = default;
         PlatformDmaCopyPairSubmission pair = default;
         DmaSubmissionRecord? acceptedSource = null, acceptedDestination = null;
+        OriginalCopyInvocation? originalInvocation = null;
         lock (_secureDomainLifecycleGate)
         lock (_dsc1Gate)
         lock (_dmaCompletionGate)
@@ -208,6 +210,8 @@ public sealed partial class PlatformAuthorityBridge
             sourceState = source.Value!;
             destinationState = destination.Value!;
             provider = copyProvider;
+            if (backing is not null && (provider is not IPlatformDmaCopyBackingProvider || backing.Source.Length != sourceGrant.Range.Length || backing.Destination.Length != destinationGrant.Range.Length))
+                return Fail(KernelError.PlatformUnsupported,"DMA copy provider does not admit the exact reserved backing.");
             epoch = BackendEpoch;
             sourceRecord.SubmissionInFlight = destinationRecord.SubmissionInFlight = true;
         }
@@ -245,6 +249,16 @@ public sealed partial class PlatformAuthorityBridge
                         new(destinationRecord.ProviderGrant, destinationState.ProviderCycle), sourceBinding, destinationBinding);
                     var valid = PlatformDmaCopySubmissionContract.ValidateRequest(request);
                     if (!valid.IsSuccess) return Fail(KernelError.PlatformFaulted, valid.Message!);
+                    if (backing is not null && provider is IPlatformOriginalDmaCopyProvider)
+                    {
+                        if (sourceRecord.CopiesIssued == ulong.MaxValue || destinationRecord.CopiesIssued == ulong.MaxValue)
+                            return Fail(KernelError.CapacityExhausted,"Original copy history exhausted before effect.");
+                        sourceRecord.CopyHistory.EnsureCapacity(sourceRecord.CopyHistory.Count + 1); destinationRecord.CopyHistory.EnsureCapacity(destinationRecord.CopyHistory.Count + 1);
+                        originalInvocation = new(new(request,backing),sourceRecord,destinationRecord) { Epoch = epoch,SourceCycle = sourceState.Visibility,DestinationCycle = destinationState.Visibility };
+                        originalInvocation.EstablishSelf();
+                        sourceRecord.CopyHistory.Add(originalInvocation); destinationRecord.CopyHistory.Add(originalInvocation); sourceRecord.CopiesIssued++; destinationRecord.CopiesIssued++;
+                        sourceRecord.OriginalCopy = destinationRecord.OriginalCopy = originalInvocation;
+                    }
                     pair = new(LocalSubmission(sourceGrant, sourcePrepare), LocalSubmission(destinationGrant, destinationPrepare),
                         sourceBinding with { EffectState = DmaEffectStateV1.EffectPossible },
                         destinationBinding with { EffectState = DmaEffectStateV1.EffectPossible });
@@ -252,8 +266,28 @@ public sealed partial class PlatformAuthorityBridge
                 }
             });
             if (!admission.IsSuccess) return admission;
+            effectBoundary?.Invoke(); // Trusted runtime retention, outside commit locks.
             invoked = true;
-            var reply = provider.SubmitDmaCopy(request); // Provider effect boundary.
+            PlatformAuthorityResult<PlatformProviderDmaCopySubmission> reply;
+            if (originalInvocation is { } original && provider is IPlatformOriginalDmaCopyProvider originalProvider)
+            {
+                original.Invoked = true;
+                try { reply = originalProvider.SubmitDmaCopy(original.Request); }
+                catch (Exception exception) when (exception is not StackOverflowException)
+                { reply = PlatformAuthorityResult<PlatformProviderDmaCopySubmission>.Fail(PlatformAuthorityStatus.Faulted,"Original copy reply lost."); }
+                original.Raw = reply; // Retain before pure lookup/source callbacks.
+                if (!reply.IsSuccess && reply.Status == PlatformAuthorityStatus.Faulted)
+                {
+                    var resolution = originalProvider.ResolveDmaCopy(original.Request);
+                    original.Resolution = resolution;
+                    if (resolution.IsSuccess && ReferenceEquals(resolution.Value.Request,original.Request) &&
+                        resolution.Value.NoEffectGuaranteed != resolution.Value.Submission.HasValue)
+                        reply = resolution.Value.NoEffectGuaranteed ? PlatformAuthorityResult<PlatformProviderDmaCopySubmission>.Fail(PlatformAuthorityStatus.NotAccepted,"Exact original copy no-effect.") :
+                            PlatformAuthorityResult<PlatformProviderDmaCopySubmission>.Ok(resolution.Value.Submission!.Value);
+                }
+            }
+            else reply = backing is null ? provider.SubmitDmaCopy(request) :
+                ((IPlatformDmaCopyBackingProvider)provider).SubmitDmaCopy(request,backing); // Provider effect boundary.
             if (!reply.IsSuccess)
             {
                 var refusedSource = CurrentProviderIncarnation();
@@ -268,6 +302,7 @@ public sealed partial class PlatformAuthorityBridge
                     }
                     if (reply.Status != PlatformAuthorityStatus.NotAccepted) PinBoth();
                 }
+                if (reply.Status == PlatformAuthorityStatus.NotAccepted) noEffectBoundary?.Invoke();
                 return FromProviderFailure<PlatformDmaCopyPairSubmission>(reply.Status, reply.Message);
             }
             var providerSubmission = reply.Value!;
@@ -284,6 +319,8 @@ public sealed partial class PlatformAuthorityBridge
                     providerSubmission.CopySubmissionId, providerSubmission.Generation);
                 acceptedDestination = new(pair.Destination, providerSubmission.DestinationSubmission, pair.DestinationBinding,
                     providerSubmission.CopySubmissionId, providerSubmission.Generation);
+                acceptedSource.EstablishSelf(); acceptedDestination.EstablishSelf();
+                if (originalInvocation is { } acceptedOriginal) { acceptedOriginal.AcceptedSource = acceptedSource; acceptedOriginal.AcceptedDestination = acceptedDestination; }
                 _activeDmaSubmissions.Add(sourceGrant.GrantId, acceptedSource);
                 _activeDmaSubmissions.Add(destinationGrant.GrantId, acceptedDestination);
                 sourceRecord.CopySubmissionId = destinationRecord.CopySubmissionId = providerSubmission.CopySubmissionId;
@@ -305,6 +342,7 @@ public sealed partial class PlatformAuthorityBridge
                 lock (_dmaCompletionGate)
                 {
                     var exact = ValidateOriginal(observed, true);
+                    if (exact.IsSuccess && originalInvocation is { } publishedOriginal) publishedOriginal.Published = true;
                     return exact.IsSuccess ? KernelResult<PlatformDmaCopyPairSubmission>.Ok(pair) : Fail(exact.Error, exact.Message!);
                 }
             });
@@ -373,6 +411,10 @@ public sealed partial class PlatformAuthorityBridge
         }
         void PinBoth()
         {
+            if (originalInvocation is { Invoked: true } original &&
+                (acceptedSource is null && acceptedDestination is null || ReferenceEquals(original.AcceptedSource,acceptedSource) && ReferenceEquals(original.AcceptedDestination,acceptedDestination)) &&
+                BackendEpoch == epoch && sourceRecord.SourceRevision == original.SourceRevision && destinationRecord.SourceRevision == original.DestinationRevision)
+            { original.Uncertain = true; return; }
             _dmaSubmissionFaultPins.Add(sourceGrant.GrantId);
             _dmaSubmissionFaultPins.Add(destinationGrant.GrantId);
         }

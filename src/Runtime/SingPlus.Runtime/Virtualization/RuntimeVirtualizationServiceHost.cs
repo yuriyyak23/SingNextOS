@@ -38,6 +38,13 @@ public sealed class RuntimeVirtualizationServiceHost
         if (received.Value.CancellationRequested)
             return SettlePreAcceptanceCancellation(invocation);
 
+        var inputAdmission = _kernel.ValidateSessionVirtualIoInput(_caller, request.MessageId, request.Payload);
+        if (!inputAdmission.IsSuccess)
+        {
+            var cancelled = _kernel.CancelSessionResponse(_service, invocation);
+            return cancelled.IsSuccess ? inputAdmission : KernelResult.Fail(cancelled.Error, cancelled.Message!);
+        }
+
         var accepted = _kernel.AcceptSessionInvocation(
             _service,
             invocation,
@@ -67,7 +74,7 @@ public sealed class RuntimeVirtualizationServiceHost
                 operation = _kernel.ConfigureVirtualDomain(_caller, configure.Domain, configure.Capability);
                 break;
             case IVirtualizationServiceProtocol.Message_MapGuestRegionAsync when request.Payload is MapGuestRegionRequest map:
-                var mapped = _kernel.MapGuestRegion(_caller, map.Domain, map.MemoryCapability, map.RegionCapability, map.Region, map.GuestRange, map.Access);
+                var mapped = _kernel.MapGuestRegion(_caller, map.Domain, map.MemoryCapability, map.RegionCapability, map.Region, map.GuestRange, map.Access, map.MaximumPrivateExecutableDataBytes);
                 operation = mapped.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(mapped.Error, mapped.Message!);
                 if (mapped.IsSuccess) response = new GuestRegionMappingResponse(mapped.Value!);
                 break;
@@ -120,6 +127,19 @@ public sealed class RuntimeVirtualizationServiceHost
                 operation = _kernel.BindVirtualDomainExecutable(_caller, artifact.Domain,
                     artifact.ExecuteCapability, artifact.Mapping, artifact.ImmutablePackage.ToArray(),
                     artifact.MaximumExecutionSteps);
+                break;
+            case IVirtualizationServiceProtocol.Message_TransferIoAsync when request.Payload is TransferVirtualIoRequest transfer:
+                var transferred=_kernel.TransferSessionVirtualIo(_caller,invocation,transfer);
+                operation=transferred.IsSuccess?KernelResult.Ok():KernelResult.Fail(transferred.Error,transferred.Message!);
+                if(transferred.IsSuccess)response=transferred.Value;
+                break;
+            case IVirtualizationServiceProtocol.Message_BindIoAsync when request.Payload is BindVirtualIoRequest bindIo:
+                var boundIo=_kernel.BindSessionVirtualIo(_caller,bindIo);
+                operation=boundIo.IsSuccess?KernelResult.Ok():KernelResult.Fail(boundIo.Error,boundIo.Message!);
+                if(boundIo.IsSuccess)response=boundIo.Value;
+                break;
+            case IVirtualizationServiceProtocol.Message_CloseIoAsync when request.Payload is CloseVirtualIoRequest closeIo:
+                operation=_kernel.CloseSessionVirtualIo(_caller,closeIo);
                 break;
             default:
                 operation = KernelResult.Fail(KernelError.UnsupportedPayload, "VirtualizationService received an unknown message or payload shape.");

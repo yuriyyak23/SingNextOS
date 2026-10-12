@@ -3,7 +3,7 @@ using YAKSys_Hybrid_CPU.Core;
 
 namespace SingPlus.Platform.HybridCpu.Tests;
 
-public sealed class ChildClosureTupleTests
+public sealed partial class ChildClosureTupleTests
 {
     [Theory]
     [InlineData(false)][InlineData(true)]
@@ -11,7 +11,7 @@ public sealed class ChildClosureTupleTests
     {
         var runtime = new ClosureProvider();
         var provider = new HybridCpuPlatformAuthorityProvider(new NeutralDomainRuntimeFacade(), runtime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         const PlatformChildAuthorityClass rights = PlatformChildAuthorityClass.Lifecycle | PlatformChildAuthorityClass.GuestMemory;
         var child = provider.CreateChildDomain(parent, new(new(1, 4096), new(rights, rights))).Value!;
         PlatformProviderGuestRegionMappingLease mapping = default!;
@@ -48,7 +48,7 @@ public sealed class ChildClosureTupleTests
         var proxy = (RootCloseRuntimeProxy)(object)neutral;
         var runtime = new ClosureProvider();
         var provider = new HybridCpuPlatformAuthorityProvider(neutral, runtime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         const PlatformChildAuthorityClass rights = PlatformChildAuthorityClass.Lifecycle;
         var child = provider.CreateChildDomain(parent, new(new(1, 4096), new(rights, rights))).Value!;
         var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
@@ -151,7 +151,7 @@ public sealed class ChildClosureTupleTests
         var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, RootCloseRuntimeProxy>();
         var proxy = (RootCloseRuntimeProxy)(object)runtime;
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         var region = new PlatformRegionIdentity(new RegionHandle(new RegionId(9), new RegionGeneration(4)),
             new RegionOwner(parent.Subject.DomainId, parent.Subject.ProcessGeneration), 4096);
         var mapped = provider.MapOwnedRegionSlice(parent, new(region, 0, 4096, PlatformMemoryAccess.Read)).Value!;
@@ -213,7 +213,7 @@ public sealed class ChildClosureTupleTests
         var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, RootCloseRuntimeProxy>();
         var proxy = (RootCloseRuntimeProxy)(object)runtime;
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         var region = new PlatformRegionIdentity(new RegionHandle(new RegionId(9), new RegionGeneration(4)),
             new RegionOwner(parent.Subject.DomainId, parent.Subject.ProcessGeneration), 4096);
         var mapping = provider.MapOwnedRegionSlice(parent, new(region, 0, 4096, PlatformMemoryAccess.Read)).Value!.Lease;
@@ -237,7 +237,7 @@ public sealed class ChildClosureTupleTests
         var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, RootCloseRuntimeProxy>();
         var proxy = (RootCloseRuntimeProxy)(object)runtime;
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         var region = new PlatformRegionIdentity(new RegionHandle(new RegionId(9), new RegionGeneration(4)),
             new RegionOwner(parent.Subject.DomainId, parent.Subject.ProcessGeneration), 4096);
         var mapping = provider.MapOwnedRegionSlice(parent, new(region, 0, 4096, PlatformMemoryAccess.Read)).Value!.Lease;
@@ -293,7 +293,7 @@ public sealed class ChildClosureTupleTests
         var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, RootCloseRuntimeProxy>();
         var proxy = (RootCloseRuntimeProxy)(object)runtime;
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         var region = new PlatformRegionIdentity(new RegionHandle(new RegionId(9), new RegionGeneration(4)),
             new RegionOwner(parent.Subject.DomainId, parent.Subject.ProcessGeneration), 4096);
         var slice = new PlatformRegionSlice(region, 0, 4096, PlatformMemoryAccess.Read);
@@ -357,7 +357,7 @@ public sealed class ChildClosureTupleTests
         var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, RootCloseRuntimeProxy>();
         var proxy = (RootCloseRuntimeProxy)(object)runtime;
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
         provider.GetType().GetField("_nextProviderMappingId", flags)!.SetValue(provider, capacity);
         var region = new PlatformRegionIdentity(new RegionHandle(new RegionId(9), new RegionGeneration(4)),
@@ -381,7 +381,7 @@ public sealed class ChildClosureTupleTests
         var proxy = (RootCloseRuntimeProxy)(object)rootRuntime;
         var children = new ClosureProvider();
         var provider = new HybridCpuPlatformAuthorityProvider(rootRuntime, children);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         const PlatformChildAuthorityClass rights = PlatformChildAuthorityClass.Lifecycle;
         var intent = new PlatformChildDomainIntent(new(1, 4096), new(rights, rights));
         var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
@@ -745,7 +745,7 @@ public sealed class ChildClosureTupleTests
     {
         var runtime = new ClosureProvider { CreateFault = outcome };
         var provider = new HybridCpuPlatformAuthorityProvider(new NeutralDomainRuntimeFacade(), runtime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         const PlatformChildAuthorityClass rights = PlatformChildAuthorityClass.Lifecycle;
         var intent = new PlatformChildDomainIntent(new(1, 4096), new(rights, rights));
         using var entered = new ManualResetEventSlim();
@@ -791,7 +791,7 @@ public sealed class ChildClosureTupleTests
     {
         var childRuntime = new ClosureProvider { Fault = fault };
         var provider = new HybridCpuPlatformAuthorityProvider(new NeutralDomainRuntimeFacade(), childRuntime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7)));
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7)));
         Assert.True(parent.IsSuccess);
         const PlatformChildAuthorityClass authority = PlatformChildAuthorityClass.Lifecycle;
         var created = provider.CreateChildDomain(parent.Value!, new(new(1, 4096), new(authority, authority)));
@@ -1124,7 +1124,7 @@ public sealed class ChildClosureTupleTests
             Assert.Equal(1, runtime.ActiveOwnedRegionMappingCount);
             Assert.Equal(PlatformAuthorityStatus.Denied, provider.RevokeDomain(parent).Status);
             Assert.Equal(1, runtime.ActiveBindingCount);
-            var independent = provider.BindDomain(new(new DomainId(20), new ProcessHandle(new ProcessId(22), 1))).Value!;
+            var independent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(20), new ProcessHandle(new ProcessId(22), 1))).Value!;
             Assert.True(provider.RevokeDomain(independent).IsSuccess);
             Assert.Equal(1, runtime.ActiveBindingCount);
         }
@@ -1135,7 +1135,7 @@ public sealed class ChildClosureTupleTests
     {
         var childRuntime = new ClosureProvider();
         var provider = new HybridCpuPlatformAuthorityProvider(new NeutralDomainRuntimeFacade(), childRuntime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         const PlatformChildAuthorityClass authority = PlatformChildAuthorityClass.Lifecycle;
         var child = provider.CreateChildDomain(parent, new(new(1, 4096), new(authority, authority))).Value!;
         childRuntime.BeforeClose = () =>
@@ -1355,7 +1355,9 @@ public sealed class ChildClosureTupleTests
         var artifacts = (global::System.Collections.IDictionary)provider.GetType().GetField("_providerArtifacts", flags)!.GetValue(provider)!;
         var fact = artifacts[artifact.ArtifactId]!;
         Assert.False((bool)fact.GetType().GetProperty("ExecutionInFlight")!.GetValue(fact)!);
-        Assert.Equal(fault != "not-invoked", fact.GetType().GetProperty("OriginalExecution")!.GetValue(fact) is not null);
+        var retainedStart = fact.GetType().GetProperty("OriginalExecution")!.GetValue(fact)!;
+        Assert.NotNull(retainedStart);
+        Assert.Equal(fault == "not-invoked", (bool)retainedStart.GetType().GetProperty("NoEffectConsumed")!.GetValue(retainedStart)!);
         Assert.False(provider.StartExecutableArtifact(request).IsSuccess);
         Assert.Equal(fault == "not-invoked" ? 2 : 1, runtime.StartCalls);
         if (fault is not ("not-invoked" or "exact" or "reentry"))
@@ -1377,7 +1379,7 @@ public sealed class ChildClosureTupleTests
     {
         var runtime = new ClosureProvider();
         var provider = new HybridCpuPlatformAuthorityProvider(new NeutralDomainRuntimeFacade(), runtime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         const PlatformChildAuthorityClass rights = PlatformChildAuthorityClass.Lifecycle;
         var intent = new PlatformChildDomainIntent(new(1, 4096), new(rights, rights));
         var prior = provider.CreateChildDomain(parent, intent).Value!;
@@ -1414,7 +1416,7 @@ public sealed class ChildClosureTupleTests
     {
         var runtime = new ClosureProvider { CreateFault = fault };
         var provider = new HybridCpuPlatformAuthorityProvider(new NeutralDomainRuntimeFacade(), runtime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         const PlatformChildAuthorityClass rights = PlatformChildAuthorityClass.Lifecycle;
         var intent = new PlatformChildDomainIntent(new(1, 4096), new(rights, rights));
         runtime.BeforeCreate = () =>
@@ -1519,7 +1521,7 @@ public sealed class ChildClosureTupleTests
     {
         var runtime = new ClosureProvider { TransitionFault = fault, Fault = fault };
         var provider = new HybridCpuPlatformAuthorityProvider(new NeutralDomainRuntimeFacade(), runtime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         const PlatformChildAuthorityClass rights = PlatformChildAuthorityClass.Lifecycle | PlatformChildAuthorityClass.GuestMemory;
         var child = provider.CreateChildDomain(parent, new(new(1, 4096), new(rights, rights))).Value!;
         var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
@@ -1577,7 +1579,7 @@ public sealed class ChildClosureTupleTests
     {
         var runtime = new ClosureProvider();
         var provider = new HybridCpuPlatformAuthorityProvider(new NeutralDomainRuntimeFacade(), runtime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         const PlatformChildAuthorityClass rights = PlatformChildAuthorityClass.Lifecycle | PlatformChildAuthorityClass.GuestMemory;
         var child = provider.CreateChildDomain(parent, new(new(1, 4096), new(rights, rights))).Value!;
         var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
@@ -1606,7 +1608,7 @@ public sealed class ChildClosureTupleTests
         var runtime = new ClosureProvider { MapFault = fault, TransitionFault = fault };
         var neutral = new NeutralDomainRuntimeFacade();
         var provider = new HybridCpuPlatformAuthorityProvider(neutral, runtime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         const PlatformChildAuthorityClass rights = PlatformChildAuthorityClass.Lifecycle | PlatformChildAuthorityClass.GuestMemory;
         var child = provider.CreateChildDomain(parent, new(new(1, 4096), new(rights, rights))).Value!;
         var region = new PlatformRegionIdentity(new RegionHandle(new RegionId(9), new RegionGeneration(4)),
@@ -1687,7 +1689,7 @@ public sealed class ChildClosureTupleTests
         var runtime = new ClosureProvider();
         var neutral = new NeutralDomainRuntimeFacade();
         var provider = new HybridCpuPlatformAuthorityProvider(neutral, runtime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         const PlatformChildAuthorityClass rights = PlatformChildAuthorityClass.Lifecycle | PlatformChildAuthorityClass.GuestMemory;
         var child = provider.CreateChildDomain(parent, new(new(1, 4096), new(rights, rights))).Value!;
         var region = new PlatformRegionIdentity(new RegionHandle(new RegionId(9), new RegionGeneration(4)),
@@ -1763,7 +1765,7 @@ public sealed class ChildClosureTupleTests
         var runtime = new ClosureProvider { StartFault = "exact" };
         var neutral = new NeutralDomainRuntimeFacade();
         var provider = new HybridCpuPlatformAuthorityProvider(neutral, runtime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         const PlatformChildAuthorityClass rights = PlatformChildAuthorityClass.Lifecycle | PlatformChildAuthorityClass.GuestMemory | PlatformChildAuthorityClass.Execution;
         var child = provider.CreateChildDomain(parent, new(new(1, 4096), new(rights, rights))).Value!;
         var region = new PlatformRegionIdentity(new RegionHandle(new RegionId(9), new RegionGeneration(4)),
@@ -1835,7 +1837,7 @@ public sealed class ChildClosureTupleTests
     {
         var runtime = new ClosureProvider();
         var provider = new HybridCpuPlatformAuthorityProvider(new NeutralDomainRuntimeFacade(), runtime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         const PlatformChildAuthorityClass rights = PlatformChildAuthorityClass.Lifecycle | PlatformChildAuthorityClass.GuestMemory | PlatformChildAuthorityClass.Execution;
         var child = provider.CreateChildDomain(parent, new(new(1, 4096), new(rights, rights))).Value!;
         var region = new PlatformRegionIdentity(new RegionHandle(new RegionId(9), new RegionGeneration(4)),
@@ -1893,8 +1895,30 @@ public sealed class ChildClosureTupleTests
         original.GetType().GetProperty("Revoked")!.SetValue(original, true);
     }
 
-    private sealed class ClosureProvider : INeutralChildDomainProvider, INeutralGuestMemoryProvider, INeutralChildExecutionProvider
+    private sealed class ClosureProvider : INeutralChildDomainProvider, INeutralGuestMemoryProvider, INeutralChildExecutionProvider, INeutralVirtualIoProvider
     {
+        public int IoBinds { get; private set; }
+        public int IoCloses { get; private set; }
+        public Action? BeforeIoBind { get; set; }
+        public Action? AfterIoClose { get; set; }
+        public string? IoFault { get; set; }
+        public NeutralVirtualizationResult<NeutralVirtualIoLease> BindVirtualIo(NeutralVirtualIoRequest request)
+        {
+            IoBinds++;
+            BeforeIoBind?.Invoke();
+            if (IoFault == "bind-throw") throw new IOException("I/O reply lost");
+            return new(NeutralVirtualizationStatus.Success, new(request.ChildLease, request.ParentDeviceLease, request.Profile, new((ulong)IoBinds), new(1)), string.Empty);
+        }
+        public NeutralVirtualizationResult<NeutralVirtualIoCloseReceipt> CloseVirtualIo(NeutralVirtualIoLease lease)
+        {
+            IoCloses++;
+            AfterIoClose?.Invoke();
+            if (IoFault == "close-throw") throw new IOException("I/O Close reply lost");
+            var receipt = new NeutralVirtualIoCloseReceipt(lease.Handle, lease.Epoch, lease.ChildLease.Handle, lease.ChildLease.Epoch,
+                lease.ChildLease.ParentLease.Handle, lease.ChildLease.ParentLease.Epoch, true);
+            if (IoFault == "close-foreign") receipt = receipt with { IoHandle = new(999) };
+            return new(NeutralVirtualizationStatus.Success, receipt, string.Empty);
+        }
         public string? Fault { get; set; }
         public int CloseCalls { get; private set; }
         public int TransitionCalls { get; private set; }

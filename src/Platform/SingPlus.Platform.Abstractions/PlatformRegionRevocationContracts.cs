@@ -68,3 +68,33 @@ public interface IPlatformRegionRevocationProvider : IPlatformCompletionProvider
         PlatformProviderRegionMappingLease mapping,
         PlatformRegionRevocationPolicy policy);
 }
+
+/// <summary>Optional guarantee: every Begin overload returns NotAccepted only
+/// with proven zero effect of that invocation and a default ticket. This permits
+/// no-effect intent consumption, never closure or quantitative release. V1
+/// providers without this guarantee retain conservative unknown-outcome semantics.</summary>
+public interface IPlatformRegionRevocationNoEffectProvider : IPlatformRegionRevocationProvider { }
+
+public readonly record struct PlatformRegionRevocationRequest(
+    Guid InvocationId,
+    PlatformProviderRegionMappingLease Mapping,
+    PlatformRegionRevocationPolicy Policy);
+
+public readonly record struct PlatformRegionRevocationResolution(
+    PlatformRegionRevocationRequest Request,
+    PlatformRegionRevocationTicket Ticket);
+
+/// <summary>
+/// Optional surviving-original response resolution. Resolve never submits or
+/// repeats a revoke and never treats absence as closure. Success requires the
+/// exact original request and retained, proven closure at its original owner.
+/// Unknown underlying outcomes and lost original owners remain unresolved.
+/// </summary>
+public interface IPlatformRegionRevocationResolutionProvider : IPlatformRegionRevocationProvider
+{
+    PlatformAuthorityResult<PlatformRegionRevocationTicket> BeginRegionMappingRevocation(
+        PlatformRegionRevocationRequest request);
+
+    PlatformAuthorityResult<PlatformRegionRevocationResolution> ResolveRegionMappingRevocation(
+        PlatformRegionRevocationRequest request);
+}

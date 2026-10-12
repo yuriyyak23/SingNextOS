@@ -3,7 +3,7 @@ using SingPlus.Contracts;
 namespace SingPlus.Runtime;
 
 /// <summary>Single accounting ledger. Reservations admit capacity but never authorize effects.</summary>
-public sealed class ResourceBudgetAuthority
+public sealed partial class ResourceBudgetAuthority
 {
     private sealed class AccountRecord
     {
@@ -42,6 +42,8 @@ public sealed class ResourceBudgetAuthority
         public DomainId OriginalRegionDomain { get; set; }
         public object? OriginalRegionOwner { get; set; }
         public bool RegionLifetimeBound { get; set; }
+        public object? OriginalVirtualIoOwner { get; set; }
+        public object? OriginalLocalGuestOwner { get; init; }
         public ChannelId? OriginalIpcChannel { get; set; }
         public ulong OriginalIpcSequence { get; set; }
         public ProcessHandle OriginalIpcReceiver { get; set; }
@@ -340,7 +342,7 @@ public sealed class ResourceBudgetAuthority
             var resolved = ResolveReservation(owner, reservation);
             if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
             var record = resolved.Value!;
-            if (!record.RuntimeAttached || record.Lifetime != BudgetReservationLifetime.LocalResource ||
+            if (!record.RuntimeAttached || record.Lifetime != BudgetReservationLifetime.LocalResource || record.OriginalVirtualIoOwner is not null ||
                 record.OriginalRegion is { } prior && (prior != region ||
                     !ReferenceEquals(record.OriginalRegionOwner, regionOwner)))
                 return KernelResult.Fail(KernelError.PlatformFaulted, "Original Region charge lifetime cannot be replaced.");
@@ -363,6 +365,22 @@ public sealed class ResourceBudgetAuthority
                     (record.Owner == process || record.OriginalRegionDomain == domain))
                 .Select(record => (record.OriginalRegion, record.OriginalRegionOwner, record.Owner, record.Handle))
                 .ToArray();
+    }
+
+    internal KernelResult ValidateOriginalPrivateDataQuota(ProcessHandle owner, object? original, object mappingOwner, bool expected, ulong quota)
+    {
+        lock (_gate)
+        {
+            if (!expected && original is null) return ValidateMappingReservationPublicationLocked(owner, null);
+            if (quota == 0 || original is not ReservationRecord record || record.Owner != owner ||
+                !ReferenceEquals(record.OriginalMappingOwner, mappingOwner) ||
+                record.Amounts.Where(amount => amount.Dimension == ServiceBudgetDimension.OwnedMemoryBytes).Sum(amount => checked((decimal)amount.Amount)) != quota)
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Private executable data quota lacks its exact original quantitative admission.");
+            var resolved = ResolveReservation(owner, record.Handle);
+            if (!resolved.IsSuccess || !ReferenceEquals(resolved.Value, record))
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Private executable data charge owner/history changed.");
+            return ValidateMappingReservationPublicationLocked(owner, record.Handle);
+        }
     }
 
     internal object? CaptureOriginalMappingReservationOwner(ProcessHandle owner, BudgetReservationHandle? reservation)
@@ -517,10 +535,37 @@ public sealed class ResourceBudgetAuthority
         ProcessHandle owner,
         BudgetReservationHandle reservation) => ReleaseCore(owner, reservation, runtimeConsumer: false);
 
+    internal KernelResult<object> BindOriginalVirtualIoCharge(ProcessHandle owner, BudgetReservationHandle reservation, object ioOwner)
+    {
+        lock (_gate)
+        {
+            var resolved = ResolveReservation(owner, reservation);
+            if (!resolved.IsSuccess) return KernelResult<object>.Fail(resolved.Error, resolved.Message!);
+            var record = resolved.Value!;
+            if (!record.RuntimeAttached || record.Lifetime != BudgetReservationLifetime.LocalResource || record.OriginalRegionOwner is not null || record.OriginalQueuedLifetime is not null ||
+                record.OriginalVirtualIoOwner is not null && !ReferenceEquals(record.OriginalVirtualIoOwner, ioOwner))
+                return KernelResult<object>.Fail(KernelError.PlatformFaulted, "Original I/O charge cannot change resource owner.");
+            record.OriginalVirtualIoOwner = ioOwner;
+            return KernelResult<object>.Ok(record);
+        }
+    }
+    internal KernelResult ConsumeOriginalVirtualIoCharge(ProcessHandle owner, BudgetReservationHandle reservation, object ioOwner, object? chargeOwner)
+    {
+        lock (_gate)
+        {
+            var resolved = ResolveReservation(owner, reservation);
+            if (!resolved.IsSuccess || !ReferenceEquals(resolved.Value, chargeOwner) || !ReferenceEquals(resolved.Value!.OriginalVirtualIoOwner, ioOwner))
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Original I/O quantitative owner/history is absent or changed.");
+            var released = ReleaseCore(owner, reservation, runtimeConsumer: true, virtualIoOwner: ioOwner);
+            return released.IsSuccess && released.Value!.State == BudgetReservationState.Released ? KernelResult.Ok() :
+                KernelResult.Fail(released.IsSuccess ? KernelError.PlatformFaulted : released.Error, released.Message ?? "Original I/O charge remains pinned.");
+        }
+    }
+
     private KernelResult<BudgetReservationSnapshot> ReleaseCore(
         ProcessHandle owner,
         BudgetReservationHandle reservation,
-        bool runtimeConsumer)
+        bool runtimeConsumer, object? virtualIoOwner = null, object? localGuestOwner = null)
     {
         lock (_gate)
         {
@@ -541,6 +586,10 @@ public sealed class ResourceBudgetAuthority
             if (record.RuntimeAttached && !runtimeConsumer)
                 return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.InvalidTransition,
                     "Runtime-attached capacity requires its existing resource release consumer.");
+            if (record.OriginalVirtualIoOwner is not null && !ReferenceEquals(record.OriginalVirtualIoOwner, virtualIoOwner))
+                return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.InvalidTransition, "Original I/O backing requires its exact closure consumer.");
+            if (record.OriginalLocalGuestOwner is not null && !ReferenceEquals(record.OriginalLocalGuestOwner, localGuestOwner))
+                return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.InvalidTransition, "Original local guest charge requires its exact VDA closure consumer.");
             if (record.State is BudgetReservationState.Consuming or BudgetReservationState.Quarantined or BudgetReservationState.Reconciled or BudgetReservationState.Settling)
                 return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.InvalidTransition, "A possibly consumed lease requires settlement or reconciliation, not release.");
 
@@ -943,7 +992,7 @@ public sealed class ResourceBudgetAuthority
         IReadOnlyList<BudgetAmount> amounts,
         BudgetReservationLifetime lifetime,
         AdmissionQosHint qosHint,
-        bool runtimeAttached = false)
+        bool runtimeAttached = false, VirtualDomainAuthority.LocalGuestLifetime? localGuestLifetime = null)
     {
         if (!Enum.IsDefined(lifetime) || !Enum.IsDefined(qosHint))
             return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.InvalidMessage, "Budget lifetime or QoS hint is invalid.");
@@ -975,8 +1024,14 @@ public sealed class ResourceBudgetAuthority
             Lifetime = lifetime,
             QosHint = qosHint,
             RuntimeAttached = runtimeAttached,
+            OriginalLocalGuestOwner = localGuestLifetime,
             State = BudgetReservationState.Active,
         };
+        if (localGuestLifetime is not null)
+        {
+            localGuestLifetime.Reservation = handle;
+            localGuestLifetime.ChargeOwner = record;
+        }
         foreach (var ancestor in chain)
         foreach (var amount in amounts)
             ancestor.Used[amount.Dimension] += amount.Amount;

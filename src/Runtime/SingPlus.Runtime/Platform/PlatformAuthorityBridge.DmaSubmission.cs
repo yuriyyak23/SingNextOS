@@ -26,6 +26,10 @@ public sealed partial class PlatformAuthorityBridge
         PlatformProviderDmaCopySubmissionId? copySubmissionId = null,
         PlatformProviderDmaCopySubmissionGeneration? copyGeneration = null)
     {
+        public DmaSubmissionRecord? OwnerSelf { get; private set; }
+        public void EstablishSelf() => OwnerSelf = this;
+        public bool OriginalCompletionLookupInvoked { get; set; }
+        public PlatformAuthorityResult<PlatformProviderDmaCompletionEvidence>? RawCompletion { get; set; }
         public PlatformDmaSubmission Submission { get; } = submission;
         public PlatformProviderDmaSubmission ProviderSubmission { get; } = providerSubmission;
         public DmaExecutionBindingV1? SemanticBinding { get; } = semanticBinding;
@@ -430,7 +434,9 @@ public sealed partial class PlatformAuthorityBridge
     internal bool HasFaultPinnedDmaSubmission(PlatformDmaGrantId grantId)
     {
         lock (_dmaCompletionGate)
-            return _dmaSubmissionFaultPins.Contains(grantId);
+            return _dmaSubmissionFaultPins.Contains(grantId) || _dmaGrants.TryGetValue(grantId,out var grant) &&
+                ((ulong)grant.CopyHistory.Count != grant.CopiesIssued || grant.CopyHistory.Any(copy => !ReferenceEquals(copy.OwnerSelf,copy)) ||
+                 grant.CopiesIssued != 0 && grant.OriginalCopy is null || grant.OriginalCopy is { Uncertain: true });
     }
 
     private ulong NextLocalDmaOperationId()

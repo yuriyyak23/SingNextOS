@@ -42,9 +42,16 @@ public sealed partial class PlatformAuthorityBridge
         CapabilityId authorityCapabilityId,
         PlatformRegionSlice slice,
         bool retainFaultedHandleOnMalformed,
-        out bool retainReservation)
+        out bool retainReservation) => MapOwnedRegionSlice(binding, expectedSubject, authorityCapabilityId, slice,
+            retainFaultedHandleOnMalformed, out retainReservation, out _);
+
+    internal KernelResult<PlatformOwnedRegionSliceMapping> MapOwnedRegionSlice(
+        PlatformDomainBinding binding, PlatformDomainIdentity expectedSubject, CapabilityId authorityCapabilityId,
+        PlatformRegionSlice slice, bool retainFaultedHandleOnMalformed, out bool retainReservation,
+        out PlatformRegionMapping? faultedMapping)
     {
         retainReservation = false;
+        faultedMapping = null;
         var bindingValidation = ValidateDomain(binding, expectedSubject);
         if (!bindingValidation.IsSuccess)
         {
@@ -101,6 +108,8 @@ public sealed partial class PlatformAuthorityBridge
             return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(KernelError.PlatformFaulted,
                 "The exact mapping provider returned an invalid zero runtime incarnation.");
         PlatformRegionMappingId mappingIdentity;
+        PlatformOwnedRegionMapRequest? originalRequest = mappingProvider is IPlatformOriginalAdmissionResolutionProvider
+            ? new(Guid.NewGuid(), domainRecord.ProviderLease, slice) : null;
         lock (_secureDomainLifecycleGate)
         {
             var originalSource = ValidateRootCleanupSourceLocked(domainRecord, binding, expectedSubject,
@@ -121,7 +130,8 @@ public sealed partial class PlatformAuthorityBridge
         try
         {
         PlatformAuthorityResult<PlatformProviderOwnedRegionMapping> providerResult;
-        try { providerResult = mappingProvider.MapOwnedRegionSlice(domainRecord.ProviderLease, slice); }
+        try { providerResult = originalRequest is { } request && mappingProvider is IPlatformOriginalAdmissionResolutionProvider capable
+                ? capable.MapOwnedRegionSlice(request) : mappingProvider.MapOwnedRegionSlice(domainRecord.ProviderLease, slice); }
         catch (Exception exception) when (exception is not StackOverflowException)
         {
             lock (_secureDomainLifecycleGate)
@@ -131,10 +141,12 @@ public sealed partial class PlatformAuthorityBridge
                 var unresolved = new PlatformRegionMapping(
                     mappingIdentity,
                     new PlatformRegionMappingGeneration(1), binding, slice.Region.Handle, slice.Access);
+                faultedMapping = unresolved;
                 AddOriginalMappingRecordLocked(domainRecord, unresolved.MappingId,
                     new MappingRecord(unresolved, default, authorityCapabilityId,
                         providerIncarnation, backendEpoch)
                     {
+                        AdmissionRequest = originalRequest,
                         ClosureState = PlatformExternalClosureState.Faulted,
                     });
                 _exactMappingSlices.Add(unresolved.MappingId, slice);
@@ -167,10 +179,12 @@ public sealed partial class PlatformAuthorityBridge
                     mappingIdentity,
                     new PlatformRegionMappingGeneration(1), binding,
                     slice.Region.Handle, slice.Access);
+                faultedMapping = quarantinedMapping;
                 AddOriginalMappingRecordLocked(domainRecord, quarantinedMapping.MappingId,
                     new MappingRecord(quarantinedMapping, default,
                         authorityCapabilityId, providerIncarnation, backendEpoch)
                     {
+                        AdmissionRequest = originalRequest,
                         ClosureState = PlatformExternalClosureState.Faulted,
                     });
                 _exactMappingSlices.Add(quarantinedMapping.MappingId, slice);
@@ -232,6 +246,7 @@ public sealed partial class PlatformAuthorityBridge
             mappingRecord = new MappingRecord(mapping, providerMapping.Lease,
                 authorityCapabilityId, providerIncarnation, backendEpoch)
             {
+                AdmissionRequest = originalRequest,
                 LocalAuthorizationRevoked = true, // Cleanup fact until final local admission.
             };
             if (!resultValidation.IsSuccess ||

@@ -7,6 +7,47 @@ namespace SingPlus.Tests.Platform;
 
 public sealed class PlatformDmaCompletionTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CompletionPublicationRouteLossClearsOriginalLocalReservationWithoutRepeatingProvider(bool foreignRoute)
+    {
+        var scenario = CreateScenario(1691, 1791, PlatformDmaDirection.DeviceReadsMemory);
+        var submission = PrepareAndSubmit(scenario);
+        var endpoint = scenario.Kernel.CreateKernelEventEndpoint(scenario.Subject).Value!;
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var registry = typeof(RuntimeKernel).GetField("_kernelEvents", flags)!.GetValue(scenario.Kernel)!;
+        var routes = (global::System.Collections.IDictionary)registry.GetType().GetField("_endpoints", flags)!.GetValue(registry)!;
+        var original = routes[endpoint.EndpointId]!;
+        var foreign = TestFixtures.Create(scenario.Kernel, 1692, 1792).Handle;
+        var foreignEndpoint = scenario.Kernel.CreateKernelEventEndpoint(foreign).Value!;
+        var foreignRecord = routes[foreignEndpoint.EndpointId]!;
+        scenario.Provider.BeforeCompletionReply = () =>
+        {
+            if (foreignRoute) routes[endpoint.EndpointId] = foreignRecord;
+            else routes.Remove(endpoint.EndpointId);
+        };
+        scenario.Provider.CompletionState = PlatformProviderDmaCompletionState.Completed;
+        var published = scenario.Kernel.ObservePlatformDmaCompletion(scenario.Subject, submission, endpoint);
+        Assert.False(published.IsSuccess);
+        Assert.Equal(KernelError.PlatformFaulted, published.Error);
+        Assert.Null(original.GetType().GetProperty("Staged")!.GetValue(original));
+        Assert.Equal(1, scenario.Provider.CompletionCalls);
+        scenario.Provider.BeforeCompletionReply = null;
+        Assert.True(scenario.Kernel.GetOrObservePlatformDmaCompletion(scenario.Subject, submission).IsSuccess);
+        Assert.Equal(1, scenario.Provider.CompletionCalls);
+        var revoke = scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant);
+        Assert.False(revoke.IsSuccess); // Completion is not post-completion visibility or closure.
+        Assert.Equal(0, scenario.Provider.DmaRevokeCalls);
+        var lifecycle = scenario.Kernel.QueryPlatformRegionMappingLifecycle(scenario.Subject, scenario.Mapping.Mapping);
+        Assert.True(lifecycle.IsSuccess, lifecycle.Message);
+        Assert.False(lifecycle.Value!.LocalReservationReleased);
+        routes[endpoint.EndpointId] = original; // Same authoritative record survived; no copy/ABA resurrection.
+        Assert.True(scenario.Kernel.CloseKernelEventEndpoint(scenario.Subject, endpoint).IsSuccess);
+        Assert.Equal("Closed", original.GetType().GetProperty("State")!.GetValue(original)!.ToString());
+        Assert.Equal("Active", foreignRecord.GetType().GetProperty("State")!.GetValue(foreignRecord)!.ToString());
+        Assert.Equal(KernelError.ResponseNotAvailable, scenario.Kernel.ConsumeKernelEvent(foreign, foreignEndpoint).Error);
+    }
     [Fact]
     public void ExactPendingThenCompletedProofBindsOperationGrantAndPreparedCycle()
     {
@@ -454,6 +495,7 @@ public sealed class PlatformDmaCompletionTests
 
         public int AcquireCalls { get; private set; }
         public int CompletionCalls { get; private set; }
+        public Action? BeforeCompletionReply { get; set; }
         public int DmaRevokeCalls { get; private set; }
         public int MappingRevokeCalls { get; private set; }
         public int DeviceRevokeCalls { get; private set; }
@@ -715,6 +757,7 @@ public sealed class PlatformDmaCompletionTests
             PlatformProviderDmaSubmission submission)
         {
             CompletionCalls++;
+            BeforeCompletionReply?.Invoke();
             if (ResetDuringNextCompletion)
             {
                 ResetDuringNextCompletion = false;

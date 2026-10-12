@@ -10,10 +10,22 @@ internal sealed record VirtualDomainInspectionRecord(
     VirtualDomainState State,
     int GuestMappingCount);
 
-internal sealed class VirtualDomainAuthority
+internal sealed partial class VirtualDomainAuthority
 {
-    internal sealed class Record(object stateGate)
+    internal sealed class Record
     {
+        private readonly object stateGate;
+        internal Record(object gate) { stateGate = gate; OriginalOwner = this; }
+        internal Record OriginalOwner { get; }
+        private long _sourceRevision;
+        private bool _sourceRevisionExhausted;
+        internal long SourceRevision { get { lock (stateGate) return _sourceRevision; } }
+        internal bool SourceRevisionExhausted { get { lock (stateGate) return _sourceRevisionExhausted; } }
+        private void AdvanceSourceRevision()
+        {
+            if (_sourceRevision == long.MaxValue) _sourceRevisionExhausted = true;
+            else _sourceRevision++;
+        }
         public required VirtualDomainHandle Handle { get; init; }
         public required VirtualAddressSpaceHandle AddressSpace { get; init; }
         public required ProcessHandle Owner { get; init; }
@@ -24,17 +36,23 @@ internal sealed class VirtualDomainAuthority
         public required PlatformChildAuthorityClass Authority { get; init; }
         public required VirtualDomainProfile Profile { get; init; }
         public required CapabilityId[] Capabilities { get; set; }
-        public bool AuthorityPublished { get; set; } = true;
+        private bool _authorityPublished = true;
+        public bool AuthorityPublished
+        {
+            get { lock (stateGate) return _authorityPublished; }
+            set { lock (stateGate) { AdvanceSourceRevision(); _authorityPublished = value; } }
+        }
         private VirtualDomainState _state;
         public VirtualDomainState State
         {
             get { lock (stateGate) return _state; }
-            set { lock (stateGate) _state = value; }
+            set { lock (stateGate) { AdvanceSourceRevision(); _state = value; } }
         }
         public Dictionary<GuestRegionMappingId, GuestRegionMapping> Mappings { get; } = [];
         // Original immutable correlation within the same VDA owner; routes cannot
         // replace the tuple that created a Region/provider cleanup obligation.
         internal Dictionary<GuestRegionMappingId, GuestRegionMapping> OriginalMappings { get; } = [];
+        internal Dictionary<GuestRegionMappingId, LocalGuestLifetime> LocalGuestLifetimes { get; } = [];
         public HashSet<GuestRegionMappingId> StagedMappings { get; } = [];
         // Correlation only; CapabilityAuthority remains the source permission owner.
         public Dictionary<GuestRegionMappingId, (CapabilityId Memory, CapabilityId Region)> MappingSources { get; } = [];
@@ -42,6 +60,8 @@ internal sealed class VirtualDomainAuthority
         public PlatformExecutableArtifactBinding? ExecutableArtifact { get; set; }
         // Correlation to the existing original mapping, never new permission.
         internal GuestRegionMappingHandle? ExecutableMapping { get; set; }
+        internal long? TerminalPublicationRevision { get; set; }
+        internal PlatformExecutionTerminalKind? TerminalPublicationKind { get; set; }
     }
 
     private readonly object _gate = new();
@@ -216,7 +236,33 @@ internal sealed class VirtualDomainAuthority
         }
     }
 
-    internal KernelResult CommitEffectAdmission(Record record, VirtualDomainState expected, Func<KernelResult> commit)
+    internal sealed record EffectSource(Record Owner,
+        IReadOnlyList<(Record Owner, long Revision, VirtualDomainState State)> Lineage);
+
+    internal KernelResult<EffectSource> CaptureEffectSource(Record record, VirtualDomainState expected)
+    {
+        lock (_gate)
+        {
+            var valid = ValidateActiveAncestors(record);
+            if (!valid.IsSuccess) return KernelResult<EffectSource>.Fail(valid.Error, valid.Message!);
+            if (!record.AuthorityPublished || record.State != expected)
+                return KernelResult<EffectSource>.Fail(KernelError.InvalidTransition, "Virtual effect source changed before capture.");
+            var lineage = new List<(Record, long, VirtualDomainState)>();
+            var current = record;
+            while (true)
+            {
+                if (current.SourceRevisionExhausted)
+                    return KernelResult<EffectSource>.Fail(KernelError.CapacityExhausted, "Virtual source revision exhausted.");
+                lineage.Add((current, current.SourceRevision, current.State));
+                if (current.ParentDomain is not { } parent) break;
+                current = _records[parent.DomainId]; // Validated same-original lineage under this gate.
+            }
+            return KernelResult<EffectSource>.Ok(new(record, lineage));
+        }
+    }
+
+    internal KernelResult CommitEffectAdmission(Record record, VirtualDomainState expected, Func<KernelResult> commit,
+        EffectSource? source = null)
     {
         lock (_gate)
         {
@@ -224,6 +270,13 @@ internal sealed class VirtualDomainAuthority
             if (!lineage.IsSuccess) return lineage;
             if (!record.AuthorityPublished || record.State != expected)
                 return KernelResult.Fail(KernelError.InvalidTransition, "Virtual effect source state/publication changed.");
+            if (record.SourceRevisionExhausted)
+                return KernelResult.Fail(KernelError.CapacityExhausted, "Virtual source revision exhausted before effect.");
+            if (source is not null && (!ReferenceEquals(source.Owner, record) || source.Lineage.Count == 0 ||
+                !ReferenceEquals(source.Lineage[0].Owner, record) || source.Lineage.Any(node =>
+                    !HasCurrentOriginalRecord(node.Owner) || !node.Owner.AuthorityPublished || node.Owner.SourceRevisionExhausted ||
+                    node.Owner.SourceRevision != node.Revision || node.Owner.State != node.State)))
+                return KernelResult.Fail(KernelError.InvalidTransition, "Original virtual source revision/lineage changed.");
             return commit(); // Trusted pure admission/state mutation; no caller/provider callback.
         }
     }
@@ -295,11 +348,14 @@ internal sealed class VirtualDomainAuthority
             record.OriginalMappings.EnsureCapacity(record.OriginalMappings.Count + 1);
             record.StagedMappings.EnsureCapacity(record.StagedMappings.Count + 1);
             record.MappingSources.EnsureCapacity(record.MappingSources.Count + 1);
+            if (record.ChildBinding is null) record.LocalGuestLifetimes.EnsureCapacity(record.LocalGuestLifetimes.Count + 1);
             var mapping = new GuestRegionMapping(new GuestRegionMappingHandle(new GuestRegionMappingId(_nextMappingId++), new GuestRegionMappingGeneration(1)), record.Handle, record.AddressSpace, range, region, access);
+            var localLifetime = record.ChildBinding is null ? new LocalGuestLifetime(record, mapping) : null;
             record.Mappings.Add(mapping.Mapping.MappingId, mapping);
             record.OriginalMappings.Add(mapping.Mapping.MappingId, mapping);
             record.StagedMappings.Add(mapping.Mapping.MappingId);
             record.MappingSources.Add(mapping.Mapping.MappingId, (memorySource, regionSource));
+            if (localLifetime is not null) record.LocalGuestLifetimes.Add(mapping.Mapping.MappingId, localLifetime);
             return KernelResult<GuestRegionMapping>.Ok(mapping);
         }
     }
@@ -322,10 +378,14 @@ internal sealed class VirtualDomainAuthority
                 var cleanup = cleanupConsumer(mapping); // Trusted local Region owner mutation, no external callback.
                 if (!cleanup.IsSuccess) return KernelResult<GuestRegionMapping>.Fail(cleanup.Error, cleanup.Message!);
             }
+            if (record.ChildBinding is null && (!TryLocalGuestLifetime(record, mapping, out var local) ||
+                local.RegionReserved && !local.RegionReleased || local.Reservation is not null && !local.ChargeConsumed))
+                return KernelResult<GuestRegionMapping>.Fail(KernelError.PlatformFaulted, "Original local guest Region/charge remains unconsumed.");
             record.Mappings.Remove(handle.MappingId);
             record.OriginalMappings.Remove(handle.MappingId);
             record.StagedMappings.Remove(handle.MappingId);
             record.MappingSources.Remove(handle.MappingId);
+            record.LocalGuestLifetimes.Remove(handle.MappingId);
             return KernelResult<GuestRegionMapping>.Ok(mapping);
         }
     }
@@ -354,6 +414,7 @@ internal sealed class VirtualDomainAuthority
 
     // Caller holds the existing VDA gate. The index references the same logical owner.
     private bool HasCurrentOriginalRecord(Record record) =>
+        ReferenceEquals(record.OriginalOwner, record) &&
         _records.TryGetValue(record.Handle.DomainId, out var current) && ReferenceEquals(current, record) &&
         _originalRecords.TryGetValue(record.Handle.DomainId, out var original) && ReferenceEquals(original, record);
 
@@ -397,7 +458,7 @@ internal sealed class VirtualDomainAuthority
             return _originalRecords.Values.Where(x => x.Owner == parent.Owner && x.ParentDomain == parent.Handle).ToArray();
     }
 
-    internal KernelResult<GuestRegionMapping> ResolveMapping(Record record, GuestRegionMappingHandle handle)
+    internal KernelResult<GuestRegionMapping> ResolveMapping(Record record, GuestRegionMappingHandle handle, bool allowLocalCleanup = false)
     {
         lock (_gate)
         {
@@ -405,10 +466,13 @@ internal sealed class VirtualDomainAuthority
                 return KernelResult<GuestRegionMapping>.Fail(KernelError.GuestMappingNotFound, "Guest mapping was not found.");
             if (mapping.Mapping.Generation != handle.Generation)
                 return KernelResult<GuestRegionMapping>.Fail(KernelError.StaleGeneration, "Guest mapping generation is stale.");
-            if (record.StagedMappings.Contains(handle.MappingId))
+            if (record.StagedMappings.Contains(handle.MappingId) && !(allowLocalCleanup && record.ChildBinding is null))
                 return KernelResult<GuestRegionMapping>.Fail(KernelError.PlatformBindingActive, "Guest mapping has not been published.");
             if (!HasOriginalMapping(record, mapping))
                 return KernelResult<GuestRegionMapping>.Fail(KernelError.StaleGeneration, "Original guest mapping tuple changed.");
+            if (record.ChildBinding is null && (!TryLocalGuestLifetime(record, mapping, out var lifetime) ||
+                (!allowLocalCleanup && (!lifetime.RegionReserved || lifetime.RegionReleased || lifetime.ChargeConsumed))))
+                return KernelResult<GuestRegionMapping>.Fail(KernelError.PlatformBindingDraining, "Original local guest lifetime is unavailable for use.");
             return KernelResult<GuestRegionMapping>.Ok(mapping);
         }
     }
@@ -420,6 +484,22 @@ internal sealed class VirtualDomainAuthority
             if (!record.Mappings.TryGetValue(mapping.Mapping.MappingId, out var exact) || exact != mapping || !HasOriginalMapping(record, mapping) ||
                 !record.StagedMappings.Remove(mapping.Mapping.MappingId))
                 return KernelResult.Fail(KernelError.StaleGeneration, "Exact staged guest mapping changed.");
+            return KernelResult.Ok();
+        }
+    }
+
+    internal KernelResult RetainGuestCleanupMapping(Record record, GuestRegionMappingHandle local,
+        (PlatformGuestMapping Guest, PlatformRegionMapping Parent) platform)
+    {
+        lock (_gate)
+        {
+            if (!HasCurrentOriginalRecord(record) || !record.Mappings.TryGetValue(local.MappingId, out var mapping) ||
+                mapping.Mapping != local || !HasOriginalMapping(record, mapping) || record.ChildBinding != platform.Guest.Child ||
+                platform.Guest.ParentMapping != platform.Parent)
+                return KernelResult.Fail(KernelError.StaleGeneration, "Original staged guest cleanup owner changed.");
+            if (record.PlatformMappings.TryGetValue(local.MappingId, out var current))
+                return current == platform ? KernelResult.Ok() : KernelResult.Fail(KernelError.StaleGeneration, "Foreign guest cleanup correlation retained.");
+            record.PlatformMappings.Add(local.MappingId, platform); // Cleanup only; StagedMappings is not published.
             return KernelResult.Ok();
         }
     }

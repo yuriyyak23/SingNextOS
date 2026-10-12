@@ -75,9 +75,11 @@ public sealed partial class RuntimeKernel
     private KernelResult AdvancePlatformDmaGrantsForDevice(PlatformDeviceLease deviceLease)
     {
         KernelResult? firstFailure = null;
-        foreach (var grant in PlatformAuthority.ActiveDmaGrantsForDevice(deviceLease))
+        var grants = PlatformAuthority.ActiveDmaGrantsForDevice(deviceLease)
+            .Concat(RetainedDmaCopyBackingGrants(grant => grant.DeviceLease == deviceLease)).Distinct().ToArray();
+        foreach (var grant in grants)
         {
-            var revoke = PlatformAuthority.RevokeDmaGrant(
+            var revoke = RetirePlatformDmaGrantAndOriginalPeer(
                 grant,
                 grant.DeviceLease.DomainBinding.Subject);
             if (!revoke.IsSuccess)
@@ -95,9 +97,11 @@ public sealed partial class RuntimeKernel
     private KernelResult AdvancePlatformDmaGrantsForMapping(PlatformRegionMapping mapping)
     {
         KernelResult? firstFailure = null;
-        foreach (var grant in PlatformAuthority.ActiveDmaGrantsForMapping(mapping))
+        var grants = PlatformAuthority.ActiveDmaGrantsForMapping(mapping)
+            .Concat(RetainedDmaCopyBackingGrants(grant => grant.Mapping.Mapping == mapping)).Distinct().ToArray();
+        foreach (var grant in grants)
         {
-            var revoke = PlatformAuthority.RevokeDmaGrant(
+            var revoke = RetirePlatformDmaGrantAndOriginalPeer(
                 grant,
                 grant.DeviceLease.DomainBinding.Subject);
             if (!revoke.IsSuccess)
@@ -119,16 +123,22 @@ public sealed partial class RuntimeKernel
         PlatformDmaGrant[] grants;
         lock (_platformMemoryUseGate)
         {
-            if (!_processPlatformDmaGrants.TryGetValue(handle, out var tracked) || tracked.Count == 0)
-                return KernelResult.Ok();
-            grants = tracked.ToArray();
+            _processPlatformDmaGrants.TryGetValue(handle, out var tracked);
+            var identityForBacking = PlatformIdentity(process);
+            grants = (tracked ?? []).Concat(PlatformAuthority.ActiveDmaGrantsForSubject(identityForBacking))
+                .Concat(RetainedDmaCopyBackingGrants(grant => grant.DeviceLease.DomainBinding.Subject == identityForBacking)).Distinct().ToArray();
         }
 
         var identity = PlatformIdentity(process);
         KernelResult? firstFailure = null;
         foreach (var grant in grants)
         {
-            var revoke = PlatformAuthority.RevokeDmaGrant(grant, identity);
+            if (PlatformAuthority.IsOriginalDmaGrantClosureConsumed(grant, identity) && RetainedDmaCopyBackingGrants(original => original == grant).Length == 0)
+            {
+                lock (_platformMemoryUseGate) UntrackPlatformDmaGrant(grant);
+                continue;
+            }
+            var revoke = RetirePlatformDmaGrantAndOriginalPeer(grant, identity);
             if (!revoke.IsSuccess)
             {
                 firstFailure ??= revoke;
@@ -138,6 +148,31 @@ public sealed partial class RuntimeKernel
             lock (_platformMemoryUseGate) UntrackPlatformDmaGrant(grant);
         }
 
+        return firstFailure ?? KernelResult.Ok();
+    }
+
+    private PlatformDmaGrant[] RetainedDmaCopyBackingGrants(Func<PlatformDmaGrant,bool> matches)
+    {
+        lock (_platformMemoryUseGate)
+            return _dmaCopyPayloads.Values.Where(payload => ReferenceEquals(payload.Original,payload))
+                .SelectMany(payload => new[] { payload.SourceGrant,payload.DestinationGrant }).Where(matches).Distinct().ToArray();
+    }
+
+    private KernelResult RetirePlatformDmaGrantAndOriginalPeer(PlatformDmaGrant grant,PlatformDomainIdentity identity)
+    {
+        var pair = PlatformAuthority.OriginalCopyRetirementGrants(grant,identity);
+        if (!pair.IsSuccess) return KernelResult.Fail(pair.Error,pair.Message!);
+        KernelResult? firstFailure = null;
+        foreach (var original in pair.Value!)
+        {
+            var subject = original.DeviceLease.DomainBinding.Subject;
+            if (!PlatformAuthority.IsOriginalDmaGrantClosureConsumed(original,subject))
+            {
+                var closed = PlatformAuthority.RevokeDmaGrant(original,subject);
+                if (!closed.IsSuccess) { firstFailure ??= closed; continue; }
+            }
+            lock (_platformMemoryUseGate) UntrackPlatformDmaGrant(original);
+        }
         return firstFailure ?? KernelResult.Ok();
     }
 
@@ -162,5 +197,13 @@ public sealed partial class RuntimeKernel
                 _processPlatformDmaGrants.Remove(entry.Key);
         }
         UntrackComponentDriverDma(grant);
+        foreach (var entry in _dmaCopyPayloads.ToArray())
+        {
+            var payload = entry.Value;
+            if (!ReferenceEquals(payload.Original,payload) || _dmaCopyPayloadCalls.Contains(payload.SourceGrant.GrantId) || _dmaCopyPayloadCalls.Contains(payload.DestinationGrant.GrantId)) continue;
+            if (!PlatformAuthority.IsOriginalDmaGrantClosureConsumed(payload.SourceGrant,payload.SourceGrant.DeviceLease.DomainBinding.Subject) ||
+                !PlatformAuthority.IsOriginalDmaGrantClosureConsumed(payload.DestinationGrant,payload.DestinationGrant.DeviceLease.DomainBinding.Subject)) continue;
+            payload.Dispose(); _dmaCopyPayloads.Remove(entry.Key); // Both original native lifetimes legally closed; no receipt publication.
+        }
     }
 }

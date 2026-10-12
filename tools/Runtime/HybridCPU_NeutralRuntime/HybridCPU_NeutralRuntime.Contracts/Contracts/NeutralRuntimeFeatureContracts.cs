@@ -17,6 +17,7 @@ public enum NeutralRuntimeFeatureFamily
     ChildTrapDelivery,
     BoundedVirtualIo,
     ChildExecutableArtifact,
+    NestedDomains,
 }
 
 public enum NeutralRuntimeFeatureAvailability
@@ -62,6 +63,7 @@ public static class NeutralRuntimeFeatureContracts
         NeutralRuntimeFeatureFamily.ChildTrapDelivery => ChildTrapDeliveryVersion,
         NeutralRuntimeFeatureFamily.BoundedVirtualIo => BoundedVirtualIoVersion,
         NeutralRuntimeFeatureFamily.ChildExecutableArtifact => ChildExecutableArtifactVersion,
+        NeutralRuntimeFeatureFamily.NestedDomains => 1,
         _ => throw new ArgumentOutOfRangeException(nameof(family)),
     };
 }

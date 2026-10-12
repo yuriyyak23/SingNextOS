@@ -9,6 +9,9 @@ public enum PlatformVirtualTrapKind
     Timer,
     Preemption,
     DeviceOrIoFault,
+    ExecutionBudgetExhausted,
+    KernelRejected,
+    ExecutionFailure,
 }
 
 /// <summary>

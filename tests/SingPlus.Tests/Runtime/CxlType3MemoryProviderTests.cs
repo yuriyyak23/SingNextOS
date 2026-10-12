@@ -9,6 +9,175 @@ namespace SingPlus.Tests.Runtime;
 public sealed class CxlType3MemoryProviderTests
 {
     [Theory]
+    [InlineData(false, false)] [InlineData(false, true)] [InlineData(true, false)] [InlineData(true, true)]
+    public void OriginalType3UnknownClosureCannotRepeatOrReclaimAttachedCharge(bool fabricReply, bool lostReply)
+    {
+        CallbackMemoryProvider? memory = null;
+        CallbackFabricProvider? fabric = null;
+        BudgetAccountHandle budget = default;
+        var s = CreateScenario(memoryFactory: model => memory = new(model), fabricFactory: model => fabric = new(model),
+            beforeAllocation: (kernel, handle) => budget = AttachOriginalType3Budget(kernel, handle));
+        var placement = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease, s.Endpoint, CxlMemoryPersistence.Volatile).Value!;
+        if (fabricReply)
+        {
+            if (lostReply) fabric!.UnbindHook = () => throw new IOException("original fabric outcome lost");
+            else s.Model.FabricUnbindFails = true;
+        }
+        else
+        {
+            if (lostReply) memory!.ReleaseHook = () => throw new IOException("original memory outcome lost");
+            else s.Model.MemoryReleaseFails = true;
+        }
+        Assert.False(s.Memory.Close(placement.PlacementId).IsSuccess);
+        Assert.Equal(1, memory!.ReleaseCalls);
+        Assert.Equal(fabricReply ? 1 : 0, fabric!.UnbindCalls);
+        memory.ReleaseHook = null; fabric.UnbindHook = null;
+        s.Model.MemoryReleaseFails = false; s.Model.FabricUnbindFails = false;
+        Assert.False(s.Memory.Close(placement.PlacementId).IsSuccess);
+        Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.Equal(1, memory.ReleaseCalls);
+        Assert.Equal(fabricReply ? 1 : 0, fabric.UnbindCalls);
+        Assert.Equal(64UL, s.Kernel.QueryBudget(budget).Value!.Usage.Single(x => x.Dimension == ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.Equal(RegionState.Owned, s.Kernel.Regions.Snapshot().Single(x => x.Handle == s.Buffer.Handle).State);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void OriginalType3PlacementCannotTransferClosureOrHideBackingThroughRouteProjection(int fault)
+    {
+        CallbackMemoryProvider? memory = null;
+        CallbackFabricProvider? fabric = null;
+        BudgetAccountHandle budget = default;
+        var s = CreateScenario(memoryFactory: model => memory = new(model), fabricFactory: model => fabric = new(model),
+            beforeAllocation: (kernel, handle) => budget = AttachOriginalType3Budget(kernel, handle));
+        var placement = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease, s.Endpoint, CxlMemoryPersistence.Volatile).Value!;
+        const global::System.Reflection.BindingFlags flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(CxlType3MemoryAuthority).GetField("_placements", flags)!.GetValue(s.Memory)!;
+        var original = routes[placement.PlacementId]!;
+        var snapshot = original.GetType().GetProperty("Snapshot")!;
+        if (fault == 0) snapshot.SetValue(original, placement with { State = CxlMemoryPlacementState.Released });
+        if (fault == 1) routes[placement.PlacementId] = typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+        if (fault == 2) routes.Remove(placement.PlacementId);
+        Assert.False(s.Memory.Close(placement.PlacementId).IsSuccess);
+        Assert.False(((ICxlTeardownParticipant)s.Memory).CloseForProcess(s.Handle, s.Owner).IsSuccess);
+        Assert.Equal(0, memory!.ReleaseCalls);
+        Assert.Equal(64UL, s.Kernel.QueryBudget(budget).Value!.Usage.Single(x => x.Dimension == ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        routes[placement.PlacementId] = original; snapshot.SetValue(original, placement);
+        Assert.True(s.Memory.Close(placement.PlacementId).IsSuccess);
+        Assert.Equal(1, memory.ReleaseCalls); Assert.Equal(1, fabric!.UnbindCalls);
+        Assert.True(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(x => x.Handle == s.Buffer.Handle).State);
+        Assert.Equal(0UL, s.Kernel.QueryBudget(budget).Value!.Usage.Single(x => x.Dimension == ServiceBudgetDimension.OwnedMemoryBytes).Used);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)]
+    public void OriginalType3KnownClosureConsumesLocalFaultAndChargeWithoutRepeatedProviderEffects(int fault)
+    {
+        CallbackMemoryProvider? memory = null;
+        CallbackFabricProvider? fabric = null;
+        BudgetAccountHandle budget = default;
+        var s = CreateScenario(memoryFactory: model => memory = new(model), fabricFactory: model => fabric = new(model),
+            beforeAllocation: (kernel, handle) => budget = AttachOriginalType3Budget(kernel, handle));
+        var placement = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease, s.Endpoint, CxlMemoryPersistence.Volatile).Value!;
+        const global::System.Reflection.BindingFlags flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(CxlType3MemoryAuthority).GetField("_placements", flags)!.GetValue(s.Memory)!;
+        var record = routes[placement.PlacementId]!;
+        var snapshot = record.GetType().GetProperty("Snapshot")!;
+        if (fault == 4) record.GetType().GetField("<SourceRevision>k__BackingField", flags)!.SetValue(record, ulong.MaxValue);
+        s.Memory.BeforePlacementClosureLocalCommit = () =>
+        {
+            foreach (var target in new object[] { s.Memory, s.Bridge })
+                Assert.False(Monitor.IsEntered(target.GetType().GetField("_gate", flags)!.GetValue(target)!));
+            Assert.Equal(KernelError.PlatformBindingDraining, s.Memory.Close(placement.PlacementId).Error);
+            if (fault == 0) throw new IOException("local backing consumption lost");
+            var original = (CxlMemoryPlacementSnapshot)snapshot.GetValue(record)!;
+            if (fault == 1) snapshot.SetValue(record, original);
+            if (fault == 2) { snapshot.SetValue(record, original with { State = CxlMemoryPlacementState.Active }); snapshot.SetValue(record, original); }
+            if (fault == 3) routes[placement.PlacementId] = typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(record, null)!;
+        };
+        Assert.Equal(fault == 4, s.Memory.Close(placement.PlacementId).IsSuccess);
+        Assert.Equal(1, memory!.ReleaseCalls); Assert.Equal(1, fabric!.UnbindCalls);
+        Assert.Equal(64UL, s.Kernel.QueryBudget(budget).Value!.Usage.Single(x => x.Dimension == ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.False((bool)record.GetType().GetProperty("CloseInFlight")!.GetValue(record)!);
+        s.Memory.BeforePlacementClosureLocalCommit = null;
+        routes[placement.PlacementId] = record;
+        Assert.True(s.Memory.Close(placement.PlacementId).IsSuccess);
+        // Completed original lifetime cannot be re-pinned by a route/state projection.
+        snapshot.SetValue(record, placement);
+        routes.Remove(placement.PlacementId);
+        Assert.True(s.Memory.Close(placement.PlacementId).IsSuccess);
+        Assert.True(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.Equal(1, memory.ReleaseCalls); Assert.Equal(1, fabric.UnbindCalls);
+        Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(x => x.Handle == s.Buffer.Handle).State);
+        Assert.Equal(0UL, s.Kernel.QueryBudget(budget).Value!.Usage.Single(x => x.Dimension == ServiceBudgetDimension.OwnedMemoryBytes).Used);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void OriginalType3HealthRejectsEqualOrAbaLocalSourceBeforeActualRegionDamage(bool aba)
+    {
+        var s = CreateScenario();
+        var placement = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease, s.Endpoint, CxlMemoryPersistence.Volatile).Value!;
+        Assert.True(s.Model.InjectHealthFault(placement.MemoryBindingId, ProviderHealthStateV1.Degraded,
+            ProviderFaultClassV1.Omission, new(8, 8)).IsSuccess);
+        const global::System.Reflection.BindingFlags flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(CxlType3MemoryAuthority).GetField("_placements", flags)!.GetValue(s.Memory)!;
+        var record = routes[placement.PlacementId]!; var snapshot = record.GetType().GetProperty("Snapshot")!;
+        s.Memory.BeforeHealthConsequenceCommit = () =>
+        {
+            var original = (CxlMemoryPlacementSnapshot)snapshot.GetValue(record)!;
+            if (aba) snapshot.SetValue(record, original with { State = CxlMemoryPlacementState.MigrationRequired });
+            snapshot.SetValue(record, original);
+        };
+        Assert.False(s.Memory.ObserveAndQuarantine(placement.PlacementId, s.Owner, s.Model).IsSuccess);
+        Assert.Empty(s.Kernel.Regions.SnapshotDamage());
+        s.Memory.BeforeHealthConsequenceCommit = null;
+        Assert.True(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false, 0)] [InlineData(false, 1)] [InlineData(false, 2)]
+    [InlineData(true, 0)] [InlineData(true, 1)] [InlineData(true, 2)]
+    public void OriginalType3PartialConsumptionCannotUseCopiedOrLostBackingClosureFact(bool fabricFact, int fault)
+    {
+        CallbackMemoryProvider? memory = null;
+        CallbackFabricProvider? fabric = null;
+        BudgetAccountHandle budget = default;
+        var s = CreateScenario(memoryFactory: model => memory = new(model), fabricFactory: model => fabric = new(model),
+            beforeAllocation: (kernel, handle) => budget = AttachOriginalType3Budget(kernel, handle));
+        var placement = s.Memory.Place(s.Owner, s.Buffer.Handle, s.Subject, s.Lease, s.Endpoint, CxlMemoryPersistence.Volatile).Value!;
+        s.Memory.BeforePlacementClosureLocalCommit = () => throw new IOException("local consumption deferred");
+        Assert.False(s.Memory.Close(placement.PlacementId).IsSuccess);
+        const global::System.Reflection.BindingFlags flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var routes = (global::System.Collections.IDictionary)typeof(CxlType3MemoryAuthority).GetField("_placements", flags)!.GetValue(s.Memory)!;
+        var record = routes[placement.PlacementId]!;
+        var sources = record.GetType().GetProperty("CleanupSources")!.GetValue(record)!;
+        var source = sources.GetType().GetProperty(fabricFact ? "Fabric" : "Memory")!.GetValue(sources)!;
+        var closure = source.GetType().GetProperty("Closure")!;
+        var fact = closure.GetValue(source)!;
+        if (fault == 0) closure.SetValue(source, typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(fact, null));
+        if (fault == 1) fact.GetType().GetProperty("RawObservation")!.SetValue(fact, null);
+        if (fault == 2) fact.GetType().GetField("<Source>k__BackingField", flags)!.SetValue(fact,
+            typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(source, null));
+        s.Memory.BeforePlacementClosureLocalCommit = null;
+        Assert.False(s.Memory.Close(placement.PlacementId).IsSuccess);
+        Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.Equal(1, memory!.ReleaseCalls); Assert.Equal(1, fabric!.UnbindCalls);
+        Assert.Equal(64UL, s.Kernel.QueryBudget(budget).Value!.Usage.Single(x => x.Dimension == ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.Equal(RegionState.Owned, s.Kernel.Regions.Snapshot().Single(x => x.Handle == s.Buffer.Handle).State);
+    }
+
+    private static BudgetAccountHandle AttachOriginalType3Budget(RuntimeKernel kernel, ProcessHandle handle)
+    {
+        var admin = TestFixtures.Create(kernel, 95, 995).Handle;
+        var cap = kernel.MintCapability(new(995), admin, ResourceKind.KernelService,
+            CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        return kernel.AdmitProcessBudget(admin, cap, handle, "original-type3-cleanup",
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 64)]).Value!.ProcessBudget;
+    }
+
+    [Theory]
     [InlineData(false, false, false)] [InlineData(false, true, false)]
     [InlineData(true, false, false)] [InlineData(true, true, false)]
     [InlineData(false, false, true)] [InlineData(false, true, true)]
@@ -344,8 +513,11 @@ public sealed class CxlType3MemoryProviderTests
             Assert.NotEqual(initialCapacity, s.Model.QueryCapacity(s.Endpoint.EndpointId).Value!);
             Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.Regions.ReserveBacking(s.Buffer.Handle, s.Owner).Error);
             s.Model.FabricUnbindFails = false;
-            Assert.True(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
-            Assert.Equal(2, fabric.UnbindCalls);
+            Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+            Assert.Equal(1, fabric.UnbindCalls);
+            Assert.Equal(1, Tickets()); Assert.Equal(1, Draining());
+            Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.Regions.ReserveBacking(s.Buffer.Handle, s.Owner).Error);
+            return;
         }
         else
         {
@@ -717,16 +889,11 @@ public sealed class CxlType3MemoryProviderTests
         Assert.Equal(fault == 0 ? CxlMemoryPlacementState.Quarantined : fault == 1 ? CxlMemoryPlacementState.Released : CxlMemoryPlacementState.Active,
             s.Memory.Query(placement.PlacementId).Value!.State);
         s.Memory.BeforeHealthConsequenceCommit = null;
-        Assert.Equal(fault != 3, s.Memory.Close(placement.PlacementId).IsSuccess);
+        Assert.True(s.Memory.Close(placement.PlacementId).IsSuccess);
         if (fault == 0)
         {
             Assert.Equal(KernelError.Quarantined, s.Kernel.TerminateProcess(s.Handle).Error);
             Assert.Single(s.Kernel.Regions.SnapshotDamage());
-            Assert.True(s.Kernel.Regions.Validate(s.Buffer.Handle, s.Owner).IsSuccess);
-        }
-        else if (fault == 3)
-        {
-            Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
             Assert.True(s.Kernel.Regions.Validate(s.Buffer.Handle, s.Owner).IsSuccess);
         }
         else Assert.True(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
@@ -1481,7 +1648,10 @@ public sealed class CxlType3MemoryProviderTests
                 s.Kernel.MapPlatformOwnedRegion(s.Handle, s.Domain, s.RegionCapability, s.Buffer.Handle,
                     PlatformMemoryAccess.Read).Error);
             s.Model.MemoryReleaseFails = false;
-            Assert.True(s.Memory.Close(placement.PlacementId).IsSuccess);
+            Assert.False(s.Memory.Close(placement.PlacementId).IsSuccess);
+            Assert.Equal(1, memory.ReleaseCalls);
+            Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+            return;
         }
         var mapping = s.Kernel.MapPlatformOwnedRegion(s.Handle, s.Domain, s.RegionCapability,
             s.Buffer.Handle, PlatformMemoryAccess.Read);
@@ -1534,12 +1704,12 @@ public sealed class CxlType3MemoryProviderTests
             Assert.False(s.Kernel.QueryProcessTeardown(s.Handle).Value.LocalReclaimCompleted);
             var retried = s.Kernel.ObserveProcessTeardown(s.Handle);
             Assert.True(retried.IsSuccess);
-            Assert.True(retried.Value.LocalReclaimCompleted);
+            Assert.False(retried.Value.LocalReclaimCompleted);
         }
-        else Assert.True(s.Memory.Close(placement.PlacementId).IsSuccess);
+        else Assert.False(s.Memory.Close(placement.PlacementId).IsSuccess);
         Assert.Equal(1, memory.ReleaseCalls);
-        Assert.Equal(2, fabric.UnbindCalls);
-        Assert.Equal(CxlMemoryPlacementState.Released, s.Memory.Query(placement.PlacementId).Value!.State);
+        Assert.Equal(1, fabric.UnbindCalls);
+        Assert.Equal(CxlMemoryPlacementState.Quarantined, s.Memory.Query(placement.PlacementId).Value!.State);
     }
 
     [Theory]
@@ -1583,12 +1753,10 @@ public sealed class CxlType3MemoryProviderTests
             s.Kernel.Regions.ReserveBacking(s.Buffer.Handle, s.Owner).Error);
         memory!.ReleaseHook = null;
         s.Model.MemoryReleaseFails = false;
-        Assert.True(s.Memory.Close(placement.PlacementId).IsSuccess);
-        Assert.Equal(2, memory.ReleaseCalls);
-        Assert.Equal(CxlMemoryPlacementState.Released, s.Memory.Query(placement.PlacementId).Value!.State);
-        var replacement = s.Kernel.Regions.ReserveBacking(s.Buffer.Handle, s.Owner);
-        Assert.True(replacement.IsSuccess);
-        Assert.True(s.Kernel.Regions.ReleaseBacking(replacement.Value!.Handle, s.Owner).IsSuccess);
+        Assert.False(s.Memory.Close(placement.PlacementId).IsSuccess);
+        Assert.Equal(1, memory.ReleaseCalls);
+        Assert.Equal(CxlMemoryPlacementState.Quarantined, s.Memory.Query(placement.PlacementId).Value!.State);
+        Assert.Equal(KernelError.PlatformBindingActive, s.Kernel.Regions.ReserveBacking(s.Buffer.Handle, s.Owner).Error);
     }
 
     [Fact]
@@ -2099,7 +2267,8 @@ public sealed class CxlType3MemoryProviderTests
     private static Scenario CreateScenario(bool twoEndpoints = false,
         Func<CxlType3ModelProvider, ICxlMemoryProvider>? memoryFactory = null,
         Func<CxlType3ModelProvider, ICxlFabricProvider>? fabricFactory = null,
-        Func<CxlType3ModelProvider, ICxlDiscoveryProvider>? discoveryFactory = null)
+        Func<CxlType3ModelProvider, ICxlDiscoveryProvider>? discoveryFactory = null,
+        Action<RuntimeKernel, ProcessHandle>? beforeAllocation = null)
     {
         var platform = new AuthorityProvider();
         var kernel = new RuntimeKernel(platform);
@@ -2127,6 +2296,7 @@ public sealed class CxlType3MemoryProviderTests
         var bridge = new CxlAuthorityBridge(kernel, discoveryFactory?.Invoke(model) ?? model, model, fabricFactory?.Invoke(model) ?? model, memoryFactory?.Invoke(model) ?? model,
             new UnsupportedCoherent(), new EvidenceOnly());
         var memory = new CxlType3MemoryAuthority(kernel, bridge);
+        beforeAllocation?.Invoke(kernel, handle);
         var buffer = kernel.AllocateBuffer<byte>(handle, 64).Value!;
         var regionCapability = kernel.MintCapability(process.DomainId, handle, ResourceKind.MemoryRegion,
             CapabilityResourceIds.MemoryRegion(buffer.Handle.RegionId),

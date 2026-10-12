@@ -6,14 +6,27 @@ namespace SingPlus.Runtime;
 public sealed partial class PlatformAuthorityBridge
 {
     // Original effect correlation on the existing child owner, never permission.
-    private sealed class GuestMapInvocationFact(GuestAdmissionSource source,
-        PlatformGuestRegionMappingRequest request, PlatformBackendEpoch epoch)
+    private sealed class GuestMapInvocationFact
     {
-        public GuestAdmissionSource Source { get; } = source;
-        public PlatformGuestRegionMappingRequest Request { get; } = request;
-        public PlatformBackendEpoch Epoch { get; } = epoch;
+        public GuestMapInvocationFact(GuestAdmissionSource source, PlatformGuestRegionMappingRequest request, PlatformBackendEpoch epoch)
+        { OriginalOwner = this; Source = source; Request = request; Epoch = epoch; OriginalRequest = new(request); ChildState = source.Child.State; ParentState = source.Parent.ClosureState; ChildRevision = source.Child.LifecycleRevision; ParentRevision = source.Parent.LifecycleRevision; }
+        public GuestMapInvocationFact OriginalOwner { get; }
+        public GuestAdmissionSource Source { get; }
+        public PlatformGuestRegionMappingRequest Request { get; }
+        public PlatformOriginalGuestMapRequest OriginalRequest { get; }
+        public PlatformBackendEpoch Epoch { get; }
+        public PlatformGuestMappingId ReservedIdentity;
+        public PlatformChildDomainState ChildState { get; }
+        public PlatformExternalClosureState ParentState { get; }
+        public long ChildRevision, ParentRevision, ChildFaultRevision, ParentFaultRevision;
+        public bool OwnChildFault, OwnParentFault, ResolutionInFlight;
+        public bool OwnGuestFault;
+        public long GuestFaultRevision;
+        public GuestBindingRecord? KnownMapping;
         public PlatformAuthorityResult<PlatformProviderGuestRegionMappingLease>? Observation { get; set; }
+        public PlatformAuthorityResult<PlatformProviderGuestRegionMappingLease>? Resolution { get; set; }
         public bool Unresolved { get; set; } = true;
+        public Dictionary<ChildBindingRecord, long> Lineage { get; init; } = [];
     }
 
     // Original invocation cleanup fact, never guest admission or original closure evidence.
@@ -64,6 +77,8 @@ public sealed partial class PlatformAuthorityBridge
         PlatformBackendEpoch backendEpoch = default;
         PlatformGuestMappingId reservedMappingId = default;
         GuestMapInvocationFact invocation = null!;
+        Dictionary<ChildBindingRecord, long> sourceRevisions = [];
+        long rootRevision = 0;
         KernelResult Begin()
         {
           lock (_secureDomainLifecycleGate)
@@ -76,21 +91,27 @@ public sealed partial class PlatformAuthorityBridge
             var lineage = ValidateActiveChildLineage(childRecord);
             if (!lineage.IsSuccess)
                 return lineage;
+            var captured = CaptureGuestEffectLineage(childRecord);
+            if (!captured.IsSuccess) return KernelResult.Fail(captured.Error, captured.Message!);
+            sourceRevisions = captured.Value!;
             if (!_childBindings.TryGetValue(child.BindingId, out var currentChild) || !ReferenceEquals(currentChild, childRecord) ||
                 !_mappings.TryGetValue(parentMapping.MappingId, out var currentParent) || !ReferenceEquals(currentParent, parent) ||
                 !_domains.TryGetValue(child.ParentBinding.BindingId, out originalRoot!) || originalRoot.Binding != child.ParentBinding ||
                 originalRoot.ProviderLease != childRecord.ProviderLease.ParentDomainLease)
                 return KernelResult.Fail(KernelError.StaleGeneration, "Original guest admission sources changed before reservation.");
+            if (originalRoot.AuthorityRevisionExhausted)
+                return KernelResult.Fail(KernelError.CapacityExhausted, "Guest root source revision exhausted.");
+            rootRevision = originalRoot.AuthorityRevision;
             if (parent.LocalAuthorizationRevoked || parent.ClosureState != PlatformExternalClosureState.Active ||
                 childRecord.State == PlatformChildDomainState.Faulted || childRecord.TransitionInFlight)
                 return KernelResult.Fail(KernelError.PlatformBindingRevoked,
                     "Parent mapping or child changed before guest admission.");
             KernelResult CommitAdmission()
             {
-                if (parent.PendingGuestMaps == int.MaxValue || childRecord.PendingChildEffects == int.MaxValue)
+                if (parent.PendingGuestMaps == int.MaxValue || sourceRevisions.Keys.Any(x => x.PendingChildEffects == int.MaxValue))
                     return KernelResult.Fail(KernelError.CapacityExhausted, "Guest admission interlock capacity is exhausted.");
                 parent.PendingGuestMaps++;
-                childRecord.PendingChildEffects++;
+                foreach (var owner in sourceRevisions.Keys) owner.PendingChildEffects++;
                 backendEpoch = BackendEpoch;
                 return KernelResult.Ok();
             }
@@ -112,14 +133,17 @@ public sealed partial class PlatformAuthorityBridge
                 parent.ProviderLease != request.ParentMapping.Lease || childRecord.ProviderLease != request.ChildLease ||
                 !_domains.TryGetValue(child.ParentBinding.BindingId, out var root) || !ReferenceEquals(root, originalRoot) || root.Binding != child.ParentBinding ||
                 root.ProviderIncarnation != source || root.BackendEpoch != backendEpoch ||
+                root.AuthorityRevisionExhausted || root.AuthorityRevision != rootRevision ||
                 root.ProviderLease != childRecord.ProviderLease.ParentDomainLease)
             {
-                childRecord.State = PlatformChildDomainState.Faulted;
-                parent.ClosureState = PlatformExternalClosureState.Faulted;
+                if (invocation is not null) PinOriginalGuestMap(invocation);
+                else { childRecord.State = PlatformChildDomainState.Faulted; parent.ClosureState = PlatformExternalClosureState.Faulted; }
                 return KernelResult.Fail(KernelError.PlatformFaulted, "Original guest-map source changed; backing remains pinned.");
             }
             var lineage = ValidateActiveChildLineage(childRecord);
             if (!lineage.IsSuccess) return lineage;
+            if (!GuestEffectLineageCurrent(sourceRevisions))
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Original guest ancestor revision/history changed; backing remains pinned.");
             if (parent.LocalAuthorizationRevoked || parent.LocalReservationReleased || parent.ClosureTransitionInFlight ||
                 parent.ClosureState != PlatformExternalClosureState.Active || childRecord.TransitionInFlight ||
                 !PlatformGuestMemoryContract.ValidateRequest(request, childRecord.State).IsSuccess)
@@ -144,7 +168,9 @@ public sealed partial class PlatformAuthorityBridge
                         return KernelResult.Fail(KernelError.PlatformFaulted, "Original guest-map effect is unresolved.");
                     reservedMappingId = new(_nextGuestBindingId++);
                     invocation = new(new(childRecord, parent, originalRoot)
-                        { LocalMappingOwner = localMappingOwner, LocalMapping = localMapping }, request, backendEpoch);
+                        { LocalMappingOwner = localMappingOwner, LocalMapping = localMapping }, request, backendEpoch)
+                        { Lineage = new(sourceRevisions) };
+                    invocation.ReservedIdentity = reservedMappingId;
                     childRecord.GuestMapInvocations.Add(invocation);
                     return KernelResult.Ok();
                 }
@@ -154,13 +180,13 @@ public sealed partial class PlatformAuthorityBridge
         var final = admissionConsumer is null ? FinalAdmission() : admissionConsumer(FinalAdmission);
         if (!final.IsSuccess) return KernelResult<PlatformGuestMapping>.Fail(final.Error, final.Message!);
         PlatformAuthorityResult<PlatformProviderGuestRegionMappingLease> result;
-        try { result = provider.MapGuestRegion(request); }
+        try { result = _provider is IPlatformOriginalGuestMapProvider { SupportsOriginalGuestMapResolution: true } originalGuest
+            ? originalGuest.MapOriginalGuest(invocation.OriginalRequest) : provider.MapGuestRegion(request); }
         catch (Exception exception) when (exception is not StackOverflowException)
         {
             lock (_secureDomainLifecycleGate)
             {
-                childRecord.State = PlatformChildDomainState.Faulted;
-                parent.ClosureState = PlatformExternalClosureState.Faulted;
+                PinOriginalGuestMap(invocation);
             }
             return KernelResult<PlatformGuestMapping>.Fail(KernelError.PlatformFaulted,
                 $"Guest mapping may have taken effect without a receipt: {exception.Message}");
@@ -176,8 +202,7 @@ public sealed partial class PlatformAuthorityBridge
             {
                 lock (_secureDomainLifecycleGate)
                 {
-                    childRecord.State = PlatformChildDomainState.Faulted;
-                    parent.ClosureState = PlatformExternalClosureState.Faulted;
+                    PinOriginalGuestMap(invocation);
                 }
             }
             return FromProviderFailure<PlatformGuestMapping>(result.Status, result.Message);
@@ -190,21 +215,10 @@ public sealed partial class PlatformAuthorityBridge
             lock (_secureDomainLifecycleGate)
             {
                 parent.UnpublishedGuestMaps.Add(fact);
-                childRecord.State = PlatformChildDomainState.Faulted;
-                parent.ClosureState = PlatformExternalClosureState.Faulted;
+                PinOriginalGuestMap(invocation);
             }
-            try
-            {
-                var cleanup = provider.UnmapGuestRegion(result.Value!);
-                if (cleanup.IsSuccess && PlatformGuestMemoryContract.ValidateClosureReceipt(result.Value!, cleanup.Value!).IsSuccess)
-                {
-                    lock (_secureDomainLifecycleGate) fact.ReturnedClosureReceipt = cleanup.Value;
-                }
-            }
-            catch (Exception exception) when (exception is not StackOverflowException)
-            {
-                // Lost cleanup receipt cannot release the parent mapping.
-            }
+            // A malformed returned tuple is not continuity of this original request.
+            // Retain it; only original request resolution may identify the cleanup target.
             return KernelResult<PlatformGuestMapping>.Fail(KernelError.PlatformFaulted, leaseValidation.Message!);
         }
         PlatformGuestMapping mapping;
@@ -216,6 +230,7 @@ public sealed partial class PlatformAuthorityBridge
                 { AdmissionSource = invocation.Source };
             _guestBindings.Add(mapping.MappingId, knownRecord);
             _originalGuestOwners.Add(mapping.MappingId, knownRecord);
+            invocation.KnownMapping = knownRecord;
             invocation.Unresolved = false; // Exact known owner now retains this effect's lifetime.
             knownMapping = mapping;
         }
@@ -230,9 +245,7 @@ public sealed partial class PlatformAuthorityBridge
             var sourceValid = ValidateSource(source);
             if (BackendEpoch != backendEpoch || childRecord.State == PlatformChildDomainState.Faulted || parent.ClosureState == PlatformExternalClosureState.Faulted)
             {
-                knownRecord.Closure = PlatformExternalClosureState.Faulted;
-                childRecord.State = PlatformChildDomainState.Faulted;
-                parent.ClosureState = PlatformExternalClosureState.Faulted;
+                PinOriginalGuestMap(invocation);
                 return KernelResult<PlatformGuestMapping>.Fail(KernelError.PlatformFaulted,
                     "Guest mapping changed before local publication; parent remains pinned.");
             }
@@ -242,9 +255,7 @@ public sealed partial class PlatformAuthorityBridge
             {
                 if (sourceCommitConsumer is null)
                 {
-                    childRecord.State = PlatformChildDomainState.Faulted;
-                    parent.ClosureState = PlatformExternalClosureState.Faulted;
-                    knownRecord.Closure = PlatformExternalClosureState.Faulted;
+                    PinOriginalGuestMap(invocation);
                     return KernelResult<PlatformGuestMapping>.Fail(KernelError.PlatformFaulted,
                         "Parent permission changed during guest admission; exact known lease remains pinned.");
                 }
@@ -287,10 +298,26 @@ public sealed partial class PlatformAuthorityBridge
             lock (_secureDomainLifecycleGate)
             {
                 parent.PendingGuestMaps--;
-                childRecord.PendingChildEffects--;
+                foreach (var owner in sourceRevisions.Keys) owner.PendingChildEffects--;
             }
         }
     }
+
+    private KernelResult<Dictionary<ChildBindingRecord, long>> CaptureGuestEffectLineage(ChildBindingRecord child)
+    {
+        var captured = new Dictionary<ChildBindingRecord, long>();
+        for (ChildBindingRecord? current = child; current is not null; current = current.CreateParentChild)
+        {
+            if (captured.ContainsKey(current) || current.LifecycleRevisionExhausted || !HasCurrentChildCreateSources(current) ||
+                !HasOriginalNestedHistory(current) || current.TransitionInFlight || current.CloseInFlight)
+                return KernelResult<Dictionary<ChildBindingRecord, long>>.Fail(KernelError.PlatformFaulted, "Original guest lineage unavailable or pending.");
+            captured.Add(current, current.LifecycleRevision);
+        }
+        return KernelResult<Dictionary<ChildBindingRecord, long>>.Ok(captured);
+    }
+    private bool GuestEffectLineageCurrent(IReadOnlyDictionary<ChildBindingRecord, long> captured) => captured.All(pair =>
+        !pair.Key.LifecycleRevisionExhausted && pair.Key.LifecycleRevision == pair.Value &&
+        HasCurrentChildCreateSources(pair.Key) && HasOriginalNestedHistory(pair.Key));
 
     internal KernelResult CommitGuestLocalMappingSource(PlatformGuestMapping mapping,
         VirtualDomainAuthority.Record localOwner, GuestRegionMappingHandle localMapping, Func<KernelResult> commit)
@@ -392,11 +419,13 @@ public sealed partial class PlatformAuthorityBridge
 
     private bool HasUnresolvedGuestMapInvocation(MappingRecord parent) =>
         _originalChildOwners.Values.Concat(_childBindings.Values).Any(child =>
-            child.GuestMapInvocations.Any(fact => fact.Unresolved &&
+            child.GuestMapInvocations.Any(fact => (fact.Unresolved || fact.ResolutionInFlight) &&
                 fact.Source.Parent.Mapping.MappingId == parent.Mapping.MappingId));
 
     internal KernelResult UnmapChildGuestRegion(PlatformGuestMapping mapping, bool allowCommittedClosure = false)
     {
+        var releasedArtifacts = ReleaseArtifactsForGuestMapping(mapping);
+        if (!releasedArtifacts.IsSuccess) return releasedArtifacts;
         PlatformChildBinding? cleanupChild = null;
         lock (_secureDomainLifecycleGate)
         {
@@ -406,7 +435,7 @@ public sealed partial class PlatformAuthorityBridge
                 admitted.Child.State == PlatformChildDomainState.Faulted)
             {
                 if (guest.ClosureInFlight || guest.PendingExecutableEffects != 0 || guest.PendingSecureRegionEffects != 0 ||
-                    _executableArtifacts.Values.Any(artifact => artifact.Binding.GuestMapping == mapping))
+                    _originalExecutableArtifactOwners.Values.Any(artifact => !artifact.Released && artifact.Binding.GuestMapping == mapping))
                     return KernelResult.Fail(KernelError.PlatformBindingActive, "Guest cleanup dependencies remain pending.");
                 cleanupChild = admitted.Child.Binding;
             }
@@ -425,6 +454,9 @@ public sealed partial class PlatformAuthorityBridge
         PlatformBackendEpoch epoch;
         PlatformExternalClosureState originalClosure;
         GuestUnmapRefusalFact? refusal;
+        bool supportsOriginalUnmap;
+        try { supportsOriginalUnmap = _provider is IPlatformOriginalGuestUnmapProvider { SupportsOriginalGuestUnmapResolution: true }; }
+        catch { return KernelResult.Fail(KernelError.PlatformFaulted, "Guest resolution source unavailable."); }
         lock (_secureDomainLifecycleGate)
         {
             if (!_guestBindings.TryGetValue(mapping.MappingId, out record!))
@@ -440,9 +472,9 @@ public sealed partial class PlatformAuthorityBridge
                     return KernelResult.Fail(KernelError.PlatformFaulted, "Closed guest projection lacks exact original closure or has pending dependents.");
                 return allowCommittedClosure ? KernelResult.Ok() : KernelResult.Fail(KernelError.PlatformBindingRevoked, "Guest mapping is already closed.");
             }
-            if (record.Closure == PlatformExternalClosureState.Faulted)
+            if (record.Closure == PlatformExternalClosureState.Faulted && !HasOwnGuestUnmapFault(record))
                 return KernelResult.Fail(KernelError.PlatformFaulted, "Guest mapping remains quarantined.");
-            if (record.ClosureInFlight || record.Closure == PlatformExternalClosureState.Draining &&
+            if (record.ClosureInFlight || record.Closure == PlatformExternalClosureState.Draining && record.OriginalUnmap is not { Supports: true, Invoked: true } &&
                 record.LastClosureReceipt is null && record.LastUnmapRefusal is null)
                 return KernelResult.Fail(KernelError.PlatformBindingRevoked, "Guest closure is already in progress.");
             if (!_childBindings.TryGetValue(mapping.Child.BindingId, out child!) || child.Binding != mapping.Child ||
@@ -451,7 +483,7 @@ public sealed partial class PlatformAuthorityBridge
             if (!HasCurrentGuestAdmissionSources(record))
                 return KernelResult.Fail(KernelError.PlatformFaulted, "Original guest admission owners changed; unmap refused before reservation or effect.");
             if (record.PendingExecutableEffects != 0 || record.PendingSecureRegionEffects != 0 ||
-                _executableArtifacts.Values.Any(artifact => artifact.Binding.GuestMapping == mapping))
+                _originalExecutableArtifactOwners.Values.Any(artifact => !artifact.Released && artifact.Binding.GuestMapping == mapping))
                 return KernelResult.Fail(KernelError.PlatformBindingActive, "Guest dependent effects or artifact release remain pending.");
             if (_provider is not IPlatformGuestMemoryProvider)
                 return KernelResult.Fail(KernelError.PlatformUnsupported, "Guest-memory provider is unavailable.");
@@ -476,26 +508,47 @@ public sealed partial class PlatformAuthorityBridge
                 // this mapping is still Active. Recheck before staging/provider unmap.
                 if (record.Closure != originalClosure || record.PendingExecutableEffects != 0 ||
                     record.PendingSecureRegionEffects != 0 ||
-                    _executableArtifacts.Values.Any(artifact => artifact.Binding.GuestMapping == mapping))
+                    _originalExecutableArtifactOwners.Values.Any(artifact => !artifact.Released && artifact.Binding.GuestMapping == mapping))
                     return KernelResult.Fail(KernelError.PlatformBindingActive, "Guest dependent owner changed before unmap invocation.");
                 record.Closure = PlatformExternalClosureState.Draining;
+                record.OriginalUnmap ??= new(record, child, parent, supportsOriginalUnmap, originalClosure);
+                record.OriginalUnmap.Revision = record.LifecycleRevision;
+                record.OriginalUnmap.OwnFault = false;
                 record.LastUnmapRefusal = null;
             }
 
             if (record.LastClosureReceipt is null)
             {
                 PlatformAuthorityResult<PlatformGuestRegionMappingClosureReceipt> result;
-                try { result = ((IPlatformGuestMemoryProvider)_provider!).UnmapGuestRegion(record.ProviderLease); }
+                try
+                {
+                    var invocation = record.OriginalUnmap!;
+                    bool pure = invocation.Invoked;
+                    if (pure)
+                        result = invocation.Supports && _provider is IPlatformOriginalGuestUnmapProvider resolver
+                            ? resolver.ResolveOriginalGuestUnmap(record.ProviderLease)
+                            : PlatformAuthorityResult<PlatformGuestRegionMappingClosureReceipt>.Fail(PlatformAuthorityStatus.Faulted, "Original guest effect cannot be repeated.");
+                    else
+                    {
+                        lock (_secureDomainLifecycleGate) invocation.Invoked = true;
+                        result = ((IPlatformGuestMemoryProvider)_provider!).UnmapGuestRegion(record.ProviderLease);
+                    }
+                    lock (_secureDomainLifecycleGate)
+                    {
+                        if (pure) invocation.Resolution = result;
+                        else invocation.Raw = result;
+                    }
+                }
                 catch (Exception exception) when (exception is not StackOverflowException)
                 {
-                    lock (_secureDomainLifecycleGate) record.Closure = PlatformExternalClosureState.Faulted;
+                    lock (_secureDomainLifecycleGate) PinOriginalGuestUnmap(record);
                     return KernelResult.Fail(KernelError.PlatformFaulted, "Guest unmap outcome is unknown; reclaim remains pinned.");
                 }
                 if (result.Status == PlatformAuthorityStatus.NotAccepted)
                 {
                     lock (_secureDomainLifecycleGate)
                     {
-                        if (originalClosure != PlatformExternalClosureState.Active)
+                        if (originalClosure != PlatformExternalClosureState.Active && record.OriginalUnmap is not { Supports: true, OriginalState: PlatformExternalClosureState.Active })
                         {
                             record.Closure = PlatformExternalClosureState.Faulted;
                             return KernelResult.Fail(KernelError.PlatformFaulted, "Refused unmap has no original Active owner.");
@@ -521,7 +574,7 @@ public sealed partial class PlatformAuthorityBridge
                     if (result.IsSuccess) record.LastClosureReceipt = new(record.ProviderLease, epoch, result.Value!);
                     else
                     {
-                        record.Closure = PlatformExternalClosureState.Faulted;
+                        PinOriginalGuestUnmap(record);
                         return FromProviderFailure(result.Status, result.Message);
                     }
                 }
@@ -556,13 +609,14 @@ public sealed partial class PlatformAuthorityBridge
             refusal.AdmissionEpoch != epoch || !ReferenceEquals(refusal.Child, child) || !ReferenceEquals(refusal.Parent, parent) ||
             record.Closure != PlatformExternalClosureState.Draining || record.LastClosureReceipt is not null ||
             record.PendingExecutableEffects != 0 || record.PendingSecureRegionEffects != 0 ||
-            _executableArtifacts.Values.Any(artifact => artifact.Binding.GuestMapping == record.Mapping))
+            _originalExecutableArtifactOwners.Values.Any(artifact => !artifact.Released && artifact.Binding.GuestMapping == record.Mapping))
         {
             record.Closure = PlatformExternalClosureState.Faulted;
             return KernelResult.Fail(KernelError.PlatformFaulted, "Refused guest unmap owner changed; staged state cannot be restored.");
         }
         record.Closure = PlatformExternalClosureState.Active;
         record.LastUnmapRefusal = null;
+        record.OriginalUnmap = null;
         // Recovery performs no provider call and cannot advance the reclaim consumer.
         return FromProviderFailure(PlatformAuthorityStatus.NotAccepted, "Guest unmap was not invoked; fresh unmap admission is required.");
     }
@@ -592,9 +646,16 @@ public sealed partial class PlatformAuthorityBridge
             record.ProviderLease.ChildLease != child.ProviderLease || record.ProviderLease.ParentMappingLease != parent.ProviderLease ||
             child.State is PlatformChildDomainState.Faulted or PlatformChildDomainState.Closed ||
             parent.ClosureState == PlatformExternalClosureState.Faulted || parent.LocalReservationReleased ||
-            record.Closure == PlatformExternalClosureState.Faulted)
+            record.Closure == PlatformExternalClosureState.Faulted && !HasOwnGuestUnmapFault(record) ||
+            record.OriginalUnmap is { Supports: true } original &&
+            (!ReferenceEquals(original.OriginalOwner, original) || !ReferenceEquals(original.Guest, record) ||
+             !ReferenceEquals(original.Child, child) || !ReferenceEquals(original.Parent, parent) ||
+             child.LifecycleRevisionExhausted || parent.LifecycleRevisionExhausted ||
+            child.LifecycleRevision != original.ChildRevision || parent.LifecycleRevision != original.ParentRevision ||
+             record.LifecycleRevisionExhausted || record.Closure == PlatformExternalClosureState.Draining && record.LifecycleRevision != original.Revision))
         {
-            record.Closure = PlatformExternalClosureState.Faulted;
+            if (record.OriginalUnmap is { Supports: true }) PinOriginalGuestUnmap(record);
+            else record.Closure = PlatformExternalClosureState.Faulted;
             return KernelResult.Fail(KernelError.PlatformFaulted, "Exact guest source/owner continuity changed; original receipt and parent pin are retained.");
         }
         return ValidateMappingIdentity(mapping.ParentMapping, mapping.Child.ParentBinding.Subject);

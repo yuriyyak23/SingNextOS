@@ -107,7 +107,19 @@ public sealed partial class PlatformAuthorityBridge
                 reply = hasKnown ? PlatformAuthorityResult<PlatformProviderDmaCompletionEvidence>.Ok(record.KnownCompletionEvidence!.Value) : default;
             }
             if (!hasKnown)
-                reply = completionProvider.ObserveDmaCompletion(record.ProviderSubmission);
+            {
+                OriginalCopyInvocation? original;
+                lock (_dmaCompletionGate)
+                {
+                    original = grantRecord.OriginalCopy;
+                    if (_provider is IPlatformOriginalDmaCopyCompletionProvider && original is not null &&
+                        (ReferenceEquals(original.AcceptedSource,record) || ReferenceEquals(original.AcceptedDestination,record))) record.OriginalCompletionLookupInvoked = true;
+                }
+                reply = record.OriginalCompletionLookupInvoked && original is not null ?
+                    ((IPlatformOriginalDmaCopyCompletionProvider)_provider).ObserveOriginalDmaCopyCompletion(original.Request,record.ProviderSubmission) :
+                    completionProvider.ObserveDmaCompletion(record.ProviderSubmission);
+            }
+            lock (_dmaCompletionGate) record.RawCompletion = reply; // Retain before callbacks and validation/publication.
             if (reply.IsSuccess)
             {
                 var valid = PlatformDmaCompletionContract.ValidateEvidence(record.ProviderSubmission, reply.Value!);
@@ -150,7 +162,8 @@ public sealed partial class PlatformAuthorityBridge
                     if (reply.Status is PlatformAuthorityStatus.Faulted or PlatformAuthorityStatus.Stale or
                         PlatformAuthorityStatus.Revoked or PlatformAuthorityStatus.WrongDomain)
                     {
-                        FaultPinDmaSubmissionLocked(submission.GrantId);
+                        if (reply.Status == PlatformAuthorityStatus.Faulted) PinOriginalCopyCompletionLookupLocked(grantRecord,record);
+                        else FaultPinDmaSubmissionLocked(submission.GrantId);
                         return KernelResult<PlatformDmaCompletionEvidence>.Fail(KernelError.PlatformFaulted,
                             reply.Message ?? "Provider completion lost exact lifetime.");
                     }
@@ -177,7 +190,7 @@ public sealed partial class PlatformAuthorityBridge
         }
         catch (Exception exception) when (exception is not StackOverflowException)
         {
-            lock (_dmaCompletionGate) FaultPinDmaSubmissionLocked(submission.GrantId);
+            lock (_dmaCompletionGate) PinOriginalCopyCompletionLookupLocked(grantRecord,record);
             return KernelResult<PlatformDmaCompletionEvidence>.Fail(KernelError.PlatformFaulted,
                 $"Completion outcome unknown; mapping pinned: {exception.GetType().Name}.");
         }

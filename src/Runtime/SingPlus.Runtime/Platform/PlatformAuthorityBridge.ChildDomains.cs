@@ -34,16 +34,37 @@ public readonly record struct PlatformExecutableArtifactBinding(
 
 public sealed partial class PlatformAuthorityBridge
 {
-    private sealed class ChildCreateInvocationFact(DomainRecord source, PlatformChildDomainIntent intent)
+    private sealed class ChildCreateInvocationFact
     {
-        public DomainRecord Source { get; } = source;
-        public PlatformChildDomainIntent Intent { get; } = intent;
+        public ChildCreateInvocationFact(DomainRecord source, PlatformChildDomainIntent intent, PlatformChildBindingId identity)
+        { OriginalOwner = this; Source = source; Intent = intent; ReservedIdentity = identity; OriginalRequest = new(source.ProviderLease, intent); Revision = source.AuthorityRevision; }
+        public ChildCreateInvocationFact OriginalOwner { get; }
+        public DomainRecord Source { get; }
+        public PlatformChildDomainIntent Intent { get; }
+        public PlatformChildBindingId ReservedIdentity { get; }
+        public PlatformOriginalChildCreateRequest OriginalRequest { get; }
         public PlatformAuthorityResult<PlatformProviderChildDomainLease>? Observation { get; set; }
+        public PlatformAuthorityResult<PlatformProviderChildDomainLease>? Resolution { get; set; }
+        public ChildBindingRecord? Child { get; set; }
+        public long Revision { get; }
+        public bool OwnFault, InFlight;
+        public long FaultRevision;
     }
-    private sealed class NestedCreateInvocationFact(ChildBindingRecord source, PlatformNestedDomainRequest request)
+    private sealed class NestedCreateInvocationFact
     {
-        public ChildBindingRecord Source { get; } = source;
-        public PlatformNestedDomainRequest Request { get; } = request;
+        public NestedCreateInvocationFact(ChildBindingRecord source, PlatformNestedDomainRequest request)
+        { OriginalOwner = this; Source = source; Request = request; OriginalRequest = new(request); AdmittedState = source.State; AdmittedRevision = source.LifecycleRevision; OriginalRoot = source.CreateRoot; AdmissionEpoch = source.CreateRoot?.BackendEpoch ?? default; }
+        public NestedCreateInvocationFact OriginalOwner { get; }
+        public ChildBindingRecord Source { get; }
+        public PlatformNestedDomainRequest Request { get; }
+        public PlatformOriginalNestedDomainRequest OriginalRequest { get; }
+        public PlatformChildDomainState AdmittedState { get; }
+        public long AdmittedRevision { get; }
+        public long? OwnFaultRevision { get; set; }
+        public PlatformOriginalNestedDomainClosure? CleanupRaw { get; set; }
+        public bool CleanupInFlight { get; set; }
+        public DomainRecord? OriginalRoot { get; }
+        public PlatformBackendEpoch AdmissionEpoch { get; }
         public PlatformAuthorityResult<PlatformProviderNestedDomainLease>? Observation { get; set; }
     }
     private sealed class ChildBindingRecord(
@@ -56,16 +77,31 @@ public sealed partial class PlatformAuthorityBridge
         public PlatformChildBinding Binding { get; } = binding;
         public PlatformProviderChildDomainLease ProviderLease { get; } = providerLease;
         public PlatformChildBinding? ParentChild { get; } = parentChild;
-        public PlatformChildDomainState State { get; set; } = PlatformChildDomainState.Created;
+        private PlatformChildDomainState _state = PlatformChildDomainState.Created;
+        private long _lifecycleRevision;
+        private int _lifecycleRevisionExhausted;
+        public long LifecycleRevision => Volatile.Read(ref _lifecycleRevision);
+        public bool LifecycleRevisionExhausted => Volatile.Read(ref _lifecycleRevisionExhausted) != 0;
+        public PlatformChildDomainState State
+        {
+            get => _state;
+            set { AdvanceExecutableSourceRevision(ref _lifecycleRevision, ref _lifecycleRevisionExhausted); _state = value; }
+        }
         public bool CreationPublished { get; set; } = true;
         public PlatformAuthorityResult<PlatformProviderChildDomainLease>? CreateObservation { get; set; }
         public ulong LastEventSequence { get; set; }
         public ulong LastTrapSequence { get; set; }
         // Original provider outcomes, not permission, sequence validation or closure truth.
         public List<ChildDeliveryInvocation<PlatformVirtualEventRequest, PlatformVirtualEventReceipt>> EventInvocations { get; } = [];
+        public ulong EventsIssued { get; set; }
+        public ulong EventsConsumed { get; set; }
+        public bool EventCleanupOnly { get; set; }
+        public bool NestedCleanupOnly { get; set; }
         public List<ChildDeliveryInvocation<PlatformProviderChildDomainLease, PlatformVirtualTrapEvidence>> TrapInvocations { get; } = [];
         public bool NestedCreateMayHaveEffect { get; set; }
         public List<NestedCreateInvocationFact> NestedCreateInvocations { get; } = [];
+        public ulong NestedCreatesIssued { get; set; }
+        public ulong NestedCreatesConsumed { get; set; }
         public PlatformAuthorityResult<PlatformProviderNestedDomainLease>? NestedCreateObservation { get; set; }
         public List<UnpublishedNestedCreateReceipt> UnpublishedNestedCreates { get; } = [];
         public bool TransitionInFlight { get; set; }
@@ -73,6 +109,7 @@ public sealed partial class PlatformAuthorityBridge
         public PlatformAuthorityResult? TransitionObservation { get; set; }
         public bool TransitionPublicationRefused { get; set; }
         public bool CloseInvocationAttempted { get; set; }
+        public OriginalChildCloseInvocation? OriginalCloseInvocation { get; set; }
         public PlatformBackendEpoch TransitionEpoch { get; set; }
         public PlatformChildDomainState TransitionAdmittedState { get; set; }
         public bool CloseInFlight { get; set; }
@@ -96,11 +133,21 @@ public sealed partial class PlatformAuthorityBridge
         PlatformGuestMapping mapping,
         PlatformProviderGuestRegionMappingLease providerLease)
     {
+        public OriginalGuestUnmapInvocation? OriginalUnmap { get; set; }
         public GuestAdmissionSource? AdmissionSource { get; init; }
         public bool AdmissionPublished { get; set; }
         public PlatformGuestMapping Mapping { get; } = mapping;
         public PlatformProviderGuestRegionMappingLease ProviderLease { get; } = providerLease;
-        public PlatformExternalClosureState Closure { get; set; } = PlatformExternalClosureState.Active;
+        private PlatformExternalClosureState _closure = PlatformExternalClosureState.Active;
+        private long _lifecycleRevision;
+        private int _lifecycleRevisionExhausted;
+        public long LifecycleRevision => Volatile.Read(ref _lifecycleRevision);
+        public bool LifecycleRevisionExhausted => Volatile.Read(ref _lifecycleRevisionExhausted) != 0;
+        public PlatformExternalClosureState Closure
+        {
+            get => _closure;
+            set { AdvanceExecutableSourceRevision(ref _lifecycleRevision, ref _lifecycleRevisionExhausted); _closure = value; }
+        }
         public int PendingExecutableEffects { get; set; }
         public int PendingSecureRegionEffects { get; set; }
         public GuestClosureReceiptFact? LastClosureReceipt { get; set; }
@@ -116,15 +163,54 @@ public sealed partial class PlatformAuthorityBridge
     private sealed record GuestUnmapRefusalFact(PlatformProviderGuestRegionMappingLease AdmittedLease,
         PlatformBackendEpoch AdmissionEpoch, ChildBindingRecord Child, MappingRecord Parent);
 
-    private sealed class VirtualIoBindingRecord(
-        PlatformVirtualIoBinding binding,
-        PlatformProviderVirtualIoLease providerLease)
+    private sealed class VirtualIoBindInvocationFact
     {
-        public PlatformVirtualIoBinding Binding { get; } = binding;
-        public PlatformProviderVirtualIoLease ProviderLease { get; } = providerLease;
+        public VirtualIoBindInvocationFact(ChildBindingRecord child, DeviceLeaseRecord device, DomainRecord root,
+            PlatformVirtualIoRequest request, PlatformBackendEpoch epoch)
+        { OriginalOwner = this; Child = child; Device = device; Root = root; Request = request; Epoch = epoch; OriginalRequest = new(Guid.NewGuid(), request); }
+        public VirtualIoBindInvocationFact OriginalOwner { get; }
+        public ChildBindingRecord Child { get; }
+        public DeviceLeaseRecord Device { get; }
+        public DomainRecord Root { get; }
+        public PlatformVirtualIoRequest Request { get; }
+        public PlatformBackendEpoch Epoch { get; }
+        public PlatformAuthorityResult<PlatformProviderVirtualIoLease>? Observation { get; set; }
+        public PlatformOriginalVirtualIoBindRequest OriginalRequest { get; }
+        public IPlatformOriginalVirtualIoBindProvider? OriginalProvider { get; set; }
+        public PlatformAuthorityResult<PlatformOriginalVirtualIoBindCleanupClosure>? CleanupRaw { get; set; }
+        public bool CleanupInFlight { get; set; }
+        public bool Consumed { get; set; }
+    }
+    private sealed class VirtualIoBindingRecord
+    {
+        public VirtualIoBindingRecord(PlatformVirtualIoBinding binding, PlatformProviderVirtualIoLease providerLease, VirtualIoBindInvocationFact admission)
+        { OriginalOwner = this; Binding = binding; ProviderLease = providerLease; Admission = admission; }
+        public VirtualIoBindingRecord OriginalOwner { get; }
+        public PlatformVirtualIoBinding Binding { get; }
+        public PlatformProviderVirtualIoLease ProviderLease { get; }
+        public VirtualIoBindInvocationFact Admission { get; }
         public PlatformExternalClosureState Closure { get; set; } = PlatformExternalClosureState.Active;
         public VirtualIoClosureReceiptFact? LastClosureReceipt { get; set; }
+        public bool TransferInFlight { get; set; }
+        public List<BridgeIoTransferFact> Transfers { get; } = [];
+        public ulong TransfersIssued { get; set; }
         public bool ClosureInFlight { get; set; }
+        public bool CloseInvoked { get; set; }
+        public bool ClosureConsumed { get; set; }
+        public VirtualIoCloseInvocationFact? CloseInvocation { get; set; }
+    }
+    private sealed class VirtualIoCloseInvocationFact
+    {
+        public VirtualIoCloseInvocationFact(VirtualIoBindingRecord source, PlatformBackendEpoch epoch)
+        { OriginalOwner = this; Source = source; Epoch = epoch; AdmittedLease = source.ProviderLease; Request = new(Guid.NewGuid(), source.ProviderLease); }
+        public VirtualIoCloseInvocationFact OriginalOwner { get; }
+        public VirtualIoBindingRecord Source { get; }
+        public PlatformBackendEpoch Epoch { get; }
+        public PlatformProviderVirtualIoLease AdmittedLease { get; }
+        public PlatformOriginalVirtualIoCloseRequest Request { get; }
+        public IPlatformOriginalVirtualIoCloseProvider? ContinuationProvider { get; set; }
+        public PlatformAuthorityResult<PlatformVirtualIoClosureReceipt>? Observation { get; set; }
+        public bool ValidatedClosed { get; set; }
     }
     // Returned cleanup fact only; exact validation and continuity still govern closure.
     private sealed record VirtualIoClosureReceiptFact(PlatformProviderVirtualIoLease AdmittedLease,
@@ -136,11 +222,21 @@ public sealed partial class PlatformAuthorityBridge
         PlatformExecutableArtifactReceipt providerReceipt)
     {
         public PlatformExecutableArtifactBinding Binding { get; } = binding;
-        public PlatformExecutableArtifactReceipt ProviderReceipt { get; } = providerReceipt;
+        public PlatformExecutableArtifactReceipt ProviderReceipt { get; set; } = providerReceipt;
+        public bool AdmissionPublished { get; set; }
+        public ExecutableBindInvocationFact? BindInvocation { get; set; }
         public ExecutableArtifactSource? AdmissionSource { get; init; }
         public bool Started { get; set; }
         public PlatformChildExecutionReceipt? ExecutionReceipt { get; set; }
+        public PlatformAuthorityResult<PlatformExecutionTerminalObservation>? TerminalObservation { get; set; }
         public bool StartInFlight { get; set; }
+        public ExecutableStartInvocationFact? StartInvocation { get; set; }
+        public PlatformArtifactReleaseRequest? ReleaseRequest { get; set; }
+        public PlatformAuthorityResult<PlatformArtifactReleaseReceipt>? ReleaseObservation { get; set; }
+        public PlatformAuthorityResult<PlatformArtifactReleaseReceipt>? ReleaseResolutionObservation { get; set; }
+        public bool ReleaseInFlight { get; set; }
+        public bool ReleaseInvoked { get; set; }
+        public bool Released { get; set; }
     }
 
     private readonly Dictionary<PlatformChildBindingId, ChildBindingRecord> _childBindings = [];
@@ -149,7 +245,13 @@ public sealed partial class PlatformAuthorityBridge
     // Retains the same authoritative lifetime record independently of routing.
     private readonly Dictionary<PlatformGuestMappingId, GuestBindingRecord> _originalGuestOwners = [];
     private readonly Dictionary<PlatformVirtualIoBindingId, VirtualIoBindingRecord> _virtualIoBindings = [];
+    private readonly List<VirtualIoBindingRecord> _virtualIoOwners = [];
+    private bool IsOriginalVirtualIo(VirtualIoBindingRecord record) => ReferenceEquals(record.OriginalOwner, record) &&
+        _virtualIoOwners.Any(x => ReferenceEquals(x, record)) &&
+        _virtualIoBindings.TryGetValue(record.Binding.BindingId, out var route) && ReferenceEquals(route, record);
+    private static bool HasConsumedVirtualIo(VirtualIoBindingRecord record) => ReferenceEquals(record.OriginalOwner, record) && record.ClosureConsumed;
     private readonly Dictionary<PlatformExecutableArtifactBindingId, ExecutableArtifactRecord> _executableArtifacts = [];
+    private readonly Dictionary<PlatformExecutableArtifactBindingId, ExecutableArtifactRecord> _originalExecutableArtifactOwners = [];
     private ulong _nextChildBindingId = 1;
     private ulong _nextGuestBindingId = 1;
     private ulong _nextVirtualIoBindingId = 1;
@@ -178,10 +280,13 @@ public sealed partial class PlatformAuthorityBridge
         ReadOnlyMemory<byte> immutablePackage, int maximumExecutionSteps,
         Func<Func<KernelResult>, KernelResult>? admissionConsumer = null,
         Func<Func<KernelResult>, KernelResult>? sourceCommitConsumer = null,
-        Func<PlatformExecutableArtifactBinding, Func<Func<KernelResult>, KernelResult>, KernelResult>? completionConsumer = null)
+        Func<PlatformExecutableArtifactBinding, Func<Func<KernelResult>, KernelResult>, KernelResult>? completionConsumer = null,
+        ulong maximumPrivateDataBytes = 0)
     {
         if (_provider is not IPlatformChildExecutionProvider provider)
             return KernelResult<PlatformExecutableArtifactBinding>.Fail(KernelError.PlatformUnsupported, "Executable artifact provider is unavailable.");
+        if (maximumPrivateDataBytes != 0 && _provider is not IPlatformExecutablePrivateDataQuotaProvider)
+            return KernelResult<PlatformExecutableArtifactBinding>.Fail(KernelError.PlatformUnsupported, "Private data quota provider unavailable before artifact admission.");
         ChildBindingRecord child;
         GuestBindingRecord guest;
         MappingRecord parent;
@@ -194,7 +299,7 @@ public sealed partial class PlatformAuthorityBridge
                 guestMapping.Child != childBinding || !_mappings.TryGetValue(guestMapping.ParentMapping.MappingId, out parent!))
                 return KernelResult<PlatformExecutableArtifactBinding>.Fail(KernelError.StaleGeneration, "Exact executable guest mapping is absent.");
         }
-        var request = new PlatformExecutableArtifactRequest(child.ProviderLease, guest.ProviderLease, immutablePackage, maximumExecutionSteps);
+        var request = new PlatformExecutableArtifactRequest(child.ProviderLease, guest.ProviderLease, immutablePackage, maximumExecutionSteps) { MaximumPrivateDataBytes = maximumPrivateDataBytes };
         var valid = PlatformChildExecutionContract.ValidateRequest(request);
         if (!valid.IsSuccess) return FromProviderFailure<PlatformExecutableArtifactBinding>(valid.Status, valid.Message);
         // Capture caller memory outside owners; provider receives the exact private package.
@@ -204,12 +309,20 @@ public sealed partial class PlatformAuthorityBridge
 
         PlatformBackendEpoch backendEpoch = default;
         PlatformExecutableArtifactBinding binding = default;
+        ExecutableArtifactRecord artifact = null!;
+        ExecutableBindInvocationFact bindInvocation = null!;
+        Dictionary<ChildBindingRecord, long> artifactLineage = null!;
         KernelResult Begin()
         {
             lock (_secureDomainLifecycleGate)
             {
                 var current = ValidateExecutableInputs(child, guest, parent);
                 if (!current.IsSuccess) return current;
+                var captured = CaptureGuestEffectLineage(child);
+                if (!captured.IsSuccess) return KernelResult.Fail(captured.Error, captured.Message!);
+                artifactLineage = captured.Value!;
+                if (artifactLineage.Keys.Any(source => source.PendingChildEffects != 0))
+                    return KernelResult.Fail(KernelError.PlatformBindingActive, "Artifact ancestor effect is already pending.");
                 if (child.PendingChildEffects != 0 || guest.PendingExecutableEffects != 0 ||
                     _executableArtifacts.Values.Any(x => x.Binding.GuestMapping == guestMapping))
                     return KernelResult.Fail(KernelError.PlatformBindingActive, "Executable guest already has pending or retained artifact admission.");
@@ -219,8 +332,14 @@ public sealed partial class PlatformAuthorityBridge
                 {
                     originalRoot = _domains[childBinding.ParentBinding.BindingId];
                     binding = new(new(_nextExecutableArtifactBindingId++), new(1), childBinding, guestMapping);
+                    var admittedSource = new ExecutableArtifactSource(child, guest, parent, originalRoot);
+                    bindInvocation = new(request, admittedSource);
+                    foreach (var pair in artifactLineage.Where(pair => !ReferenceEquals(pair.Key, child))) bindInvocation.Ancestors.Add(pair.Key, pair.Value);
+                    artifact = new(binding, default) { AdmissionSource = admittedSource, BindInvocation = bindInvocation };
+                    _originalExecutableArtifactOwners.Add(binding.BindingId, artifact);
+                    _executableArtifacts.Add(binding.BindingId, artifact);
                     guest.PendingExecutableEffects++;
-                    child.PendingChildEffects++;
+                    foreach (var source in artifactLineage.Keys) source.PendingChildEffects++;
                     backendEpoch = BackendEpoch;
                     return KernelResult.Ok();
                 }
@@ -233,6 +352,8 @@ public sealed partial class PlatformAuthorityBridge
         {
             KernelResult ValidateSource(PlatformProviderIncarnation source)
             {
+                if (!GuestEffectLineageCurrent(artifactLineage))
+                    return KernelResult.Fail(KernelError.PlatformFaulted, "Original artifact lineage changed before effect/publication.");
                 if (source.Value == 0 || source != parent.ProviderIncarnation || source != originalRoot.ProviderIncarnation ||
                     BackendEpoch != backendEpoch || parent.BackendEpoch != backendEpoch || originalRoot.BackendEpoch != backendEpoch ||
                     _backendEpochExhausted || !TryGetCanonicalRootRecord(childBinding.ParentBinding.BindingId, out var root) ||
@@ -262,24 +383,33 @@ public sealed partial class PlatformAuthorityBridge
             }
             var final = admissionConsumer is null ? FinalAdmission() : admissionConsumer(FinalAdmission);
             if (!final.IsSuccess) return KernelResult<PlatformExecutableArtifactBinding>.Fail(final.Error, final.Message!);
+            lock (_secureDomainLifecycleGate)
+            {
+                if (!ReferenceEquals(artifact.BindInvocation, bindInvocation))
+                    return KernelResult<PlatformExecutableArtifactBinding>.Fail(KernelError.PlatformFaulted, "Original Bind invocation owner changed before effect.");
+                bindInvocation.Invoked = true;
+            }
             var result = provider.BindExecutableArtifact(request);
+            lock (_secureDomainLifecycleGate)
+            {
+                bindInvocation.Observation = result;
+                if (result.Status == PlatformAuthorityStatus.NotAccepted) bindInvocation.Invoked = false;
+            }
             if (!result.IsSuccess)
             {
-                if (result.Status != PlatformAuthorityStatus.NotAccepted) FaultPinExecutableArtifactDependencies(child, guest, parent);
+                if (result.Status != PlatformAuthorityStatus.NotAccepted) FaultPinExecutableArtifactDependencies(child, guest, parent, artifact);
                 return FromProviderFailure<PlatformExecutableArtifactBinding>(result.Status, result.Message);
             }
             var exact = PlatformChildExecutionContract.ValidateAdmissionReceipt(request, result.Value!);
             if (!exact.IsSuccess || !string.Equals(result.Value!.ContentDigest, digest, StringComparison.Ordinal))
             {
-                FaultPinExecutableArtifactDependencies(child, guest, parent);
+                FaultPinExecutableArtifactDependencies(child, guest, parent, artifact);
                 return KernelResult<PlatformExecutableArtifactBinding>.Fail(KernelError.PlatformFaulted, "Executable receipt does not identify the exact captured package/dependency tuple.");
             }
-            ExecutableArtifactRecord artifact;
             lock (_secureDomainLifecycleGate)
             {
                 // Known source-tuple receipt is retained before mutable permission checks.
-                artifact = new(binding, result.Value) { AdmissionSource = new(child, guest, parent, originalRoot) };
-                _executableArtifacts.Add(binding.BindingId, artifact);
+                artifact.ProviderReceipt = result.Value;
             }
             KernelResult continuity;
             try
@@ -290,7 +420,7 @@ public sealed partial class PlatformAuthorityBridge
                     continuity = ValidateSource(source);
                     if (!continuity.IsSuccess)
                     {
-                        FaultPinExecutableArtifactDependencies(child, guest, parent);
+                        FaultPinExecutableArtifactDependencies(child, guest, parent, artifact);
                         continuity = KernelResult.Fail(KernelError.PlatformFaulted, "Executable admission lost exact dependency continuity; receipt retained.");
                     }
                 }
@@ -313,24 +443,35 @@ public sealed partial class PlatformAuthorityBridge
                 }
             }
             var completed = completionConsumer is null ? continuity : completionConsumer(binding, CommitCurrent);
+            lock (_secureDomainLifecycleGate) artifact.AdmissionPublished = completed.IsSuccess;
             return completed.IsSuccess ? KernelResult<PlatformExecutableArtifactBinding>.Ok(binding) :
                 KernelResult<PlatformExecutableArtifactBinding>.Fail(completed.Error, completed.Message!);
         }
         catch (Exception exception) when (exception is not StackOverflowException)
         {
-            FaultPinExecutableArtifactDependencies(child, guest, parent);
+            FaultPinExecutableArtifactDependencies(child, guest, parent, artifact);
             return KernelResult<PlatformExecutableArtifactBinding>.Fail(KernelError.PlatformFaulted, $"Executable admission may have taken effect without exact publication: {exception.Message}");
         }
         finally
         {
-            lock (_secureDomainLifecycleGate) { guest.PendingExecutableEffects--; child.PendingChildEffects--; }
+            lock (_secureDomainLifecycleGate)
+            {
+                guest.PendingExecutableEffects--;
+                foreach (var source in artifactLineage.Keys) source.PendingChildEffects--;
+                if (!bindInvocation.Invoked)
+                {
+                    _originalExecutableArtifactOwners.Remove(binding.BindingId);
+                    if (_executableArtifacts.TryGetValue(binding.BindingId, out var route) && ReferenceEquals(route, artifact)) _executableArtifacts.Remove(binding.BindingId);
+                }
+            }
         }
     }
 
     internal KernelResult StartChildExecutableArtifact(PlatformExecutableArtifactBinding binding,
         Func<Func<KernelResult>, KernelResult>? admissionConsumer = null,
         Func<Func<KernelResult>, KernelResult>? sourceCommitConsumer = null,
-        Func<Func<Func<KernelResult>, KernelResult>, KernelResult>? completionConsumer = null)
+        Func<Func<Func<KernelResult>, KernelResult>, KernelResult>? completionConsumer = null,
+        Func<PlatformExecutionTerminalKind?, Func<Func<KernelResult>, KernelResult>, KernelResult>? terminalCompletionConsumer = null)
     {
         if (_provider is not IPlatformChildExecutionProvider provider)
             return KernelResult.Fail(KernelError.PlatformUnsupported, "Executable artifact provider is unavailable.");
@@ -358,13 +499,16 @@ public sealed partial class PlatformAuthorityBridge
                 return KernelResult.Fail(KernelError.PlatformFaulted, "Original artifact admission owners changed; start refused before reservation or effect.");
         }
         DomainRecord originalRoot = null!;
+        Dictionary<ChildBindingRecord, long> startLineage = [];
 
         PlatformChildExecutionStartRequest request = default;
         PlatformBackendEpoch backendEpoch = default;
+        bool startPending = false;
         KernelResult Begin()
         {
             lock (_secureDomainLifecycleGate)
             {
+                if (startPending) return KernelResult.Fail(KernelError.PlatformBindingActive, "Original Start admission cannot reenter.");
                 var current = ValidateExecutableInputs(child, guest, parent);
                 if (!current.IsSuccess) return current;
                 if (!_executableArtifacts.TryGetValue(binding.BindingId, out var saved) || !ReferenceEquals(saved, artifact) ||
@@ -372,7 +516,16 @@ public sealed partial class PlatformAuthorityBridge
                     !ReferenceEquals(guest, capturedSource.Guest) || !ReferenceEquals(parent, capturedSource.Parent) ||
                     !TryGetCanonicalRootRecord(binding.Child.ParentBinding.BindingId, out var root) || !ReferenceEquals(root, capturedSource.Root))
                     return KernelResult.Fail(KernelError.StaleGeneration, "Original executable artifact owners changed.");
-                if (artifact.Started) return KernelResult.Fail(KernelError.PlatformDenied, "Executable artifact was already started.");
+                if (!artifact.AdmissionPublished || artifact.Started || artifact.StartInvocation is { Invoked: true })
+                    return KernelResult.Fail(KernelError.PlatformDenied, "Executable artifact start was already invoked or remains uncertain.");
+                if (artifact.ReleaseRequest is not null || artifact.Released ||
+                    !_originalExecutableArtifactOwners.TryGetValue(binding.BindingId, out var originalArtifact) || !ReferenceEquals(originalArtifact, artifact))
+                    return KernelResult.Fail(KernelError.PlatformFaulted, "Original artifact is released, release-pending or routed to a foreign owner.");
+                var capturedLineage = CaptureGuestEffectLineage(child);
+                if (!capturedLineage.IsSuccess) return KernelResult.Fail(capturedLineage.Error, capturedLineage.Message!);
+                startLineage = capturedLineage.Value!;
+                if (startLineage.Keys.Any(source => source.PendingChildEffects != 0))
+                    return KernelResult.Fail(KernelError.PlatformBindingActive, "Original Start ancestor effect is pending.");
                 if (artifact.StartInFlight || child.PendingChildEffects != 0 || guest.PendingExecutableEffects != 0)
                     return KernelResult.Fail(KernelError.PlatformBindingActive, "Executable artifact was started or an effect is pending.");
                 if (_nextChildStartOperationId == ulong.MaxValue)
@@ -382,24 +535,49 @@ public sealed partial class PlatformAuthorityBridge
                 if (!valid.IsSuccess) return FromProviderFailure(valid.Status, valid.Message);
                 KernelResult Commit()
                 {
+                    if (startPending) return KernelResult.Fail(KernelError.PlatformBindingActive, "Original Start admission is already committed.");
                     originalRoot = _domains[binding.Child.ParentBinding.BindingId];
                     _nextChildStartOperationId++;
                     guest.PendingExecutableEffects++;
-                    child.PendingChildEffects++;
+                    foreach (var source in startLineage.Keys) source.PendingChildEffects++;
                     artifact.StartInFlight = true;
+                    artifact.StartInvocation = new(request, capturedSource);
+                    foreach (var pair in startLineage.Where(pair => !ReferenceEquals(pair.Key, child))) artifact.StartInvocation.Ancestors.Add(pair.Key, pair.Value);
                     backendEpoch = BackendEpoch;
+                    startPending = true;
                     return KernelResult.Ok();
                 }
                 return sourceCommitConsumer is null ? Commit() : sourceCommitConsumer(Commit);
             }
         }
-        var admitted = admissionConsumer is null ? Begin() : admissionConsumer(Begin);
-        if (!admitted.IsSuccess) return admitted;
+        void EndStart()
+        {
+            lock (_secureDomainLifecycleGate)
+            {
+                if (!startPending) return;
+                guest.PendingExecutableEffects--;
+                foreach (var source in startLineage.Keys) source.PendingChildEffects--;
+                artifact.StartInFlight = false;
+                startPending = false;
+            }
+        }
+        KernelResult admitted;
+        try { admitted = admissionConsumer is null ? Begin() : admissionConsumer(Begin); }
+        catch (Exception exception) when (exception is not StackOverflowException)
+        {
+            EndStart();
+            return KernelResult.Fail(KernelError.PlatformFaulted, "Original Start admission callback failed before invocation: " + exception.GetType().Name);
+        }
+        if (!admitted.IsSuccess || !startPending)
+        {
+            EndStart();
+            return admitted.IsSuccess ? KernelResult.Fail(KernelError.PlatformFaulted, "Original Start admission was not committed.") : admitted;
+        }
         try
         {
             KernelResult ValidateSource(PlatformProviderIncarnation source)
             {
-                if (source.Value == 0 || source != parent.ProviderIncarnation || source != originalRoot.ProviderIncarnation ||
+                if (!GuestEffectLineageCurrent(startLineage) || source.Value == 0 || source != parent.ProviderIncarnation || source != originalRoot.ProviderIncarnation ||
                     BackendEpoch != backendEpoch || parent.BackendEpoch != backendEpoch || originalRoot.BackendEpoch != backendEpoch ||
                     _backendEpochExhausted || !TryGetCanonicalRootRecord(binding.Child.ParentBinding.BindingId, out var root) ||
                     !ReferenceEquals(root, originalRoot) || root.Binding != binding.Child.ParentBinding ||
@@ -408,7 +586,7 @@ public sealed partial class PlatformAuthorityBridge
                     !_executableArtifacts.TryGetValue(binding.BindingId, out var saved) || !ReferenceEquals(saved, artifact) ||
                     artifact.Binding != binding || artifact.ProviderReceipt != request.Artifact || !artifact.StartInFlight)
                 {
-                    FaultPinExecutableArtifactDependencies(child, guest, parent);
+                    FaultPinExecutableArtifactDependencies(child, guest, parent, artifact);
                     QuarantineDomain(originalRoot);
                     return KernelResult.Fail(KernelError.PlatformFaulted, "Original executable start source changed; dependencies remain pinned.");
                 }
@@ -429,18 +607,40 @@ public sealed partial class PlatformAuthorityBridge
             }
             var final = admissionConsumer is null ? FinalAdmission() : admissionConsumer(FinalAdmission);
             if (!final.IsSuccess) return final;
+            lock (_secureDomainLifecycleGate) artifact.StartInvocation!.Invoked = true;
             var result = provider.StartExecutableArtifact(request);
+            lock (_secureDomainLifecycleGate)
+            {
+                artifact.StartInvocation!.Observation = result; // Original raw before validation/callbacks.
+                if (result.Status == PlatformAuthorityStatus.NotAccepted)
+                {
+                    artifact.StartInvocation.Invoked = false;
+                    artifact.StartInvocation.NoEffectConsumed = true;
+                }
+            }
             if (!result.IsSuccess)
             {
-                if (result.Status != PlatformAuthorityStatus.NotAccepted) FaultPinExecutableArtifactDependencies(child, guest, parent);
+                if (result.Status != PlatformAuthorityStatus.NotAccepted) FaultPinExecutableArtifactDependencies(child, guest, parent, artifact);
                 return FromProviderFailure(result.Status, result.Message);
             }
             var exact = PlatformChildExecutionContract.ValidateExecution(request, result.Value!);
-            if (!exact.IsSuccess) { FaultPinExecutableArtifactDependencies(child, guest, parent); return KernelResult.Fail(KernelError.PlatformFaulted, exact.Message!); }
+            if (!exact.IsSuccess) { FaultPinExecutableArtifactDependencies(child, guest, parent, artifact); return KernelResult.Fail(KernelError.PlatformFaulted, exact.Message!); }
             lock (_secureDomainLifecycleGate)
             {
                 artifact.ExecutionReceipt = result.Value;
                 artifact.Started = true; // exact returned provider fact, never local permission or release
+            }
+            PlatformExecutionTerminalKind? terminalKind = null;
+            if (terminalCompletionConsumer is not null && _provider is IPlatformExecutionTerminalProvider terminalProvider)
+            {
+                var terminal = terminalProvider.ResolveExecutionTerminal(child.ProviderLease);
+                lock (_secureDomainLifecycleGate) artifact.TerminalObservation = terminal; // Raw before source callbacks.
+                if (!terminal.IsSuccess || !Enum.IsDefined(terminal.Value.Kind) || terminal.Value.Receipt != result.Value)
+                {
+                    FaultPinExecutableArtifactDependencies(child, guest, parent, artifact);
+                    return KernelResult.Fail(KernelError.PlatformFaulted, "Original Start terminal outcome is unknown or foreign; execution retained without publication.");
+                }
+                terminalKind = terminal.Value.Kind;
             }
             KernelResult continuity;
             try
@@ -451,10 +651,15 @@ public sealed partial class PlatformAuthorityBridge
                     continuity = ValidateSource(source);
                     if (!continuity.IsSuccess)
                     {
-                        FaultPinExecutableArtifactDependencies(child, guest, parent);
+                        FaultPinExecutableArtifactDependencies(child, guest, parent, artifact);
                         continuity = KernelResult.Fail(KernelError.PlatformFaulted, "Executable receipt retained without current dependency continuity.");
                     }
-                    else child.State = PlatformChildDomainState.Running;
+                    else
+                    {
+                        child.State = PlatformChildDomainState.Running;
+                        artifact.StartInvocation!.PublishedChildRevision = child.LifecycleRevision;
+                        startLineage[child] = child.LifecycleRevision; // Only this validated owned publication advances the captured leaf.
+                    }
                 }
             }
             catch (Exception exception) when (exception is not StackOverflowException)
@@ -474,26 +679,40 @@ public sealed partial class PlatformAuthorityBridge
                     return commit();
                 }
             }
-            return completionConsumer is null ? continuity : completionConsumer(CommitCurrent);
+            return terminalCompletionConsumer is not null ? terminalCompletionConsumer(terminalKind, CommitCurrent) :
+                completionConsumer is null ? continuity : completionConsumer(CommitCurrent);
         }
         catch (Exception exception) when (exception is not StackOverflowException)
         {
-            FaultPinExecutableArtifactDependencies(child, guest, parent);
+            FaultPinExecutableArtifactDependencies(child, guest, parent, artifact);
             return KernelResult.Fail(KernelError.PlatformFaulted, $"Executable start may have taken effect without exact publication: {exception.Message}");
         }
         finally
         {
-            lock (_secureDomainLifecycleGate) { guest.PendingExecutableEffects--; child.PendingChildEffects--; artifact.StartInFlight = false; }
+            EndStart();
         }
     }
 
-    private void FaultPinExecutableArtifactDependencies(ChildBindingRecord child, GuestBindingRecord guest, MappingRecord parent)
+    private void FaultPinExecutableArtifactDependencies(ChildBindingRecord child, GuestBindingRecord guest, MappingRecord parent,
+        ExecutableArtifactRecord? artifact = null)
     {
         lock (_secureDomainLifecycleGate)
         {
+            var fact = artifact?.StartInvocation as ExecutableDependencyFailureFact ?? artifact?.BindInvocation;
+            bool ownFailure = fact is { Invoked: true } && SameExecutableSourceRevision(fact) &&
+                ReferenceEquals(fact.Source.Child, child) && ReferenceEquals(fact.Source.Guest, guest) && ReferenceEquals(fact.Source.Parent, parent) &&
+                (fact.OwnFailurePinned ? HasOwnExecutableStartFailure(artifact!) :
+                 child.State == fact.ChildBefore && guest.Closure == fact.GuestBefore && parent.ClosureState == fact.ParentBefore);
             child.State = PlatformChildDomainState.Faulted;
             guest.Closure = PlatformExternalClosureState.Faulted;
             parent.ClosureState = PlatformExternalClosureState.Faulted;
+            if (fact is not null)
+            {
+                fact.OwnFailurePinned = ownFailure;
+                fact.ChildRevision = child.LifecycleRevision;
+                fact.GuestRevision = guest.LifecycleRevision;
+                fact.ParentRevision = parent.LifecycleRevision;
+            }
         }
     }
 
@@ -575,7 +794,14 @@ public sealed partial class PlatformAuthorityBridge
             {
                 if (receipt is not null) parentRecord.UnpublishedChildCreates.Add(receipt);
                 parentRecord.ChildCreateMayHaveEffect = true;
-                QuarantineDomain(parentRecord);
+                if (invocation is not null && !parentRecord.AuthorityRevisionExhausted &&
+                    (parentRecord.AuthorityState == DomainAuthorityState.Active && parentRecord.AuthorityRevision == invocation.Revision ||
+                     invocation.OwnFault && parentRecord.AuthorityState == DomainAuthorityState.Quarantined && parentRecord.AuthorityRevision == invocation.FaultRevision))
+                {
+                    if (!invocation.OwnFault) QuarantineDomain(parentRecord);
+                    invocation.OwnFault = true; invocation.FaultRevision = parentRecord.AuthorityRevision;
+                }
+                else QuarantineDomain(parentRecord);
             }
         }
         PlatformProviderIncarnation source;
@@ -593,7 +819,7 @@ public sealed partial class PlatformAuthorityBridge
                 KernelResult Commit()
                 {
                     reservedBindingId = new(_nextChildBindingId++);
-                    invocation = new(parentRecord, intent);
+                    invocation = new(parentRecord, intent, reservedBindingId);
                     parentRecord.ChildCreateInvocations.Add(invocation);
                     return KernelResult.Ok();
                 }
@@ -606,7 +832,9 @@ public sealed partial class PlatformAuthorityBridge
         bool refusedBeforeEffect = false;
         try
         {
-            result = provider is IPlatformChildCreateDispositionProvider exactProvider
+            result = provider is IPlatformOriginalChildCreateProvider { SupportsOriginalChildCreateResolution: true } originalProvider
+                ? originalProvider.CreateOriginalChild(invocation!.OriginalRequest, out refusedBeforeEffect)
+                : provider is IPlatformChildCreateDispositionProvider exactProvider
                 ? exactProvider.CreateChildDomain(parentRecord.ProviderLease, intent, out refusedBeforeEffect)
                 : provider.CreateChildDomain(parentRecord.ProviderLease, intent);
         }
@@ -739,6 +967,7 @@ public sealed partial class PlatformAuthorityBridge
     {
         // Returned child closure only; it cannot establish original nested invocation closure.
         public PlatformChildDomainClosureReceipt? ReturnedClosureReceipt { get; set; }
+        public NestedCreateInvocationFact? Invocation { get; init; }
     }
 
     internal KernelResult<PlatformChildBinding> CreateNestedChildDomain(
@@ -770,6 +999,8 @@ public sealed partial class PlatformAuthorityBridge
         DomainRecord originalRoot = null!;
         NestedCreateInvocationFact? invocation = null;
         var originalAncestors = new List<ChildBindingRecord>();
+        var sourceRevisions = new Dictionary<ChildBindingRecord, long>();
+        long rootRevision = 0;
         PlatformBackendEpoch backendEpoch = default;
         KernelResult Begin()
         {
@@ -777,6 +1008,7 @@ public sealed partial class PlatformAuthorityBridge
         {
             if (parentRecord.TransitionInFlight || parentRecord.CloseInFlight ||
                 parentRecord.State == PlatformChildDomainState.Faulted ||
+                !HasOriginalNestedHistory(parentRecord) ||
                 !PlatformNestedDomainContract.ValidateRequest(request, parentRecord.State).IsSuccess)
                 return KernelResult.Fail(KernelError.PlatformBindingActive,
                     "Immediate parent child changed before nested admission.");
@@ -786,6 +1018,8 @@ public sealed partial class PlatformAuthorityBridge
             var root = ValidateDomain(parentChild.ParentBinding, parentChild.ParentBinding.Subject);
             if (!root.IsSuccess) return root;
             originalRoot = _domains[parentChild.ParentBinding.BindingId];
+            if (parentRecord.NestedCreatesIssued == ulong.MaxValue || originalRoot.AuthorityRevisionExhausted)
+                return KernelResult.Fail(KernelError.CapacityExhausted, "Nested invocation/source identity capacity is exhausted.");
             originalAncestors.Clear();
             var cursor = parentRecord;
             var visited = new HashSet<PlatformChildBindingId> { parentChild.BindingId };
@@ -798,11 +1032,19 @@ public sealed partial class PlatformAuthorityBridge
                 originalAncestors.Add(ancestor.Value!);
                 cursor = ancestor.Value!;
             }
+            sourceRevisions.Clear();
+            foreach (var owner in originalAncestors.Prepend(parentRecord))
+            {
+                if (owner.LifecycleRevisionExhausted || owner.PendingChildEffects == int.MaxValue)
+                    return KernelResult.Fail(KernelError.CapacityExhausted, "Nested lineage source/interlock capacity is exhausted.");
+                sourceRevisions.Add(owner, owner.LifecycleRevision);
+            }
+            rootRevision = originalRoot.AuthorityRevision;
             KernelResult Commit()
             {
                 if (parentRecord.PendingChildEffects == int.MaxValue)
                     return KernelResult.Fail(KernelError.CapacityExhausted, "Nested child interlock capacity is exhausted.");
-                parentRecord.PendingChildEffects++;
+                foreach (var owner in sourceRevisions.Keys) owner.PendingChildEffects++;
                 backendEpoch = BackendEpoch;
                 return KernelResult.Ok();
             }
@@ -817,6 +1059,7 @@ public sealed partial class PlatformAuthorityBridge
         {
             if (source.Value == 0 || source != originalRoot.ProviderIncarnation ||
                 BackendEpoch != backendEpoch || originalRoot.BackendEpoch != backendEpoch || _backendEpochExhausted ||
+                originalRoot.AuthorityRevision != rootRevision || originalRoot.AuthorityRevisionExhausted ||
                 !TryGetCanonicalRootRecord(parentChild.ParentBinding.BindingId, out var root) || !ReferenceEquals(root, originalRoot) ||
                 root.Binding != parentChild.ParentBinding || root.ParentRevokeMayHaveEffect || root.ParentRevokeInFlight)
             {
@@ -832,6 +1075,8 @@ public sealed partial class PlatformAuthorityBridge
                     ancestor.Binding.Owner != expectedOwner || ancestor.ProviderLease.ParentDomainLease != root.ProviderLease))
                 return KernelResult.Fail(KernelError.StaleGeneration, "Exact original nested parent/ancestor tuple changed.");
             if (!current.CreationPublished || current.TransitionInFlight || current.CloseInFlight ||
+                !HasOriginalNestedHistory(current) ||
+                sourceRevisions.Any(pair => pair.Key.LifecycleRevisionExhausted || pair.Key.LifecycleRevision != pair.Value) ||
                 current.NestedCreateMayHaveEffect || !PlatformNestedDomainContract.ValidateRequest(request, current.State).IsSuccess)
                 return KernelResult.Fail(KernelError.PlatformFaulted, "Nested parent admission changed after source observation.");
             return ValidateActiveChildLineage(parentRecord);
@@ -840,9 +1085,12 @@ public sealed partial class PlatformAuthorityBridge
         {
             lock (_secureDomainLifecycleGate)
             {
-                if (receipt is not null) parentRecord.UnpublishedNestedCreates.Add(receipt);
+                if (receipt is not null) parentRecord.UnpublishedNestedCreates.Add(receipt with { Invocation = invocation });
                 parentRecord.NestedCreateMayHaveEffect = true;
+                bool ownFault = invocation is not null && !parentRecord.LifecycleRevisionExhausted &&
+                    parentRecord.State == invocation.AdmittedState && parentRecord.LifecycleRevision == invocation.AdmittedRevision;
                 parentRecord.State = PlatformChildDomainState.Faulted;
+                if (ownFault && !parentRecord.LifecycleRevisionExhausted) invocation!.OwnFaultRevision = parentRecord.LifecycleRevision;
             }
         }
         PlatformProviderIncarnation source;
@@ -874,10 +1122,19 @@ public sealed partial class PlatformAuthorityBridge
             {
                 var fresh = ValidateSource(source);
                 if (!fresh.IsSuccess) return KernelResult<PlatformChildBinding>.Fail(fresh.Error, fresh.Message!);
+                if (parentRecord.NestedCreatesIssued == ulong.MaxValue)
+                    return KernelResult<PlatformChildBinding>.Fail(KernelError.CapacityExhausted, "Nested invocation capacity changed before effect.");
                 invocation = new(parentRecord, request);
                 parentRecord.NestedCreateInvocations.Add(invocation);
+                parentRecord.NestedCreatesIssued++;
             }
-            result = provider.CreateNestedChildDomain(request);
+            if (provider is IPlatformOriginalNestedDomainProvider { SupportsOriginalNestedDomains: true } originalProvider)
+            {
+                try { result = originalProvider.CreateOriginalNestedDomain(invocation!.OriginalRequest); }
+                catch (Exception exception) when (exception is not StackOverflowException)
+                { result = originalProvider.ResolveOriginalNestedDomain(invocation!.OriginalRequest); }
+            }
+            else result = provider.CreateNestedChildDomain(request);
         }
         catch (Exception exception) when (exception is not StackOverflowException)
         {
@@ -889,7 +1146,8 @@ public sealed partial class PlatformAuthorityBridge
         {
         invocation!.Observation = result;
         if (BackendEpoch != backendEpoch || parentRecord.State == PlatformChildDomainState.Faulted ||
-            !HasCurrentChildCreateSources(parentRecord))
+            !HasCurrentChildCreateSources(parentRecord) || !HasOriginalNestedHistory(parentRecord) ||
+            !parentRecord.NestedCreateInvocations.Contains(invocation) || !ReferenceEquals(invocation.OriginalOwner, invocation))
         {
             PinNestedCreate(result.IsSuccess ? new(parentChild, request, backendEpoch, result.Value!) : null);
             return KernelResult<PlatformChildBinding>.Fail(KernelError.PlatformFaulted,
@@ -898,6 +1156,27 @@ public sealed partial class PlatformAuthorityBridge
         }
         if (!result.IsSuccess)
         {
+            if (result.Status == PlatformAuthorityStatus.NotAccepted &&
+                provider is IPlatformOriginalNestedDomainProvider { SupportsOriginalNestedDomains: true } originalProvider)
+            {
+                try
+                {
+                    var resolved = originalProvider.ResolveOriginalNestedDomain(invocation!.OriginalRequest);
+                    var currentSource = CurrentProviderIncarnation();
+                    lock (_secureDomainLifecycleGate)
+                    {
+                        if (resolved.Status == PlatformAuthorityStatus.NotAccepted && currentSource == originalRoot.ProviderIncarnation &&
+                            BackendEpoch == backendEpoch && !_backendEpochExhausted && HasCurrentChildCreateSources(parentRecord) &&
+                            HasOriginalNestedHistory(parentRecord) && parentRecord.NestedCreateInvocations.Contains(invocation) &&
+                            ReferenceEquals(invocation.OriginalOwner, invocation))
+                        {
+                            parentRecord.NestedCreateInvocations.Remove(invocation); parentRecord.NestedCreatesConsumed++;
+                            return FromProviderFailure<PlatformChildBinding>(result.Status, result.Message);
+                        }
+                    }
+                }
+                catch (Exception exception) when (exception is not StackOverflowException) { /* Absence/unknown is not no-effect. */ }
+            }
             PinNestedCreate();
             return FromProviderFailure<PlatformChildBinding>(result.Status, result.Message);
         }
@@ -910,28 +1189,9 @@ public sealed partial class PlatformAuthorityBridge
             // A malformed immediate-parent/request tuple leaves the original effect unknown.
             // Retain that parent before any returned-object compensation callback/reset.
             PinNestedCreate(fact);
-            if (_provider is IPlatformChildDomainProvider lifecycle)
-            {
-                try
-                {
-                    var cleanupSource = CurrentProviderIncarnation();
-                    lock (_secureDomainLifecycleGate)
-                        if (cleanupSource.Value == 0 || cleanupSource != originalRoot.ProviderIncarnation ||
-                            BackendEpoch != backendEpoch || _backendEpochExhausted ||
-                            !HasCurrentChildCreateSources(parentRecord) || originalRoot.ParentRevokeMayHaveEffect)
-                            return KernelResult<PlatformChildBinding>.Fail(KernelError.PlatformFaulted,
-                                "Malformed nested receipt retained; original cleanup source changed.");
-                    var cleanup = lifecycle.CloseChildDomain(lease);
-                    if (cleanup.IsSuccess && PlatformChildDomainContract.ValidateClosureReceipt(lease, cleanup.Value!).IsSuccess)
-                    {
-                        lock (_secureDomainLifecycleGate) fact.ReturnedClosureReceipt = cleanup.Value;
-                    }
-                }
-                catch (Exception exception) when (exception is not StackOverflowException)
-                {
-                    // Original request pin and known malformed lease remain; no closure is invented.
-                }
-            }
+            // A returned lease is not continuity of the invocation. Closing it could
+            // destroy a foreign equal-tuple lifetime. Only original-request cleanup
+            // may discharge this pin; V1 does not provide that proof.
             return KernelResult<PlatformChildBinding>.Fail(KernelError.PlatformFaulted,
                 exact.Message ?? "Provider returned malformed nested-domain authority.");
         }
@@ -954,6 +1214,7 @@ public sealed partial class PlatformAuthorityBridge
             _originalChildOwners.Add(binding.BindingId, childRecord);
             childRecord.NestedCreateObservation = invocation!.Observation;
             parentRecord.NestedCreateInvocations.Remove(invocation);
+            parentRecord.NestedCreatesConsumed++;
         }
         try { cleanupConsumer?.Invoke(binding); }
         catch (Exception exception) when (exception is not StackOverflowException)
@@ -988,7 +1249,7 @@ public sealed partial class PlatformAuthorityBridge
         return published.IsSuccess ? KernelResult<PlatformChildBinding>.Ok(binding) :
             KernelResult<PlatformChildBinding>.Fail(published.Error, published.Message!);
         }
-        finally { lock (_secureDomainLifecycleGate) parentRecord.PendingChildEffects--; }
+        finally { lock (_secureDomainLifecycleGate) foreach (var owner in sourceRevisions.Keys) owner.PendingChildEffects--; }
     }
 
     // Trusted pure consumer mutation only; provider/caller callbacks stay outside this gate.
@@ -1007,6 +1268,12 @@ public sealed partial class PlatformAuthorityBridge
     // Pure existing-owner validation. Own in-flight flag is checked by each caller;
     // ancestor lifecycle/closure must be active at every effect boundary.
     // Original lineage identity for admission/cleanup; lifecycle permission is checked independently.
+    private static bool HasOriginalNestedHistory(ChildBindingRecord owner) =>
+        owner.NestedCreatesConsumed <= owner.NestedCreatesIssued &&
+        owner.NestedCreatesIssued - owner.NestedCreatesConsumed == (ulong)owner.NestedCreateInvocations.Count &&
+        owner.NestedCreateInvocations.All(f => ReferenceEquals(f.OriginalOwner, f) && ReferenceEquals(f.Source, owner) &&
+            f.Request.ParentChildLease == owner.ProviderLease);
+
     private bool HasCurrentChildCreateSources(ChildBindingRecord record)
     {
         if (!_originalChildOwners.TryGetValue(record.Binding.BindingId, out var original) || !ReferenceEquals(original, record))
@@ -1039,6 +1306,8 @@ public sealed partial class PlatformAuthorityBridge
 
     private KernelResult ValidateActiveChildLineage(ChildBindingRecord record)
     {
+        if (record.EventCleanupOnly || record.NestedCleanupOnly)
+            return KernelResult.Fail(KernelError.PlatformDenied, "Original event cleanup continuation grants no new child effects.");
         if (!HasCurrentChildCreateSources(record) || !_childBindings.TryGetValue(record.Binding.BindingId, out var current) || !ReferenceEquals(current, record))
             return KernelResult.Fail(KernelError.StaleGeneration, "Exact child owner changed.");
         if (record.CloseInFlight)
@@ -1069,6 +1338,15 @@ public sealed partial class PlatformAuthorityBridge
     {
         if (_provider is not IPlatformChildDomainProvider provider)
             return KernelResult.Fail(KernelError.PlatformUnsupported, "Child-domain provider is unavailable.");
+        if (transition == PlatformChildDomainTransition.BeginDrain)
+        {
+            var nestedCleanup = ContainOriginalNestedForDrain(binding);
+            if (!nestedCleanup.IsSuccess) return nestedCleanup;
+            var eventCleanup = ContainOriginalChildEventsForDrain(binding);
+            if (!eventCleanup.IsSuccess) return eventCleanup;
+            var guestCleanup = ResolveOriginalGuestMapsForDrain(binding);
+            if (!guestCleanup.IsSuccess) return guestCleanup;
+        }
         ChildBindingRecord? retainedDrain = null;
         lock (_secureDomainLifecycleGate)
         {
@@ -1133,7 +1411,8 @@ public sealed partial class PlatformAuthorityBridge
                     committedDrain = true;
                     return KernelResult.Ok();
                 }
-                var resolved = ResolveChild(binding, allowUnpublished: transition == PlatformChildDomainTransition.BeginDrain);
+                var resolved = ResolveChild(binding, allowDraining: transition == PlatformChildDomainTransition.BeginDrain,
+                    allowUnpublished: transition == PlatformChildDomainTransition.BeginDrain);
                 if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
                 record = resolved.Value!;
                 if (!HasCurrentChildCreateSources(record) || !TryGetCanonicalRootRecord(binding.ParentBinding.BindingId, out originalRoot!) ||
@@ -1350,11 +1629,17 @@ public sealed partial class PlatformAuthorityBridge
                 !HasUnclosedGuestDependency(committed) && HasValidatedChildClosureFact(committed))
                 return KernelResult.Ok();
         }
-        var resolved = ResolveChild(binding, allowDraining: true, allowUnpublished: true);
+        var resolved = ResolveChild(binding, allowDraining: true, allowUnpublished: true, allowOwnCloseFailure: true);
         if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
         ChildBindingRecord record = resolved.Value!;
         if (_provider is not IPlatformChildDomainProvider provider)
             return KernelResult.Fail(KernelError.PlatformUnsupported, "Child-domain provider is unavailable.");
+        var eventCleanup = ContainOriginalChildEvents(record);
+        if (!eventCleanup.IsSuccess) return eventCleanup;
+        bool supportsOriginalCloseResolution;
+        try { supportsOriginalCloseResolution = _provider is IPlatformOriginalChildCloseProvider { SupportsOriginalChildCloseResolution: true }; }
+        catch (Exception exception) when (exception is not StackOverflowException)
+        { return KernelResult.Fail(KernelError.PlatformFaulted, "Original child Close resolution source unavailable."); }
         DomainRecord root;
         var ancestors = new List<ChildBindingRecord>();
         PlatformBackendEpoch backendEpoch;
@@ -1363,9 +1648,9 @@ public sealed partial class PlatformAuthorityBridge
             if (record.TransitionInFlight || record.CloseInFlight || record.PendingChildEffects != 0)
                 return KernelResult.Fail(KernelError.PlatformBindingActive,
                     "Child lifecycle or external effect is already in flight.");
-            if (record.State != PlatformChildDomainState.Draining)
+            if (!HasChildCloseStateContinuity(record))
                 return KernelResult.Fail(KernelError.PlatformDenied, "Child closure requires an explicit draining state.");
-            if (record.NestedCreateMayHaveEffect || record.NestedCreateInvocations.Count != 0)
+            if (record.NestedCreateMayHaveEffect || record.NestedCreateInvocations.Count != 0 || !HasOriginalNestedHistory(record))
                 return KernelResult.Fail(KernelError.PlatformFaulted,
                     "Nested child creation may have taken effect without exact closure.");
             if (_childBindings.Values.Concat(_originalChildOwners.Values).Any(x => x.ParentChild == binding &&
@@ -1373,7 +1658,8 @@ public sealed partial class PlatformAuthorityBridge
                 return KernelResult.Fail(KernelError.PlatformBindingActive,
                     "Nested child domains must reach exact terminal closure before their parent child closes.");
             if (HasUnclosedGuestDependency(record) ||
-                _virtualIoBindings.Values.Any(x => x.Binding.Child == binding && x.Closure != PlatformExternalClosureState.Closed))
+                _virtualIoOwners.Any(x => x.Binding.Child == binding && !HasConsumedVirtualIo(x)) ||
+                DeviceDependencyRecordsLocked().Any(device => HasOriginalIoInvocationPins(device, record)))
                 return KernelResult.Fail(KernelError.PlatformBindingActive,
                     "Child mappings and virtual-I/O bindings must close before child closure.");
             if (!HasCurrentChildCreateSources(record) || !TryGetCanonicalRootRecord(binding.ParentBinding.BindingId, out root!) ||
@@ -1409,15 +1695,42 @@ public sealed partial class PlatformAuthorityBridge
                 PlatformAuthorityResult<PlatformChildDomainClosureReceipt> result;
                 // A previous drain receipt cannot establish containment of this close.
                 // Retain the attempt on the captured owner even if routing changes.
-                lock (_secureDomainLifecycleGate) record.CloseInvocationAttempted = true;
-                try { result = provider.CloseChildDomain(record.ProviderLease); }
+                OriginalChildCloseInvocation invocation;
+                bool resolveClose;
+                lock (_secureDomainLifecycleGate)
+                {
+                    if (record.CloseInvocationAttempted && record.OriginalCloseInvocation is null)
+                        return KernelResult.Fail(KernelError.PlatformFaulted, "Original Close request history unavailable; repeat prohibited.");
+                    if (record.OriginalCloseInvocation is null || record.OriginalCloseInvocation.NoEffectConsumed)
+                        record.OriginalCloseInvocation = new(record, root, ancestors, backendEpoch, supportsOriginalCloseResolution);
+                    invocation = record.OriginalCloseInvocation;
+                    resolveClose = invocation.Invoked;
+                    if (resolveClose && _provider is not IPlatformOriginalChildCloseProvider)
+                        return KernelResult.Fail(KernelError.PlatformFaulted, "Original child Close resolver unavailable; no effect repeat.");
+                    invocation.Invoked = true;
+                    record.CloseInvocationAttempted = true;
+                }
+                try
+                {
+                    result = resolveClose ? ((IPlatformOriginalChildCloseProvider)_provider).ResolveOriginalChildClose(record.ProviderLease)
+                        : provider.CloseChildDomain(record.ProviderLease);
+                    lock (_secureDomainLifecycleGate)
+                    { if (resolveClose) invocation.ResolutionObservation = result; else invocation.Observation = result; }
+                }
                 catch (Exception exception) when (exception is not StackOverflowException)
                 {
-                    lock (_secureDomainLifecycleGate) record.State = PlatformChildDomainState.Faulted;
+                    lock (_secureDomainLifecycleGate) PinOwnChildCloseFailure(record);
                     return KernelResult.Fail(KernelError.PlatformFaulted, "Child closure outcome unknown; original owner remains pinned.");
                 }
                 if (result.Status == PlatformAuthorityStatus.NotAccepted)
                 {
+                    if (_provider is IPlatformOriginalChildCloseProvider exactResolver && !resolveClose)
+                    {
+                        result = exactResolver.ResolveOriginalChildClose(record.ProviderLease);
+                        lock (_secureDomainLifecycleGate) invocation.ResolutionObservation = result;
+                    }
+                    if (result.Status == PlatformAuthorityStatus.NotAccepted)
+                    {
                     // This invocation produced no closure fact. A fresh source check
                     // permits retaining Draining only for the exact original owner.
                     // Query outside the lifecycle lock: source callbacks may reenter/reset.
@@ -1427,7 +1740,13 @@ public sealed partial class PlatformAuthorityBridge
                     lock (_secureDomainLifecycleGate)
                     {
                         var exact = ValidateChildCloseSourceLocked(record, root, ancestors, backendEpoch, source);
+                        if (exact.IsSuccess && _provider is IPlatformOriginalChildCloseProvider && result.Status == PlatformAuthorityStatus.NotAccepted)
+                        {
+                            if (invocation.OwnFaultPinned) record.State = PlatformChildDomainState.Draining;
+                            invocation.NoEffectConsumed = true; invocation.OwnFaultPinned = false;
+                        }
                         return exact.IsSuccess ? FromProviderFailure(result.Status, result.Message) : exact;
+                    }
                     }
                 }
                 lock (_secureDomainLifecycleGate)
@@ -1437,7 +1756,7 @@ public sealed partial class PlatformAuthorityBridge
                         record.LastClosureReceipt = new(record.ProviderLease, backendEpoch, result.Value!);
                     else
                     {
-                        record.State = PlatformChildDomainState.Faulted;
+                        PinOwnChildCloseFailure(record);
                         return FromProviderFailure(result.Status, result.Message);
                     }
                 }
@@ -1491,6 +1810,16 @@ public sealed partial class PlatformAuthorityBridge
         return state != PlatformChildDomainState.Faulted;
     }
 
+    internal bool HasOriginalChildCloseContinuation(PlatformChildBinding binding)
+    {
+        lock (_secureDomainLifecycleGate)
+            return _originalChildOwners.TryGetValue(binding.BindingId, out var owner) && owner.Binding == binding &&
+                _childBindings.TryGetValue(binding.BindingId, out var route) && ReferenceEquals(route, owner) &&
+                owner.LastClosureReceipt is null &&
+                owner.OriginalCloseInvocation is { Invoked: true, NoEffectConsumed: false, SupportsResolution: true } fact &&
+                ReferenceEquals(fact.OriginalOwner, fact) && ReferenceEquals(fact.Child, owner);
+    }
+
     // Original completed lifetime fact, never admission on the current backend.
     private static bool HasValidatedChildClosureFact(ChildBindingRecord record) =>
         record.LastClosureReceipt is { } fact && fact.AdmittedLease == record.ProviderLease &&
@@ -1515,20 +1844,22 @@ public sealed partial class PlatformAuthorityBridge
             !TryGetCanonicalRootRecord(binding.ParentBinding.BindingId, out var currentRoot) || !ReferenceEquals(currentRoot, root) ||
             root.Binding != binding.ParentBinding || root.AuthorityState == DomainAuthorityState.Closed || root.ParentRevokeInFlight ||
             record.ProviderLease.ParentDomainLease != root.ProviderLease ||
-            record.State != PlatformChildDomainState.Draining ||
+            !HasChildCloseStateContinuity(record) ||
+            record.OriginalCloseInvocation is { Invoked: true, NoEffectConsumed: false } saved &&
+                (saved.Ancestors.Length != ancestors.Count || saved.Ancestors.Where((ancestor, index) => !ReferenceEquals(ancestor, ancestors[index])).Any()) ||
             ancestors.Any(ancestor => !_childBindings.TryGetValue(ancestor.Binding.BindingId, out var exact) ||
                 !ReferenceEquals(exact, ancestor) || ancestor.State is PlatformChildDomainState.Faulted or PlatformChildDomainState.Closed ||
                 ancestor.CloseInFlight || ancestor.TransitionInFlight || ancestor.PendingChildEffects != 0 ||
                 ancestor.Binding.ParentBinding != root.Binding ||
                 ancestor.ProviderLease.ParentDomainLease != root.ProviderLease))
         {
-            record.State = PlatformChildDomainState.Faulted;
+            PinOwnChildCloseFailure(record);
             return KernelResult.Fail(KernelError.PlatformFaulted, "Original child/root source or lineage changed; closure/reclaim remains pinned.");
         }
         return ValidateDomainIdentity(binding.ParentBinding, binding.ParentBinding.Subject);
     }
 
-    private KernelResult<ChildBindingRecord> ResolveChild(PlatformChildBinding binding, bool allowDraining = false, bool allowUnpublished = false)
+    private KernelResult<ChildBindingRecord> ResolveChild(PlatformChildBinding binding, bool allowDraining = false, bool allowUnpublished = false, bool allowOwnCloseFailure = false)
     {
         lock (_secureDomainLifecycleGate)
         {
@@ -1542,13 +1873,15 @@ public sealed partial class PlatformAuthorityBridge
             return KernelResult<ChildBindingRecord>.Fail(KernelError.PlatformFaulted, "Original child owner is unavailable; routing cannot supply permission.");
         if (!allowUnpublished && !record.CreationPublished)
             return KernelResult<ChildBindingRecord>.Fail(KernelError.PlatformDenied, "Known child cleanup receipt has not published admission.");
+        if (!allowDraining && (record.EventCleanupOnly || record.NestedCleanupOnly))
+            return KernelResult<ChildBindingRecord>.Fail(KernelError.PlatformDenied, "Child is retained only for original event cleanup.");
         lock (_secureDomainLifecycleGate)
             if (record.TransitionInFlight)
                 return KernelResult<ChildBindingRecord>.Fail(KernelError.PlatformBindingActive,
                     "Child transition is in flight.");
         if (record.State == PlatformChildDomainState.Closed)
             return KernelResult<ChildBindingRecord>.Fail(KernelError.PlatformBindingRevoked, "Child binding is closed.");
-        if (record.State == PlatformChildDomainState.Faulted)
+        if (record.State == PlatformChildDomainState.Faulted && !(allowOwnCloseFailure && HasOwnChildCloseFailure(record)))
             return KernelResult<ChildBindingRecord>.Fail(KernelError.PlatformFaulted, "Child binding is quarantined.");
         if (!allowDraining && record.State == PlatformChildDomainState.Draining)
             return KernelResult<ChildBindingRecord>.Fail(KernelError.PlatformDenied, "Child binding is draining.");
@@ -1575,3 +1908,5 @@ public sealed partial class PlatformAuthorityBridge
         };
 
 }
+
+

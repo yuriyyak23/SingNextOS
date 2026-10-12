@@ -1,0 +1,13 @@
+namespace YAKSys_Hybrid_CPU.Core;
+
+public sealed record NeutralOriginalNestedDomainRequest(NeutralChildDomainLease ParentChild, NeutralChildDomainIntent Intent);
+public readonly record struct NeutralNestedDomainLease(NeutralChildDomainLease Child, NeutralChildDomainLease ImmediateParent);
+public sealed record NeutralOriginalNestedDomainClosure(NeutralOriginalNestedDomainRequest Request, bool NoEffect, bool NoFurtherAdmission, bool NoFurtherChildUse);
+public interface INeutralOriginalNestedDomainProvider
+{
+    bool SupportsOriginalNestedDomains { get; }
+    NeutralVirtualizationResult<NeutralNestedDomainLease> CreateOriginalNestedDomain(NeutralOriginalNestedDomainRequest request);
+    NeutralVirtualizationResult<NeutralNestedDomainLease> ResolveOriginalNestedDomain(NeutralOriginalNestedDomainRequest originalRequest);
+    NeutralVirtualizationResult<NeutralOriginalNestedDomainClosure> ContainOriginalNestedDomain(NeutralOriginalNestedDomainRequest originalRequest);
+    NeutralVirtualizationResult<NeutralOriginalNestedDomainClosure> ResolveOriginalNestedDomainCleanup(NeutralOriginalNestedDomainRequest originalRequest);
+}

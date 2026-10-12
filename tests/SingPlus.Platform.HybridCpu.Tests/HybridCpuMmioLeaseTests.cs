@@ -61,7 +61,7 @@ public sealed class HybridCpuMmioLeaseTests
         var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, ChildClosureTupleTests.RootCloseRuntimeProxy>();
         var proxy = (ChildClosureTupleTests.RootCloseRuntimeProxy)(object)runtime;
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
-        var parent = provider.BindDomain(new(new DomainId(710), new ProcessHandle(new ProcessId(71), 1))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(710), new ProcessHandle(new ProcessId(71), 1))).Value!;
         var device = provider.BindDevice(parent, new("device/uart0"), PlatformDeviceRights.Read).Value!;
         var mapping = provider.MapMmio(device, new("registers", 4096), new(0, 64), PlatformMmioAccess.Read).Value!;
         var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;

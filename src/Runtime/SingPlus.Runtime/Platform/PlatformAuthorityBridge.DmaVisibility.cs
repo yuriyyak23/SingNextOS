@@ -1,4 +1,4 @@
-using SingPlus.Platform;
+﻿using SingPlus.Platform;
 
 namespace SingPlus.Runtime;
 
@@ -60,6 +60,7 @@ public sealed partial class PlatformAuthorityBridge
         DmaGrantRecord record;
         PlatformBackendEpoch epoch;
         IPlatformDmaVisibilityProvider visibilityProvider;
+        DmaVisibilityOwnerInvocation? invocation = null;
         lock (_secureDomainLifecycleGate)
         lock (_dmaCompletionGate)
         {
@@ -82,6 +83,7 @@ public sealed partial class PlatformAuthorityBridge
         }
         try
         {
+            var canContain = _provider is IPlatformDmaVisibilityClosureProvider closure && closure.CanCloseOriginalDmaVisibility(record.ProviderGrant); // Pure provider callback outside owners.
             var incarnation = CurrentProviderIncarnation();
             lock (_secureDomainLifecycleGate)
             lock (_dmaCompletionGate)
@@ -95,7 +97,14 @@ public sealed partial class PlatformAuthorityBridge
                     return KernelResult<PlatformDmaPrepareEvidence>.Fail(KernelError.PlatformFaulted, "DMA continuity changed before preparation; grant pinned.");
                 }
             }
+            lock (_dmaCompletionGate)
+            {
+                if (!OriginalVisibilityHistoryIntact(record)) throw new InvalidOperationException("Original visibility history lost.");
+                if (record.VisibilityIssued == ulong.MaxValue) return KernelResult<PlatformDmaPrepareEvidence>.Fail(KernelError.CapacityExhausted,"Visibility history exhausted before effect.");
+                invocation = new(record,false,epoch,canContain); record.VisibilityHistory.Add(invocation); record.VisibilityIssued++; invocation.Invoked = true;
+            }
             var providerResult = visibilityProvider.PrepareDmaGrantVisibility(record.ProviderGrant);
+            lock (_dmaCompletionGate) { invocation.RawPrepare = providerResult; if (!providerResult.IsSuccess) PinOriginalDmaVisibilityLocked(record,invocation); }
             if (providerResult.IsSuccess &&
                 PlatformDmaVisibilityContract.ValidatePrepareEvidence(record.ProviderGrant, providerResult.Value!).IsSuccess)
             {
@@ -113,7 +122,7 @@ public sealed partial class PlatformAuthorityBridge
                 {
                     if (!providerResult.IsSuccess || record.KnownPreparationEvidence != providerResult.Value ||
                         record.KnownPreparationEpoch != epoch)
-                        _dmaSubmissionFaultPins.Add(grant.GrantId);
+                        PinOriginalDmaVisibilityLocked(record,invocation);
                 }
                 return KernelResult<PlatformDmaPrepareEvidence>.Fail(KernelError.PlatformFaulted,
                     "DMA prepare source unavailable; exact known receipt retained for grant cleanup, no local cycle published.");
@@ -125,6 +134,8 @@ public sealed partial class PlatformAuthorityBridge
                 lock (_dmaCompletionGate)
                 {
                     record.PreparationInFlight = false;
+                    if (!providerResult.IsSuccess && record.OwnVisibilityUncertain && IsOriginalDmaGrant(record) && BackendEpoch == epoch && observedIncarnation == incarnation)
+                        return FromProviderFailure<PlatformDmaPrepareEvidence>(providerResult.Status,providerResult.Message);
                     if (observedIncarnation != incarnation || BackendEpoch != epoch ||
                         !_dmaGrants.TryGetValue(grant.GrantId, out var current) || !ReferenceEquals(current, record) ||
                         HasFaultPinnedDmaSubmission(grant.GrantId) || HasActiveDmaSubmission(grant.GrantId) ||
@@ -149,7 +160,7 @@ public sealed partial class PlatformAuthorityBridge
         }
         catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
         {
-            lock (_dmaCompletionGate) _dmaSubmissionFaultPins.Add(grant.GrantId);
+            lock (_dmaCompletionGate) PinOriginalDmaVisibilityLocked(record,invocation);
             return KernelResult<PlatformDmaPrepareEvidence>.Fail(KernelError.PlatformFaulted,
                 $"DMA preparation outcome unavailable; grant pinned: {exception.GetType().Name}.");
         }
@@ -163,6 +174,7 @@ public sealed partial class PlatformAuthorityBridge
         DmaVisibilityState state;
         PlatformBackendEpoch epoch;
         IPlatformDmaVisibilityProvider visibilityProvider;
+        DmaVisibilityOwnerInvocation? invocation = null;
         lock (_secureDomainLifecycleGate)
         lock (_dmaCompletionGate)
         {
@@ -185,6 +197,7 @@ public sealed partial class PlatformAuthorityBridge
         }
         try
         {
+            var canContain = _provider is IPlatformDmaVisibilityClosureProvider closure && closure.CanCloseOriginalDmaVisibility(record.ProviderGrant); // Pure provider callback outside owners.
             var incarnation = CurrentProviderIncarnation();
             lock (_secureDomainLifecycleGate)
             lock (_dmaCompletionGate)
@@ -199,7 +212,14 @@ public sealed partial class PlatformAuthorityBridge
                     return KernelResult<PlatformDmaAcquireEvidence>.Fail(KernelError.PlatformFaulted, "Acquire lost exact source/cycle; grant pinned.");
                 }
             }
+            lock (_dmaCompletionGate)
+            {
+                if (!OriginalVisibilityHistoryIntact(record)) throw new InvalidOperationException("Original visibility history lost.");
+                if (record.VisibilityIssued == ulong.MaxValue) return KernelResult<PlatformDmaAcquireEvidence>.Fail(KernelError.CapacityExhausted,"Visibility history exhausted before effect.");
+                invocation = new(record,true,epoch,canContain); record.VisibilityHistory.Add(invocation); record.VisibilityIssued++; invocation.Invoked = true;
+            }
             var providerResult = visibilityProvider.AcquireDmaGrantVisibility(record.ProviderGrant);
+            lock (_dmaCompletionGate) { invocation.RawAcquire = providerResult; if (!providerResult.IsSuccess) PinOriginalDmaVisibilityLocked(record,invocation); }
             if (providerResult.IsSuccess && PlatformDmaVisibilityContract.ValidateAcquireEvidence(
                     record.ProviderGrant, state.ProviderCycle, providerResult.Value!).IsSuccess)
             {
@@ -216,7 +236,7 @@ public sealed partial class PlatformAuthorityBridge
             {
                 lock (_dmaCompletionGate)
                     if (!providerResult.IsSuccess || state.KnownAcquireEvidence != providerResult.Value || state.KnownAcquireEpoch != epoch)
-                        _dmaSubmissionFaultPins.Add(grant.GrantId);
+                        PinOriginalDmaVisibilityLocked(record,invocation);
                 return KernelResult<PlatformDmaAcquireEvidence>.Fail(KernelError.PlatformFaulted, "Acquire source unavailable; known facts retained without CPU publication.");
             }
             return ownerCommit(() =>
@@ -225,6 +245,8 @@ public sealed partial class PlatformAuthorityBridge
                 lock (_dmaCompletionGate)
                 {
                     record.AcquisitionInFlight = false;
+                    if (!providerResult.IsSuccess && record.OwnVisibilityUncertain && IsOriginalDmaGrant(record) && BackendEpoch == epoch && observed == incarnation)
+                        return FromProviderFailure<PlatformDmaAcquireEvidence>(providerResult.Status,providerResult.Message);
                     if (observed != incarnation || BackendEpoch != epoch ||
                         !_dmaGrants.TryGetValue(grant.GrantId, out var current) || !ReferenceEquals(current, record) ||
                         !_dmaVisibilityStates.TryGetValue(grant.GrantId, out var cycle) || !ReferenceEquals(cycle, state) ||
@@ -248,7 +270,7 @@ public sealed partial class PlatformAuthorityBridge
         }
         catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
         {
-            lock (_dmaCompletionGate) _dmaSubmissionFaultPins.Add(grant.GrantId);
+            lock (_dmaCompletionGate) PinOriginalDmaVisibilityLocked(record,invocation);
             return KernelResult<PlatformDmaAcquireEvidence>.Fail(KernelError.PlatformFaulted, $"Acquire outcome unavailable; grant pinned: {exception.GetType().Name}.");
         }
         finally { lock (_dmaCompletionGate) record.AcquisitionInFlight = false; }

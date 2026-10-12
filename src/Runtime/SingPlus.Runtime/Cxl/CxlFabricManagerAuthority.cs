@@ -17,17 +17,62 @@ public sealed record CxlOwnedPoolAllocation(
 /// <summary>Serializes FM observations into generation-safe local admission and reclaim.</summary>
 public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
 {
-    private sealed class BindingRecord(CxlFabricBinding binding)
+    private sealed class BindingRecord
     {
-        public CxlFabricBinding Binding { get; set; } = binding;
-        public CxlFabricResourceState State { get; set; } = CxlFabricResourceState.Bound;
-        public CxlFabricReconfigurationTicket? Ticket { get; set; }
+        public BindingRecord(CxlFabricBinding binding) { OwnerSelf = this; Binding = binding; State = CxlFabricResourceState.Bound; }
+        public BindingRecord OwnerSelf { get; }
+        private CxlFabricBinding _binding = null!;
+        private CxlFabricResourceState _state;
+        public CxlFabricBinding Binding { get => _binding; set { Advance(); _binding = value; } }
+        public CxlFabricResourceState State { get => _state; set { Advance(); _state = value; } }
+        public ulong SourceRevision { get; private set; }
+        public bool RevisionExhausted { get; private set; }
+        private void Advance() { if (SourceRevision == ulong.MaxValue) RevisionExhausted = true; else SourceRevision++; }
+        private CxlFabricReconfigurationTicket? _ticket;
+        public CxlFabricReconfigurationTicket? Ticket { get => _ticket; set { Advance(); _ticket = value; } }
         public int PendingAdmissions { get; set; }
         public bool CompletionInFlight { get; set; }
+        public bool BeginInFlight { get; set; }
+        public BeginInvocation? Begin { get; set; }
+        public CompletionInvocation? Completion { get; set; }
+        public List<BeginInvocation> BeginHistory { get; } = [];
+        public List<CompletionInvocation> CompletionHistory { get; } = [];
         public CxlFabricBinding? LastCompletionReceipt { get; set; }
         public List<(ProcessHandle Principal, ExternalOperationHandle Operation, Func<KernelResult>? ProviderClosure)> Operations { get; } = [];
     }
-
+    private sealed class BeginInvocation
+    {
+        public BeginInvocation(BindingRecord source, CxlFabricBinding binding, ulong revision)
+        { OwnerSelf = this; Source = source; Binding = binding; Revision = revision; }
+        public BeginInvocation OwnerSelf { get; }
+        public BindingRecord Source { get; }
+        public CxlFabricBinding Binding { get; }
+        public ulong Revision { get; }
+        public bool Invoked { get; set; }
+        public bool NoEffectConsumed { get; set; }
+        public bool Completed { get; set; }
+        public ulong? OwnFaultRevision { get; set; }
+        public PlatformAuthorityResult<CxlFabricReconfigurationTicket>? RawObservation { get; set; }
+    }
+    private sealed class CompletionInvocation
+    {
+        public CompletionInvocation(BindingRecord source, BeginInvocation begin, CxlFabricReconfigurationTicket ticket, ulong revision)
+        { OwnerSelf = this; Source = source; Begin = begin; Ticket = ticket; Revision = revision; }
+        public CompletionInvocation OwnerSelf { get; }
+        public BindingRecord Source { get; }
+        public BeginInvocation Begin { get; }
+        public CxlFabricReconfigurationTicket Ticket { get; }
+        public ulong Revision { get; }
+        public bool Invoked { get; set; }
+        public bool NoEffectConsumed { get; set; }
+        public bool Consumed { get; set; }
+        public ulong? OwnFaultRevision { get; set; }
+        public PlatformAuthorityResult<CxlFabricBinding>? RawObservation { get; set; }
+    }
+    private readonly List<BindingRecord> _bindingOwners = [];
+    private bool IsOriginalBinding(BindingRecord record) => ReferenceEquals(record.OwnerSelf, record) &&
+        _bindingOwners.Any(owner => ReferenceEquals(owner, record)) &&
+        _bindings.TryGetValue(record.Binding.BindingId, out var routed) && ReferenceEquals(routed, record);
     private sealed class PoolRecord(CxlOwnedPoolAllocation allocation)
     {
         public CxlOwnedPoolAllocation Allocation { get; } = allocation;
@@ -69,28 +114,70 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
             if (_bindings.ContainsKey(binding.BindingId))
                 return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.PlatformDenied, "Fabric registration lost to an existing exact binding owner.");
             var record = new BindingRecord(binding);
+            _bindingOwners.EnsureCapacity(_bindingOwners.Count + 1);
+            _bindingOwners.Add(record);
             _bindings.Add(binding.BindingId, record);
             return KernelResult<CxlFabricManagedBinding>.Ok(Snapshot(record));
         }
     }
 
-    public KernelResult ValidateAdmission(CxlFabricBinding binding)
+    private KernelResult<(BindingRecord Source, ulong Revision)> PrepareAdmission(CxlFabricBinding binding)
     {
+        BindingRecord record; ulong revision;
         lock (_gate)
         {
             var local = ValidateAdmissionCore(binding);
-            if (!local.IsSuccess) return local;
+            if (!local.IsSuccess) return KernelResult<(BindingRecord, ulong)>.Fail(local.Error, local.Message!);
+            record = _bindings[binding.BindingId]; revision = record.SourceRevision;
         }
         var current = _provider.QueryResource(binding.BindingId);
         if (!current.IsSuccess || current.Value!.Binding != binding || current.Value.State != CxlFabricResourceState.Bound)
-            return KernelResult.Fail(current.Status == PlatformAuthorityStatus.Stale ? KernelError.StaleGeneration : Map(current.Status), current.Message ?? "Fabric provider state changed.");
-        lock (_gate) return ValidateAdmissionCore(binding);
+            return KernelResult<(BindingRecord, ulong)>.Fail(current.Status == PlatformAuthorityStatus.Stale ? KernelError.StaleGeneration : Map(current.Status), current.Message ?? "Fabric provider state changed.");
+        lock (_gate)
+        {
+            var local = ValidateAdmissionCore(binding);
+            if (!local.IsSuccess) return KernelResult<(BindingRecord, ulong)>.Fail(local.Error, local.Message!);
+            if (!IsOriginalBinding(record) || record.SourceRevision != revision)
+                return KernelResult<(BindingRecord, ulong)>.Fail(KernelError.StaleGeneration, "Original fabric owner changed across admission query.");
+            return KernelResult<(BindingRecord, ulong)>.Ok((record, revision));
+        }
+    }
+    internal readonly record struct EffectSource(object OriginalOwner, ulong Revision, CxlFabricBinding Binding);
+    internal KernelResult<EffectSource> CaptureEffectSource(CxlFabricBinding binding)
+    {
+        lock (_gate)
+        {
+            var admitted = ValidateAdmissionCore(binding);
+            if (!admitted.IsSuccess) return KernelResult<EffectSource>.Fail(admitted.Error, admitted.Message!);
+            var record = _bindings[binding.BindingId];
+            return KernelResult<EffectSource>.Ok(new(record, record.SourceRevision, record.Binding));
+        }
+    }
+    internal KernelResult CommitEffectSource(EffectSource source, Func<KernelResult> commit)
+    {
+        lock (_gate)
+        {
+            if (source.OriginalOwner is not BindingRecord record || !IsOriginalBinding(record) ||
+                record.RevisionExhausted || record.SourceRevision != source.Revision || record.Binding != source.Binding)
+                return KernelResult.Fail(KernelError.StaleGeneration, "Original FM source changed before consumer commit.");
+            var admitted = ValidateAdmissionCore(source.Binding);
+            return admitted.IsSuccess ? commit() : admitted; // trusted local writer; no callback/provider queries
+        }
+    }
+    public KernelResult ValidateAdmission(CxlFabricBinding binding)
+    {
+        var source = PrepareAdmission(binding);
+        return source.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(source.Error, source.Message!);
     }
 
     private KernelResult ValidateAdmissionCore(CxlFabricBinding binding)
     {
         if (!_bindings.TryGetValue(binding.BindingId, out var record))
             return KernelResult.Fail(KernelError.PlatformBindingNotFound, "Fabric binding is not managed.");
+        if (!IsOriginalBinding(record) || record.RevisionExhausted)
+            return KernelResult.Fail(KernelError.StaleGeneration, "Original fabric owner is unavailable or exhausted.");
+        if (record.Begin is { Invoked: true, NoEffectConsumed: false, Completed: false } || record.BeginInFlight || record.CompletionInFlight)
+            return KernelResult.Fail(KernelError.PlatformBindingDraining, "Original reconfiguration invocation remains pending.");
         if (record.State != CxlFabricResourceState.Bound)
             return KernelResult.Fail(KernelError.PlatformBindingDraining, "Fabric binding is draining or faulted; new admission is closed.");
         if (record.Binding != binding)
@@ -101,14 +188,16 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
     public KernelResult TrackOperation(CxlFabricBinding binding, ProcessHandle principal, ExternalOperationHandle operation,
         Func<KernelResult>? providerClosure = null)
     {
-        var fresh = ValidateAdmission(binding);
-        if (!fresh.IsSuccess) return fresh;
+        var fresh = PrepareAdmission(binding);
+        if (!fresh.IsSuccess) return KernelResult.Fail(fresh.Error, fresh.Message!);
         var snapshot = _kernel.QueryExternalOperation(principal, operation);
         if (!snapshot.IsSuccess) return KernelResult.Fail(snapshot.Error, snapshot.Message!);
         lock (_gate)
         {
             var admission = ValidateAdmissionCore(binding);
             if (!admission.IsSuccess) return admission;
+            if (!IsOriginalBinding(fresh.Value.Source) || fresh.Value.Source.SourceRevision != fresh.Value.Revision)
+                return KernelResult.Fail(KernelError.StaleGeneration, "Original tracking source changed.");
             if (snapshot.Value!.State is ExternalOperationState.Submitted or ExternalOperationState.DeviceComplete or ExternalOperationState.Visible or ExternalOperationState.Published &&
                 providerClosure is null)
                 return KernelResult.Fail(KernelError.ExternalEffectUncontained,
@@ -131,8 +220,8 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
         {
             if (!_bindings.TryGetValue(binding.BindingId, out var record))
                 return KernelResult.Fail(KernelError.PlatformBindingNotFound, "Fabric binding is not managed.");
-            if (record.Binding != binding)
-                return KernelResult.Fail(KernelError.StaleGeneration, "Fabric binding generation is stale.");
+            if (!IsOriginalBinding(record) || record.Binding != binding)
+                return KernelResult.Fail(KernelError.StaleGeneration, "Original fabric binding generation is stale.");
             record.Operations.RemoveAll(item => item.Principal == principal && item.Operation == operation);
             return KernelResult.Ok();
         }
@@ -141,37 +230,138 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
     public KernelResult<T> ExecuteAdmission<T>(CxlFabricBinding binding, Func<KernelResult<T>> providerEffect)
     {
         ArgumentNullException.ThrowIfNull(providerEffect);
-        var fresh = ValidateAdmission(binding);
+        var fresh = PrepareAdmission(binding);
         if (!fresh.IsSuccess) return KernelResult<T>.Fail(fresh.Error, fresh.Message!);
         BindingRecord record;
         lock (_gate)
         {
             var admission = ValidateAdmissionCore(binding);
             if (!admission.IsSuccess) return KernelResult<T>.Fail(admission.Error, admission.Message!);
-            record = _bindings[binding.BindingId];
+            record = fresh.Value.Source;
+            if (!IsOriginalBinding(record) || record.SourceRevision != fresh.Value.Revision)
+                return KernelResult<T>.Fail(KernelError.StaleGeneration, "Original fabric admission source changed.");
             if (record.PendingAdmissions == int.MaxValue)
                 return KernelResult<T>.Fail(KernelError.CapacityExhausted, "Fabric admission interlock is saturated.");
             record.PendingAdmissions++;
         }
-        try { return providerEffect(); }
+        try
+        {
+            var result = providerEffect(); // actual consumer owns raw outcome before this boundary
+            lock (_gate)
+            {
+                if (!IsOriginalBinding(record) || record.SourceRevision != fresh.Value.Revision || record.RevisionExhausted)
+                    return KernelResult<T>.Fail(KernelError.ExternalEffectUncontained, "Actual fabric effect finished after original local source changed; cleanup facts remain at its consumer.");
+            }
+            return result;
+        }
         finally { lock (_gate) record.PendingAdmissions--; }
     }
 
+    private void RetainOriginalBeginFault(BindingRecord record, BeginInvocation fact)
+    {
+        lock (_gate)
+        {
+            var own = ReferenceEquals(record.OwnerSelf, record) && _bindingOwners.Any(value => ReferenceEquals(value, record)) &&
+                ReferenceEquals(record.Begin, fact) && ReferenceEquals(fact.OwnerSelf, fact) && ReferenceEquals(fact.Source, record) &&
+                record.Binding == fact.Binding && (record.SourceRevision == fact.Revision || record.SourceRevision == fact.OwnFaultRevision) &&
+                fact.RawObservation is { } raw && (raw.IsSuccess || raw.Status == PlatformAuthorityStatus.NotAccepted);
+            record.State = CxlFabricResourceState.Faulted;
+            if (own && !record.RevisionExhausted) fact.OwnFaultRevision = record.SourceRevision;
+        }
+    }
+    private KernelResult RestoreOriginalBegin(CxlFabricBindingId bindingId)
+    {
+        BindingRecord record; BeginInvocation fact; ulong revision;
+        (ProcessHandle Principal, ExternalOperationHandle Operation, Func<KernelResult>? ProviderClosure)[] dependencies;
+        lock (_gate)
+        {
+            if (!_bindings.TryGetValue(bindingId, out record!)) return KernelResult.Ok();
+            if (!IsOriginalBinding(record)) return KernelResult.Fail(KernelError.StaleGeneration, "Original FM route was substituted.");
+            if (record.Begin is not { } pending || pending.NoEffectConsumed || pending.Completed || record.Ticket is not null) return KernelResult.Ok();
+            fact = pending;
+            if (record.BeginInFlight || record.CompletionInFlight || record.PendingAdmissions != 0)
+                return KernelResult.Fail(KernelError.PlatformBindingDraining, "Original Begin observation is in flight.");
+            if (!ReferenceEquals(fact.OwnerSelf, fact) || !ReferenceEquals(fact.Source, record) || record.Binding != fact.Binding || record.RevisionExhausted ||
+                !(record.State == CxlFabricResourceState.Draining && record.SourceRevision == fact.Revision ||
+                  record.State == CxlFabricResourceState.Faulted && record.SourceRevision == fact.OwnFaultRevision))
+                return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Independent Begin source loss remains pinned.");
+            if (fact.Invoked && fact.RawObservation is not { IsSuccess: true } && fact.RawObservation is not { Status: PlatformAuthorityStatus.NotAccepted })
+                return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Original Begin outcome is unknown; no repeat.");
+            revision = record.SourceRevision;
+            dependencies = fact.Invoked ? [] : record.Operations.ToArray();
+            record.BeginInFlight = true;
+        }
+        try
+        {
+            var observed = _provider.QueryResource(bindingId);
+            // Caller never-invoked does not erase an unresolved dependent operation.
+            foreach (var operation in dependencies)
+            {
+                var state = _kernel.QueryExternalOperation(operation.Principal, operation.Operation);
+                if (!state.IsSuccess || state.Value!.State != ExternalOperationState.Released)
+                    return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Original dependent operation has not closed.");
+            }
+            lock (_gate)
+            {
+                if (!IsOriginalBinding(record) || !ReferenceEquals(record.Begin, fact) || !ReferenceEquals(fact.OwnerSelf, fact) ||
+                    record.SourceRevision != revision || record.RevisionExhausted || !observed.IsSuccess || observed.Value!.Binding != fact.Binding)
+                    return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Original Begin source cannot be reconciled.");
+                if (!fact.Invoked || fact.RawObservation is { Status: PlatformAuthorityStatus.NotAccepted })
+                {
+                    if (observed.Value.State != CxlFabricResourceState.Bound)
+                        return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Original no-effect lacks current Bound source.");
+                    fact.NoEffectConsumed = true; record.State = CxlFabricResourceState.Bound;
+                    return KernelResult.Ok();
+                }
+                var ticket = fact.RawObservation!.Value.Value;
+                if (ticket is null || ticket.PreviousBinding != fact.Binding || ticket.ReconfigurationId.Value == 0 ||
+                    ticket.ReplacementGeneration.Value <= fact.Binding.Generation.Value || observed.Value.State != CxlFabricResourceState.Draining)
+                    return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Original Begin ticket/source is malformed or unavailable.");
+                record.Ticket = ticket; record.State = CxlFabricResourceState.Draining;
+                return KernelResult.Ok(); // cleanup-only ticket handoff; admission remains closed
+            }
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        { return KernelResult.Fail(KernelError.ExternalEffectUncontained, $"Original Begin observation unavailable: {exception.Message}"); }
+        finally { lock (_gate) record.BeginInFlight = false; }
+    }
     public KernelResult<CxlFabricManagedBinding> BeginReconfiguration(CxlFabricBinding binding)
     {
-        var fresh = ValidateAdmission(binding);
+        var restored = RestoreOriginalBegin(binding.BindingId);
+        if (!restored.IsSuccess) return KernelResult<CxlFabricManagedBinding>.Fail(restored.Error, restored.Message!);
+        var fresh = PrepareAdmission(binding);
         if (!fresh.IsSuccess) return KernelResult<CxlFabricManagedBinding>.Fail(fresh.Error, fresh.Message!);
         BindingRecord record;
+        BeginInvocation fact;
         (ProcessHandle Principal, ExternalOperationHandle Operation, Func<KernelResult>? ProviderClosure)[] operations;
         lock (_gate)
         {
             var admission = ValidateAdmissionCore(binding);
             if (!admission.IsSuccess) return KernelResult<CxlFabricManagedBinding>.Fail(admission.Error, admission.Message!);
-            record = _bindings[binding.BindingId];
+            record = fresh.Value.Source;
+            if (!IsOriginalBinding(record) || record.SourceRevision != fresh.Value.Revision)
+                return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.StaleGeneration, "Original fabric Begin source changed.");
             if (record.PendingAdmissions != 0)
                 return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.PlatformBindingDraining, "Fabric creation callbacks must settle before reconfiguration.");
-            record.State = CxlFabricResourceState.Draining; // closes admission before provider generation changes
             operations = record.Operations.ToArray();
+        }
+        foreach (var tracked in operations)
+        {
+            var pending = _kernel.ExternalOperations.ValidateFabricDrainPreflight(tracked.Operation);
+            if (!pending.IsSuccess && pending.Error == KernelError.PlatformBindingDraining)
+                return KernelResult<CxlFabricManagedBinding>.Fail(pending.Error, pending.Message!);
+            // Other missing/foreign dependencies are diagnosed after admission closes.
+            // An unavailable tracked owner cannot leave this fabric open to new work.
+        }
+        lock (_gate)
+        {
+            if (!IsOriginalBinding(record) || record.SourceRevision != fresh.Value.Revision || record.PendingAdmissions != 0 ||
+                !record.Operations.SequenceEqual(operations))
+                return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.StaleGeneration, "Original drain inventory changed during preflight.");
+            record.State = CxlFabricResourceState.Draining; // closes admission before provider generation changes
+            fact = new(record, record.Binding, record.SourceRevision);
+            record.BeginHistory.Add(fact); record.Begin = fact;
+            record.BeginInFlight = true;
         }
         try
         {
@@ -183,7 +373,7 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
                     var closure = tracked.ProviderClosure();
                     if (!closure.IsSuccess)
                     {
-                        lock (_gate) record.State = CxlFabricResourceState.Faulted;
+                        RetainOriginalBeginFault(record, fact);
                         return KernelResult<CxlFabricManagedBinding>.Fail(closure.Error, closure.Message!);
                     }
                     providerClosed = true;
@@ -191,18 +381,30 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
                 var drained = DrainOperation(tracked.Principal, tracked.Operation, providerClosed);
                 if (!drained.IsSuccess)
                 {
-                    lock (_gate) record.State = CxlFabricResourceState.Faulted;
+                    RetainOriginalBeginFault(record, fact);
                     return KernelResult<CxlFabricManagedBinding>.Fail(drained.Error, drained.Message!);
                 }
             }
             PlatformAuthorityResult<CxlFabricReconfigurationTicket> begun;
             try
             {
-                begun = _provider.BeginReconfiguration(binding);
+                var preSource = _provider.QueryResource(binding.BindingId);
+                if (!preSource.IsSuccess || preSource.Value!.Binding != fact.Binding || preSource.Value.State != CxlFabricResourceState.Bound)
+                    return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.ExternalEffectUncontained, "Original Begin source stopped before effect.");
+                lock (_gate)
+                {
+                    if (!IsOriginalBinding(record) || record.RevisionExhausted || !ReferenceEquals(fact.OwnerSelf, fact) ||
+                        !ReferenceEquals(record.Begin, fact) || record.SourceRevision != fact.Revision ||
+                        record.State != CxlFabricResourceState.Draining || record.Binding != fact.Binding || record.Ticket is not null || fact.Invoked)
+                        return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.StaleGeneration, "Original fabric Begin stopped before effect.");
+                    fact.Invoked = true;
+                }
+                begun = _provider.BeginReconfiguration(fact.Binding);
+                lock (_gate) fact.RawObservation = begun;
             }
             catch (Exception exception)
             {
-                lock (_gate) record.State = CxlFabricResourceState.Faulted;
+                RetainOriginalBeginFault(record, fact);
                 return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.ExternalEffectUncontained,
                     $"Fabric reconfiguration threw after its effect boundary: {exception.Message}");
             }
@@ -219,24 +421,31 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
                 {
                     if (begun.Status == PlatformAuthorityStatus.NotAccepted &&
                         (!rejectedSourceCurrent || !_bindings.TryGetValue(binding.BindingId, out var current) ||
-                         !ReferenceEquals(current, record) || record.Binding != binding ||
+                         !IsOriginalBinding(record) || !ReferenceEquals(current, record) || record.SourceRevision != fact.Revision || record.Binding != binding ||
                          record.State != CxlFabricResourceState.Draining || record.Ticket is not null))
                     {
-                        record.State = CxlFabricResourceState.Faulted;
+                        RetainOriginalBeginFault(record, fact);
                         return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.ExternalEffectUncontained,
                             "Rejected reconfiguration did not preserve its exact provider/local source.");
                     }
+                    if (rejectedSourceCurrent) fact.NoEffectConsumed = true;
                     record.State = rejectedSourceCurrent ? CxlFabricResourceState.Bound : CxlFabricResourceState.Faulted;
                 }
                 return KernelResult<CxlFabricManagedBinding>.Fail(Map(begun.Status), begun.Message ?? "Fabric reconfiguration failed to begin.");
             }
             lock (_gate)
             {
-                record.Ticket = begun.Value!; // cleanup fact, never admission by itself
+                if (!IsOriginalBinding(record) || !ReferenceEquals(record.Begin, fact) || !ReferenceEquals(fact.OwnerSelf, fact) ||
+                    record.SourceRevision != fact.Revision || record.State != CxlFabricResourceState.Draining || record.Binding != fact.Binding)
+                {
+                    RetainOriginalBeginFault(record, fact);
+                    return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.ExternalEffectUncontained, "Original Begin outcome retained after local source loss.");
+                }
+                record.Ticket = begun.Value!; // raw already retained; this is local publication
                 if (begun.Value!.ReconfigurationId.Value == 0 || begun.Value.PreviousBinding != binding ||
                     begun.Value.ReplacementGeneration.Value <= binding.Generation.Value)
                 {
-                    record.State = CxlFabricResourceState.Faulted;
+                    RetainOriginalBeginFault(record, fact);
                     return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.ExternalEffectUncontained,
                         "Fabric reconfiguration ticket does not preserve the exact source and forward generation.");
                 }
@@ -245,83 +454,110 @@ public sealed class CxlFabricManagerAuthority : ICxlTeardownParticipant
         }
         catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
         {
-            lock (_gate) record.State = CxlFabricResourceState.Faulted;
+            RetainOriginalBeginFault(record, fact);
             return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.ExternalEffectUncontained,
                 $"Fabric drain did not prove closure: {exception.Message}");
         }
+        finally { lock (_gate) record.BeginInFlight = false; }
     }
 
     public KernelResult<CxlFabricManagedBinding> CompleteReconfiguration(CxlFabricBindingId bindingId)
     {
+        var restored = RestoreOriginalBegin(bindingId);
+        if (!restored.IsSuccess) return KernelResult<CxlFabricManagedBinding>.Fail(restored.Error, restored.Message!);
         BindingRecord record;
-        CxlFabricReconfigurationTicket ticket;
+        CompletionInvocation fact;
+        bool OriginalFact() => IsOriginalBinding(record) && ReferenceEquals(fact.OwnerSelf, fact) &&
+            ReferenceEquals(fact.Source, record) && ReferenceEquals(record.Completion, fact) &&
+            record.CompletionHistory.Any(value => ReferenceEquals(value, fact)) &&
+            ReferenceEquals(record.Begin, fact.Begin) && ReferenceEquals(fact.Begin.OwnerSelf, fact.Begin) &&
+            ReferenceEquals(fact.Begin.Source, record) && fact.Begin.Invoked &&
+            fact.Begin.RawObservation is { IsSuccess: true } begun && ReferenceEquals(begun.Value, fact.Ticket) &&
+            ReferenceEquals(record.Ticket, fact.Ticket) && record.Binding == fact.Ticket.PreviousBinding;
+        bool CurrentSource() => !record.RevisionExhausted &&
+            (record.State == CxlFabricResourceState.Draining && record.SourceRevision == fact.Revision ||
+             record.State == CxlFabricResourceState.Faulted && fact.OwnFaultRevision == record.SourceRevision);
+        void RetainOwnFault()
+        {
+            lock (_gate)
+            {
+                var own = OriginalFact() && CurrentSource() && fact.RawObservation is { } raw &&
+                    (raw.IsSuccess || raw.Status == PlatformAuthorityStatus.NotAccepted);
+                record.State = CxlFabricResourceState.Faulted;
+                if (own && !record.RevisionExhausted) fact.OwnFaultRevision = record.SourceRevision;
+            }
+        }
         lock (_gate)
         {
-            if (!_bindings.TryGetValue(bindingId, out record!) || record.State != CxlFabricResourceState.Draining || record.Ticket is null)
-                return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.InvalidTransition, "Fabric binding has no active reconfiguration.");
-            if (record.CompletionInFlight)
-                return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.PlatformBindingDraining, "Fabric completion callback is already in flight.");
-            ticket = record.Ticket;
+            if (!_bindings.TryGetValue(bindingId, out record!) || !IsOriginalBinding(record) || record.Begin is not { } begin ||
+                !ReferenceEquals(begin.OwnerSelf, begin) || !ReferenceEquals(begin.Source, record) || !begin.Invoked ||
+                begin.RawObservation is not { IsSuccess: true } begun || begun.Value is not { } ticket || !ReferenceEquals(record.Ticket, ticket))
+                return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.InvalidTransition, "Original fabric binding has no admitted reconfiguration ticket.");
+            if (record.CompletionInFlight || record.BeginInFlight)
+                return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.PlatformBindingDraining, "Fabric callback is already in flight.");
+            if (record.Completion is null || record.Completion.NoEffectConsumed)
+            {
+                if (record.State != CxlFabricResourceState.Draining || record.RevisionExhausted)
+                    return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.InvalidTransition, "Fabric completion requires the original draining source.");
+                record.Completion = new(record, begin, ticket, record.SourceRevision);
+                record.CompletionHistory.Add(record.Completion);
+            }
+            fact = record.Completion;
+            if (!OriginalFact()) return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.InvalidTransition, "Original completion fact was substituted.");
+            if (fact.Invoked && fact.RawObservation is not { IsSuccess: true } &&
+                fact.RawObservation is not { Status: PlatformAuthorityStatus.NotAccepted })
+                return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.ExternalEffectUncontained, "Original Complete outcome is unknown; no repeat.");
+            if (!CurrentSource()) return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.InvalidTransition, "Independent fabric source loss prevents completion consumption.");
             record.CompletionInFlight = true;
         }
         try
         {
-            PlatformAuthorityResult<CxlFabricBinding> completed;
-            PlatformAuthorityResult<CxlFabricResourceSnapshot> observed = default;
-            try
+            if (!fact.Invoked)
             {
-                completed = _provider.CompleteReconfiguration(ticket);
-                if (completed.IsSuccess)
+                lock (_gate)
                 {
-                    // Preserve a returned receipt even when later observation/publication fails.
-                    lock (_gate) record.LastCompletionReceipt = completed.Value;
-                    observed = _provider.QueryResource(bindingId);
+                    if (!OriginalFact() || !CurrentSource()) return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.StaleGeneration, "Completion stopped before effect.");
+                    fact.Invoked = true;
                 }
-                else if (completed.Status == PlatformAuthorityStatus.NotAccepted)
-                    observed = _provider.QueryResource(bindingId); // fresh original source, outside owner gate
+                var completed = _provider.CompleteReconfiguration(fact.Ticket);
+                lock (_gate)
+                {
+                    fact.RawObservation = completed;
+                    if (completed.IsSuccess) record.LastCompletionReceipt = completed.Value;
+                }
             }
-            catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
-            {
-                lock (_gate) record.State = CxlFabricResourceState.Faulted;
-                return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.ExternalEffectUncontained,
-                    $"Fabric reconfiguration completion threw after its effect boundary: {exception.Message}");
-            }
+            var raw = fact.RawObservation;
+            if (raw is null) { RetainOwnFault(); return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.ExternalEffectUncontained, "Original completion response is absent."); }
+            if (!raw.Value.IsSuccess && raw.Value.Status != PlatformAuthorityStatus.NotAccepted)
+            { RetainOwnFault(); return KernelResult<CxlFabricManagedBinding>.Fail(Map(raw.Value.Status), raw.Value.Message ?? "Original completion remains pinned."); }
+            var observed = _provider.QueryResource(bindingId); // pure fresh source observation, never another Complete
             lock (_gate)
             {
-                if (!_bindings.TryGetValue(bindingId, out var current) || !ReferenceEquals(current, record) ||
-                    record.State != CxlFabricResourceState.Draining || record.Ticket != ticket || record.Binding != ticket.PreviousBinding)
+                if (!OriginalFact() || !CurrentSource())
+                { RetainOwnFault(); return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.ExternalEffectUncontained, "Original completion lost its local source."); }
+                if (!raw.Value.IsSuccess)
                 {
-                    record.State = CxlFabricResourceState.Faulted;
-                    return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.ExternalEffectUncontained, "Fabric completion lost its exact admitted ticket/state.");
+                    if (!observed.IsSuccess || observed.Value!.Binding != fact.Ticket.PreviousBinding || observed.Value.State != CxlFabricResourceState.Draining)
+                    { RetainOwnFault(); return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.ExternalEffectUncontained, "Exact no-effect completion lacks current draining source."); }
+                    fact.NoEffectConsumed = true; record.State = CxlFabricResourceState.Draining;
+                    return KernelResult<CxlFabricManagedBinding>.Fail(Map(raw.Value.Status), raw.Value.Message ?? "Exact no-effect consumed; a fresh completion may be admitted.");
                 }
-                if (!completed.IsSuccess)
-                {
-                    if (completed.Status == PlatformAuthorityStatus.NotAccepted &&
-                        observed.IsSuccess && observed.Value!.Binding == ticket.PreviousBinding &&
-                        observed.Value.State == CxlFabricResourceState.Draining)
-                        return KernelResult<CxlFabricManagedBinding>.Fail(Map(completed.Status),
-                            completed.Message ?? "Fabric completion was rejected before effect; exact draining ticket retained.");
-                    record.State = CxlFabricResourceState.Faulted;
-                    return KernelResult<CxlFabricManagedBinding>.Fail(Map(completed.Status), completed.Message ?? "Fabric reconfiguration completion failed.");
-                }
-                if (completed.Value!.BindingId != bindingId || completed.Value.Generation != ticket.ReplacementGeneration ||
-                    completed.Value.EndpointId != ticket.PreviousBinding.EndpointId ||
-                    completed.Value.DeviceGeneration != ticket.PreviousBinding.DeviceGeneration)
-                {
-                    record.State = CxlFabricResourceState.Faulted;
-                    return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.PlatformFaulted, "Provider returned a malformed replacement binding.");
-                }
-                if (!observed.IsSuccess || observed.Value!.Binding != completed.Value || observed.Value.State != CxlFabricResourceState.Bound)
-                {
-                    record.State = CxlFabricResourceState.Faulted;
-                    return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.ExternalEffectUncontained, "Fabric completion receipt lost provider source continuity.");
-                }
-                record.Binding = completed.Value;
-                record.State = CxlFabricResourceState.Bound;
-                record.Ticket = null;
+                var binding = raw.Value.Value;
+                if (binding is null || binding.BindingId != bindingId || binding.Generation != fact.Ticket.ReplacementGeneration ||
+                    binding.EndpointId != fact.Ticket.PreviousBinding.EndpointId || binding.DeviceGeneration != fact.Ticket.PreviousBinding.DeviceGeneration)
+                { RetainOwnFault(); return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.PlatformFaulted, "Malformed original replacement binding."); }
+                if (!observed.IsSuccess || observed.Value!.Binding != binding || observed.Value.State != CxlFabricResourceState.Bound)
+                { RetainOwnFault(); return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.ExternalEffectUncontained, "Known completion lost provider source continuity."); }
+                fact.Consumed = true; fact.Begin.Completed = true;
+                record.Binding = binding; record.State = CxlFabricResourceState.Bound; record.Ticket = null;
                 record.Operations.Clear();
                 return KernelResult<CxlFabricManagedBinding>.Ok(Snapshot(record));
             }
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException and not StackOverflowException)
+        {
+            RetainOwnFault();
+            return KernelResult<CxlFabricManagedBinding>.Fail(KernelError.ExternalEffectUncontained, $"Original completion remains pinned: {exception.Message}");
         }
         finally { lock (_gate) record.CompletionInFlight = false; }
     }

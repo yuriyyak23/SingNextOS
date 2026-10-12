@@ -1,4 +1,5 @@
 using SingPlus.Contracts;
+using SingPlus.Platform;
 
 namespace SingPlus.Runtime;
 
@@ -9,18 +10,28 @@ internal readonly record struct PreparedSecurePublication(
 public sealed partial class RuntimeKernel
 {
     private enum SecureExecutionState { Binding, Active, Checking, Closing, Quarantined, Closed }
-    private sealed class SecureExecutionRecord(SecureExecutionRequest request, ProcessHandle owner,
-        CapabilityId virtualCapability, CapabilityId secureCapability, ISecureExecutionProvider provider)
+    private sealed class SecureExecutionRecord
     {
-        internal readonly SecureExecutionRequest Request = request;
-        internal readonly ProcessHandle Owner = owner;
-        internal readonly CapabilityId VirtualCapability = virtualCapability;
-        internal readonly CapabilityId SecureCapability = secureCapability;
-        internal readonly ISecureExecutionProvider Provider = provider;
+        internal SecureExecutionRecord(SecureExecutionRequest request, ProcessHandle owner, CapabilityId virtualCapability,
+            CapabilityId secureCapability, ISecureExecutionProvider provider)
+        { OriginalOwner = this; Request = request; Owner = owner; VirtualCapability = virtualCapability; SecureCapability = secureCapability; Provider = provider; }
+        internal readonly SecureExecutionRecord OriginalOwner;
+        internal readonly SecureExecutionRequest Request;
+        internal readonly ProcessHandle Owner;
+        internal readonly CapabilityId VirtualCapability;
+        internal readonly CapabilityId SecureCapability;
+        internal readonly ISecureExecutionProvider Provider;
         internal SecureExecutionReceipt? Receipt;
+        internal PlatformAuthorityResult<SecureExecutionReceipt>? BindObservation;
+        internal VirtualDomainAuthority.EffectSource? BindVirtualSource;
+        internal SecureEffectSource? BindSecureSource;
         internal SecureExecutionState State = SecureExecutionState.Binding;
         internal int EffectUses;
         internal SecureExecutionClosureFact? LastClosureReceipt;
+        internal bool CloseInvoked;
+        internal bool CloseInFlight;
+        internal bool ClosureConsumed;
+        internal SecureExecutionCloseInvocationFact? CloseInvocation;
         // Observation-only identity; saturation disables tracing, never cleanup.
         internal ulong ClosureObservationSequence;
         // Optional observation consumer, never consulted for admission or reclaim.
@@ -29,8 +40,27 @@ public sealed partial class RuntimeKernel
     // Cleanup fact only; preserve Closed and Contained independently, never permission.
     private sealed record SecureExecutionClosureFact(SecureExecutionRequest AdmittedRequest,
         SecureExecutionReceipt? AdmittedReceipt, PlatformBackendEpoch AdmissionEpoch, SecureExecutionClosure Receipt);
+    private sealed class SecureExecutionCloseInvocationFact
+    {
+        internal SecureExecutionCloseInvocationFact(SecureExecutionRecord owner, PlatformBackendEpoch epoch)
+        { OriginalOwner = this; Source = owner; Request = owner.Request; Receipt = owner.Receipt; Epoch = epoch; }
+        internal readonly SecureExecutionCloseInvocationFact OriginalOwner;
+        internal readonly SecureExecutionRecord Source;
+        internal readonly SecureExecutionRequest Request;
+        internal readonly SecureExecutionReceipt? Receipt;
+        internal readonly PlatformBackendEpoch Epoch;
+        internal PlatformAuthorityResult<SecureExecutionClosure>? Observation;
+    }
     private readonly object _secureExecutionGate = new();
     private readonly Dictionary<ulong, SecureExecutionRecord> _secureExecutions = [];
+    // Existing execution owners remain authoritative when a routing index is lost.
+    private readonly List<SecureExecutionRecord> _secureExecutionOwners = [];
+    private bool HasOriginalSecureExecution(SecureExecutionRecord record) =>
+        ReferenceEquals(record.OriginalOwner, record) && _secureExecutionOwners.Any(x => ReferenceEquals(x, record)) &&
+        _secureExecutions.TryGetValue(record.Request.Binding.Id, out var route) && ReferenceEquals(route, record);
+    private IEnumerable<SecureExecutionRecord> SecureExecutionInventory() => _secureExecutionOwners;
+    private static bool HasCompletedSecureExecution(SecureExecutionRecord record) =>
+        ReferenceEquals(record.OriginalOwner, record) && record.ClosureConsumed;
     private readonly HashSet<ProcessHandle> _secureExecutionDrainingOwners = [];
     private readonly HashSet<VirtualDomainHandle> _secureExecutionDrainingVirtual = [];
     private readonly HashSet<SecureDomainHandle> _secureExecutionDrainingSecure = [];
@@ -60,13 +90,26 @@ public sealed partial class RuntimeKernel
         var admission = CommitSecureBindSources(owner, virtualDomain, virtualCapability, secureDomain, secureCapability, context =>
         {
             if (_secureExecutionDrainingOwners.Contains(owner) || _secureExecutionDrainingVirtual.Contains(virtualDomain) ||
-                _secureExecutionDrainingSecure.Contains(secureDomain) || _secureExecutions.Values.Any(x =>
-                    x.State != SecureExecutionState.Closed && (x.Request.Context.Virtual == virtualDomain || x.Request.Context.Secure == secureDomain)))
+                _secureExecutionDrainingSecure.Contains(secureDomain) || SecureExecutionInventory().Any(x =>
+                    !HasCompletedSecureExecution(x) && (x.Request.Context.Virtual == virtualDomain || x.Request.Context.Secure == secureDomain)))
                 return KernelResult.Fail(KernelError.PlatformBindingActive, "Composition is already pinned or admissions are draining.");
             if (_nextSecureExecution is 0 or ulong.MaxValue)
                 return KernelResult.Fail(KernelError.CapacityExhausted, "Secure composition identity space exhausted.");
             admittedRecord = new(new(new(_nextSecureExecution++, 1), context), owner, virtualCapability, secureCapability, provider);
+            var domainSource = _virtualDomains.ResolveAdmission(owner, virtualDomain);
+            if (!domainSource.IsSuccess) return KernelResult.Fail(domainSource.Error, domainSource.Message!);
+            var captured = _virtualDomains.CaptureEffectSource(domainSource.Value!, domainSource.Value!.State);
+            if (!captured.IsSuccess) return KernelResult.Fail(captured.Error, captured.Message!);
+            admittedRecord.BindVirtualSource = captured.Value;
+            var secureSource = CaptureSecureEffectSource(_secureDomainRecords[secureDomain.DomainId]);
+            if (!secureSource.IsSuccess) return KernelResult.Fail(secureSource.Error, secureSource.Message!);
+            admittedRecord.BindSecureSource = secureSource.Value;
             admittedRecord.ClosureTraceSink = closureTraceSink;
+            if (_secureExecutionOwners.Count == int.MaxValue || _secureExecutions.Count == int.MaxValue)
+                return KernelResult.Fail(KernelError.CapacityExhausted, "Original secure execution inventory is exhausted.");
+            _secureExecutionOwners.EnsureCapacity(_secureExecutionOwners.Count + 1);
+            _secureExecutions.EnsureCapacity(_secureExecutions.Count + 1);
+            _secureExecutionOwners.Add(admittedRecord);
             _secureExecutions.Add(admittedRecord.Request.Binding.Id, admittedRecord);
             return KernelResult.Ok();
         });
@@ -77,11 +120,14 @@ public sealed partial class RuntimeKernel
             var result = record.Provider.BindSecureExecution(record.Request);
             // Known materialization must survive even a subsequent query exception.
             lock (_secureExecutionGate)
+            {
+                record.BindObservation = result;
                 if (result.IsSuccess) record.Receipt = result.Value;
+            }
             var currentProvider = PlatformAuthority.SecureExecutionProvider;
             var publication = CommitSecureBindSources(owner, virtualDomain, virtualCapability, secureDomain, secureCapability, current =>
             {
-                if (record.State == SecureExecutionState.Binding && result.IsSuccess &&
+                if (HasOriginalSecureExecution(record) && record.State == SecureExecutionState.Binding && result.IsSuccess &&
                     currentProvider == record.Provider &&
                     ExactAdmission(record.Request, result.Value) && current == record.Request.Context &&
                     !_secureExecutionDrainingOwners.Contains(owner) && !_secureExecutionDrainingVirtual.Contains(virtualDomain) &&
@@ -92,7 +138,7 @@ public sealed partial class RuntimeKernel
                     return KernelResult.Ok();
                 }
                 return KernelResult.Fail(KernelError.PlatformFaulted, "Secure bind exact publication refused.");
-            });
+            }, record.BindVirtualSource, record.BindSecureSource);
             if (publication.IsSuccess) return KernelResult<SecureExecutionBinding>.Ok(record.Request.Binding);
             lock (_secureExecutionGate) record.State = SecureExecutionState.Quarantined;
         }
@@ -109,7 +155,8 @@ public sealed partial class RuntimeKernel
     // Trusted pure owner admission/publication only; provider code runs outside these locks.
     private KernelResult CommitSecureBindSources(ProcessHandle owner, VirtualDomainHandle virtualDomain,
         CapabilityId virtualCapability, SecureDomainHandle secureDomain, CapabilityId secureCapability,
-        Func<SecureExecutionContext, KernelResult> commit)
+        Func<SecureExecutionContext, KernelResult> commit, VirtualDomainAuthority.EffectSource? virtualSource = null,
+        SecureEffectSource? secureSource = null)
     {
         lock (_platformMemoryUseGate)
         lock (_secureExecutionGate)
@@ -128,10 +175,10 @@ public sealed partial class RuntimeKernel
                     return _virtualDomains.CommitEffectAdmission(domain.Value!, domain.Value!.State, () =>
                     {
                         var context = ResolveComposition(owner, virtualDomain, virtualCapability, secureDomain, secureCapability);
-                        return context.IsSuccess
-                            ? PlatformAuthority.CommitSecureExecutionContext(context.Value, () => commit(context.Value))
-                            : KernelResult.Fail(context.Error, context.Message!);
-                    });
+                        if (!context.IsSuccess) return KernelResult.Fail(context.Error, context.Message!);
+                        KernelResult Commit() => PlatformAuthority.CommitSecureExecutionContext(context.Value, () => commit(context.Value));
+                        return secureSource is null ? Commit() : CommitSecureEffectSource(secureSource, Commit);
+                    }, virtualSource);
                 }));
         }
     }
@@ -149,7 +196,7 @@ public sealed partial class RuntimeKernel
             sc.Value!.ResourceKind != ResourceKind.SecureCompute || sc.Value.ResourceId != SecureComputeResourceIds.Domain(secureDomain.DomainId))
             return KernelResult<SecureExecutionContext>.Fail(KernelError.WrongCapabilityResource, "Both exact local configure authorities are required.");
         if (!_secureDomainRecords.TryGetValue(secureDomain.DomainId, out var secureRecord) ||
-            secureRecord.Handle != secureDomain || secureRecord.Owner != owner)
+            !HasOriginalSecureRecord(secureRecord) || secureRecord.Handle != secureDomain || secureRecord.Owner != owner || secureRecord.SourceRevisionExhausted)
             return KernelResult<SecureExecutionContext>.Fail(KernelError.StaleGeneration, "Secure domain identity or generation is absent or stale.");
         if (virtualRecord.Value!.State is VirtualDomainState.Draining or VirtualDomainState.Quarantined or VirtualDomainState.Faulted ||
             secureRecord.State is SecureDomainState.Draining or SecureDomainState.Quarantined or SecureDomainState.Faulted or SecureDomainState.Closed)
@@ -162,23 +209,40 @@ public sealed partial class RuntimeKernel
             secureRecord.PolicyGeneration, secureRecord.ProtectionGeneration);
     }
 
+    internal KernelResult<SecureEffectSource> CaptureSecureComputeSource(ProcessHandle owner, SecureExecutionBinding binding)
+    {
+        lock (_platformMemoryUseGate)
+        lock (_secureExecutionGate)
+            return _secureExecutions.TryGetValue(binding.Id, out var execution) && HasOriginalSecureExecution(execution) && execution.Request.Binding == binding && execution.Owner == owner &&
+                _secureDomainRecords.TryGetValue(execution.Request.Context.Secure.DomainId, out var secure) && secure.Owner == owner
+                ? CaptureSecureEffectSource(secure)
+                : KernelResult<SecureEffectSource>.Fail(KernelError.StaleGeneration, "Original local secure compute source unavailable.");
+    }
+
     internal KernelResult<PreparedSecurePublication> PrepareSecurePublication(ProcessHandle owner,
-        VirtualComputeContext context)
+        VirtualComputeContext context, VirtualDomainAuthority.EffectSource? originalSource = null, SecureEffectSource? originalSecureSource = null)
     {
         if (context.SecureExecution is not { } binding)
             return KernelResult<PreparedSecurePublication>.Fail(KernelError.PlatformDenied, "Exact secure execution required.");
+        var secureSource = originalSecureSource is null ? CaptureSecureComputeSource(owner, binding) : KernelResult<SecureEffectSource>.Ok(originalSecureSource);
+        if (!secureSource.IsSuccess) return KernelResult<PreparedSecurePublication>.Fail(secureSource.Error, secureSource.Message!);
         var valid = RevalidateSecureExecution(binding); // Provider callbacks before all commit locks.
         if (!valid.IsSuccess) return KernelResult<PreparedSecurePublication>.Fail(valid.Error, valid.Message!);
         lock (_platformMemoryUseGate)
         lock (_secureExecutionGate)
         {
-            if (!_secureExecutions.TryGetValue(binding.Id, out var record) || record.Request.Binding != binding ||
+            if (!_secureExecutions.TryGetValue(binding.Id, out var record) || !HasOriginalSecureExecution(record) || record.Request.Binding != binding ||
                 record.Owner != owner || record.Request.Context.Virtual != context.VirtualDomain ||
                 record.State != SecureExecutionState.Active || record.Receipt is not { } receipt ||
                 !_secureDomainRecords.TryGetValue(record.Request.Context.Secure.DomainId, out var secure))
                 return KernelResult<PreparedSecurePublication>.Fail(KernelError.StaleGeneration, "Secure publication composition changed.");
             var expectedState = secure.State;
             var expected = record.Request.Context;
+            var domainSource = _virtualDomains.ResolveAdmission(owner, expected.Virtual);
+            if (!domainSource.IsSuccess) return KernelResult<PreparedSecurePublication>.Fail(domainSource.Error, domainSource.Message!);
+            var captured = originalSource is null ? _virtualDomains.CaptureEffectSource(domainSource.Value!, domainSource.Value!.State) :
+                KernelResult<VirtualDomainAuthority.EffectSource>.Ok(originalSource);
+            if (!captured.IsSuccess) return KernelResult<PreparedSecurePublication>.Fail(captured.Error, captured.Message!);
             var subject = expected.Parent.Subject.DomainId;
             KernelResult Admission(Func<KernelResult> commit)
             {
@@ -186,7 +250,7 @@ public sealed partial class RuntimeKernel
                 lock (_secureExecutionGate)
                 {
                     if (!_secureExecutions.TryGetValue(binding.Id, out var current) || !ReferenceEquals(current, record) ||
-                        current.State != SecureExecutionState.Active || current.Receipt != receipt ||
+                        !HasOriginalSecureExecution(current) || current.State != SecureExecutionState.Active || current.Receipt != receipt ||
                         _secureExecutionDrainingOwners.Contains(owner) || _secureExecutionDrainingVirtual.Contains(expected.Virtual) ||
                         _secureExecutionDrainingSecure.Contains(expected.Secure) ||
                         !_secureDomainRecords.TryGetValue(expected.Secure.DomainId, out var local) || !ReferenceEquals(local, secure) ||
@@ -195,10 +259,11 @@ public sealed partial class RuntimeKernel
                         local.PolicyGeneration != expected.LocalPolicyGeneration || local.ProtectionGeneration != expected.LocalProtectionGeneration ||
                         local.TransitionInFlight || local.ClosureInFlight || local.RegionMutationInFlight)
                         return KernelResult.Fail(KernelError.PlatformBindingDraining, "Secure publication local composition stopped or changed.");
-                    return CapabilityAuthority.CommitVirtualDomainEffect(record.VirtualCapability, subject, owner.Generation,
+                    return CommitSecureEffectSource(secureSource.Value!, () => CapabilityAuthority.CommitVirtualDomainEffect(record.VirtualCapability, subject, owner.Generation,
                         CapabilityRights.Configure, VirtualizationResourceIds.Domain(expected.Virtual.DomainId), () =>
                         CapabilityAuthority.CommitSecureDomainEffect(record.SecureCapability, subject, owner.Generation,
-                            SecureComputeResourceIds.Domain(expected.Secure.DomainId), commit));
+                            SecureComputeResourceIds.Domain(expected.Secure.DomainId), () =>
+                            _virtualDomains.CommitEffectAdmission(captured.Value!.Owner, captured.Value.Lineage[0].State, commit, captured.Value))));
                 }
             }
             return KernelResult<PreparedSecurePublication>.Ok(new(Admission,
@@ -209,9 +274,12 @@ public sealed partial class RuntimeKernel
     internal KernelResult RevalidateSecureExecution(SecureExecutionBinding binding)
     {
         SecureExecutionRecord record;
+        VirtualDomainAuthority.EffectSource virtualSource;
+        SecureEffectSource secureSource;
+        lock (_platformMemoryUseGate)
         lock (_secureExecutionGate)
         {
-            if (!_secureExecutions.TryGetValue(binding.Id, out record!) || record.Request.Binding != binding)
+            if (!_secureExecutions.TryGetValue(binding.Id, out record!) || !HasOriginalSecureExecution(record) || record.Request.Binding != binding)
                 return KernelResult.Fail(KernelError.StaleGeneration, "Exact composition identity/generation required.");
             if (record.State != SecureExecutionState.Active) return KernelResult.Fail(KernelError.PlatformFaulted, "Composition is not active.");
             var current = ResolveComposition(record.Owner, record.Request.Context.Virtual, record.VirtualCapability,
@@ -220,6 +288,14 @@ public sealed partial class RuntimeKernel
                 _secureExecutionDrainingOwners.Contains(record.Owner) ||
                 _secureExecutionDrainingVirtual.Contains(record.Request.Context.Virtual) || _secureExecutionDrainingSecure.Contains(record.Request.Context.Secure))
             { record.State = SecureExecutionState.Quarantined; return KernelResult.Fail(KernelError.StaleGeneration, "Composition authority changed."); }
+            var domainSource = _virtualDomains.ResolveAdmission(record.Owner, record.Request.Context.Virtual);
+            if (!domainSource.IsSuccess) { record.State = SecureExecutionState.Quarantined; return KernelResult.Fail(domainSource.Error, domainSource.Message!); }
+            var captured = _virtualDomains.CaptureEffectSource(domainSource.Value!, domainSource.Value!.State);
+            if (!captured.IsSuccess) { record.State = SecureExecutionState.Quarantined; return KernelResult.Fail(captured.Error, captured.Message!); }
+            virtualSource = captured.Value!;
+            var capturedSecure = CaptureSecureEffectSource(_secureDomainRecords[record.Request.Context.Secure.DomainId]);
+            if (!capturedSecure.IsSuccess) { record.State = SecureExecutionState.Quarantined; return KernelResult.Fail(capturedSecure.Error, capturedSecure.Message!); }
+            secureSource = capturedSecure.Value!;
             record.State = SecureExecutionState.Checking;
         }
         bool exact = false;
@@ -234,11 +310,14 @@ public sealed partial class RuntimeKernel
             currentProvider = PlatformAuthority.SecureExecutionProvider;
         }
         catch (Exception) { exact = false; }
+        lock (_platformMemoryUseGate)
         lock (_secureExecutionGate)
         {
             var current = ResolveComposition(record.Owner, record.Request.Context.Virtual, record.VirtualCapability,
                 record.Request.Context.Secure, record.SecureCapability);
-            exact &= record.State == SecureExecutionState.Checking && current.IsSuccess && current.Value == record.Request.Context &&
+            exact &= HasOriginalSecureExecution(record) && record.State == SecureExecutionState.Checking && current.IsSuccess && current.Value == record.Request.Context &&
+                CommitSecureEffectSource(secureSource, KernelResult.Ok).IsSuccess &&
+                _virtualDomains.CommitEffectAdmission(virtualSource.Owner, virtualSource.Lineage[0].State, KernelResult.Ok, virtualSource).IsSuccess &&
                 currentProvider == record.Provider &&
                 !_secureExecutionDrainingOwners.Contains(record.Owner) && !_secureExecutionDrainingVirtual.Contains(record.Request.Context.Virtual) &&
                 !_secureExecutionDrainingSecure.Contains(record.Request.Context.Secure);
@@ -252,40 +331,63 @@ public sealed partial class RuntimeKernel
         SecureExecutionRecord record;
         SecureExecutionReceipt? admittedReceipt;
         PlatformBackendEpoch admissionEpoch;
+        SecureExecutionCloseInvocationFact invocation;
+        bool invoke;
         ulong observationSequence = 0;
         lock (_secureExecutionGate)
         {
-            if (!_secureExecutions.TryGetValue(binding.Id, out record!) || record.Request.Binding != binding)
+            if (!_secureExecutions.TryGetValue(binding.Id, out record!) || !HasOriginalSecureExecution(record) || record.Request.Binding != binding)
                 return KernelResult.Fail(KernelError.StaleGeneration, "Exact composition identity/generation required for closure.");
-            if (record.State == SecureExecutionState.Closed) return KernelResult.Ok();
+            if (record.ClosureConsumed) return KernelResult.Ok();
             if (HasSecureGuestRegionsForExecution(binding) || HasVirtualIoForSecureExecution(binding) || HasVirtualComputePin(binding))
                 return KernelResult.Fail(KernelError.PlatformBindingDraining,
                     "Secure execution remains pinned by a secure guest, Virtual-I/O, or virtualized compute dependency.");
             if (record.EffectUses != 0)
                 return KernelResult.Fail(KernelError.PlatformBindingDraining, "Composed provider effect/publication is in flight.");
-            if (record.State is SecureExecutionState.Binding or SecureExecutionState.Checking or SecureExecutionState.Closing)
+            if (record.CloseInFlight || record.State is SecureExecutionState.Binding or SecureExecutionState.Checking or SecureExecutionState.Closing)
                 return KernelResult.Fail(KernelError.PlatformBindingDraining, "Composition provider call is in flight.");
+            invoke = !record.CloseInvoked;
+            if (invoke)
+            {
+                record.CloseInvocation = new(record, PlatformAuthority.BackendEpoch);
+                record.CloseInvoked = true;
+            }
+            if (record.CloseInvocation is not { } original || !ReferenceEquals(original.OriginalOwner, original) ||
+                !ReferenceEquals(original.Source, record) || original.Request != record.Request || original.Receipt != record.Receipt)
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Original secure closure fact is unavailable; effect cannot repeat.");
+            invocation = original;
+            record.CloseInFlight = true;
             record.State = SecureExecutionState.Closing;
-            admittedReceipt = record.Receipt;
-            admissionEpoch = PlatformAuthority.BackendEpoch;
+            admittedReceipt = invocation.Receipt;
+            admissionEpoch = invocation.Epoch;
             traceSink ??= record.ClosureTraceSink;
             if (traceSink is not null && record.ClosureObservationSequence != ulong.MaxValue)
                 observationSequence = ++record.ClosureObservationSequence;
             else traceSink = null;
         }
+        try
+        {
         bool terminal;
         SecureExecutionClosure? rawClosure = null;
         try
         {
-            var result = record.Provider.CloseSecureExecution(record.Request, admittedReceipt);
-            if (result.IsSuccess)
+            if (invoke)
             {
-                rawClosure = result.Value;
+                var observed = record.Provider.CloseSecureExecution(invocation.Request, admittedReceipt);
                 lock (_secureExecutionGate)
-                    record.LastClosureReceipt = new(record.Request, admittedReceipt, admissionEpoch, result.Value);
+                {
+                    invocation.Observation = observed;
+                    if (observed.IsSuccess)
+                        record.LastClosureReceipt = new(invocation.Request, admittedReceipt, admissionEpoch, observed.Value);
+                }
             }
-            terminal = result.IsSuccess && result.Value.Request == record.Request && result.Value.Receipt == admittedReceipt &&
-                (result.Value.ProviderClosed || result.Value.ProviderEffectContained);
+            lock (_secureExecutionGate)
+            {
+                var result = invocation.Observation;
+                if (result is { IsSuccess: true } known) rawClosure = known.Value;
+                terminal = result is { IsSuccess: true } exact && exact.Value.Request == invocation.Request &&
+                    exact.Value.Receipt == admittedReceipt && (exact.Value.ProviderClosed || exact.Value.ProviderEffectContained);
+            }
         }
         catch (Exception) { terminal = false; }
         KernelResult completed;
@@ -296,10 +398,11 @@ public sealed partial class RuntimeKernel
             {
                 lock (_secureExecutionGate)
                 {
-                    terminal &= _secureExecutions.TryGetValue(binding.Id, out var current) && ReferenceEquals(current, record) &&
+                    terminal &= HasOriginalSecureExecution(record) && ReferenceEquals(record.CloseInvocation, invocation) &&
+                        ReferenceEquals(invocation.OriginalOwner, invocation) && invocation.Request == record.Request && invocation.Receipt == record.Receipt &&
                         record.State == SecureExecutionState.Closing;
                       record.State = terminal ? SecureExecutionState.Closed : SecureExecutionState.Quarantined;
-                      if (terminal) record.ClosureTraceSink = null;
+                      if (terminal) { record.ClosureConsumed = true; record.ClosureTraceSink = null; }
                     return terminal ? KernelResult.Ok() : KernelResult.Fail(KernelError.PlatformFaulted,
                         "Exact terminal closure/containment missing; composition quarantined.");
                 }
@@ -307,10 +410,13 @@ public sealed partial class RuntimeKernel
             if (!completed.IsSuccess)
                 lock (_secureExecutionGate) record.State = SecureExecutionState.Quarantined;
         }
+        lock (_secureExecutionGate) record.CloseInFlight = false;
         if (traceSink is not null)
             ObserveSecureExecutionClosure(traceSink, record.Request, admittedReceipt, record.Owner,
                 observationSequence, admissionEpoch, completionEpoch, rawClosure, completed.IsSuccess);
         return completed;
+        }
+        finally { lock (_secureExecutionGate) record.CloseInFlight = false; }
     }
 
     private KernelResult DrainSecureExecutions(ProcessHandle owner, VirtualDomainHandle? virtualDomain = null, SecureDomainHandle? secureDomain = null)
@@ -321,7 +427,7 @@ public sealed partial class RuntimeKernel
             if (virtualDomain is { } v) _secureExecutionDrainingVirtual.Add(v);
             else if (secureDomain is { } s) _secureExecutionDrainingSecure.Add(s);
             else _secureExecutionDrainingOwners.Add(owner);
-            bindings = _secureExecutions.Values.Where(x => x.Owner == owner && x.State != SecureExecutionState.Closed &&
+            bindings = SecureExecutionInventory().Where(x => x.Owner == owner && !HasCompletedSecureExecution(x) &&
                 (virtualDomain is null || x.Request.Context.Virtual == virtualDomain) &&
                 (secureDomain is null || x.Request.Context.Secure == secureDomain)).Select(x => x.Request.Binding).ToArray();
         }
@@ -333,7 +439,7 @@ public sealed partial class RuntimeKernel
     {
         SecureExecutionBinding[] bindings;
         lock (_secureExecutionGate)
-            bindings = _secureExecutions.Values.Where(x => x.Owner == owner && x.State != SecureExecutionState.Closed &&
+            bindings = SecureExecutionInventory().Where(x => x.Owner == owner && !HasCompletedSecureExecution(x) &&
                 (virtualDomain is null || x.Request.Context.Virtual == virtualDomain) &&
                 (secureDomain is null || x.Request.Context.Secure == secureDomain)).Select(x => x.Request.Binding).ToArray();
         foreach (var binding in bindings) { var valid = RevalidateSecureExecution(binding); if (!valid.IsSuccess) return valid; }
@@ -357,21 +463,42 @@ public sealed partial class RuntimeKernel
     }
 
     // Independent source permission around pure admission/publication; a lifetime pin is insufficient.
-    private KernelResult CommitComposedDomainSources(ProcessHandle owner, VirtualDomainHandle? virtualDomain,
-        Func<KernelResult> commit, SecureDomainHandle? secureDomain = null)
+    private KernelResult<IReadOnlyDictionary<ulong, SecureEffectSource>> CaptureComposedSecureSources(ProcessHandle owner, VirtualDomainHandle domain)
     {
         lock (_platformMemoryUseGate)
         lock (_secureExecutionGate)
         {
-            var records = _secureExecutions.Values.Where(x => x.Owner == owner &&
+            Dictionary<ulong, SecureEffectSource> sources = [];
+            foreach (var execution in SecureExecutionInventory().Where(x => x.Owner == owner && x.Request.Context.Virtual == domain && !HasCompletedSecureExecution(x)))
+            {
+                if (!HasOriginalSecureExecution(execution) || execution.State != SecureExecutionState.Active || !_secureDomainRecords.TryGetValue(execution.Request.Context.Secure.DomainId, out var secure))
+                    return KernelResult<IReadOnlyDictionary<ulong, SecureEffectSource>>.Fail(KernelError.PlatformFaulted, "Original composed secure source unavailable.");
+                var captured = CaptureSecureEffectSource(secure);
+                if (!captured.IsSuccess) return KernelResult<IReadOnlyDictionary<ulong, SecureEffectSource>>.Fail(captured.Error, captured.Message!);
+                sources.Add(execution.Request.Binding.Id, captured.Value!);
+            }
+            return KernelResult<IReadOnlyDictionary<ulong, SecureEffectSource>>.Ok(sources);
+        }
+    }
+
+    private KernelResult CommitComposedDomainSources(ProcessHandle owner, VirtualDomainHandle? virtualDomain,
+        Func<KernelResult> commit, SecureDomainHandle? secureDomain = null,
+        IReadOnlyDictionary<ulong, SecureEffectSource>? originalSources = null)
+    {
+        lock (_platformMemoryUseGate)
+        lock (_secureExecutionGate)
+        {
+            var records = SecureExecutionInventory().Where(x => x.Owner == owner &&
                 (virtualDomain is null || x.Request.Context.Virtual == virtualDomain) &&
                 (secureDomain is null || x.Request.Context.Secure == secureDomain) &&
-                x.State != SecureExecutionState.Closed).ToArray();
+                !HasCompletedSecureExecution(x)).ToArray();
+            if (originalSources is not null && (records.Length != originalSources.Count || records.Any(x => !originalSources.ContainsKey(x.Request.Binding.Id))))
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Captured composed secure inventory changed.");
             KernelResult Next(int index)
             {
                 if (index == records.Length) return commit();
                 var record = records[index];
-                if (record.State != SecureExecutionState.Active ||
+                if (!HasOriginalSecureExecution(record) || record.State != SecureExecutionState.Active ||
                     _secureExecutionDrainingOwners.Contains(owner) ||
                     _secureExecutionDrainingVirtual.Contains(record.Request.Context.Virtual) ||
                     _secureExecutionDrainingSecure.Contains(record.Request.Context.Secure))
@@ -379,7 +506,36 @@ public sealed partial class RuntimeKernel
                 return CommitSecureBindSources(owner, record.Request.Context.Virtual, record.VirtualCapability,
                     record.Request.Context.Secure, record.SecureCapability, context =>
                         context == record.Request.Context ? Next(index + 1)
-                            : KernelResult.Fail(KernelError.StaleGeneration, "Exact composed effect context changed."));
+                            : KernelResult.Fail(KernelError.StaleGeneration, "Exact composed effect context changed."),
+                    secureSource: originalSources is null ? null : originalSources[record.Request.Binding.Id]);
+            }
+            return Next(0);
+        }
+    }
+
+    // Child/artifact owner validates its own pending effect. Composed permission/revision
+    // must not reclassify that same invocation's interlock as an unrelated child effect.
+    private KernelResult CommitCapturedComposedSecureRevisions(ProcessHandle owner, VirtualDomainHandle domain,
+        IReadOnlyDictionary<ulong, SecureEffectSource> sources, Func<KernelResult> commit)
+    {
+        lock (_platformMemoryUseGate)
+        lock (_secureExecutionGate)
+        {
+            var records = SecureExecutionInventory().Where(x => x.Owner == owner && x.Request.Context.Virtual == domain && !HasCompletedSecureExecution(x)).ToArray();
+            if (records.Length != sources.Count || records.Any(x => !sources.ContainsKey(x.Request.Binding.Id)))
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Captured secure composition inventory changed.");
+            KernelResult Next(int index)
+            {
+                if (index == records.Length) return commit();
+                var execution = records[index]; var context = execution.Request.Context;
+                if (!HasOriginalSecureExecution(execution) || execution.State != SecureExecutionState.Active || _secureExecutionDrainingOwners.Contains(owner) ||
+                    _secureExecutionDrainingVirtual.Contains(domain) || _secureExecutionDrainingSecure.Contains(context.Secure))
+                    return KernelResult.Fail(KernelError.PlatformFaulted, "Captured secure composition stopped.");
+                return CommitSecureEffectSource(sources[execution.Request.Binding.Id], () =>
+                    CapabilityAuthority.CommitSecureDomainEffect(execution.SecureCapability, context.Parent.Subject.DomainId,
+                        owner.Generation, SecureComputeResourceIds.Domain(context.Secure.DomainId), () =>
+                    CapabilityAuthority.CommitVirtualDomainEffect(execution.VirtualCapability, context.Parent.Subject.DomainId,
+                        owner.Generation, CapabilityRights.Configure, VirtualizationResourceIds.Domain(domain.DomainId), () => Next(index + 1))));
             }
             return Next(0);
         }
@@ -389,13 +545,13 @@ public sealed partial class RuntimeKernel
     {
         lock (_secureExecutionGate)
         {
-            var records = _secureExecutions.Values.Where(x => x.Owner == owner && x.State != SecureExecutionState.Closed &&
+            var records = SecureExecutionInventory().Where(x => x.Owner == owner && !HasCompletedSecureExecution(x) &&
                 (virtualDomain is null || x.Request.Context.Virtual == virtualDomain) &&
                 (secureDomain is null || x.Request.Context.Secure == secureDomain)).ToArray();
-            var participated = _secureExecutions.Values.Any(x => x.Owner == owner &&
+            var participated = SecureExecutionInventory().Any(x => x.Owner == owner &&
                 (virtualDomain is null || x.Request.Context.Virtual == virtualDomain) &&
                 (secureDomain is null || x.Request.Context.Secure == secureDomain));
-            if (records.Any(x => x.State != SecureExecutionState.Active) ||
+            if (records.Any(x => !HasOriginalSecureExecution(x) || x.State != SecureExecutionState.Active) ||
                 participated && !allowDraining && (_secureExecutionDrainingOwners.Contains(owner) ||
                     virtualDomain is { } v && _secureExecutionDrainingVirtual.Contains(v) ||
                     secureDomain is { } s && _secureExecutionDrainingSecure.Contains(s)))
@@ -408,13 +564,13 @@ public sealed partial class RuntimeKernel
     private void QuarantineSecureExecutionsForBackendReset()
     {
         lock (_secureExecutionGate)
-            foreach (var record in _secureExecutions.Values)
-                if (record.State != SecureExecutionState.Closed) record.State = SecureExecutionState.Quarantined;
+            foreach (var record in SecureExecutionInventory())
+                if (!HasCompletedSecureExecution(record)) record.State = SecureExecutionState.Quarantined;
     }
 
     private bool HasPinnedSecureExecution(ProcessHandle owner)
     {
         lock (_secureExecutionGate)
-            return _secureExecutions.Values.Any(x => x.Owner == owner && x.State != SecureExecutionState.Closed);
+            return SecureExecutionInventory().Any(x => x.Owner == owner && !HasCompletedSecureExecution(x));
     }
 }

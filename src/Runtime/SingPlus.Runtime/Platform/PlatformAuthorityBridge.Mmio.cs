@@ -1,4 +1,4 @@
-using SingPlus.Contracts;
+﻿using SingPlus.Contracts;
 using SingPlus.Platform;
 
 namespace SingPlus.Runtime;
@@ -16,16 +16,26 @@ public readonly record struct PlatformMmioLease(
 
 public sealed partial class PlatformAuthorityBridge
 {
-    private sealed class MmioLeaseRecord(
-        PlatformMmioLease lease,
-        PlatformProviderMmioLease providerLease,
-        CapabilityId authorityCapabilityId)
+    private sealed class MmioLeaseRecord
     {
-        public PlatformMmioLease Lease { get; } = lease;
-        public PlatformProviderMmioLease ProviderLease { get; } = providerLease;
-        public CapabilityId AuthorityCapabilityId { get; } = authorityCapabilityId;
+        public MmioLeaseRecord(PlatformMmioLease lease,PlatformProviderMmioLease providerLease,CapabilityId authorityCapabilityId)
+        { OwnerSelf = this; Lease = lease; ProviderLease = providerLease; AuthorityCapabilityId = authorityCapabilityId; }
+        public MmioLeaseRecord OwnerSelf { get; }
+        public PlatformMmioLease Lease { get; }
+        private PlatformProviderMmioLease _providerLease;
+        private bool _platformClosed;
+        public ulong SourceRevision { get; private set; }
+        public bool SourceExhausted { get; private set; }
+        private void Advance() { if (SourceRevision == ulong.MaxValue) SourceExhausted = true; else SourceRevision++; }
+        public PlatformProviderMmioLease ProviderLease { get => _providerLease; set { Advance(); _providerLease = value; } }
+        public CapabilityId AuthorityCapabilityId { get; }
+        public OriginalMmioMapInvocation? OriginalMap { get; init; }
+        public OriginalMmioCloseInvocation? OriginalClose { get; set; }
+        public List<OriginalMmioCloseInvocation> CloseHistory { get; } = [];
+        public bool CleanupOnly { get; init; }
+        public bool OwnCloseUncertain { get; set; }
         public bool LocalAuthorizationRevoked { get; set; }
-        public bool PlatformClosed { get; set; }
+        public bool PlatformClosed { get => _platformClosed; set { Advance(); _platformClosed = value; } }
         public bool ProviderClosureConfirmed { get; set; } // Known exact reply, not local release.
         public bool FaultPinned { get; set; }
         public bool ClosureInFlight { get; set; }
@@ -38,6 +48,7 @@ public sealed partial class PlatformAuthorityBridge
     }
 
     private readonly Dictionary<PlatformMmioLeaseId, MmioLeaseRecord> _mmioLeases = [];
+    private readonly Dictionary<PlatformMmioLeaseId,MmioLeaseRecord> _originalMmioOwners = [];
     private ulong _nextMmioLeaseId = 1;
 
     internal KernelResult<PlatformMmioLease> BindMmio(
@@ -88,7 +99,7 @@ public sealed partial class PlatformAuthorityBridge
             return DeviceDependencyRecordsLocked().Any(record => record.UnresolvedMmioCapabilityId is { } id && depends(id)) ||
                 _domains.Values.Concat(DeviceDependencyRecordsLocked().Select(device => device.BindParentSource)
                         .OfType<DomainRecord>()).SelectMany(domain => domain.MmioSources).OfType<MmioLeaseRecord>()
-                    .Any(record => !record.PlatformClosed && depends(record.AuthorityCapabilityId));
+                    .Any(record => !HasConsumedOriginalMmioClosure(record) && depends(record.AuthorityCapabilityId));
     }
 
     private KernelResult<PlatformMmioLease> BindMmioCore(
@@ -132,10 +143,13 @@ public sealed partial class PlatformAuthorityBridge
                 "The bound platform provider does not expose bounded semantic MMIO leases.");
         }
 
+        if (mmioProvider is IPlatformOriginalMmioProvider original)
+            return BindOriginalMmio(deviceLease,expectedSubject,authorityCapabilityId,region,range,access,deviceRecord,domainRecord,localId,authorize,publish,original);
+
         lock (_secureDomainLifecycleGate)
         {
-        if (_mmioLeases.Values.Any(record =>
-                !record.PlatformClosed &&
+        if (MmioDependencyRecordsLocked().Any(record =>
+                !HasConsumedOriginalMmioClosure(record) &&
                 record.Lease.DeviceLease.LeaseId == deviceLease.LeaseId &&
                 string.Equals(record.Lease.Region.ResourceId, region.ResourceId, StringComparison.Ordinal)))
         {
@@ -218,30 +232,6 @@ public sealed partial class PlatformAuthorityBridge
                 deviceRecord.FaultPinned = true;
                 deviceRecord.MalformedMmioReceipt = providerLease;
             }
-            try
-            {
-                var sourceCurrent = ValidateDeviceClosureGeneration(deviceRecord);
-                bool cleanupAdmitted;
-                lock (_secureDomainLifecycleGate)
-                {
-                    cleanupAdmitted = sourceCurrent && !_backendEpochExhausted && BackendEpoch == deviceRecord.BackendEpoch &&
-                        TryGetOriginalDeviceRecord(deviceLease.LeaseId, out var exactDevice) && ReferenceEquals(exactDevice, deviceRecord) &&
-                        TryGetCanonicalRootRecord(deviceLease.DomainBinding.BindingId, out var exactDomain) && ReferenceEquals(exactDomain, domainRecord) &&
-                        !deviceRecord.PlatformClosed && !deviceRecord.ClosureInFlight &&
-                        domainRecord.AuthorityState == DomainAuthorityState.Active && !domainRecord.ParentRevokeMayHaveEffect &&
-                        deviceRecord.UnresolvedMmioCapabilityId == authorityCapabilityId && !deviceRecord.MalformedMmioCleanupMayHaveEffect;
-                    if (cleanupAdmitted) deviceRecord.MalformedMmioCleanupMayHaveEffect = true;
-                }
-                if (cleanupAdmitted)
-                {
-                    var cleanup = mmioProvider.RevokeMmio(providerLease);
-                    lock (_secureDomainLifecycleGate) deviceRecord.MalformedMmioCleanupObservation = cleanup;
-                }
-            }
-            catch (Exception exception) when (exception is not StackOverflowException)
-            {
-                // A missing exact cleanup receipt leaves the parent device pinned.
-            }
             return KernelResult<PlatformMmioLease>.Fail(
                 KernelError.PlatformFaulted,
                 providerValidation.Message ?? "The provider returned malformed MMIO authority.");
@@ -276,48 +266,11 @@ public sealed partial class PlatformAuthorityBridge
                 TransferMmioMapObservationLocked(deviceRecord, domainRecord, record);
             }
             var cleaned = false;
-            try
-            {
-                var sourceCurrent = ValidateDeviceClosureGeneration(deviceRecord);
-                bool cleanupAdmitted;
-                lock (_secureDomainLifecycleGate)
-                {
-                    cleanupAdmitted = sourceCurrent && !_backendEpochExhausted && BackendEpoch == deviceRecord.BackendEpoch &&
-                        _mmioLeases.TryGetValue(lease.LeaseId, out var exactChild) && ReferenceEquals(exactChild, record) &&
-                        TryGetOriginalDeviceRecord(deviceLease.LeaseId, out var exactDevice) && ReferenceEquals(exactDevice, deviceRecord) &&
-                        TryGetCanonicalRootRecord(deviceLease.DomainBinding.BindingId, out var exactDomain) && ReferenceEquals(exactDomain, domainRecord) &&
-                        !deviceRecord.FaultPinned && !deviceRecord.PlatformClosed && !deviceRecord.ClosureInFlight &&
-                        domainRecord.AuthorityState == DomainAuthorityState.Active && !domainRecord.ParentRevokeMayHaveEffect &&
-                        record.ClosureInFlight;
-                    if (cleanupAdmitted)
-                    {
-                        record.RevokeParent = domainRecord;
-                        record.RevokeMayHaveEffect = true;
-                    }
-                }
-                if (cleanupAdmitted)
-                {
-                    var cleanup = mmioProvider.RevokeMmio(providerLease);
-                    lock (_secureDomainLifecycleGate) record.RevokeObservation = cleanup;
-                    if (cleanup.IsSuccess)
-                    {
-                        lock (_secureDomainLifecycleGate) record.ProviderClosureConfirmed = true;
-                        cleaned = CompleteKnownMmioClosure(record, deviceRecord).IsSuccess;
-                    }
-                }
-            }
-            catch (Exception exception) when (exception is not StackOverflowException) { }
+            try { cleaned = RevokeOriginalMmio(lease,expectedSubject,record).IsSuccess; }
             finally { lock (_secureDomainLifecycleGate) record.ClosureInFlight = false; }
             lock (_secureDomainLifecycleGate)
-            {
-                if (cleaned) _mmioLeases.Remove(lease.LeaseId);
-                else if (record.FaultPinned || deviceRecord.FaultPinned || deviceRecord.BackendEpoch != BackendEpoch ||
-                    !record.ProviderClosureConfirmed)
-                {
-                    record.FaultPinned = true;
-                    deviceRecord.FaultPinned = true;
-                }
-            }
+                if (!cleaned && (record.FaultPinned || deviceRecord.FaultPinned || deviceRecord.BackendEpoch != BackendEpoch || !record.ProviderClosureConfirmed))
+                { record.FaultPinned = true; deviceRecord.FaultPinned = true; }
             return KernelResult<PlatformMmioLease>.Fail(published.Error, published.Message!);
         }
         return KernelResult<PlatformMmioLease>.Ok(lease);
@@ -339,7 +292,7 @@ public sealed partial class PlatformAuthorityBridge
                 return KernelResult.Fail(KernelError.PlatformFaulted, "Exact MMIO closure is ambiguous.");
             if (record.ClosureInFlight)
                 return KernelResult.Fail(KernelError.PlatformBindingActive, "Exact MMIO closure is already in flight.");
-            if (record.RevokeMayHaveEffect && !record.ProviderClosureConfirmed)
+            if (record.RevokeMayHaveEffect && !record.ProviderClosureConfirmed && _provider is not IPlatformOriginalMmioProvider)
                 return KernelResult.Fail(KernelError.PlatformFaulted, "Original MMIO closure remains ambiguous; repeat refused.");
             record.LocalAuthorizationRevoked = true;
             record.ClosureInFlight = true;
@@ -354,121 +307,11 @@ public sealed partial class PlatformAuthorityBridge
         finally { lock (_secureDomainLifecycleGate) record.ClosureInFlight = false; }
     }
 
-    private KernelResult RevokeMmioCore(
-        PlatformMmioLease lease, PlatformDomainIdentity expectedSubject, MmioLeaseRecord record)
+    private KernelResult RevokeMmioCore(PlatformMmioLease lease,PlatformDomainIdentity expectedSubject,MmioLeaseRecord record) => RevokeOriginalMmio(lease,expectedSubject,record);
+
+    private void TransferMmioMapObservationLocked(DeviceLeaseRecord device, DomainRecord parent, MmioLeaseRecord record)
     {
-        DeviceLeaseRecord device;
-        DomainRecord domain;
-        bool knownClosure;
-        lock (_secureDomainLifecycleGate)
-        {
-            var validation = ValidateMmioLeaseIdentity(lease, expectedSubject);
-            if (!validation.IsSuccess) return validation;
-            if (!_mmioLeases.TryGetValue(lease.LeaseId, out var current) || !ReferenceEquals(current, record) || !record.ClosureInFlight)
-                return KernelResult.Fail(KernelError.PlatformFaulted, "Original MMIO cleanup owner changed.");
-            if (record.PlatformClosed)
-                return KernelResult.Fail(KernelError.PlatformBindingRevoked, "The platform MMIO lease has already been closed.");
-            if (record.FaultPinned)
-                return KernelResult.Fail(KernelError.PlatformFaulted, "The MMIO lease has ambiguous provider closure and remains pinned.");
-            device = _deviceLeases[lease.DeviceLease.LeaseId];
-            if (!ReferenceEquals(device, record.MapDeviceSource))
-                return KernelResult.Fail(KernelError.PlatformFaulted, "Original MMIO device cleanup owner is absent or replaced.");
-            domain = _domains[lease.DeviceLease.DomainBinding.BindingId];
-            knownClosure = record.ProviderClosureConfirmed;
-        }
-        if (knownClosure) return CompleteKnownMmioClosure(record, device);
-        if (_provider is not IPlatformMmioLeaseProvider mmioProvider)
-        {
-            return KernelResult.Fail(
-                KernelError.PlatformFaulted,
-                "The provider that materialized the MMIO lease no longer exposes MMIO closure.");
-        }
-
-        if (!ValidateDeviceClosureGeneration(device))
-        {
-            record.FaultPinned = true;
-            return KernelResult.Fail(KernelError.PlatformFaulted,
-                "The device generation changed before MMIO closure.");
-        }
-        lock (_secureDomainLifecycleGate)
-        {
-            var identity = ValidateMmioLeaseIdentity(lease, expectedSubject);
-            if (!identity.IsSuccess) return identity;
-            if (!_mmioLeases.TryGetValue(lease.LeaseId, out var current) || !ReferenceEquals(current, record) ||
-                !TryGetOriginalDeviceRecord(lease.DeviceLease.LeaseId, out var parent) || !ReferenceEquals(parent, device) ||
-                !record.ClosureInFlight || record.FaultPinned || record.PlatformClosed || device.FaultPinned || device.PlatformClosed ||
-                BackendEpoch != device.BackendEpoch || _backendEpochExhausted || !HasExactChildCleanupDomainLocked(device, domain) ||
-                !ReferenceEquals(record.MapParent, domain) || !domain.MmioSources.Contains(record))
-                return KernelResult.Fail(KernelError.PlatformFaulted, "MMIO cleanup admission changed during source observation; effect refused.");
-            record.RevokeParent = domain;
-            record.RevokeMayHaveEffect = true;
-        }
-        PlatformAuthorityResult providerResult;
-        try { providerResult = mmioProvider.RevokeMmio(record.ProviderLease); }
-        catch (Exception exception) when (exception is not StackOverflowException)
-        {
-            lock (_secureDomainLifecycleGate) { record.FaultPinned = true; device.FaultPinned = true; }
-            return KernelResult.Fail(KernelError.PlatformFaulted,
-                $"MMIO closure may have taken effect without a receipt: {exception.Message}");
-        }
-        lock (_secureDomainLifecycleGate) record.RevokeObservation = providerResult;
-        if (!providerResult.IsSuccess)
-        {
-            lock (_secureDomainLifecycleGate) { record.FaultPinned = true; device.FaultPinned = true; }
-            return KernelResult.Fail(KernelError.PlatformFaulted,
-                "MMIO closure lacks exact containment evidence; the original reply and lease remain pinned.");
-        }
-
-        lock (_secureDomainLifecycleGate) record.ProviderClosureConfirmed = true;
-        return CompleteKnownMmioClosure(record, device);
-    }
-
-    private KernelResult CompleteKnownMmioClosure(MmioLeaseRecord record, DeviceLeaseRecord device)
-    {
-        PlatformProviderIncarnation current;
-        try { current = CurrentProviderIncarnation(); }
-        catch (Exception exception) when (exception is not StackOverflowException)
-        {
-            lock (_secureDomainLifecycleGate)
-            {
-                if (!_mmioLeases.TryGetValue(record.Lease.LeaseId, out var exactChild) || !ReferenceEquals(exactChild, record) ||
-                    !TryGetOriginalDeviceRecord(record.Lease.DeviceLease.LeaseId, out var exactParent) || !ReferenceEquals(exactParent, device) ||
-                    !HasExactChildCleanupDomainLocked(device, record.RevokeParent) ||
-                    !ReferenceEquals(record.MapParent, record.RevokeParent) || record.MapParent is null || !record.MapParent.MmioSources.Contains(record))
-                {
-                    record.FaultPinned = true;
-                    device.FaultPinned = true;
-                }
-                if (BackendEpoch != device.BackendEpoch || _backendEpochExhausted || device.FaultPinned)
-                    record.FaultPinned = true;
-            }
-            return KernelResult.Fail(KernelError.PlatformFaulted,
-                $"Known MMIO closure retained while source observation failed: {exception.Message}");
-        }
-        lock (_secureDomainLifecycleGate)
-        {
-            if (current.Value == 0 || current != device.ProviderIncarnation ||
-                BackendEpoch != device.BackendEpoch || _backendEpochExhausted || device.PlatformClosed ||
-                !_mmioLeases.TryGetValue(record.Lease.LeaseId, out var exactChild) || !ReferenceEquals(exactChild, record) ||
-                !TryGetOriginalDeviceRecord(record.Lease.DeviceLease.LeaseId, out var exactDevice) ||
-                !ReferenceEquals(exactDevice, device) || !HasExactChildCleanupDomainLocked(device, record.RevokeParent) ||
-                !ReferenceEquals(record.MapParent, record.RevokeParent) || record.MapParent is null || !record.MapParent.MmioSources.Contains(record))
-            {
-                device.FaultPinned = true;
-                record.FaultPinned = true;
-            }
-            if (!record.ProviderClosureConfirmed || record.FaultPinned || device.FaultPinned || !record.ClosureInFlight ||
-                !_mmioLeases.TryGetValue(record.Lease.LeaseId, out var exact) || !ReferenceEquals(exact, record))
-                return KernelResult.Fail(KernelError.PlatformFaulted,
-                    "MMIO closure continuity was lost before local publication.");
-            record.PlatformClosed = true;
-            record.MapParent!.MmioSources.Remove(record);
-        }
-        return KernelResult.Ok();
-    }
-
-    private static void TransferMmioMapObservationLocked(DeviceLeaseRecord device, DomainRecord parent, MmioLeaseRecord record)
-    {
+        _originalMmioOwners.TryAdd(record.Lease.LeaseId,record);
         record.MapObservation = device.MmioMapObservation;
         record.MapParent = parent;
         record.MapDeviceSource = device;
@@ -505,9 +348,8 @@ public sealed partial class PlatformAuthorityBridge
                 "The platform MMIO lease has been closed.");
         }
 
-        if (record.FaultPinned)
-            return KernelResult.Fail(KernelError.PlatformFaulted,
-                "The MMIO lease is fault-pinned after ambiguous closure.");
+        if (record.CleanupOnly || record.OriginalClose is not null || record.OwnCloseUncertain || record.FaultPinned)
+            return KernelResult.Fail(KernelError.PlatformFaulted,"Original MMIO cleanup/pending/uncertain cannot authorize use.");
 
         return ValidateDeviceLease(lease.DeviceLease, expectedSubject);
     }
@@ -517,9 +359,9 @@ public sealed partial class PlatformAuthorityBridge
     {
         lock (_secureDomainLifecycleGate)
         {
-        var affected = _mmioLeases.Values
+        var affected = MmioDependencyRecordsLocked()
             .Where(record =>
-                !record.PlatformClosed &&
+                !HasConsumedOriginalMmioClosure(record) &&
                 dependsOnRevokedCapability(record.AuthorityCapabilityId))
             .OrderBy(record => record.Lease.LeaseId.Value)
             .ToArray();
@@ -533,17 +375,17 @@ public sealed partial class PlatformAuthorityBridge
 
     internal bool HasActiveMmioLeases(PlatformDeviceLease deviceLease)
     {
-        lock (_secureDomainLifecycleGate) return _mmioLeases.Values.Any(record =>
-            !record.PlatformClosed &&
+        lock (_secureDomainLifecycleGate) return MmioDependencyRecordsLocked().Any(record =>
+            !HasConsumedOriginalMmioClosure(record) &&
             record.Lease.DeviceLease.LeaseId == deviceLease.LeaseId);
     }
 
     internal IReadOnlyList<PlatformMmioLease> ActiveMmioLeasesForDevice(
         PlatformDeviceLease deviceLease)
     {
-        lock (_secureDomainLifecycleGate) return _mmioLeases.Values
+        lock (_secureDomainLifecycleGate) return MmioDependencyRecordsLocked()
             .Where(record =>
-                !record.PlatformClosed &&
+                !HasConsumedOriginalMmioClosure(record) &&
                 record.Lease.DeviceLease.LeaseId == deviceLease.LeaseId)
             .OrderBy(record => record.Lease.LeaseId.Value)
             .Select(static record => record.Lease)
@@ -553,7 +395,7 @@ public sealed partial class PlatformAuthorityBridge
     internal IReadOnlyList<PlatformMmioLease> ActiveMmioLeasesForProcess(PlatformDomainIdentity subject)
     {
         lock (_secureDomainLifecycleGate)
-            return _mmioLeases.Values.Where(record => !record.PlatformClosed &&
+            return MmioDependencyRecordsLocked().Where(record => !HasConsumedOriginalMmioClosure(record) &&
                 record.Lease.DeviceLease.DomainBinding.Subject == subject)
                 .OrderBy(record => record.Lease.LeaseId.Value).Select(record => record.Lease).ToArray();
     }
@@ -568,6 +410,9 @@ public sealed partial class PlatformAuthorityBridge
                 KernelError.PlatformBindingNotFound,
                 "The platform MMIO lease does not exist.");
         }
+
+        if (!ReferenceEquals(record.OwnerSelf,record) || !_originalMmioOwners.TryGetValue(lease.LeaseId,out var owner) || !ReferenceEquals(owner,record))
+            return KernelResult.Fail(KernelError.PlatformFaulted,"Original MMIO owner absent/foreign.");
 
         if (record.Lease.Generation != lease.Generation)
         {

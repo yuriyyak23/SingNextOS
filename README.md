@@ -2192,7 +2192,7 @@ Unsupported features remain explicitly unavailable rather than silently degradin
 | `tools/SingPlus.HybridCpuQualification/`         | HybridCPU qualification/reproducibility tooling                                                                       |
 | `tests/`                                         | Authority, Region, SIP, budget, provider, concurrency, integration, analyzers/generators, and conformance tests       |
 | `docs/Completed/SingCap-Refactoring/`            | Completed SingCap-M architecture and implementation evidence                                                          |
-| `docs/SingNextOS-vNext-refactoring-roadmap-new/` | vNext resource/compute architecture, invariants, qualification, and phase records                                     |
+| `docs/SingNextOS-v6-roadmap-reworked-2026-09-23/` | vNext resource/compute architecture, invariants, qualification, and phase records                                     |
 | `docs/`                                          | Whitebooks, cross-project architecture, CXL, HybridCPU, and historical design records                                 |
 
 ---
@@ -2252,11 +2252,11 @@ Recommended starting points:
 ### Current architecture
 
 * [`README.md`](README.md) — architecture overview.
-* [`docs/SingNextOS-vNext-refactoring-roadmap-new/README.md`](docs/SingNextOS-vNext-refactoring-roadmap-new/README.md) — corrected vNext resource/heterogeneous-execution architecture.
-* [`docs/SingNextOS-vNext-refactoring-roadmap-new/AUTHORITY_OWNER_MAP.md`](docs/SingNextOS-vNext-refactoring-roadmap-new/AUTHORITY_OWNER_MAP.md) — authoritative state ownership.
-* [`docs/SingNextOS-vNext-refactoring-roadmap-new/RESOURCE_MODEL.md`](docs/SingNextOS-vNext-refactoring-roadmap-new/RESOURCE_MODEL.md) — resource dimensions, leases, conservation, settlement.
-* [`docs/SingNextOS-vNext-refactoring-roadmap-new/VNEXT_NORMATIVE_INVARIANTS.md`](docs/SingNextOS-vNext-refactoring-roadmap-new/VNEXT_NORMATIVE_INVARIANTS.md) — normative vNext invariants.
-* [`docs/SingNextOS-vNext-refactoring-roadmap-new/VNEXT_FEATURE_GATES.md`](docs/SingNextOS-vNext-refactoring-roadmap-new/VNEXT_FEATURE_GATES.md) — feature qualification boundaries.
+* [`docs/SingNextOS-v6-roadmap-reworked-2026-09-23/00-README.md`](docs/SingNextOS-v6-roadmap-reworked-2026-09-23/00-README.md) — corrected vNext resource/heterogeneous-execution architecture.
+* [`docs/SingNextOS-v6-roadmap-reworked-2026-09-23/02-AUTHORITY-OWNER-MAP.md`](docs/SingNextOS-v6-roadmap-reworked-2026-09-23/02-AUTHORITY-OWNER-MAP.md) — authoritative state ownership.
+* [`docs/SingNextOS-v6-roadmap-reworked-2026-09-23/12-P03-TEMPORAL-EXECUTION-CONTRACTS.md`](docs/SingNextOS-v6-roadmap-reworked-2026-09-23/12-P03-TEMPORAL-EXECUTION-CONTRACTS.md) — temporal resource accounting, upper bounds and service guarantees.
+* [`docs/SingNextOS-v6-roadmap-reworked-2026-09-23/04-NORMATIVE-INVARIANTS.md`](docs/SingNextOS-v6-roadmap-reworked-2026-09-23/04-NORMATIVE-INVARIANTS.md) — normative vNext invariants.
+* [`docs/SingNextOS-v6-roadmap-reworked-2026-09-23/05-FEATURE-GATES-AND-CLAIMS.md`](docs/SingNextOS-v6-roadmap-reworked-2026-09-23/05-FEATURE-GATES-AND-CLAIMS.md) — feature qualification boundaries.
 
 ### SingCap-M
 

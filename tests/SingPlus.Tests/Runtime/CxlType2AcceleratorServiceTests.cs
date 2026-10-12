@@ -8,6 +8,171 @@ namespace SingPlus.Tests.Runtime;
 public sealed class CxlType2AcceleratorServiceTests
 {
     [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void ActualType2SubmitRetainsEffectAfterFabricManagerSourceLossAndReclaimsOriginal(int fault)
+    {
+        SubmitHookAccelerator? hook = null;
+        var s = CreateScenario(acceleratorFactory: model => hook = new(model));
+        var routes = (global::System.Collections.IDictionary)typeof(CxlFabricManagerAuthority).GetField("_bindings", PrivateFields)!.GetValue(s.FabricManager)!;
+        var original = routes[s.Fabric.BindingId]!;
+        var parent = FabricRoutes(s)[s.Fabric.BindingId]!;
+        hook!.AfterSubmit = () =>
+        {
+            Assert.False(Monitor.IsEntered(typeof(CxlFabricManagerAuthority).GetField("_gate", PrivateFields)!.GetValue(s.FabricManager)!));
+            if (fault == 0) routes[s.Fabric.BindingId] = CloneFabric(original);
+            else
+            {
+                var state = original.GetType().GetProperty("State")!;
+                if (fault == 2) state.SetValue(original, CxlFabricResourceState.Draining);
+                state.SetValue(original, CxlFabricResourceState.Bound);
+            }
+        };
+        var submitted = s.Service.Submit(s.Handle, s.Plan, [s.Candidate], s.Subject, s.Lease, s.Endpoint, s.Fabric, 1);
+        Assert.False(submitted.IsSuccess);
+        Assert.Equal(1, s.Accelerator.SubmitCount);
+        Assert.NotNull(hook.LastSubmission);
+        Assert.Equal(1, OperationPins(parent));
+        Assert.True(s.Kernel.Regions.Validate(s.Input.Handle, new(s.Subject.DomainId, s.Handle.Generation)).IsSuccess);
+        hook.AfterSubmit = null; routes[s.Fabric.BindingId] = original;
+        var closed = s.Kernel.TerminateProcess(s.Handle);
+        Assert.True(closed.IsSuccess, closed.Message);
+        Assert.Equal(1, hook.ReleaseCalls); Assert.Equal(0, OperationPins(parent));
+        Assert.False(s.Kernel.Processes.Resolve(s.Handle).IsSuccess);
+        Assert.Equal(RegionState.Released, s.Kernel.Regions.Snapshot().Single(region => region.Handle == s.Input.Handle).State);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void ActualType2PublicationCannotRefreshFabricManagerSourceAfterAction(int fault)
+    {
+        SubmitHookAccelerator? hook = null;
+        var s = CreateScenario(acceleratorFactory: model => hook = new(model));
+        var execution = s.Service.Submit(s.Handle, s.Plan, [s.Candidate], s.Subject, s.Lease, s.Endpoint, s.Fabric, 1).Value!;
+        var routes = (global::System.Collections.IDictionary)typeof(CxlFabricManagerAuthority).GetField("_bindings", PrivateFields)!.GetValue(s.FabricManager)!;
+        var original = routes[s.Fabric.BindingId]!;
+        var parent = FabricRoutes(s)[s.Fabric.BindingId]!;
+        var actions = 0;
+        var published = s.Service.CompleteVisiblePublish(s.Handle, execution, [s.Candidate], () =>
+        {
+            actions++;
+            if (fault == 0) routes[s.Fabric.BindingId] = CloneFabric(original);
+            else
+            {
+                var state = original.GetType().GetProperty("State")!;
+                if (fault == 2) state.SetValue(original, CxlFabricResourceState.Draining);
+                state.SetValue(original, CxlFabricResourceState.Bound);
+            }
+        });
+        Assert.False(published.IsSuccess); Assert.Equal(1, actions);
+        Assert.NotEqual(ExternalOperationState.Published, s.Kernel.ExternalOperations.Query(execution.Operation).Value!.State);
+        routes[s.Fabric.BindingId] = original;
+        Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.Equal(1, hook!.ReleaseCalls); Assert.Equal(1, OperationPins(parent));
+        Assert.False(s.Kernel.QueryProcessTeardown(s.Handle).Value!.LocalReclaimCompleted);
+        Assert.True(s.Kernel.Regions.Validate(s.Input.Handle, new(s.Subject.DomainId, s.Handle.Generation)).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void OriginalType2LostReleaseCannotRepeatDuringActualProcessReclaim(bool lostReply)
+    {
+        SubmitHookAccelerator? hook = null;
+        var s = CreateScenario(acceleratorFactory: model => hook = new(model));
+        var execution = s.Service.Submit(s.Handle, s.Plan, [s.Candidate], s.Subject, s.Lease,
+            s.Endpoint, s.Fabric, 1).Value!;
+        if (lostReply) hook!.AfterRelease = () => throw new IOException("original Release reply lost");
+        else s.Accelerator.ReleaseFails = true;
+        Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.Equal(1, hook!.ReleaseCalls);
+        hook.AfterRelease = null;
+        s.Accelerator.ReleaseFails = false;
+        Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.Equal(1, hook.ReleaseCalls);
+        Assert.False(s.Kernel.QueryProcessTeardown(s.Handle).Value!.LocalReclaimCompleted);
+        Assert.NotEqual(ExternalOperationState.Released, s.Kernel.ExternalOperations.Query(execution.Operation).Value!.State);
+        Assert.Equal(1, OperationPins(FabricRoutes(s)[s.Fabric.BindingId]!));
+        Assert.True(s.Kernel.Regions.Validate(s.Input.Handle, new(s.Subject.DomainId, s.Handle.Generation)).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void OriginalType2EffectInventoryRefusesAbsentOrCopiedRouteThroughActualTeardown(bool copied)
+    {
+        SubmitHookAccelerator? hook = null;
+        var s = CreateScenario(acceleratorFactory: model => hook = new(model));
+        _ = s.Service.Submit(s.Handle, s.Plan, [s.Candidate], s.Subject, s.Lease, s.Endpoint, s.Fabric, 1).Value!;
+        var effects = (global::System.Collections.IDictionary)typeof(CxlType2AcceleratorService)
+            .GetField("_effects", PrivateFields)!.GetValue(s.Service)!;
+        var key = Assert.Single(effects.Keys.Cast<object>());
+        var original = effects[key]!;
+        var originalFabric = FabricRoutes(s)[s.Fabric.BindingId]!;
+        if (copied) effects[key] = CloneFabric(original); else effects.Remove(key);
+        Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.Equal(0, hook!.ReleaseCalls);
+        Assert.Equal(1, OperationPins(FabricRoutes(s)[s.Fabric.BindingId]!));
+        effects[key] = original;
+        Assert.True(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.Equal(1, hook.ReleaseCalls);
+        Assert.Equal(0, OperationPins(originalFabric));
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)] [InlineData(5)]
+    public void OriginalType2KnownReleaseNeedsSameFactForActualLocalConsumption(int fault)
+    {
+        SubmitHookAccelerator? hook = null;
+        var s = CreateScenario(acceleratorFactory: model => hook = new(model));
+        var execution = s.Service.Submit(s.Handle, s.Plan, [s.Candidate], s.Subject, s.Lease, s.Endpoint, s.Fabric, 1).Value!;
+        var effects = (global::System.Collections.IDictionary)typeof(CxlType2AcceleratorService)
+            .GetField("_effects", PrivateFields)!.GetValue(s.Service)!;
+        var key = Assert.Single(effects.Keys.Cast<object>());
+        var original = effects[key]!;
+        var fabric = FabricRoutes(s)[s.Fabric.BindingId]!;
+        hook!.AfterRelease = () =>
+        {
+            Assert.False(Monitor.IsEntered(typeof(CxlType2AcceleratorService).GetField("_effectGate", PrivateFields)!.GetValue(s.Service)!));
+            Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+            effects[key] = CloneFabric(original);
+        };
+        Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.Equal(1, hook.ReleaseCalls);
+        Assert.Equal(1, OperationPins(fabric));
+        Assert.False((bool)original.GetType().GetProperty("ClosureInFlight")!.GetValue(original)!);
+        var property = original.GetType().GetProperty("OriginalClosure")!;
+        var fact = property.GetValue(original)!;
+        Assert.NotNull(fact.GetType().GetProperty("RawReleaseObservation")!.GetValue(fact));
+        hook.AfterRelease = null;
+        effects[key] = original;
+        if (fault == 1) property.SetValue(original, CloneFabric(fact));
+        if (fault is 2 or 5) fact.GetType().GetProperty("RawReleaseObservation")!.SetValue(fact, null);
+        if (fault == 3) fact.GetType().GetField("<Submission>k__BackingField", PrivateFields)!.SetValue(fact, execution.Submission with { });
+        if (fault == 4) fact.GetType().GetField("<Source>k__BackingField", PrivateFields)!.SetValue(fact, CloneFabric(original));
+        if (fault == 5) original.GetType().GetProperty("ProviderClosed")!.SetValue(original, true);
+        var retry = s.Kernel.TerminateProcess(s.Handle);
+        Assert.Equal(fault == 0, retry.IsSuccess);
+        Assert.Equal(1, hook.ReleaseCalls);
+        Assert.Equal(fault == 0 ? 0 : 1, OperationPins(fabric));
+        Assert.Equal(fault == 0, s.Kernel.ExternalOperations.Query(execution.Operation).Value!.State == ExternalOperationState.Released);
+        if (fault != 0) Assert.True(s.Kernel.Regions.Validate(s.Input.Handle, new(s.Subject.DomainId, s.Handle.Generation)).IsSuccess);
+    }
+
+    [Fact]
+    public void OriginalType2SubmitFactClosesAfterPublishedExecutionRouteLoss()
+    {
+        SubmitHookAccelerator? hook = null;
+        var s = CreateScenario(acceleratorFactory: model => hook = new(model));
+        var execution = s.Service.Submit(s.Handle, s.Plan, [s.Candidate], s.Subject, s.Lease, s.Endpoint, s.Fabric, 1).Value!;
+        var live = (global::System.Collections.IDictionary)typeof(CxlType2AcceleratorService).GetField("_live", PrivateFields)!.GetValue(s.Service)!;
+        live.Remove(execution.Operation.OperationId);
+        var fabric = FabricRoutes(s)[s.Fabric.BindingId]!;
+        Assert.True(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.Equal(1, hook!.ReleaseCalls);
+        Assert.Equal(0, OperationPins(fabric));
+        Assert.Equal(ExternalOperationState.Released, s.Kernel.ExternalOperations.Query(execution.Operation).Value!.State);
+        Assert.Equal(PlatformAuthorityStatus.Stale, s.Accelerator.ObserveCompletion(execution.Submission).Status);
+    }
+
+    [Theory]
     [InlineData(false)] [InlineData(true)]
     public void ActualType2CapturesMutablePlanBeforeValidationAndProviderCallback(bool throwOnCapture)
     {
@@ -579,16 +744,16 @@ public sealed class CxlType2AcceleratorServiceTests
             Assert.False(s.Kernel.QueryProcessTeardown(s.Handle).Value.LocalReclaimCompleted);
             s.Accelerator.CancellationFails = false;
             s.Accelerator.ReleaseFails = false;
-            Assert.True(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
-            Assert.Equal(ExternalOperationState.Released,
+            Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+            Assert.NotEqual(ExternalOperationState.Released,
                 s.Kernel.ExternalOperations.Query(receipt.OperationBinding.Operation).Value!.State);
         }
         if (fault == 0)
         {
             Assert.True(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
         }
-        Assert.Equal(ExternalOperationState.Released,
-            s.Kernel.ExternalOperations.Query(receipt.OperationBinding.Operation).Value!.State);
+        Assert.Equal(fault == 0,
+            s.Kernel.ExternalOperations.Query(receipt.OperationBinding.Operation).Value!.State == ExternalOperationState.Released);
         Assert.Equal(1, s.Accelerator.SubmitCount);
     }
     [Theory]
@@ -729,9 +894,9 @@ public sealed class CxlType2AcceleratorServiceTests
             Assert.Equal(KernelError.PlatformBindingActive, s.Bridge.ReleaseFabric(s.Fabric).Error);
             Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
             Assert.True(s.Kernel.Regions.Validate(s.Output.Handle, new(s.Subject.DomainId, s.Handle.Generation)).IsSuccess);
-            // Retry must reach the same modeled provider receipt; revoke did not close it.
+            // Failed original Release is unknown; restoring a flag does not resolve that invocation.
             s.Accelerator.ReleaseFails = false;
-            Assert.True(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+            Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
         }
         else
         {
@@ -758,12 +923,13 @@ public sealed class CxlType2AcceleratorServiceTests
         Assert.DoesNotContain(published.Transitions, transition => transition.Event == "ProviderLost");
         Assert.Equal(KernelError.PlatformBindingActive, s.Bridge.ReleaseFabric(s.Fabric).Error);
         hook.AfterRelease = null;
-        Assert.True(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.Equal(1, hook.ReleaseCalls);
         var recovered = s.Kernel.ExternalOperations.Query(execution.Operation).Value!;
-        Assert.Equal(ExternalOperationState.Released, recovered.State);
+        Assert.Equal(ExternalOperationState.Published, recovered.State);
         var trace = V6ExternalOperationTraceProjection.ProjectPublishedPrefix(recovered, new string('a', 64));
         Assert.Contains(trace, item => item.Kind == SemanticTraceEventKindV1.Published);
-        Assert.Equal(SemanticTraceEventKindV1.LocalAuthorityReleasedWithoutResourceBinding, trace[^1].Kind);
+        Assert.DoesNotContain(trace, item => item.Kind == SemanticTraceEventKindV1.LocalAuthorityReleasedWithoutResourceBinding);
         Assert.DoesNotContain(trace, item => item.Kind is SemanticTraceEventKindV1.Quarantined or SemanticTraceEventKindV1.EffectClosedWithoutPublication or SemanticTraceEventKindV1.Settled or SemanticTraceEventKindV1.Released);
         Assert.True(SemanticTraceValidatorV1.Validate(trace).IsValid);
     }
@@ -926,11 +1092,13 @@ public sealed class CxlType2AcceleratorServiceTests
         Assert.True(SemanticTraceValidatorV1.Validate(prefix).IsValid);
         hook.AfterCancel = () => cancellations++;
         var retry = ((ICxlTeardownParticipant)s.Service).CloseForProcess(s.Handle, new(s.Subject.DomainId, s.Handle.Generation));
-        Assert.True(retry.IsSuccess, retry.Message);
-        Assert.Equal(3, cancellations);
-        Assert.Equal(1, releases);
-        Assert.Equal(ExternalOperationState.Released, s.Kernel.ExternalOperations.Query(execution.Operation).Value!.State);
-        Assert.True(s.Bridge.ReleaseFabric(s.Fabric).IsSuccess);
+        Assert.False(retry.IsSuccess);
+        Assert.Equal(1, cancellations);
+        Assert.Equal(0, releases);
+        Assert.NotEqual(ExternalOperationState.Released, s.Kernel.ExternalOperations.Query(execution.Operation).Value!.State);
+        Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.Equal(1, cancellations);
+        Assert.Equal(KernelError.PlatformBindingActive, s.Bridge.ReleaseFabric(s.Fabric).Error);
     }
 
     [Fact]
@@ -1124,9 +1292,10 @@ public sealed class CxlType2AcceleratorServiceTests
         Assert.True(s.Kernel.Regions.Validate(s.Input.Handle, new(s.Subject.DomainId, s.Handle.Generation)).IsSuccess);
         s.Accelerator.ReleaseFails = false;
         var retry = s.Kernel.TerminateProcess(s.Handle);
-        Assert.True(retry.IsSuccess, retry.Message);
-        Assert.Equal(ExternalOperationState.Released, s.Kernel.ExternalOperations.Query(execution.Operation).Value!.State);
-        Assert.Equal(PlatformAuthorityStatus.Stale, s.Accelerator.ObserveCompletion(execution.Submission).Status);
+        Assert.False(retry.IsSuccess);
+        Assert.Equal(1, hook!.ReleaseCalls);
+        Assert.NotEqual(ExternalOperationState.Released, s.Kernel.ExternalOperations.Query(execution.Operation).Value!.State);
+        Assert.False(s.Kernel.QueryProcessTeardown(s.Handle).Value!.LocalReclaimCompleted);
     }
 
     [Theory]
@@ -1184,7 +1353,8 @@ public sealed class CxlType2AcceleratorServiceTests
         Assert.Equal(KernelError.PlatformBindingActive, s.Bridge.ReleaseFabric(s.Fabric).Error);
         Assert.True(s.Kernel.Regions.Validate(s.Input.Handle, new(s.Subject.DomainId, s.Handle.Generation)).IsSuccess);
         s.Accelerator.ReleaseFails = false;
-        Assert.True(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.False(s.Kernel.TerminateProcess(s.Handle).IsSuccess);
+        Assert.False(s.Kernel.QueryProcessTeardown(s.Handle).Value!.LocalReclaimCompleted);
     }
 
     [Fact]
@@ -1317,20 +1487,10 @@ public sealed class CxlType2AcceleratorServiceTests
             Assert.True(SemanticTraceValidatorV1.Validate(prefix).IsValid);
         }
         var retry = s.Kernel.TerminateProcess(s.Handle);
-        Assert.Equal(!resetSource, retry.IsSuccess);
-        if (resetSource)
-            Assert.True(s.Kernel.Regions.Validate(s.Input.Handle, new(s.Subject.DomainId, s.Handle.Generation)).IsSuccess);
-        else
-        {
-            var recovered = s.Kernel.ExternalOperations.Query(execution.Operation).Value!;
-            Assert.Equal(ExternalOperationState.Released, recovered.State);
-            Assert.Single(recovered.Transitions, transition => transition.Event == "ProviderLost");
-            var trace = V6ExternalOperationTraceProjection.ProjectPublishedPrefix(recovered, new string('a', 64));
-            Assert.Contains(trace, item => item.Kind == SemanticTraceEventKindV1.Quarantined);
-            Assert.Equal(SemanticTraceEventKindV1.LocalAuthorityReleasedWithoutResourceBinding, trace[^1].Kind);
-            Assert.DoesNotContain(trace, item => item.Kind is SemanticTraceEventKindV1.Settled or SemanticTraceEventKindV1.Released or SemanticTraceEventKindV1.EffectClosedWithoutPublication);
-            Assert.True(SemanticTraceValidatorV1.Validate(trace).IsValid);
-        }
+        Assert.False(retry.IsSuccess);
+        Assert.Equal(1, hook.ReleaseCalls);
+        Assert.True(s.Kernel.Regions.Validate(s.Input.Handle, new(s.Subject.DomainId, s.Handle.Generation)).IsSuccess);
+        Assert.NotEqual(ExternalOperationState.Released, s.Kernel.ExternalOperations.Query(execution.Operation).Value!.State);
     }
 
     [Fact]

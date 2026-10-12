@@ -28,7 +28,8 @@ public readonly record struct VirtualDomainCommand(VirtualDomainHandle Domain, C
 [BoundedPayload(192)]
 public readonly record struct MapGuestRegionRequest(VirtualDomainHandle Domain, CapabilityId MemoryCapability, CapabilityId RegionCapability, RegionHandle Region, GuestAddressRange GuestRange, GuestMemoryAccess Access) : IBoundedPayload
 {
-    public int PayloadSize => 144;
+    public ulong MaximumPrivateExecutableDataBytes { get; init; }
+    public int PayloadSize => 152;
     public int MaxPayloadSize => 192;
 }
 
@@ -103,6 +104,48 @@ public readonly record struct BindVirtualExecutableArtifactRequest(
     public int MaxPayloadSize => 4352;
 }
 
+[Flags]
+public enum VirtualIoAccess : byte { Read=1, Write=2 }
+[BoundedPayload(112)]
+public readonly record struct BindVirtualIoRequest(VirtualDomainHandle Domain,ulong DeviceLeaseId,ulong DeviceGeneration,VirtualIoAccess Access,int MaximumTransferBytes) : IBoundedPayload
+{
+    public int PayloadSize=>80;
+    public int MaxPayloadSize=>112;
+}
+[BoundedPayload(32)]
+public readonly record struct VirtualIoHandleResponse(ulong IoId,ulong Generation) : IBoundedPayload
+{
+    public int PayloadSize=>16;
+    public int MaxPayloadSize=>32;
+}
+[BoundedPayload(32)]
+public readonly record struct CloseVirtualIoRequest(ulong IoId,ulong Generation) : IBoundedPayload
+{
+    public int PayloadSize=>16;
+    public int MaxPayloadSize=>32;
+}
+
+[BoundedPayload(4224)]
+public readonly struct TransferVirtualIoRequest : IBoundedPayload
+{
+    public TransferVirtualIoRequest(ulong ioId,ulong generation,ulong offset,bool write,int length,BoundedBytes data)
+    { IoId=ioId;Generation=generation;Offset=offset;Write=write;Length=length;Data=data; }
+    public ulong IoId {get;}
+    public ulong Generation {get;}
+    public ulong Offset {get;}
+    public bool Write {get;}
+    public int Length {get;}
+    public BoundedBytes Data {get;}
+    public int PayloadSize=>64+Data.PayloadSize;
+    public int MaxPayloadSize=>4224;
+}
+[BoundedPayload(4160)]
+public readonly record struct VirtualIoTransferResponse(bool Completed,bool NoEffect,BoundedBytes Data) : IBoundedPayload
+{
+    public int PayloadSize=>16+Data.PayloadSize;
+    public int MaxPayloadSize=>4160;
+}
+
 /// <summary>
 /// Session-bound local virtualization control plane. Every command carries exact
 /// Sing-local authority; discovery and the session itself confer no VM authority.
@@ -149,4 +192,10 @@ public interface IVirtualizationService
 
     [Message(13), Transition("Ready", "Ready")]
     ValueTask BindExecutableArtifactAsync(BindVirtualExecutableArtifactRequest request);
+    [Message(14), Transition("Ready", "Ready")]
+    ValueTask<VirtualIoTransferResponse> TransferIoAsync(TransferVirtualIoRequest request);
+    [Message(15), Transition("Ready", "Ready")]
+    ValueTask<VirtualIoHandleResponse> BindIoAsync(BindVirtualIoRequest request);
+    [Message(16), Transition("Ready", "Ready")]
+    ValueTask CloseIoAsync(CloseVirtualIoRequest request);
 }

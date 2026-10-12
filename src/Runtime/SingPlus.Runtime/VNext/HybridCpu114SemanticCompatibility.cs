@@ -9,7 +9,7 @@ namespace SingPlus.Runtime;
 internal static class HybridCpu114SemanticCompatibility
 {
     internal const string PackageId = "HybridCPU.ExternalRuntime.Contracts";
-    internal const string PackageVersion = "1.14.0";
+    internal const string PackageVersion = "1.34.0";
     internal const string SchemaIdentity = "ExternalOperationContract/1.4.0";
 
     internal static KernelResult<ExecutionGuaranteesV1> Map(Hc.ExternalOperationSemanticRequest request)
@@ -19,7 +19,7 @@ internal static class HybridCpu114SemanticCompatibility
             !Enum.IsDefined(request.EffectClass) || !Enum.IsDefined(request.VisibilityRequirement) ||
             !Enum.IsDefined(request.CancellationMode) || !Enum.IsDefined(request.ReplayEffectClass))
             return KernelResult<ExecutionGuaranteesV1>.Fail(KernelError.InvalidMessage,
-                "HybridCPU 1.14.0 request version or semantic class is unknown.");
+                "HybridCPU request version or semantic class is unknown.");
 
         var cancellation = request.CancellationMode == Hc.ExternalCancellationMode.ExactAcknowledgement
             ? Supported(CancellationClassV1.ExactAcknowledgement, GuaranteeEvidenceSourceV1.ContractSemantics)
@@ -122,7 +122,7 @@ internal sealed record SemanticExecutionBindingV1(
                 HybridCpu114SemanticCompatibility.PackageId,
                 HybridCpu114SemanticCompatibility.PackageVersion,
                 HybridCpu114SemanticCompatibility.SchemaIdentity))
-            throw new NotSupportedException("Provider contract tuple is not the qualified 1.14.0 mapping.");
+            throw new NotSupportedException("Provider contract tuple is not the exact consumed package mapping.");
         if (HybridCpu114SemanticCompatibility.GenerationDigest(ProviderGenerations) != ProviderGenerationDigest)
             throw new ArgumentException("Provider generation digest does not match the exact opaque generation set.");
         var envelope = ResourceEnvelope.Canonicalize();
@@ -174,3 +174,8 @@ internal sealed record SemanticExecutionBindingV1(
         return Convert.ToHexStringLower(SHA256.HashData(new UTF8Encoding(false, true).GetBytes(payload)));
     }
 }
+
+
+
+
+

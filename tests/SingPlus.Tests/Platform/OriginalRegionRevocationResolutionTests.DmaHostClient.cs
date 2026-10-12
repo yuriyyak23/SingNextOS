@@ -1,0 +1,60 @@
+using SingPlus.Contracts;
+using SingPlus.Runtime;
+
+namespace SingPlus.Tests.Platform;
+
+public sealed partial class OriginalRegionRevocationResolutionTests
+{
+    [Theory]
+    [InlineData("exact")] [InlineData("absent-cost")] [InlineData("stale-cost")] [InlineData("foreign-owner")]
+    [InlineData("unsupported-cost")] [InlineData("throw-cost")]
+    public void PublicDmaClientUsesOriginalNativeBackingAndIndependentOwnerCharges(string fault)
+    {
+        var x=CopyKernel(true);
+        var costs=new V6ManagedLocalityCostProvider();
+        var now=DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        if(fault!="absent-cost")
+        {
+            Assert.True(costs.Publish(new(1,"source",fault=="stale-cost"?4UL:3UL,now,now+60000,64,1,0,0)).IsSuccess);
+            Assert.True(costs.Publish(new(1,"destination",5,now,now+60000,64,1,0,0)).IsSuccess);
+        }
+        var sp=x.Kernel.PreparePlatformDmaForDevice(x.Owner,x.Source).Value;
+        var dp=x.Kernel.PreparePlatformDmaForDevice(x.DestinationOwner,x.Destination).Value;
+        var foreign=TestFixtures.Create(x.Kernel,782,1140).Handle;
+        var calls=0;x.Spy.BeforeInvocation=(name,_)=>{if(name=="CopyDma")calls++;};
+        IV6LocalityCostEvidenceProvider evidence=fault is "unsupported-cost" or "throw-cost" ? new InvalidCostSource(costs,fault) : costs;
+        var moved=x.Kernel.MoveProviderDmaBuffers(fault=="foreign-owner"?foreign:x.Owner,x.DestinationOwner,x.Input,x.Output,x.Plan,
+            x.SourceMap,x.Source,sp,x.DestinationMap,x.Destination,dp,evidence);
+        ulong Used(BudgetAccountHandle account)=>x.Kernel.QueryBudget(account).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used;
+        if(fault=="exact")
+        {
+            Assert.True(moved.IsSuccess,moved.Message);Assert.Same(x.Output,moved.Value!.Buffer);
+            Assert.False(moved.Value.Receipt.AuthorizesMovement);Assert.All(moved.Value.Buffer.Span.ToArray(),b=>Assert.Equal((byte)0x5A,b));
+            Assert.False(x.Input.IsValid);Assert.Equal(1,calls);Assert.Equal(0UL,Used(x.Budget));Assert.Equal(64UL,Used(x.DestinationBudget));
+            Assert.False(x.Kernel.MoveProviderDmaBuffers(x.Owner,x.DestinationOwner,x.Input,x.Output,x.Plan,
+                x.SourceMap,x.Source,sp,x.DestinationMap,x.Destination,dp,costs).IsSuccess);
+            Assert.Equal(1,calls);Assert.Equal(0,x.Native.ActiveDmaGrantCount);Assert.Equal(0,x.Native.ActiveOwnedRegionMappingCount);
+        }
+        else
+        {
+            Assert.False(moved.IsSuccess);Assert.Equal(0,calls);
+            Assert.All(x.Output.Span.ToArray(),b=>Assert.Equal((byte)0,b));Assert.True(x.Input.IsValid);
+            Assert.Equal(64UL,Used(x.Budget));Assert.Equal(64UL,Used(x.DestinationBudget));
+        }
+        Assert.True(x.Kernel.TerminateProcess(x.Owner).IsSuccess);Assert.True(x.Kernel.TerminateProcess(x.DestinationOwner).IsSuccess);
+        Assert.Equal(0UL,Used(x.Budget));Assert.Equal(0UL,Used(x.DestinationBudget));
+        Assert.Equal(0,x.Native.ActiveDmaGrantCount);Assert.Equal(0,x.Native.ActiveOwnedRegionMappingCount);Assert.Equal(0,x.Native.ActiveDeviceLeaseCount);
+        Assert.True(x.Kernel.Processes.Resolve(foreign).IsSuccess);
+    }
+
+    private sealed class InvalidCostSource(IV6LocalityCostEvidenceProvider original,string fault) : IV6LocalityCostEvidenceProvider
+    {
+        public KernelResult<ulong> CurrentGeneration(string providerClass)=>original.CurrentGeneration(providerClass);
+        public KernelResult<LocalityCostEstimateV1> QueryFresh(string providerClass,long now)
+        {
+            if(fault=="throw-cost")throw new IOException("Locality source lost.");
+            var value=original.QueryFresh(providerClass,now);
+            return value.IsSuccess ? KernelResult<LocalityCostEstimateV1>.Ok(value.Value with {Version=99}) : value;
+        }
+    }
+}

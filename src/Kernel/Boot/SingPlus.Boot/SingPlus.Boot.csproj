@@ -11,6 +11,7 @@
     <Compile Remove="Samples/**/*.cs" />
     <Content Include="Samples/VerifiedRoot/guest.hce" Link="guest.hce" CopyToOutputDirectory="PreserveNewest" />
     <ProjectReference Include="Samples/ManagedCap/ManagedCap.csproj" />
+    <ProjectReference Include="Samples/Snake.Host/Snake.Host.csproj" />
     <ProjectReference Include="../../../../tools/HybridCpu_ExecutableAdapter/HybridCpu_ExecutableAdapter.csproj" />
     <ProjectReference Include="../../SingPlus.Kernel/SingPlus.Kernel.csproj" />
     <ProjectReference Include="../../Hal/SingPlus.Kernel.Hal.Host/SingPlus.Kernel.Hal.Host.csproj" />

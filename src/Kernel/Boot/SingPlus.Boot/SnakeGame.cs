@@ -1,4 +1,5 @@
-using SingPlus.Boot.Samples;
+using SingPlus.Apps.Snake;
+using SingPlus.Apps.Snake.Host;
 using SingPlus.Contracts;
 using SingPlus.Runtime;
 
@@ -18,9 +19,10 @@ internal static class SnakeGame
         ProcessHandle? serverHandle = null;
         EndpointSessionHandle? openedHandle = null;
         var success = false;
+        SnakeServiceHost? executor = null;
         try
         {
-            KernelResult<ProcessHandle> server = session.SpawnProcess("singplus.game.snake.service", ExecutionRole.User, MemoryProfile.ManagedGc);
+            KernelResult<ProcessHandle> server = session.SpawnProcess("singplus.game.snake.service", ExecutionRole.Sip, MemoryProfile.SipRegion);
             if (!server.IsSuccess) return Error($"{server.Error}: {server.Message}");
             serverHandle = server.Value;
             if (session.Options.TraceEnabled)
@@ -45,11 +47,15 @@ internal static class SnakeGame
             var opened = runtime.OpenSession(caller.Value, registered.Value, [authority.Value!.CapabilityId]);
             if (!opened.IsSuccess) return Error($"{opened.Error}: {opened.Message}");
             openedHandle = opened.Value;
-            var game = new SnakeBindings.Game();
+            var hosted = SnakeServiceHost.Start(runtime, server.Value, opened.Value);
+            if (!hosted.IsSuccess) return Error($"{hosted.Error}: {hosted.Message}");
+            executor = hosted.Value!;
             using var timeout = new CancellationTokenSource();
-            var transport = new SnakePump(runtime, caller.Value, server.Value, opened.Value, game, timeout);
+            var transport = new SnakeClientTransport(runtime, caller.Value, opened.Value, executor, timeout);
             var client = SnakeBindings.CreateClient(transport);
-            EmulatorConsole.Info($"[snake] caller={caller.Value.ProcessId.Value} server={server.Value.ProcessId.Value} session={opened.Value.SessionId.Value}; generated SIP on cooperative host CLR\r\n");
+            EmulatorConsole.Info($"[snake] storage Region={executor.Storage.RegionId.Value}: 160 Int32 cells, 640 runtime-accounted bytes; SIP role/SipRegion profile\r\n");
+            EmulatorConsole.Info($"[snake] caller={caller.Value.ProcessId.Value} server={server.Value.ProcessId.Value} session={opened.Value.SessionId.Value}; generated SIP, restricted child execution, runtime-owned snapshot Region\r\n");
+            EmulatorConsole.Info($"[snake] Windows child PID={executor.ChildProcessId}; low integrity, disabled privileges; Job: 1 process, 512 MiB committed memory, CPU cap 20%, kill-on-close; reads/network are not fully sandboxed\r\n");
             if (moves is not null)
             {
                 EmulatorConsole.Info("ASCII SNAKE | scripted steps; R = restart; Q = quit\r\n");
@@ -76,6 +82,20 @@ internal static class SnakeGame
         { Error($"Invocation failed: {exception.Message}"); }
         finally
         {
+            if (executor is not null)
+            {
+                try
+                {
+                    var stopped = executor.Stop();
+                    if (!stopped.IsSuccess) { Error($"Storage cleanup: {stopped.Error}: {stopped.Message}"); success = false; }
+                    else EmulatorConsole.Info("[snake] worker joined; runtime Region released before process reclaim; restricted child termination confirmed\r\n");
+                }
+                catch (InvalidOperationException exception)
+                {
+                    Error($"Worker stopped with failure: {exception.Message}; owner teardown retains cleanup responsibility.");
+                    success = false;
+                }
+            }
             if (openedHandle is { } handle)
             {
                 var closed = runtime.CloseSession(caller.Value, handle);
@@ -174,11 +194,11 @@ internal static class SnakeGame
         return false;
     }
 
-    private sealed class SnakePump(RuntimeKernel runtime, ProcessHandle caller, ProcessHandle server,
-        EndpointSessionHandle session, SnakeBindings.Game game, CancellationTokenSource timeout) : ISipClientRuntimeTransport
+    private sealed class SnakeClientTransport(RuntimeKernel runtime, ProcessHandle caller,
+        EndpointSessionHandle session, SnakeServiceHost executor, CancellationTokenSource timeout) : ISipClientRuntimeTransport
     {
         private readonly RuntimeSipClientTransport _transport = new(runtime, caller, session, timeout.Token);
-        public int DispatchCount { get; private set; }
+        public int DispatchCount => executor.DispatchCount;
         public ResponseEnvelope Invoke(uint id, object? payload = null) => InvokeAsync(id, payload).AsTask().GetAwaiter().GetResult();
         public ValueTask<ResponseEnvelope> InvokeAsync(uint id, object? payload = null) => InvokeAsync(id, payload, timeout.Token);
         public async ValueTask<ResponseEnvelope> InvokeAsync(uint id, object? payload, CancellationToken token)
@@ -186,19 +206,11 @@ internal static class SnakeGame
             timeout.CancelAfter(TimeSpan.FromSeconds(5));
             try
             {
-                var response = _transport.InvokeAsync(id, payload, token);
-                if (!response.IsCompleted)
+                var response = _transport.InvokeAsync(id, payload, token).AsTask();
+                if (await Task.WhenAny(response, executor.Completion).ConfigureAwait(false) == executor.Completion)
                 {
-                    var received = runtime.ReceiveSessionRequest(server, session);
-                    if (!received.IsSuccess) throw new InvalidOperationException($"{received.Error}: {received.Message}");
-                    var accepted = runtime.AcceptSessionInvocation(server, received.Value!.Invocation, allowInFlightCancellation: false);
-                    if (!accepted.IsSuccess) throw new InvalidOperationException($"{accepted.Error}: {accepted.Message}");
-                    if (received.Value.Request.MessageId != SnakeBindings.StepMessageId || received.Value.Request.Payload is not SnakeMove move)
-                        throw new InvalidOperationException("Snake request shape mismatch.");
-                    var frame = game.Dispatch(move);
-                    DispatchCount++;
-                    var published = runtime.PublishSessionResponse(server, received.Value.Invocation, frame);
-                    if (!published.IsSuccess) throw new InvalidOperationException($"{published.Error}: {published.Message}");
+                    await executor.Completion.ConfigureAwait(false);
+                    throw new InvalidOperationException("Snake service stopped before response.");
                 }
                 return await response.ConfigureAwait(false);
             }

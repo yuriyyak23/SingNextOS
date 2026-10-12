@@ -93,7 +93,7 @@ public sealed partial class RuntimeKernel
             subject,
             eventEndpoint,
             KernelEventClass.Completion,
-            DmaCompletionEventSource(submission));
+            DmaCompletionEventSource(submission), out var rollbackOriginal);
         if (!staged.IsSuccess)
         {
             return KernelResult<PlatformDmaCompletionEvidence>.Fail(
@@ -101,31 +101,43 @@ public sealed partial class RuntimeKernel
                 staged.Message!);
         }
 
-        KernelResult<PlatformDmaCompletionEvidence> completion;
-        try { completion = PlatformAuthority.ObserveDmaCompletion(submission, identity); }
-        finally { PlatformAuthority.FlushDmaTrace(trace); }
-        if (!completion.IsSuccess)
+        bool localConsumed = false;
+        try
         {
-            var rollback = _kernelEvents.RollbackExact(subject, staged.Value!);
-            if (!rollback.IsSuccess)
+            KernelResult<PlatformDmaCompletionEvidence> completion;
+            try { completion = PlatformAuthority.ObserveDmaCompletion(submission, identity); }
+            finally { PlatformAuthority.FlushDmaTrace(trace); }
+            if (!completion.IsSuccess)
+            {
+                var rollback = rollbackOriginal!();
+                localConsumed = rollback.IsSuccess;
+                if (!rollback.IsSuccess)
+                {
+                    return KernelResult<PlatformDmaCompletionEvidence>.Fail(
+                        KernelError.PlatformFaulted,
+                        "DMA completion observation failed and the exact staged local event could not be rolled back.");
+                }
+
+                return completion;
+            }
+
+            var committed = _kernelEvents.CommitExact(subject, staged.Value!);
+            localConsumed = committed.IsSuccess;
+            if (!committed.IsSuccess)
             {
                 return KernelResult<PlatformDmaCompletionEvidence>.Fail(
                     KernelError.PlatformFaulted,
-                    "DMA completion observation failed and the exact staged local event could not be rolled back.");
+                    "DMA completion was proven but the exact staged local event could not be committed.");
             }
 
             return completion;
         }
-
-        var committed = _kernelEvents.CommitExact(subject, staged.Value!);
-        if (!committed.IsSuccess)
+        finally
         {
-            return KernelResult<PlatformDmaCompletionEvidence>.Fail(
-                KernelError.PlatformFaulted,
-                "DMA completion was proven but the exact staged local event could not be committed.");
+            // Local visibility refusal only. Original DMA completion/uncertainty
+            // and backing remain with their existing authority owners.
+            if (!localConsumed) _ = rollbackOriginal!();
         }
-
-        return completion;
     }
 
     private static string DmaCompletionEventSource(PlatformDmaSubmission submission) =>

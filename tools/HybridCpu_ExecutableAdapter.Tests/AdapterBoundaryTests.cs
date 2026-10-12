@@ -15,7 +15,7 @@ public sealed class AdapterBoundaryTests
     {
         var assembly = typeof(ExternalOperationAdapterSession).Assembly;
         Assert.Equal("HybridCPU_ExternalRuntime", assembly.GetName().Name);
-        Assert.Equal(new Version(1, 6, 0, 0), assembly.GetName().Version);
+        Assert.Equal(new Version(1, 23, 8, 0), assembly.GetName().Version);
         Assert.Throws<ArgumentNullException>(() => new ExternalOperationAdapterSession(null!));
     }
 
@@ -655,3 +655,12 @@ public sealed class AdapterBoundaryTests
         }
     }
 }
+
+
+
+
+
+
+
+
+

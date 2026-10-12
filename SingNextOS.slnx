@@ -18,10 +18,20 @@
     <Project Path="tools/SingPlus.HybridCpuQualification/SingPlus.HybridCpuQualification.csproj" />
     <Project Path="tools/SingPlus.LoweringEvidenceEmitter/SingPlus.LoweringEvidenceEmitter.csproj" />
     <Project Path="tools/SingPlus.SingCapQualification/SingPlus.SingCapQualification.csproj" />
+    <Project Path="tools/SingPlus.VirtualIoHost/SingPlus.VirtualIoHost.csproj" />
   </Folder>
   <Folder Name="/Samples/" />
   <Folder Name="/Samples/ManagedCap/">
     <Project Path="src/Kernel/Boot/SingPlus.Boot/Samples/ManagedCap/ManagedCap.csproj" />
+  </Folder>
+  <Folder Name="/Samples/Snake/">
+    <Project Path="src/Kernel/Boot/SingPlus.Boot/Samples/Snake/Snake.csproj" />
+    <Project Path="src/Kernel/Boot/SingPlus.Boot/Samples/Snake.Checks/Snake.Checks.csproj" />
+    <Project Path="src/Kernel/Boot/SingPlus.Boot/Samples/Snake.Child/Snake.Child.csproj" />
+    <Project Path="src/Kernel/Boot/SingPlus.Boot/Samples/Snake.Host/Snake.Host.csproj" />
+  </Folder>
+  <Folder Name="/Samples/VerifiedRoot/">
+    <Project Path="src/Kernel/Boot/SingPlus.Boot/Samples/VerifiedRoot/VerifiedRoot.csproj" />
   </Folder>
   <Folder Name="/sdk/">
     <Project Path="sdk/SingPlus.Analyzers/SingPlus.Analyzers.csproj" />

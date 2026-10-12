@@ -84,7 +84,8 @@ public sealed partial class RuntimeKernel
     internal KernelResult<V6PlatformDmaCopyExecution> SubmitV6PlatformDmaCopy(
         ProcessHandle sourceSubject, PlatformDmaGrant sourceGrant, PlatformDmaPrepareEvidence sourcePrepare,
         ProcessHandle destinationSubject, PlatformDmaGrant destinationGrant, PlatformDmaPrepareEvidence destinationPrepare,
-        ISemanticTraceSinkV1? sourceSink = null, ISemanticTraceSinkV1? destinationSink = null)
+        ISemanticTraceSinkV1? sourceSink = null, ISemanticTraceSinkV1? destinationSink = null,
+        PlatformDmaCopyBacking? backing = null, Action? effectBoundary = null, Action? noEffectBoundary = null)
     {
         PlatformAuthorityBridge.DmaTraceObserver? sourceTrace = null, destinationTrace = null;
         try
@@ -135,7 +136,7 @@ public sealed partial class RuntimeKernel
                             return usable.IsSuccess ? commit() : Fail(usable.Error, usable.Message!);
                         }
                     }
-                }, sourceSink, destinationSink, out sourceTrace, out destinationTrace);
+                }, sourceSink, destinationSink, out sourceTrace, out destinationTrace,backing,effectBoundary,noEffectBoundary);
             return submitted.IsSuccess
                 ? KernelResult<V6PlatformDmaCopyExecution>.Ok(new(new(submitted.Value.Source, submitted.Value.SourceBinding),
                     new(submitted.Value.Destination, submitted.Value.DestinationBinding)))

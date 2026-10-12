@@ -25,7 +25,7 @@ public sealed class HybridCpuPlatformAuthorityProviderTests
         object? foreignClosure = null;
         if (completed)
         {
-            var other = provider.BindDomain(new(new DomainId(601), new ProcessHandle(new ProcessId(61), 1))).Value!;
+            var other = provider.BindDomain(new PlatformDomainIdentity(new DomainId(601), new ProcessHandle(new ProcessId(61), 1))).Value!;
             Assert.True(provider.RevokeDomain(other).IsSuccess);
             foreignClosure = domains[other.LeaseId]!.GetType().GetProperty("RootCloseObservation")!.GetValue(domains[other.LeaseId]);
         }
@@ -59,7 +59,14 @@ public sealed class HybridCpuPlatformAuthorityProviderTests
         var originals = (global::System.Collections.IDictionary)provider.GetType().GetField("_originalRootBinds", flags)!.GetValue(provider)!;
         Assert.Same(original, originals[lease.LeaseId]);
         Assert.Equal(false, original.GetType().GetProperty("InFlight")!.GetValue(original));
-        Assert.Null(original.GetType().GetProperty("PublishedDomain")!.GetValue(original));
+        var retainedDomain = original.GetType().GetProperty("PublishedDomain")!.GetValue(original);
+        if (lostReply) Assert.Null(retainedDomain);
+        else
+        {
+            Assert.NotNull(retainedDomain);
+            Assert.Equal(true,retainedDomain.GetType().GetProperty("CleanupOnly")!.GetValue(retainedDomain));
+            Assert.Same(original,retainedDomain.GetType().GetProperty("BindSource")!.GetValue(retainedDomain));
+        }
         var raw = original.GetType().GetProperty("Observation")!.GetValue(original);
         if (lostReply) Assert.Null(raw);
         else Assert.True(Assert.IsType<NeutralDomainBindResult>(raw).IsBound);
@@ -325,7 +332,7 @@ public sealed class HybridCpuPlatformAuthorityProviderTests
             features.Resolve(PlatformFeatureFamily.ExplicitMemoryVisibility).ContractVersion);
         Assert.Equal(PlatformFeatureAvailability.RuntimeAdmission,
             features.Resolve(PlatformFeatureFamily.ExplicitMemoryVisibility).Availability);
-        Assert.Equal(PlatformDmaGrantContract.ContractVersion,
+        Assert.Equal(PlatformDmaCopySubmissionContract.ContractVersion,
             features.Resolve(PlatformFeatureFamily.DmaMapping).ContractVersion);
         Assert.Equal(PlatformFeatureAvailability.RuntimeAdmission,
             features.Resolve(PlatformFeatureFamily.DmaMapping).Availability);

@@ -5,6 +5,15 @@ namespace SingPlus.Runtime;
 
 public sealed partial class RuntimeKernel
 {
+    /// <summary>Returns this caller's existing admitted parent correlation; not permission.</summary>
+    public KernelResult<PlatformDomainBinding> QueryVirtualDomainPlatformBinding(ProcessHandle owner,VirtualDomainHandle domain)
+    {
+        var original=_virtualDomains.ResolveAdmission(owner,domain);
+        return original.IsSuccess && original.Value!.ParentBinding is { } parent
+            ? KernelResult<PlatformDomainBinding>.Ok(parent)
+            : KernelResult<PlatformDomainBinding>.Fail(original.IsSuccess?KernelError.PlatformUnsupported:original.Error,original.Message??"Virtual parent binding unavailable.");
+    }
+
     private readonly VirtualDomainAuthority _virtualDomains = new();
 
     public KernelResult<VirtualDomainAuthoritySet> CreateVirtualDomain(ProcessHandle owner, CapabilityId createCapability, VirtualDomainProfile profile)
@@ -89,7 +98,7 @@ public sealed partial class RuntimeKernel
             }
             var authority = PlatformChildAuthorityClass.Lifecycle | PlatformChildAuthorityClass.Execution |
                 PlatformChildAuthorityClass.GuestMemory | PlatformChildAuthorityClass.Events | PlatformChildAuthorityClass.Traps;
-            if (PlatformAuthority.FeatureManifest.Resolve(PlatformFeatureFamily.BoundedVirtualIo).Availability == PlatformFeatureAvailability.Executable)
+            if (PlatformAuthority.FeatureManifest.Resolve(PlatformFeatureFamily.BoundedVirtualIo).Availability is PlatformFeatureAvailability.RuntimeAdmission or PlatformFeatureAvailability.Executable)
                 authority |= PlatformChildAuthorityClass.Io;
             var intent = new PlatformChildDomainIntent(new(profile.VirtualProcessorCount, profile.MaximumGuestMemoryBytes), new(authority, authority));
             var child = PlatformAuthority.CreateChildDomain(parent.Value!, identity, intent, Admit, SourceCommit,
@@ -369,6 +378,8 @@ public sealed partial class RuntimeKernel
         using var creation = preparedIdentity.Value!;
         var capturedParent = parent.Value;
         var parentState = capturedParent.State;
+        var effectSource = _virtualDomains.CaptureEffectSource(capturedParent, parentState);
+        if (!effectSource.IsSuccess) return KernelResult<VirtualDomainAuthoritySet>.Fail(effectSource.Error, effectSource.Message!);
         lock (_platformMemoryUseGate)
         {
             var current = Processes.Resolve(owner);
@@ -397,7 +408,7 @@ public sealed partial class RuntimeKernel
         }
         KernelResult SourceCommit(Func<KernelResult> commit) =>
             CapabilityAuthority.CommitVirtualDomainEffect(parentCapability, process.DomainId, owner.Generation,
-                CapabilityRights.Configure, VirtualizationResourceIds.Domain(parentDomain.DomainId), () => _virtualDomains.CommitEffectAdmission(capturedParent, parentState, commit));
+                CapabilityRights.Configure, VirtualizationResourceIds.Domain(parentDomain.DomainId), () => _virtualDomains.CommitEffectAdmission(capturedParent, parentState, commit, effectSource.Value!));
         VirtualDomainAuthority.Record? record = null;
         try
         {
@@ -440,6 +451,9 @@ public sealed partial class RuntimeKernel
     }
 
     public KernelResult<GuestRegionMapping> MapGuestRegion(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId memoryCapability, CapabilityId regionCapability, RegionHandle region, GuestAddressRange range, GuestMemoryAccess access)
+        => MapGuestRegion(owner, domain, memoryCapability, regionCapability, region, range, access, 0);
+
+    public KernelResult<GuestRegionMapping> MapGuestRegion(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId memoryCapability, CapabilityId regionCapability, RegionHandle region, GuestAddressRange range, GuestMemoryAccess access, ulong maximumPrivateExecutableDataBytes)
     {
         using var pin = PinComposedDomain(owner, virtualDomain: domain);
         if (!pin.Result.IsSuccess) return KernelResult<GuestRegionMapping>.Fail(pin.Result.Error, pin.Result.Message!);
@@ -461,7 +475,7 @@ public sealed partial class RuntimeKernel
             KernelResult DualCommit(Func<KernelResult> commit) => CapabilityAuthority.CommitGuestRegionSource(
                 regionCapability, current.Value!.DomainId, owner.Generation, rights,
                 CapabilityResourceIds.MemoryRegion(region.RegionId), () => memoryCommit(commit));
-            result = MapGuestRegionCore(owner, domain, memoryCapability, regionCapability, region, range, access, fresh, DualCommit);
+            result = MapGuestRegionCore(owner, domain, memoryCapability, regionCapability, region, range, access, fresh, DualCommit, maximumPrivateExecutableDataBytes);
             return result.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(result.Error, result.Message!);
         });
         return operation.IsSuccess ? result : KernelResult<GuestRegionMapping>.Fail(operation.Error, operation.Message!);
@@ -469,12 +483,15 @@ public sealed partial class RuntimeKernel
 
     private KernelResult<GuestRegionMapping> MapGuestRegionCore(ProcessHandle owner, VirtualDomainHandle domain,
         CapabilityId memoryCapability, CapabilityId regionCapability, RegionHandle region, GuestAddressRange range,
-        GuestMemoryAccess access, Func<Func<KernelResult>, KernelResult> fresh, Func<Func<KernelResult>, KernelResult> sourceCommit)
+        GuestMemoryAccess access, Func<Func<KernelResult>, KernelResult> fresh, Func<Func<KernelResult>, KernelResult> sourceCommit, ulong maximumPrivateExecutableDataBytes = 0)
     {
         using var composedUse = PinComposedDomain(owner, virtualDomain: domain);
         if (!composedUse.Result.IsSuccess) return KernelResult<GuestRegionMapping>.Fail(composedUse.Result.Error, composedUse.Result.Message!);
         var record = ResolveVirtualCapability(owner, domain, memoryCapability, VirtualizationResourceIds.Memory(domain.DomainId), CapabilityRights.Map);
         if (!record.IsSuccess) return KernelResult<GuestRegionMapping>.Fail(record.Error, record.Message!);
+        if (maximumPrivateExecutableDataBytes > 0x3000_0000 || maximumPrivateExecutableDataBytes % 4096 != 0 ||
+            maximumPrivateExecutableDataBytes != 0 && (record.Value!.ChildBinding is null || (access & GuestMemoryAccess.Execute) == 0))
+            return KernelResult<GuestRegionMapping>.Fail(KernelError.PlatformDenied, "Private data quota requires a page-aligned bounded executable provider mapping.");
         if (record.Value!.State is not VirtualDomainState.Configured and not VirtualDomainState.Parked)
             return KernelResult<GuestRegionMapping>.Fail(KernelError.InvalidTransition, "Guest memory can only be mapped while configured or parked.");
         const GuestMemoryAccess supportedAccess = GuestMemoryAccess.Read | GuestMemoryAccess.Write | GuestMemoryAccess.Execute;
@@ -492,9 +509,31 @@ public sealed partial class RuntimeKernel
         var staged = _virtualDomains.AddMapping(record.Value, range, region, access, memoryCapability, regionCapability);
         if (!staged.IsSuccess) return staged;
         var local = staged.Value!;
-        var reservation = fresh(() => sourceCommit(() => Regions.ReservePlatformMapping(region, new RegionOwner(process.DomainId, owner.Generation))));
+        var budget = record.Value.ChildBinding is not null && record.Value.ParentBinding is not null
+            ? ReserveAttachedBudget(owner,
+                maximumPrivateExecutableDataBytes == 0
+                    ? [new(ServiceBudgetDimension.PinnedMappedMemoryBytes, checked((ulong)range.ByteLength)), new(ServiceBudgetDimension.GuestMemoryBytes, checked((ulong)range.ByteLength))]
+                    : [new(ServiceBudgetDimension.PinnedMappedMemoryBytes, checked((ulong)range.ByteLength)), new(ServiceBudgetDimension.GuestMemoryBytes, checked((ulong)range.ByteLength)), new(ServiceBudgetDimension.OwnedMemoryBytes, maximumPrivateExecutableDataBytes)],
+                BudgetReservationLifetime.PlatformMapping)
+            : KernelResult<BudgetReservationHandle?>.Ok(null);
+        if (!budget.IsSuccess)
+        {
+            _ = _virtualDomains.RemoveMapping(record.Value, local.Mapping, local);
+            return KernelResult<GuestRegionMapping>.Fail(budget.Error, budget.Message!);
+        }
+        var originalBudgetOwner = Budgets.CaptureOriginalMappingReservationOwner(owner, budget.Value);
+        var reservation = fresh(() => sourceCommit(() => record.Value.ChildBinding is null
+            ? ReserveLocalGuest(record.Value, local, owner, new(process.DomainId, owner.Generation))
+            : Regions.ReservePlatformMapping(region, new RegionOwner(process.DomainId, owner.Generation))));
         if (!reservation.IsSuccess)
         {
+            if (record.Value.ChildBinding is null)
+            {
+                var cleanup = RemoveClosedGuestMapping(record.Value, local, owner, false);
+                return KernelResult<GuestRegionMapping>.Fail(cleanup.IsSuccess ? reservation.Error : cleanup.Error,
+                    cleanup.IsSuccess ? reservation.Message! : cleanup.Message!);
+            }
+            _ = ReleaseAttachedBudget(owner, budget.Value);
             var rollback = _virtualDomains.RemoveMapping(record.Value, local.Mapping, local);
             return KernelResult<GuestRegionMapping>.Fail(rollback.IsSuccess ? reservation.Error : rollback.Error,
                 rollback.IsSuccess ? reservation.Message! : rollback.Message!);
@@ -513,10 +552,26 @@ public sealed partial class RuntimeKernel
             {
                 _ = _virtualDomains.RemoveMapping(record.Value, local.Mapping);
                 if (!retainParentReservation)
+                {
                     _ = Regions.ReleasePlatformMappingReservation(region, new(process.DomainId, owner.Generation));
+                    _ = ReleaseAttachedBudget(owner, budget.Value);
+                }
                 else
                     record.Value.State = VirtualDomainState.Quarantined;
                 return KernelResult<GuestRegionMapping>.Fail(parentMap.Error, parentMap.Message!);
+            }
+            lock (_platformMemoryUseGate)
+            {
+                TrackPlatformMapping(owner, parentMap.Value!);
+                lock (Budgets.MappingReservationPublicationGate)
+                {
+                    var bound = PlatformAuthority.BindOriginalMappingBudgetOwner(parentMap.Value!, budget.Value is not null, originalBudgetOwner, maximumPrivateExecutableDataBytes);
+                    if (!bound.IsSuccess || budget.Value is not null && !Budgets.BindOriginalMappingChargeOwnerLocked(originalBudgetOwner, bound.Value!).IsSuccess ||
+                        !Budgets.ValidateMappingReservationPublicationLocked(owner, budget.Value).IsSuccess)
+                        _ = PlatformAuthority.RevokeExactMappingLocalAuthorization(parentMap.Value!, PlatformIdentity(process));
+                    if (budget.Value is { } charge)
+                        _mappingBudgetReservations.Add(parentMap.Value.MappingId, (owner, charge));
+                }
             }
             var composedMap = RevalidateComposedDomain(owner, virtualDomain: domain);
             if (!composedMap.IsSuccess)
@@ -569,18 +624,14 @@ public sealed partial class RuntimeKernel
         var publication = composedPublication.IsSuccess ? fresh(() =>
             record.Value.ChildBinding is { } publicationChild
                 ? PlatformAuthority.CommitActiveChildDomainConsumer(publicationChild, () => sourceCommit(() => _virtualDomains.PublishMapping(record.Value, local)))
-                : sourceCommit(() => _virtualDomains.PublishMapping(record.Value, local))) : composedPublication;
+                : sourceCommit(() => PublishLocalGuest(record.Value, local, owner))) : composedPublication;
         if (publication.IsSuccess) return KernelResult<GuestRegionMapping>.Ok(local);
         // Provider facts remain owned even when late source permission rejects publication.
         var hasPlatformCleanup = record.Value.PlatformMappings.ContainsKey(local.Mapping.MappingId);
         var publicationCleanup = hasPlatformCleanup
             ? CloseChildPlatformMapping(record.Value, owner, local.Mapping.MappingId)
-            : Regions.ReleasePlatformMappingReservation(region, new(process.DomainId, owner.Generation));
-        if (publicationCleanup.IsSuccess)
-        {
-            if (!hasPlatformCleanup) _ = _virtualDomains.RemoveMapping(record.Value, local.Mapping);
-        }
-        else record.Value.State = VirtualDomainState.Quarantined;
+            : RemoveClosedGuestMapping(record.Value, local, owner, false);
+        if (!publicationCleanup.IsSuccess) record.Value.State = VirtualDomainState.Quarantined;
         return KernelResult<GuestRegionMapping>.Fail(publication.Error, publication.Message!);
     }
 
@@ -593,7 +644,7 @@ public sealed partial class RuntimeKernel
         if (record.Value!.State is VirtualDomainState.Quarantined or VirtualDomainState.Faulted)
             return KernelResult.Fail(KernelError.PlatformFaulted, "A quarantined virtual-domain mapping remains pinned and cannot be locally reclaimed.");
 
-        var exactMapping = _virtualDomains.ResolveMapping(record.Value, mapping);
+        var exactMapping = _virtualDomains.ResolveMapping(record.Value, mapping, allowLocalCleanup: true);
         if (!exactMapping.IsSuccess)
             return KernelResult.Fail(exactMapping.Error, exactMapping.Message!);
         if (HasVirtualComputePin(mapping))
@@ -636,13 +687,28 @@ public sealed partial class RuntimeKernel
             !record.Value.PlatformMappings.TryGetValue(mapping.MappingId, out var platform))
             return KernelResult.Fail(KernelError.StaleGeneration, "Exact executable guest mapping is absent, stale, or lacks execute access.");
         var captured = record.Value;
+        var privateCharge = PlatformAuthority.QueryOriginalMappingBudgetOwner(platform.Parent);
+        if (!privateCharge.IsSuccess || !privateCharge.Value.Known)
+            return KernelResult.Fail(KernelError.PlatformFaulted, "Original executable data quota admission is absent.");
+        var quota = privateCharge.Value.PrivateDataQuota;
+        KernelResult ValidatePrivateQuota()
+        {
+            var current = PlatformAuthority.QueryOriginalMappingBudgetOwner(platform.Parent);
+            if (!current.IsSuccess || !current.Value.Known || current.Value.PrivateDataQuota != quota ||
+                current.Value.Expected != privateCharge.Value.Expected || !ReferenceEquals(current.Value.Owner, privateCharge.Value.Owner) ||
+                !ReferenceEquals(current.Value.MappingOwner, privateCharge.Value.MappingOwner))
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Original private executable data quota source changed.");
+            return Budgets.ValidateOriginalPrivateDataQuota(owner, current.Value.Owner, current.Value.MappingOwner, current.Value.Expected, quota);
+        }
+        var privateAdmission = ValidatePrivateQuota();
+        if (!privateAdmission.IsSuccess) return privateAdmission;
         return UseVirtualExecutableSource(owner, domain, executeCapability, captured, child, (fresh, sourceCommit) =>
         {
             KernelResult MappingCommit(Func<KernelResult> commit) =>
                 PlatformAuthority.CommitGuestLocalMappingSource(platform.Guest, captured, local.Mapping, () => sourceCommit(() =>
                     _virtualDomains.CommitExecutableMappingAdmission(captured, local, platform, commit)));
             KernelResult Admission(Func<KernelResult> commit) => fresh(() =>
-                captured.ExecutableArtifact is null &&
+                ValidatePrivateQuota().IsSuccess && captured.ExecutableArtifact is null &&
                 _virtualDomains.CommitExecutableMappingAdmission(captured, local, platform, KernelResult.Ok).IsSuccess
                     ? commit() : KernelResult.Fail(KernelError.StaleGeneration, "Executable local mapping/artifact changed."));
             var bound = PlatformAuthority.BindChildExecutableArtifact(child, platform.Guest, immutablePackage, maximumExecutionSteps,
@@ -652,9 +718,11 @@ public sealed partial class RuntimeKernel
                     KernelResult retained;
                     lock (_platformMemoryUseGate) retained = _virtualDomains.RetainExecutableArtifact(captured, local.Mapping, binding);
                     if (!retained.IsSuccess) return retained;
+                    var quotaCurrent = ValidatePrivateQuota();
+                    if (!quotaCurrent.IsSuccess) return quotaCurrent;
                     return fresh(() => commit(() => PlatformAuthority.CommitGuestLocalMappingSource(platform.Guest, captured, local.Mapping,
                         () => sourceCommit(() => _virtualDomains.CommitExecutableArtifactAdmission(captured, binding, local, KernelResult.Ok)))));
-                });
+                }, quota);
             return bound.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(bound.Error, bound.Message!);
         });
     }
@@ -691,8 +759,8 @@ public sealed partial class RuntimeKernel
                             _virtualDomains.CommitExecutableArtifactAdmission(captured, artifact, local, KernelResult.Ok).IsSuccess
                                 ? commit() : KernelResult.Fail(KernelError.StaleGeneration, "Executable local artifact or mapping changed.")),
                         sourceCommitConsumer: ArtifactCommit,
-                        completionConsumer: commit => fresh(() => commit(() => ArtifactCommit(() =>
-                            _virtualDomains.CommitStateTransition(captured, VirtualDomainState.Configured, VirtualDomainState.Running)))));
+                        terminalCompletionConsumer: (terminal, commit) => fresh(() => commit(() => ArtifactCommit(() =>
+                            _virtualDomains.CommitExecutionPublication(captured, terminal)))));
                 });
         }
         return TransitionVirtualDomain(owner, domain, executeCapability, VirtualDomainState.Configured,
@@ -768,27 +836,42 @@ public sealed partial class RuntimeKernel
             VirtualizationResourceIds.Traps(domain.DomainId), CapabilityRights.Read);
         if (!record.IsSuccess)
             return KernelResult<VirtualTrapObservation>.Fail(record.Error, record.Message!);
-        if (record.Value!.State != VirtualDomainState.Running)
+        var terminalRead = record.Value!.State == VirtualDomainState.Faulted && PlatformAuthority.HasOriginalExecutionTerminalProducer;
+        if (terminalRead)
+        {
+            var original = _virtualDomains.ValidateOriginalTerminalFailurePublication(record.Value);
+            if (!original.IsSuccess) return KernelResult<VirtualTrapObservation>.Fail(original.Error, original.Message!);
+        }
+        else if (record.Value.State != VirtualDomainState.Running)
             return KernelResult<VirtualTrapObservation>.Fail(KernelError.InvalidTransition,
                 "Virtual traps may be observed only for the exact running domain.");
         if (record.Value.ChildBinding is not { } child)
             return KernelResult<VirtualTrapObservation>.Fail(KernelError.PlatformUnsupported,
                 "The virtual domain has no neutral trap-delivery provider.");
         KernelResult<PlatformVirtualTrapEvidence> observed = default;
-        var publication = UseVirtualTrapSource(owner, domain, trapCapability, record.Value, child, (fresh, sourceCommit) =>
+        var expected = terminalRead ? VirtualDomainState.Faulted : VirtualDomainState.Running;
+        var publication = UseVirtualDeliverySource(owner, domain, trapCapability, record.Value, child, CapabilityRights.Read,
+            VirtualizationResourceIds.Traps(domain.DomainId), expected, (fresh, sourceCommit) =>
         {
             observed = PlatformAuthority.ObserveChildTrap(child, fresh, sourceCommit,
                 completionConsumer: commit =>
                 {
                     // Composition may consult provider state; keep it outside source and owner locks.
                     var composed = RevalidateComposedDomain(owner, virtualDomain: domain);
-                    return composed.IsSuccess ? fresh(() => commit(() => sourceCommit(() => KernelResult.Ok()))) : composed;
+                    return composed.IsSuccess ? fresh(() => commit(() => sourceCommit(() =>
+                        terminalRead ? _virtualDomains.ValidateOriginalTerminalFailurePublication(record.Value) : PlatformAuthority.HasOriginalExecutionTerminalProducer
+                            ? _virtualDomains.CommitStateTransition(record.Value, VirtualDomainState.Running, VirtualDomainState.Faulted)
+                            : KernelResult.Ok()))) : composed;
                 });
             return observed.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(observed.Error, observed.Message!);
         });
         if (!publication.IsSuccess)
         {
-            if (RequiresVirtualDomainQuarantine(publication.Error))
+            // A failed pure read does not create a new execution lifetime. Preserve
+            // its already faulted original publication only while that exact local
+            // owner/revision remains current; future reads still validate all sources.
+            if (RequiresVirtualDomainQuarantine(publication.Error) &&
+                (!terminalRead || !_virtualDomains.ValidateOriginalTerminalFailurePublication(record.Value).IsSuccess))
                 record.Value.State = VirtualDomainState.Quarantined;
             return KernelResult<VirtualTrapObservation>.Fail(publication.Error, publication.Message!);
         }
@@ -824,7 +907,7 @@ public sealed partial class RuntimeKernel
         if (record.Value.State != VirtualDomainState.Draining)
         {
             if (record.Value.State is not VirtualDomainState.Created and not VirtualDomainState.Configured and
-                not VirtualDomainState.Running and not VirtualDomainState.Parked)
+                not VirtualDomainState.Running and not VirtualDomainState.Parked and not VirtualDomainState.Completed)
                 return KernelResult.Fail(KernelError.InvalidTransition, $"Virtual domain cannot begin destroy from {record.Value.State}.");
             record.Value.State = VirtualDomainState.Draining;
         }
@@ -872,6 +955,10 @@ public sealed partial class RuntimeKernel
         CapabilityId source, VirtualDomainAuthority.Record record, PlatformChildBinding binding,
         VirtualDomainState from, VirtualDomainState to, PlatformChildDomainTransition? transition)
     {
+        var secureSources = CaptureComposedSecureSources(owner, domain);
+        if (!secureSources.IsSuccess) return KernelResult.Fail(secureSources.Error, secureSources.Message!);
+        var effectSource = _virtualDomains.CaptureEffectSource(record, from);
+        if (!effectSource.IsSuccess) return KernelResult.Fail(effectSource.Error, effectSource.Message!);
         SingPlus.Sip.SingProcess process;
         lock (_platformMemoryUseGate)
         {
@@ -896,13 +983,13 @@ public sealed partial class RuntimeKernel
                 if (!ReferenceEquals(local.Value, record) || record.State != from || record.ChildBinding != binding)
                     return KernelResult.Fail(KernelError.InvalidTransition, "Child local source state changed.");
                 var lineage = _virtualDomains.ValidateActiveAncestors(record);
-                return lineage.IsSuccess ? commit() : lineage;
+                return lineage.IsSuccess ? CommitCapturedComposedSecureRevisions(owner, domain, secureSources.Value!, commit) : lineage;
             }
         }
         KernelResult SourceCommit(Func<KernelResult> commit) =>
             CapabilityAuthority.CommitVirtualDomainEffect(source, process.DomainId, owner.Generation,
                 transition is null ? CapabilityRights.Configure : CapabilityRights.Execute,
-                VirtualizationResourceIds.Domain(domain.DomainId), () => _virtualDomains.CommitEffectAdmission(record, from, commit));
+                VirtualizationResourceIds.Domain(domain.DomainId), () => _virtualDomains.CommitEffectAdmission(record, from, commit, effectSource.Value!));
         try
         {
             if (transition is null)
@@ -920,6 +1007,10 @@ public sealed partial class RuntimeKernel
         VirtualDomainAuthority.Record record, PlatformChildBinding child,
         Func<Func<Func<KernelResult>, KernelResult>, Func<Func<KernelResult>, KernelResult>, KernelResult> operation)
     {
+        var secureSources = CaptureComposedSecureSources(owner, domain);
+        if (!secureSources.IsSuccess) return KernelResult.Fail(secureSources.Error, secureSources.Message!);
+        var effectSource = _virtualDomains.CaptureEffectSource(record, VirtualDomainState.Configured);
+        if (!effectSource.IsSuccess) return KernelResult.Fail(effectSource.Error, effectSource.Message!);
         SingPlus.Sip.SingProcess process;
         lock (_platformMemoryUseGate)
         {
@@ -944,21 +1035,15 @@ public sealed partial class RuntimeKernel
                 if (!ReferenceEquals(local.Value, record) || record.ChildBinding != child || record.State != VirtualDomainState.Configured)
                     return KernelResult.Fail(KernelError.InvalidTransition, "Executable local owner/from state changed.");
                 var lineage = _virtualDomains.ValidateActiveAncestors(record);
-                return lineage.IsSuccess ? commit() : lineage;
+                return lineage.IsSuccess ? CommitCapturedComposedSecureRevisions(owner, domain, secureSources.Value!, commit) : lineage;
             }
         }
         KernelResult SourceCommit(Func<KernelResult> commit) =>
             CapabilityAuthority.CommitVirtualDomainEffect(source, process.DomainId, owner.Generation, CapabilityRights.Execute,
-                VirtualizationResourceIds.Domain(domain.DomainId), () => _virtualDomains.CommitEffectAdmission(record, VirtualDomainState.Configured, commit));
+                VirtualizationResourceIds.Domain(domain.DomainId), () => _virtualDomains.CommitEffectAdmission(record, VirtualDomainState.Configured, commit, effectSource.Value!));
         try { return operation(Fresh, SourceCommit); }
         finally { lock (_platformMemoryUseGate) _pendingVirtualTransitions.Remove(domain); }
     }
-
-    private KernelResult UseVirtualTrapSource(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId source,
-        VirtualDomainAuthority.Record record, PlatformChildBinding child,
-        Func<Func<Func<KernelResult>, KernelResult>, Func<Func<KernelResult>, KernelResult>, KernelResult> operation)
-        => UseVirtualDeliverySource(owner, domain, source, record, child, CapabilityRights.Read,
-            VirtualizationResourceIds.Traps(domain.DomainId), VirtualDomainState.Running, operation);
 
     private KernelResult UseVirtualDeliverySource(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId source,
         VirtualDomainAuthority.Record record, PlatformChildBinding? child, CapabilityRights rights, string resource,
@@ -968,6 +1053,10 @@ public sealed partial class RuntimeKernel
     {
         using var composedUse = PinComposedDomain(owner, virtualDomain: domain);
         if (!composedUse.Result.IsSuccess) return composedUse.Result;
+        var secureSources = CaptureComposedSecureSources(owner, domain);
+        if (!secureSources.IsSuccess) return KernelResult.Fail(secureSources.Error, secureSources.Message!);
+        var effectSource = _virtualDomains.CaptureEffectSource(record, expected);
+        if (!effectSource.IsSuccess) return KernelResult.Fail(effectSource.Error, effectSource.Message!);
         SingPlus.Sip.SingProcess process;
         lock (_platformMemoryUseGate)
         {
@@ -992,15 +1081,15 @@ public sealed partial class RuntimeKernel
                 if (!ReferenceEquals(local.Value, record) || record.ChildBinding != child || record.State != expected)
                     return KernelResult.Fail(KernelError.InvalidTransition, "Trap local owner/from state changed.");
                 var lineage = _virtualDomains.ValidateActiveAncestors(record);
-                return lineage.IsSuccess ? CommitComposedDomainSources(owner, domain, commit) : lineage;
+                return lineage.IsSuccess ? CommitComposedDomainSources(owner, domain, commit, originalSources: secureSources.Value!) : lineage;
             }
         }
         KernelResult SourceCommit(Func<KernelResult> commit) =>
             deviceSource
                 ? CapabilityAuthority.CommitDeviceLeaseAdmission(source, process.DomainId, owner.Generation, rights,
-                    resource, () => _virtualDomains.CommitEffectAdmission(record, expected, commit))
+                    resource, () => _virtualDomains.CommitEffectAdmission(record, expected, commit, effectSource.Value!))
                 : CapabilityAuthority.CommitVirtualDomainEffect(source, process.DomainId, owner.Generation, rights,
-                    resource, () => _virtualDomains.CommitEffectAdmission(record, expected, commit));
+                    resource, () => _virtualDomains.CommitEffectAdmission(record, expected, commit, effectSource.Value!));
         try { return operation(Fresh, SourceCommit); }
         finally { lock (_platformMemoryUseGate) _pendingVirtualTransitions.Remove(domain); }
     }
@@ -1012,6 +1101,8 @@ public sealed partial class RuntimeKernel
         CapabilityId source, VirtualDomainAuthority.Record record, PlatformAuthorityBridge.VirtualDomainBinding binding,
         VirtualDomainState from, VirtualDomainState to, PlatformVirtualDomainTransition transition, CapabilityRights rights)
     {
+        var effectSource = _virtualDomains.CaptureEffectSource(record, from);
+        if (!effectSource.IsSuccess) return KernelResult.Fail(effectSource.Error, effectSource.Message!);
         SingPlus.Sip.SingProcess process;
         lock (_platformMemoryUseGate)
         {
@@ -1040,7 +1131,7 @@ public sealed partial class RuntimeKernel
         }
         KernelResult SourceCommit(Func<KernelResult> commit) =>
             CapabilityAuthority.CommitVirtualDomainEffect(source, process.DomainId, owner.Generation, rights,
-                VirtualizationResourceIds.Domain(domain.DomainId), () => _virtualDomains.CommitEffectAdmission(record, from, commit));
+                VirtualizationResourceIds.Domain(domain.DomainId), () => _virtualDomains.CommitEffectAdmission(record, from, commit, effectSource.Value!));
         try
         {
             return PlatformAuthority.TransitionVirtualDomain(binding, transition, Fresh, SourceCommit,
@@ -1263,6 +1354,14 @@ public sealed partial class RuntimeKernel
                 "Exact platform child cleanup owner is unavailable; virtual domain remains pinned.");
         // Cleanup only: the existing bridge checks original source, dependents,
         // state and receipt. No local quarantine state grants closure or permission.
+        if (PlatformAuthority.HasOriginalChildCloseContinuation(child))
+        {
+            // An uncertain original Close must be reconciled before attempting
+            // another drain. Drain cannot manufacture its missing closure.
+            var continued = PlatformAuthority.CloseChildDomain(child, allowCommittedClosure: true);
+            return continued.IsSuccess ? continued : KernelResult.Fail(KernelError.PlatformFaulted,
+                continued.Message ?? "Original child Close remains unresolved; no effect repeat.");
+        }
         var drained = PlatformAuthority.TransitionChildDomain(child,
             PlatformChildDomainTransition.BeginDrain, allowCommittedDrain: true);
         if (!drained.IsSuccess) return KernelResult.Fail(KernelError.PlatformFaulted,
@@ -1299,6 +1398,28 @@ public sealed partial class RuntimeKernel
     {
         var originalOwner = _virtualDomains.ValidateCleanupOwner(record);
         if (!originalOwner.IsSuccess) return originalOwner;
+        if (record.ChildBinding is { } child)
+        {
+            var pendingLocal = record.Mappings.Values.Where(x => !record.PlatformMappings.ContainsKey(x.Mapping.MappingId)).Select(x => x.Mapping).ToArray();
+            var resolved = PlatformAuthority.ResolveGuestMapCleanupForLocalOwner(child, record, pendingLocal);
+            if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+            foreach (var cleanup in resolved.Value!)
+            {
+                if (cleanup.Guest is { } guest)
+                {
+                    var retained = PlatformAuthority.CommitGuestLocalMappingSource(guest, record, cleanup.Local,
+                        () => _virtualDomains.RetainGuestCleanupMapping(record, cleanup.Local, (guest, cleanup.Parent)));
+                    if (!retained.IsSuccess) return retained;
+                }
+                else
+                {
+                    var process = Processes.Resolve(owner);
+                    if (!process.IsSuccess) return KernelResult.Fail(process.Error, process.Message!);
+                    var closed = CloseParentPlatformMapping(cleanup.Parent, PlatformIdentity(process.Value!));
+                    if (!closed.IsSuccess) return closed;
+                }
+            }
+        }
         foreach (var mapping in record.Mappings.Values.OrderBy(x => x.Mapping.MappingId.Value).ToArray())
         {
             if (HasVirtualComputePin(mapping.Mapping))
@@ -1329,7 +1450,7 @@ public sealed partial class RuntimeKernel
                 return KernelResult.Fail(KernelError.StaleGeneration, "Guest mapping cleanup process changed.");
             var removed = _virtualDomains.RemoveMapping(record, mapping.Mapping, expected: mapping,
                 cleanupConsumer: exact => platformMapping ? KernelResult.Ok() :
-                    Regions.ReleasePlatformMappingReservation(exact.Region, new(process.Value!.DomainId, owner.Generation)));
+                    ConsumeLocalGuest(record, exact, owner, new(process.Value!.DomainId, owner.Generation)));
             return removed.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(removed.Error, removed.Message!);
         }
     }
@@ -1341,6 +1462,7 @@ public sealed partial class RuntimeKernel
         KernelError.PlatformFaulted or KernelError.PlatformBindingRevoked or KernelError.StaleGeneration or
         KernelError.WrongPlatformDomain;
 }
+
 
 
 

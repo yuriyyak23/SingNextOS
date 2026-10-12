@@ -16,6 +16,9 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                 requestValidation.Message ?? "The region-acquire request is invalid.");
         }
 
+        var source = ValidateOriginalNativeMappingSource();
+        if (!source.IsSuccess) return PlatformAuthorityResult<PlatformRegionAcquireResult>.Fail(source.Status, source.Message!);
+
         ProviderMappingRecord record;
         DomainRecord parent;
         lock (_childCreateCommitGate)
@@ -42,6 +45,10 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
         var external = _runtime.AcquireOwnedRegionVisibility(
             record.HybridCpuLease,
             ToNeutralAcquireRequirement(request.Requirement));
+
+        lock (_childCreateCommitGate) record.AcquireObservation = external;
+        source = ValidateOriginalNativeMappingSource();
+        if (!source.IsSuccess) return PlatformAuthorityResult<PlatformRegionAcquireResult>.Fail(source.Status, source.Message!);
 
         lock (_childCreateCommitGate)
         {
@@ -106,6 +113,8 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
         }
         if (!_originalProviderMappings.TryGetValue(mapping.MappingId, out var original) || !ReferenceEquals(original, record))
             return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Provider acquire mapping route is not the original owner.");
+        if (record.CleanupOnly)
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Denied, "Resolved original mapping cannot admit a new acquire.");
 
         if (record.Mapping.Lease.Generation != mapping.Generation)
         {

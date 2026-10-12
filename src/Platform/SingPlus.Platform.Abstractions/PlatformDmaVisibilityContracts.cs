@@ -1,4 +1,4 @@
-namespace SingPlus.Platform;
+﻿namespace SingPlus.Platform;
 
 public readonly record struct PlatformProviderDmaVisibilityCycle(ulong Value);
 
@@ -139,4 +139,13 @@ public interface IPlatformDmaVisibilityProvider
 
     PlatformAuthorityResult<PlatformProviderDmaAcquireEvidence> AcquireDmaGrantVisibility(
         PlatformProviderDmaGrant grant);
+}
+
+/// <summary>Optional exact original grant closure guarantee. A successful original
+/// RevokeDmaGrant prohibits further visibility use of that admitted grant even if a
+/// visibility reply was lost. It does not contain transfer/submission uncertainty.
+/// The query is pure and cannot authorize use or prove closure by itself.</summary>
+public interface IPlatformDmaVisibilityClosureProvider : IPlatformDmaGrantProvider
+{
+    bool CanCloseOriginalDmaVisibility(PlatformProviderDmaGrant grant);
 }

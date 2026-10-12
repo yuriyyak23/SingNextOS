@@ -104,7 +104,7 @@ public sealed class DmaAdmissionContinuityTests
         var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, ChildClosureTupleTests.RootCloseRuntimeProxy>();
         var proxy = (ChildClosureTupleTests.RootCloseRuntimeProxy)(object)runtime;
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         var device = provider.BindDevice(parent, new("dma-test"), PlatformDeviceRights.Read | PlatformDeviceRights.Configure | (writer ? PlatformDeviceRights.Write : PlatformDeviceRights.None)).Value!;
         var region = new PlatformRegionIdentity(new RegionHandle(new RegionId(9), new RegionGeneration(4)),
             new RegionOwner(parent.Subject.DomainId, parent.Subject.ProcessGeneration), 4096);
@@ -350,7 +350,7 @@ public sealed class DmaAdmissionContinuityTests
         var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, ChildClosureTupleTests.RootCloseRuntimeProxy>();
         var proxy = (ChildClosureTupleTests.RootCloseRuntimeProxy)(object)runtime;
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         var device = provider.BindDevice(parent, new("dma-test"), PlatformDeviceRights.Read | PlatformDeviceRights.Configure).Value!;
         var region = new PlatformRegionIdentity(new RegionHandle(new RegionId(9), new RegionGeneration(4)),
             new RegionOwner(parent.Subject.DomainId, parent.Subject.ProcessGeneration), 4096);

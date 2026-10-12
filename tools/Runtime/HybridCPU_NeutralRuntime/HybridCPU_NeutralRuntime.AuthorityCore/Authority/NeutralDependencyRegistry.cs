@@ -11,7 +11,7 @@ internal sealed class NeutralDependencyRegistry
 
     public void RegisterDomain(NeutralDomainBindingLease lease) => Domains.Add(lease.Handle, new() { Lease = lease });
     public void RegisterMapping(NeutralOwnedRegionMappingLease lease) => Mappings.Add(lease.Handle, new() { Lease = lease });
-    public void RegisterDevice(NeutralDeviceLease lease) => Devices.Add(lease.Handle, new() { Lease = lease });
+    public void RegisterDevice(NeutralDeviceLease lease) => Devices.Add(lease.Handle, new() { Lease = lease, OriginalParent = Domains.GetValueOrDefault(lease.DomainLease.Handle) });
     public void RegisterMmio(NeutralMmioLease lease) => Mmio.Add(lease.Handle, new() { Lease = lease });
     public void RegisterInterrupt(NeutralInterruptLease lease) => Interrupts.Add(lease.Handle, new() { Lease = lease });
     public void RegisterDma(NeutralDmaGrant lease) => Dma.Add(lease.Handle, new() { Lease = lease });
@@ -23,11 +23,28 @@ internal sealed class NeutralDependencyRegistry
     public int ActiveInterruptCount => Interrupts.Values.Count(x => x.IsActive);
     public int ActiveDmaCount => Dma.Values.Count(x => x.IsActive);
 
-    public bool HasActiveDependents(NeutralDomainBindingLease domain) => Mappings.Values.Any(x => x.IsActive && x.Lease.DomainLease == domain) || Devices.Values.Any(x => x.IsActive && x.Lease.DomainLease == domain);
-    public bool HasActiveDependents(NeutralDeviceLease device) => Mmio.Values.Any(x => x.IsActive && x.Lease.DeviceLease == device) || Interrupts.Values.Any(x => x.IsActive && x.Lease.DeviceLease == device) || Dma.Values.Any(x => x.IsActive && x.Lease.DeviceLease == device);
+    public bool HasActiveDependents(NeutralDomainBindingLease domain) => Mappings.Values.Any(x => x.IsActive && x.Lease.DomainLease == domain) || Devices.Values.Any(x => x.IsActive && x.Lease.DomainLease == domain) ||
+        Domains.TryGetValue(domain.Handle,out var root) && ((ulong)root.OriginalDeviceAdmissions.Count != root.OriginalDevicesIssued || root.OriginalDeviceAdmissions.Any(fact => !ConsumedOriginalDeviceAdmission(fact)));
+    public bool HasActiveDependents(NeutralDeviceLease device) => Mmio.Values.Any(x => x.IsActive && x.Lease.DeviceLease == device) || Interrupts.Values.Any(x => x.IsActive && x.Lease.DeviceLease == device) || Dma.Values.Any(x => x.IsActive && x.Lease.DeviceLease == device) || Devices.TryGetValue(device.Handle,out var owner) && ((ulong)owner.OriginalDeviceLoans.Count != owner.OriginalDeviceLoansIssued || owner.OriginalDeviceLoans.Any(fact => !fact.IsConsumed) || (ulong)owner.OriginalIrqAdmissions.Count != owner.OriginalIrqIssued || owner.OriginalIrqAdmissions.Any(fact => !ConsumedOriginalIrqAdmission(fact)) || !owner.HasIntactOriginalDmaHistory || owner.OriginalDmaAdmissions.Any(fact => !ConsumedOriginalDmaAdmission(fact)) || (ulong)owner.OriginalMmioAdmissions.Count != owner.OriginalMmioIssued || owner.OriginalMmioAdmissions.Any(fact => !ConsumedOriginalMmioAdmission(fact)));
     public bool HasActiveDependents(NeutralOwnedRegionMappingLease mapping) => Dma.Values.Any(x => x.IsActive && x.Lease.MappingLease == mapping);
-    public bool HasActiveDeviceBinding(NeutralDomainBindingLease domain, NeutralDeviceIdentity identity) => Devices.Values.Any(x => x.IsActive && x.Lease.DomainLease == domain && x.Identity == identity);
-    public bool HasActiveMmioMapping(NeutralDeviceLease device, NeutralMmioRegionIdentity region, NeutralMmioRange range, NeutralMmioAccess access) => Mmio.Values.Any(x => x.IsActive && x.Lease.DeviceLease == device && x.Lease.Region == region && x.Lease.Range == range && x.Lease.Access == access);
-    public bool HasActiveInterruptBinding(NeutralDeviceLease device, NeutralInterruptSourceIdentity source) => Interrupts.Values.Any(x => x.IsActive && x.Lease.DeviceLease == device && x.Lease.Source == source);
+    private static bool ConsumedOriginalIrqAdmission(NeutralOriginalIrqAdmissionFact fact) => ReferenceEquals(fact.OwnerSelf,fact) &&
+        (fact.Source is null && fact.Observation is { NoEffectGuaranteed: true } raw && raw.Request == fact.Request && !raw.Observation.IsBound && raw.Observation.Lease == default ||
+         fact.Source is { } source && ReferenceEquals(source.OriginalAdmission,fact) && source.HasExactOriginalClosure);
+    private static bool ConsumedOriginalMmioAdmission(NeutralOriginalMmioAdmissionFact fact) => ReferenceEquals(fact.OwnerSelf,fact) &&
+        (fact.Source is null && fact.Observation is { NoEffectGuaranteed: true } raw && raw.Request == fact.Request && !raw.Observation.IsMapped && raw.Observation.Lease == default ||
+         fact.Source is { } source && ReferenceEquals(source.OriginalAdmission,fact) && source.HasExactOriginalClosure);
+    private static bool ConsumedOriginalDmaAdmission(NeutralOriginalDmaAdmissionFact fact) => ReferenceEquals(fact.OwnerSelf,fact) &&
+        (fact.Source is null && fact.Observation is { NoEffectGuaranteed: true } noEffect && noEffect.Request == fact.Request && !noEffect.Observation.IsGranted && noEffect.Observation.Grant == default ||
+         fact.Source is { } source && ReferenceEquals(source.OwnerSelf,source) && ReferenceEquals(source.OriginalAdmission,fact) && source.OriginalClose is { } close &&
+         ReferenceEquals(close.OwnerSelf,close) && ReferenceEquals(close.Source,source) && ReferenceEquals(close.Admission,fact) && close.Request.Grant == source.Lease &&
+         close.Request.DmaBindInvocationId == fact.Request.InvocationId && close.Observation is { SourceFenceMatched: true, NoEffectGuaranteed: false } raw && raw.Request == close.Request && raw.Observation.Decision == NeutralDmaGrantCloseDecision.Closed);
+    private static bool ConsumedOriginalDeviceAdmission(NeutralOriginalDeviceAdmissionFact fact) => ReferenceEquals(fact.OwnerSelf,fact) &&
+        (fact.Source is null && fact.Observation is { NoEffectGuaranteed: true } raw && raw.Request == fact.Request && raw.Observation is { IsBound: false } && raw.Observation.Lease == default ||
+         fact.Source is { } source && ReferenceEquals(source.OriginalAdmission,fact) && source.HasExactOriginalClosure);
+    public bool HasActiveDeviceBinding(NeutralDomainBindingLease domain, NeutralDeviceIdentity identity, NeutralOriginalDeviceAdmissionFact? intent = null) => Devices.Values.Any(x => x.IsActive && x.Lease.DomainLease == domain && x.Identity == identity) ||
+        Domains.TryGetValue(domain.Handle,out var root) && root.OriginalDeviceAdmissions.Any(fact => !ReferenceEquals(fact,intent) && fact.Request.Device == identity && !ConsumedOriginalDeviceAdmission(fact));
+    public bool HasActiveMmioMapping(NeutralDeviceLease device, NeutralMmioRegionIdentity region, NeutralMmioRange range, NeutralMmioAccess access, NeutralOriginalMmioAdmissionFact? intent = null) => Mmio.Values.Any(x => x.IsActive && x.Lease.DeviceLease == device && x.Lease.Region == region && x.Lease.Range == range && x.Lease.Access == access) || Devices.TryGetValue(device.Handle,out var owner) && owner.OriginalMmioAdmissions.Any(fact => !ReferenceEquals(fact,intent) && fact.Request.Region == region && fact.Request.Range == range && fact.Request.Access == access && !ConsumedOriginalMmioAdmission(fact));
+    public bool HasActiveInterruptBinding(NeutralDeviceLease device, NeutralInterruptSourceIdentity source,NeutralOriginalIrqAdmissionFact? intent = null) => Interrupts.Values.Any(x => x.IsActive && x.Lease.DeviceLease == device && x.Lease.Source == source) || Devices.TryGetValue(device.Handle,out var owner) && owner.OriginalIrqAdmissions.Any(fact => !ReferenceEquals(fact,intent) && fact.Request.Source == source && !ConsumedOriginalIrqAdmission(fact));
     public bool HasActiveDmaGrant(NeutralDeviceLease device, NeutralOwnedRegionMappingLease mapping, NeutralDmaRange range, NeutralDmaDirection direction) => Dma.Values.Any(x => x.IsActive && x.Lease.DeviceLease == device && x.Lease.MappingLease == mapping && x.Lease.Range == range && x.Lease.Direction == direction);
 }
+

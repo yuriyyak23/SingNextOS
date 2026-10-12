@@ -6,7 +6,7 @@ using SingPlus.Sip;
 
 namespace SingPlus.Tests.Platform;
 
-public sealed class PlatformDmaSubmissionTests
+public sealed partial class PlatformDmaSubmissionTests
 {
     [Theory]
     [InlineData(0)]
@@ -28,7 +28,7 @@ public sealed class PlatformDmaSubmissionTests
         var s = CreateCrossOwnerCopyScenario(1602, 2520, 1603, 2530);
         var sp = s.Kernel.PreparePlatformDmaForDevice(s.SourceSubject, s.Source).Value!;
         var dp = s.Kernel.PreparePlatformDmaForDevice(s.DestinationSubject, s.Destination).Value!;
-        s.Provider.CopyEffect = () => s.Input.Span.CopyTo(s.Output.Span);
+        s.Provider.CopyEffect = () => { Assert.Throws<InvalidOperationException>(() => s.Input.Span.ToArray()); Assert.Throws<InvalidOperationException>(() => s.Output.Span.ToArray()); };
         if (fault is 2 or 3) s.Provider.MappingObserveEffect = () =>
         {
             if (s.Provider.MappingRevokeCalls == (fault == 2 ? 1 : 2))
@@ -104,7 +104,7 @@ public sealed class PlatformDmaSubmissionTests
         var sp = s.Kernel.PreparePlatformDmaForDevice(s.SourceSubject, s.Source).Value!;
         var dp = s.Kernel.PreparePlatformDmaForDevice(s.DestinationSubject, s.Destination).Value!;
         var sourceSink = new DmaTraceSink(); var destinationSink = new DmaTraceSink();
-        s.Provider.CopyEffect = () => s.Input.Span.CopyTo(s.Output.Span);
+        s.Provider.CopyEffect = () => { Assert.Throws<InvalidOperationException>(() => s.Input.Span.ToArray()); Assert.Throws<InvalidOperationException>(() => s.Output.Span.ToArray()); };
         if (fault == 0) s.Provider.CompletionEffect = () =>
         {
             if (s.Provider.CompletionCalls == 2) s.Provider.OnIncarnationRead = () => throw new InvalidOperationException("Known destination completion late loss.");
@@ -203,7 +203,7 @@ public sealed class PlatformDmaSubmissionTests
         s.Provider.CopyEffect = () =>
         {
             outside();
-            s.Input.Span.CopyTo(s.Output.Span);
+            Assert.Throws<InvalidOperationException>(() => s.Input.Span.ToArray()); Assert.Throws<InvalidOperationException>(() => s.Output.Span.ToArray());
             if (fault == 2) Assert.True(s.Kernel.Regions.QuarantineSubrange(s.Destination.Mapping.Region,
                 new(s.Destination.DeviceLease.DomainBinding.Subject.DomainId, s.DestinationSubject.Generation),
                 new(1, new("copy-model", "bank-0", 1, 1), 1, ProviderHealthStateV1.Degraded, ProviderFaultClassV1.Omission, new(0, 8))).IsSuccess);
@@ -2080,8 +2080,10 @@ public sealed class PlatformDmaSubmissionTests
             Assert.True(scenario.Kernel.TerminateProcess(scenario.Subject).IsSuccess);
             return;
         }
-        Assert.Equal(KernelError.PlatformFaulted, scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).Error);
-        Assert.False(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
+        // No effect-capable Revoke was invoked before the failed source read.
+        Assert.True(scenario.Kernel.RevokePlatformDma(scenario.Subject, scenario.Grant).IsSuccess);
+        Assert.Equal(1, scenario.Provider.DmaRevokeCalls);
+        Assert.True(scenario.Kernel.RevokePlatformRegionMapping(scenario.Subject, scenario.Mapping).IsSuccess);
     }
     [Fact]
     public void V6GrantClosureSidecarCannotRepairTraceSinkLoss()
@@ -2236,7 +2238,7 @@ public sealed class PlatformDmaSubmissionTests
     {
         var scenario = CreateCopyScenario(1525, 1770);
         scenario.Input.Span.Fill(0x6B);
-        scenario.Provider.CopyEffect = () => scenario.Input.Span.CopyTo(scenario.Output.Span);
+        scenario.Provider.CopyEffect = () => Assert.Throws<InvalidOperationException>(() => scenario.Input.Span.ToArray());
         var sourcePrepare = scenario.Kernel.PreparePlatformDmaForDevice(
             scenario.Subject, scenario.Source).Value!;
         var destinationPrepare = scenario.Kernel.PreparePlatformDmaForDevice(
@@ -2262,7 +2264,7 @@ public sealed class PlatformDmaSubmissionTests
     public void PendingProviderDmaDataMotionDoesNotReleaseEitherRegionOrLowerAuthority()
     {
         var scenario = CreateCopyScenario(1526, 1780);
-        scenario.Provider.CopyEffect = () => scenario.Input.Span.CopyTo(scenario.Output.Span);
+        scenario.Provider.CopyEffect = () => Assert.Throws<InvalidOperationException>(() => scenario.Input.Span.ToArray());
         scenario.Provider.KeepWriteCompletionPending = true;
         var sourcePrepare = scenario.Kernel.PreparePlatformDmaForDevice(
             scenario.Subject, scenario.Source).Value!;
@@ -2304,7 +2306,7 @@ public sealed class PlatformDmaSubmissionTests
     {
         var scenario = CreateCopyScenario(duringCopySubmit ? 1550UL : 1551UL,
             duringCopySubmit ? 1990UL : 2000UL);
-        scenario.Provider.CopyEffect = () => scenario.Input.Span.CopyTo(scenario.Output.Span);
+        scenario.Provider.CopyEffect = () => Assert.Throws<InvalidOperationException>(() => scenario.Input.Span.ToArray());
         scenario.Provider.ResetDuringCopySubmit = duringCopySubmit;
         scenario.Provider.ResetDuringRevoke = !duringCopySubmit;
         var sourcePrepare = scenario.Kernel.PreparePlatformDmaForDevice(
@@ -2330,7 +2332,7 @@ public sealed class PlatformDmaSubmissionTests
     public void ProviderDmaPartialGrantClosureCannotResubmitOrReleaseSourceAfterDestinationReset()
     {
         var scenario = CreateCopyScenario(1552, 2010);
-        scenario.Provider.CopyEffect = () => scenario.Input.Span.CopyTo(scenario.Output.Span);
+        scenario.Provider.CopyEffect = () => Assert.Throws<InvalidOperationException>(() => scenario.Input.Span.ToArray());
         scenario.Provider.RevokeEffect = () =>
         {
             if (scenario.Provider.DmaRevokeCalls == 2)
@@ -2381,7 +2383,7 @@ public sealed class PlatformDmaSubmissionTests
     {
         var scenario = CreateCrossOwnerCopyScenario(1527, 1790, 1528, 1800);
         scenario.Input.Span.Fill(0x3D);
-        scenario.Provider.CopyEffect = () => scenario.Input.Span.CopyTo(scenario.Output.Span);
+        scenario.Provider.CopyEffect = () => Assert.Throws<InvalidOperationException>(() => scenario.Input.Span.ToArray());
         var sourcePrepare = scenario.Kernel.PreparePlatformDmaForDevice(
             scenario.SourceSubject, scenario.Source).Value!;
         var destinationPrepare = scenario.Kernel.PreparePlatformDmaForDevice(
@@ -4490,11 +4492,12 @@ public sealed class PlatformDmaSubmissionTests
             grant);
     }
 
-    private static CopyScenario CreateCopyScenario(ulong processId, ulong domainId)
+    private static CopyScenario CreateCopyScenario(ulong processId, ulong domainId, Action<RuntimeKernel,ProcessHandle>? beforeAllocation = null)
     {
         var provider = new SubmissionProvider();
         var kernel = new RuntimeKernel(provider);
         var (_, subject) = TestFixtures.Create(kernel, processId, domainId);
+        beforeAllocation?.Invoke(kernel,subject);
         var binding = kernel.BindPlatformDomain(subject).Value!;
         const PlatformDeviceRights deviceRights = PlatformDeviceRights.Read |
             PlatformDeviceRights.Write | PlatformDeviceRights.Configure;
@@ -5045,7 +5048,7 @@ public sealed class PlatformDmaSubmissionTests
         IPlatformDmaGrantProvider,
         IPlatformDmaVisibilityProvider,
         IPlatformDmaBoundSubmissionProvider,
-        IPlatformDmaCopySubmissionProvider,
+        IPlatformDmaCopyBackingProvider,
         IPlatformDmaCompletionProvider,
         IPlatformDmaPageFaultProvider,
         IPlatformRegionRevocationProvider,
@@ -5087,6 +5090,7 @@ public sealed class PlatformDmaSubmissionTests
         public bool ResetDuringCopySubmit { get; set; }
         public bool KeepWriteCompletionPending { get; set; }
         public Action? CopyEffect { get; set; }
+        public PlatformDmaCopyBacking? CopyBacking { get; private set; }
         public Action? SubmitEffect { get; set; }
         public Action? PrepareEffect { get; set; }
         public bool ResetDuringPageFault { get; set; }
@@ -5546,6 +5550,13 @@ public sealed class PlatformDmaSubmissionTests
         }
 
         public PlatformAuthorityResult<PlatformProviderDmaCopySubmission> SubmitDmaCopy(
+            PlatformProviderDmaCopySubmitRequest request, PlatformDmaCopyBacking backing)
+        {
+            CopyBacking = backing;
+            return SubmitDmaCopy(request);
+        }
+
+        public PlatformAuthorityResult<PlatformProviderDmaCopySubmission> SubmitDmaCopy(
             PlatformProviderDmaCopySubmitRequest request)
         {
             CopySubmitCalls++;
@@ -5564,6 +5575,7 @@ public sealed class PlatformDmaSubmissionTests
             var destination = CreateSubmission(request.Destination);
             _submissions.Add(source.GrantId, source);
             _submissions.Add(destination.GrantId, destination);
+            CopyBacking?.Source.Span.CopyTo(CopyBacking.Destination.Span);
             CopyEffect?.Invoke();
             if (ResetDuringCopySubmit) AdvanceIncarnation();
             if (MalformedCopySubmit)

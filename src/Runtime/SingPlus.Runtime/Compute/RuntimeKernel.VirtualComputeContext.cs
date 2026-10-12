@@ -51,10 +51,43 @@ public sealed partial class RuntimeKernel
             : KernelResult<VirtualComputeContext>.Fail(validation.Error, validation.Message!);
     }
 
-    // Prepare external queries first. Returned delegate is kernel-private pure owner commit only.
-    internal KernelResult<Func<Func<KernelResult>, KernelResult>> PrepareVirtualComputePublication(
-        ProcessHandle owner, VirtualComputeContext context, ComputePlan plan)
+    internal sealed record VirtualIoEffectSource(object OriginalOwner, long Revision);
+    internal KernelResult<VirtualIoEffectSource> CaptureVirtualComputeIoSource(ProcessHandle owner, VirtualComputeContext context)
     {
+        lock (_virtualIoGate)
+            return _virtualIo.TryGetValue(context.VirtualIo.Id, out var record) && HasOriginalVirtualIo(record) &&
+                record.Owner == owner && record.Domain == context.VirtualDomain && !record.SourceRevisionExhausted && record.State == VirtualIoState.Active
+                ? KernelResult<VirtualIoEffectSource>.Ok(new(record, record.SourceRevision))
+                : KernelResult<VirtualIoEffectSource>.Fail(KernelError.PlatformFaulted, "Original Virtual-I/O source unavailable.");
+    }
+
+    // Prepare external queries first. Returned delegate is kernel-private pure owner commit only.
+    internal KernelResult<VirtualDomainAuthority.EffectSource> CaptureVirtualComputeSource(ProcessHandle owner,
+        VirtualDomainHandle domain)
+    {
+        var original = _virtualDomains.ResolveAdmission(owner, domain);
+        return original.IsSuccess ? _virtualDomains.CaptureEffectSource(original.Value!, original.Value!.State) :
+            KernelResult<VirtualDomainAuthority.EffectSource>.Fail(original.Error, original.Message!);
+    }
+
+    internal KernelResult<Func<Func<KernelResult>, KernelResult>> PrepareVirtualComputePublication(
+        ProcessHandle owner, VirtualComputeContext context, ComputePlan plan,
+        VirtualDomainAuthority.EffectSource? originalSource = null, SecureEffectSource? originalSecureSource = null, VirtualIoEffectSource? originalIoSource = null)
+    {
+        var originalDomain = _virtualDomains.ResolveAdmission(owner, context.VirtualDomain);
+        if (!originalDomain.IsSuccess) return KernelResult<Func<Func<KernelResult>, KernelResult>>.Fail(originalDomain.Error, originalDomain.Message!);
+        var effectSource = originalSource is null ? _virtualDomains.CaptureEffectSource(originalDomain.Value!, originalDomain.Value!.State) :
+            KernelResult<VirtualDomainAuthority.EffectSource>.Ok(originalSource);
+        if (!effectSource.IsSuccess) return KernelResult<Func<Func<KernelResult>, KernelResult>>.Fail(effectSource.Error, effectSource.Message!);
+        SecureEffectSource? secureSource = originalSecureSource;
+        if (context.SecureExecution is { } secureBinding && secureSource is null)
+        {
+            var captured = CaptureSecureComputeSource(owner, secureBinding);
+            if (!captured.IsSuccess) return KernelResult<Func<Func<KernelResult>, KernelResult>>.Fail(captured.Error, captured.Message!);
+            secureSource = captured.Value;
+        }
+        var ioSource = originalIoSource is null ? CaptureVirtualComputeIoSource(owner, context) : KernelResult<VirtualIoEffectSource>.Ok(originalIoSource);
+        if (!ioSource.IsSuccess) return KernelResult<Func<Func<KernelResult>, KernelResult>>.Fail(ioSource.Error, ioSource.Message!);
         var valid = RevalidateVirtualComputeContext(owner, context, plan);
         if (!valid.IsSuccess) return KernelResult<Func<Func<KernelResult>, KernelResult>>.Fail(valid.Error, valid.Message!);
         var domain = _virtualDomains.ResolveAdmission(owner, context.VirtualDomain);
@@ -70,7 +103,8 @@ public sealed partial class RuntimeKernel
         VirtualIoRecord io;
         lock (_virtualIoGate)
         {
-            if (!_virtualIo.TryGetValue(context.VirtualIo.Id, out io!) || io.Binding != context.VirtualIo ||
+            if (!_virtualIo.TryGetValue(context.VirtualIo.Id, out io!) || !HasOriginalVirtualIo(io) || io.SourceRevisionExhausted ||
+                !ReferenceEquals(ioSource.Value!.OriginalOwner, io) || ioSource.Value.Revision != io.SourceRevision || io.Binding != context.VirtualIo ||
                 io.Owner != owner || io.Domain != context.VirtualDomain || io.State != VirtualIoState.Active)
                 return KernelResult<Func<Func<KernelResult>, KernelResult>>.Fail(KernelError.StaleGeneration, "Virtual publication I/O tuple changed.");
         }
@@ -105,16 +139,18 @@ public sealed partial class RuntimeKernel
                     currentInputSource.Value != inputSource.Value || currentOutputSource.Value != outputSource.Value ||
                     currentInput.Value!.Region != plan.Intent.Input.Region || currentOutput.Value!.Region != plan.Intent.Output.Region)
                     return KernelResult.Fail(KernelError.StaleGeneration, "Virtual publication exact operand/source tuple changed.");
-                return backings.Value!(commit);
-            })))))));
+                KernelResult CommitIo() => CommitVirtualComputeIo(owner, context, commit, ioSource.Value);
+                return secureSource is null ? backings.Value!(CommitIo) : CommitSecureEffectSource(secureSource, () => backings.Value!(CommitIo));
+            }, effectSource.Value!)))))));
         return KernelResult<Func<Func<KernelResult>, KernelResult>>.Ok(Commit);
     }
 
     // Called after domain and bridge admission locks, immediately around the pure owner transition.
-    internal KernelResult CommitVirtualComputeIo(ProcessHandle owner, VirtualComputeContext context, Func<KernelResult> commit)
+    internal KernelResult CommitVirtualComputeIo(ProcessHandle owner, VirtualComputeContext context, Func<KernelResult> commit, VirtualIoEffectSource? originalSource = null)
     {
         lock (_virtualIoGate)
-            return _virtualIo.TryGetValue(context.VirtualIo.Id, out var io) && io.Binding == context.VirtualIo &&
+            return _virtualIo.TryGetValue(context.VirtualIo.Id, out var io) && HasOriginalVirtualIo(io) && !io.SourceRevisionExhausted &&
+                (originalSource is null || ReferenceEquals(originalSource.OriginalOwner, io) && originalSource.Revision == io.SourceRevision) && io.Binding == context.VirtualIo &&
                 io.Owner == owner && io.Domain == context.VirtualDomain && io.State == VirtualIoState.Active
                 ? commit() : KernelResult.Fail(KernelError.PlatformBindingDraining, "Virtual publication I/O stopped.");
     }

@@ -83,7 +83,7 @@ public sealed class HybridCpuIrqBindingTests
         var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, ChildClosureTupleTests.RootCloseRuntimeProxy>();
         var proxy = (ChildClosureTupleTests.RootCloseRuntimeProxy)(object)runtime;
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
-        var parent = provider.BindDomain(new(new DomainId(830), new ProcessHandle(new ProcessId(83), 1))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(830), new ProcessHandle(new ProcessId(83), 1))).Value!;
         var device = provider.BindDevice(parent, new("device/irq0"), PlatformDeviceRights.Configure).Value!;
         var binding = provider.BindInterrupt(device, new("notify", PlatformInterruptTrigger.Edge)).Value!;
         var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;

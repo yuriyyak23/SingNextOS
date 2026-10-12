@@ -603,6 +603,18 @@ public sealed partial class ExternalOperationAuthority
         }
     }
 
+    internal KernelResult ValidateFabricDrainPreflight(ExternalOperationHandle operation)
+    {
+        lock (_gate)
+        {
+            var resolved = Resolve(operation);
+            if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+            return resolved.Value!.PublicationInFlight
+                ? KernelResult.Fail(KernelError.PlatformBindingDraining, "Original external operation publication is in flight.")
+                : KernelResult.Ok();
+        }
+    }
+
     public KernelResult<ExternalOperationSnapshot> Query(ExternalOperationHandle operation)
     {
         lock (_gate)

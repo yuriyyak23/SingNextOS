@@ -5,11 +5,24 @@ namespace SingPlus.Platform.HybridCpu;
 public sealed partial class HybridCpuPlatformAuthorityProvider :
     IPlatformOwnedRegionMappingProvider,
     IPlatformRegionVisibilityProvider,
-    IPlatformRegionRevocationProvider
+    IPlatformRegionRevocationResolutionProvider
 {
-    private sealed record OwnedMapFailure(PlatformProviderRegionMappingId InvocationId,
-        PlatformProviderDomainLease Domain, NeutralDomainBindingLease NeutralDomain,
-        PlatformRegionSlice Slice, NeutralOwnedRegionSlice NeutralSlice, NeutralOwnedRegionMapResult? Observation);
+    private sealed class OwnedMapFailure(PlatformProviderRegionMappingId invocationId,
+        PlatformProviderDomainLease domain, NeutralDomainBindingLease neutralDomain,
+        PlatformRegionSlice slice, NeutralOwnedRegionSlice neutralSlice, NeutralOwnedRegionMapResult? observation)
+    {
+        public PlatformProviderRegionMappingId InvocationId { get; } = invocationId;
+        public PlatformProviderDomainLease Domain { get; } = domain;
+        public NeutralDomainBindingLease NeutralDomain { get; } = neutralDomain;
+        public PlatformRegionSlice Slice { get; } = slice;
+        public NeutralOwnedRegionSlice NeutralSlice { get; } = neutralSlice;
+        public NeutralOwnedRegionMapResult? Observation { get; set; } = observation;
+        public PlatformOwnedRegionMapRequest? Request { get; init; }
+        public NeutralOriginalOwnedRegionMapRequest? NativeRequest { get; set; }
+        public NeutralOriginalOwnedRegionMapObservation? NativeObservation { get; set; }
+        public ProviderMappingRecord? OriginalMapping { get; set; }
+        public ProviderMappingRecord? CleanupMapping { get; set; }
+    }
     private sealed class ProviderMappingRecord(
         PlatformProviderOwnedRegionMapping mapping,
         NeutralOwnedRegionMappingLease hybridCpuLease)
@@ -17,6 +30,9 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
         public PlatformProviderOwnedRegionMapping Mapping { get; } = mapping;
         public NeutralOwnedRegionMappingLease HybridCpuLease { get; } = hybridCpuLease;
         public DomainRecord? MapParent { get; init; }
+        public bool CleanupOnly { get; set; }
+        public PlatformOwnedRegionMapRequest? AdmissionRequest { get; init; }
+        public OwnedMapFailure? MapAdmissionSource { get; init; }
         public bool GuestMapInFlight { get; set; }
         public GuestMapFailure? FailedGuestMap { get; set; }
         public bool Revoked { get; set; }
@@ -33,6 +49,13 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
         public DomainRecord? CloseParent { get; set; }
         public NeutralOwnedRegionAcquireResult? AcquireObservation { get; set; }
         public ProviderOperationRecord? CloseOperation { get; set; }
+        public PlatformRegionRevocationRequest? RevocationRequest { get; set; }
+        public ProviderOperationRecord? PreparedCloseOperation { get; set; }
+        public NeutralOriginalMappingCloseRequest? OriginalNeutralCloseRequest { get; set; }
+        public NeutralOriginalMappingCloseResolution? NeutralCloseResolutionObservation { get; set; }
+        public bool CloseResolutionInFlight { get; set; }
+        public List<Dsc1BackingFact> Dsc1Copies {get;}=[];
+        public ulong Dsc1CopiesIssued {get;set;}
     }
 
     private sealed class ProviderOperationRecord(
@@ -57,8 +80,17 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
 
     public PlatformAuthorityResult<PlatformProviderOwnedRegionMapping> MapOwnedRegionSlice(
         PlatformProviderDomainLease domainLease,
-        PlatformRegionSlice slice)
+        PlatformRegionSlice slice) => MapOwnedRegionSliceCore(domainLease, slice, null);
+
+    public PlatformAuthorityResult<PlatformProviderOwnedRegionMapping> MapOwnedRegionSlice(PlatformOwnedRegionMapRequest request) => request.InvocationId == Guid.Empty
+        ? PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(PlatformAuthorityStatus.NotAccepted, "Original Map key is empty.")
+        : MapOwnedRegionSliceCore(request.Domain, request.Slice, request);
+
+    private PlatformAuthorityResult<PlatformProviderOwnedRegionMapping> MapOwnedRegionSliceCore(
+        PlatformProviderDomainLease domainLease, PlatformRegionSlice slice, PlatformOwnedRegionMapRequest? request)
     {
+        var source = ValidateOriginalNativeMappingSource();
+        if (!source.IsSuccess) return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(PlatformAuthorityStatus.NotAccepted, source.Message!);
         var domainValidation = ValidateDomain(domainLease);
         if (!domainValidation.IsSuccess)
         {
@@ -87,6 +119,7 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
 
         DomainRecord domainRecord;
         PlatformProviderRegionMappingId reservedId;
+        OwnedMapFailure originalMap;
         var neutralSlice = new NeutralOwnedRegionSlice(
             slice.Offset,
             slice.Length,
@@ -97,6 +130,9 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
             if (!current.IsSuccess)
                 return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(current.Status, current.Message!);
             domainRecord = _domains[domainLease.LeaseId];
+            if (request is { } intended && (_originalProviderMappings.Values.Any(x => x.AdmissionRequest?.InvocationId == intended.InvocationId) ||
+                _domains.Values.Any(x => x.OwnedMapAdmissionOwner?.Request?.InvocationId == intended.InvocationId)))
+                return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(PlatformAuthorityStatus.NotAccepted, "Original Map key cannot be reused after consumption.");
             if (domainRecord.OwnedMapInFlight || domainRecord.FailedOwnedMap is not null)
                 return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(PlatformAuthorityStatus.NotAccepted,
                     "Original owned mapping invocation is in flight or pinned.");
@@ -106,18 +142,54 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
             _providerMappings.EnsureCapacity(checked(_providerMappings.Count + 1));
             _originalProviderMappings.EnsureCapacity(checked(_originalProviderMappings.Count + 1));
             reservedId = new(_nextProviderMappingId++);
+            originalMap = new(reservedId, domainLease, domainRecord.HybridCpuLease, slice, neutralSlice, null) { Request = request };
+            domainRecord.OwnedMapAdmissionOwner = originalMap;
+            domainRecord.FailedOwnedMap = originalMap;
             domainRecord.OwnedMapInFlight = true;
         }
         try
         {
         NeutralOwnedRegionMapResult external;
-        try { external = _runtime.MapOwnedRegion(domainRecord.HybridCpuLease, neutralSlice); }
+        try
+        {
+            if (request is { } intended && _runtime is INeutralOriginalAdmissionProvider fenced &&
+                domainRecord.BindSource is { NativeRequest: { } parentRequest,
+                    NativeObservation: { SourceFenceMatched: true } parentObservation } &&
+                parentObservation.Request == parentRequest && _originalNativeMappingIncarnation is { } incarnation)
+            {
+                var nativeRequest = new NeutralOriginalOwnedRegionMapRequest(intended.InvocationId, incarnation,
+                    parentRequest.InvocationId, domainRecord.HybridCpuLease, neutralSlice);
+                lock (_childCreateCommitGate) originalMap.NativeRequest = nativeRequest;
+                var observation = fenced.MapOwnedRegion(nativeRequest);
+                lock (_childCreateCommitGate) originalMap.NativeObservation = observation;
+                external = observation.Request == nativeRequest && observation.SourceFenceMatched
+                    ? observation.Observation
+                    : new() { Decision = NeutralOwnedRegionMapDecision.Faulted, Reason = "Original native Map source fence refused or response malformed." };
+            }
+            else external = _runtime.MapOwnedRegion(domainRecord.HybridCpuLease, neutralSlice);
+        }
         catch
         {
             lock (_childCreateCommitGate)
                 domainRecord.FailedOwnedMap ??= new(reservedId, domainLease, domainRecord.HybridCpuLease, slice, neutralSlice, null);
             throw;
         }
+        ProviderMappingRecord? originalOutput;
+        lock (_childCreateCommitGate)
+        {
+            originalMap.Observation = external;
+            if (external is { IsMapped: true, Decision: NeutralOwnedRegionMapDecision.Mapped } && external.Lease.Handle.Value != 0 &&
+                external.Lease.Epoch.Value != 0 && external.Lease.DomainLease == domainRecord.HybridCpuLease && external.Lease.Slice == neutralSlice &&
+                external.Lease.Coherence == NeutralMemoryCoherenceModel.NonCoherent)
+            {
+                var originalLease = new PlatformProviderRegionMappingLease(reservedId, new(1), domainLease, slice.Region, slice.Access);
+                originalMap.OriginalMapping = new(new(originalLease, slice), external.Lease) { MapParent = domainRecord, CleanupOnly = true, AdmissionRequest = request, MapAdmissionSource = originalMap };
+                originalMap.CleanupMapping = originalMap.OriginalMapping;
+            }
+            originalOutput = originalMap.OriginalMapping;
+        }
+        source = ValidateOriginalNativeMappingSource();
+        if (!source.IsSuccess) return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(source.Status, source.Message!);
         lock (_childCreateCommitGate)
         {
         if (external is null)
@@ -141,6 +213,9 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                 _ => PlatformAuthorityStatus.Faulted,
             };
             if (external.Lease != default) status = PlatformAuthorityStatus.Faulted;
+            if (external.Lease == default && external.Decision is NeutralOwnedRegionMapDecision.InvalidRange or NeutralOwnedRegionMapDecision.InvalidAccess &&
+                ReferenceEquals(domainRecord.FailedOwnedMap, originalMap))
+            { domainRecord.FailedOwnedMap = null; domainRecord.OwnedMapAdmissionOwner = null; }
             return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(
                 status,
                 external.Reason);
@@ -172,9 +247,16 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
             slice.Region,
             slice.Access);
         var mapping = new PlatformProviderOwnedRegionMapping(lease, slice);
-        var originalMapping = new ProviderMappingRecord(mapping, external.Lease) { MapParent = domainRecord };
+        if (!ReferenceEquals(domainRecord.FailedOwnedMap, originalMap) || !ReferenceEquals(domainRecord.OwnedMapAdmissionOwner, originalMap))
+            return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(PlatformAuthorityStatus.Faulted, "Original Map admission owner changed.");
+        var originalMapping = originalMap.CleanupMapping!;
+        if (!ReferenceEquals(originalMapping, originalOutput) || !ReferenceEquals(originalMap.OriginalMapping, originalOutput))
+            return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(PlatformAuthorityStatus.Faulted, "Original Map output owner changed before publication.");
+        originalMapping.CleanupOnly = false;
         _originalProviderMappings.Add(lease.MappingId, originalMapping);
         _providerMappings.Add(lease.MappingId, originalMapping);
+        if (ReferenceEquals(domainRecord.FailedOwnedMap, originalMap))
+        { domainRecord.FailedOwnedMap = null; domainRecord.OwnedMapAdmissionOwner = null; }
         return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Ok(mapping);
         }
         }
@@ -184,6 +266,8 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
     public PlatformAuthorityResult<PlatformRegionVisibilityResult> PrepareRegionMappingForConsumer(
         PlatformRegionVisibilityRequest request)
     {
+        var source = ValidateOriginalNativeMappingSource();
+        if (!source.IsSuccess) return PlatformAuthorityResult<PlatformRegionVisibilityResult>.Fail(source.Status, source.Message!);
         var requestValidation = PlatformRegionVisibilityContract.ValidateRequest(request);
         if (!requestValidation.IsSuccess)
         {
@@ -225,9 +309,11 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                 lock (_childCreateCommitGate) record.VisibilityUncertain = true;
                 throw;
             }
+            lock (_childCreateCommitGate) record.VisibilityObservation = external;
+            source = ValidateOriginalNativeMappingSource();
+            if (!source.IsSuccess) return PlatformAuthorityResult<PlatformRegionVisibilityResult>.Fail(source.Status, source.Message!);
             lock (_childCreateCommitGate)
             {
-                record.VisibilityObservation = external;
                 if (external is null || !Enum.IsDefined(external.Decision) || !Enum.IsDefined(external.Outcome) ||
                     external.Lease != record.HybridCpuLease ||
                     external.Requirement != ToNeutralVisibilityRequirement(request.Requirement))
@@ -290,6 +376,19 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
     public PlatformAuthorityResult<PlatformRegionRevocationTicket> BeginRegionMappingRevocation(
         PlatformProviderRegionMappingLease mapping,
         PlatformRegionRevocationPolicy policy)
+        => BeginRegionMappingRevocationCore(mapping, policy, null);
+
+    public PlatformAuthorityResult<PlatformRegionRevocationTicket> BeginRegionMappingRevocation(
+        PlatformRegionRevocationRequest request)
+    {
+        if (request.InvocationId == Guid.Empty)
+            return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Fail(PlatformAuthorityStatus.Denied, "Original revocation request key is required.");
+        return BeginRegionMappingRevocationCore(request.Mapping, request.Policy, request);
+    }
+
+    private PlatformAuthorityResult<PlatformRegionRevocationTicket> BeginRegionMappingRevocationCore(
+        PlatformProviderRegionMappingLease mapping, PlatformRegionRevocationPolicy policy,
+        PlatformRegionRevocationRequest? request)
     {
         if (!Enum.IsDefined(policy) || policy != PlatformRegionRevocationPolicy.DrainBeforeRevoke)
         {
@@ -303,6 +402,15 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
         ProviderOperationRecord fact;
         lock (_childCreateCommitGate)
         {
+            if (_originalProviderMappings.TryGetValue(mapping.MappingId, out var prior) &&
+                (prior.RevocationRequest is not null || prior.CloseInFlight || prior.CloseUncertain))
+                return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Fail(PlatformAuthorityStatus.Faulted,
+                    "Original mapping invocation already exists; no new no-effect disposition can replace it.");
+        }
+        var source = ValidateOriginalNativeMappingSource();
+        if (!source.IsSuccess) return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Fail(PlatformAuthorityStatus.NotAccepted, source.Message!);
+        lock (_childCreateCommitGate)
+        {
         var validation = ValidateProviderMapping(mapping, expectedSlice: null, allowClose: true);
         if (!validation.IsSuccess)
         {
@@ -312,7 +420,7 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
         }
 
         original = _providerMappings[mapping.MappingId];
-        if (original.CloseInFlight || original.CloseUncertain || original.VisibilityInFlight || HasActiveProviderGuestMappings(mapping))
+        if (original.RevocationRequest is not null || original.CloseInFlight || original.CloseUncertain || original.VisibilityInFlight || HasActiveProviderGuestMappings(mapping))
             return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Fail(PlatformAuthorityStatus.Faulted,
                 "Original mapping close is pending or unknown; repeat refused before operation reservation.");
         if (_nextProviderOperationId is 0 or ulong.MaxValue)
@@ -324,6 +432,11 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
         // Immutable intended output, unpublished until exact original Close succeeds.
         fact = new(operation, new(operation.OperationId, operation.Generation,
             operation.DomainLease, PlatformCompletionState.Closed), original);
+        if (request is { } intended)
+        {
+            original.RevocationRequest = intended;
+            original.PreparedCloseOperation = fact;
+        }
         }
 
         var close = CloseProviderRegionMapping(mapping, original);
@@ -343,7 +456,9 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                 !original.Revoked || original.CloseObservation?.Decision is not (NeutralOwnedRegionCloseDecision.Closed or NeutralOwnedRegionCloseDecision.Revoked))
                 return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Fail(PlatformAuthorityStatus.Faulted,
                     "Original completed mapping operation retained without owner publication.");
-            _providerOperations.Add(operation.OperationId, fact);
+            if (_providerOperations.TryGetValue(operation.OperationId, out var existing) && !ReferenceEquals(existing, fact))
+                return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Fail(PlatformAuthorityStatus.Faulted, "Original operation route is foreign.");
+            _providerOperations.TryAdd(operation.OperationId, fact);
         }
 
         return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Ok(
@@ -351,6 +466,121 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
                 mapping.MappingId,
                 mapping.Generation,
                 operation));
+    }
+
+    public PlatformAuthorityResult<PlatformRegionRevocationResolution> ResolveRegionMappingRevocation(
+        PlatformRegionRevocationRequest request)
+    {
+        var underlying = ResolveOriginalNeutralMappingClose(request);
+        if (!underlying.IsSuccess)
+            return PlatformAuthorityResult<PlatformRegionRevocationResolution>.Fail(underlying.Status, underlying.Message!);
+        lock (_childCreateCommitGate)
+        {
+            if (request.InvocationId == Guid.Empty || request.Policy != PlatformRegionRevocationPolicy.DrainBeforeRevoke ||
+                !_originalProviderMappings.TryGetValue(request.Mapping.MappingId, out var original) ||
+                original.Mapping.Lease != request.Mapping || original.RevocationRequest != request ||
+                original.PreparedCloseOperation is not { } operation || !ReferenceEquals(operation.MappingSource, original) ||
+                (_providerMappings.TryGetValue(request.Mapping.MappingId, out var route) && !ReferenceEquals(route, original)))
+                return PlatformAuthorityResult<PlatformRegionRevocationResolution>.Fail(PlatformAuthorityStatus.Faulted,
+                    "Original revocation request/owner is absent or foreign; no effect repeated.");
+            if (original.CloseInFlight || original.CloseUncertain || original.VisibilityInFlight ||
+                original.CloseObservation?.Decision is not (NeutralOwnedRegionCloseDecision.Closed or NeutralOwnedRegionCloseDecision.Revoked) ||
+                original.CloseParent is not { } parent || !ReferenceEquals(parent, original.MapParent) ||
+                !_domains.TryGetValue(request.Mapping.DomainLease.LeaseId, out var currentParent) || !ReferenceEquals(parent, currentParent) ||
+                parent.Lease != request.Mapping.DomainLease || !ValidateDomainIdentity(parent.Lease).IsSuccess || parent.RootCloseInFlight ||
+                original.HybridCpuLease.DomainLease != parent.HybridCpuLease || HasActiveProviderDmaGrants(request.Mapping) ||
+                HasActiveProviderGuestMappings(request.Mapping) ||
+                (_providerOperations.TryGetValue(operation.Identity.OperationId, out var routedOperation) && !ReferenceEquals(routedOperation, operation)))
+                return PlatformAuthorityResult<PlatformRegionRevocationResolution>.Fail(PlatformAuthorityStatus.Faulted,
+                    "Exact original closure/source is unavailable; request remains pinned.");
+            original.Revoked = true;
+            original.CloseOperation = operation;
+            _providerOperations.TryAdd(operation.Identity.OperationId, operation);
+            return PlatformAuthorityResult<PlatformRegionRevocationResolution>.Ok(new(request,
+                new(request.Mapping.MappingId, request.Mapping.Generation, operation.Identity)));
+        }
+    }
+
+    private PlatformAuthorityResult ResolveOriginalNeutralMappingClose(PlatformRegionRevocationRequest request)
+    {
+        ProviderMappingRecord original;
+        NeutralOriginalMappingCloseRequest nativeRequest;
+        INeutralOriginalMappingClosureProvider native;
+        NeutralOriginalMappingCloseResolution? retained;
+        NeutralOwnedRegionCloseResult? knownClose;
+        lock (_childCreateCommitGate)
+        {
+            if (!_originalProviderMappings.TryGetValue(request.Mapping.MappingId, out original!) ||
+                original.Mapping.Lease != request.Mapping || original.RevocationRequest != request ||
+                (_providerMappings.TryGetValue(request.Mapping.MappingId, out var route) && !ReferenceEquals(route, original)))
+                return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Original native Close owner/request is absent or foreign.");
+            knownClose = !original.CloseUncertain &&
+                original.CloseObservation?.Decision is NeutralOwnedRegionCloseDecision.Closed or NeutralOwnedRegionCloseDecision.Revoked
+                ? original.CloseObservation : null;
+            if (knownClose is not null && (original.Revoked || original.OriginalNeutralCloseRequest is null))
+                return PlatformAuthorityResult.Ok();
+            if (_runtime is not INeutralOriginalMappingClosureProvider capable || original.OriginalNeutralCloseRequest is not { } intended ||
+                original.CloseInFlight || original.CloseResolutionInFlight)
+                return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Exact native Close resolution unavailable or pending; original pins retained.");
+            native = capable;
+            nativeRequest = intended;
+            retained = original.NeutralCloseResolutionObservation;
+            original.CloseResolutionInFlight = true;
+        }
+        try
+        {
+            if (native.MappingClosureIncarnation != nativeRequest.RuntimeIncarnation)
+                return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Original native Close incarnation changed.");
+            // A direct original result is already known. Revalidate its source,
+            // without attributing another query or effect to that invocation.
+            var resolved = knownClose is not null
+                ? new NeutralOriginalMappingCloseResolution(nativeRequest, knownClose)
+                : retained ?? native.ResolveOwnedRegionMappingClose(nativeRequest);
+            if (knownClose is null)
+                lock (_childCreateCommitGate) original.NeutralCloseResolutionObservation = resolved;
+            if (resolved is not { } observed || observed.Request != nativeRequest ||
+                observed.Observation.Decision is not (NeutralOwnedRegionCloseDecision.Closed or NeutralOwnedRegionCloseDecision.Revoked))
+                return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Original native Close has no exact closure observation.");
+            var source = native.MappingClosureIncarnation; // Callback outside provider owner gate.
+            lock (_childCreateCommitGate)
+            {
+                if (source != nativeRequest.RuntimeIncarnation || original.OriginalNeutralCloseRequest != nativeRequest ||
+                    original.RevocationRequest != request || !_originalProviderMappings.TryGetValue(request.Mapping.MappingId, out var owner) || !ReferenceEquals(owner, original) ||
+                    (_providerMappings.TryGetValue(request.Mapping.MappingId, out var route) && !ReferenceEquals(route, original)) ||
+                    original.CloseParent is not { } parent || !ReferenceEquals(parent, original.MapParent) ||
+                    !_domains.TryGetValue(request.Mapping.DomainLease.LeaseId, out var currentParent) || !ReferenceEquals(parent, currentParent) ||
+                    !ValidateDomainIdentity(parent.Lease).IsSuccess || parent.RootCloseInFlight ||
+                    HasActiveProviderDmaGrants(request.Mapping) || HasActiveProviderGuestMappings(request.Mapping))
+                    return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Native original closure retained without final owner/source continuity.");
+                original.CloseObservation = observed.Observation;
+                original.CloseUncertain = false;
+                return PlatformAuthorityResult.Ok();
+            }
+        }
+        catch (Exception exception) when (exception is not StackOverflowException)
+        {
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, $"Original native Close resolution unavailable: {exception.Message}");
+        }
+        finally { lock (_childCreateCommitGate) original.CloseResolutionInFlight = false; }
+    }
+
+    private NeutralOwnedRegionCloseResult InvokeOriginalMappingClose(ProviderMappingRecord record, PlatformProviderRegionMappingLease mapping,
+        DomainRecord parent)
+    {
+        if (record.RevocationRequest is not { } request || _runtime is not INeutralOriginalMappingClosureProvider native)
+            return _runtime.CloseOwnedRegionMapping(record.HybridCpuLease);
+        var incarnation = _originalNativeMappingIncarnation ?? Guid.Empty;
+        lock (_childCreateCommitGate)
+        {
+            if (incarnation == Guid.Empty || !record.CloseInFlight || record.RevocationRequest != request ||
+                !_originalProviderMappings.TryGetValue(mapping.MappingId, out var original) || !ReferenceEquals(original, record) ||
+                !_providerMappings.TryGetValue(mapping.MappingId, out var routed) || !ReferenceEquals(routed, record) ||
+                !_domains.TryGetValue(mapping.DomainLease.LeaseId, out var root) || !ReferenceEquals(root, parent) ||
+                !ValidateDomainIdentity(parent.Lease).IsSuccess || parent.RootCloseInFlight)
+                throw new InvalidOperationException("Original native Close source/owner lost before effect.");
+            record.OriginalNeutralCloseRequest = new(request.InvocationId, incarnation, record.HybridCpuLease);
+        }
+        return native.CloseOwnedRegionMapping(record.OriginalNeutralCloseRequest.Value);
     }
 
     public PlatformAuthorityResult<PlatformCompletionReceipt> ObserveCompletion(
@@ -452,11 +682,30 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
         try
         {
         NeutralOwnedRegionCloseResult external;
-        try { external = record.CloseObservation ?? _runtime.CloseOwnedRegionMapping(record.HybridCpuLease); }
+        try { external = record.CloseObservation ?? InvokeOriginalMappingClose(record, mapping, parent); }
         catch
         {
             lock (_childCreateCommitGate) record.CloseUncertain = true;
             throw;
+        }
+        NeutralOriginalMappingCloseRequest? nativeRequest;
+        lock (_childCreateCommitGate)
+        {
+            record.CloseObservation = external;
+            nativeRequest = record.OriginalNeutralCloseRequest;
+        }
+        Guid? nativeSource = null;
+        if (nativeRequest is not null)
+        {
+            try
+            {
+                nativeSource = (_runtime as INeutralOriginalMappingClosureProvider)?.MappingClosureIncarnation;
+            }
+            catch (Exception exception) when (exception is not StackOverflowException)
+            {
+                return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted,
+                    $"Original mapping Close outcome retained while native source is unavailable: {exception.Message}");
+            }
         }
         lock (_childCreateCommitGate)
         {
@@ -465,11 +714,14 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
             record.CloseUncertain = true;
             return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Original mapping close observation is absent.");
         }
-        record.CloseObservation = external;
-        if (!_providerMappings.TryGetValue(mapping.MappingId, out var current) || !ReferenceEquals(current, record) ||
+        if ((nativeRequest is { } intended &&
+                (nativeSource != intended.RuntimeIncarnation || record.OriginalNeutralCloseRequest != intended)) ||
+            !_originalProviderMappings.TryGetValue(mapping.MappingId, out var original) || !ReferenceEquals(original, record) ||
+            !_providerMappings.TryGetValue(mapping.MappingId, out var current) || !ReferenceEquals(current, record) ||
             record.Mapping.Lease != mapping || record.HybridCpuLease.DomainLease != parent.HybridCpuLease ||
             !_domains.TryGetValue(mapping.DomainLease.LeaseId, out var currentParent) || !ReferenceEquals(currentParent, parent) ||
-            parent.Lease != mapping.DomainLease || parent.Revoked || parent.RootCloseInFlight || HasActiveProviderDmaGrants(mapping))
+            parent.Lease != mapping.DomainLease || !ValidateDomainIdentity(parent.Lease).IsSuccess ||
+            parent.Revoked || parent.RootCloseInFlight || HasActiveProviderDmaGrants(mapping))
             return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted,
                 "Original mapping close observation retained without current owner/source publication.");
         switch (external.Decision)
@@ -520,6 +772,8 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
         }
         if (!_originalProviderMappings.TryGetValue(mapping.MappingId, out var original) || !ReferenceEquals(original, record))
             return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted, "Provider mapping route is not the original owner.");
+        if (record.CleanupOnly && !allowClose)
+            return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Denied, "Resolved original mapping is cleanup-only.");
 
         if (record.Mapping.Lease.Generation != mapping.Generation)
         {

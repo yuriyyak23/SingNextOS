@@ -1,4 +1,4 @@
-using System.Reflection;
+﻿using System.Reflection;
 using SingPlus.Contracts;
 using SingPlus.Platform;
 using SingPlus.Runtime;
@@ -209,27 +209,21 @@ public sealed class PlatformMmioLeaseTests
         if (outcome == 3) provider.AfterMmioRevokeEffect = () => throw new IOException("Compensation reply lost after provider effect.");
         provider.BeforeMmioRevoke = () =>
         {
-            Assert.Equal(true, Read("MalformedMmioCleanupMayHaveEffect"));
+            Assert.Equal(false, Read("MalformedMmioCleanupMayHaveEffect"));
             Assert.NotNull(Read("MalformedMmioReceipt"));
             Assert.False(Monitor.IsEntered(typeof(PlatformAuthorityBridge).GetField("_secureDomainLifecycleGate", flags)!.GetValue(kernel.PlatformAuthority)!));
             Assert.False(kernel.RevokePlatformDevice(subject, device).IsSuccess);
         };
         Assert.Equal(KernelError.PlatformFaulted, kernel.BindPlatformMmio(subject, device, capability, 0, 64, PlatformMmioAccess.Read).Error);
-        Assert.Equal(true, Read("MalformedMmioCleanupMayHaveEffect"));
-        if (outcome == 3) Assert.Null(Read("MalformedMmioCleanupObservation"));
-        else
-        {
-            var raw = Assert.IsType<PlatformAuthorityResult>(Read("MalformedMmioCleanupObservation"));
-            if (outcome == 0) Assert.True(raw.IsSuccess);
-            else Assert.Equal(outcome == 1 ? PlatformAuthorityStatus.NotAccepted : (PlatformAuthorityStatus)999, raw.Status);
-        }
+        Assert.Equal(false, Read("MalformedMmioCleanupMayHaveEffect"));
+        Assert.Null(Read("MalformedMmioCleanupObservation"));
         Assert.Equal(false, Read("ProviderClosureConfirmed"));
         Assert.True(kernel.PlatformAuthority.HasUnresolvedMmioEffect(id => id == capability));
         provider.MmioRevokeStatus = null;
         provider.AfterMmioRevokeEffect = null;
         Assert.False(kernel.RevokeCapability(capability).IsSuccess);
         Assert.False(kernel.TerminateProcess(subject).IsSuccess);
-        Assert.Equal(1, provider.MmioRevokeCalls);
+        Assert.Equal(0, provider.MmioRevokeCalls);
         Assert.Equal(0, provider.DeviceRevokeCalls);
         Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
     }
@@ -255,7 +249,7 @@ public sealed class PlatformMmioLeaseTests
             var reads = 0;
             provider.IncarnationRead = () =>
             {
-                if (++reads != 2) return;
+                if (++reads != 1) return;
                 provider.IncarnationRead = null;
                 facts[key] = original.GetType().GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
                 replaced = true;
@@ -652,7 +646,7 @@ public sealed class PlatformMmioLeaseTests
         if (cleanup == 2) provider.ThrowOnMmioRevoke = true;
         var bind = kernel.BindPlatformMmio(subject, device, capability, 0, 64, PlatformMmioAccess.Read);
         Assert.Equal(KernelError.PlatformFaulted, bind.Error);
-        Assert.True(pinObserved);
+        Assert.False(pinObserved, "Malformed tuple must not authorize compensation callback.");
         Assert.True(kernel.PlatformAuthority.HasUnresolvedMmioEffect(id => id == capability));
         provider.MmioRevokeStatus = null;
         provider.ThrowOnMmioRevoke = false;
@@ -661,7 +655,7 @@ public sealed class PlatformMmioLeaseTests
         Assert.False(kernel.TerminateProcess(subject).IsSuccess);
         Assert.True(kernel.Processes.Resolve(subject).IsSuccess);
         Assert.Equal(1, provider.MmioMapCalls);
-        Assert.Equal(1, provider.MmioRevokeCalls);
+        Assert.Equal(0, provider.MmioRevokeCalls);
         Assert.Equal(0, provider.DeviceRevokeCalls);
         Assert.Equal(0, provider.DomainRevokeCalls);
     }
@@ -1151,7 +1145,7 @@ public sealed class PlatformMmioLeaseTests
 
         Assert.Equal(KernelError.PlatformFaulted, result.Error);
         Assert.Equal(1, provider.MmioMapCalls);
-        Assert.Equal(1, provider.MmioRevokeCalls);
+        Assert.Equal(0, provider.MmioRevokeCalls);
     }
 
     [Theory]
@@ -1304,7 +1298,7 @@ public sealed class PlatformMmioLeaseTests
         Assert.Equal(KernelError.PlatformFaulted,
             kernel.BindPlatformMmio(subject, device, capability,
                 0, 16, PlatformMmioAccess.Read).Error);
-        Assert.Equal(1, provider.MmioRevokeCalls);
+        Assert.Equal(0, provider.MmioRevokeCalls);
         provider.MmioRevokeStatus = null;
         provider.ThrowOnMmioRevoke = false;
         Assert.Equal(KernelError.PlatformFaulted, kernel.RevokePlatformDevice(subject, device).Error);

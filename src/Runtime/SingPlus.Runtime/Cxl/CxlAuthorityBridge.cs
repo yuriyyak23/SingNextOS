@@ -25,6 +25,7 @@ public sealed class CxlAuthorityBridge : ICxlTeardownParticipant
         public bool Admitted { get; set; }
         // Successful provider reply, retained independently of late source/local cleanup.
         public CxlFabricBinding? ReleasedBinding { get; set; }
+        public OriginalClosure<TrackedFabric, CxlFabricBinding>? Closure { get; set; }
         public HashSet<OperationPin> Operations { get; } = [];
         public List<MemoryInvocation> MemoryInvocations { get; } = [];
     }
@@ -42,6 +43,45 @@ public sealed class CxlAuthorityBridge : ICxlTeardownParticipant
     {
         public bool ReleaseInFlight { get; set; }
         public CxlMemoryBinding? ReleasedBinding { get; set; }
+        public OriginalClosure<TrackedMemory, CxlMemoryBinding>? Closure { get; set; }
+    }
+    private sealed class OriginalClosure<TSource, TBinding> where TSource : class
+    {
+        public OriginalClosure(TSource source, TBinding binding)
+        { OwnerSelf = this; Source = source; Binding = binding; }
+        public OriginalClosure<TSource, TBinding> OwnerSelf { get; }
+        public TSource Source { get; }
+        public TBinding Binding { get; }
+        public bool Invoked { get; set; }
+        public PlatformAuthorityResult? RawObservation { get; set; }
+        public bool Consumed { get; set; }
+        public bool IsOriginal(TSource source, TBinding binding) => ReferenceEquals(OwnerSelf, this) &&
+            ReferenceEquals(Source, source) && EqualityComparer<TBinding>.Default.Equals(Binding, binding);
+    }
+    internal readonly record struct BackingCleanupSources(object Memory, object Fabric);
+    internal KernelResult<BackingCleanupSources> CaptureBackingCleanupSources(CxlMemoryBinding memory, CxlFabricBinding fabric)
+    {
+        lock (_gate)
+        {
+            if (!_trackedMemory.TryGetValue(memory.BindingId, out var source) || !IsOriginalMemoryCurrentLocked(source) ||
+                source.Binding != memory || !source.Invocation.ReceiptValidated || !IsOriginalFabricCurrentLocked(source.Invocation.Parent) ||
+                source.Invocation.Parent.Binding != fabric)
+                return KernelResult<BackingCleanupSources>.Fail(KernelError.StaleGeneration, "Original backing cleanup sources are unavailable.");
+            return KernelResult<BackingCleanupSources>.Ok(new(source, source.Invocation.Parent));
+        }
+    }
+    internal CxlMemoryBinding? ConsumedOriginalMemoryClosure(BackingCleanupSources sources)
+    {
+        lock (_gate) return sources.Memory is TrackedMemory source && sources.Fabric is TrackedFabric parent &&
+            ReferenceEquals(source.Invocation.Parent, parent) && ReferenceEquals(source.Invocation.OriginalMemorySource, source) &&
+            ReferenceEquals(parent.DeviceReservation.OriginalFabricSource, parent) && source.Closure is { Consumed: true, Invoked: true } fact &&
+            fact.IsOriginal(source, fact.Binding) && fact.RawObservation is { IsSuccess: true } ? fact.Binding : null;
+    }
+    internal CxlFabricBinding? ConsumedOriginalFabricClosure(BackingCleanupSources sources)
+    {
+        lock (_gate) return sources.Fabric is TrackedFabric source &&
+            ReferenceEquals(source.DeviceReservation.OriginalFabricSource, source) && source.Closure is { Consumed: true, Invoked: true } fact &&
+            fact.IsOriginal(source, fact.Binding) && fact.RawObservation is { IsSuccess: true } ? fact.Binding : null;
     }
     private readonly object _gate = new();
     private readonly RegionAuthority _regions;
@@ -734,6 +774,18 @@ public sealed class CxlAuthorityBridge : ICxlTeardownParticipant
         var tracked = record.Binding;
         var source = ValidateClosureEndpoint(tracked.FabricBinding);
         if (!source.IsSuccess) return source;
+        lock (_gate)
+        {
+            if (record.Closure is { } known)
+            {
+                if (!known.IsOriginal(record, binding)) return KernelResult.Fail(KernelError.StaleGeneration, "Original memory closure fact was substituted.");
+                if (known.Invoked && known.RawObservation is not { IsSuccess: true })
+                    return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Original memory Release outcome is unknown; no repeat.");
+                if (known.RawObservation is { IsSuccess: true }) record.ReleasedBinding = known.Binding;
+            }
+            else if (record.ReleasedBinding is not null)
+                return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Released memory projection lacks original proof.");
+        }
         if (record.ReleasedBinding is null)
         {
             var current = FromProvider(_memory.QueryMemory(binding.BindingId));
@@ -741,12 +793,23 @@ public sealed class CxlAuthorityBridge : ICxlTeardownParticipant
             if (current.Value != binding) return KernelResult.Fail(KernelError.StaleGeneration, "CXL memory release requires the exact current binding generation.");
             var finalSource = ValidateClosureEndpoint(tracked.FabricBinding);
             if (!finalSource.IsSuccess) return finalSource;
+            OriginalClosure<TrackedMemory, CxlMemoryBinding> fact;
             lock (_gate)
+            {
                 if (!IsOriginalMemoryCurrentLocked(record) || !IsOriginalFabricCurrentLocked(record.Invocation.Parent))
                     return KernelResult.Fail(KernelError.StaleGeneration, "Original memory source changed before provider Release.");
+                fact = record.Closure ??= new(record, binding);
+                if (!fact.IsOriginal(record, binding) || fact.Invoked)
+                    return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Original memory Release cannot repeat.");
+                fact.Invoked = true;
+            }
             var released = _memory.ReleaseMemory(binding);
+            lock (_gate)
+            {
+                fact.RawObservation = released;
+                if (released.IsSuccess) record.ReleasedBinding = binding;
+            }
             if (!released.IsSuccess) return KernelResult.Fail(Map(released.Status), released.Message ?? "CXL memory release failed.");
-            lock (_gate) record.ReleasedBinding = binding;
         }
         if (!ValidateClosureEndpoint(tracked.FabricBinding).IsSuccess)
             return KernelResult.Fail(KernelError.ExternalEffectUncontained, "CXL memory closure lost endpoint continuity; receipt and parent remain pinned.");
@@ -756,6 +819,9 @@ public sealed class CxlAuthorityBridge : ICxlTeardownParticipant
                 return KernelResult.Fail(KernelError.StaleGeneration, "CXL memory cleanup lost its original tracked lifetime.");
             if (!IsOriginalFabricCurrentLocked(record.Invocation.Parent))
                 return KernelResult.Fail(KernelError.StaleGeneration, "Known CXL memory closure lost its original parent; cleanup facts remain pinned.");
+            if (record.Closure is not { Invoked: true } fact || !fact.IsOriginal(record, binding) || fact.RawObservation is not { IsSuccess: true })
+                return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Original memory closure proof is unavailable at consumption.");
+            fact.Consumed = true;
             record.Invocation.Parent.MemoryInvocations.Remove(record.Invocation);
             _trackedMemory.TryRemove(binding.BindingId, out _);
         }
@@ -791,6 +857,18 @@ public sealed class CxlAuthorityBridge : ICxlTeardownParticipant
             return KernelResult.Fail(KernelError.StaleGeneration, "CXL fabric closure cannot substitute a rebound source tuple.");
         var source = ValidateClosureEndpoint(tracked.Binding);
         if (!source.IsSuccess) return source;
+        lock (_gate)
+        {
+            if (tracked.Closure is { } known)
+            {
+                if (!known.IsOriginal(tracked, binding)) return KernelResult.Fail(KernelError.StaleGeneration, "Original fabric closure fact was substituted.");
+                if (known.Invoked && known.RawObservation is not { IsSuccess: true })
+                    return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Original fabric Unbind outcome is unknown; no repeat.");
+                if (known.RawObservation is { IsSuccess: true }) tracked.ReleasedBinding = known.Binding;
+            }
+            else if (tracked.ReleasedBinding is not null)
+                return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Released fabric projection lacks original proof.");
+        }
         if (tracked.ReleasedBinding is null)
         {
             var current = FromProvider(_fabric.Query(binding.BindingId));
@@ -798,18 +876,23 @@ public sealed class CxlAuthorityBridge : ICxlTeardownParticipant
             if (current.Value != binding) return KernelResult.Fail(KernelError.StaleGeneration, "CXL fabric release requires the exact current binding generation.");
             var finalSource = ValidateClosureEndpoint(tracked.Binding);
             if (!finalSource.IsSuccess) return finalSource;
+            OriginalClosure<TrackedFabric, CxlFabricBinding> fact;
             lock (_gate)
             {
                 var local = ValidateFabricClosureCommitLocked(tracked);
                 if (!local.IsSuccess) return local;
+                fact = tracked.Closure ??= new(tracked, binding);
+                if (!fact.IsOriginal(tracked, binding) || fact.Invoked)
+                    return KernelResult.Fail(KernelError.ExternalEffectUncontained, "Original fabric Unbind cannot repeat.");
+                fact.Invoked = true;
             }
             var released = _fabric.Unbind(binding);
-            if (!released.IsSuccess) return KernelResult.Fail(Map(released.Status), released.Message ?? "CXL fabric release failed.");
             lock (_gate)
             {
-                tracked.ReleasedBinding = binding;
-                tracked.Admitted = false;
+                fact.RawObservation = released;
+                if (released.IsSuccess) { tracked.ReleasedBinding = binding; tracked.Admitted = false; }
             }
+            if (!released.IsSuccess) return KernelResult.Fail(Map(released.Status), released.Message ?? "CXL fabric release failed.");
         }
         if (!ValidateClosureEndpoint(tracked.Binding).IsSuccess)
             return KernelResult.Fail(KernelError.ExternalEffectUncontained, "CXL fabric closure lost endpoint continuity; parent remains pinned.");
@@ -819,10 +902,12 @@ public sealed class CxlAuthorityBridge : ICxlTeardownParticipant
             {
                 var local = ValidateFabricClosureCommitLocked(tracked);
                 if (!local.IsSuccess) return local;
-                if (tracked.ReleasedBinding != binding)
+                if (tracked.Closure is not { Invoked: true } fact || !fact.IsOriginal(tracked, binding) ||
+                    fact.RawObservation is not { IsSuccess: true } || tracked.ReleasedBinding != binding)
                     return KernelResult.Fail(KernelError.StaleGeneration, "Original CXL fabric closure receipt is not exact.");
                 var parent = release(); // trusted platform mutation; no callback or provider query
                 if (!parent.IsSuccess) return parent;
+                fact.Consumed = true;
                 _trackedFabric.TryRemove(binding.BindingId, out _);
                 return KernelResult.Ok();
             }

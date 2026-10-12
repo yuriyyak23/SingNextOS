@@ -25,6 +25,8 @@ public sealed partial class PlatformAuthorityBridge
         CapabilityId authorityCapabilityId)
     {
         public PlatformIrqBinding Binding { get; } = binding;
+        public IrqBindingRecord? OwnerSelf { get; set; }
+        public OriginalIrqBindInvocation? OriginalBind { get; init; }
         public PlatformProviderIrqBinding ProviderBinding { get; } = providerBinding;
         public CapabilityId AuthorityCapabilityId { get; } = authorityCapabilityId;
         public bool LocalAuthorizationRevoked { get; set; }
@@ -37,6 +39,8 @@ public sealed partial class PlatformAuthorityBridge
         public DeviceLeaseRecord? BindDeviceSource { get; set; }
         public KernelEventRegistry.IrqSourceReservation? EndpointSource { get; set; }
         public PlatformAuthorityResult<PlatformProviderIrqBinding>? BindObservation { get; set; }
+        public bool OwnCloseUncertain { get; set; }
+        public bool DeliveryPinned { get; set; }
         public bool FaultPinned { get; set; }
         public bool ClosureInFlight { get; set; }
         public bool DeliveryInFlight { get; set; }
@@ -47,6 +51,15 @@ public sealed partial class PlatformAuthorityBridge
     }
 
     private readonly Dictionary<PlatformIrqBindingId, IrqBindingRecord> _irqBindings = [];
+    private readonly Dictionary<PlatformIrqBindingId, IrqBindingRecord> _originalIrqOwners = [];
+    private void RegisterOriginalIrq(IrqBindingRecord record)
+    {
+        record.OwnerSelf ??= record;
+        _originalIrqOwners.Add(record.Binding.BindingId,record);
+        _irqBindings.Add(record.Binding.BindingId,record);
+    }
+    private IEnumerable<IrqBindingRecord> IrqDependencyRecordsLocked() => _originalIrqOwners.Values.Concat(_irqBindings.Values)
+        .Concat(DeviceDependencyRecordsLocked().SelectMany(device => device.OriginalIrqBinds).Select(fact => fact.LocalBinding).OfType<IrqBindingRecord>()).Distinct();
     private ulong _nextIrqBindingId = 1;
 
     internal KernelResult<PlatformIrqBinding> BindIrq(
@@ -110,6 +123,12 @@ public sealed partial class PlatformAuthorityBridge
             if (!reserved.IsSuccess) return KernelResult<PlatformIrqBinding>.Fail(reserved.Error, reserved.Message!);
             endpointSource = reserved.Value!;
             endpointSource.BindSource(deviceRecord);
+            if (irqProvider is IPlatformOriginalIrqAdmissionProvider originalProvider)
+            {
+                effectMayHaveOccurred = true; // The original owner below also owns never-invoked endpoint release.
+                return BindOriginalIrq(deviceLease,expectedSubject,authorityCapabilityId,source,eventEndpoint,deviceRecord,domainRecord,localId,
+                    endpointSource,revalidateAuthorization,commitAuthorization,originalProvider);
+            }
             authorization = revalidateAuthorization();
             if (!authorization.IsSuccess) return Failure(authorization);
             if (!ValidateDeviceClosureGeneration(deviceRecord))
@@ -139,7 +158,7 @@ public sealed partial class PlatformAuthorityBridge
                     endpointSource.TransferSource(deviceRecord, retainedRecord);
                     lock (_secureDomainLifecycleGate)
                     {
-                        _irqBindings.Add(retained.BindingId, retainedRecord);
+                        RegisterOriginalIrq(retainedRecord);
                         TransferIrqBindObservationLocked(deviceRecord, retainedRecord);
                     }
                 }
@@ -155,34 +174,12 @@ public sealed partial class PlatformAuthorityBridge
             var validReceipt = PlatformIrqBindingContract.ValidateBinding(deviceRecord.ProviderLease, source, providerBinding);
             if (!validReceipt.IsSuccess)
             {
-                // Best-effort cleanup of the returned object cannot establish closure
-                // of the requested effect: its exact receipt contract already failed.
+                // Malformed returned objects cannot identify the original effect.
                 lock (_secureDomainLifecycleGate)
                 {
                     deviceRecord.FaultPinned = true;
                     deviceRecord.MalformedIrqReceipt = providerBinding;
                 }
-                try
-                {
-                    var sourceCurrent = ValidateDeviceClosureGeneration(deviceRecord);
-                    bool cleanupAdmitted;
-                    lock (_secureDomainLifecycleGate)
-                    {
-                        cleanupAdmitted = sourceCurrent && !_backendEpochExhausted && BackendEpoch == deviceRecord.BackendEpoch &&
-                            TryGetOriginalDeviceRecord(deviceLease.LeaseId, out var exactDevice) && ReferenceEquals(exactDevice, deviceRecord) &&
-                            TryGetCanonicalRootRecord(deviceLease.DomainBinding.BindingId, out var exactDomain) && ReferenceEquals(exactDomain, domainRecord) &&
-                            !deviceRecord.PlatformClosed && !deviceRecord.ClosureInFlight &&
-                            domainRecord.AuthorityState == DomainAuthorityState.Active && !domainRecord.ParentRevokeMayHaveEffect &&
-                            deviceRecord.UnresolvedIrqCapabilityId == authorityCapabilityId && !deviceRecord.MalformedIrqCleanupMayHaveEffect;
-                        if (cleanupAdmitted) deviceRecord.MalformedIrqCleanupMayHaveEffect = true;
-                    }
-                    if (cleanupAdmitted)
-                    {
-                        var cleanup = irqProvider.RevokeInterrupt(providerBinding);
-                        lock (_secureDomainLifecycleGate) deviceRecord.MalformedIrqCleanupObservation = cleanup;
-                    }
-                }
-                catch (Exception exception) when (exception is not StackOverflowException) { }
                 // Preserve UnresolvedIrqCapabilityId for original admission cleanup.
                 return KernelResult<PlatformIrqBinding>.Fail(KernelError.PlatformFaulted, validReceipt.Message!);
             }
@@ -199,7 +196,7 @@ public sealed partial class PlatformAuthorityBridge
                 {
                     var currentParent = CheckParent();
                     if (!currentParent.IsSuccess) return currentParent;
-                    _irqBindings.Add(binding.BindingId, record);
+                    RegisterOriginalIrq(record);
                     TransferIrqBindObservationLocked(deviceRecord, record);
                     return KernelResult.Ok();
                 }
@@ -213,7 +210,7 @@ public sealed partial class PlatformAuthorityBridge
                 {
                     record.LocalAuthorizationRevoked = true;
                     record.ClosureInFlight = true;
-                    _irqBindings.Add(binding.BindingId, record);
+                    RegisterOriginalIrq(record);
                     // Transfer the known creation receipt to its existing owner.
                     TransferIrqBindObservationLocked(deviceRecord, record);
                 }
@@ -245,7 +242,7 @@ public sealed partial class PlatformAuthorityBridge
                     lock (_secureDomainLifecycleGate) record.RevokeObservation = cleanup;
                     if (cleanup.IsSuccess)
                     {
-                        lock (_secureDomainLifecycleGate) record.ProviderClosureConfirmed = true;
+                        lock (_secureDomainLifecycleGate) { record.ProviderClosureConfirmed = true; record.OwnCloseUncertain = false; }
                         var closed = CompleteKnownIrqClosure(binding, record, deviceRecord);
                         if (closed.IsSuccess)
                             lock (_secureDomainLifecycleGate) _irqBindings.Remove(binding.BindingId);
@@ -386,6 +383,17 @@ public sealed partial class PlatformAuthorityBridge
         }
     }
 
+    private void PinIrqInvocation(IrqBindingRecord record, DeviceLeaseRecord device)
+    {
+        lock (_secureDomainLifecycleGate)
+        {
+            if (_provider is IPlatformOriginalIrqContainmentProvider && CurrentOriginalIrqOwnerLocked(record,device) is not null &&
+                BackendEpoch == device.BackendEpoch && !_backendEpochExhausted && !device.FaultPinned)
+                record.DeliveryPinned = true;
+            else FaultIrqDelivery(record,device);
+        }
+    }
+
     private KernelResult AdmitOriginalIrqEffect(IrqBindingRecord record, DeviceLeaseRecord device,
         PlatformIrqBinding binding, PlatformDomainIdentity subject)
     {
@@ -425,11 +433,15 @@ public sealed partial class PlatformAuthorityBridge
             valid = ValidateIrqBinding(binding, expectedSubject);
             if (!valid.IsSuccess) return KernelResult<PlatformIrqDeliveryEvidence>.Fail(valid.Error, valid.Message!);
             if (_provider is not IPlatformIrqBindingProvider provider) return Fault("Provider lacks IRQ delivery.");
-            var observed = provider.PollInterrupt(record.ProviderBinding);
+            PlatformAuthorityResult<PlatformInterruptDeliveryObservation> observed;
+            try { observed = provider.PollInterrupt(record.ProviderBinding); }
+            catch (Exception exception) when (exception is not StackOverflowException)
+            { PinIrqInvocation(record,device); return KernelResult<PlatformIrqDeliveryEvidence>.Fail(KernelError.PlatformFaulted,exception.Message); }
             // Original cleanup correlation, retained even when later publication is refused.
             lock (_secureDomainLifecycleGate) record.PollObservation = observed;
             if (!ValidateDeviceClosureGeneration(device)) return Fault("IRQ poll generation changed during observation.");
-            if (!observed.IsSuccess) return Fault("IRQ observation failed without exact no-effect evidence.");
+            if (!observed.IsSuccess)
+            { PinIrqInvocation(record,device); return KernelResult<PlatformIrqDeliveryEvidence>.Fail(KernelError.PlatformFaulted,"Original IRQ observation needs exact containment."); }
             var observation = observed.Value!;
             var receipt = PlatformIrqBindingContract.ValidateObservation(record.ProviderBinding, observation);
             if (!receipt.IsSuccess) return Fault(receipt.Message!);
@@ -483,7 +495,10 @@ public sealed partial class PlatformAuthorityBridge
             });
             if (!permission.IsSuccess) { FaultIrqDelivery(record, device); return permission; }
             if (_provider is not IPlatformIrqBindingProvider provider) return Fault("Provider lacks IRQ completion.");
-            var completed = provider.CompleteInterruptDelivery(record.ProviderBinding, sequence);
+            PlatformAuthorityResult completed;
+            try { completed = provider.CompleteInterruptDelivery(record.ProviderBinding, sequence); }
+            catch (Exception exception) when (exception is not StackOverflowException)
+            { PinIrqInvocation(record,device); return KernelResult.Fail(KernelError.PlatformFaulted,exception.Message); }
             lock (_secureDomainLifecycleGate)
             {
                 record.CompletionObservation = completed;
@@ -494,7 +509,7 @@ public sealed partial class PlatformAuthorityBridge
             if (!ValidateDeviceClosureGeneration(device)) return Fault("IRQ completion generation changed during effect.");
             if (!completed.IsSuccess)
             {
-                FaultIrqDelivery(record, device);
+                PinIrqInvocation(record, device);
                 return FromProviderFailure(completed.Status, completed.Message);
             }
             lock (_secureDomainLifecycleGate)
@@ -551,7 +566,7 @@ public sealed partial class PlatformAuthorityBridge
                 return KernelResult.Fail(KernelError.PlatformFaulted, "Exact IRQ binding has unclosed ambiguity.");
             if (record.ClosureInFlight)
                 return KernelResult.Fail(KernelError.PlatformBindingActive, "Exact IRQ closure is already in flight.");
-            if (record.RevokeMayHaveEffect && !record.ProviderClosureConfirmed)
+            if (record.RevokeMayHaveEffect && !record.ProviderClosureConfirmed && _provider is not IPlatformOriginalIrqProvider)
                 return KernelResult.Fail(KernelError.PlatformFaulted, "Original IRQ closure remains ambiguous; repeat refused.");
             record.LocalAuthorizationRevoked = true;
             if (record.DeliveryInFlight)
@@ -620,17 +635,26 @@ public sealed partial class PlatformAuthorityBridge
                 record.RevokeMayHaveEffect = true;
             }
             PlatformAuthorityResult revoked;
-            try { revoked = irqProvider.RevokeInterrupt(record.ProviderBinding); }
+            bool lookup; lock (_secureDomainLifecycleGate) lookup = record.RevokeObservation is not null || record.OwnCloseUncertain;
+            try { revoked = record.DeliveryPinned && irqProvider is IPlatformOriginalIrqContainmentProvider containment ? containment.ContainIrqDelivery(record.ProviderBinding) :
+                lookup && irqProvider is IPlatformOriginalIrqProvider original ? original.ResolveIrqRevocation(record.ProviderBinding) : irqProvider.RevokeInterrupt(record.ProviderBinding); }
             catch (Exception exception) when (exception is not StackOverflowException)
             {
-                FaultIrqDelivery(record, device);
+                if (irqProvider is IPlatformOriginalIrqProvider) { lock (_secureDomainLifecycleGate) record.OwnCloseUncertain = true; }
+                else FaultIrqDelivery(record, device);
                 return KernelResult.Fail(KernelError.PlatformFaulted,
                     $"Interrupt closure may have taken effect without a receipt: {exception.Message}");
             }
             lock (_secureDomainLifecycleGate) record.RevokeObservation = revoked;
             if (!revoked.IsSuccess)
             {
-                FaultIrqDelivery(record, device);
+                if (revoked.Status == PlatformAuthorityStatus.NotAccepted && irqProvider is IPlatformIrqRevocationNoEffectProvider)
+                {
+                    lock (_secureDomainLifecycleGate) { record.RevokeMayHaveEffect = false; record.RevokeObservation = null; record.RevokeParent = null; record.OwnCloseUncertain = false; }
+                    return KernelResult.Fail(KernelError.PlatformFaulted,"Exact IRQ close no effect; binding and endpoint remain live.");
+                }
+                if (irqProvider is IPlatformOriginalIrqProvider) { lock (_secureDomainLifecycleGate) record.OwnCloseUncertain = true; }
+                else FaultIrqDelivery(record, device);
                 return KernelResult.Fail(KernelError.PlatformFaulted,
                     "Interrupt closure lacks exact containment evidence; the original reply and binding remain pinned.");
             }
@@ -683,6 +707,7 @@ public sealed partial class PlatformAuthorityBridge
                     return KernelResult.Fail(KernelError.PlatformFaulted,
                         "IRQ closure reply retained without exact source continuity for local publication.");
                 record.PlatformClosed = true;
+                record.DeliveryPinned = false; // Exact containment consumed; independent FaultPinned remains untouched.
                 record.BindParentSource!.IrqSources.Remove(record);
             }
             return KernelResult.Ok();
@@ -712,7 +737,7 @@ public sealed partial class PlatformAuthorityBridge
                 "The platform interrupt binding has been closed.");
         }
 
-        if (record.FaultPinned)
+        if (record.FaultPinned || record.DeliveryPinned)
             return KernelResult.Fail(KernelError.PlatformFaulted,
                 "The interrupt binding is fault-pinned after ambiguous closure.");
 
@@ -743,14 +768,14 @@ public sealed partial class PlatformAuthorityBridge
     internal IReadOnlyList<PlatformIrqBinding> ActiveIrqBindingsForProcess(PlatformDomainIdentity subject)
     {
         lock (_secureDomainLifecycleGate)
-            return _irqBindings.Values.Where(record => !record.PlatformClosed &&
+            return IrqDependencyRecordsLocked().Where(record => !record.PlatformClosed &&
                 record.Binding.DeviceLease.DomainBinding.Subject == subject)
                 .Select(static record => record.Binding).ToArray();
     }
     internal IReadOnlyList<PlatformIrqBinding> ActiveIrqBindingsForDevice(PlatformDeviceLease deviceLease)
     {
         lock (_secureDomainLifecycleGate)
-            return _irqBindings.Values.Where(record => !record.PlatformClosed &&
+            return IrqDependencyRecordsLocked().Where(record => !record.PlatformClosed &&
                 record.Binding.DeviceLease.LeaseId == deviceLease.LeaseId)
                 .OrderBy(record => record.Binding.BindingId.Value).Select(static record => record.Binding).ToArray();
     }
@@ -758,7 +783,7 @@ public sealed partial class PlatformAuthorityBridge
     internal IReadOnlyList<PlatformIrqBinding> ActiveIrqBindingsForEndpoint(KernelEventEndpoint endpoint)
     {
         lock (_secureDomainLifecycleGate)
-            return _irqBindings.Values.Where(record => !record.PlatformClosed && record.Binding.EventEndpoint == endpoint)
+            return IrqDependencyRecordsLocked().Where(record => !record.PlatformClosed && record.Binding.EventEndpoint == endpoint)
                 .OrderBy(record => record.Binding.BindingId.Value).Select(static record => record.Binding).ToArray();
     }
     private KernelResult ValidateIrqBindingIdentity(
@@ -771,6 +796,9 @@ public sealed partial class PlatformAuthorityBridge
                 KernelError.PlatformBindingNotFound,
                 "The platform interrupt binding does not exist.");
         }
+
+        if (!ReferenceEquals(record.OwnerSelf,record) || !_originalIrqOwners.TryGetValue(binding.BindingId,out var original) || !ReferenceEquals(original,record))
+            return KernelResult.Fail(KernelError.PlatformFaulted,"Original IRQ route/canonical owner changed.");
 
         if (record.Binding.Generation != binding.Generation)
         {

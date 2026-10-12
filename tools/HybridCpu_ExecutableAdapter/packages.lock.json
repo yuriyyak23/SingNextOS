@@ -4,18 +4,18 @@
     "net11.0": {
       "HybridCPU.ExternalRuntime": {
         "type": "Direct",
-        "requested": "[1.6.0, 1.6.0]",
-        "resolved": "1.6.0",
-        "contentHash": "WKackEce/f3ib8w0MBRIsYBAqrqHjEx23nP+k4bseTN+vfj6H/0Ykf1jGCQyRNmWuowxqLPzQWBZbusMhkju5A==",
+        "requested": "[1.24.0, 1.24.0]",
+        "resolved": "1.24.0",
+        "contentHash": "t5LZNgWAb/LHpmQl12ykcIZAYP7DL33NI14+hUmBtv8UxLv/z6rrC+xY4M440yIHc89t0H8waKJ5TRxd7CynAw==",
         "dependencies": {
-          "HybridCPU.ExternalRuntime.Contracts": "1.14.0"
+          "HybridCPU.ExternalRuntime.Contracts": "1.35.0"
         }
       },
       "HybridCPU.ExternalRuntime.Contracts": {
         "type": "Direct",
-        "requested": "[1.14.0, 1.14.0]",
-        "resolved": "1.14.0",
-        "contentHash": "wLH8suR5xnj9C0CmqKTvUBSp2fLQsnS18ELZbILGosnGU3KIRJTZykX6bfvL/IWNOFOzGmQVvKI3q7irmjeM/Q=="
+        "requested": "[1.35.0, 1.35.0]",
+        "resolved": "1.35.0",
+        "contentHash": "ijdklm2Ta2lg37UcFFwoW1pXR12XerINhpgC7eHW3KY9LopfEJkKlcCwc9jHh0SgumuFqNFqN4eIoF+WdLg5fQ=="
       },
       "hybridcpu.boot.contracts": {
         "type": "Project"

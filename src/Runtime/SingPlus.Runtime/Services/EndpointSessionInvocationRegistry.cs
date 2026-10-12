@@ -30,6 +30,8 @@ internal sealed class EndpointSessionInvocationRegistry
         public bool CancellationRequested { get; set; }
         public bool CancellationAccepted { get; set; }
         public bool AcceptedResponseCancelled { get; set; }
+        public object? OriginalVirtualIoTransfer { get; set; }
+        public bool VirtualIoTransferContained { get; set; }
         public bool FailedSettlementMayHaveEffect { get; set; }
         public bool DonationReturnInProgress { get; set; }
         public bool DonationBindingInProgress { get; set; } // Admission only.
@@ -734,7 +736,8 @@ internal sealed class EndpointSessionInvocationRegistry
                 var record = _ownedRecords[key];
                 if (record.ResourceDonation is { State: ResourceDonationState.Bound or ResourceDonationState.Active } live)
                     record.ResourceDonation = live with { State = ResourceDonationState.Quarantined };
-                if (!HasUnclosedPossibleEffect(record))
+                if (!HasUnclosedPossibleEffect(record) &&
+                    (record.OriginalVirtualIoTransfer is null || record.VirtualIoTransferContained))
                 {
                     _ownedRecords.Remove(key);
                     if (_records.TryGetValue(key, out var routed) && ReferenceEquals(routed, record))
@@ -749,9 +752,43 @@ internal sealed class EndpointSessionInvocationRegistry
         record.DonationReturnInProgress ||
         record.SettlementInProgress is not null ||
         record.ServiceAccepted && record.TerminalStatus is null ||
-        record.AcceptedResponseCancelled ||
+        record.AcceptedResponseCancelled && !record.VirtualIoTransferContained ||
         record.FailedSettlementMayHaveEffect ||
         record.ResourceDonation?.State == ResourceDonationState.Quarantined;
+
+    // Existing invocation owns its correlation; the kernel IO owner supplies the
+    // same original fact before effect and only consumes it inside exact IO closure.
+    internal KernelResult BindVirtualIoTransfer(EndpointSessionInvocationHandle invocation, ProcessHandle caller, object original)
+    {
+        if(original is null)return KernelResult.Fail(KernelError.PlatformFaulted,"Original IO transfer owner is required.");
+        lock (_gate)
+        {
+            var resolved=ResolveForCaller(invocation,caller);
+            if(!resolved.IsSuccess)return KernelResult.Fail(resolved.Error,resolved.Message!);
+            var record=resolved.Value!;
+            if(record.MessageId != SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_TransferIoAsync ||
+                !record.ServiceAccepted || record.TerminalStatus is not null || record.VirtualIoTransferContained ||
+                record.OriginalVirtualIoTransfer is { } prior && !ReferenceEquals(prior,original))
+                return KernelResult.Fail(KernelError.InvalidTransition,"Original invocation cannot admit this IO transfer.");
+            record.OriginalVirtualIoTransfer=original;
+            return KernelResult.Ok();
+        }
+    }
+
+    internal KernelResult ConsumeVirtualIoTransferClosure(EndpointSessionInvocationHandle invocation, ProcessHandle caller, object original)
+    {
+        if(original is null)return KernelResult.Fail(KernelError.PlatformFaulted,"Original IO transfer owner is required.");
+        lock (_gate)
+        {
+            var resolved=ResolveForCaller(invocation,caller);
+            if(!resolved.IsSuccess)return KernelResult.Fail(resolved.Error,resolved.Message!);
+            var record=resolved.Value!;
+            if(!ReferenceEquals(record.OriginalVirtualIoTransfer,original))
+                return KernelResult.Fail(KernelError.PlatformFaulted,"Original invocation IO transfer owner changed.");
+            record.VirtualIoTransferContained=true;
+            return KernelResult.Ok();
+        }
+    }
 
     private KernelResult<Record> ResolveForCaller(
         EndpointSessionInvocationHandle handle,

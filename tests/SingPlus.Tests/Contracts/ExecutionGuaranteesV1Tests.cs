@@ -51,7 +51,7 @@ public sealed class ExecutionGuaranteesV1Tests
         Assert.True(result.IsSuccess, result.Message);
         var guarantees = result.Value!;
         Assert.Equal(new ProviderContractIdentityV1(
-            "HybridCPU.ExternalRuntime.Contracts", "1.14.0", "ExternalOperationContract/1.4.0"),
+            "HybridCPU.ExternalRuntime.Contracts", "1.34.0", "ExternalOperationContract/1.4.0"),
             guarantees.ProviderContract);
         Assert.Equal("external-operation/1.4.0", guarantees.ProviderExecutionClass);
         Assert.All(guarantees.DimensionClaims(), claim =>
@@ -162,3 +162,8 @@ public sealed class ExecutionGuaranteesV1Tests
         cancellation,
         Hc.ExternalReplayEffectClass.StagedReversibleUntilPublish);
 }
+
+
+
+
+

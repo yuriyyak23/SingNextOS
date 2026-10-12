@@ -10,7 +10,7 @@ public readonly record struct GuestRegionMappingId(ulong Value);
 public readonly record struct GuestRegionMappingGeneration(ulong Value);
 public readonly record struct GuestRegionMappingHandle(GuestRegionMappingId MappingId, GuestRegionMappingGeneration Generation);
 
-public enum VirtualDomainState { Created = 0, Configured, Running, Parked, Draining, Closed, Faulted, Quarantined }
+public enum VirtualDomainState { Created = 0, Configured, Running, Parked, Draining, Closed, Faulted, Quarantined, Completed }
 [Flags] public enum GuestMemoryAccess { None = 0, Read = 1, Write = 2, Execute = 4 }
 [Flags]
 public enum VirtualDomainAuthorityClass
@@ -33,6 +33,9 @@ public enum VirtualTrapKind
     Timer,
     Preemption,
     DeviceOrIoFault,
+    ExecutionBudgetExhausted,
+    KernelRejected,
+    ExecutionFailure,
 }
 
 public readonly record struct VirtualDomainProfile(int VirtualProcessorCount, long MaximumGuestMemoryBytes);
@@ -55,6 +58,9 @@ public readonly record struct VirtualTrapObservation(
     VirtualDomainHandle Domain,
     ulong Sequence,
     VirtualTrapKind Kind);
+
+/// <summary>Original program result; grants no execution, containment or backing release authority.</summary>
+public readonly record struct VirtualExecutionResult(VirtualDomainHandle Domain, ulong Sequence, int ProcessExitCode);
 
 public readonly record struct GuestRegionMapping(
     GuestRegionMappingHandle Mapping,

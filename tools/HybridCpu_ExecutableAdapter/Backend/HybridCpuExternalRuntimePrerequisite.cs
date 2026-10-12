@@ -11,7 +11,18 @@ internal static class HybridCpuExternalRuntimePrerequisite
     public const string RequiredFacadeName = "IHybridCpuChildDomainRuntimeV3";
     public const string QualifiedFacade130Commit = "fd37b00a207a162baaa860f3f8b96c0c66d7e691";
     public const string ContractsPackage = "HybridCPU.ExternalRuntime.Contracts";
-    public const string ContractsPackageVersion = "1.14.0";
-    public const string ContractsPackageSha256 = "B96E99BDA066EE585B26A11CBFA7B68CE6BF44FC0006679483CCC1A4EEB678C2";
-    public const string RuntimePackageSha256 = "191A1976DECAF607425B3F93378BA11446B32AF2EBFD09DFF45A26944E7E765F";
+    public const string ContractsPackageVersion = "1.34.0";
+    public const string ContractsPackageSha256 = "DB84FC2396E809E63F078E6BEAF88633638DE71809EF5DA22C3AF07CB036A295";
+    public const string RuntimePackageSha256 = "76B1918D075ADEFB50ACA35376FBCC58F9E1A911F3AA8DAA39B7F3388E43E9C4";
 }
+
+
+
+
+
+
+
+
+
+
+

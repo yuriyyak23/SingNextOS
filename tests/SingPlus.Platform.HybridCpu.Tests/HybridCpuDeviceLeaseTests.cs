@@ -14,7 +14,7 @@ public sealed class HybridCpuDeviceLeaseTests
         var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, ChildClosureTupleTests.RootCloseRuntimeProxy>();
         var proxy = (ChildClosureTupleTests.RootCloseRuntimeProxy)(object)runtime;
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
-        var parent = provider.BindDomain(new(new DomainId(610), new ProcessHandle(new ProcessId(61), 1))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(610), new ProcessHandle(new ProcessId(61), 1))).Value!;
         var device = provider.BindDevice(parent, new("device/net0"), PlatformDeviceRights.Read | PlatformDeviceRights.Configure).Value!;
         var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
         var records = (global::System.Collections.IDictionary)provider.GetType().GetField("_deviceLeases", flags)!.GetValue(provider)!;
@@ -96,7 +96,7 @@ public sealed class HybridCpuDeviceLeaseTests
         var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, ChildClosureTupleTests.RootCloseRuntimeProxy>();
         var proxy = (ChildClosureTupleTests.RootCloseRuntimeProxy)(object)runtime;
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
-        var parent = provider.BindDomain(new(new DomainId(610), new ProcessHandle(new ProcessId(61), 1))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(610), new ProcessHandle(new ProcessId(61), 1))).Value!;
         var device = provider.BindDevice(parent, new("device/net0"), PlatformDeviceRights.Read).Value!;
         var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
         var records = (global::System.Collections.IDictionary)provider.GetType().GetField("_deviceLeases", flags)!.GetValue(provider)!;

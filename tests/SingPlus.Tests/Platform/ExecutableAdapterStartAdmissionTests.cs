@@ -16,6 +16,38 @@ namespace SingPlus.Tests.Platform;
 public sealed class ExecutableAdapterStartAdmissionTests
 {
     [Theory]
+    [InlineData("admission-no-commit")] [InlineData("source-no-commit")]
+    [InlineData("admission-fail")] [InlineData("admission-throw")]
+    [InlineData("source-fail")] [InlineData("source-throw")]
+    [InlineData("admission-reentry")] [InlineData("source-reentry")]
+    public void StartAdmissionCallbacksCannotLeakOrInventPendingInterlocks(string mode)
+    {
+        var s = CreateScenario();
+        KernelResult Callback(Func<KernelResult> commit)
+        {
+            if (mode.EndsWith("no-commit")) return KernelResult.Ok();
+            Assert.True(commit().IsSuccess);
+            if (mode.EndsWith("reentry")) Assert.False(commit().IsSuccess);
+            if (mode.EndsWith("throw")) throw new IOException("Admission callback lost after commit.");
+            return KernelResult.Fail(KernelError.PlatformDenied, "Admission refused after commit.");
+        }
+        var result = s.Bridge.StartChildExecutableArtifact(s.Artifact,
+            admissionConsumer: mode.StartsWith("admission") ? Callback : null,
+            sourceCommitConsumer: mode.StartsWith("source") ? Callback : null);
+        Assert.False(result.IsSuccess);
+        Assert.Equal(0, s.Spy.StartCalls);
+        var child = Record(s.Bridge, "_childBindings", s.Child.BindingId);
+        var guest = Record(s.Bridge, "_guestBindings", s.Guest.MappingId);
+        var artifact = Record(s.Bridge, "_executableArtifacts", s.Artifact.BindingId);
+        AssertBalanced(child, guest, artifact);
+        Assert.Equal(PlatformChildDomainState.Created, Property(child, "State"));
+        Assert.False((bool)Property(artifact, "Started")!);
+        Assert.True(s.Bridge.StartChildExecutableArtifact(s.Artifact).IsSuccess);
+        Assert.Equal(1, s.Spy.StartCalls);
+        AssertBalanced(child, guest, artifact);
+    }
+
+    [Theory]
     [InlineData(false, "exact")] [InlineData(true, "exact")]
     [InlineData(false, "unknown")] [InlineData(true, "unknown")]
     [InlineData(false, "throw")] [InlineData(true, "throw")]
@@ -1239,7 +1271,7 @@ public sealed class ExecutableAdapterStartAdmissionTests
         }
     }
 
-    private static byte[] CreateExecutablePackage()
+    internal static byte[] CreateExecutablePackage()
     {
         Assembly compiler = Assembly.Load("HybridCPU.Compiler.Core");
         Type optionsType = Required("HybridCPU.Compiler.Core.Target.Runtime.HybridCpuRestrictedStartupOptionsV1");

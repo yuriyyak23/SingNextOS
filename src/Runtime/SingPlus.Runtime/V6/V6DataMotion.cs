@@ -226,6 +226,34 @@ public sealed partial class RuntimeKernel
         Func<ulong> currentDestinationEstimateGeneration,
         ISemanticTraceSinkV1? sourceTraceSink = null, ISemanticTraceSinkV1? destinationTraceSink = null) where T : unmanaged
     {
+        lock (_platformMemoryUseGate)
+        {
+            if (_dmaCopyPayloadCalls.Contains(sourceGrant.GrantId) || _dmaCopyPayloadCalls.Contains(destinationGrant.GrantId))
+                return KernelResult<V6DataMotionExecution<T>>.Fail(KernelError.PlatformBindingDraining,"Original DMA payload caller is already in flight.");
+            _dmaCopyPayloadCalls.EnsureCapacity(_dmaCopyPayloadCalls.Count + 2);
+            _dmaCopyPayloadCalls.Add(sourceGrant.GrantId); _dmaCopyPayloadCalls.Add(destinationGrant.GrantId);
+        }
+        try { return ExecuteV6ProviderDmaDataMotionCore(source,destination,input,output,plan,sourceMapping,sourceGrant,sourcePrepare,
+            destinationMapping,destinationGrant,destinationPrepare,currentSourceEstimateGeneration,currentDestinationEstimateGeneration,sourceTraceSink,destinationTraceSink); }
+        finally
+        {
+            lock (_platformMemoryUseGate)
+            {
+                if (_dmaCopyPayloads.TryGetValue(sourceGrant.GrantId,out var payload) &&
+                    (!payload.EffectPossible || payload.Consumed && !input.IsValid))
+                { payload.Dispose(); _dmaCopyPayloads.Remove(sourceGrant.GrantId); }
+                _dmaCopyPayloadCalls.Remove(sourceGrant.GrantId); _dmaCopyPayloadCalls.Remove(destinationGrant.GrantId);
+            }
+        }
+    }
+
+    private KernelResult<V6DataMotionExecution<T>> ExecuteV6ProviderDmaDataMotionCore<T>(
+        ProcessHandle source, ProcessHandle destination, OwnedBuffer<T> input, OwnedBuffer<T> output, DataMotionPlanV1 plan,
+        PlatformOwnedRegionSliceMapping sourceMapping, PlatformDmaGrant sourceGrant, PlatformDmaPrepareEvidence sourcePrepare,
+        PlatformOwnedRegionSliceMapping destinationMapping, PlatformDmaGrant destinationGrant, PlatformDmaPrepareEvidence destinationPrepare,
+        Func<ulong> currentSourceEstimateGeneration, Func<ulong> currentDestinationEstimateGeneration,
+        ISemanticTraceSinkV1? sourceTraceSink, ISemanticTraceSinkV1? destinationTraceSink) where T : unmanaged
+    {
         ArgumentNullException.ThrowIfNull(input);
         ArgumentNullException.ThrowIfNull(output);
         ArgumentNullException.ThrowIfNull(currentSourceEstimateGeneration);
@@ -266,6 +294,8 @@ public sealed partial class RuntimeKernel
         catch (OverflowException)
         { return KernelResult<V6DataMotionExecution<T>>.Fail(KernelError.InvalidMessage,
             "Provider-DMA data-motion byte length overflowed."); }
+        catch (InvalidOperationException exception)
+        { return KernelResult<V6DataMotionExecution<T>>.Fail(KernelError.InvalidRegionState,exception.Message); }
         if (plan.SourceRegionGeneration != input.Handle.Generation.Value ||
             plan.SourceMutationGeneration != sourceRegion.Value!.MutationEpoch.Value ||
             plan.ByteLength != exactBytes || outputBytes != exactBytes ||
@@ -286,10 +316,14 @@ public sealed partial class RuntimeKernel
         var cleanup = PlatformAuthority.HasCompletedDmaCopyPairForCleanup(sourceGrant, sourcePrepare, PlatformIdentity(sourceProcess.Value!),
             destinationGrant, destinationPrepare, PlatformIdentity(destinationProcess.Value!), plan.SourceMutationGeneration);
         if (!cleanup.IsSuccess) return KernelResult<V6DataMotionExecution<T>>.Fail(cleanup.Error, cleanup.Message!);
+        var reserved = ReserveDmaCopyPayload(source,destination,input,output,sourceGrant,sourcePrepare,destinationGrant,destinationPrepare,cleanup.Value);
+        if (!reserved.IsSuccess) return KernelResult<V6DataMotionExecution<T>>.Fail(reserved.Error,reserved.Message!);
+        var payload = reserved.Value!;
         if (!cleanup.Value)
         {
             var submitted = SubmitV6PlatformDmaCopy(source, sourceGrant, sourcePrepare,
-                destination, destinationGrant, destinationPrepare, sourceTraceSink, destinationTraceSink);
+                destination, destinationGrant, destinationPrepare, sourceTraceSink, destinationTraceSink,payload.Backing,
+                () => payload.EffectPossible = true, () => payload.EffectPossible = false);
             V6PlatformDmaCopyExecution execution;
             if (submitted.IsSuccess)
                 execution = submitted.Value!;
@@ -322,6 +356,9 @@ public sealed partial class RuntimeKernel
         if (!destinationMappingClosed.IsSuccess)
             return KernelResult<V6DataMotionExecution<T>>.Fail(destinationMappingClosed.Error,
                 destinationMappingClosed.Message!);
+        // Exact completion/visibility and both original mapping closures end the
+        // provider's byte lifetime. Local publication is a separate fresh commit.
+        lock (_platformMemoryUseGate) payload.Dispose();
         var releasedSource = ReleaseRegion(source, input);
         if (!releasedSource.IsSuccess)
             return KernelResult<V6DataMotionExecution<T>>.Fail(releasedSource.Error, releasedSource.Message!);
@@ -332,7 +369,21 @@ public sealed partial class RuntimeKernel
             [DataMotionLifecycleStateV1.Planned, DataMotionLifecycleStateV1.SourcePinned,
              DataMotionLifecycleStateV1.Copied, DataMotionLifecycleStateV1.SourceReleased,
              DataMotionLifecycleStateV1.Completed]).Validate();
-        return KernelResult<V6DataMotionExecution<T>>.Ok(new(output, receipt));
+        lock (_platformMemoryUseGate)
+        {
+            var current = Processes.Resolve(destination);
+            if (!current.IsSuccess) return KernelResult<V6DataMotionExecution<T>>.Fail(current.Error,current.Message!);
+            if (!ReferenceEquals(current.Value,destinationProcess.Value))
+                return KernelResult<V6DataMotionExecution<T>>.Fail(KernelError.StaleGeneration,"Original DMA destination incarnation changed before publication.");
+            var accepts = EnsureProcessAcceptsNewEffects(current.Value!);
+            if (!accepts.IsSuccess) return KernelResult<V6DataMotionExecution<T>>.Fail(accepts.Error,accepts.Message!);
+            var exact = Regions.Validate(output.Handle,new RegionOwner(current.Value!.DomainId,destination.Generation));
+            if (!exact.IsSuccess || !output.IsValid || !ReferenceEquals(payload.Original,payload) ||
+                !_dmaCopyPayloads.TryGetValue(sourceGrant.GrantId,out var retained) || !ReferenceEquals(retained,payload))
+                return KernelResult<V6DataMotionExecution<T>>.Fail(KernelError.InvalidRegionState,"Original DMA output/backing changed before publication.");
+            payload.Dispose(); _dmaCopyPayloads.Remove(sourceGrant.GrantId);
+            return KernelResult<V6DataMotionExecution<T>>.Ok(new(output, receipt));
+        }
 
         KernelResult CloseGrant(ProcessHandle process, PlatformDmaGrant grant, bool sourceLeg)
         {

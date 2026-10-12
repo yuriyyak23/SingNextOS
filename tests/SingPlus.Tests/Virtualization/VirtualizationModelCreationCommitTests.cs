@@ -9,6 +9,165 @@ namespace SingPlus.Tests.Virtualization;
 public sealed class VirtualizationModelCreationCommitTests
 {
     [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)]
+    [InlineData(4)] [InlineData(5)] [InlineData(6)] [InlineData(7)]
+    public void MutableLocalVirtualSourceCannotPublishAcrossEqualWriteOrAba(int fault)
+    {
+        var provider = new ObservedModelProvider(); var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 992, 9920);
+        var admin = TestFixtures.Create(kernel, 993, 9930).Handle;
+        var budgetSource = kernel.MintCapability(new DomainId(9930), admin, ResourceKind.KernelService,
+            CapabilityResourceIds.BudgetAdministration, CapabilityRights.Configure).Value!.CapabilityId;
+        var budget = kernel.AdmitProcessBudget(admin, budgetSource, owner, "virtual-revision-reclaim",
+            [new(ServiceBudgetDimension.OwnedMemoryBytes, 512)]).Value!.ProcessBudget;
+        var source = kernel.MintCapability(process.DomainId, owner, ResourceKind.Virtualization,
+            VirtualizationResourceIds.Create, CapabilityRights.Configure).Value!.CapabilityId;
+        var region = kernel.AllocateBuffer<byte>(owner, 128).Value!;
+        var created = kernel.CreateVirtualDomain(owner, source, new(1, 4096)).Value!;
+        var local = Assert.Single(Records(kernel).ForOwner(owner));
+        var original = local.State;
+        void ChangeSource()
+        {
+            provider.BeforeSource = null;
+            if (fault >= 4)
+            {
+                local.AuthorityPublished = true; // Equal publication write is also a source revision.
+                if (fault >= 6)
+                    local.GetType().GetField("_sourceRevisionExhausted", global::System.Reflection.BindingFlags.Instance |
+                        global::System.Reflection.BindingFlags.NonPublic)!.SetValue(local, true);
+                return;
+            }
+            if (fault % 2 != 0) local.State = VirtualDomainState.Quarantined;
+            local.State = original; // Independent equal write/ABA, not this transaction's state commit.
+        }
+        var beforeEffect = fault < 2 || fault is 4 or 6;
+        if (beforeEffect) provider.BeforeSource = ChangeSource; else provider.AfterTransition = ChangeSource;
+        Assert.False(kernel.ConfigureVirtualDomain(owner, created.Domain, created.ConfigureCapability).IsSuccess);
+        Assert.Equal(original, local.State);
+        Assert.Equal(beforeEffect ? 0 : 1, provider.TransitionCalls);
+        Assert.Equal(128UL, kernel.QueryBudget(budget).Value!.Usage.Single(x => x.Dimension == ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.Equal(RegionState.Owned, kernel.Regions.Snapshot().Single(x => x.Handle == region.Handle).State);
+        provider.BeforeSource = null; provider.AfterTransition = null;
+        if (!beforeEffect)
+        {
+            Assert.False(kernel.ConfigureVirtualDomain(owner, created.Domain, created.ConfigureCapability).IsSuccess);
+            Assert.Equal(1, provider.TransitionCalls); // Retained known effect cannot be repeated.
+        }
+        Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.Equal(VirtualDomainState.Closed, local.State);
+        Assert.Equal(1, provider.RevokeCalls);
+        Assert.Equal(RegionState.Released, kernel.Regions.Snapshot().Single(x => x.Handle == region.Handle).State);
+        Assert.Equal(0UL, kernel.QueryBudget(budget).Value!.Usage.Single(x => x.Dimension == ServiceBudgetDimension.OwnedMemoryBytes).Used);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void EqualCopyOfLocalOwnerCannotPublishEvenWhenBothIndexesChange(bool late)
+    {
+        var provider = new ObservedModelProvider(); var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 994, 9940);
+        var source = kernel.MintCapability(process.DomainId, owner, ResourceKind.Virtualization,
+            VirtualizationResourceIds.Create, CapabilityRights.Configure).Value!.CapabilityId;
+        var region = kernel.AllocateBuffer<byte>(owner, 128).Value!;
+        var created = kernel.CreateVirtualDomain(owner, source, new(1, 4096)).Value!;
+        var authority = Records(kernel); var local = Assert.Single(authority.ForOwner(owner));
+        var routes = (global::System.Collections.IDictionary)Field(authority, "_records");
+        var originals = (global::System.Collections.IDictionary)Field(authority, "_originalRecords");
+        void Copy()
+        {
+            provider.BeforeSource = null;
+            var copy = typeof(object).GetMethod("MemberwiseClone", global::System.Reflection.BindingFlags.Instance |
+                global::System.Reflection.BindingFlags.NonPublic)!.Invoke(local, null)!;
+            routes[created.Domain.DomainId] = originals[created.Domain.DomainId] = copy;
+        }
+        if (late) provider.AfterTransition = Copy; else provider.BeforeSource = Copy;
+        Assert.False(kernel.ConfigureVirtualDomain(owner, created.Domain, created.ConfigureCapability).IsSuccess);
+        Assert.Equal(late ? 1 : 0, provider.TransitionCalls);
+        Assert.False(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.Equal(RegionState.Owned, kernel.Regions.Snapshot().Single(x => x.Handle == region.Handle).State);
+        routes[created.Domain.DomainId] = originals[created.Domain.DomainId] = local;
+        provider.AfterTransition = null; provider.BeforeSource = null;
+        Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.Equal(1, provider.RevokeCalls);
+        Assert.Equal(RegionState.Released, kernel.Regions.Snapshot().Single(x => x.Handle == region.Handle).State);
+    }
+
+    [Fact]
+    public void ModelCapabilityLostInsideSourceCallbackRefusesActualEffect()
+    {
+        var provider = new ObservedModelProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 990, 9900);
+        var source = kernel.MintCapability(process.DomainId, owner, ResourceKind.Virtualization,
+            VirtualizationResourceIds.Create, CapabilityRights.Configure).Value!.CapabilityId;
+        kernel.AllocateRegion(owner, 128);
+        provider.BeforeSource = () =>
+        {
+            provider.BeforeSource = null;
+            Assert.True(kernel.RevokeCapability(source).IsSuccess);
+        };
+        Assert.False(kernel.CreateVirtualDomain(owner, source, new(1, 4096)).IsSuccess);
+        Assert.Equal(0, provider.CreateCalls);
+        Assert.False(kernel.PlatformAuthority.HasUnresolvedVirtualDomainCreate(new(process.DomainId, owner)));
+        Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.Equal(RegionState.Released, Assert.Single(kernel.Regions.Snapshot()).State);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)]
+    public void ModelOriginalCreateFactRetainsOutcomeAndPinsActualBacking(int outcome)
+    {
+        var provider = new ObservedModelProvider { CreateFailure = outcome == 0 ? PlatformAuthorityStatus.Denied : null, MalformedLease = outcome == 2 };
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 991, 9910);
+        var subject = new PlatformDomainIdentity(process.DomainId, owner);
+        var source = kernel.MintCapability(process.DomainId, owner, ResourceKind.Virtualization,
+            VirtualizationResourceIds.Create, CapabilityRights.Configure).Value!.CapabilityId;
+        kernel.AllocateRegion(owner, 128);
+        var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var pending = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_pendingVirtualDomainCreates", flags)!.GetValue(kernel.PlatformAuthority)!;
+        var unresolved = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_unresolvedVirtualDomainCreates", flags)!.GetValue(kernel.PlatformAuthority)!;
+        object? original = null;
+        provider.AfterCreate = () =>
+        {
+            original = pending[subject]!;
+            Assert.True((bool)original.GetType().GetProperty("EffectMayHaveOccurred")!.GetValue(original)!);
+            Assert.False(kernel.CreateVirtualDomain(owner, source, new(1, 4096)).IsSuccess);
+            if (outcome == 3) Assert.True(kernel.PlatformAuthority.ObserveBackendReset().IsSuccess);
+            if (outcome == 1) throw new IOException("Original model reply lost.");
+        };
+        Assert.False(kernel.CreateVirtualDomain(owner, source, new(1, 4096)).IsSuccess);
+        Assert.Same(original, unresolved[subject]);
+        Assert.False(pending.Contains(subject));
+        var result = original!.GetType().GetProperty("Observation")!.GetValue(original);
+        if (outcome == 1) Assert.Null(result); else Assert.NotNull(result);
+        Assert.False(kernel.CreateVirtualDomain(owner, source, new(1, 4096)).IsSuccess);
+        Assert.False(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.Equal(1, provider.CreateCalls);
+        Assert.Equal(0, provider.RevokeCalls);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
+    }
+    [Fact]
+    public void ModelResetBeforeCreateEffectDoesNotPinActualReclaim()
+    {
+        var provider = new ObservedModelProvider();
+        var kernel = new RuntimeKernel(provider);
+        var (process, owner) = TestFixtures.Create(kernel, 989, 9890);
+        var source = kernel.MintCapability(process.DomainId, owner, ResourceKind.Virtualization,
+            VirtualizationResourceIds.Create, CapabilityRights.Configure).Value!.CapabilityId;
+        kernel.AllocateRegion(owner, 128);
+        provider.BeforeSource = () =>
+        {
+            provider.BeforeSource = null;
+            Assert.True(kernel.PlatformAuthority.ObserveBackendReset().IsSuccess);
+        };
+        Assert.False(kernel.CreateVirtualDomain(owner, source, new(1, 4096)).IsSuccess);
+        Assert.Equal(0, provider.CreateCalls);
+        Assert.False(kernel.PlatformAuthority.HasUnresolvedVirtualDomainCreate(new(process.DomainId, owner)));
+        Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+        Assert.Equal(RegionState.Released, Assert.Single(kernel.Regions.Snapshot()).State);
+    }
+    [Theory]
     [InlineData(false, false)] [InlineData(true, false)]
     [InlineData(false, true)] [InlineData(true, true)]
     public async Task ConcurrentModelDestroyAndTeardownKeepOriginalClosureInterlocked(bool teardownFirst, bool lostReply)
@@ -659,8 +818,8 @@ public sealed class VirtualizationModelCreationCommitTests
         finally { release.Set(); }
         Assert.Equal(!reset, (await work).IsSuccess);
         Assert.Equal(reset ? 0 : 1, provider.CreateCalls);
-        Assert.Equal(!reset, kernel.TerminateProcess(owner).IsSuccess);
-        if (reset) Assert.True(kernel.PlatformAuthority.HasUnresolvedVirtualDomainCreate(new(process.DomainId, owner)));
+        Assert.True(kernel.TerminateProcess(owner).IsSuccess);
+        if (reset) Assert.False(kernel.PlatformAuthority.HasUnresolvedVirtualDomainCreate(new(process.DomainId, owner)));
     }
 
     [Theory]

@@ -10,7 +10,10 @@ public readonly record struct NeutralExecutableArtifactRequest(
     NeutralChildDomainLease ChildLease,
     NeutralGuestMappingLease GuestMapping,
     ReadOnlyMemory<byte> ImmutablePackage,
-    int MaximumExecutionSteps);
+    int MaximumExecutionSteps)
+{
+    public ulong MaximumPrivateDataBytes { get; init; }
+}
 
 /// <summary>Artifact admission evidence only; never child, memory, or completion authority.</summary>
 public readonly record struct NeutralExecutableArtifactReceipt(
@@ -23,7 +26,12 @@ public readonly record struct NeutralExecutableArtifactReceipt(
     NeutralDomainBindingHandle ParentHandle,
     NeutralDomainBindingEpoch ParentEpoch,
     string ContentDigest,
-    int MaximumExecutionSteps);
+    int MaximumExecutionSteps)
+{
+    public ulong MaximumPrivateDataBytes { get; init; }
+}
+
+public interface INeutralExecutablePrivateDataQuotaProvider : INeutralChildExecutionProvider { }
 
 public readonly record struct NeutralChildExecutionStartRequest(
     NeutralChildDomainLease ChildLease,
@@ -73,7 +81,7 @@ public static class NeutralChildExecutionContract
                 "Executable artifact mapping identity is empty or stale.");
         if (request.ImmutablePackage.IsEmpty || request.ImmutablePackage.Length > MaximumArtifactBytes ||
             request.ImmutablePackage.Length > request.GuestMapping.GuestRange.Length ||
-            request.MaximumExecutionSteps <= 0)
+            request.MaximumExecutionSteps <= 0 || request.MaximumPrivateDataBytes > 0x3000_0000 || request.MaximumPrivateDataBytes % 4096 != 0)
             return NeutralChildDomainContract.Fail(NeutralVirtualizationStatus.Denied,
                 "Executable artifact or finite execution bound exceeds the exact guest mapping.");
         return NeutralChildDomainContract.Ok();
@@ -94,6 +102,7 @@ public static class NeutralChildExecutionContract
             receipt.MappingEpoch != request.GuestMapping.Epoch)
             return NeutralChildDomainContract.Fail(NeutralVirtualizationStatus.Stale, "Artifact receipt has a stale child, parent, or mapping epoch.");
         if (receipt.MappingHandle != request.GuestMapping.Handle || receipt.MaximumExecutionSteps != request.MaximumExecutionSteps ||
+            receipt.MaximumPrivateDataBytes != request.MaximumPrivateDataBytes ||
             receipt.ContentDigest.Length != 64)
             return NeutralChildDomainContract.Fail(NeutralVirtualizationStatus.Faulted, "Artifact receipt is not exact admission evidence.");
         return NeutralChildDomainContract.Ok();

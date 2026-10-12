@@ -18,24 +18,24 @@ public sealed class ExternalChildContractQualificationTests
             Assert.Equal(YAKSys_Hybrid_CPU.Core.NeutralRuntimeFeatureAvailability.RuntimeAdmission, feature.Availability));
         Assert.Equal(YAKSys_Hybrid_CPU.Core.NeutralRuntimeFeatureAvailability.Unavailable,
             neutral.Resolve(YAKSys_Hybrid_CPU.Core.NeutralRuntimeFeatureFamily.BoundedVirtualIo).Availability);
-        Assert.Equal("1.14.0", HybridCpuExternalRuntimePrerequisite.ContractsPackageVersion);
+        Assert.Equal("1.34.0", HybridCpuExternalRuntimePrerequisite.ContractsPackageVersion);
         Assert.Equal(
-            "B96E99BDA066EE585B26A11CBFA7B68CE6BF44FC0006679483CCC1A4EEB678C2",
+            "DB84FC2396E809E63F078E6BEAF88633638DE71809EF5DA22C3AF07CB036A295",
             HybridCpuExternalRuntimePrerequisite.ContractsPackageSha256);
-        Assert.Equal("191A1976DECAF607425B3F93378BA11446B32AF2EBFD09DFF45A26944E7E765F",
+        Assert.Equal("76B1918D075ADEFB50ACA35376FBCC58F9E1A911F3AA8DAA39B7F3388E43E9C4",
             HybridCpuExternalRuntimePrerequisite.RuntimePackageSha256);
         Assert.Equal("fd37b00a207a162baaa860f3f8b96c0c66d7e691",
             HybridCpuExternalRuntimePrerequisite.QualifiedFacade130Commit);
     }
 
     [Fact]
-    public void RepositoryLocalPackages_MatchQualifiedHashes()
+    public void RepositoryLocalPackages_MatchConsumedHashes()
     {
         string root = FindRepositoryRoot();
         Assert.Equal(HybridCpuExternalRuntimePrerequisite.ContractsPackageSha256,
-            Hash(Path.Combine(root, ".packages", "HybridCPU.ExternalRuntime.Contracts.1.14.0.nupkg")));
+            Hash(Path.Combine(root, ".packages", "HybridCPU.ExternalRuntime.Contracts.1.34.0.nupkg")));
         Assert.Equal(HybridCpuExternalRuntimePrerequisite.RuntimePackageSha256,
-            Hash(Path.Combine(root, ".packages", "HybridCPU.ExternalRuntime.1.3.0.nupkg")));
+            Hash(Path.Combine(root, ".packages", "HybridCPU.ExternalRuntime.1.23.8.nupkg")));
     }
 
     [Fact]
@@ -113,3 +113,15 @@ public sealed class ExternalChildContractQualificationTests
     private static string Hash(string path) =>
         Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(path)));
 }
+
+
+
+
+
+
+
+
+
+
+
+

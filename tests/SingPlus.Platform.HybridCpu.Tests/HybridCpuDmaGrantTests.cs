@@ -86,7 +86,7 @@ public sealed class HybridCpuDmaGrantTests
         var provider = new HybridCpuPlatformAuthorityProvider(new NeutralDomainRuntimeFacade());
         var dma = provider.QueryFeatures().Resolve(PlatformFeatureFamily.DmaMapping);
 
-        Assert.Equal(PlatformDmaGrantContract.ContractVersion, dma.ContractVersion);
+        Assert.Equal(PlatformDmaCopySubmissionContract.ContractVersion, dma.ContractVersion);
         Assert.Equal(PlatformFeatureAvailability.RuntimeAdmission, dma.Availability);
         Assert.NotEqual(PlatformFeatureAvailability.Executable, dma.Availability);
     }

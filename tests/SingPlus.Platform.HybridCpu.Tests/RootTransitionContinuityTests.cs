@@ -15,7 +15,7 @@ public sealed class RootTransitionContinuityTests
         var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, ChildClosureTupleTests.RootCloseRuntimeProxy>();
         var proxy = (ChildClosureTupleTests.RootCloseRuntimeProxy)(object)runtime;
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         var owners = (global::System.Collections.IDictionary)provider.GetType().GetField("_domains",
             global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.GetValue(provider)!;
         var original = owners[parent.LeaseId]!;
@@ -72,7 +72,7 @@ public sealed class RootTransitionContinuityTests
         var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, ChildClosureTupleTests.RootCloseRuntimeProxy>();
         var proxy = (ChildClosureTupleTests.RootCloseRuntimeProxy)(object)runtime;
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
-        var parent = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
+        var parent = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7))).Value!;
         Assert.False(provider.TransitionDomainExecution(parent, (PlatformDomainExecutionTransition)777).IsSuccess);
         Assert.Equal(0, proxy.RootTransitionCalls);
         Assert.Equal(PlatformAuthorityStatus.Denied, provider.TransitionDomainExecution(parent, PlatformDomainExecutionTransition.Resume).Status);

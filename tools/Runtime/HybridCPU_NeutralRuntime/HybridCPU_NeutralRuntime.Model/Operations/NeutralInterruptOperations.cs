@@ -2,62 +2,83 @@ namespace YAKSys_Hybrid_CPU.Core;
 
 public sealed partial class NeutralDomainRuntimeFacade
 {
-    public int ActiveInterruptLeaseCount => _dependencies.ActiveInterruptCount;
+    public int ActiveInterruptLeaseCount { get { lock (_lifecycleGate) return _dependencies.ActiveInterruptCount; } }
 
     public NeutralInterruptBindResult BindInterrupt(NeutralDeviceLease device, NeutralInterruptSourceIdentity source)
+        => BindInterruptCore(device,source,null);
+
+    private NeutralInterruptBindResult BindInterruptCore(NeutralDeviceLease device,NeutralInterruptSourceIdentity source,NeutralOriginalIrqAdmissionFact? intent)
     {
-        var parent = _leases.Validate(device);
-        if (!parent.IsValid) return new() { Decision = ToInterruptBind(parent.Status) };
-        if (string.IsNullOrWhiteSpace(source.ResourceId) || !Enum.IsDefined(source.Trigger)) return new() { Decision = NeutralInterruptBindDecision.InvalidSource };
-        if (!NeutralRuntimeValidation.Has(parent.State!.Rights, NeutralDeviceRights.Configure)) return new() { Decision = NeutralInterruptBindDecision.InsufficientDeviceRights };
-        if (_dependencies.HasActiveInterruptBinding(device, source)) return new() { Decision = NeutralInterruptBindDecision.AlreadyBound };
-        if (!TryAllocate(ref _nextResource, out var handle)) return new() { Decision = NeutralInterruptBindDecision.Faulted, Reason = "Neutral resource handle space is exhausted." };
-        var lease = new NeutralInterruptLease(device, source, new(handle), new(1));
-        _dependencies.RegisterInterrupt(lease);
-        return new() { IsBound = true, Lease = lease, Decision = NeutralInterruptBindDecision.Bound };
+        lock (_lifecycleGate)
+        {
+            var parent = _leases.Validate(device);
+            if (!parent.IsValid) return new() { Decision = ToInterruptBind(parent.Status) };
+            if (string.IsNullOrWhiteSpace(source.ResourceId) || !Enum.IsDefined(source.Trigger)) return new() { Decision = NeutralInterruptBindDecision.InvalidSource };
+            if (!NeutralRuntimeValidation.Has(parent.State!.Rights, NeutralDeviceRights.Configure)) return new() { Decision = NeutralInterruptBindDecision.InsufficientDeviceRights };
+            if (_dependencies.HasActiveInterruptBinding(device, source,intent)) return new() { Decision = NeutralInterruptBindDecision.AlreadyBound };
+            if (!TryAllocate(ref _nextResource, out var handle)) return new() { Decision = NeutralInterruptBindDecision.Faulted, Reason = "Neutral resource handle space is exhausted." };
+            var lease = new NeutralInterruptLease(device, source, new(handle), new(1));
+            _dependencies.RegisterInterrupt(lease);
+            return new() { IsBound = true, Lease = lease, Decision = NeutralInterruptBindDecision.Bound };
+        }
     }
 
     /// <summary>Signals an idle interrupt. A repeated signal is rejected as AlreadyPending so pending delivery is never overwritten.</summary>
     public NeutralInterruptSignalResult SignalInterrupt(NeutralInterruptLease lease)
     {
-        var validation = ValidateInterruptLifetime(lease);
-        if (!validation.IsValid) return new() { Decision = ToInterruptSignal(validation.Status) };
-        var state = validation.State!;
-        if (state.Delivery == NeutralDeliveryState.Pending) return new() { Decision = NeutralInterruptSignalDecision.AlreadyPending, Sequence = state.Sequence };
-        if (state.Sequence.Value == ulong.MaxValue) return new() { Decision = NeutralInterruptSignalDecision.Faulted, Sequence = state.Sequence, Reason = "Interrupt delivery sequence space is exhausted." };
-        state.Sequence = new(state.Sequence.Value + 1);
-        state.Delivery = NeutralDeliveryState.Pending;
-        return new() { IsSignaled = true, Decision = NeutralInterruptSignalDecision.Signaled, Sequence = state.Sequence };
+        lock (_lifecycleGate)
+        {
+            var validation = ValidateInterruptLifetime(lease);
+            if (!validation.IsValid) return new() { Decision = ToInterruptSignal(validation.Status) };
+            var state = validation.State!;
+            if (state.OriginalAdmission is { } admission && (state.SourceRevisionExhausted || state.SourceRevision > ulong.MaxValue - 2 ||
+                !OriginalIrqSources(state,admission,admission.Request.RuntimeIncarnation)))
+                return new() { Decision = NeutralInterruptSignalDecision.Faulted, Reason = "Original IRQ signal source or revision exhausted/lost." };
+            if (state.Delivery == NeutralDeliveryState.Pending) return new() { Decision = NeutralInterruptSignalDecision.AlreadyPending, Sequence = state.Sequence };
+            if (state.Sequence.Value == ulong.MaxValue) return new() { Decision = NeutralInterruptSignalDecision.Faulted, Sequence = state.Sequence, Reason = "Interrupt delivery sequence space is exhausted." };
+            state.Sequence = new(state.Sequence.Value + 1);
+            state.Delivery = NeutralDeliveryState.Pending;
+            return new() { IsSignaled = true, Decision = NeutralInterruptSignalDecision.Signaled, Sequence = state.Sequence };
+        }
     }
 
     public NeutralInterruptPollResult PollInterrupt(NeutralInterruptLease lease)
     {
-        var validation = ValidateInterruptLifetime(lease);
-        if (!validation.IsValid) return new() { Lease = lease, Decision = ToInterruptPoll(validation.Status) };
-        var state = validation.State!;
-        var pending = state.Delivery == NeutralDeliveryState.Pending;
-        return new() { IsObserved = pending, Lease = state.Lease, DeliveryAvailable = pending, Sequence = state.Sequence, Decision = pending ? NeutralInterruptPollDecision.Observed : NeutralInterruptPollDecision.NoDelivery };
+        lock (_lifecycleGate)
+        {
+            var validation = ValidateInterruptLifetime(lease);
+            if (!validation.IsValid) return new() { Lease = lease, Decision = ToInterruptPoll(validation.Status) };
+            var state = validation.State!;
+            var pending = state.Delivery == NeutralDeliveryState.Pending;
+            return new() { IsObserved = pending, Lease = state.Lease, DeliveryAvailable = pending, Sequence = state.Sequence, Decision = pending ? NeutralInterruptPollDecision.Observed : NeutralInterruptPollDecision.NoDelivery };
+        }
     }
 
     public NeutralInterruptCompleteResult CompleteInterruptDelivery(NeutralInterruptLease lease, NeutralInterruptDeliverySequence sequence)
     {
-        var validation = ValidateInterruptLifetime(lease);
-        if (!validation.IsValid) return new() { Decision = ToInterruptComplete(validation.Status) };
-        var state = validation.State!;
-        if (state.Delivery != NeutralDeliveryState.Pending) return new() { Decision = NeutralInterruptCompleteDecision.NoPendingDelivery };
-        if (state.Sequence != sequence) return new() { Decision = NeutralInterruptCompleteDecision.WrongSequence };
-        state.Delivery = NeutralDeliveryState.Idle;
-        return new() { Decision = NeutralInterruptCompleteDecision.Completed };
+        lock (_lifecycleGate)
+        {
+            var validation = ValidateInterruptLifetime(lease);
+            if (!validation.IsValid) return new() { Decision = ToInterruptComplete(validation.Status) };
+            var state = validation.State!;
+            if (state.Delivery != NeutralDeliveryState.Pending) return new() { Decision = NeutralInterruptCompleteDecision.NoPendingDelivery };
+            if (state.Sequence != sequence) return new() { Decision = NeutralInterruptCompleteDecision.WrongSequence };
+            state.Delivery = NeutralDeliveryState.Idle;
+            return new() { Decision = NeutralInterruptCompleteDecision.Completed };
+        }
     }
 
     public NeutralInterruptCloseResult CloseInterrupt(NeutralInterruptLease lease)
     {
-        var validation = _leases.Validate(lease);
-        if (!validation.IsValid) return new() { Decision = ToInterruptClose(validation.Status) };
-        if (validation.State!.Delivery == NeutralDeliveryState.Pending) return new() { Decision = NeutralInterruptCloseDecision.PendingDelivery, Reason = "Pending interrupt delivery must complete before close." };
-        validation.State!.Lifecycle = NeutralResourceLifecycle.Revoked;
-        validation.State.Delivery = NeutralDeliveryState.Idle;
-        return new() { Decision = NeutralInterruptCloseDecision.Closed };
+        lock (_lifecycleGate)
+        {
+            var validation = _leases.Validate(lease);
+            if (!validation.IsValid) return new() { Decision = ToInterruptClose(validation.Status) };
+            if (validation.State!.Delivery == NeutralDeliveryState.Pending) return new() { Decision = NeutralInterruptCloseDecision.PendingDelivery, Reason = "Pending interrupt delivery must complete before close." };
+            validation.State!.Lifecycle = NeutralResourceLifecycle.Revoked;
+            validation.State.Delivery = NeutralDeliveryState.Idle;
+            return new() { Decision = NeutralInterruptCloseDecision.Closed };
+        }
     }
 
     private NeutralLeaseValidation<NeutralInterruptState> ValidateInterruptLifetime(NeutralInterruptLease lease)

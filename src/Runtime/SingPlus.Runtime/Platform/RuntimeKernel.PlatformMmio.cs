@@ -1,4 +1,4 @@
-using SingPlus.Contracts;
+﻿using SingPlus.Contracts;
 using SingPlus.Platform;
 using SingPlus.Sip;
 
@@ -214,6 +214,8 @@ public sealed partial class RuntimeKernel
 
     private KernelResult AdvancePlatformMmioLeasesForDevice(PlatformDeviceLease deviceLease)
     {
+        var originalMaps = PlatformAuthority.ResolveOriginalMmioMapsForCleanup(deviceLease.DomainBinding.Subject);
+        if (!originalMaps.IsSuccess) return originalMaps;
         KernelResult? firstFailure = null;
         foreach (var lease in PlatformAuthority.ActiveMmioLeasesForDevice(deviceLease))
         {
@@ -237,10 +239,14 @@ public sealed partial class RuntimeKernel
         ProcessHandle handle)
     {
         var identity = PlatformIdentity(process);
-        var leases = PlatformAuthority.ActiveMmioLeasesForProcess(identity);
+        var originalMaps = PlatformAuthority.ResolveOriginalMmioMapsForCleanup(identity);
+        if (!originalMaps.IsSuccess) return originalMaps;
+        _processPlatformMmioLeases.TryGetValue(handle,out var tracked);
+        var leases = (tracked ?? []).Concat(PlatformAuthority.ActiveMmioLeasesForProcess(identity)).Distinct().ToArray();
         KernelResult? firstFailure = null;
         foreach (var lease in leases.ToArray())
         {
+            if (PlatformAuthority.IsOriginalMmioClosureConsumed(lease,identity)) { UntrackPlatformMmioLease(lease); continue; }
             var revoke = PlatformAuthority.RevokeMmio(lease, identity);
             if (!revoke.IsSuccess)
             {

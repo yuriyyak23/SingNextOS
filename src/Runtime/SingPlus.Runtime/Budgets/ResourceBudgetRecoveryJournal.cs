@@ -179,7 +179,8 @@ internal sealed class ResourceBudgetRecoveryJournal
             throw new ArgumentException("Recovery journal authentication keys require at least 256 bits.", nameof(authenticationKey));
         _key = authenticationKey.ToArray();
 
-        var recovered = ReplayCore(_store.ReadFrames());
+        var frames = _store.ReadFrames();
+        var recovered = ReplayCore(frames);
         if (recovered.LastSequence == 0)
         {
             _epoch = newJournalEpoch ?? Guid.NewGuid();
@@ -189,7 +190,7 @@ internal sealed class ResourceBudgetRecoveryJournal
         {
             _epoch = recovered.JournalEpoch;
             _lastSequence = recovered.LastSequence;
-            _lastAuthenticator = DecodeFrame(_store.ReadFrames()[^1]).Authenticator;
+            _lastAuthenticator = DecodeFrame(frames[^1]).Authenticator;
         }
     }
 

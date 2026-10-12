@@ -2,7 +2,7 @@ using SingPlus.Contracts;
 
 namespace SingPlus.Runtime;
 
-internal interface IV6LocalityCostEvidenceProvider
+public interface IV6LocalityCostEvidenceProvider
 {
     KernelResult<LocalityCostEstimateV1> QueryFresh(string providerClass, long nowUnixMilliseconds);
     KernelResult<ulong> CurrentGeneration(string providerClass);
@@ -12,13 +12,13 @@ internal interface IV6LocalityCostEvidenceProvider
 /// Managed observation source for provider-neutral locality costs. Observations are
 /// advisory only; this provider owns freshness and replay protection, never authority.
 /// </summary>
-internal sealed class V6ManagedLocalityCostProvider : IV6LocalityCostEvidenceProvider
+public sealed class V6ManagedLocalityCostProvider : IV6LocalityCostEvidenceProvider
 {
     private readonly object gate = new();
     private readonly Dictionary<string, LocalityCostEstimateV1> estimates =
         new(StringComparer.Ordinal);
 
-    internal KernelResult Publish(LocalityCostEstimateV1 estimate)
+    public KernelResult Publish(LocalityCostEstimateV1 estimate)
     {
         try { estimate.Validate(); }
         catch (Exception exception) when (exception is ArgumentException or NotSupportedException)

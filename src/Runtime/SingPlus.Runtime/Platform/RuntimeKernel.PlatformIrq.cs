@@ -333,7 +333,7 @@ public sealed partial class RuntimeKernel
             subject,
             binding.EventEndpoint,
             KernelEventClass.ExternalSignal,
-            binding.Source.ResourceId);
+            binding.Source.ResourceId, out var rollbackOriginal);
         if (!staged.IsSuccess)
         {
             // No provider completion occurs: the exact external delivery remains pending.
@@ -342,33 +342,44 @@ public sealed partial class RuntimeKernel
                 staged.Message!);
         }
 
-        var completed = complete(delivery.ProviderSequence, AuthorizeSource);
-        if (!completed.IsSuccess)
+        bool localConsumed = false;
+        try
         {
-            var rollback = _kernelEvents.RollbackExact(subject, staged.Value!);
-            if (!rollback.IsSuccess)
+            var completed = complete(delivery.ProviderSequence, AuthorizeSource);
+            if (!completed.IsSuccess)
             {
+                var rollback = rollbackOriginal!();
+                localConsumed = rollback.IsSuccess;
+                if (!rollback.IsSuccess)
+                {
+                    return KernelResult<PlatformInterruptPollResult>.Fail(
+                        KernelError.PlatformFaulted,
+                        "Interrupt completion failed and the exact staged local event could not be rolled back.");
+                }
+
                 return KernelResult<PlatformInterruptPollResult>.Fail(
-                    KernelError.PlatformFaulted,
-                    "Interrupt completion failed and the exact staged local event could not be rolled back.");
+                    completed.Error,
+                    completed.Message!);
             }
 
-            return KernelResult<PlatformInterruptPollResult>.Fail(
-                completed.Error,
-                completed.Message!);
-        }
+            var committed = _kernelEvents.CommitExact(subject, staged.Value!);
+            localConsumed = committed.IsSuccess;
+            if (!committed.IsSuccess)
+            {
+                fault();
+                return KernelResult<PlatformInterruptPollResult>.Fail(
+                    KernelError.PlatformFaulted,
+                    "Interrupt delivery completed but the exact staged local event could not be committed.");
+            }
 
-        var committed = _kernelEvents.CommitExact(subject, staged.Value!);
-        if (!committed.IsSuccess)
+            return KernelResult<PlatformInterruptPollResult>.Ok(
+                new PlatformInterruptPollResult(true, committed.Value!));
+        }
+        finally
         {
-            fault();
-            return KernelResult<PlatformInterruptPollResult>.Fail(
-                KernelError.PlatformFaulted,
-                "Interrupt delivery completed but the exact staged local event could not be committed.");
+            // Consume only the original local reservation; provider containment remains independent.
+            if (!localConsumed) _ = rollbackOriginal?.Invoke();
         }
-
-        return KernelResult<PlatformInterruptPollResult>.Ok(
-            new PlatformInterruptPollResult(true, committed.Value!));
     }
 
     public KernelResult RevokePlatformInterrupt(
@@ -388,6 +399,8 @@ public sealed partial class RuntimeKernel
 
     internal KernelResult CascadePlatformIrqCapabilityRevocation(CapabilityId capabilityId)
     {
+        var original = PlatformAuthority.ResolveOriginalIrqBindsForCapabilityCleanup(id => CapabilityAuthority.DependsOnCapability(id,capabilityId));
+        if (!original.IsSuccess) return original;
         KernelResult? firstFailure = null;
         foreach (var binding in PlatformAuthority.BeginIrqCapabilityRevocation(capabilityId, id => CapabilityAuthority.DependsOnCapability(id, capabilityId)))
         {
@@ -419,6 +432,8 @@ public sealed partial class RuntimeKernel
 
     private KernelResult AdvancePlatformIrqBindingsForDevice(PlatformDeviceLease deviceLease)
     {
+        var original = PlatformAuthority.ResolveOriginalIrqBindsForCleanup(deviceLease.DomainBinding.Subject);
+        if (!original.IsSuccess) return original;
         KernelResult? firstFailure = null;
         foreach (var binding in PlatformAuthority.ActiveIrqBindingsForDevice(deviceLease))
         {
@@ -462,6 +477,8 @@ public sealed partial class RuntimeKernel
         ProcessHandle handle)
     {
         var identity = PlatformIdentity(process);
+        var original = PlatformAuthority.ResolveOriginalIrqBindsForCleanup(identity);
+        if (!original.IsSuccess) return original;
         var bindings = PlatformAuthority.ActiveIrqBindingsForProcess(identity);
         KernelResult? firstFailure = null;
         foreach (var binding in bindings)

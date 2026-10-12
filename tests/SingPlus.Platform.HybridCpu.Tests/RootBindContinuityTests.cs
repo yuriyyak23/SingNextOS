@@ -14,7 +14,7 @@ public sealed class RootBindContinuityTests
         var provider = new HybridCpuPlatformAuthorityProvider(runtime);
         provider.GetType().GetField("_nextProviderDomainId", global::System.Reflection.BindingFlags.Instance |
             global::System.Reflection.BindingFlags.NonPublic)!.SetValue(provider, capacity);
-        var result = provider.BindDomain(new(new DomainId(10), new ProcessHandle(new ProcessId(12), 7)));
+        var result = provider.BindDomain(new PlatformDomainIdentity(new DomainId(10), new ProcessHandle(new ProcessId(12), 7)));
         var usable = capacity == ulong.MaxValue - 1;
         Assert.Equal(usable, result.IsSuccess);
         Assert.Equal(usable ? 1 : 0, proxy.RootBindCalls);
@@ -23,7 +23,7 @@ public sealed class RootBindContinuityTests
         {
             Assert.Equal(capacity, result.Value!.LeaseId.Value);
             Assert.True(provider.RevokeDomain(result.Value).IsSuccess);
-            Assert.False(provider.BindDomain(new(new DomainId(11), new ProcessHandle(new ProcessId(13), 7))).IsSuccess);
+            Assert.False(provider.BindDomain(new PlatformDomainIdentity(new DomainId(11), new ProcessHandle(new ProcessId(13), 7))).IsSuccess);
             Assert.Equal(1, proxy.RootBindCalls);
         }
     }

@@ -231,6 +231,57 @@ public sealed class VNextPhase16ResourceBudgetRecoveryJournalTests
         Assert.Equal([Amount(1000)], journal.Replay().ConservativeRecoveryCharge);
     }
 
+    [Fact]
+    public void KernelRecoveryRejectsAuthenticatedForkAfterFirstSnapshot()
+    {
+        var original = new MemoryStore();
+        var journal = new ResourceBudgetRecoveryJournal(original, Key, Guid.NewGuid());
+        journal.Append(Payload(ResourceBudgetRecoveryTransition.Prepared));
+        journal.Append(Payload(ResourceBudgetRecoveryTransition.PossibleSubmit));
+        var fork = new MemoryStore();
+        fork.Frames.Add(original.Frames[0].ToArray());
+        new ResourceBudgetRecoveryJournal(fork, Key).Append(
+            Payload(ResourceBudgetRecoveryTransition.CancelledPreSubmit));
+        var changing = new SnapshotChangeStore(original.ReadFrames(), fork.ReadFrames());
+
+        Assert.Throws<InvalidDataException>(() => new RuntimeKernel(null, null,
+            new RuntimeKernelRecoveryOptions("unused-budget-recovery", Key), changing));
+    }
+
+    [Fact]
+    public void KernelRecoveryAcceptsExtensionAndImportsConservativeCharge()
+    {
+        var original = new MemoryStore();
+        var journal = new ResourceBudgetRecoveryJournal(original, Key, Guid.NewGuid());
+        journal.Append(Payload(ResourceBudgetRecoveryTransition.Prepared));
+        var first = original.ReadFrames();
+        journal.Append(Payload(ResourceBudgetRecoveryTransition.PossibleSubmit));
+        var changing = new SnapshotChangeStore(first, original.ReadFrames());
+
+        var kernel = new RuntimeKernel(null, null,
+            new RuntimeKernelRecoveryOptions("unused-budget-recovery", Key), changing);
+
+        Assert.Equal(ResourceBudgetRecoveryTransition.PossibleSubmit,
+            Assert.Single(kernel.ResourceBudgetRecovery!.ReconciliationBacklog).LastPayload.Transition);
+        Assert.Equal(KernelError.BudgetReservationNotFound, kernel.Budgets.Query(
+            Payload(ResourceBudgetRecoveryTransition.Prepared).Lease).Error);
+        Assert.Equal(KernelError.BudgetExceeded, kernel.Budgets.ConfigureSystem([Amount(999)]).Error);
+        Assert.False(kernel.Budgets.RecoveryImportComplete);
+        Assert.True(kernel.Budgets.ConfigureSystem([Amount(1000)]).IsSuccess);
+        Assert.Equal(1000UL, kernel.Budgets.Query(kernel.Budgets.SystemBudget).Value!.Usage
+            .Single(usage => usage.Dimension == ServiceBudgetDimension.ComputeTimeNanoseconds).Used);
+    }
+
+    private sealed class SnapshotChangeStore(IReadOnlyList<byte[]> first, IReadOnlyList<byte[]> next)
+        : IResourceBudgetJournalStore
+    {
+        private int _reads;
+        public IReadOnlyList<byte[]> ReadFrames() =>
+            (++_reads == 1 ? first : next).Select(static frame => frame.ToArray()).ToArray();
+        public void AppendFrame(ReadOnlySpan<byte> frame) =>
+            throw new InvalidOperationException("Recovery must not append or repeat submission.");
+    }
+
     private static ResourceBudgetRecoveryPayload Payload(
         ResourceBudgetRecoveryTransition transition,
         IReadOnlyList<BudgetAmount>? charged = null) =>

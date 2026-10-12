@@ -5,21 +5,63 @@ namespace SingPlus.Runtime;
 
 public sealed partial class RuntimeKernel
 {
-    private sealed class SecureRecord(SecureDomainHandle handle, ProcessHandle owner, PlatformAuthorityBridge.SecureDomainBinding binding)
+    private sealed class SecureRecord
     {
-        public SecureDomainHandle Handle { get; } = handle;
-        public ProcessHandle Owner { get; } = owner;
-        public PlatformAuthorityBridge.SecureDomainBinding Binding { get; } = binding;
-        public SecureDomainState State { get; set; } = SecureDomainState.Created;
-        public ulong PolicyGeneration { get; set; } = 1;
-        public ulong ProtectionGeneration { get; set; } = 1;
+        private readonly object _sourceGate;
+        private SecureDomainState _state = SecureDomainState.Created;
+        private ulong _policyGeneration = 1, _protectionGeneration = 1;
+        private long _sourceRevision;
+        private bool _sourceRevisionExhausted;
+        public SecureRecord(SecureDomainHandle handle, ProcessHandle owner, PlatformAuthorityBridge.SecureDomainBinding binding, object sourceGate)
+        { OriginalOwner = this; Handle = handle; Owner = owner; Binding = binding; _sourceGate = sourceGate; }
+        public SecureRecord OriginalOwner { get; }
+        public SecureDomainHandle Handle { get; }
+        public ProcessHandle Owner { get; }
+        public PlatformAuthorityBridge.SecureDomainBinding Binding { get; }
+        private void AdvanceRevision()
+        { if (_sourceRevision == long.MaxValue) _sourceRevisionExhausted = true; else _sourceRevision++; }
+        public SecureDomainState State { get { lock (_sourceGate) return _state; } set { lock (_sourceGate) { AdvanceRevision(); _state = value; } } }
+        public ulong PolicyGeneration { get { lock (_sourceGate) return _policyGeneration; } set { lock (_sourceGate) { AdvanceRevision(); _policyGeneration = value; } } }
+        public ulong ProtectionGeneration { get { lock (_sourceGate) return _protectionGeneration; } set { lock (_sourceGate) { AdvanceRevision(); _protectionGeneration = value; } } }
+        public long SourceRevision { get { lock (_sourceGate) return _sourceRevision; } }
+        public bool SourceRevisionExhausted { get { lock (_sourceGate) return _sourceRevisionExhausted; } }
+        public void AdvanceProtectionAfterClosure()
+        {
+            lock (_sourceGate)
+            {
+                AdvanceRevision();
+                if (_protectionGeneration == ulong.MaxValue) _sourceRevisionExhausted = true;
+                else _protectionGeneration++;
+            }
+        }
         public List<CapabilityId> Capabilities { get; } = [];
         public Dictionary<PlatformRegionMappingId, PlatformRegionMapping> Regions { get; } = [];
+        public Dictionary<PlatformRegionMappingId, object> RegionBindingSources { get; } = [];
         public bool TransitionInFlight { get; set; }
         public bool ClosureInFlight { get; set; }
         public bool RegionMutationInFlight { get; set; }
     }
     private readonly Dictionary<SecureDomainId, SecureRecord> _secureDomainRecords = [];
+    internal sealed record SecureEffectSource(object OriginalOwner, long Revision);
+    private bool HasOriginalSecureRecord(SecureRecord record)
+    {
+        lock (_platformMemoryUseGate)
+            return ReferenceEquals(record.OriginalOwner, record) && _secureDomainRecords.TryGetValue(record.Handle.DomainId, out var current) && ReferenceEquals(current, record);
+    }
+    private KernelResult<SecureEffectSource> CaptureSecureEffectSource(SecureRecord record)
+    {
+        lock (_platformMemoryUseGate)
+            return HasOriginalSecureRecord(record) && !record.SourceRevisionExhausted
+                ? KernelResult<SecureEffectSource>.Ok(new(record, record.SourceRevision))
+                : KernelResult<SecureEffectSource>.Fail(KernelError.StaleGeneration, "Original local secure owner/revision is unavailable.");
+    }
+    private KernelResult CommitSecureEffectSource(SecureEffectSource source, Func<KernelResult> commit)
+    {
+        lock (_platformMemoryUseGate)
+            return source.OriginalOwner is SecureRecord record && HasOriginalSecureRecord(record) &&
+                !record.SourceRevisionExhausted && record.SourceRevision == source.Revision
+                ? commit() : KernelResult.Fail(KernelError.PlatformFaulted, "Captured local secure source changed.");
+    }
     private ulong _nextSecureDomainId = 1;
     // Deterministic fault-injection seam; it never supplies authority or closure evidence.
     internal Action? BeforeSecureDomainLocalPublication { get; set; }
@@ -135,7 +177,7 @@ public sealed partial class RuntimeKernel
                 {
                     var committed = preparedPublication.Value!( () => CommitSource(() =>
                     {
-                    var record = new SecureRecord(handle, owner, created.Value!);
+                    var record = new SecureRecord(handle, owner, created.Value!, _platformMemoryUseGate);
                     record.Capabilities.AddRange(mintedIds);
                     _secureDomainRecords.Add(handle.DomainId, record);
                     published = new(handle, mintedIds[0], mintedIds[1], mintedIds[2], mintedIds[3]);
@@ -180,6 +222,8 @@ public sealed partial class RuntimeKernel
         var record = ResolveSecure(owner, domain, memoryCapability, SecureComputeResourceIds.Memory(domain.DomainId), CapabilityRights.Map);
         if (!record.IsSuccess) return KernelResult.Fail(record.Error, record.Message!);
         var expected = record.Value!.State;
+        var source = CaptureSecureEffectSource(record.Value);
+        if (!source.IsSuccess) return KernelResult.Fail(source.Error, source.Message!);
         KernelResult CommitSource(Func<KernelResult> commit)
         {
             lock (_platformMemoryUseGate)
@@ -191,9 +235,9 @@ public sealed partial class RuntimeKernel
                 if (!_secureDomainRecords.TryGetValue(domain.DomainId, out var current) ||
                     !ReferenceEquals(current, record.Value) || current.Handle != domain || current.Owner != owner)
                     return KernelResult.Fail(KernelError.StaleGeneration, "Exact secure-region source changed.");
-                return CommitComposedDomainSources(owner, null, () =>
+                return CommitSecureEffectSource(source.Value!, () => CommitComposedDomainSources(owner, null, () =>
                     CapabilityAuthority.CommitSecureDomainEffect(memoryCapability, process.Value!.DomainId,
-                        owner.Generation, CapabilityRights.Map, SecureComputeResourceIds.Memory(domain.DomainId), commit), domain);
+                        owner.Generation, CapabilityRights.Map, SecureComputeResourceIds.Memory(domain.DomainId), commit), domain));
             }
         }
         try { BeforeSecureRegionAdmission?.Invoke(); }
@@ -216,6 +260,8 @@ public sealed partial class RuntimeKernel
         try
         {
             var result = PlatformAuthority.BindSecureRegion(record.Value.Binding, mapping, regionClass, CommitSource);
+            var bindingSource = result.IsSuccess ? PlatformAuthority.CaptureOriginalSecureRegionBinding(record.Value.Binding, mapping) : default;
+            if (result.IsSuccess && !bindingSource.IsSuccess) return KernelResult.Fail(bindingSource.Error, bindingSource.Message!);
             if (result.IsSuccess) BeforeSecureRegionLocalCommit?.Invoke();
             var prepared = result.IsSuccess ? PlatformAuthority.PrepareSecureDomainPublication(
                 record.Value.Binding, record.Value.Binding.Parent.Subject, mapping) : default;
@@ -228,7 +274,7 @@ public sealed partial class RuntimeKernel
                         record.Value.State = SecureDomainState.Quarantined;
                     return result;
                 }
-                var publication = prepared.IsSuccess ? CommitSource(() => prepared.Value!(() =>
+                var publication = prepared.IsSuccess ? PlatformAuthority.CommitOriginalSecureRegionBinding(bindingSource.Value!, () => CommitSource(() => prepared.Value!(() =>
                 {
                 if (record.Value.State != expected)
                 {
@@ -241,10 +287,11 @@ public sealed partial class RuntimeKernel
                 if (record.Value.ProtectionGeneration == ulong.MaxValue || record.Value.Regions.ContainsKey(mapping.MappingId))
                     return KernelResult.Fail(KernelError.PlatformFaulted, "Secure-region publication cannot advance the exact local generation.");
                 record.Value.Regions.Add(mapping.MappingId, mapping);
+                record.Value.RegionBindingSources.Add(mapping.MappingId, bindingSource.Value!);
                 record.Value.State = SecureDomainState.Configured;
                 record.Value.ProtectionGeneration = checked(record.Value.ProtectionGeneration + 1);
                 return KernelResult.Ok();
-                })) : KernelResult.Fail(prepared.Error, prepared.Message!);
+                }))) : KernelResult.Fail(prepared.Error, prepared.Message!);
                 if (!publication.IsSuccess)
                 {
                     // Bridge retains the exact provider binding; refusal does not erase its effect.
@@ -286,8 +333,10 @@ public sealed partial class RuntimeKernel
         }
         try
         {
+            if (!record.Value.RegionBindingSources.TryGetValue(mapping.MappingId, out var bindingSource))
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Original kernel secure-region binding source unavailable.");
             var result = PlatformAuthority.UnbindSecureRegion(record.Value.Binding, mapping,
-                commit => CompleteSecureRegionClosure(record.Value, mapping, commit));
+                commit => CompleteSecureRegionClosure(record.Value, mapping, commit), bindingSource);
             if (!result.IsSuccess) record.Value.State = SecureDomainState.Quarantined;
             return result;
         }
@@ -329,6 +378,9 @@ public sealed partial class RuntimeKernel
         if (!composedUse.Result.IsSuccess) return KernelResult.Fail(composedUse.Result.Error, composedUse.Result.Message!);
         var record = ResolveSecure(owner, domain, executeCapability, SecureComputeResourceIds.Domain(domain.DomainId), CapabilityRights.Execute);
         if (!record.IsSuccess) return KernelResult.Fail(record.Error, record.Message!);
+        var source = CaptureSecureEffectSource(record.Value!);
+        if (!source.IsSuccess) return KernelResult.Fail(source.Error, source.Message!);
+        var localSourceChanged = false;
         KernelResult CommitSource(Func<KernelResult> commit)
         {
             lock (_platformMemoryUseGate)
@@ -340,9 +392,10 @@ public sealed partial class RuntimeKernel
                 if (!_secureDomainRecords.TryGetValue(domain.DomainId, out var current) ||
                     !ReferenceEquals(current, record.Value) || current.Handle != domain || current.Owner != owner)
                     return KernelResult.Fail(KernelError.StaleGeneration, "Exact secure transition source changed.");
-                return CommitComposedDomainSources(owner, null, () =>
+                localSourceChanged |= record.Value!.SourceRevisionExhausted || record.Value.SourceRevision != source.Value!.Revision;
+                return CommitSecureEffectSource(source.Value!, () => CommitComposedDomainSources(owner, null, () =>
                     CapabilityAuthority.CommitSecureDomainEffect(executeCapability, process.Value!.DomainId,
-                        owner.Generation, CapabilityRights.Execute, SecureComputeResourceIds.Domain(domain.DomainId), commit), domain);
+                        owner.Generation, CapabilityRights.Execute, SecureComputeResourceIds.Domain(domain.DomainId), commit), domain));
             }
         }
         SecureDomainState expected;
@@ -400,7 +453,7 @@ public sealed partial class RuntimeKernel
             if (!publication.IsSuccess)
             {
                 record.Value.State = SecureDomainState.Quarantined;
-                PlatformAuthority.QuarantineSecureDomainLocalTransition(record.Value.Binding);
+                PlatformAuthority.QuarantineSecureDomainLocalTransition(record.Value.Binding, localSourceChanged);
                 return publication;
             }
             committedState = record.Value.State;
@@ -423,21 +476,25 @@ public sealed partial class RuntimeKernel
         }
         try
         {
-            lock (_secureExecutionGate)
+            lock (_platformMemoryUseGate)
                 if (record.Value!.State is not (SecureDomainState.Quarantined or SecureDomainState.Faulted or SecureDomainState.Closed))
                     record.Value.State = SecureDomainState.Draining;
             var secureGuestDrain = CloseSecureGuestRegionsForSecureDomain(owner, domain);
             if (!secureGuestDrain.IsSuccess) return secureGuestDrain;
             var composedDrain = DrainSecureExecutions(owner, secureDomain: domain);
             if (!composedDrain.IsSuccess) return composedDrain;
-            if (record.Value!.State is SecureDomainState.Quarantined or SecureDomainState.Faulted)
+            var originalRevoke = PlatformAuthority.HasOriginalSecureRevokeInvocation(record.Value!.Binding);
+            var knownDrain = originalRevoke ? KernelResult<bool>.Ok(true) : PlatformAuthority.ConsumeKnownSecureDrainForCleanup(record.Value.Binding);
+            if (!knownDrain.IsSuccess) return KernelResult.Fail(knownDrain.Error, knownDrain.Message!);
+            if (!originalRevoke && !knownDrain.Value && record.Value.State is SecureDomainState.Quarantined or SecureDomainState.Faulted)
                 return KernelResult.Fail(KernelError.PlatformFaulted, "Quarantined secure-domain authority remains pinned.");
+            if (!HasOriginalSecureRecord(record.Value)) return KernelResult.Fail(KernelError.PlatformFaulted, "Original local secure cleanup owner changed.");
             record.Value.State = SecureDomainState.Draining;
             if (record.Value.Regions.Count != 0) return KernelResult.Fail(KernelError.PlatformBindingActive, "Secure regions must close before secure-domain destruction.");
-            var drain = PlatformAuthority.TransitionSecureDomain(record.Value.Binding, PlatformSecureDomainTransition.BeginDrain);
+            var drain = knownDrain.Value ? KernelResult.Ok() : PlatformAuthority.TransitionSecureDomain(record.Value.Binding, PlatformSecureDomainTransition.BeginDrain);
             if (!drain.IsSuccess) { record.Value.State = SecureDomainState.Quarantined; return drain; }
             var close = PlatformAuthority.RevokeSecureDomain(record.Value.Binding,
-                commit => CompleteSecureDomainClosure(record.Value, commit));
+                commit => CompleteSecureDomainClosure(record.Value, commit, originalRevoke));
             if (!close.IsSuccess) { record.Value.State = SecureDomainState.Quarantined; return close; }
             foreach (var capability in record.Value.Capabilities) _ = RevokeCapability(capability);
             return KernelResult.Ok();
@@ -452,6 +509,7 @@ public sealed partial class RuntimeKernel
     {
         foreach (var record in _secureDomainRecords.Values.Where(record => record.Owner == owner && record.State != SecureDomainState.Closed).OrderBy(record => record.Handle.DomainId.Value).ToArray())
         {
+            if (!HasOriginalSecureRecord(record)) return KernelResult.Fail(KernelError.PlatformFaulted, "Original local secure cleanup owner changed.");
             if (record.TransitionInFlight || record.ClosureInFlight || record.RegionMutationInFlight)
                 return KernelResult.Fail(KernelError.PlatformBindingActive,
                     "Secure-domain transition or closure must settle before process teardown.");
@@ -459,15 +517,21 @@ public sealed partial class RuntimeKernel
             if (!secureGuestDrain.IsSuccess) return secureGuestDrain;
             foreach (var mapping in record.Regions.Values.OrderBy(mapping => mapping.MappingId.Value).ToArray())
             {
+                if (!record.RegionBindingSources.TryGetValue(mapping.MappingId, out var bindingSource))
+                    return KernelResult.Fail(KernelError.PlatformFaulted, "Original kernel secure-region binding source unavailable.");
                 var unbind = PlatformAuthority.UnbindSecureRegion(record.Binding, mapping,
-                    commit => CompleteSecureRegionClosure(record, mapping, commit));
+                    commit => CompleteSecureRegionClosure(record, mapping, commit), bindingSource);
                 if (!unbind.IsSuccess) { record.State = SecureDomainState.Quarantined; return unbind; }
             }
+            var originalRevoke = PlatformAuthority.HasOriginalSecureRevokeInvocation(record.Binding);
+            var knownDrain = originalRevoke ? KernelResult<bool>.Ok(true) : PlatformAuthority.ConsumeKnownSecureDrainForCleanup(record.Binding);
+            if (!knownDrain.IsSuccess) return KernelResult.Fail(knownDrain.Error, knownDrain.Message!);
+            if (!HasOriginalSecureRecord(record)) return KernelResult.Fail(KernelError.PlatformFaulted, "Original local secure cleanup owner changed.");
             record.State = SecureDomainState.Draining;
-            var drain = PlatformAuthority.TransitionSecureDomain(record.Binding, PlatformSecureDomainTransition.BeginDrain);
+            var drain = knownDrain.Value ? KernelResult.Ok() : PlatformAuthority.TransitionSecureDomain(record.Binding, PlatformSecureDomainTransition.BeginDrain);
             if (!drain.IsSuccess) { record.State = SecureDomainState.Quarantined; return drain; }
             var close = PlatformAuthority.RevokeSecureDomain(record.Binding,
-                commit => CompleteSecureDomainClosure(record, commit));
+                commit => CompleteSecureDomainClosure(record, commit, originalRevoke));
             if (!close.IsSuccess) { record.State = SecureDomainState.Quarantined; return close; }
             foreach (var capability in record.Capabilities) _ = RevokeCapability(capability);
         }
@@ -477,34 +541,36 @@ public sealed partial class RuntimeKernel
     private KernelResult CompleteSecureRegionClosure(SecureRecord record, PlatformRegionMapping mapping,
         Func<Func<KernelResult>, KernelResult> bridgeCommit)
     {
+        if (!record.RegionBindingSources.TryGetValue(mapping.MappingId, out var bindingSource))
+            return KernelResult.Fail(KernelError.PlatformFaulted, "Original kernel binding source unavailable for completion.");
         BeforeSecureRegionLocalCommit?.Invoke();
-        var prepared = PlatformAuthority.PrepareSecureDomainPublication(record.Binding,
-            record.Binding.Parent.Subject, mapping, closingRegion: true);
+        var prepared = PlatformAuthority.PrepareOriginalSecureRegionClosureCompletion(record.Binding, mapping, bindingSource);
         if (!prepared.IsSuccess) return KernelResult.Fail(KernelError.PlatformFaulted, prepared.Message!);
         lock (_platformMemoryUseGate)
             return prepared.Value!(() => bridgeCommit(() =>
             {
-                if (!_secureDomainRecords.TryGetValue(record.Handle.DomainId, out var current) || !ReferenceEquals(current, record) ||
-                    !record.Regions.TryGetValue(mapping.MappingId, out var exact) || exact != mapping)
+                if (!HasOriginalSecureRecord(record) ||
+                    !record.Regions.TryGetValue(mapping.MappingId, out var exact) || exact != mapping ||
+                    !record.RegionBindingSources.TryGetValue(mapping.MappingId, out var currentBindingSource) || !ReferenceEquals(currentBindingSource, bindingSource))
                     return KernelResult.Fail(KernelError.PlatformFaulted, "Exact secure-region local closure record changed before completion.");
-                var protectionGeneration = checked(record.ProtectionGeneration + 1);
                 record.Regions.Remove(mapping.MappingId);
-                record.ProtectionGeneration = protectionGeneration;
+                record.RegionBindingSources.Remove(mapping.MappingId);
+                record.AdvanceProtectionAfterClosure();
                 return KernelResult.Ok();
             }));
     }
 
     private KernelResult CompleteSecureDomainClosure(SecureRecord record,
-        Func<Func<KernelResult>, KernelResult> bridgeCommit)
+        Func<Func<KernelResult>, KernelResult> bridgeCommit, bool consumingOriginalClosure = false)
     {
         BeforeSecureDomainClosureLocalCommit?.Invoke();
-        var prepared = PlatformAuthority.PrepareSecureDomainPublication(record.Binding, record.Binding.Parent.Subject);
+        var prepared = consumingOriginalClosure ? PlatformAuthority.PrepareOriginalSecureDomainClosureCompletion(record.Binding) :
+            PlatformAuthority.PrepareSecureDomainPublication(record.Binding, record.Binding.Parent.Subject);
         if (!prepared.IsSuccess) return KernelResult.Fail(prepared.Error, prepared.Message!);
         lock (_platformMemoryUseGate)
             return prepared.Value!(() => bridgeCommit(() =>
             {
-                if (!_secureDomainRecords.TryGetValue(record.Handle.DomainId, out var current) ||
-                    !ReferenceEquals(current, record) || record.State is SecureDomainState.Quarantined or SecureDomainState.Faulted)
+                if (!HasOriginalSecureRecord(record) || !consumingOriginalClosure && record.State is SecureDomainState.Quarantined or SecureDomainState.Faulted)
                     return KernelResult.Fail(KernelError.PlatformFaulted,
                         "Exact secure-domain local closure record changed before completion.");
                 record.State = SecureDomainState.Closed;
@@ -525,7 +591,7 @@ public sealed partial class RuntimeKernel
         if (capability.Value!.ResourceKind is not (ResourceKind.SecureCompute or ResourceKind.Evidence) || capability.Value.ResourceId != resource)
             return KernelResult<SecureRecord>.Fail(KernelError.WrongCapabilityResource, "Capability does not authorize the exact secure-domain resource.");
         if (!_secureDomainRecords.TryGetValue(domain.DomainId, out var record)) return KernelResult<SecureRecord>.Fail(KernelError.PlatformBindingNotFound, "Secure domain was not found.");
-        if (record.Handle != domain || record.Owner != owner) return KernelResult<SecureRecord>.Fail(KernelError.StaleGeneration, "Secure domain is stale or owned by another process.");
+        if (!HasOriginalSecureRecord(record) || record.Handle != domain || record.Owner != owner) return KernelResult<SecureRecord>.Fail(KernelError.StaleGeneration, "Secure domain is stale or owned by another process.");
         if (rights != CapabilityRights.Configure && rights != CapabilityRights.Read)
         {
             var composed = RevalidateComposedDomain(owner, secureDomain: domain);

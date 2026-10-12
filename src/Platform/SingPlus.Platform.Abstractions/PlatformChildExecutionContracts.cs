@@ -10,7 +10,10 @@ public readonly record struct PlatformExecutableArtifactRequest(
     PlatformProviderChildDomainLease ChildLease,
     PlatformProviderGuestRegionMappingLease GuestMapping,
     ReadOnlyMemory<byte> ImmutablePackage,
-    int MaximumExecutionSteps);
+    int MaximumExecutionSteps)
+{
+    public ulong MaximumPrivateDataBytes { get; init; }
+}
 
 public readonly record struct PlatformExecutableArtifactReceipt(
     PlatformExecutableArtifactId ArtifactId,
@@ -22,7 +25,13 @@ public readonly record struct PlatformExecutableArtifactReceipt(
     PlatformProviderDomainLeaseId ParentLeaseId,
     PlatformProviderLeaseGeneration ParentGeneration,
     string ContentDigest,
-    int MaximumExecutionSteps);
+    int MaximumExecutionSteps)
+{
+    public ulong MaximumPrivateDataBytes { get; init; }
+}
+
+/// <summary>Optional producer guarantee: nonzero data-page quota is enforced by actual materialization and execution.</summary>
+public interface IPlatformExecutablePrivateDataQuotaProvider : IPlatformChildExecutionProvider { }
 
 public readonly record struct PlatformChildExecutionStartRequest(
     PlatformProviderChildDomainLease ChildLease,
@@ -62,7 +71,8 @@ public static class PlatformChildExecutionContract
             (PlatformChildAuthorityClass.Execution | PlatformChildAuthorityClass.GuestMemory))
             return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Denied, "Artifact admission requires execution and guest-memory authority.");
         if (request.ImmutablePackage.IsEmpty || request.ImmutablePackage.Length > NeutralArtifactLimit ||
-            request.ImmutablePackage.Length > request.GuestMapping.GuestRange.ByteLength || request.MaximumExecutionSteps <= 0)
+            request.ImmutablePackage.Length > request.GuestMapping.GuestRange.ByteLength || request.MaximumExecutionSteps <= 0 ||
+            request.MaximumPrivateDataBytes > 0x3000_0000 || request.MaximumPrivateDataBytes % 4096 != 0)
             return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Denied, "Artifact and finite execution bound must fit the exact guest mapping.");
         return PlatformAuthorityResult.Ok();
     }
@@ -75,7 +85,7 @@ public static class PlatformChildExecutionContract
         var requestValidation = ValidateRequest(request);
         if (!requestValidation.IsSuccess) return requestValidation;
         if (receipt.ArtifactId.Value == 0 || receipt.ContentDigest.Length != 64 ||
-            receipt.MaximumExecutionSteps != request.MaximumExecutionSteps)
+            receipt.MaximumExecutionSteps != request.MaximumExecutionSteps || receipt.MaximumPrivateDataBytes != request.MaximumPrivateDataBytes)
             return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted,
                 "Artifact admission evidence is empty or does not match the request.");
         if (receipt.ChildLeaseId != request.ChildLease.LeaseId ||

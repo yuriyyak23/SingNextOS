@@ -115,13 +115,13 @@ public sealed class HybridCpuDmaVisibilityTests
     }
 
     [Fact]
-    public void DmaVisibilityV2IsRuntimeAdmissionAndStillHasNoSubmitSurface()
+    public void OriginalCopyV5HasManagedBackingSurfaceWithoutExecutablePromotion()
     {
         var provider = new HybridCpuPlatformAuthorityProvider(new NeutralDomainRuntimeFacade());
         var dma = provider.QueryFeatures().Resolve(PlatformFeatureFamily.DmaMapping);
 
-        Assert.Equal(PlatformDmaVisibilityContract.ContractVersion, dma.ContractVersion);
-        Assert.Equal(2U, dma.ContractVersion);
+        Assert.Equal(PlatformDmaCopySubmissionContract.ContractVersion, dma.ContractVersion);
+        Assert.Equal(5U, dma.ContractVersion);
         Assert.Equal(PlatformFeatureAvailability.RuntimeAdmission, dma.Availability);
         Assert.NotEqual(PlatformFeatureAvailability.Executable, dma.Availability);
 
@@ -131,9 +131,10 @@ public sealed class HybridCpuDmaVisibilityTests
             .ToArray();
         Assert.Contains(nameof(IPlatformDmaVisibilityProvider.PrepareDmaGrantVisibility), providerMethods);
         Assert.Contains(nameof(IPlatformDmaVisibilityProvider.AcquireDmaGrantVisibility), providerMethods);
-        Assert.DoesNotContain(providerMethods, static name =>
-            name.Contains("SubmitDma", StringComparison.OrdinalIgnoreCase) ||
-            name.Contains("CompleteDma", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(nameof(IPlatformDmaCopyBackingProvider.SubmitDmaCopy),providerMethods);
+        Assert.IsAssignableFrom<IPlatformOriginalDmaCopyProvider>(provider);
+        Assert.IsAssignableFrom<IPlatformDmaCompletionProvider>(provider);
+        Assert.False(provider is IPlatformDmaSubmissionProvider); // No unbound single-leg effect.
     }
 
     private static (PlatformDeviceLease Device, PlatformOwnedRegionSliceMapping Mapping)

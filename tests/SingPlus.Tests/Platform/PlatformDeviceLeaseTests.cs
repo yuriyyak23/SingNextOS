@@ -1,4 +1,4 @@
-using System.Reflection;
+﻿using System.Reflection;
 using SingPlus.Contracts;
 using SingPlus.Platform;
 using SingPlus.Runtime;
@@ -814,22 +814,22 @@ public sealed class PlatformDeviceLeaseTests
             capability,
             PlatformDeviceRights.Configure);
 
-        Assert.True(recordObserved, "Malformed receipt owner must retain lifetime before cleanup callback.");
+        Assert.False(recordObserved, "Foreign malformed returned receipt must not authorize compensation.");
         var records = (global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge)
             .GetField("_deviceLeases", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(kernel.PlatformAuthority)!;
         var original = Assert.Single(records.Values.Cast<object>());
-        Assert.Equal(true, original.GetType().GetProperty("RevokeMayHaveEffect")!.GetValue(original));
-        Assert.True(((PlatformAuthorityResult)original.GetType().GetProperty("RevokeObservation")!.GetValue(original)!).IsSuccess);
+        Assert.Equal(false, original.GetType().GetProperty("RevokeMayHaveEffect")!.GetValue(original));
+        Assert.Null(original.GetType().GetProperty("RevokeObservation")!.GetValue(original));
         Assert.Equal(false, original.GetType().GetProperty("ProviderClosureConfirmed")!.GetValue(original));
         Assert.False(result.IsSuccess);
         Assert.Equal(KernelError.PlatformFaulted, result.Error);
         Assert.Equal(1, provider.DeviceBindCalls);
-        Assert.Equal(1, provider.DeviceRevokeCalls);
+        Assert.Equal(0, provider.DeviceRevokeCalls);
         Assert.False(kernel.RevokeCapability(capability).IsSuccess);
         Assert.False(kernel.RevokePlatformDomain(subject, binding).IsSuccess);
         Assert.False(kernel.TerminateProcess(subject).IsSuccess);
         Assert.True(kernel.Processes.Resolve(subject).IsSuccess);
-        Assert.Equal(1, provider.DeviceRevokeCalls);
+        Assert.Equal(0, provider.DeviceRevokeCalls);
         Assert.Equal(0, provider.DomainRevokeCalls);
     }
 
@@ -854,7 +854,7 @@ public sealed class PlatformDeviceLeaseTests
             PlatformDeviceRights.Configure);
 
         Assert.Equal(KernelError.PlatformFaulted, bound.Error);
-        Assert.Equal(1, provider.DeviceRevokeCalls);
+        Assert.Equal(0, provider.DeviceRevokeCalls);
         Assert.Equal(0, provider.DomainRevokeCalls);
         Assert.False(kernel.RevokePlatformDomain(subject, binding).IsSuccess);
         Assert.Equal(0, provider.DomainRevokeCalls);
