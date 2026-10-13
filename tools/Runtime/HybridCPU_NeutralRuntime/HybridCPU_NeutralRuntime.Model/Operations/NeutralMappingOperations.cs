@@ -36,6 +36,8 @@ public sealed partial class NeutralDomainRuntimeFacade
         var validation = _leases.Validate(lease);
         if (!validation.IsValid) return new() { Decision = ToMappingClose(validation.Status) };
         if (_dependencies.HasActiveDependents(lease)) return new() { Decision = NeutralOwnedRegionCloseDecision.ActiveDependents };
+        if (!EndPreparedDsc1Custody(validation.State!))
+            return new() { Decision = NeutralOwnedRegionCloseDecision.ActiveDependents, Reason = "Original DSC1 byte custody is unknown; mapping remains retained." };
         validation.State!.Lifecycle = NeutralResourceLifecycle.Revoked;
         return new() { Decision = NeutralOwnedRegionCloseDecision.Closed };
     }

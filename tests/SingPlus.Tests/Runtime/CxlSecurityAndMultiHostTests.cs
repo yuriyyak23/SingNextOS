@@ -333,7 +333,7 @@ public sealed class CxlSecurityAndMultiHostTests
     }
 
     [Fact]
-    public void WritableSecondHostIsRejectedUntilFenceAndReclaimComplete()
+    public void LocalFenceCannotReclaimOrEnableSecondWriterWithoutRemoteClosure()
     {
         var kernel = new RuntimeKernel();
         var (_, ownerHandle) = TestFixtures.Create(kernel, 1001, 1002);
@@ -346,11 +346,11 @@ public sealed class CxlSecurityAndMultiHostTests
         Assert.True(gate.Fence(first.Binding).IsSuccess);
         Assert.Equal(KernelError.RegionUseConflict,
             gate.Bind(buffer.Handle, owner, new("host-b"), MultiHostAccessMode.Writable, false).Error);
-        Assert.True(gate.BeginReclaim(first.Binding).IsSuccess);
+        Assert.Equal(KernelError.PlatformUnsupported, gate.BeginReclaim(first.Binding).Error);
         Assert.Equal(KernelError.RegionUseConflict,
             gate.Bind(buffer.Handle, owner, new("host-b"), MultiHostAccessMode.Writable, false).Error);
-        Assert.True(gate.CompleteReclaim(first.Binding).IsSuccess);
-        Assert.True(gate.Bind(buffer.Handle, owner, new("host-b"), MultiHostAccessMode.Writable, false).IsSuccess);
+        Assert.Equal(KernelError.PlatformUnsupported, gate.CompleteReclaim(first.Binding).Error);
+        Assert.Equal(KernelError.RegionUseConflict, gate.Bind(buffer.Handle, owner, new("host-b"), MultiHostAccessMode.Writable, false).Error);
     }
 
     [Fact]
@@ -380,7 +380,7 @@ public sealed class CxlSecurityAndMultiHostTests
     }
 
     [Fact]
-    public void HostDisappearanceFencesBeforeReclaimAndNeverReassignsSilently()
+    public void HostDisappearanceRetainsOriginalUseAndCannotProveRemoteIsolation()
     {
         var kernel = new RuntimeKernel();
         var (_, handle) = TestFixtures.Create(kernel, 1025, 1026);
@@ -395,9 +395,9 @@ public sealed class CxlSecurityAndMultiHostTests
         Assert.Equal(MultiHostBindingState.Fenced, disappeared.Value!.State);
         Assert.Equal(KernelError.RegionUseConflict,
             gate.Bind(buffer.Handle, owner, new("host-b"), MultiHostAccessMode.Writable, false).Error);
-        Assert.True(gate.BeginReclaim(first.Binding).IsSuccess);
-        Assert.True(gate.CompleteReclaim(first.Binding).IsSuccess);
-        Assert.True(gate.Bind(buffer.Handle, owner, new("host-b"), MultiHostAccessMode.Writable, false).IsSuccess);
+        Assert.Equal(KernelError.PlatformUnsupported, gate.BeginReclaim(first.Binding).Error);
+        Assert.Equal(KernelError.PlatformUnsupported, gate.CompleteReclaim(first.Binding).Error);
+        Assert.Equal(KernelError.RegionUseConflict, gate.Bind(buffer.Handle, owner, new("host-b"), MultiHostAccessMode.Writable, false).Error);
     }
 
     [Fact]

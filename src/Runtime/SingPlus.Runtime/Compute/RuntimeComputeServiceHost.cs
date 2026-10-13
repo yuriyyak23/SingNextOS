@@ -16,8 +16,9 @@ namespace SingPlus.Runtime;
 /// accepted platform use has reached exact terminal closure and the temporary
 /// mappings are closed.
 ///
-/// This is a ModelOnly composition. It is not direct-borrow external execution,
-/// zero-copy, coherent shared memory or executable HybridCPU evidence.
+/// Supports lifecycle-only ModelOnly reference Copy and the separate original
+/// neutral software backing profile. Neither path is direct-borrow external
+/// execution, zero-copy, coherent shared memory or executable HybridCPU evidence.
 /// </summary>
 public sealed class RuntimeComputeServiceHost
 {
@@ -336,7 +337,7 @@ public sealed class RuntimeComputeServiceHost
         }
 
         if (pending.AdmissionRefusal is { } refusal) return refusal;
-        if (pending.AbortError == KernelError.PlatformFaulted)
+        if (pending.AbortError == KernelError.PlatformFaulted && pending.Submission is null)
         {
             return KernelResult.Fail(
                 pending.AbortError.Value,
@@ -346,6 +347,13 @@ public sealed class RuntimeComputeServiceHost
 
         var callerCancellation = ObserveCallerCancellation(pending);
         if (!callerCancellation.IsSuccess) return callerCancellation;
+
+        if (pending.AbortError == KernelError.PlatformFaulted && pending.Outcome is null && pending.Submission is { } original)
+        {
+            var closed = _kernel.CancelPlatformDsc1Copy(_service, original);
+            if (!closed.IsSuccess) return KernelResult.Fail(closed.Error, closed.Message!);
+            pending.Outcome = closed.Value.Outcome;
+        }
 
         if (!pending.CancelledBeforeProviderInvocation && pending.AbortError is null && pending.Outcome is null)
         {
@@ -400,7 +408,7 @@ public sealed class RuntimeComputeServiceHost
         }
 
         if (pending.AdmissionRefusal is { } refusal) return refusal;
-        if (pending.AbortError == KernelError.PlatformFaulted ||
+        if ((pending.AbortError == KernelError.PlatformFaulted && pending.Submission is null) ||
             !pending.CancelledBeforeProviderInvocation && pending.Submission is null && pending.AbortError is null)
         {
             return KernelResult.Fail(
@@ -487,6 +495,18 @@ public sealed class RuntimeComputeServiceHost
             : _kernel.CancelResponse(_service, _endpoint, requestSequence);
     }
 
+    private KernelResult<PlatformRegionMapping> MapCopyBacking(ProcessHandle owner, PlatformDomainBinding binding,
+        CapabilityId capability, RegionHandle region, PlatformMemoryAccess access)
+    {
+        if (!_kernel.PlatformAuthority.SupportsDsc1Backing)
+            return _kernel.MapPlatformOwnedRegion(owner, binding, capability, region, access);
+        var descriptor = _kernel.Regions.Validate(region, new(_serviceDomain, owner.Generation));
+        if (!descriptor.IsSuccess) return KernelResult<PlatformRegionMapping>.Fail(descriptor.Error, descriptor.Message!);
+        var mapped = _kernel.MapPlatformOwnedRegionSlice(owner, binding, capability, region, 0, descriptor.Value!.ByteLength, access);
+        return mapped.IsSuccess ? KernelResult<PlatformRegionMapping>.Ok(mapped.Value.Mapping) :
+            KernelResult<PlatformRegionMapping>.Fail(mapped.Error, mapped.Message!);
+    }
+
     private KernelResult PrepareAndSubmit(PendingCopy pending)
     {
         if (pending.SourceBorrow.Length != pending.Destination.Length)
@@ -535,7 +555,7 @@ public sealed class RuntimeComputeServiceHost
             return KernelResult.Fail(destinationCapability.Error, destinationCapability.Message!);
         pending.DestinationMappingCapability = destinationCapability.Value!.CapabilityId;
 
-        var sourceMapping = _kernel.MapPlatformOwnedRegion(
+        var sourceMapping = MapCopyBacking(
             _service,
             _platformDomain,
             pending.StagingMappingCapability.Value,
@@ -545,7 +565,7 @@ public sealed class RuntimeComputeServiceHost
             return KernelResult.Fail(sourceMapping.Error, sourceMapping.Message!);
         pending.StagingMapping = sourceMapping.Value!;
 
-        var destinationMapping = _kernel.MapPlatformOwnedRegion(
+        var destinationMapping = MapCopyBacking(
             _service,
             _platformDomain,
             pending.DestinationMappingCapability.Value,
@@ -564,14 +584,15 @@ public sealed class RuntimeComputeServiceHost
             0,
             pending.Destination.Length);
 
-        var submission = _kernel.SubmitPlatformDsc1Copy(
+        var submission = _kernel.SubmitComputeServiceDsc1Copy(
             _service,
             _platformDomain,
             _platformComputeCapability,
             pending.StagingSource,
             sourceRange,
             pending.Destination,
-            destinationRange);
+            destinationRange,
+            original => pending.Submission = original);
         if (!submission.IsSuccess)
             return KernelResult.Fail(submission.Error, submission.Message!);
 

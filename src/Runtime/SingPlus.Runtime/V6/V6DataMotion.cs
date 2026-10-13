@@ -6,7 +6,10 @@ using SingPlus.Sip;
 namespace SingPlus.Runtime;
 
 internal sealed record V6DataMotionExecution<T>(OwnedBuffer<T> Moved, DataMotionReceiptV1 Receipt)
-    where T : unmanaged;
+    where T : unmanaged
+{
+    internal ProviderDmaDataMotionResult<T>? PreparedProviderResult { get; init; }
+}
 
 public sealed partial class RuntimeKernel
 {
@@ -358,31 +361,55 @@ public sealed partial class RuntimeKernel
                 destinationMappingClosed.Message!);
         // Exact completion/visibility and both original mapping closures end the
         // provider's byte lifetime. Local publication is a separate fresh commit.
-        lock (_platformMemoryUseGate) payload.Dispose();
-        var releasedSource = ReleaseRegion(source, input);
-        if (!releasedSource.IsSuccess)
-            return KernelResult<V6DataMotionExecution<T>>.Fail(releasedSource.Error, releasedSource.Message!);
-
+        // Source reclaim ends only source custody. Keep destination access
+        // reserved through callbacks until the final fresh publication commit.
+        // Allocate and validate the unpublished result before irreversible
+        // source consumption. Allocation failure leaves the original retryable.
         var receipt = new DataMotionReceiptV1(1,
             $"dma-move:{input.Handle.RegionId.Value}:{input.Handle.Generation.Value}:{output.Handle.RegionId.Value}",
             plan, source.Generation, destination.Generation, output.Handle.Generation.Value,
             [DataMotionLifecycleStateV1.Planned, DataMotionLifecycleStateV1.SourcePinned,
              DataMotionLifecycleStateV1.Copied, DataMotionLifecycleStateV1.SourceReleased,
              DataMotionLifecycleStateV1.Completed]).Validate();
+        var preparedResult = new V6DataMotionExecution<T>(output, receipt)
+        { PreparedProviderResult = new ProviderDmaDataMotionResult<T>(output, receipt) };
+        lock (_platformMemoryUseGate) payload.ReleaseSourceAfterClosure();
+        var releasedSource = ReleaseRegion(source, input);
+        if (!releasedSource.IsSuccess)
+        {
+            if (!input.IsValid)
+            {
+                // Reentry may have consumed the source while its release
+                // callback ran. Native grants/mappings are already closed;
+                // end original destination custody without publishing a result.
+                lock (_platformMemoryUseGate)
+                    return RefuseClosedPublication(releasedSource.Error,releasedSource.Message!);
+            }
+            return KernelResult<V6DataMotionExecution<T>>.Fail(releasedSource.Error, releasedSource.Message!);
+        }
         lock (_platformMemoryUseGate)
         {
             var current = Processes.Resolve(destination);
-            if (!current.IsSuccess) return KernelResult<V6DataMotionExecution<T>>.Fail(current.Error,current.Message!);
+            if (!current.IsSuccess) return RefuseClosedPublication(current.Error,current.Message!);
             if (!ReferenceEquals(current.Value,destinationProcess.Value))
-                return KernelResult<V6DataMotionExecution<T>>.Fail(KernelError.StaleGeneration,"Original DMA destination incarnation changed before publication.");
+                return RefuseClosedPublication(KernelError.StaleGeneration,"Original DMA destination incarnation changed before publication.");
             var accepts = EnsureProcessAcceptsNewEffects(current.Value!);
-            if (!accepts.IsSuccess) return KernelResult<V6DataMotionExecution<T>>.Fail(accepts.Error,accepts.Message!);
+            if (!accepts.IsSuccess) return RefuseClosedPublication(accepts.Error,accepts.Message!);
             var exact = Regions.Validate(output.Handle,new RegionOwner(current.Value!.DomainId,destination.Generation));
             if (!exact.IsSuccess || !output.IsValid || !ReferenceEquals(payload.Original,payload) ||
                 !_dmaCopyPayloads.TryGetValue(sourceGrant.GrantId,out var retained) || !ReferenceEquals(retained,payload))
-                return KernelResult<V6DataMotionExecution<T>>.Fail(KernelError.InvalidRegionState,"Original DMA output/backing changed before publication.");
+                return RefuseClosedPublication(KernelError.InvalidRegionState,"Original DMA output/backing changed before publication.");
             payload.Dispose(); _dmaCopyPayloads.Remove(sourceGrant.GrantId);
-            return KernelResult<V6DataMotionExecution<T>>.Ok(new(output, receipt));
+            return KernelResult<V6DataMotionExecution<T>>.Ok(preparedResult);
+        }
+
+        KernelResult<V6DataMotionExecution<T>> RefuseClosedPublication(KernelError error,string message)
+        {
+            // Both original grants/mappings already closed above. Refusing a
+            // result must not strand consumed destination custody or its owner.
+            if(ReferenceEquals(payload.Original,payload) && _dmaCopyPayloads.TryGetValue(sourceGrant.GrantId,out var original) && ReferenceEquals(original,payload))
+            {payload.Dispose();_dmaCopyPayloads.Remove(sourceGrant.GrantId);}
+            return KernelResult<V6DataMotionExecution<T>>.Fail(error,message);
         }
 
         KernelResult CloseGrant(ProcessHandle process, PlatformDmaGrant grant, bool sourceLeg)

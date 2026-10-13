@@ -1,4 +1,11 @@
 namespace SingPlus.Platform;
+public static class PlatformOriginalDsc1CopyBackingContract
+{
+    public const uint ContractVersion = 2;
+    public static bool Supports(PlatformFeatureDescriptor feature) =>
+        feature.Family == PlatformFeatureFamily.Dsc1BulkCompute &&
+        feature.ContractVersion == ContractVersion && feature.Availability == PlatformFeatureAvailability.RuntimeAdmission;
+}
 public sealed class PlatformOriginalDsc1CopyBackingRequest(PlatformDsc1CopyRequest request,ReadOnlyMemory<byte> source,Memory<byte> destination)
 {
     public Guid InvocationId {get;}=Guid.NewGuid();

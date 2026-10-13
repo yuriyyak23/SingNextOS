@@ -88,12 +88,14 @@ public sealed partial class PlatformDmaSubmissionTests
         s.Kernel.BeforeRegionReleaseQualificationHook = () =>
         {
             s.Kernel.BeforeRegionReleaseQualificationHook = null;
-            if (transfer) Assert.True(s.Kernel.TransferRegion(s.DestinationSubject,next,s.Output).IsSuccess);
+            if (transfer) Assert.Equal(KernelError.RegionUseConflict,s.Kernel.TransferRegion(s.DestinationSubject,next,s.Output).Error);
             else Assert.True(s.Kernel.TerminateProcess(s.DestinationSubject).IsSuccess);
         };
         var moved = s.Kernel.ExecuteV6ProviderDmaDataMotion(s.SourceSubject,s.DestinationSubject,s.Input,s.Output,s.Plan,
             s.SourceMapping,s.Source,sp,s.DestinationMapping,s.Destination,dp,() => 3,() => 5);
-        Assert.False(moved.IsSuccess); Assert.False(s.Input.IsValid); Assert.False(s.Output.IsValid);
+        Assert.Equal(transfer,moved.IsSuccess); Assert.False(s.Input.IsValid);
+        if(transfer)Assert.True(s.Kernel.TransferRegion(s.DestinationSubject,next,s.Output).IsSuccess);
+        Assert.False(s.Output.IsValid);
         Assert.Equal(1,s.Provider.CopySubmitCalls); Assert.Equal(2,s.Provider.DmaRevokeCalls); Assert.Equal(2,s.Provider.MappingRevokeCalls);
         var payloads = (global::System.Collections.IDictionary)s.Kernel.GetType().GetField("_dmaCopyPayloads",global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic)!.GetValue(s.Kernel)!;
         Assert.Empty(payloads);

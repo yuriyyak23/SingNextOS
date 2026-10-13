@@ -12,6 +12,7 @@ public sealed partial class RuntimeKernel
         RuntimeBufferLease<byte> destinationLease,
         byte[] stagedOutput)
     {
+        public Dsc1PayloadRecord? OriginalOwner { get; set; }
         public ProcessHandle Owner { get; } = owner;
         public PlatformDsc1CopySubmission? AcceptedSubmission { get; private set; }
         public PlatformDsc1CopySubmission Submission =>
@@ -20,6 +21,7 @@ public sealed partial class RuntimeKernel
         public RuntimeBufferLease<byte> SourceLease { get; } = sourceLease;
         public RuntimeBufferLease<byte> DestinationLease { get; } = destinationLease;
         public byte[] StagedOutput { get; } = stagedOutput;
+        public byte[]? StagedInput { get; init; }
         public CapabilityId ComputeCapability { get; set; }
         public CapabilityId SourceCapability { get; set; }
         public CapabilityId DestinationCapability { get; set; }
@@ -38,11 +40,13 @@ public sealed partial class RuntimeKernel
         _dsc1PayloadOperations = [];
 
     /// <summary>
-    /// Submits the bounded UInt8 DSC1 Copy reference model. The source is copied into
+    /// Submits bounded UInt8 DSC1 Copy. The source is copied into
     /// private staging and subsequent owner access through <see cref="OwnedBuffer{T}"/>
     /// is rejected until exact provider completion/cancellation closure is validated.
     /// Previously acquired managed aliases cannot be revoked by this ModelOnly path.
-    /// This method accepts only a provider explicitly classified as ModelOnly.
+    /// Lifecycle-only providers require ModelOnly v1. Original software backing
+    /// providers require the separate RuntimeAdmission v2 custody contract; their
+    /// disjoint private output is additionally charged before provider entry.
     /// </summary>
     public KernelResult<PlatformDsc1CopySubmission> SubmitPlatformDsc1Copy(
         ProcessHandle subject,
@@ -69,6 +73,16 @@ public sealed partial class RuntimeKernel
         }
     }
 
+    internal KernelResult<PlatformDsc1CopySubmission> SubmitComputeServiceDsc1Copy(
+        ProcessHandle subject, PlatformDomainBinding binding, Dsc1ComputeCapability computeCapability,
+        OwnedBuffer<byte> sourceBuffer, PlatformDsc1RegionRange source,
+        OwnedBuffer<byte> destinationBuffer, PlatformDsc1RegionRange destination,
+        Action<PlatformDsc1CopySubmission> retainOriginal)
+    {
+        lock (_platformMemoryUseGate)
+            return SubmitPlatformDsc1CopyLocked(subject,binding,computeCapability,sourceBuffer,source,destinationBuffer,destination,retainOriginal);
+    }
+
     private KernelResult<PlatformDsc1CopySubmission> SubmitPlatformDsc1CopyLocked(
         ProcessHandle subject,
         PlatformDomainBinding binding,
@@ -76,7 +90,8 @@ public sealed partial class RuntimeKernel
         OwnedBuffer<byte> sourceBuffer,
         PlatformDsc1RegionRange source,
         OwnedBuffer<byte> destinationBuffer,
-        PlatformDsc1RegionRange destination)
+        PlatformDsc1RegionRange destination,
+        Action<PlatformDsc1CopySubmission>? originalReserved = null)
     {
 
         var resolved = Processes.Resolve(subject);
@@ -177,12 +192,14 @@ public sealed partial class RuntimeKernel
         RuntimeBufferLease<byte>? sourceLease = null;
         RuntimeBufferLease<byte>? destinationLease = null;
         byte[]? stagedOutput = null;
+        byte[]? stagedInput = null;
+        var backingCopy = PlatformAuthority.SupportsDsc1Backing;
         BudgetReservationHandle? stagedOutputCharge=null;
         var providerAccepted = false;
         PlatformDsc1SubmissionId? trackedSubmissionId = null;
         try
         {
-            var reserved=Budgets.ReserveIfAttached(subject,[new(ServiceBudgetDimension.OwnedMemoryBytes,checked((ulong)source.Length))],
+            var reserved=Budgets.ReserveIfAttached(subject,[new(ServiceBudgetDimension.OwnedMemoryBytes,checked((ulong)source.Length * (backingCopy ? 2UL : 1UL)))],
                 BudgetReservationLifetime.LocalResource,AdmissionQosHint.None);
             if(!reserved.IsSuccess)return KernelResult<PlatformDsc1CopySubmission>.Fail(reserved.Error,reserved.Message!);
             stagedOutputCharge=reserved.Value?.Reservation;
@@ -191,6 +208,11 @@ public sealed partial class RuntimeKernel
             stagedOutput = sourceLease.ReadOnlySpan
                 .Slice(checked((int)source.Offset), checked((int)source.Length))
                 .ToArray();
+            if (backingCopy)
+            {
+                stagedInput = stagedOutput;
+                stagedOutput = new byte[checked((int)destination.Length)];
+            }
 
             _dsc1PayloadOperations.EnsureCapacity(
                 _dsc1PayloadOperations.Count + 1);
@@ -198,7 +220,8 @@ public sealed partial class RuntimeKernel
                 subject,
                 sourceLease,
                 destinationLease,
-                stagedOutput){StagedOutputCharge=stagedOutputCharge,StagedOutputChargeExpected=stagedOutputCharge is not null};
+                stagedOutput){StagedInput=stagedInput,StagedOutputCharge=stagedOutputCharge,StagedOutputChargeExpected=stagedOutputCharge is not null};
+            record.OriginalOwner = record;
 
             var submission = InvokeDsc1ProviderOutsideMemoryUseGate<PlatformDsc1CopySubmission,
                 KernelResult<PlatformDsc1CopySubmission>>(boundaryReady =>
@@ -237,11 +260,12 @@ public sealed partial class RuntimeKernel
                                 });
                         }
                     },
-                    boundaryReady), reserved =>
+                    boundaryReady, stagedInput ?? ReadOnlyMemory<byte>.Empty, backingCopy ? stagedOutput : Memory<byte>.Empty), reserved =>
                     {
                         record.Accept(reserved);
                         _dsc1PayloadOperations.Add(reserved.SubmissionId, record);
                         trackedSubmissionId = reserved.SubmissionId;
+                        originalReserved?.Invoke(reserved);
                     });
             if (!submission.IsSuccess)
             {
@@ -286,6 +310,7 @@ public sealed partial class RuntimeKernel
                 if (trackedSubmissionId is { } tracked)
                     _dsc1PayloadOperations.Remove(tracked);
                 if (stagedOutput is not null) Array.Clear(stagedOutput);
+                if (stagedInput is not null) Array.Clear(stagedInput);
                 destinationLease?.Dispose();
                 sourceLease?.Dispose();
                 if(stagedOutputCharge is { } unaccepted) _=Budgets.Release(subject,unaccepted);
@@ -415,28 +440,32 @@ public sealed partial class RuntimeKernel
 
         KernelResult Consume()
         {
-            if (!_dsc1PayloadOperations.TryGetValue(payload.Submission.SubmissionId, out var currentPayload) ||
+            if (!ReferenceEquals(payload.OriginalOwner, payload) ||
+                !_dsc1PayloadOperations.TryGetValue(payload.Submission.SubmissionId, out var currentPayload) ||
                 !ReferenceEquals(currentPayload, payload))
                 return KernelResult.Fail(KernelError.PlatformFaulted, "Original DSC1 payload owner changed before consumption.");
             return PlatformAuthority.CommitDsc1LocalReservationRelease(payload.Submission, admitted =>
             {
                 if(payload.StagedOutputChargeExpected!=(payload.StagedOutputCharge is not null))
                     return KernelResult.Fail(KernelError.PlatformFaulted,"Original DSC1 snapshot charge association lost.");
-                if(!payload.StagedOutputChargeConsumed && payload.StagedOutputCharge is { } charge)
-                {
-                    var settled=Budgets.Release(payload.Owner,charge);
-                    if(!settled.IsSuccess)return KernelResult.Fail(settled.Error,settled.Message!);
-                    payload.StagedOutputChargeConsumed=true;
-                }
                 outputPublished &= admitted;
                 if (outputPublished)
                     payload.StagedOutput.AsSpan().CopyTo(
                         payload.DestinationLease.WritableSpan.Slice(
                             checked((int)payload.Submission.Destination.Offset),
                             checked((int)payload.Submission.Destination.Length)));
+                // A failed destination lease access must retain the original
+                // private arrays' charge, rather than expose uncharged custody.
+                if(!payload.StagedOutputChargeConsumed && payload.StagedOutputCharge is { } charge)
+                {
+                    var settled=Budgets.Release(payload.Owner,charge);
+                    if(!settled.IsSuccess)return KernelResult.Fail(settled.Error,settled.Message!);
+                    payload.StagedOutputChargeConsumed=true;
+                }
                 payload.DestinationLease.Dispose();
                 payload.SourceLease.Dispose();
                 Array.Clear(payload.StagedOutput);
+                if (payload.StagedInput is not null) Array.Clear(payload.StagedInput);
                 _dsc1PayloadOperations.Remove(payload.Submission.SubmissionId);
                 return KernelResult.Ok();
             });
@@ -486,6 +515,9 @@ public sealed partial class RuntimeKernel
                 "The local DSC1 payload reservation does not exist.");
         }
 
+        if (!ReferenceEquals(record.OriginalOwner, record))
+            return KernelResult<Dsc1PayloadRecord>.Fail(KernelError.PlatformFaulted,
+                "Copied DSC1 payload cannot replace the original custody owner.");
         if (record.Submission.Generation != submission.Generation)
         {
             return KernelResult<Dsc1PayloadRecord>.Fail(

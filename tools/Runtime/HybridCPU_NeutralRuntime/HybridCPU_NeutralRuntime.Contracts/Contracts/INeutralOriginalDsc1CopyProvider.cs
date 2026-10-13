@@ -1,5 +1,23 @@
 namespace YAKSys_Hybrid_CPU.Core;
 
+/// <summary>Caller-retained original identity before possible custody acceptance.
+/// Identity alone grants no mapping or byte permission.</summary>
+public sealed class NeutralOriginalDsc1Preparation
+{
+    public Guid InvocationId { get; } = Guid.NewGuid();
+}
+
+public interface INeutralOriginalDsc1PreparationProvider : INeutralOriginalDsc1CopyProvider
+{
+    NeutralOriginalDsc1CopyRequest? PrepareDsc1Copy(NeutralOriginalDsc1Preparation preparation,
+        NeutralOwnedRegionMappingLease sourceMapping, long sourceOffset,
+        NeutralOwnedRegionMappingLease destinationMapping, long destinationOffset,
+        ReadOnlyMemory<byte> source, Memory<byte> destination);
+    NeutralOriginalDsc1CopyRequest? ResolveDsc1Preparation(NeutralOriginalDsc1Preparation preparation,
+        NeutralOwnedRegionMappingLease sourceMapping, NeutralOwnedRegionMappingLease destinationMapping);
+    NeutralOriginalDsc1CopyObservation? EndDsc1PreparedCustody(NeutralOriginalDsc1CopyRequest request);
+}
+
 /// <summary>Opaque custody request prepared by the original native mapping owners.
 /// Caller must independently admit compute/Region/budget use before invoking.</summary>
 public sealed class NeutralOriginalDsc1CopyRequest
@@ -18,6 +36,7 @@ public sealed class NeutralOriginalDsc1CopyObservation
     internal NeutralOriginalDsc1CopyObservation(NeutralOriginalDsc1CopyRequest request,bool completed,bool noEffect)
     {Original=this;Request=request;Completed=completed;NoEffectGuaranteed=noEffect;}
     internal NeutralOriginalDsc1CopyObservation Original {get;}
+    public bool IsOriginalObservation => ReferenceEquals(Original, this);
     public NeutralOriginalDsc1CopyRequest Request {get;}
     public bool Completed {get;}
     public bool NoEffectGuaranteed {get;}

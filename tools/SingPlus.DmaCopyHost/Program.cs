@@ -7,7 +7,15 @@ using SingPlus.Sip;
 using YAKSys_Hybrid_CPU.Core;
 
 var native=new NeutralDomainRuntimeFacade();
-var kernel=new RuntimeKernel(new HybridCpuPlatformAuthorityProvider(native));
+var lossMode=args.Contains("--lost-copy-reply",StringComparer.Ordinal);
+DmaReplyLossRuntime? responseLoss=null;
+INeutralDomainRuntime runtime=native;
+if(lossMode)
+{
+    var proxy=global::System.Reflection.DispatchProxy.Create<IDmaReplyLossRuntime,DmaReplyLossRuntime>();
+    responseLoss=(DmaReplyLossRuntime)(object)proxy;responseLoss.Native=native;responseLoss.LoseResponses=true;runtime=proxy;
+}
+var kernel=new RuntimeKernel(new HybridCpuPlatformAuthorityProvider(runtime));
 void Check(bool value,string operation){if(!value)throw new InvalidOperationException(operation);}
 ProcessHandle Create(ulong id,ulong domain)
 {
@@ -47,13 +55,46 @@ var plan=new DataMotionPlanV1(1,"software-dma-source","software-dma-destination"
     input.Buffer.Handle.Generation.Value,descriptor.MutationEpoch.Value,64,64,DataMotionModeV1.ProviderDmaThenReleaseSource);
 var sp=kernel.PreparePlatformDmaForDevice(source,input.Grant);var dp=kernel.PreparePlatformDmaForDevice(destination,output.Grant);
 Check(sp.IsSuccess && dp.IsSuccess,"DMA prepare visibility");
-var moved=kernel.MoveProviderDmaBuffers(source,destination,input.Buffer,output.Buffer,plan,input.Mapping,input.Grant,sp.Value,output.Mapping,output.Grant,dp.Value,costs);
+var request=new ProviderDmaDataMotionRequest<byte>(source,destination,input.Buffer,output.Buffer,plan,input.Mapping,input.Grant,sp.Value,output.Mapping,output.Grant,dp.Value);
+var moved=kernel.MoveProviderDmaBuffers(request,costs);
+if(!moved.IsSuccess)
+{
+    var cleanup=kernel.CleanupProviderDmaDataMotion(request);
+    if(responseLoss is not null)
+    {
+        Check(responseLoss.CopyCalls==1,"actual byte effect exactly once");
+        // Response failure never permits another movement invocation.
+        Check(!kernel.MoveProviderDmaBuffers(request,costs).IsSuccess,"unknown effect no-repeat");
+        responseLoss.LoseResponses=false;
+        if(!cleanup.IsSuccess)cleanup=kernel.CleanupProviderDmaDataMotion(request);
+    }
+    Check(cleanup.IsSuccess,cleanup.Message??"original byte cleanup retained");
+    Check(kernel.CleanupProviderDmaDataMotion(request).IsSuccess,"same original cleanup consumption");
+    Check(!kernel.ReadProviderDmaDataMotionResult(request).IsSuccess,"cleanup does not publish a Copy result");
+    Check(input.Buffer.Span.Length==64 && output.Buffer.Span.Length==64,"closed byte custody returned to owners");
+    Check(kernel.TerminateProcess(source).IsSuccess,"failure source teardown");
+    Check(kernel.TerminateProcess(destination).IsSuccess,"failure destination teardown");
+    Check(kernel.QueryBudget(sourceBudget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used==0 &&
+        kernel.QueryBudget(destinationBudget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used==0,"failure quantitative reclaim");
+    Check(native.ActiveDmaGrantCount==0 && native.ActiveOwnedRegionMappingCount==0 && native.ActiveDeviceLeaseCount==0 && native.ActiveBindingCount==0,"failure original retirement");
+    if(responseLoss is not null)Check(responseLoss.CopyCalls==1,"cleanup never repeats byte effect");
+    Console.WriteLine("DMA-copy original failed response: Copy1; result unavailable; custody closed; charges=0; grants/maps/devices/roots=0; gates=OFF; ISA=NONE; ProductionQualified=false");
+    return;
+}
+Check(!lossMode,"lost response cannot become successful Copy publication");
 Check(moved.IsSuccess,moved.Message??"DMA copy");Check(ReferenceEquals(moved.Value!.Buffer,output.Buffer),"original output publication");
 Check(moved.Value.Buffer.Span.ToArray().All(b=>b==0x53),"copied bytes");Check(!input.Buffer.IsValid,"source lifetime release");
+Check(ReferenceEquals(moved.Value,kernel.ReadProviderDmaDataMotionResult(request).Value),"same original retained result");
+Check(ReferenceEquals(moved.Value,kernel.MoveProviderDmaBuffers(request,costs).Value),"replay is read without consumed source effect");
+var copiedRequest=(ProviderDmaDataMotionRequest<byte>)typeof(object).GetMethod("MemberwiseClone",global::System.Reflection.BindingFlags.Instance|global::System.Reflection.BindingFlags.NonPublic)!.Invoke(request,null)!;
+Check(!kernel.ReadProviderDmaDataMotionResult(copiedRequest).IsSuccess && !kernel.MoveProviderDmaBuffers(copiedRequest,costs).IsSuccess,"copied continuation denied");
+Check(!new RuntimeKernel().ReadProviderDmaDataMotionResult(request).IsSuccess,"foreign kernel denied");
 ulong Used(BudgetAccountHandle budget)=>kernel.QueryBudget(budget).Value!.Usage.Single(x=>x.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used;
 Check(Used(sourceBudget)==0 && Used(destinationBudget)==64,"source release and retained destination charge");
 Check(native.ActiveDmaGrantCount==0 && native.ActiveOwnedRegionMappingCount==0,"exact grants/mappings closure");
 Check(kernel.TerminateProcess(source).IsSuccess,"source teardown");Check(kernel.TerminateProcess(destination).IsSuccess,"destination teardown");
 Check(Used(sourceBudget)==0 && Used(destinationBudget)==0,"quantitative reclaim");
 Check(native.ActiveDeviceLeaseCount==0 && native.ActiveBindingCount==0,"device/root retirement");
+Check(ReferenceEquals(moved.Value,kernel.ReadProviderDmaDataMotionResult(request).Value),"retired original result readable without repin");
+Check(!moved.Value!.Buffer.IsValid && Used(destinationBudget)==0,"read cannot restore consumed ownership");
 Console.WriteLine("DMA-copy software host: bytes=64x53; source=64->0; destination=64->64->0; grants=0; mappings=0; devices=0; roots=0; gates=OFF; ISA=NONE; ProductionQualified=false");

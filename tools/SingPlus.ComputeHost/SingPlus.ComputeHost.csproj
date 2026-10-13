@@ -3,5 +3,6 @@
   <ItemGroup>
     <ProjectReference Include="../../src/Runtime/SingPlus.Runtime/SingPlus.Runtime.csproj" />
     <ProjectReference Include="../../src/Platform/SingPlus.Platform.Host/SingPlus.Platform.Host.csproj" />
+    <ProjectReference Include="../../src/Platform/SingPlus.Platform.HybridCpu/SingPlus.Platform.HybridCpu.csproj" />
   </ItemGroup>
 </Project>

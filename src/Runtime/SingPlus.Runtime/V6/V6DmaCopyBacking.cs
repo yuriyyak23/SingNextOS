@@ -23,6 +23,7 @@ public sealed partial class RuntimeKernel
         internal bool Consumed { get; set; }
         internal abstract PlatformDmaCopyBacking Backing { get; }
         internal abstract bool Matches(object input, object output);
+        internal abstract void ReleaseSourceAfterClosure();
         public abstract void Dispose();
     }
     private sealed class DmaCopyPayload<T> : DmaCopyPayload where T : unmanaged
@@ -41,6 +42,7 @@ public sealed partial class RuntimeKernel
         }
         internal override PlatformDmaCopyBacking Backing { get; }
         internal override bool Matches(object input,object output) => ReferenceEquals(_input,input) && ReferenceEquals(_output,output);
+        internal override void ReleaseSourceAfterClosure() => _read.Dispose();
         public override void Dispose() { _read.Dispose(); _write.Dispose(); Consumed = true; }
     }
     private readonly Dictionary<PlatformDmaGrantId,DmaCopyPayload> _dmaCopyPayloads = [];

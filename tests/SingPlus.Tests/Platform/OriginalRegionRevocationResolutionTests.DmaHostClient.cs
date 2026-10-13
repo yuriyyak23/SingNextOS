@@ -6,6 +6,67 @@ namespace SingPlus.Tests.Platform;
 public sealed partial class OriginalRegionRevocationResolutionTests
 {
     [Theory]
+    [InlineData(false,false)] [InlineData(true,false)] [InlineData(true,true)]
+    public void PublicOriginalDmaRequestRejectsReentryAndNeverRepeatsUnknownEffect(bool unknown,bool partialClose)
+    {
+        var x=CopyKernel(true);var foreign=CopyKernel(true);
+        var costs=new V6ManagedLocalityCostProvider();var now=DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        Assert.True(costs.Publish(new(1,"source",3,now,now+60000,64,1,0,0)).IsSuccess);
+        Assert.True(costs.Publish(new(1,"destination",5,now,now+60000,64,1,0,0)).IsSuccess);
+        var sp=x.Kernel.PreparePlatformDmaForDevice(x.Owner,x.Source).Value;
+        var dp=x.Kernel.PreparePlatformDmaForDevice(x.DestinationOwner,x.Destination).Value;
+        var request=new ProviderDmaDataMotionRequest<byte>(x.Owner,x.DestinationOwner,x.Input,x.Output,x.Plan,x.SourceMap,x.Source,sp,x.DestinationMap,x.Destination,dp);
+        Assert.False(x.Kernel.ReadProviderDmaDataMotionResult(request).IsSuccess);
+        var copies=0;
+        x.Spy.BeforeInvocation=(name,_)=>
+        {
+            if(name!="CopyDma")return;
+            copies++;
+            Assert.False(x.Kernel.MoveProviderDmaBuffers(request,costs).IsSuccess);
+            Assert.False(x.Kernel.ReadProviderDmaDataMotionResult(request).IsSuccess);
+            Assert.False(x.Kernel.CleanupProviderDmaDataMotion(request).IsSuccess);
+        };
+        x.Spy.AfterOperation=name=>
+        {
+            if(unknown && name is "CopyDma" or "ResolveDmaCopy")throw new IOException("Original byte reply/query unavailable");
+        };
+        var moved=x.Kernel.MoveProviderDmaBuffers(request,costs);
+        Assert.Equal(!unknown,moved.IsSuccess);Assert.Equal(1,copies);
+        if(unknown)
+        {
+            Assert.False(x.Kernel.MoveProviderDmaBuffers(request,costs).IsSuccess);
+            Assert.False(x.Kernel.ReadProviderDmaDataMotionResult(request).IsSuccess);
+            Assert.Equal(1,copies);
+            Assert.Throws<InvalidOperationException>(()=>{_=x.Output.Span.Length;});
+            Assert.Equal(64UL,x.Kernel.QueryBudget(x.DestinationBudget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+            x.Spy.AfterOperation=null;
+            var retirementCallsBeforeRetry=0;
+            if(partialClose)
+            {
+                x.Spy.AfterOperation=name=>{if(name is "CloseDmaGrant" or "ResolveDmaGrantClose")throw new IOException("Original retirement reply/query lost");};
+                Assert.False(x.Kernel.CleanupProviderDmaDataMotion(request).IsSuccess);
+                Assert.False(x.Kernel.MoveProviderDmaBuffers(request,costs).IsSuccess);
+                Assert.Equal(1,copies);
+                Assert.Equal(64UL,x.Kernel.QueryBudget(x.DestinationBudget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+                retirementCallsBeforeRetry=x.Spy.DmaCloseCalls;
+                x.Spy.AfterOperation=null;
+            }
+            var cleanup=x.Kernel.CleanupProviderDmaDataMotion(request);Assert.True(cleanup.IsSuccess,cleanup.Message);
+            if(partialClose)Assert.Equal(retirementCallsBeforeRetry,x.Spy.DmaCloseCalls);
+            Assert.True(x.Kernel.CleanupProviderDmaDataMotion(request).IsSuccess);
+            Assert.Equal(64,x.Input.Span.Length);Assert.Equal(64,x.Output.Span.Length);
+            Assert.Equal(0,x.Native.ActiveDmaGrantCount);
+            Assert.Equal(64UL,x.Kernel.QueryBudget(x.Budget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+            Assert.Equal(64UL,x.Kernel.QueryBudget(x.DestinationBudget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        }
+        else Assert.Same(moved.Value,x.Kernel.ReadProviderDmaDataMotionResult(request).Value);
+        Assert.True(x.Kernel.TerminateProcess(x.Owner).IsSuccess);
+        Assert.True(x.Kernel.TerminateProcess(x.DestinationOwner).IsSuccess);
+        Assert.Equal(0UL,x.Kernel.QueryBudget(x.Budget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.Equal(0UL,x.Kernel.QueryBudget(x.DestinationBudget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.Equal(1,copies);Assert.Equal(2,foreign.Native.ActiveDmaGrantCount);Assert.Equal(64,foreign.Input.Span.Length);
+    }
+    [Theory]
     [InlineData("exact")] [InlineData("absent-cost")] [InlineData("stale-cost")] [InlineData("foreign-owner")]
     [InlineData("unsupported-cost")] [InlineData("throw-cost")]
     public void PublicDmaClientUsesOriginalNativeBackingAndIndependentOwnerCharges(string fault)

@@ -55,14 +55,18 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDsc1CopySubmission submission,
         CapabilityId computeCapabilityId,
         DomainRecord originalDomain,
-        IPlatformDsc1ComputeProvider originalSource,
+        IPlatformDsc1ComputeProvider? originalSource,
         PlatformDsc1CopyRequest originalRequest,
         MappingRecord originalSourceMapping,
         MappingRecord originalDestinationMapping)
     {
+        public Dsc1OperationRecord? OriginalOwner { get; set; }
         public PlatformDsc1CopySubmission Submission { get; } = submission;
         public DomainRecord OriginalDomain { get; } = originalDomain;
-        public IPlatformDsc1ComputeProvider OriginalSource { get; } = originalSource;
+        public IPlatformDsc1ComputeProvider? OriginalSource { get; } = originalSource;
+        public IPlatformOriginalDsc1CopyBackingProvider? OriginalBackingSource { get; init; }
+        public PlatformOriginalDsc1CopyBackingRequest? OriginalBackingRequest { get; init; }
+        public PlatformOriginalDsc1CopyBackingObservation? OriginalBackingObservation { get; set; }
         public PlatformDsc1CopyRequest OriginalRequest { get; } = originalRequest;
         public MappingRecord OriginalSourceMapping { get; } = originalSourceMapping;
         public MappingRecord OriginalDestinationMapping { get; } = originalDestinationMapping;
@@ -91,6 +95,8 @@ public sealed partial class PlatformAuthorityBridge
     private readonly Dictionary<PlatformDsc1SubmissionId, Dsc1OperationRecord>
         _dsc1Operations = [];
     private ulong _nextDsc1SubmissionId = 1;
+    internal bool SupportsDsc1Backing => _provider is IPlatformOriginalDsc1CopyBackingProvider &&
+        PlatformOriginalDsc1CopyBackingContract.Supports(_featureManifest.Resolve(PlatformFeatureFamily.Dsc1BulkCompute));
 
     internal KernelResult<PlatformDsc1CopySubmission> SubmitDsc1ModelCopy(
         PlatformDomainBinding binding,
@@ -100,13 +106,16 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDsc1RegionRange destination,
         out bool retainPayload,
         Func<CapabilityId, CapabilityId, Func<KernelResult>, KernelResult> authorizeCommit,
-        Action<PlatformDsc1CopySubmission>? providerBoundaryReady = null)
+        Action<PlatformDsc1CopySubmission>? providerBoundaryReady = null,
+        ReadOnlyMemory<byte> backingInput = default,
+        Memory<byte> backingOutput = default)
     {
         retainPayload = false;
         PlatformDsc1CopyRequest request;
         PlatformDsc1CopySubmission localSubmission;
         Dsc1OperationRecord operationRecord;
-        IPlatformDsc1ComputeProvider computeProvider;
+        IPlatformDsc1ComputeProvider? computeProvider;
+        IPlatformOriginalDsc1CopyBackingProvider? backingProvider;
         lock (_secureDomainLifecycleGate)
         lock (_dsc1Gate)
         {
@@ -127,20 +136,23 @@ public sealed partial class PlatformAuthorityBridge
 
             var feature = _featureManifest.Resolve(
                 PlatformFeatureFamily.Dsc1BulkCompute);
-            if (!PlatformDsc1ComputeContract.SupportsModelOnly(feature))
+            backingProvider = SupportsDsc1Backing ? (IPlatformOriginalDsc1CopyBackingProvider)_provider : null;
+            if (backingProvider is null && !PlatformDsc1ComputeContract.SupportsModelOnly(feature))
             {
                 return KernelResult<PlatformDsc1CopySubmission>.Fail(
                     KernelError.PlatformUnsupported,
                     $"The platform provider does not expose DSC1 Copy contract v{PlatformDsc1ComputeContract.ContractVersion} as ModelOnly.");
             }
 
-            if (_provider is not IPlatformDsc1ComputeProvider resolvedProvider)
+            if (backingProvider is null && _provider is not IPlatformDsc1ComputeProvider)
             {
                 return KernelResult<PlatformDsc1CopySubmission>.Fail(
                     KernelError.PlatformUnsupported,
                     "The platform provider does not implement the DSC1 Copy model contract.");
             }
-            computeProvider = resolvedProvider;
+            computeProvider = _provider as IPlatformDsc1ComputeProvider;
+            if (backingProvider is not null && (backingInput.Length != source.Length || backingOutput.Length != destination.Length))
+                return KernelResult<PlatformDsc1CopySubmission>.Fail(KernelError.PlatformDenied, "Original DSC1 backing byte custody is not exact.");
 
             if (_nextDsc1SubmissionId == 0)
             {
@@ -200,8 +212,13 @@ public sealed partial class PlatformAuthorityBridge
                 computeProvider,
                 request,
                 sourceRecord,
-                destinationRecord);
+                destinationRecord)
+            {
+                OriginalBackingSource = backingProvider,
+                OriginalBackingRequest = backingProvider is null ? null : new(request, backingInput, backingOutput)
+            };
             operationRecord.ProviderCallInFlight = true;
+            operationRecord.OriginalOwner = operationRecord;
             _dsc1Operations.Add(localSubmission.SubmissionId, operationRecord);
             domainRecord.Dsc1Operations.Add(operationRecord);
         }
@@ -245,10 +262,15 @@ public sealed partial class PlatformAuthorityBridge
             return KernelResult<PlatformDsc1CopySubmission>.Fail(admission.Error, admission.Message!);
         }
 
+        if (backingProvider is not null)
+        {
+            retainPayload = true; // Original local payload already retained before possible byte effect.
+            return SubmitDsc1Backing(operationRecord, expectedSubject, authorizeCommit);
+        }
         PlatformAuthorityResult<PlatformProviderDsc1Submission> providerResult;
         try
         {
-            providerResult = computeProvider.SubmitDsc1Copy(request);
+            providerResult = computeProvider!.SubmitDsc1Copy(request);
         }
         catch (Exception exception)
         {
@@ -350,6 +372,7 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDomainIdentity expectedSubject,
         Action? providerBoundaryReady = null)
     {
+        if (IsDsc1Backing(submission)) return ObserveDsc1Backing(submission, expectedSubject, providerBoundaryReady);
         Dsc1OperationRecord record;
         PlatformProviderDsc1Submission providerSubmission;
         lock (_secureDomainLifecycleGate)
@@ -400,7 +423,7 @@ public sealed partial class PlatformAuthorityBridge
         PlatformAuthorityResult<PlatformProviderDsc1Completion> observed;
         try
         {
-            observed = record.OriginalSource
+            observed = record.OriginalSource!
                 .ObserveDsc1Completion(providerSubmission);
         }
         catch (Exception exception)
@@ -430,6 +453,7 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDomainIdentity expectedSubject,
         Action? providerBoundaryReady = null)
     {
+        if (IsDsc1Backing(submission)) return ObserveDsc1Backing(submission, expectedSubject, providerBoundaryReady);
         Dsc1OperationRecord record;
         PlatformProviderDsc1Submission providerSubmission;
         bool observeOnly;
@@ -482,7 +506,7 @@ public sealed partial class PlatformAuthorityBridge
         PlatformAuthorityResult<PlatformProviderDsc1Completion> completion;
         try
         {
-            var provider = record.OriginalSource;
+            var provider = record.OriginalSource!;
             completion = observeOnly
                 ? provider.ObserveDsc1Completion(providerSubmission)
                 : provider.CancelDsc1(providerSubmission);
@@ -714,6 +738,9 @@ public sealed partial class PlatformAuthorityBridge
                 "The local DSC1 submission does not exist.");
         }
 
+        if (!ReferenceEquals(record.OriginalOwner, record))
+            return KernelResult<Dsc1OperationRecord>.Fail(KernelError.PlatformFaulted,
+                "Copied DSC1 history cannot replace the original operation owner.");
         if (record.Submission.Generation != submission.Generation)
         {
             return KernelResult<Dsc1OperationRecord>.Fail(
@@ -840,11 +867,11 @@ public sealed partial class PlatformAuthorityBridge
     }
 
     private static bool HasValidatedDsc1Closure(Dsc1OperationRecord record) =>
-        record.AcceptedProviderSubmission is { } submission &&
+        ReferenceEquals(record.OriginalOwner, record) && (HasValidatedDsc1BackingClosure(record) || (record.AcceptedProviderSubmission is { } submission &&
         record.OriginalCompletionObservation is { IsSuccess: true } observation &&
         PlatformDsc1ComputeContract.ValidateCompletion(submission, observation.Value!).IsSuccess &&
         ((record.State == Dsc1OperationState.ClosedCompleted && observation.Value!.Disposition == PlatformDsc1CompletionDisposition.Completed) ||
-         (record.State == Dsc1OperationState.ClosedCancelled && observation.Value!.Disposition == PlatformDsc1CompletionDisposition.Cancelled));
+         (record.State == Dsc1OperationState.ClosedCancelled && observation.Value!.Disposition == PlatformDsc1CompletionDisposition.Cancelled))));
 
     internal bool IsDsc1PublicationAdmitted(PlatformDsc1CopySubmission submission)
     {
@@ -878,6 +905,8 @@ public sealed partial class PlatformAuthorityBridge
 
     private KernelResult ValidateDsc1OriginalOwnersLocked(Dsc1OperationRecord record, PlatformProviderIncarnation source)
     {
+        if (!ReferenceEquals(record.OriginalOwner, record))
+            return KernelResult.Fail(KernelError.PlatformFaulted, "Original DSC1 operation owner was copied.");
         var binding = record.Submission.DomainBinding;
         var root = ValidateRootCleanupSourceLocked(record.OriginalDomain, binding, binding.Subject,
             record.OriginalDomain.BackendEpoch, source);

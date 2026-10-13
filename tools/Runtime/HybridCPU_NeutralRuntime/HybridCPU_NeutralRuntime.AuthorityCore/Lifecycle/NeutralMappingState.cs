@@ -23,16 +23,19 @@ internal sealed class NeutralOriginalDsc1CopyFact(object runtime,NeutralMappingS
     public readonly NeutralOriginalMappingAdmissionFact SourceAdmission=sourceAdmission,DestinationAdmission=destinationAdmission;
     public NeutralOriginalDsc1CopyFact? Self;
     public NeutralOriginalDsc1CopyRequest Request=null!;
+    public NeutralOriginalDsc1Preparation? Preparation;
     public bool Invoked;
     public NeutralOriginalDsc1CopyObservation? Raw;
 }
 
-internal sealed class NeutralOriginalMappingAdmissionFact(
-    NeutralOriginalOwnedRegionMapRequest request, NeutralMappingState source, NeutralDomainState parent)
+internal sealed class NeutralOriginalMappingAdmissionFact
 {
-    public NeutralOriginalOwnedRegionMapRequest Request { get; } = request;
-    public NeutralMappingState Source { get; } = source;
-    public NeutralDomainState Parent { get; } = parent;
+    public NeutralOriginalMappingAdmissionFact(NeutralOriginalOwnedRegionMapRequest request, NeutralMappingState source, NeutralDomainState parent)
+    { Request=request; Source=source; Parent=parent; Original=this; }
+    public NeutralOriginalMappingAdmissionFact Original { get; }
+    public NeutralOriginalOwnedRegionMapRequest Request { get; }
+    public NeutralMappingState Source { get; }
+    public NeutralDomainState Parent { get; }
 }
 
 internal sealed class NeutralOriginalMappingCloseFact(NeutralOriginalMappingCloseRequest request,

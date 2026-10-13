@@ -20,9 +20,10 @@ public sealed partial class RuntimeKernel
         var moved=ExecuteV6ProviderDmaDataMotion(source,destination,input,output,plan,
             sourceMapping,sourceGrant,sourcePrepare,destinationMapping,destinationGrant,destinationPrepare,
             ()=>FreshGeneration(plan.SourceProviderClass),()=>FreshGeneration(plan.DestinationProviderClass));
-        return moved.IsSuccess
-            ? KernelResult<ProviderDmaDataMotionResult<T>>.Ok(new(moved.Value!.Moved,moved.Value.Receipt))
-            : KernelResult<ProviderDmaDataMotionResult<T>>.Fail(moved.Error,moved.Message!);
+        if(!moved.IsSuccess)return KernelResult<ProviderDmaDataMotionResult<T>>.Fail(moved.Error,moved.Message!);
+        return moved.Value!.PreparedProviderResult is { } result
+            ? KernelResult<ProviderDmaDataMotionResult<T>>.Ok(result)
+            : KernelResult<ProviderDmaDataMotionResult<T>>.Fail(KernelError.PlatformFaulted,"Original DMA result was not prepared before source consumption.");
 
         ulong FreshGeneration(string providerClass)
         {

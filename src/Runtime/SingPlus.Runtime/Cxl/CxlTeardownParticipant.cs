@@ -61,6 +61,16 @@ public sealed partial class RuntimeKernel
     }
 
     // Callback is local admission/publication only, never provider code.
+    internal KernelResult CommitCxlRegionOwnerAdmission(RegionOwner owner, Func<KernelResult> commit)
+    {
+        lock (_platformMemoryUseGate)
+        {
+            var process = Processes.FindByDomainGeneration(owner.DomainId, owner.ProcessGeneration);
+            if (process is null) return KernelResult.Fail(KernelError.WrongRegionOwner, "CXL owner has no original process incarnation.");
+            return CommitCxlBackingPublication(new(process.ProcessId, process.Generation), owner, commit);
+        }
+    }
+
     internal KernelResult CommitCxlBackingPublication(ProcessHandle process, RegionOwner owner, Func<KernelResult> commit)
     {
         lock (_platformMemoryUseGate)

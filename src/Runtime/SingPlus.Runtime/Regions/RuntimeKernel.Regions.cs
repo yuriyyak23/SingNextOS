@@ -133,6 +133,11 @@ public sealed partial class RuntimeKernel
         if (!targetEffect.IsSuccess) return KernelResult<OwnedBuffer<T>>.Fail(targetEffect.Error, targetEffect.Message!);
         var transferable = (ITransferableOwnedPayload)buffer;
         if (!transferable.IsValidForRuntime) return KernelResult<OwnedBuffer<T>>.Fail(KernelError.InvalidRegionState, "Source ownership token has already been consumed.");
+        // Validate managed custody before Region/budget mutation, not only when
+        // constructing the returned ownership wrapper after that mutation.
+        try { transferable.ValidateTransferForRuntime(); }
+        catch (InvalidOperationException exception)
+        { return KernelResult<OwnedBuffer<T>>.Fail(KernelError.RegionUseConflict,exception.Message); }
         var oldHandle = buffer.Handle;
         var targetBudget = PrepareRegionBudgetTransfer(source, target, oldHandle, observations);
         if (!targetBudget.IsSuccess) return KernelResult<OwnedBuffer<T>>.Fail(targetBudget.Error, targetBudget.Message!);

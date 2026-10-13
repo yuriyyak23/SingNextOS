@@ -111,6 +111,10 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
             PlatformAuthorityFeatures.NeutralDomainBinding |
             PlatformAuthorityFeatures.DirectOwnedRegionMapping);
         _featureManifest = TranslateFeatures(ImplementationProfile, neutralFeatures, _childFeatureSource?.QueryNeutralFeatures(),runtime is INeutralOriginalDmaCopyProvider);
+        if (runtime is INeutralOriginalDsc1CopyProvider)
+            _featureManifest = new PlatformFeatureManifest(_featureManifest.Features.Concat([
+                new PlatformFeatureDescriptor(PlatformFeatureFamily.Dsc1BulkCompute,
+                    PlatformOriginalDsc1CopyBackingContract.ContractVersion, PlatformFeatureAvailability.RuntimeAdmission)]));
     }
 
     public PlatformProviderDescriptor Descriptor { get; }

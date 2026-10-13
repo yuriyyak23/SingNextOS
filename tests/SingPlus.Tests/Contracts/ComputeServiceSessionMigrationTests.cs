@@ -8,6 +8,98 @@ namespace SingPlus.Tests.Contracts;
 
 public sealed class ComputeServiceSessionMigrationTests
 {
+    [Fact]
+    public async Task CallerCancellationAfterActualSoftwareByteEffectClosesOriginalCustodyAndNeverPublishesDestination()
+    {
+        var proxy=global::System.Reflection.DispatchProxy.Create<SingPlus.Tests.Platform.PlatformDsc1ComputeTests.IOriginalDsc1Runtime,
+            SingPlus.Tests.Platform.PlatformDsc1ComputeTests.Dsc1NativeSpy>();
+        var spy=(SingPlus.Tests.Platform.PlatformDsc1ComputeTests.Dsc1NativeSpy)(object)proxy; spy.Native=new();
+        var scenario=CreateComponentScenario(new SingPlus.Platform.HybridCpu.HybridCpuPlatformAuthorityProvider(proxy));
+        var budget=scenario.Kernel.QueryComponent(new ComponentIdentity("compute-session-test")).Value!.ProcessBudget;
+        ulong Used()=>scenario.Kernel.QueryBudget(budget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used;
+        var foreign=TestFixtures.Create(scenario.Kernel,2581,2582).Handle;
+        var independent=scenario.Kernel.AllocateBuffer<byte>(foreign,16).Value!;
+        scenario.Source.Span.Fill(0x67);
+        using var cancellation=new CancellationTokenSource();
+        spy.AfterCopy=()=>
+        {
+            spy.AfterCopy=null;
+            Assert.Equal(64UL,Used());
+            Assert.Throws<InvalidOperationException>(()=>{_=scenario.Source.Span.Length;});
+            cancellation.Cancel();
+        };
+        var client=ComputeServiceClient.Create(new RuntimeSipClientTransport(scenario.Kernel,scenario.Caller,scenario.Session,cancellation.Token));
+        var pending=client.CopyAsync(scenario.Source,scenario.Destination).AsTask();
+        var settled=scenario.Host.ProcessNextCopy(); Assert.True(settled.IsSuccess,settled.Message);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async()=>await pending.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Equal(1,spy.Copies); Assert.Equal(0UL,Used()); Assert.False(scenario.Host.HasPendingCopy);
+        Assert.True(scenario.Source.IsValid); Assert.Equal((byte)0x67,scenario.Source.Span[0]);
+        Assert.False(scenario.Destination.IsValid); Assert.Equal(16,independent.Span.Length);
+        Assert.True(scenario.Kernel.CloseSession(scenario.Caller,scenario.Session).IsSuccess);
+        Assert.True(scenario.Kernel.FaultComponent(new ComponentIdentity("compute-session-test")).IsSuccess);
+        Assert.Equal(0,spy.Native.ActiveOwnedRegionMappingCount); Assert.Equal(0,spy.Native.ActiveBindingCount);
+    }
+    [Fact]
+    public async Task ActualSoftwareServiceRetriesOriginalResponseSettlementAfterThrowWithoutCopyRepeat()
+    {
+        var proxy=global::System.Reflection.DispatchProxy.Create<SingPlus.Tests.Platform.PlatformDsc1ComputeTests.IOriginalDsc1Runtime,
+            SingPlus.Tests.Platform.PlatformDsc1ComputeTests.Dsc1NativeSpy>();
+        var spy=(SingPlus.Tests.Platform.PlatformDsc1ComputeTests.Dsc1NativeSpy)(object)proxy; spy.Native=new();
+        var scenario=CreateComponentScenario(new SingPlus.Platform.HybridCpu.HybridCpuPlatformAuthorityProvider(proxy));
+        var budget=scenario.Kernel.QueryComponent(new ComponentIdentity("compute-session-test")).Value!.ProcessBudget;
+        ulong Used()=>scenario.Kernel.QueryBudget(budget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used;
+        scenario.Source.Span.Fill(0x72);
+        var client=ComputeServiceClient.Create(new RuntimeSipClientTransport(scenario.Kernel,scenario.Caller,scenario.Session));
+        var pending=client.CopyAsync(scenario.Source,scenario.Destination).AsTask();
+        scenario.Kernel.SessionInvocationSettlementReservedHook=()=>
+        {
+            scenario.Kernel.SessionInvocationSettlementReservedHook=null;
+            throw new IOException("Settlement interrupted before response effect");
+        };
+        Assert.Throws<IOException>(()=>scenario.Host.ProcessNextCopy());
+        Assert.True(scenario.Host.HasPendingCopy); Assert.Equal(1,spy.Copies);
+        Assert.Equal(16UL,Used()); Assert.True(scenario.Source.IsValid);
+        Assert.False(pending.IsCompleted);
+        var resumed=scenario.Host.AdvancePendingCopy(); Assert.True(resumed.IsSuccess,resumed.Message);
+        var returned=await pending.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.All(returned.Span.ToArray(),b=>Assert.Equal((byte)0x72,b));
+        Assert.Equal(1,spy.Copies); Assert.Equal(0UL,Used()); Assert.False(scenario.Host.HasPendingCopy);
+        Assert.True(scenario.Kernel.CloseSession(scenario.Caller,scenario.Session).IsSuccess);
+        Assert.True(scenario.Kernel.FaultComponent(new ComponentIdentity("compute-session-test")).IsSuccess);
+        Assert.Equal(0,spy.Native.ActiveOwnedRegionMappingCount); Assert.Equal(0,spy.Native.ActiveBindingCount);
+    }
+    [Fact]
+    public async Task ActualServiceUnknownSubmitRetainsOriginalContinuationAndSettlesWithoutRepeat()
+    {
+        var proxy=global::System.Reflection.DispatchProxy.Create<SingPlus.Tests.Platform.PlatformDsc1ComputeTests.IOriginalDsc1Runtime,
+            SingPlus.Tests.Platform.PlatformDsc1ComputeTests.Dsc1NativeSpy>();
+        var spy=(SingPlus.Tests.Platform.PlatformDsc1ComputeTests.Dsc1NativeSpy)(object)proxy;
+        spy.Native=new();spy.LoseCopyReply=true;spy.LoseQuery=true;
+        var scenario=CreateComponentScenario(new SingPlus.Platform.HybridCpu.HybridCpuPlatformAuthorityProvider(proxy));
+        var budget=scenario.Kernel.QueryComponent(new ComponentIdentity("compute-session-test")).Value!.ProcessBudget;
+        ulong Used()=>scenario.Kernel.QueryBudget(budget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used;
+        var client=ComputeServiceClient.Create(new RuntimeSipClientTransport(scenario.Kernel,scenario.Caller,scenario.Session));
+        var pending=client.CopyAsync(scenario.Source,scenario.Destination).AsTask();
+        Assert.Equal(KernelError.PlatformFaulted,scenario.Host.ProcessNextCopy().Error);
+        Assert.Equal(1,spy.Copies);
+        Assert.Equal(64UL,Used());
+        Assert.False(scenario.Host.AdvancePendingCopy().IsSuccess);
+        Assert.False(pending.IsCompleted);
+        spy.LoseQuery=false;
+        var settled=scenario.Host.AdvancePendingCopy();
+        Assert.Equal(KernelError.PlatformFaulted,settled.Error); // original request failure remains failure
+        Assert.Equal(1,spy.Copies);
+        Assert.Equal(0UL,Used());
+        var responseFailure=await Assert.ThrowsAnyAsync<Exception>(async()=>await pending.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.IsNotType<TimeoutException>(responseFailure);
+        Assert.True(scenario.Source.IsValid);
+        Assert.False(scenario.Destination.IsValid);
+        Assert.True(scenario.Kernel.CloseSession(scenario.Caller,scenario.Session).IsSuccess);
+        var teardown=scenario.Kernel.FaultComponent(new ComponentIdentity("compute-session-test"));
+        Assert.True(teardown.IsSuccess,teardown.Message);
+        Assert.Equal(0,spy.Native.ActiveOwnedRegionMappingCount);
+        Assert.Equal(0,spy.Native.ActiveBindingCount);
+    }
     [Theory]
     [InlineData(false)] [InlineData(true)]
     public void HostCreationRefusesSourceLossAfterComponentAuthoritySnapshot(bool drain)
@@ -159,7 +251,7 @@ public sealed class ComputeServiceSessionMigrationTests
         return (kernel, caller, session, kernel.AllocateBuffer<byte>(caller, 8).Value!, kernel.AllocateBuffer<byte>(caller, 8).Value!);
     }
 
-    private static ComponentScenario CreateComponentScenario(HostPlatformAuthorityProvider provider)
+    private static ComponentScenario CreateComponentScenario(SingPlus.Platform.IPlatformAuthorityProvider provider)
     {
         var kernel = new RuntimeKernel(provider);
         _ = TestFixtures.Create(kernel, 920, 9200);
@@ -169,7 +261,7 @@ public sealed class ComputeServiceSessionMigrationTests
         var internalCompute = new CapabilityRequirementV1(ResourceKind.Compute, CapabilityResourceIds.Dsc1Copy, CapabilityRights.Execute);
         var image = new byte[] { 9, 2, 0 };
         var manifest = new ServiceManifestV1(new ComponentIdentity("compute-session-test"), new ComponentVersion("1"), Digest(image), TestFixtures.Manifest(921, 9210, capabilities: [internalCompute]), [registration], requiresPlatformDomain: true,
-            budgetRequests: [new(ServiceBudgetDimension.OwnedMemoryBytes, 96), new(ServiceBudgetDimension.ExternalOperations, 4), new(ServiceBudgetDimension.IpcMessages, 4), new(ServiceBudgetDimension.IpcBytes, 4096)]);
+            budgetRequests: [new(ServiceBudgetDimension.OwnedMemoryBytes, provider is SingPlus.Platform.HybridCpu.HybridCpuPlatformAuthorityProvider ? 128UL : 96UL), new(ServiceBudgetDimension.ExternalOperations, 4), new(ServiceBudgetDimension.IpcMessages, 4), new(ServiceBudgetDimension.IpcBytes, 4096)]);
         var admitted = kernel.AdmitComponent(new ComponentAdmissionPlan(manifest, image, [new ComponentCapabilityGrant(new DomainId(9200), internalCompute)], [new ComponentProvidedServiceRegistration(registration, protocol, IComputeServiceResponseProtocol.Definition, [internalCompute])]));
         Assert.True(admitted.IsSuccess, admitted.Message);
         var caller = TestFixtures.Create(kernel, 922, 9220).Handle;

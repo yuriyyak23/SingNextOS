@@ -21,9 +21,11 @@ internal sealed class NeutralOriginalDomainCloseFact(NeutralOriginalDomainCloseR
     public NeutralOriginalDomainCloseObservation? Observation { get; set; }
 }
 
-internal sealed class NeutralOriginalDomainAdmissionFact(
-    NeutralOriginalDomainBindRequest request, NeutralDomainState source)
+internal sealed class NeutralOriginalDomainAdmissionFact
 {
-    public NeutralOriginalDomainBindRequest Request { get; } = request;
-    public NeutralDomainState Source { get; } = source;
+    public NeutralOriginalDomainAdmissionFact(NeutralOriginalDomainBindRequest request, NeutralDomainState source)
+    { Request=request; Source=source; Original=this; }
+    public NeutralOriginalDomainAdmissionFact Original { get; }
+    public NeutralOriginalDomainBindRequest Request { get; }
+    public NeutralDomainState Source { get; }
 }

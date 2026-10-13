@@ -4,16 +4,19 @@ namespace SingPlus.Runtime;
 
 /// <summary>
 /// Conservative gate until a separately reviewed distributed ownership protocol exists.
-/// Writable bindings are single-host and rebinding requires verified prior reclaim.
+/// Fenced means local admission is stopped, not remote isolation. Without an
+/// original external closure producer all acquired uses remain retained.
 /// </summary>
 public sealed class CxlMultiHostGate : ICxlTeardownParticipant
 {
     private readonly RegionAuthority regions;
+    private readonly RuntimeKernel kernel;
+    private readonly object _gate = new();
     private sealed class Record(MultiHostMemoryBinding binding, RegionOwner owner, RegionUseHandle use)
     {
         public MultiHostMemoryBinding Binding { get; set; } = binding;
         public RegionOwner Owner { get; } = owner;
-        public RegionUseHandle Use { get; } = use;
+        public RegionUseHandle Use { get; set; } = use;
     }
     private readonly Dictionary<MultiHostBindingId, Record> _bindings = [];
     private ulong _nextId = 1;
@@ -21,6 +24,7 @@ public sealed class CxlMultiHostGate : ICxlTeardownParticipant
     public CxlMultiHostGate(RuntimeKernel kernel)
     {
         ArgumentNullException.ThrowIfNull(kernel);
+        this.kernel = kernel;
         regions = kernel.Regions;
         kernel.RegisterCxlTeardownParticipant(this);
     }
@@ -32,6 +36,20 @@ public sealed class CxlMultiHostGate : ICxlTeardownParticipant
         MultiHostAccessMode access,
         bool providerSupportsReadOnlySharing,
         bool distributedWritableAuthorityAvailable = false)
+    {
+        KernelResult<MultiHostMemoryBinding> result = default;
+        var admitted = kernel.CommitCxlRegionOwnerAdmission(owner, () =>
+        {
+            lock (_gate)
+                result = BindLocked(region, owner, host, access, providerSupportsReadOnlySharing, distributedWritableAuthorityAvailable);
+            return result.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(result.Error, result.Message!);
+        });
+        return admitted.IsSuccess ? result : KernelResult<MultiHostMemoryBinding>.Fail(admitted.Error, admitted.Message!);
+    }
+
+    private KernelResult<MultiHostMemoryBinding> BindLocked(
+        RegionHandle region, RegionOwner owner, ExternalHostIdentity host,
+        MultiHostAccessMode access, bool providerSupportsReadOnlySharing, bool distributedWritableAuthorityAvailable)
     {
         if (string.IsNullOrWhiteSpace(host.Value) || !Enum.IsDefined(access))
             return KernelResult<MultiHostMemoryBinding>.Fail(KernelError.InvalidMessage, "Multi-host binding request is invalid.");
@@ -45,62 +63,70 @@ public sealed class CxlMultiHostGate : ICxlTeardownParticipant
         if (access == MultiHostAccessMode.ReadOnly && (!providerSupportsReadOnlySharing || live.Any(record => record.Binding.Access != MultiHostAccessMode.ReadOnly)))
             return KernelResult<MultiHostMemoryBinding>.Fail(KernelError.PlatformUnsupported, "Read-only multi-host sharing is not explicitly supported or conflicts with a writer.");
 
+        if (_nextId == 0)
+            return KernelResult<MultiHostMemoryBinding>.Fail(KernelError.CapacityExhausted, "Multi-host binding identity space is exhausted.");
+        // Prepare local publication before acquiring the irreversible use.
+        _bindings.EnsureCapacity(_bindings.Count + 1);
+        var handle = new MultiHostBindingHandle(new(_nextId), new(1));
+        _nextId = _nextId == ulong.MaxValue ? 0 : _nextId + 1;
+        var binding = new MultiHostMemoryBinding(handle, host, region, access, MultiHostBindingState.Active);
+        var record = new Record(binding, owner, default);
         var mode = access == MultiHostAccessMode.Writable ? RegionUseMode.DevicePrivate : RegionUseMode.ReadOnly;
         var use = regions.AcquireUse(region, owner, mode, new(0, descriptor.Value!.ByteLength));
         if (!use.IsSuccess) return KernelResult<MultiHostMemoryBinding>.Fail(use.Error, use.Message!);
-        var handle = new MultiHostBindingHandle(new(_nextId++), new(1));
-        var binding = new MultiHostMemoryBinding(handle, host, region, access, MultiHostBindingState.Active);
-        _bindings.Add(handle.BindingId, new(binding, owner, use.Value!.Handle));
+        record.Use = use.Value!.Handle;
+        _bindings.Add(handle.BindingId, record);
         return KernelResult<MultiHostMemoryBinding>.Ok(binding);
     }
 
     public KernelResult<MultiHostMemoryBinding> Fence(MultiHostBindingHandle binding)
     {
+        lock (_gate)
+        {
         var record = Resolve(binding);
         if (!record.IsSuccess) return KernelResult<MultiHostMemoryBinding>.Fail(record.Error, record.Message!);
         if (record.Value!.Binding.State == MultiHostBindingState.Released) return KernelResult<MultiHostMemoryBinding>.Ok(record.Value.Binding);
         record.Value.Binding = record.Value.Binding with { State = MultiHostBindingState.Fenced };
         return KernelResult<MultiHostMemoryBinding>.Ok(record.Value.Binding);
+        }
     }
 
     public KernelResult<MultiHostMemoryBinding> RecordHostDisappearance(MultiHostBindingHandle binding)
-    {
-        var record = Resolve(binding);
-        if (!record.IsSuccess) return KernelResult<MultiHostMemoryBinding>.Fail(record.Error, record.Message!);
-        if (record.Value!.Binding.State == MultiHostBindingState.Released)
-            return KernelResult<MultiHostMemoryBinding>.Ok(record.Value.Binding);
-        record.Value.Binding = record.Value.Binding with { State = MultiHostBindingState.Fenced };
-        return KernelResult<MultiHostMemoryBinding>.Ok(record.Value.Binding);
-    }
+        => Fence(binding);
 
     public KernelResult BeginReclaim(MultiHostBindingHandle binding)
     {
+        lock (_gate)
+        {
         var record = Resolve(binding);
         if (!record.IsSuccess) return KernelResult.Fail(record.Error, record.Message!);
         if (record.Value!.Binding.State != MultiHostBindingState.Fenced)
             return KernelResult.Fail(KernelError.InvalidTransition, "Host binding must be fenced before reclaim.");
-        record.Value.Binding = record.Value.Binding with { State = MultiHostBindingState.Reclaiming };
-        return KernelResult.Ok();
+        return KernelResult.Fail(KernelError.PlatformUnsupported,
+            "A local fence does not prove original remote no-further-use; RegionUse remains retained.");
+        }
     }
 
     public KernelResult CompleteReclaim(MultiHostBindingHandle binding)
     {
+        lock (_gate)
+        {
         var record = Resolve(binding);
         if (!record.IsSuccess) return KernelResult.Fail(record.Error, record.Message!);
-        if (record.Value!.Binding.State != MultiHostBindingState.Reclaiming)
-            return KernelResult.Fail(KernelError.InvalidTransition, "Host binding must enter reclaim before release.");
-        var release = regions.ReleaseUse(record.Value.Use, record.Value.Owner);
-        if (!release.IsSuccess) return release;
-        record.Value.Binding = record.Value.Binding with { State = MultiHostBindingState.Released };
-        return KernelResult.Ok();
+        return KernelResult.Fail(KernelError.PlatformUnsupported,
+            "No original remote isolation producer is installed; RegionUse cannot be released.");
+        }
     }
 
     public KernelResult<MultiHostMemoryBinding> Query(MultiHostBindingHandle binding)
     {
+        lock (_gate)
+        {
         var record = Resolve(binding);
         return record.IsSuccess
             ? KernelResult<MultiHostMemoryBinding>.Ok(record.Value!.Binding)
             : KernelResult<MultiHostMemoryBinding>.Fail(record.Error, record.Message!);
+        }
     }
 
     private KernelResult<Record> Resolve(MultiHostBindingHandle handle)
@@ -114,21 +140,16 @@ public sealed class CxlMultiHostGate : ICxlTeardownParticipant
 
     KernelResult ICxlTeardownParticipant.CloseForProcess(ProcessHandle process, RegionOwner owner)
     {
+        lock (_gate)
+        {
+        var retained = false;
         foreach (var record in _bindings.Values.Where(item => item.Owner == owner && item.Binding.State != MultiHostBindingState.Released).ToArray())
         {
-            if (record.Binding.State == MultiHostBindingState.Active)
-            {
-                var fenced = Fence(record.Binding.Binding);
-                if (!fenced.IsSuccess) return KernelResult.Fail(fenced.Error, fenced.Message!);
-            }
-            if (record.Binding.State == MultiHostBindingState.Fenced)
-            {
-                var begun = BeginReclaim(record.Binding.Binding);
-                if (!begun.IsSuccess) return begun;
-            }
-            var completed = CompleteReclaim(record.Binding.Binding);
-            if (!completed.IsSuccess) return completed;
+            record.Binding = record.Binding with { State = MultiHostBindingState.Fenced };
+            retained = true;
         }
-        return KernelResult.Ok();
+        return retained ? KernelResult.Fail(KernelError.PlatformBindingDraining,
+            "Local process teardown cannot prove remote isolation; original multi-host uses remain pinned.") : KernelResult.Ok();
+        }
     }
 }

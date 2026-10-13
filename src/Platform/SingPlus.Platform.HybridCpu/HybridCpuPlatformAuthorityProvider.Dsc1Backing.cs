@@ -8,12 +8,13 @@ public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformOrigin
         public readonly ProviderMappingRecord Source=source,Destination=destination;
         public Dsc1BackingFact? Self;
         public NeutralOriginalDsc1CopyRequest? Native;
+        public NeutralOriginalDsc1Preparation? Preparation;
         public NeutralOriginalDsc1CopyObservation? Raw;
         public PlatformOriginalDsc1CopyBackingObservation? Published;
-        public bool Invoked,InFlight,SourceLost;
+        public bool PrepareAttempted,Invoked,InFlight,SourceLost;
     }
     private static bool Dsc1BackingHistory(ProviderMappingRecord mapping)=>(ulong)mapping.Dsc1Copies.Count==mapping.Dsc1CopiesIssued &&
-        mapping.Dsc1Copies.All(f=>ReferenceEquals(f.Self,f) && (ReferenceEquals(f.Source,mapping)||ReferenceEquals(f.Destination,mapping))) &&
+        mapping.Dsc1Copies.All(f=>f is not null && ReferenceEquals(f.Self,f) && f.Request is not null && (ReferenceEquals(f.Source,mapping)||ReferenceEquals(f.Destination,mapping))) &&
         mapping.Dsc1Copies.Select(f=>f.Request.InvocationId).Distinct().Count()==mapping.Dsc1Copies.Count;
     public PlatformAuthorityResult<PlatformOriginalDsc1CopyBackingObservation> CopyDsc1Backing(PlatformOriginalDsc1CopyBackingRequest request)=>RunDsc1Backing(request,false);
     public PlatformAuthorityResult<PlatformOriginalDsc1CopyBackingObservation> ResolveDsc1Backing(PlatformOriginalDsc1CopyBackingRequest request)=>RunDsc1Backing(request,true);
@@ -28,7 +29,14 @@ public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformOrigin
                 !_providerMappings.TryGetValue(request.Request.Destination.Mapping.MappingId,out var destination) ||
                 !Dsc1BackingHistory(source)||!Dsc1BackingHistory(destination))return Fail();
             var prior=source.Dsc1Copies.SingleOrDefault(f=>f.Request.InvocationId==request.InvocationId);
-            if(prior is not null){if(!ReferenceEquals(prior.Request,request))return Fail();fact=prior;}
+            if(prior is not null)
+            {
+                if(!ReferenceEquals(prior.Request,request) || !ReferenceEquals(prior.Source,source) ||
+                    !ReferenceEquals(prior.Destination,destination) ||
+                    source.Dsc1Copies.Count(f=>ReferenceEquals(f,prior))!=1 ||
+                    destination.Dsc1Copies.Count(f=>ReferenceEquals(f,prior))!=1)return Fail();
+                fact=prior;
+            }
             else
             {
                 if(lookup || ReferenceEquals(source,destination) || !PlatformDsc1ComputeContract.ValidateRequest(request.Request).IsSuccess ||
@@ -40,7 +48,7 @@ public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformOrigin
                 fact=new(request,source,destination);fact.Self=fact;
                 source.Dsc1Copies.Add(fact);destination.Dsc1Copies.Add(fact);source.Dsc1CopiesIssued++;destination.Dsc1CopiesIssued++;
             }
-            if(fact.SourceLost || fact.InFlight)return Fail();
+            if((fact.SourceLost && !lookup) || fact.InFlight)return Fail();
             if(fact.Published is { } published)return PlatformAuthorityResult<PlatformOriginalDsc1CopyBackingObservation>.Ok(published);
             fact.InFlight=true;
         }
@@ -49,19 +57,46 @@ public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformOrigin
             if(!Fresh())return Fail();
             if(fact.Native is null)
             {
-                if(lookup)return Fail();
-                var prepared=native.PrepareDsc1Copy(fact.Source.HybridCpuLease,request.Request.Source.Offset,
-                    fact.Destination.HybridCpuLease,request.Request.Destination.Offset,request.Source,request.Destination);
+                lock(_childCreateCommitGate)
+                {
+                    if (!lookup && fact.PrepareAttempted)return Fail();
+                    if(!fact.PrepareAttempted)
+                    {
+                        if(lookup)return Fail();
+                        fact.Preparation = native is INeutralOriginalDsc1PreparationProvider ? new() : null;
+                        fact.PrepareAttempted=true;
+                    }
+                }
+                NeutralOriginalDsc1CopyRequest? prepared;
+                if (lookup)
+                    prepared = native is INeutralOriginalDsc1PreparationProvider recovery && fact.Preparation is { } identity
+                        ? recovery.ResolveDsc1Preparation(identity, fact.Source.HybridCpuLease, fact.Destination.HybridCpuLease) : null;
+                else if (fact.Preparation is { } identity && native is INeutralOriginalDsc1PreparationProvider original)
+                    prepared = original.PrepareDsc1Copy(identity, fact.Source.HybridCpuLease,request.Request.Source.Offset,
+                        fact.Destination.HybridCpuLease,request.Request.Destination.Offset,request.Source,request.Destination);
+                else
+                    prepared=native.PrepareDsc1Copy(fact.Source.HybridCpuLease,request.Request.Source.Offset,
+                        fact.Destination.HybridCpuLease,request.Request.Destination.Offset,request.Source,request.Destination);
                 lock(_childCreateCommitGate){fact.Native=prepared;if(prepared is not null)request.Drop();}
                 if(prepared is null)return Fail();
+                if (lookup && !fact.Invoked && native is INeutralOriginalDsc1PreparationProvider cleanup)
+                {
+                    var closed = cleanup.EndDsc1PreparedCustody(prepared);
+                    lock(_childCreateCommitGate) fact.Raw = closed;
+                }
             }
             if(!Fresh())return Fail();
             bool invoke;
-            lock(_childCreateCommitGate){invoke=!lookup&&!fact.Invoked;if(invoke)fact.Invoked=true;}
-            if(invoke){try{var raw=native.CopyDsc1(fact.Native);lock(_childCreateCommitGate)fact.Raw=raw;}catch(Exception e)when(e is not StackOverflowException){} }
+            lock(_childCreateCommitGate)
+            {
+                if((fact.SourceLost && !lookup) || !Current()){fact.SourceLost=true;return Fail();}
+                invoke=!lookup&&!fact.Invoked;if(invoke)fact.Invoked=true;
+            }
+            if(invoke){try{var raw=native.CopyDsc1(fact.Native);lock(_childCreateCommitGate){if(raw is { IsOriginalObservation:true })fact.Raw=raw;}}catch(Exception e)when(e is not StackOverflowException){} }
             var observed=native.ResolveDsc1Copy(fact.Native);
             lock(_childCreateCommitGate)
             {
+                if(observed is not { IsOriginalObservation:true })return Fail();
                 if(fact.Raw is null)fact.Raw=observed;
                 else if(!ReferenceEquals(fact.Raw,observed))return Fail();
             }
@@ -69,7 +104,7 @@ public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformOrigin
             lock(_childCreateCommitGate)
             {
                 var raw=fact.Raw;
-                if(fact.SourceLost || !Current() || raw is null || !ReferenceEquals(raw.Request,fact.Native) ||
+                if((fact.SourceLost && !lookup) || !Current() || raw is not { IsOriginalObservation:true } || !ReferenceEquals(raw.Request,fact.Native) ||
                     raw.Completed==raw.NoEffectGuaranteed || !raw.NoFurtherByteUseGuaranteed)return Fail();
                 return PlatformAuthorityResult<PlatformOriginalDsc1CopyBackingObservation>.Ok(fact.Published=new(request,raw.Completed,raw.NoEffectGuaranteed,true));
             }
@@ -79,6 +114,6 @@ public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformOrigin
         bool Current()=>Dsc1BackingHistory(fact.Source)&&Dsc1BackingHistory(fact.Destination) &&
             fact.Source.Dsc1Copies.Any(f=>ReferenceEquals(f,fact)) && fact.Destination.Dsc1Copies.Any(f=>ReferenceEquals(f,fact)) &&
             ValidateProviderMapping(request.Request.Source.Mapping,null).IsSuccess && ValidateProviderMapping(request.Request.Destination.Mapping,null).IsSuccess;
-        bool Fresh(){var source=ValidateOriginalNativeMappingSource();lock(_childCreateCommitGate){if(!source.IsSuccess||!Current())fact.SourceLost=true;return !fact.SourceLost;}}
+        bool Fresh(){var source=ValidateOriginalNativeMappingSource();lock(_childCreateCommitGate){var current=source.IsSuccess&&Current();if(!current)fact.SourceLost=true;return current&&(lookup||!fact.SourceLost);}}
     }
 }

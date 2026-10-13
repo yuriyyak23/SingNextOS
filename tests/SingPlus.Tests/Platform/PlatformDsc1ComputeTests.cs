@@ -7,7 +7,7 @@ using SingPlus.Sip;
 
 namespace SingPlus.Tests.Platform;
 
-public sealed class PlatformDsc1ComputeTests
+public sealed partial class PlatformDsc1ComputeTests
 {
     [Theory]
     [InlineData(64UL,false)] [InlineData(96UL,false)] [InlineData(96UL,true)]
@@ -1992,7 +1992,8 @@ public sealed class PlatformDsc1ComputeTests
         ulong processId,
         ulong domainId,
         int length,
-        Action<RuntimeKernel, ProcessHandle>? beforeAllocation = null)
+        Action<RuntimeKernel, ProcessHandle>? beforeAllocation = null,
+        bool originalSlices = false)
     {
         var kernel = new RuntimeKernel(provider);
         var (_, subject) = TestFixtures.Create(kernel, processId, domainId);
@@ -2020,18 +2021,11 @@ public sealed class PlatformDsc1ComputeTests
                 ResourceKind.Compute,
                 CapabilityResourceIds.Dsc1Copy,
                 CapabilityRights.Execute).Value!.CapabilityId);
-        var sourceMapping = kernel.MapPlatformOwnedRegion(
-            subject,
-            binding,
-            sourceCapability,
-            source.Handle,
-            PlatformMemoryAccess.Read).Value!;
-        var destinationMapping = kernel.MapPlatformOwnedRegion(
-            subject,
-            binding,
-            destinationCapability,
-            destination.Handle,
-            PlatformMemoryAccess.Write).Value!;
+        PlatformRegionMapping Map(RegionHandle region, CapabilityId capability, PlatformMemoryAccess access) => originalSlices
+            ? kernel.MapPlatformOwnedRegionSlice(subject, binding, capability, region, 0, length, access).Value!.Mapping
+            : kernel.MapPlatformOwnedRegion(subject, binding, capability, region, access).Value!;
+        var sourceMapping = Map(source.Handle, sourceCapability, PlatformMemoryAccess.Read);
+        var destinationMapping = Map(destination.Handle, destinationCapability, PlatformMemoryAccess.Write);
 
         return new Scenario(
             kernel,
