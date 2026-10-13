@@ -4,7 +4,7 @@
 
 ## Текущий блок
 
-**Service BindIo original invocation closure завершён в bounded software contour.** [Record](../../artifacts/v6/iteration-20261013-service-io-bind/report.md): actual Bind/containment reply-query loss, original custody до effect, independent backing/loan/charge и invocation cleanup, no-repeat/copy/foreign deny; applicable main exit0 и actual host modes passed. Warm continuation не B1 cold recovery. Следующий concrete seam — service MapGuestRegion response loss, original mapping/Region/charges и invocation closure.
+**Accepted model Create exact provider refusal verified; весь Create lifecycle Partial.** [Record](../../artifacts/v6/iteration-20261013-model-refusal/report.md): actual Host capacity NotAccepted, original raw/source/no-effect consumption, Create1/Revoke0 и caller Region reclaim; changed source/malformed refusal pinned/no-repeat; applicable main exit0. Следующий consumer — accepted service model Create с source/admission отказом до AdmitEffect: original intent до source callbacks и own never-invoked consequence. Warm repair не B1 cold recovery.
 
 Actual assets: SDK11.0.100-rc.1.26425.128/net11.0; ExternalRuntime1.24.0/Contracts1.35.0/schema1.4.0. Версии перепроверять перед adoption; sibling source сам по себе не меняет NuGet consumer.
 
@@ -14,7 +14,7 @@ Actual assets: SDK11.0.100-rc.1.26425.128/net11.0; ExternalRuntime1.24.0/Contrac
 
 | Приоритет | Boundary / classification | Действие |
 |---|---|---|
-| 1 | VirtualizationService guest mapping invocation closure, Partial | Actual generated MapGuestRegion client reply loss; original mapping/Region/budget custody до effect и exact parent/guest closure перед invocation consumption. Mapped acquisition guard сохранять |
+| 1 | VirtualizationService model Create pre-effect source/admission refusal, Partial | Actual accepted client при unavailable/reset/revoked source до AdmitEffect; existing original intent до callbacks и own never-invoked consequence для caller cleanup. Unknown effect/NotFound/exception после invocation не containment |
 | 2 | B2/B3/B5, Partial | Remaining actual provider unknown/history/independent-user consequences: request/fact до effect, exact same-original no-effect/closure, no-repeat, actual adoption и Region/charge последствия. Выбирать конкретного клиента по source; API/helper/test callback не producer |
 | 3 | B1, Missing/ExternalBlocked | Durable original fact до effect и cleanup-only replay после all-fact-loss/reboot. Нужны trusted cold monotonic anchor/provider continuation, freshness/rollback/torn-write и authenticated lifetime semantics. Сохранять dependent pins; независимую работу продолжать |
 | 4 | P08/P03 consumers, not dependency-ready без prerequisite | DMA cross-owner execution не required staged ExternalOperation predecessor. Не фабриковать predecessor, не обходить mapped-region acquisition guard. Restart/settlement/pool/coherent APIs расширять после actual client и original acquisition/backing need |

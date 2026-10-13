@@ -11,6 +11,8 @@ public enum PlatformVirtualDomainTransition { Configure = 0, Start, Park, Resume
 
 public interface IPlatformVirtualizationProvider
 {
+    /// <summary>NotAccepted with no lease guarantees this invocation produced no effect.
+    /// Other failures do not establish containment or closure.</summary>
     PlatformAuthorityResult<PlatformProviderVirtualDomainLease> CreateVirtualDomain(PlatformDomainIdentity owner, PlatformVirtualDomainProfile profile);
     PlatformAuthorityResult TransitionVirtualDomain(PlatformProviderVirtualDomainLease lease, PlatformVirtualDomainTransition transition);
     PlatformAuthorityResult RevokeVirtualDomain(PlatformProviderVirtualDomainLease lease);

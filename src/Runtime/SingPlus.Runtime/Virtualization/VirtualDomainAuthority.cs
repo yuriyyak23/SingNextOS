@@ -348,9 +348,9 @@ internal sealed partial class VirtualDomainAuthority
             record.OriginalMappings.EnsureCapacity(record.OriginalMappings.Count + 1);
             record.StagedMappings.EnsureCapacity(record.StagedMappings.Count + 1);
             record.MappingSources.EnsureCapacity(record.MappingSources.Count + 1);
-            if (record.ChildBinding is null) record.LocalGuestLifetimes.EnsureCapacity(record.LocalGuestLifetimes.Count + 1);
+            record.LocalGuestLifetimes.EnsureCapacity(record.LocalGuestLifetimes.Count + 1);
             var mapping = new GuestRegionMapping(new GuestRegionMappingHandle(new GuestRegionMappingId(_nextMappingId++), new GuestRegionMappingGeneration(1)), record.Handle, record.AddressSpace, range, region, access);
-            var localLifetime = record.ChildBinding is null ? new LocalGuestLifetime(record, mapping) : null;
+            var localLifetime = new LocalGuestLifetime(record, mapping);
             record.Mappings.Add(mapping.Mapping.MappingId, mapping);
             record.OriginalMappings.Add(mapping.Mapping.MappingId, mapping);
             record.StagedMappings.Add(mapping.Mapping.MappingId);
@@ -407,6 +407,7 @@ internal sealed partial class VirtualDomainAuthority
             record.OriginalMappings.Remove(id);
             record.StagedMappings.Remove(id);
             record.MappingSources.Remove(id);
+            record.LocalGuestLifetimes.Remove(id);
             return KernelResult.Ok();
         }
     }

@@ -23,7 +23,7 @@ public sealed partial class HostPlatformAuthorityProvider
         CreateVirtualDomainCallCount++;
         if (!PlatformDomainContract.ValidateSubject(owner).IsSuccess || profile.VirtualProcessorCount <= 0 || profile.MaximumGuestMemoryBytes <= 0)
             return PlatformAuthorityResult<PlatformProviderVirtualDomainLease>.Fail(PlatformAuthorityStatus.Denied, "Virtual-domain owner and profile must be bounded and materialized.");
-        if (_nextVirtualDomainId == ulong.MaxValue) return PlatformAuthorityResult<PlatformProviderVirtualDomainLease>.Fail(PlatformAuthorityStatus.Denied, "Model-domain identity space is exhausted.");
+        if (_nextVirtualDomainId == ulong.MaxValue) return PlatformAuthorityResult<PlatformProviderVirtualDomainLease>.Fail(PlatformAuthorityStatus.NotAccepted, "Model-domain identity space is exhausted before effect.");
         var lease = new PlatformProviderVirtualDomainLease(new PlatformProviderVirtualDomainLeaseId(_nextVirtualDomainId++), new PlatformProviderLeaseGeneration(1), owner);
         _virtualDomains.Add(lease.LeaseId, new VirtualDomainRecord(lease));
         return PlatformAuthorityResult<PlatformProviderVirtualDomainLease>.Ok(lease);

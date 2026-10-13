@@ -23,6 +23,17 @@ public interface INeutralOriginalAdmissionProvider : INeutralOriginalMappingClos
     NeutralOriginalOwnedRegionMapObservation MapOwnedRegion(NeutralOriginalOwnedRegionMapRequest request);
 }
 
+/// <summary>Pure lookup of a surviving original Map invocation; absence is unknown.</summary>
+public interface INeutralOriginalMapOutcomeProvider : INeutralOriginalAdmissionProvider
+{
+    NeutralOriginalOwnedRegionMapObservation? ResolveOriginalOwnedRegionMap(NeutralOriginalOwnedRegionMapRequest request);
+}
+
+public interface INeutralOriginalBindOutcomeProvider : INeutralOriginalAdmissionProvider
+{
+    NeutralOriginalDomainBindObservation? ResolveOriginalDomainBind(NeutralOriginalDomainBindRequest request);
+}
+
 public readonly record struct NeutralOriginalDomainCloseRequest(
     Guid InvocationId, Guid RuntimeIncarnation, Guid DomainBindInvocationId, NeutralDomainBindingLease Domain);
 public readonly record struct NeutralOriginalDomainCloseObservation(

@@ -8,12 +8,22 @@ using YAKSys_Hybrid_CPU.ExecutableAdapter;
 // The second mapping is an independent live user, not an execution predecessor.
 var startLoss=args.Contains("--service-start-loss",StringComparer.Ordinal);
 var mapLoss=args.Contains("--service-map-loss",StringComparer.Ordinal);
+var childCreateLoss=args.Contains("--service-cached-create-loss",StringComparer.Ordinal);
+var freshChildLoss=args.Contains("--service-child-create-loss",StringComparer.Ordinal);
 var serviceMode=startLoss || args.Contains("--service-bind-loss",StringComparer.Ordinal);
-var lossMode=mapLoss || serviceMode || args.Contains("--lost-release-reply",StringComparer.Ordinal);
+var lossMode=freshChildLoss || childCreateLoss || mapLoss || serviceMode || args.Contains("--lost-release-reply",StringComparer.Ordinal);
 var packageArgument=args.SingleOrDefault(arg=>!arg.StartsWith("--",StringComparison.Ordinal));
 var packagePath=packageArgument is null?Path.Combine(AppContext.BaseDirectory,"guest.hcexe"):Path.GetFullPath(packageArgument);
 var package=File.ReadAllBytes(packagePath);
 var native=new NeutralDomainRuntimeFacade();
+var createLoss=args.Contains("--service-create-loss",StringComparer.Ordinal);
+GuestCreateReplyLossRuntime? createResponseLoss=null;
+INeutralDomainRuntime rootRuntime=native;
+if(createLoss)
+{
+    var proxy=global::System.Reflection.DispatchProxy.Create<IGuestCreateReplyLossRuntime,GuestCreateReplyLossRuntime>();
+    createResponseLoss=(GuestCreateReplyLossRuntime)(object)proxy;createResponseLoss.Inner=native;rootRuntime=proxy;
+}
 GuestReplyLossRuntime? responseLoss=null;
 var adapter=new HybridCpuExecutableChildAdapter();
 if(lossMode)
@@ -25,7 +35,7 @@ if(lossMode)
         [typeof(HybridCPU.ExternalRuntime.Contracts.IHybridCpuExternalRuntime),typeof(HybridCPU.ExternalRuntime.Contracts.IHybridCpuChildDomainRuntimeV3),typeof(ISemanticTraceSinkV1)],null)!;
     adapter=(HybridCpuExecutableChildAdapter)constructor.Invoke([external,proxy,null]);
 }
-var kernel=new RuntimeKernel(new HybridCpuPlatformAuthorityProvider(native,adapter));
+var kernel=new RuntimeKernel(new HybridCpuPlatformAuthorityProvider(rootRuntime,adapter));
 void Check(bool value,string operation){if(!value)throw new InvalidOperationException(operation);}
 ProcessHandle Create(ulong id,ulong domain)
 {
@@ -42,6 +52,49 @@ ulong Used(ServiceBudgetDimension dimension)=>kernel.QueryBudget(budget).Value!.
 var code=kernel.AllocateBuffer<byte>(owner,(int)bytes).Value!;
 var peer=kernel.AllocateBuffer<byte>(owner,(int)bytes).Value!;peer.Span[0]=0x6B;
 var create=kernel.MintCapability(new(23010),owner,ResourceKind.Virtualization,VirtualizationResourceIds.Create,CapabilityRights.Configure).Value!.CapabilityId;
+if(createLoss || childCreateLoss || freshChildLoss)
+{
+    if(childCreateLoss)
+    {
+        Check(kernel.BindPlatformDomain(owner).IsSuccess,"pre-existing root admission");
+        responseLoss!.LoseChildCreateResponses=true;
+    }
+    if(freshChildLoss)responseLoss!.LoseChildCreateResponses=true;
+    var protocol=SingPlus.Sip.Virtualization.VirtualizationServiceClient.CreateProtocol();
+    var descriptor=kernel.RegisterService(foreign,"guest-create-host",new(protocol.ContractName,"1",protocol.ContractDigest),protocol,
+        SingPlus.Sip.Virtualization.VirtualizationServiceClient.ResponseProtocol,[]).Value!;
+    var session=kernel.OpenSession(owner,descriptor,[]).Value;
+    var host=RuntimeVirtualizationServiceHost.CreateForSession(kernel,foreign,session).Value!;
+    var client=SingPlus.Sip.Virtualization.VirtualizationServiceClient.Create(new RuntimeSipClientTransport(kernel,owner,session));
+    var pending=client.CreateAsync(new(create,new(1,(long)bytes*2)));
+    Check(!host.ProcessNext().IsSuccess,"unknown Create not published");
+    var denied=false;try{await pending;}catch(Exception){denied=true;}Check(denied,"failed accepted Create response");
+    if(childCreateLoss)
+    {
+        Check(responseLoss!.ChildCreates==0 && native.ActiveBindingCount==1,"existing root refusal before child effect");
+        Check(kernel.CloseSession(owner,session).IsSuccess,"pre-acceptance refusal session closure");
+        Check(kernel.TerminateProcess(owner).IsSuccess,"existing root ordinary owner teardown");
+        Check(kernel.QueryBudget(budget).Value!.Usage.All(u=>u.Used==0),"refused Create original charges reclaim");
+        Console.WriteLine("Existing-root Create refused before acceptance: ChildCreate0; nativeRoots0; charges0; service survives; gatesOFF; ISA NONE; ProductionQualified=false");
+        return;
+    }
+    Check((freshChildLoss?responseLoss!.ChildCreates:createResponseLoss!.Binds)==1 && native.ActiveBindingCount==1,"original root/child effect once");
+    Check(!kernel.TerminateProcess(owner).IsSuccess,"unknown root/query retains caller");
+    if(freshChildLoss)responseLoss!.LoseChildCreateResponses=false;else createResponseLoss!.Lose=false;
+    if(freshChildLoss && args.Contains("--lost-child-close-reply",StringComparer.Ordinal))
+    {
+        responseLoss!.LoseChildCloseResponses=true;
+        Check(!kernel.TerminateProcess(owner).IsSuccess,"unknown child Close retains original caller");
+        Check(Used(ServiceBudgetDimension.OwnedMemoryBytes)==bytes*2 && native.ActiveBindingCount==1,"partial child Close retains independent Regions/charges/root");
+        responseLoss.LoseChildCloseResponses=false;
+    }
+    var teardown=kernel.TerminateProcess(owner);
+    Console.WriteLine($"Create loss: effects={(freshChildLoss?responseLoss!.ChildCreates:createResponseLoss!.Binds)}; nativeRoots={native.ActiveBindingCount}; OwnedMemory={Used(ServiceBudgetDimension.OwnedMemoryBytes)}; teardown={teardown.Error}; codeRegion={kernel.Regions.Snapshot().Single(r=>r.Handle==code.Handle).State}; serviceAlive={kernel.Processes.Resolve(foreign).IsSuccess}");
+    Check(teardown.IsSuccess,teardown.Message??"original service Create invocation closure");
+    Check(kernel.QueryBudget(budget).Value!.Usage.All(u=>u.Used==0),"Create quantitative reclaim");
+    if(freshChildLoss)Check(responseLoss!.ChildCreates==1 && responseLoss.ChildCloses==1,"original child Create/Close no-repeat");
+    return;
+}
 var domain=kernel.CreateVirtualDomain(owner,create,new(1,(long)bytes*2)).Value!;
 Check(kernel.ConfigureVirtualDomain(owner,domain.Domain,domain.ConfigureCapability).IsSuccess,"configure guest");
 CapabilityId Memory(SingPlus.Sip.OwnedBuffer<byte> buffer,bool executable)=>kernel.MintCapability(new(23010),owner,ResourceKind.MemoryRegion,

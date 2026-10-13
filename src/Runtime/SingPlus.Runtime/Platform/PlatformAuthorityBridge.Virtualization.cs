@@ -20,6 +20,7 @@ public sealed partial class PlatformAuthorityBridge
         public PlatformProviderIncarnation ProviderIncarnation { get; set; }
         public bool EffectMayHaveOccurred { get; set; }
         public PlatformAuthorityResult<PlatformProviderVirtualDomainLease>? Observation { get; set; }
+        public Func<KernelResult>? LocalCreationClosureConsumer { get; set; }
     }
     private sealed record VirtualDomainRecord(
         VirtualDomainBinding Binding,
@@ -66,7 +67,11 @@ public sealed partial class PlatformAuthorityBridge
         Func<Func<KernelResult>, KernelResult>? admissionConsumer = null,
         Func<Func<KernelResult>, KernelResult>? sourceCommitConsumer = null,
         Func<VirtualDomainBinding, Func<Func<KernelResult>, KernelResult>, KernelResult>? completionConsumer = null,
-        Action<VirtualDomainBinding>? cleanupConsumer = null)
+        Action<VirtualDomainBinding>? cleanupConsumer = null,
+        Func<object,KernelResult>? originalCreationConsumer=null,
+        Func<object,KernelResult>? originalCreationClosureConsumer=null,
+        Func<object,KernelResult>? originalCreationNoEffectConsumer=null,
+        Func<object,KernelResult>? originalCreationNeverInvokedConsumer=null)
     {
         if (_provider is not IPlatformVirtualizationProvider provider ||
             !_featureManifest.Supports(PlatformFeatureFamily.VirtualizationDomains,
@@ -94,6 +99,12 @@ public sealed partial class PlatformAuthorityBridge
                     epoch = BackendEpoch;
                     binding = new(new(_nextVirtualDomainBindingId++), new(1), owner.Process);
                     invocation = new(owner, profile, epoch);
+                    if(originalCreationConsumer is not null)
+                    {
+                        var linked=originalCreationConsumer(invocation);
+                        if(!linked.IsSuccess)return linked;
+                        invocation.LocalCreationClosureConsumer=()=>originalCreationClosureConsumer?.Invoke(invocation)??KernelResult.Ok();
+                    }
                     _pendingVirtualDomainCreates.Add(owner, invocation);
                     return KernelResult.Ok();
                 }
@@ -138,9 +149,29 @@ public sealed partial class PlatformAuthorityBridge
             lock (_secureDomainLifecycleGate) invocation.Observation = result;
             if (!result.IsSuccess)
             {
+                if(result.Status!=PlatformAuthorityStatus.NotAccepted)
+                {
+                    lock(_secureDomainLifecycleGate)_unresolvedVirtualDomainCreates.TryAdd(owner,invocation);
+                    return FromProviderFailure<VirtualDomainBinding>(result.Status,result.Message);
+                }
+                PlatformProviderIncarnation refusalSource=default;
+                if(result.Status==PlatformAuthorityStatus.NotAccepted)
+                    try { refusalSource=CurrentProviderIncarnation(); }
+                    catch(Exception exception) when(exception is not StackOverflowException) { }
                 lock (_secureDomainLifecycleGate)
-                    if (result.Status != PlatformAuthorityStatus.NotAccepted || BackendEpoch != epoch)
+                {
+                    var exactNoEffect=result.Status==PlatformAuthorityStatus.NotAccepted && result.Value==default && refusalSource==source && source.Value!=0 &&
+                        BackendEpoch==epoch && !_backendEpochExhausted &&
+                        _pendingVirtualDomainCreates.TryGetValue(owner,out var pending) && ReferenceEquals(pending,invocation) &&
+                        invocation.Observation is { Status:PlatformAuthorityStatus.NotAccepted } retained && retained==result;
+                    var consumed=exactNoEffect ? originalCreationNoEffectConsumer?.Invoke(invocation)??KernelResult.Ok() :
+                        KernelResult.Fail(KernelError.PlatformFaulted,"Original model refusal source is unavailable or changed.");
+                    if(!consumed.IsSuccess)
+                    {
                         _unresolvedVirtualDomainCreates.TryAdd(owner, invocation);
+                        return KernelResult<VirtualDomainBinding>.Fail(consumed.Error,consumed.Message!);
+                    }
+                }
                 return FromProviderFailure<VirtualDomainBinding>(result.Status, result.Message);
             }
             var lease = result.Value!;
@@ -202,7 +233,24 @@ public sealed partial class PlatformAuthorityBridge
             }
             return KernelResult<VirtualDomainBinding>.Ok(binding);
         }
-        finally { lock (_secureDomainLifecycleGate) _pendingVirtualDomainCreates.Remove(owner); }
+        finally
+        {
+            lock (_secureDomainLifecycleGate)
+            {
+                if(_pendingVirtualDomainCreates.TryGetValue(owner,out var pending) && ReferenceEquals(pending,invocation))
+                {
+                    // Own control-flow fact, before every provider effect call. Source failure/reset
+                    // cannot turn this into an unknown invoked effect or require fresh permission.
+                    if(!invocation.EffectMayHaveOccurred)
+                    {
+                        var consumed=originalCreationNeverInvokedConsumer?.Invoke(invocation)??KernelResult.Ok();
+                        if(!consumed.IsSuccess)_unresolvedVirtualDomainCreates.TryAdd(owner,invocation);
+                    }
+                    _pendingVirtualDomainCreates.Remove(owner);
+                }
+                else _unresolvedVirtualDomainCreates.TryAdd(owner,invocation);
+            }
+        }
     }
 
     internal KernelResult CommitModelDomainConsumer(VirtualDomainBinding binding, Func<KernelResult> commit)
@@ -443,6 +491,8 @@ public sealed partial class PlatformAuthorityBridge
                     if (retainCleanupReceipt) return KernelResult.Ok();
                     return localConsumer(() =>
                     {
+                        var creationClosed=record.CreateInvocation?.LocalCreationClosureConsumer?.Invoke()??KernelResult.Ok();
+                        if(!creationClosed.IsSuccess)return creationClosed;
                         _virtualDomainBindings.Remove(binding.BindingId);
                         if (_originalVirtualDomainOwners.TryGetValue(binding.BindingId, out var original) && ReferenceEquals(original, record))
                             _originalVirtualDomainOwners.Remove(binding.BindingId);

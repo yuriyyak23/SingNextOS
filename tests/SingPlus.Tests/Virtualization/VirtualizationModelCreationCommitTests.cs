@@ -9,6 +9,76 @@ namespace SingPlus.Tests.Virtualization;
 public sealed class VirtualizationModelCreationCommitTests
 {
     [Theory]
+    [InlineData(0,false)] [InlineData(1,false)] [InlineData(2,false)]
+    [InlineData(0,true)] [InlineData(1,true)] [InlineData(2,true)]
+    public async Task AcceptedModelCreateRetainsIntentBeforeSourceAndClosesNeverInvoked(int fault,bool overlap)
+    {
+        var provider=new ObservedModelProvider();var kernel=new RuntimeKernel(provider);
+        var caller=TestFixtures.Create(kernel,2941,29410).Handle;var service=TestFixtures.Create(kernel,2942,29420).Handle;
+        var region=kernel.AllocateBuffer<byte>(caller,64).Value!;var foreign=kernel.AllocateBuffer<byte>(service,32).Value!;
+        var cap=kernel.MintCapability(new(29410),caller,ResourceKind.Virtualization,VirtualizationResourceIds.Create,CapabilityRights.Configure).Value!.CapabilityId;
+        var protocol=SingPlus.Sip.Virtualization.VirtualizationServiceClient.CreateProtocol();
+        var descriptor=kernel.RegisterService(service,"pre-effect-source",new(protocol.ContractName,"1",protocol.ContractDigest),protocol,SingPlus.Sip.Virtualization.VirtualizationServiceClient.ResponseProtocol,[]).Value!;
+        var session=kernel.OpenSession(caller,descriptor,[]).Value;
+        var host=RuntimeVirtualizationServiceHost.CreateForSession(kernel,service,session).Value!;
+        var client=SingPlus.Sip.Virtualization.VirtualizationServiceClient.Create(new RuntimeSipClientTransport(kernel,caller,session));
+        object? retainedInvocation=null;
+        provider.BeforeSource=()=>
+        {
+            provider.BeforeSource=null;
+            var flags=global::System.Reflection.BindingFlags.Instance|global::System.Reflection.BindingFlags.NonPublic;
+            var pending=(global::System.Collections.IDictionary)typeof(PlatformAuthorityBridge).GetField("_pendingVirtualDomainCreates",flags)!.GetValue(kernel.PlatformAuthority)!;
+            var original=Assert.Single(pending.Values.Cast<object>());
+            Assert.False((bool)original.GetType().GetProperty("EffectMayHaveOccurred")!.GetValue(original)!);
+            var registry=(EndpointSessionInvocationRegistry)typeof(RuntimeKernel).GetField("_endpointSessionInvocationRegistry",flags)!.GetValue(kernel)!;
+            var records=(global::System.Collections.IDictionary)registry.GetType().GetField("_ownedRecords",flags)!.GetValue(registry)!;
+            var record=Assert.Single(records.Values.Cast<object>());
+            retainedInvocation=record;
+            Assert.Same(original,record.GetType().GetProperty("OriginalVirtualCreate")!.GetValue(record));
+            var invocation=(EndpointSessionInvocationHandle)record.GetType().GetProperty("Handle")!.GetValue(record)!;
+            Assert.False(registry.ConsumeVirtualCreationNeverInvoked(invocation,service,original).IsSuccess);
+            Assert.False(registry.ConsumeVirtualCreationNeverInvoked(invocation,caller,new object()).IsSuccess);
+            if(overlap)Assert.False(kernel.TerminateProcess(caller).IsSuccess);
+            if(fault==0)throw new IOException("Pre-effect source unavailable");
+            if(fault==1)Assert.True(kernel.ObservePlatformBackendReset().IsSuccess);
+            if(fault==2)Assert.True(kernel.RevokeCapability(cap).IsSuccess);
+        };
+        var request=client.CreateAsync(new(cap,new(1,4096)));
+        Assert.False(host.ProcessNext().IsSuccess);await Assert.ThrowsAnyAsync<Exception>(async()=>await request);
+        Assert.NotNull(retainedInvocation);
+        Assert.True((bool)retainedInvocation.GetType().GetProperty("VirtualCreateNeverInvoked")!.GetValue(retainedInvocation)!);
+        var closed=kernel.TerminateProcess(caller);Assert.True(closed.IsSuccess,$"{closed.Message}; teardown={kernel.QueryProcessTeardown(caller).Value}; terminal={retainedInvocation.GetType().GetProperty("TerminalStatus")!.GetValue(retainedInvocation)}");
+        Assert.Equal(0,provider.CreateCalls);Assert.Equal(0,provider.RevokeCalls);
+        Assert.Equal(RegionState.Released,kernel.Regions.Snapshot().Single(r=>r.Handle==region.Handle).State);
+        Assert.Equal(RegionState.Owned,kernel.Regions.Snapshot().Single(r=>r.Handle==foreign.Handle).State);
+        Assert.True(kernel.Processes.Resolve(service).IsSuccess);
+    }
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public async Task AcceptedModelRefusalWithChangedSourceRetainsCallerWithoutRepeat(bool unavailable)
+    {
+        var provider=new ObservedModelProvider();
+        typeof(HostPlatformAuthorityProvider).GetField("_nextVirtualDomainId",global::System.Reflection.BindingFlags.Instance|global::System.Reflection.BindingFlags.NonPublic)!.SetValue(provider._inner,ulong.MaxValue);
+        provider.AfterCreate=()=>{if(unavailable)provider.ThrowSource=true;else provider.Incarnation=new(2);};
+        var kernel=new RuntimeKernel(provider);
+        var caller=TestFixtures.Create(kernel,2931,29310).Handle;var service=TestFixtures.Create(kernel,2932,29320).Handle;
+        var region=kernel.AllocateBuffer<byte>(caller,64).Value!;
+        var cap=kernel.MintCapability(new(29310),caller,ResourceKind.Virtualization,VirtualizationResourceIds.Create,CapabilityRights.Configure).Value!.CapabilityId;
+        var protocol=SingPlus.Sip.Virtualization.VirtualizationServiceClient.CreateProtocol();
+        var descriptor=kernel.RegisterService(service,"source-refusal",new(protocol.ContractName,"1",protocol.ContractDigest),protocol,SingPlus.Sip.Virtualization.VirtualizationServiceClient.ResponseProtocol,[]).Value!;
+        var session=kernel.OpenSession(caller,descriptor,[]).Value;
+        var host=RuntimeVirtualizationServiceHost.CreateForSession(kernel,service,session).Value!;
+        var client=SingPlus.Sip.Virtualization.VirtualizationServiceClient.Create(new RuntimeSipClientTransport(kernel,caller,session));
+        var pending=client.CreateAsync(new(cap,new(1,4096)));
+        Assert.False(host.ProcessNext().IsSuccess);await Assert.ThrowsAnyAsync<Exception>(async()=>await pending);
+        Assert.False(kernel.TerminateProcess(caller).IsSuccess);
+        provider.ThrowSource=false;provider.Incarnation=new(1);
+        Assert.False(kernel.TerminateProcess(caller).IsSuccess);
+        Assert.Equal(1,provider.CreateCalls);Assert.Equal(0,provider.RevokeCalls);
+        Assert.Equal(RegionState.Owned,kernel.Regions.Snapshot().Single(r=>r.Handle==region.Handle).State);
+        Assert.True(kernel.Processes.Resolve(service).IsSuccess);
+    }
+    [Theory]
     [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)]
     [InlineData(4)] [InlineData(5)] [InlineData(6)] [InlineData(7)]
     public void MutableLocalVirtualSourceCannotPublishAcrossEqualWriteOrAba(int fault)
@@ -115,9 +185,10 @@ public sealed class VirtualizationModelCreationCommitTests
 
     [Theory]
     [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)]
+    [InlineData(4)]
     public void ModelOriginalCreateFactRetainsOutcomeAndPinsActualBacking(int outcome)
     {
-        var provider = new ObservedModelProvider { CreateFailure = outcome == 0 ? PlatformAuthorityStatus.Denied : null, MalformedLease = outcome == 2 };
+        var provider = new ObservedModelProvider { CreateFailure = outcome == 0 ? PlatformAuthorityStatus.Denied : null, MalformedLease = outcome == 2, MalformedRefusal=outcome==4 };
         var kernel = new RuntimeKernel(provider);
         var (process, owner) = TestFixtures.Create(kernel, 991, 9910);
         var subject = new PlatformDomainIdentity(process.DomainId, owner);
@@ -1285,7 +1356,7 @@ public sealed class VirtualizationModelCreationCommitTests
 
     private sealed class ObservedModelProvider : IPlatformAuthorityProvider, IPlatformVirtualizationProvider, IPlatformFeatureProvider, IPlatformProviderIncarnationSource
     {
-        private readonly HostPlatformAuthorityProvider _inner = new();
+        internal readonly HostPlatformAuthorityProvider _inner = new();
         public PlatformProviderIncarnation Incarnation { get; set; } = new(1);
         public bool ThrowSource { get; set; }
         public Action? BeforeSource { get; set; }
@@ -1305,6 +1376,7 @@ public sealed class VirtualizationModelCreationCommitTests
         public PlatformAuthorityStatus? CreateFailure { get; set; }
         public PlatformAuthorityStatus? RevokeFailure { get; set; }
         public bool MalformedLease { get; set; }
+        public bool MalformedRefusal { get; set; }
         public int CreateCalls { get; private set; }
         public int RevokeCalls { get; private set; }
         public int TransitionCalls { get; private set; }
@@ -1322,6 +1394,7 @@ public sealed class VirtualizationModelCreationCommitTests
             CreateCalls++;
             var result = _inner.CreateVirtualDomain(owner, profile);
             AfterCreate?.Invoke();
+            if(MalformedRefusal)return new(PlatformAuthorityStatus.NotAccepted,result.Value,"Malformed refusal carries an effect lease");
             if (CreateFailure is { } status) return PlatformAuthorityResult<PlatformProviderVirtualDomainLease>.Fail(status, "controlled unknown creation");
             return MalformedLease ? PlatformAuthorityResult<PlatformProviderVirtualDomainLease>.Ok(
                 result.Value! with { LeaseId = new(0) }) : result;

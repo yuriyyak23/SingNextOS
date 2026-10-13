@@ -66,6 +66,7 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
         public PlatformDomainBindRequest? Request { get; init; }
         public NeutralOriginalDomainBindRequest? NativeRequest { get; set; }
         public NeutralOriginalDomainBindObservation? NativeObservation { get; set; }
+        public NeutralOriginalDomainBindObservation? NativeResolutionObservation { get; set; }
         public bool NoEffectConsumed { get; set; }
         public DomainRecord? OriginalDomain { get; set; }
         public DomainRecord? PublishedDomain { get; set; }

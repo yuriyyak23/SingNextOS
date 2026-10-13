@@ -18,6 +18,15 @@ public sealed partial class RuntimeKernel
     // Success is only a shape/owner filter; effect admission is checked again by the actual owner.
     internal KernelResult ValidateSessionVirtualIoInput(ProcessHandle owner, uint messageId, object? payload)
     {
+        if(messageId==SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_CreateAsync &&
+            payload is SingPlus.Sip.Virtualization.CreateVirtualDomainRequest)
+        {
+            var process=Processes.Resolve(owner);
+            if(!process.IsSuccess)return KernelResult.Fail(process.Error,process.Message!);
+            lock(_platformMemoryUseGate)
+                if(PlatformAuthority.HasActiveAuthority(PlatformIdentity(process.Value!)) || _pendingPlatformDomainBinds.Contains(owner))
+                    return KernelResult.Fail(KernelError.PlatformDenied,"Create requires a fresh root admission; existing root cannot be reused.");
+        }
         if (messageId == SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_BindIoAsync &&
             payload is SingPlus.Sip.Virtualization.BindVirtualIoRequest bind)
         {

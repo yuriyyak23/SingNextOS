@@ -17,6 +17,10 @@ public class GuestReplyLossRuntime : DispatchProxy
     public bool LoseBindResponses;
     public bool LoseStartResponses;
     public bool LoseMapResponses;
+    public bool LoseChildCreateResponses;
+    public int ChildCreates;
+    public bool LoseChildCloseResponses;
+    public int ChildCloses;
     public int MapCalls, UnmapCalls, BindCalls, StartCalls, ReleaseCalls;
     protected override object? Invoke(MethodInfo? method,object?[]? arguments)
     {
@@ -26,7 +30,11 @@ public class GuestReplyLossRuntime : DispatchProxy
             throw new IOException("Original artifact Bind query lost");
         if(LoseStartResponses && method!.Name=="ResolveOriginalChildExecutionStart")throw new IOException("Original Start query lost");
         if(LoseMapResponses && method!.Name=="ResolveOriginalGuestMap")throw new IOException("Original guest Map query lost");
+        if(LoseChildCreateResponses && method!.Name=="ResolveOriginalChildCreate")throw new IOException("Original ChildCreate query lost");
+        if(LoseChildCloseResponses && method!.Name=="ResolveOriginalChildClose")throw new IOException("Original child Close query lost");
         var result=method!.Invoke(Inner,arguments);
+        if(method.Name=="CreateOriginalChild"){ChildCreates++;if(LoseChildCreateResponses)throw new IOException("Original ChildCreate reply lost after effect");}
+        if(method.Name=="CloseOriginalChild"){ChildCloses++;if(LoseChildCloseResponses)throw new IOException("Original child Close reply lost after effect");}
         if(method.Name=="MapOriginalGuest"){MapCalls++;if(LoseMapResponses)throw new IOException("Original guest Map reply lost after effect");}
         if(method.Name=="UnmapOriginalGuest")UnmapCalls++;
         if(method.Name=="BindChildExecutableArtifact")

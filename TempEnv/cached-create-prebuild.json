@@ -1,0 +1,27 @@
+[
+  {
+    "ProcessId": 11344,
+    "ParentProcessId": 16864,
+    "CommandLine": "\"C:\\Program Files\\Microsoft Visual Studio\\18\\Insiders\\MSBuild\\Current\\Bin\\amd64\\MSBuild.exe\" /noautoresponse /nologo /nodemode:1 /nodeReuse:true /low:false"
+  },
+  {
+    "ProcessId": 23192,
+    "ParentProcessId": 16864,
+    "CommandLine": "\"C:\\Program Files\\Microsoft Visual Studio\\18\\Insiders\\MSBuild\\Current\\Bin\\amd64\\MSBuild.exe\" /noautoresponse /nologo /nodemode:1 /nodeReuse:true /low:false"
+  },
+  {
+    "ProcessId": 3820,
+    "ParentProcessId": 16864,
+    "CommandLine": "\"C:\\Program Files\\Microsoft Visual Studio\\18\\Insiders\\MSBuild\\Current\\Bin\\amd64\\MSBuild.exe\" /noautoresponse /nologo /nodemode:1 /nodeReuse:true /low:false"
+  },
+  {
+    "ProcessId": 19904,
+    "ParentProcessId": 32068,
+    "CommandLine": "\"C:\\Program Files\\dotnet\\sdk\\11.0.100-rc.1.26425.128\\MSBuild.exe\" /nologo /nodemode:8"
+  },
+  {
+    "ProcessId": 31544,
+    "ParentProcessId": 25808,
+    "CommandLine": "\"C:\\Program Files\\dotnet\\dotnet.exe\" \"C:\\Users\\Yuriy Kurnosov\\Desktop\\HybridCPU ISE\\TempEnv\\doom-continuation-20260905\\p5-canonical-cancellation-20261013/output/bin/ManagedPortSmoke/net11.0/ManagedPortSmoke.dll\""
+  }
+]

@@ -66,7 +66,7 @@ public sealed class RuntimeVirtualizationServiceHost
         switch (request.MessageId)
         {
             case IVirtualizationServiceProtocol.Message_CreateAsync when request.Payload is CreateVirtualDomainRequest create:
-                var created = _kernel.CreateVirtualDomain(_caller, create.CreateCapability, create.Profile);
+                var created = _kernel.CreateSessionVirtualDomain(_caller,invocation,create.CreateCapability,create.Profile);
                 operation = created.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(created.Error, created.Message!);
                 if (created.IsSuccess) response = new VirtualDomainAuthorityResponse(created.Value!);
                 break;

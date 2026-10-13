@@ -34,6 +34,10 @@ internal sealed class EndpointSessionInvocationRegistry
         public bool VirtualIoTransferContained { get; set; }
         public object? OriginalVirtualIoBind { get; set; }
         public bool VirtualIoBindContained { get; set; }
+        public object? OriginalVirtualCreate { get; set; }
+        public bool VirtualCreateContained { get; set; }
+        public bool VirtualCreateNeverInvoked { get; set; }
+        public bool VirtualCreateNoEffect { get; set; }
         public object? OriginalComputeCopy { get; set; }
         public bool ComputeCopyContained { get; set; }
         public object? OriginalVirtualArtifactOwner { get; set; }
@@ -746,6 +750,7 @@ internal sealed class EndpointSessionInvocationRegistry
                 if (!HasUnclosedPossibleEffect(record) &&
                     (record.OriginalVirtualIoTransfer is null || record.VirtualIoTransferContained) &&
                     (record.OriginalVirtualIoBind is null || record.VirtualIoBindContained) &&
+                    (record.OriginalVirtualCreate is null || record.VirtualCreateContained || record.VirtualCreateNoEffect || record.VirtualCreateNeverInvoked) &&
                     (record.OriginalVirtualArtifactOwner is null || record.VirtualArtifactContained))
                 {
                     _ownedRecords.Remove(key);
@@ -761,10 +766,65 @@ internal sealed class EndpointSessionInvocationRegistry
         record.DonationReturnInProgress ||
         record.SettlementInProgress is not null ||
         record.ServiceAccepted && record.TerminalStatus is null ||
-        record.AcceptedResponseCancelled && !record.VirtualIoTransferContained && !record.VirtualIoBindContained && !record.ComputeCopyContained && !record.VirtualArtifactContained ||
+        record.AcceptedResponseCancelled && !record.VirtualIoTransferContained && !record.VirtualIoBindContained && !record.VirtualCreateContained && !record.VirtualCreateNeverInvoked && !record.VirtualCreateNoEffect && !record.ComputeCopyContained && !record.VirtualArtifactContained ||
         record.OriginalComputeCopy is not null && !record.ComputeCopyContained ||
         record.FailedSettlementMayHaveEffect ||
         record.ResourceDonation?.State == ResourceDonationState.Quarantined;
+
+    internal KernelResult BindVirtualCreation(EndpointSessionInvocationHandle invocation,ProcessHandle caller,object original)
+    {
+        lock(_gate)
+        {
+            var resolved=ResolveForCaller(invocation,caller);
+            if(!resolved.IsSuccess)return KernelResult.Fail(resolved.Error,resolved.Message!);
+            var record=resolved.Value!;
+            if(original is null || record.MessageId!=SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_CreateAsync ||
+                !record.ServiceAccepted || record.TerminalStatus is not null || record.VirtualCreateContained || record.VirtualCreateNeverInvoked || record.VirtualCreateNoEffect ||
+                record.OriginalVirtualCreate is { } prior && !ReferenceEquals(prior,original))
+                return KernelResult.Fail(KernelError.InvalidTransition,"Original invocation cannot admit this virtual creation.");
+            record.OriginalVirtualCreate=original;return KernelResult.Ok();
+        }
+    }
+    // Called only by the Create owner's validation branches or original pre-effect retirement.
+    // This is a never-invoked consequence, not provider closure or unknown-effect containment.
+    internal KernelResult ConsumeVirtualCreationNeverInvoked(EndpointSessionInvocationHandle invocation,ProcessHandle caller,object? original=null)
+    {
+        lock(_gate)
+        {
+            var resolved=ResolveForCaller(invocation,caller);
+            if(!resolved.IsSuccess)return KernelResult.Fail(resolved.Error,resolved.Message!);
+            var record=resolved.Value!;
+            if(record.MessageId!=SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_CreateAsync ||
+                !record.ServiceAccepted || original is null && (record.TerminalStatus is not null || record.SettlementInProgress is not null) ||
+                !ReferenceEquals(record.OriginalVirtualCreate,original) || record.VirtualCreateContained || record.VirtualCreateNoEffect)
+                return KernelResult.Fail(KernelError.InvalidTransition,"Create no-effect requires its own never-invoked validation branch.");
+            record.VirtualCreateNeverInvoked=true;
+            return KernelResult.Ok();
+        }
+    }
+    internal KernelResult ConsumeVirtualCreationClosure(EndpointSessionInvocationHandle invocation,ProcessHandle caller,object original)
+    {
+        lock(_gate)
+        {
+            var resolved=ResolveForCaller(invocation,caller);
+            if(!resolved.IsSuccess)return KernelResult.Fail(resolved.Error,resolved.Message!);
+            if(original is null || !ReferenceEquals(resolved.Value!.OriginalVirtualCreate,original))
+                return KernelResult.Fail(KernelError.PlatformFaulted,"Original creation invocation owner changed.");
+            resolved.Value.VirtualCreateContained=true;return KernelResult.Ok();
+        }
+    }
+    internal KernelResult ConsumeVirtualCreationNoEffect(EndpointSessionInvocationHandle invocation,ProcessHandle caller,object original)
+    {
+        lock(_gate)
+        {
+            var resolved=ResolveForCaller(invocation,caller);
+            if(!resolved.IsSuccess)return KernelResult.Fail(resolved.Error,resolved.Message!);
+            var record=resolved.Value!;
+            if(original is null || !ReferenceEquals(record.OriginalVirtualCreate,original) || record.VirtualCreateContained || record.VirtualCreateNeverInvoked)
+                return KernelResult.Fail(KernelError.PlatformFaulted,"Exact original provider no-effect owner required.");
+            record.VirtualCreateNoEffect=true;return KernelResult.Ok();
+        }
+    }
 
     internal KernelResult BindVirtualIoAdmission(EndpointSessionInvocationHandle invocation,ProcessHandle caller,object original)
     {

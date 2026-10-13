@@ -1,4 +1,5 @@
 using SingPlus.Contracts;
+using SingPlus.Platform;
 
 namespace SingPlus.Runtime;
 
@@ -22,6 +23,9 @@ internal sealed partial class VirtualDomainAuthority
         internal bool RegionReserved { get; set; }
         internal bool RegionReleased { get; set; }
         internal bool ChargeConsumed { get; set; }
+        internal PlatformRegionMapping? ParentMapping { get; set; }
+        internal bool ParentAdmissionInvoked { get; set; }
+        internal bool ParentAdmissionKnown { get; set; }
     }
 
     private bool TryLocalGuestLifetime(Record record, GuestRegionMapping mapping, out LocalGuestLifetime lifetime) =>

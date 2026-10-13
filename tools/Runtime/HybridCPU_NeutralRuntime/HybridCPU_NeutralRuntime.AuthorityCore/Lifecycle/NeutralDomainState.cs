@@ -12,6 +12,20 @@ internal sealed class NeutralDomainState
     public NeutralOriginalDomainCloseFact? OriginalClose { get; set; }
     public List<NeutralOriginalDeviceAdmissionFact> OriginalDeviceAdmissions { get; } = [];
     public ulong OriginalDevicesIssued { get; set; }
+    public List<NeutralOriginalMapInvocation> OriginalMaps { get; } = [];
+    public ulong OriginalMapsIssued { get; set; }
+}
+
+internal sealed class NeutralOriginalMapInvocation
+{
+    public NeutralOriginalMapInvocation(NeutralOriginalOwnedRegionMapRequest request,NeutralDomainState parent)
+    {Original=this;Request=request;Parent=parent;ParentAdmission=parent.OriginalAdmission;}
+    public NeutralOriginalMapInvocation Original { get; }
+    public NeutralOriginalOwnedRegionMapRequest Request { get; }
+    public NeutralDomainState Parent { get; }
+    public NeutralOriginalDomainAdmissionFact? ParentAdmission { get; }
+    public NeutralOriginalOwnedRegionMapObservation? Raw { get; set; }
+    public NeutralOriginalMappingAdmissionFact? Admission { get; set; }
 }
 
 internal sealed class NeutralOriginalDomainCloseFact(NeutralOriginalDomainCloseRequest request, NeutralDomainState source)

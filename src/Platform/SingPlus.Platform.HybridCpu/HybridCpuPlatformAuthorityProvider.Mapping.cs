@@ -20,6 +20,7 @@ public sealed partial class HybridCpuPlatformAuthorityProvider :
         public PlatformOwnedRegionMapRequest? Request { get; init; }
         public NeutralOriginalOwnedRegionMapRequest? NativeRequest { get; set; }
         public NeutralOriginalOwnedRegionMapObservation? NativeObservation { get; set; }
+        public NeutralOriginalOwnedRegionMapObservation? NativeResolutionObservation { get; set; }
         public ProviderMappingRecord? OriginalMapping { get; set; }
         public ProviderMappingRecord? CleanupMapping { get; set; }
     }

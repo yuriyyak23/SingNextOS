@@ -54,6 +54,7 @@ public sealed partial class PlatformAuthorityBridge
         public bool EffectMayHaveOccurred { get; set; }
         public PlatformAuthorityResult<PlatformProviderDomainLease>? Observation { get; set; }
         public PlatformAuthorityResult? ReturnedCleanupObservation { get; set; }
+        public Func<KernelResult>? LocalCreationClosureConsumer { get; set; }
     }
     private enum DomainAuthorityState
     {
@@ -216,7 +217,9 @@ public sealed partial class PlatformAuthorityBridge
         Func<Func<KernelResult>, KernelResult>? admissionConsumer = null,
         Func<PlatformDomainBinding, Func<Func<KernelResult>, KernelResult>, KernelResult>? completionConsumer = null,
         Func<Func<KernelResult>, KernelResult>? sourceCommitConsumer = null,
-        Func<KernelResult>? invocationConsumer = null)
+        Func<KernelResult>? invocationConsumer = null,
+        Func<object,KernelResult>? originalCreationConsumer=null,
+        Func<object,KernelResult>? originalCreationClosureConsumer=null)
     {
         if (_backendEpochExhausted)
             return KernelResult<PlatformDomainBinding>.Fail(KernelError.CapacityExhausted,
@@ -296,6 +299,12 @@ public sealed partial class PlatformAuthorityBridge
                 return KernelResult<PlatformDomainBinding>.Fail(KernelError.PlatformFaulted,
                     "Original root admission changed before effect; no provider invocation occurred.");
             originalInvocation.ProviderIncarnation = providerIncarnation;
+            if(originalCreationConsumer is not null)
+            {
+                var retained=originalCreationConsumer(originalInvocation); // Trusted local correlation, no provider callback.
+                if(!retained.IsSuccess)return KernelResult<PlatformDomainBinding>.Fail(retained.Error,retained.Message!);
+                originalInvocation.LocalCreationClosureConsumer=()=>originalCreationClosureConsumer?.Invoke(originalInvocation)??KernelResult.Ok();
+            }
             if (_provider is IPlatformOriginalAdmissionResolutionProvider)
                 originalInvocation.Request = new(Guid.NewGuid(), subject);
             originalInvocation.EffectMayHaveOccurred = true;
@@ -639,6 +648,8 @@ public sealed partial class PlatformAuthorityBridge
                     record.RootRevokeObservation = null; // Consumed invocation, never evidence for a later call.
                     return FromProviderFailure(noEffect.Status, noEffect.Message);
                 }
+                var localCreation=record.BindInvocation?.LocalCreationClosureConsumer?.Invoke()??KernelResult.Ok();
+                if(!localCreation.IsSuccess)return localCreation;
                 CloseDomain(record);
                 return KernelResult.Ok();
             }

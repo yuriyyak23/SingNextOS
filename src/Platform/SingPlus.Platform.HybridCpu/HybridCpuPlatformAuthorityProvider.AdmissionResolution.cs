@@ -16,6 +16,27 @@ public sealed partial class HybridCpuPlatformAuthorityProvider
         if (owner is null) return PlatformAuthorityResult<PlatformDomainBindResolution>.Fail(PlatformAuthorityStatus.Faulted, "Original Bind request is unavailable.");
         var source = ValidateOriginalNativeMappingSource(); // Callback outside owner lock.
         if (!source.IsSuccess) return PlatformAuthorityResult<PlatformDomainBindResolution>.Fail(source.Status, source.Message!);
+        if(owner is {NativeObservation:null,NativeRequest:{ } pendingNativeBind} && _runtime is INeutralOriginalBindOutcomeProvider nativeLookup)
+        {
+            var queried=owner.NativeResolutionObservation??nativeLookup.ResolveOriginalDomainBind(pendingNativeBind);
+            lock(_childCreateCommitGate)
+            {
+                if(queried is not null)owner.NativeResolutionObservation??=queried;
+                queried=owner.NativeResolutionObservation;
+                if(!owner.InFlight && owner.Request==request && owner.NativeObservation is null &&
+                    _originalRootBinds.TryGetValue(owner.Lease.LeaseId,out var originalBind) && ReferenceEquals(originalBind,owner) &&
+                    queried is {SourceFenceMatched:true} raw && raw.Request==pendingNativeBind &&
+                    raw.Observation is {IsBound:true,Decision:NeutralDomainBindDecision.Bound} bound &&
+                    bound.Lease.Handle.Value!=0 && bound.Lease.Epoch.Value!=0)
+                {
+                    owner.NativeObservation=raw;owner.Observation=bound;
+                    output=new(owner.Lease,bound.Lease){BindSource=owner,CleanupOnly=true};
+                    owner.OriginalDomain=output;owner.PublishedDomain=output;
+                }
+            }
+            source=ValidateOriginalNativeMappingSource();
+            if(!source.IsSuccess)return PlatformAuthorityResult<PlatformDomainBindResolution>.Fail(source.Status,source.Message!);
+        }
         lock (_childCreateCommitGate)
         {
             if (!owner.InFlight && owner.Request == request && owner.NativeRequest is { } rejectedRequest &&
@@ -73,6 +94,30 @@ public sealed partial class HybridCpuPlatformAuthorityProvider
             return PlatformAuthorityResult<PlatformOwnedRegionMapResolution>.Fail(PlatformAuthorityStatus.Faulted, "Original Map outcome is unavailable.");
         var source = ValidateOriginalNativeMappingSource();
         if (!source.IsSuccess) return PlatformAuthorityResult<PlatformOwnedRegionMapResolution>.Fail(source.Status, source.Message!);
+        if(owner is { NativeObservation:null,NativeRequest:{ } pending } && owner.Request==request &&
+            _runtime is INeutralOriginalMapOutcomeProvider nativeLookup)
+        {
+            var queried=owner.NativeResolutionObservation??nativeLookup.ResolveOriginalOwnedRegionMap(pending); // Pure callback outside provider gate.
+            lock(_childCreateCommitGate)
+            {
+                if(queried is not null)owner.NativeResolutionObservation??=queried; // Raw before validation; malformed cannot be replaced.
+                queried=owner.NativeResolutionObservation;
+                if(!parent.OwnedMapInFlight && ReferenceEquals(parent.OwnedMapAdmissionOwner,owner) &&
+                    ReferenceEquals(parent.FailedOwnedMap,owner) && owner.NativeObservation is null &&
+                    queried is { SourceFenceMatched:true } raw && raw.Request==pending &&
+                    raw.Observation is { IsMapped:true,Decision:NeutralOwnedRegionMapDecision.Mapped } observed &&
+                    observed.Lease.DomainLease==owner.NeutralDomain && observed.Lease.Slice==owner.NeutralSlice &&
+                    observed.Lease.Handle.Value!=0 && observed.Lease.Epoch.Value!=0 && observed.Lease.Coherence==NeutralMemoryCoherenceModel.NonCoherent)
+                {
+                    owner.NativeObservation=raw;owner.Observation=observed;
+                    var lease=new PlatformProviderRegionMappingLease(owner.InvocationId,new(1),request.Domain,request.Slice.Region,request.Slice.Access);
+                    mapping=new(new(lease,request.Slice),observed.Lease){MapParent=parent,CleanupOnly=true,AdmissionRequest=request,MapAdmissionSource=owner};
+                    owner.OriginalMapping=mapping;owner.CleanupMapping=mapping;
+                }
+            }
+            source=ValidateOriginalNativeMappingSource();
+            if(!source.IsSuccess)return PlatformAuthorityResult<PlatformOwnedRegionMapResolution>.Fail(source.Status,source.Message!);
+        }
         lock (_childCreateCommitGate)
         {
             if (!parent.OwnedMapInFlight && owner is not null && owner.Request == request &&

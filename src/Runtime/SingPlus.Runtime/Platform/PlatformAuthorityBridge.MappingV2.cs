@@ -24,6 +24,8 @@ public readonly record struct PlatformRegionVisibilityEvidence(
 
 public sealed partial class PlatformAuthorityBridge
 {
+    internal bool SupportsOriginalOwnedRegionAdmission => _provider is IPlatformOriginalAdmissionResolutionProvider &&
+        _featureManifest.Resolve(PlatformFeatureFamily.OwnedRegionMapping).ContractVersion>=PlatformOwnedRegionMappingContract.ContractVersion;
     private readonly Dictionary<PlatformRegionMappingId, PlatformRegionSlice>
         _exactMappingSlices = [];
 
@@ -48,7 +50,9 @@ public sealed partial class PlatformAuthorityBridge
     internal KernelResult<PlatformOwnedRegionSliceMapping> MapOwnedRegionSlice(
         PlatformDomainBinding binding, PlatformDomainIdentity expectedSubject, CapabilityId authorityCapabilityId,
         PlatformRegionSlice slice, bool retainFaultedHandleOnMalformed, out bool retainReservation,
-        out PlatformRegionMapping? faultedMapping)
+        out PlatformRegionMapping? faultedMapping,
+        Func<Func<KernelResult>,KernelResult>? admissionConsumer=null,
+        Func<Func<KernelResult>,KernelResult>? sourceCommitConsumer=null)
     {
         retainReservation = false;
         faultedMapping = null;
@@ -107,26 +111,36 @@ public sealed partial class PlatformAuthorityBridge
         if (providerIncarnation.Value == 0)
             return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(KernelError.PlatformFaulted,
                 "The exact mapping provider returned an invalid zero runtime incarnation.");
-        PlatformRegionMappingId mappingIdentity;
+        PlatformRegionMappingId mappingIdentity=default;
         PlatformOwnedRegionMapRequest? originalRequest = mappingProvider is IPlatformOriginalAdmissionResolutionProvider
             ? new(Guid.NewGuid(), domainRecord.ProviderLease, slice) : null;
-        lock (_secureDomainLifecycleGate)
+        KernelResult Begin()
         {
+          lock (_secureDomainLifecycleGate)
+          {
             var originalSource = ValidateRootCleanupSourceLocked(domainRecord, binding, expectedSubject,
                 domainRecord.BackendEpoch, providerIncarnation);
             if (!originalSource.IsSuccess)
-                return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(originalSource.Error, originalSource.Message!);
+                return KernelResult.Fail(originalSource.Error, originalSource.Message!);
             var admission = ValidateDomain(binding, expectedSubject);
             if (!admission.IsSuccess)
-                return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(admission.Error, admission.Message!);
+                return KernelResult.Fail(admission.Error, admission.Message!);
+            KernelResult CommitAdmission()
+            {
             if (domainRecord.PendingMappings == int.MaxValue || domainRecord.MappingRecords.Count >= int.MaxValue - domainRecord.PendingMappings || _nextMappingId is 0 or ulong.MaxValue ||
                 _mappings.ContainsKey(new PlatformRegionMappingId(_nextMappingId)))
-                return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(KernelError.CapacityExhausted,
+                return KernelResult.Fail(KernelError.CapacityExhausted,
                     "The root mapping admission identity or interlock is exhausted.");
             mappingIdentity = new PlatformRegionMappingId(_nextMappingId++);
             domainRecord.MappingRecords.EnsureCapacity(domainRecord.MappingRecords.Count + domainRecord.PendingMappings + 1);
             domainRecord.PendingMappings++;
+            return KernelResult.Ok();
+            }
+            return sourceCommitConsumer is null?CommitAdmission():sourceCommitConsumer(CommitAdmission);
+          }
         }
+        var admitted=admissionConsumer is null?Begin():admissionConsumer(Begin);
+        if(!admitted.IsSuccess)return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(admitted.Error,admitted.Message!);
         try
         {
         PlatformAuthorityResult<PlatformProviderOwnedRegionMapping> providerResult;
@@ -264,8 +278,13 @@ public sealed partial class PlatformAuthorityBridge
         var sourceAvailable = false;
         try { publicationIncarnation = CurrentProviderIncarnation(); sourceAvailable = true; }
         catch (Exception exception) when (exception is not StackOverflowException) { }
-        lock (_secureDomainLifecycleGate)
+        var retainPublication=false;
+        KernelResult Publish()
         {
+          lock (_secureDomainLifecycleGate)
+          {
+            KernelResult CommitPublication()
+            {
             if (BackendEpoch != backendEpoch || _backendEpochExhausted ||
                 !_domains.TryGetValue(binding.BindingId, out var routed) || !ReferenceEquals(routed, domainRecord) ||
                 !ValidateDomain(binding, expectedSubject).IsSuccess ||
@@ -278,8 +297,20 @@ public sealed partial class PlatformAuthorityBridge
                 // Faulted lifecycle itself forbids use; preserve V1 fault errors.
                 if (mappingRecord.ClosureState == PlatformExternalClosureState.Faulted)
                     mappingRecord.LocalAuthorizationRevoked = false;
-                retainReservation = true;
+                retainPublication = true;
             }
+            return KernelResult.Ok();
+            }
+            return sourceCommitConsumer is null?CommitPublication():sourceCommitConsumer(CommitPublication);
+          }
+        }
+        var publication=admissionConsumer is null?Publish():admissionConsumer(Publish);
+        retainReservation |= retainPublication;
+        if(!publication.IsSuccess)
+        {
+            lock(_secureDomainLifecycleGate)mappingRecord.LocalAuthorizationRevoked=true;
+            retainReservation=true;faultedMapping=mapping;
+            return KernelResult<PlatformOwnedRegionSliceMapping>.Fail(publication.Error,publication.Message!);
         }
 
         return KernelResult<PlatformOwnedRegionSliceMapping>.Ok(

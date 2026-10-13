@@ -9,6 +9,72 @@ namespace SingPlus.Tests.Virtualization;
 public sealed class VirtualizationServiceSessionTests
 {
     [Fact]
+    public async Task AcceptedModelCreateCapacityRefusalConsumesOriginalNoEffect()
+    {
+        var provider=new HostPlatformAuthorityProvider();var kernel=new RuntimeKernel(provider);
+        typeof(HostPlatformAuthorityProvider).GetField("_nextVirtualDomainId",global::System.Reflection.BindingFlags.Instance|global::System.Reflection.BindingFlags.NonPublic)!.SetValue(provider,ulong.MaxValue);
+        var caller=TestFixtures.Create(kernel,2921,29210).Handle;var service=TestFixtures.Create(kernel,2922,29220).Handle;
+        var buffer=kernel.AllocateBuffer<byte>(caller,64).Value!;
+        var foreign=kernel.AllocateBuffer<byte>(service,32).Value!;
+        var capability=kernel.MintCapability(new(29210),caller,ResourceKind.Virtualization,VirtualizationResourceIds.Create,CapabilityRights.Configure).Value!.CapabilityId;
+        var protocol=VirtualizationServiceClient.CreateProtocol();
+        var descriptor=kernel.RegisterService(service,"capacity-refusal",new(protocol.ContractName,"1",protocol.ContractDigest),protocol,VirtualizationServiceClient.ResponseProtocol,[]).Value!;
+        var session=kernel.OpenSession(caller,descriptor,[]).Value;
+        var host=RuntimeVirtualizationServiceHost.CreateForSession(kernel,service,session).Value!;
+        var client=VirtualizationServiceClient.Create(new RuntimeSipClientTransport(kernel,caller,session));
+        var pending=client.CreateAsync(new(capability,new(1,4096)));
+        Assert.False(host.ProcessNext().IsSuccess);await Assert.ThrowsAnyAsync<Exception>(async()=>await pending);
+        var closed=kernel.TerminateProcess(caller);Assert.True(closed.IsSuccess,closed.Message);
+        Assert.Equal(1,provider.CreateVirtualDomainCallCount);Assert.Equal(0,provider.RevokeVirtualDomainCallCount);
+        Assert.Equal(RegionState.Released,kernel.Regions.Snapshot().Single(r=>r.Handle==buffer.Handle).State);
+        Assert.Equal(RegionState.Owned,kernel.Regions.Snapshot().Single(r=>r.Handle==foreign.Handle).State);
+        Assert.True(kernel.Processes.Resolve(service).IsSuccess);
+    }
+    [Theory]
+    [InlineData(0,4096)]
+    [InlineData(257,4096)]
+    [InlineData(1,0)]
+    public async Task AcceptedCreateProfileRefusalHasOwnNoEffectAndReclaimsCaller(int processors,long bytes)
+    {
+        var provider=new HostPlatformAuthorityProvider();var kernel=new RuntimeKernel(provider);
+        var caller=TestFixtures.Create(kernel,2911,29110).Handle;var service=TestFixtures.Create(kernel,2912,29120).Handle;
+        var buffer=kernel.AllocateBuffer<byte>(caller,64).Value!;
+        var capability=kernel.MintCapability(new(29110),caller,ResourceKind.Virtualization,VirtualizationResourceIds.Create,CapabilityRights.Configure).Value!.CapabilityId;
+        var protocol=VirtualizationServiceClient.CreateProtocol();
+        var descriptor=kernel.RegisterService(service,"create-refusal",new(protocol.ContractName,"1",protocol.ContractDigest),protocol,VirtualizationServiceClient.ResponseProtocol,[]).Value!;
+        var session=kernel.OpenSession(caller,descriptor,[]).Value;
+        var host=RuntimeVirtualizationServiceHost.CreateForSession(kernel,service,session).Value!;
+        var client=VirtualizationServiceClient.Create(new RuntimeSipClientTransport(kernel,caller,session));
+        var pending=client.CreateAsync(new(capability,new(processors,bytes)));
+        Assert.Equal(KernelError.PlatformDenied,host.ProcessNext().Error);
+        await Assert.ThrowsAnyAsync<Exception>(async()=>await pending);
+        Assert.Equal(0,provider.CreateVirtualDomainCallCount);Assert.Equal(0,provider.RevokeVirtualDomainCallCount);
+        var closed=kernel.TerminateProcess(caller);Assert.True(closed.IsSuccess,closed.Message);
+        Assert.Equal(RegionState.Released,kernel.Regions.Snapshot().Single(r=>r.Handle==buffer.Handle).State);
+        Assert.True(kernel.Processes.Resolve(service).IsSuccess);
+    }
+    [Fact]
+    public async Task FailedModelCreatePublicationClosesOriginalInvocationAfterModelCleanup()
+    {
+        var provider=new HostPlatformAuthorityProvider();var kernel=new RuntimeKernel(provider);
+        var caller=TestFixtures.Create(kernel,2901,29010).Handle;var service=TestFixtures.Create(kernel,2902,29020).Handle;
+        var buffer=kernel.AllocateBuffer<byte>(caller,64).Value!;
+        var capability=kernel.MintCapability(new(29010),caller,ResourceKind.Virtualization,VirtualizationResourceIds.Create,CapabilityRights.Configure).Value!.CapabilityId;
+        var protocol=VirtualizationServiceClient.CreateProtocol();
+        var descriptor=kernel.RegisterService(service,"model-failure",new(protocol.ContractName,"1",protocol.ContractDigest),protocol,VirtualizationServiceClient.ResponseProtocol,[]).Value!;
+        var session=kernel.OpenSession(caller,descriptor,[]).Value;
+        var host=RuntimeVirtualizationServiceHost.CreateForSession(kernel,service,session).Value!;
+        var client=VirtualizationServiceClient.Create(new RuntimeSipClientTransport(kernel,caller,session));
+        kernel.BeforeVirtualAuthorityPublicationQualificationHook=()=>throw new IOException("Model publication interrupted");
+        var pending=client.CreateAsync(new(capability,new(1,4096)));
+        Assert.False(host.ProcessNext().IsSuccess);await Assert.ThrowsAnyAsync<Exception>(async()=>await pending);
+        kernel.BeforeVirtualAuthorityPublicationQualificationHook=null;
+        var closed=kernel.TerminateProcess(caller);Assert.True(closed.IsSuccess,closed.Message);
+        Assert.Equal(1,provider.CreateVirtualDomainCallCount);Assert.Equal(1,provider.RevokeVirtualDomainCallCount);
+        Assert.Equal(RegionState.Released,kernel.Regions.Snapshot().Single(r=>r.Handle==buffer.Handle).State);
+        Assert.True(kernel.Processes.Resolve(service).IsSuccess);
+    }
+    [Fact]
     public async Task DiscoverySessionAndTypedClientDriveCompleteLocalLifecycle()
     {
         var provider = new HostPlatformAuthorityProvider();
