@@ -227,7 +227,8 @@ public sealed partial class RuntimeKernel
         PlatformDmaPrepareEvidence destinationPrepare,
         Func<ulong> currentSourceEstimateGeneration,
         Func<ulong> currentDestinationEstimateGeneration,
-        ISemanticTraceSinkV1? sourceTraceSink = null, ISemanticTraceSinkV1? destinationTraceSink = null) where T : unmanaged
+        ISemanticTraceSinkV1? sourceTraceSink = null, ISemanticTraceSinkV1? destinationTraceSink = null,
+        ProviderDmaDataMotionRequest<T>? originalRequest = null) where T : unmanaged
     {
         lock (_platformMemoryUseGate)
         {
@@ -237,7 +238,7 @@ public sealed partial class RuntimeKernel
             _dmaCopyPayloadCalls.Add(sourceGrant.GrantId); _dmaCopyPayloadCalls.Add(destinationGrant.GrantId);
         }
         try { return ExecuteV6ProviderDmaDataMotionCore(source,destination,input,output,plan,sourceMapping,sourceGrant,sourcePrepare,
-            destinationMapping,destinationGrant,destinationPrepare,currentSourceEstimateGeneration,currentDestinationEstimateGeneration,sourceTraceSink,destinationTraceSink); }
+            destinationMapping,destinationGrant,destinationPrepare,currentSourceEstimateGeneration,currentDestinationEstimateGeneration,sourceTraceSink,destinationTraceSink,originalRequest); }
         finally
         {
             lock (_platformMemoryUseGate)
@@ -255,7 +256,8 @@ public sealed partial class RuntimeKernel
         PlatformOwnedRegionSliceMapping sourceMapping, PlatformDmaGrant sourceGrant, PlatformDmaPrepareEvidence sourcePrepare,
         PlatformOwnedRegionSliceMapping destinationMapping, PlatformDmaGrant destinationGrant, PlatformDmaPrepareEvidence destinationPrepare,
         Func<ulong> currentSourceEstimateGeneration, Func<ulong> currentDestinationEstimateGeneration,
-        ISemanticTraceSinkV1? sourceTraceSink, ISemanticTraceSinkV1? destinationTraceSink) where T : unmanaged
+        ISemanticTraceSinkV1? sourceTraceSink, ISemanticTraceSinkV1? destinationTraceSink,
+        ProviderDmaDataMotionRequest<T>? originalRequest) where T : unmanaged
     {
         ArgumentNullException.ThrowIfNull(input);
         ArgumentNullException.ThrowIfNull(output);
@@ -322,6 +324,16 @@ public sealed partial class RuntimeKernel
         var reserved = ReserveDmaCopyPayload(source,destination,input,output,sourceGrant,sourcePrepare,destinationGrant,destinationPrepare,cleanup.Value);
         if (!reserved.IsSuccess) return KernelResult<V6DataMotionExecution<T>>.Fail(reserved.Error,reserved.Message!);
         var payload = reserved.Value!;
+        if(originalRequest is not null)
+        {
+            lock(originalRequest)
+            {
+                if(!ReferenceEquals(originalRequest.Original,originalRequest)||!ReferenceEquals(originalRequest.Owner,this)||
+                    !originalRequest.InFlight||originalRequest.CleanupPayload is { } prior && !ReferenceEquals(prior,payload))
+                    return KernelResult<V6DataMotionExecution<T>>.Fail(KernelError.PlatformFaulted,"Original DMA caller custody changed before effect.");
+                originalRequest.CleanupPayload=payload;
+            }
+        }
         if (!cleanup.Value)
         {
             var submitted = SubmitV6PlatformDmaCopy(source, sourceGrant, sourcePrepare,

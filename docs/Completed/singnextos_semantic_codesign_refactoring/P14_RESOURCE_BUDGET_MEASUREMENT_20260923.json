@@ -1,0 +1,38 @@
+{
+  "schema": "SingNextOS.SemanticCodesign.P14MeasurementSummary.v1",
+  "captured_utc": "2026-09-23T00:21:17.3122248+03:00",
+  "source_command": "dotnet run --project tools/SingPlus.SingCapQualification/SingPlus.SingCapQualification.csproj -c Release --no-build -- --vnext-resource-performance --iterations 1000 --workers 1,2,4,8,16",
+  "raw_json_utf8_sha256": "2294b0277e060bd20e409eba5e9733370005b71b9bbc5d5c9107b18c56d28aba",
+  "environment": {
+    "runtime": "11.0.0",
+    "operating_system": "Microsoft Windows NT 10.0.26200.0",
+    "runtime_identifier": "win-x64",
+    "logical_processor_count": 16,
+    "execution_mode": "JIT-host"
+  },
+  "methodology": {
+    "iterations_per_worker": 1000,
+    "worker_counts": [1, 2, 4, 8, 16],
+    "measurement_rows": 20,
+    "total_attempts": 124000,
+    "unexpected_outcomes": 0,
+    "lock_wait_separately_instrumented": false,
+    "controlled_smt_topology": false,
+    "provider_execution_included": false
+  },
+  "observations": {
+    "minimum_throughput_per_second": 50143.47,
+    "maximum_p99_nanoseconds": 1183000.0,
+    "maximum_observed_nanoseconds": 7090100.0
+  },
+  "product_slo": null,
+  "decision": "MEASURED_NO_AGREED_SLO_NO_SHARDING_TRIGGER",
+  "claim": "ModelOnly AccountingOnly observation for the exact host/JIT ResourceBudgetAuthority benchmark run",
+  "exclusions": [
+    "No latency threshold, deadline, realtime, EnforcedUpperBound, GuaranteedReservation or ProductionQualified claim",
+    "No separately instrumented lock-hold or lock-wait distribution",
+    "No controlled SMT or provider-count measurement",
+    "No HybridCPU, NativeAOT, hardware, QEMU, firmware or CXL execution",
+    "No sharding, escrow or distributed-authority authorization"
+  ]
+}

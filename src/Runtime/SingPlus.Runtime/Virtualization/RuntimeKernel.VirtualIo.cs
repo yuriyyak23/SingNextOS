@@ -26,6 +26,9 @@ public sealed partial class RuntimeKernel
         internal bool BackingChargeExpected { get; }
         internal object? BackingChargeOwner { get; set; }
         internal bool BackingChargeBound { get; set; }
+        internal EndpointSessionInvocationHandle? BindSessionInvocation { get; set; }
+        internal bool BindSessionBound { get; set; }
+        internal bool BindSessionClosureConsumed { get; set; }
         internal bool PlatformKnown { get; set; }
         internal PlatformOriginalVirtualIoBindRequest? OriginalBindRequest { get; set; }
         internal bool OwnNoEffect { get; set; }
@@ -57,7 +60,8 @@ public sealed partial class RuntimeKernel
     private ulong _nextVirtualIoId = 1;
 
     internal KernelResult<VirtualIoBinding> BindVirtualIo(ProcessHandle owner, VirtualDomainHandle domain,
-        PlatformDeviceLease device, PlatformVirtualIoProfile profile, SecureExecutionBinding? secureExecution = null)
+        PlatformDeviceLease device, PlatformVirtualIoProfile profile, SecureExecutionBinding? secureExecution = null,
+        EndpointSessionInvocationHandle? sessionInvocation=null)
     {
         var virtualRecord = _virtualDomains.ResolveAdmission(owner, domain);
         if (!virtualRecord.IsSuccess) return KernelResult<VirtualIoBinding>.Fail(virtualRecord.Error, virtualRecord.Message!);
@@ -126,6 +130,20 @@ public sealed partial class RuntimeKernel
                             record.BackingChargeOwner = charge.Value;
                         }
                         record.BackingChargeBound = true;
+                        if(sessionInvocation is { } invocation)
+                        {
+                            record.BindSessionInvocation=invocation;
+                            var linked=SessionInvocations.BindVirtualIoAdmission(invocation,owner,record);
+                            if(!linked.IsSuccess)
+                            {
+                                record.OwnNoEffect=true; // This caller has not invoked the provider.
+                                var released=ConsumeVirtualIoBackingCharge(record);
+                                if(!released.IsSuccess)return released;
+                                record.ClosureConsumed=true;record.State=VirtualIoState.Closed;
+                                return linked;
+                            }
+                            record.BindSessionBound=true;
+                        }
                         return KernelResult.Ok();
                     }
                 });
@@ -380,8 +398,16 @@ public sealed partial class RuntimeKernel
             if(!consumed.IsSuccess)return consumed;
             transfer.Consumed=true;
         }
-        return record.BackingReservation is { } reservation
+        var backing=record.BackingReservation is { } reservation
             ? Budgets.ConsumeOriginalVirtualIoCharge(record.Owner, reservation, record, record.BackingChargeOwner) : KernelResult.Ok();
+        if(!backing.IsSuccess)return backing;
+        if(record.BindSessionBound && !record.BindSessionClosureConsumed && record.BindSessionInvocation is { } bindInvocation)
+        {
+            var contained=SessionInvocations.ConsumeVirtualIoAdmissionClosure(bindInvocation,record.Owner,record);
+            if(!contained.IsSuccess)return contained;
+            record.BindSessionClosureConsumed=true;
+        }
+        return KernelResult.Ok();
     }
 
     private KernelResult CloseVirtualIoForDevice(ProcessHandle owner, PlatformDeviceLease device) =>

@@ -454,6 +454,14 @@ public sealed partial class RuntimeKernel
         => MapGuestRegion(owner, domain, memoryCapability, regionCapability, region, range, access, 0);
 
     public KernelResult<GuestRegionMapping> MapGuestRegion(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId memoryCapability, CapabilityId regionCapability, RegionHandle region, GuestAddressRange range, GuestMemoryAccess access, ulong maximumPrivateExecutableDataBytes)
+        => MapGuestRegionInvocation(owner,domain,memoryCapability,regionCapability,region,range,access,maximumPrivateExecutableDataBytes,null);
+
+    internal KernelResult<GuestRegionMapping> MapSessionGuestRegion(ProcessHandle owner,EndpointSessionInvocationHandle invocation,
+        VirtualDomainHandle domain,CapabilityId memoryCapability,CapabilityId regionCapability,RegionHandle region,
+        GuestAddressRange range,GuestMemoryAccess access,ulong quota)
+        => MapGuestRegionInvocation(owner,domain,memoryCapability,regionCapability,region,range,access,quota,invocation);
+
+    private KernelResult<GuestRegionMapping> MapGuestRegionInvocation(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId memoryCapability, CapabilityId regionCapability, RegionHandle region, GuestAddressRange range, GuestMemoryAccess access, ulong maximumPrivateExecutableDataBytes,EndpointSessionInvocationHandle? invocation)
     {
         using var pin = PinComposedDomain(owner, virtualDomain: domain);
         if (!pin.Result.IsSuccess) return KernelResult<GuestRegionMapping>.Fail(pin.Result.Error, pin.Result.Message!);
@@ -475,7 +483,7 @@ public sealed partial class RuntimeKernel
             KernelResult DualCommit(Func<KernelResult> commit) => CapabilityAuthority.CommitGuestRegionSource(
                 regionCapability, current.Value!.DomainId, owner.Generation, rights,
                 CapabilityResourceIds.MemoryRegion(region.RegionId), () => memoryCommit(commit));
-            result = MapGuestRegionCore(owner, domain, memoryCapability, regionCapability, region, range, access, fresh, DualCommit, maximumPrivateExecutableDataBytes);
+            result = MapGuestRegionCore(owner, domain, memoryCapability, regionCapability, region, range, access, fresh, DualCommit, maximumPrivateExecutableDataBytes,invocation);
             return result.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(result.Error, result.Message!);
         });
         return operation.IsSuccess ? result : KernelResult<GuestRegionMapping>.Fail(operation.Error, operation.Message!);
@@ -483,7 +491,7 @@ public sealed partial class RuntimeKernel
 
     private KernelResult<GuestRegionMapping> MapGuestRegionCore(ProcessHandle owner, VirtualDomainHandle domain,
         CapabilityId memoryCapability, CapabilityId regionCapability, RegionHandle region, GuestAddressRange range,
-        GuestMemoryAccess access, Func<Func<KernelResult>, KernelResult> fresh, Func<Func<KernelResult>, KernelResult> sourceCommit, ulong maximumPrivateExecutableDataBytes = 0)
+        GuestMemoryAccess access, Func<Func<KernelResult>, KernelResult> fresh, Func<Func<KernelResult>, KernelResult> sourceCommit, ulong maximumPrivateExecutableDataBytes = 0,EndpointSessionInvocationHandle? sessionInvocation=null)
     {
         using var composedUse = PinComposedDomain(owner, virtualDomain: domain);
         if (!composedUse.Result.IsSuccess) return KernelResult<GuestRegionMapping>.Fail(composedUse.Result.Error, composedUse.Result.Message!);
@@ -540,6 +548,20 @@ public sealed partial class RuntimeKernel
         }
         if (record.Value.ChildBinding is { } child && record.Value.ParentBinding is { } parent)
         {
+            if(sessionInvocation is { } invocation)
+            {
+                var linked=fresh(()=>sourceCommit(()=>_virtualDomains.CommitStagedGuestInvocation(record.Value,local,
+                    ()=>SessionInvocations.BindVirtualGuestMapping(invocation,owner,record.Value,local.Mapping))));
+                if(!linked.IsSuccess)
+                {
+                    var released=Regions.ReleasePlatformMappingReservation(region,new(process.DomainId,owner.Generation));
+                    if(!released.IsSuccess)return KernelResult<GuestRegionMapping>.Fail(released.Error,released.Message!);
+                    released=ReleaseAttachedBudget(owner,budget.Value);
+                    if(!released.IsSuccess)return KernelResult<GuestRegionMapping>.Fail(released.Error,released.Message!);
+                    _=_virtualDomains.RemoveMapping(record.Value,local.Mapping,local);
+                    return KernelResult<GuestRegionMapping>.Fail(linked.Error,linked.Message!);
+                }
+            }
             PlatformMemoryAccess parentAccess = PlatformMemoryAccess.None;
             if ((access & (GuestMemoryAccess.Read | GuestMemoryAccess.Execute)) != 0)
                 parentAccess |= PlatformMemoryAccess.Read;
@@ -670,6 +692,16 @@ public sealed partial class RuntimeKernel
     public KernelResult BindVirtualDomainExecutable(
         ProcessHandle owner, VirtualDomainHandle domain, CapabilityId executeCapability,
         GuestRegionMappingHandle mapping, ReadOnlyMemory<byte> immutablePackage, int maximumExecutionSteps)
+        => BindVirtualDomainExecutableCore(owner,domain,executeCapability,mapping,immutablePackage,maximumExecutionSteps,null);
+
+    internal KernelResult BindSessionVirtualDomainExecutable(ProcessHandle owner,EndpointSessionInvocationHandle invocation,
+        VirtualDomainHandle domain,CapabilityId executeCapability,GuestRegionMappingHandle mapping,ReadOnlyMemory<byte> package,int steps)
+        => BindVirtualDomainExecutableCore(owner,domain,executeCapability,mapping,package,steps,invocation);
+
+    private KernelResult BindVirtualDomainExecutableCore(
+        ProcessHandle owner, VirtualDomainHandle domain, CapabilityId executeCapability,
+        GuestRegionMappingHandle mapping, ReadOnlyMemory<byte> immutablePackage, int maximumExecutionSteps,
+        EndpointSessionInvocationHandle? sessionInvocation)
     {
         using var composedUse = PinComposedDomain(owner, virtualDomain: domain);
         if (!composedUse.Result.IsSuccess) return KernelResult.Fail(composedUse.Result.Error, composedUse.Result.Message!);
@@ -704,6 +736,12 @@ public sealed partial class RuntimeKernel
         if (!privateAdmission.IsSuccess) return privateAdmission;
         return UseVirtualExecutableSource(owner, domain, executeCapability, captured, child, (fresh, sourceCommit) =>
         {
+            if(sessionInvocation is { } invocation)
+            {
+                var correlation=_virtualDomains.CommitExecutableMappingAdmission(captured,local,platform,
+                    ()=>SessionInvocations.BindVirtualArtifact(invocation,owner,captured,local.Mapping));
+                if(!correlation.IsSuccess)return correlation;
+            }
             KernelResult MappingCommit(Func<KernelResult> commit) =>
                 PlatformAuthority.CommitGuestLocalMappingSource(platform.Guest, captured, local.Mapping, () => sourceCommit(() =>
                     _virtualDomains.CommitExecutableMappingAdmission(captured, local, platform, commit)));
@@ -728,6 +766,14 @@ public sealed partial class RuntimeKernel
     }
 
     public KernelResult StartVirtualDomain(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId executeCapability)
+        => StartVirtualDomainCore(owner,domain,executeCapability,null);
+
+    internal KernelResult StartSessionVirtualDomain(ProcessHandle owner,EndpointSessionInvocationHandle invocation,
+        VirtualDomainHandle domain,CapabilityId executeCapability)
+        => StartVirtualDomainCore(owner,domain,executeCapability,invocation);
+
+    private KernelResult StartVirtualDomainCore(ProcessHandle owner,VirtualDomainHandle domain,CapabilityId executeCapability,
+        EndpointSessionInvocationHandle? sessionInvocation)
     {
         using var composedUse = PinComposedDomain(owner, virtualDomain: domain);
         if (!composedUse.Result.IsSuccess) return KernelResult.Fail(composedUse.Result.Error, composedUse.Result.Message!);
@@ -751,6 +797,12 @@ public sealed partial class RuntimeKernel
             return UseVirtualExecutableSource(owner, domain, executeCapability, captured, captured.ChildBinding.Value,
                 (fresh, sourceCommit) =>
                 {
+                    if(sessionInvocation is { } invocation)
+                    {
+                        var correlation=_virtualDomains.CommitExecutableArtifactAdmission(captured,artifact,local,
+                            ()=>SessionInvocations.BindVirtualArtifact(invocation,owner,captured,local.Mapping));
+                        if(!correlation.IsSuccess)return correlation;
+                    }
                     KernelResult ArtifactCommit(Func<KernelResult> commit) =>
                         PlatformAuthority.CommitGuestLocalMappingSource(artifact.GuestMapping, captured, local.Mapping, () => sourceCommit(() =>
                             _virtualDomains.CommitExecutableArtifactAdmission(captured, artifact, local, commit)));
@@ -1229,7 +1281,8 @@ public sealed partial class RuntimeKernel
             if (record.Owner != owner)
                 return KernelResult.Fail(KernelError.StaleGeneration, "Platform mapping cleanup process owner changed.");
             return PlatformAuthority.CommitGuestLocalMappingSource(platformMapping.Guest, record, originalMapping.Mapping,
-                () => _virtualDomains.RemovePlatformMapping(record, originalMapping, platformMapping));
+                () => _virtualDomains.RemovePlatformMapping(record, originalMapping, platformMapping,
+                    ()=>SessionInvocations.ConsumeVirtualArtifactMappingClosure(owner,record,originalMapping.Mapping)));
         }
     }
 

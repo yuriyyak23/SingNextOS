@@ -16,10 +16,22 @@ public sealed partial class RuntimeKernel
         PlatformDmaGrant destinationGrant, PlatformDmaPrepareEvidence destinationPrepare,
         IV6LocalityCostEvidenceProvider costProvider) where T : unmanaged
     {
+        return MoveProviderDmaBuffersCore(source,destination,input,output,plan,sourceMapping,sourceGrant,sourcePrepare,
+            destinationMapping,destinationGrant,destinationPrepare,costProvider,null);
+    }
+
+    private KernelResult<ProviderDmaDataMotionResult<T>> MoveProviderDmaBuffersCore<T>(
+        ProcessHandle source, ProcessHandle destination, OwnedBuffer<T> input, OwnedBuffer<T> output,
+        DataMotionPlanV1 plan, PlatformOwnedRegionSliceMapping sourceMapping, PlatformDmaGrant sourceGrant,
+        PlatformDmaPrepareEvidence sourcePrepare, PlatformOwnedRegionSliceMapping destinationMapping,
+        PlatformDmaGrant destinationGrant, PlatformDmaPrepareEvidence destinationPrepare,
+        IV6LocalityCostEvidenceProvider costProvider, ProviderDmaDataMotionRequest<T>? originalRequest) where T : unmanaged
+    {
         ArgumentNullException.ThrowIfNull(costProvider);
         var moved=ExecuteV6ProviderDmaDataMotion(source,destination,input,output,plan,
             sourceMapping,sourceGrant,sourcePrepare,destinationMapping,destinationGrant,destinationPrepare,
-            ()=>FreshGeneration(plan.SourceProviderClass),()=>FreshGeneration(plan.DestinationProviderClass));
+            ()=>FreshGeneration(plan.SourceProviderClass),()=>FreshGeneration(plan.DestinationProviderClass),
+            originalRequest:originalRequest);
         if(!moved.IsSuccess)return KernelResult<ProviderDmaDataMotionResult<T>>.Fail(moved.Error,moved.Message!);
         return moved.Value!.PreparedProviderResult is { } result
             ? KernelResult<ProviderDmaDataMotionResult<T>>.Ok(result)

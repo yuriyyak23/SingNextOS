@@ -34,10 +34,31 @@ public sealed partial class OriginalRegionRevocationResolutionTests
         Assert.Equal(!unknown,moved.IsSuccess);Assert.Equal(1,copies);
         if(unknown)
         {
+            var routes=(global::System.Collections.IDictionary)x.Kernel.GetType().GetField("_dmaCopyPayloads",global::System.Reflection.BindingFlags.Instance|global::System.Reflection.BindingFlags.NonPublic)!.GetValue(x.Kernel)!;
+            var originalPayload=routes[x.Source.GrantId];
+            Assert.NotNull(originalPayload);
+            routes.Remove(x.Source.GrantId);
+            var copied=(ProviderDmaDataMotionRequest<byte>)typeof(object).GetMethod("MemberwiseClone",global::System.Reflection.BindingFlags.Instance|global::System.Reflection.BindingFlags.NonPublic)!.Invoke(request,null)!;
+            Assert.False(x.Kernel.CleanupProviderDmaDataMotion(copied).IsSuccess);
+            Assert.False(foreign.Kernel.CleanupProviderDmaDataMotion(request).IsSuccess);
+            var foreignPrepare=foreign.Kernel.PreparePlatformDmaForDevice(foreign.Owner,foreign.Source).Value;
+            var foreignDestinationPrepare=foreign.Kernel.PreparePlatformDmaForDevice(foreign.DestinationOwner,foreign.Destination).Value;
+            foreign.Spy.AfterOperation=name=>{if(name is "CopyDma" or "ResolveDmaCopy")throw new IOException("Foreign reply unavailable");};
+            Assert.False(foreign.Kernel.MoveProviderDmaBuffers(foreign.Owner,foreign.DestinationOwner,foreign.Input,foreign.Output,foreign.Plan,
+                foreign.SourceMap,foreign.Source,foreignPrepare,foreign.DestinationMap,foreign.Destination,foreignDestinationPrepare,costs).IsSuccess);
+            var foreignRoutes=(global::System.Collections.IDictionary)foreign.Kernel.GetType().GetField("_dmaCopyPayloads",global::System.Reflection.BindingFlags.Instance|global::System.Reflection.BindingFlags.NonPublic)!.GetValue(foreign.Kernel)!;
+            routes[x.Source.GrantId]=foreignRoutes[foreign.Source.GrantId];
+            Assert.False(x.Kernel.CleanupProviderDmaDataMotion(request).IsSuccess);
+            Assert.Equal(2,foreign.Native.ActiveDmaGrantCount);
+            routes.Remove(x.Source.GrantId);
+            foreign.Spy.AfterOperation=null;
+            Assert.True(foreign.Kernel.TerminateProcess(foreign.Owner).IsSuccess);
+            Assert.True(foreign.Kernel.TerminateProcess(foreign.DestinationOwner).IsSuccess);
             Assert.False(x.Kernel.MoveProviderDmaBuffers(request,costs).IsSuccess);
             Assert.False(x.Kernel.ReadProviderDmaDataMotionResult(request).IsSuccess);
             Assert.Equal(1,copies);
             Assert.Throws<InvalidOperationException>(()=>{_=x.Output.Span.Length;});
+            Assert.Throws<InvalidOperationException>(()=>{_=x.Input.Span.Length;});
             Assert.Equal(64UL,x.Kernel.QueryBudget(x.DestinationBudget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
             x.Spy.AfterOperation=null;
             var retirementCallsBeforeRetry=0;
@@ -49,11 +70,14 @@ public sealed partial class OriginalRegionRevocationResolutionTests
                 Assert.Equal(1,copies);
                 Assert.Equal(64UL,x.Kernel.QueryBudget(x.DestinationBudget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
                 retirementCallsBeforeRetry=x.Spy.DmaCloseCalls;
+                Assert.Same(originalPayload,routes[x.Source.GrantId]);
+                routes.Remove(x.Source.GrantId);
                 x.Spy.AfterOperation=null;
             }
             var cleanup=x.Kernel.CleanupProviderDmaDataMotion(request);Assert.True(cleanup.IsSuccess,cleanup.Message);
             if(partialClose)Assert.Equal(retirementCallsBeforeRetry,x.Spy.DmaCloseCalls);
             Assert.True(x.Kernel.CleanupProviderDmaDataMotion(request).IsSuccess);
+            Assert.Empty(routes);
             Assert.Equal(64,x.Input.Span.Length);Assert.Equal(64,x.Output.Span.Length);
             Assert.Equal(0,x.Native.ActiveDmaGrantCount);
             Assert.Equal(64UL,x.Kernel.QueryBudget(x.Budget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
@@ -61,10 +85,14 @@ public sealed partial class OriginalRegionRevocationResolutionTests
         }
         else Assert.Same(moved.Value,x.Kernel.ReadProviderDmaDataMotionResult(request).Value);
         Assert.True(x.Kernel.TerminateProcess(x.Owner).IsSuccess);
+        Assert.Equal(0UL,x.Kernel.QueryBudget(x.Budget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.Equal(64UL,x.Kernel.QueryBudget(x.DestinationBudget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.Equal(64,x.Output.Span.Length);
         Assert.True(x.Kernel.TerminateProcess(x.DestinationOwner).IsSuccess);
         Assert.Equal(0UL,x.Kernel.QueryBudget(x.Budget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
         Assert.Equal(0UL,x.Kernel.QueryBudget(x.DestinationBudget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
-        Assert.Equal(1,copies);Assert.Equal(2,foreign.Native.ActiveDmaGrantCount);Assert.Equal(64,foreign.Input.Span.Length);
+        Assert.Equal(1,copies);
+        if(!unknown){Assert.Equal(2,foreign.Native.ActiveDmaGrantCount);Assert.Equal(64,foreign.Input.Span.Length);}
     }
     [Theory]
     [InlineData("exact")] [InlineData("absent-cost")] [InlineData("stale-cost")] [InlineData("foreign-owner")]

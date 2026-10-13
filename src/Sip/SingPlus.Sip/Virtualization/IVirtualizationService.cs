@@ -104,6 +104,15 @@ public readonly record struct BindVirtualExecutableArtifactRequest(
     public int MaxPayloadSize => 4352;
 }
 
+[BoundedPayload(1048688)]
+public readonly record struct BindVirtualExecutablePackageRequest(
+    VirtualDomainHandle Domain, CapabilityId ExecuteCapability, GuestRegionMappingHandle Mapping,
+    BoundedExecutablePackage ImmutablePackage, int MaximumExecutionSteps) : IBoundedPayload
+{
+    public int PayloadSize=>112+ImmutablePackage.PayloadSize;
+    public int MaxPayloadSize=>1048688;
+}
+
 [Flags]
 public enum VirtualIoAccess : byte { Read=1, Write=2 }
 [BoundedPayload(112)]
@@ -198,4 +207,6 @@ public interface IVirtualizationService
     ValueTask<VirtualIoHandleResponse> BindIoAsync(BindVirtualIoRequest request);
     [Message(16), Transition("Ready", "Ready")]
     ValueTask CloseIoAsync(CloseVirtualIoRequest request);
+    [Message(17), Transition("Ready", "Ready")]
+    ValueTask BindExecutablePackageAsync(BindVirtualExecutablePackageRequest request);
 }

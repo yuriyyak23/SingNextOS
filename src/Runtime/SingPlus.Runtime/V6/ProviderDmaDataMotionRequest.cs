@@ -54,8 +54,8 @@ public sealed partial class RuntimeKernel
         // No provider callbacks under the caller correlation monitor.
         try
         {
-        var moved=MoveProviderDmaBuffers(request.Source,request.Destination,request.Input,request.Output,request.Plan,
-            request.SourceMapping,request.SourceGrant,request.SourcePrepare,request.DestinationMapping,request.DestinationGrant,request.DestinationPrepare,costProvider);
+        var moved=MoveProviderDmaBuffersCore(request.Source,request.Destination,request.Input,request.Output,request.Plan,
+            request.SourceMapping,request.SourceGrant,request.SourcePrepare,request.DestinationMapping,request.DestinationGrant,request.DestinationPrepare,costProvider,request);
         if(moved.IsSuccess)lock(request)request.Result=moved.Value;
         return moved;
         }
@@ -86,6 +86,13 @@ public sealed partial class RuntimeKernel
                     payload.SourcePrepare!=request.SourcePrepare||payload.DestinationPrepare!=request.DestinationPrepare)
                     return KernelResult.Fail(KernelError.PlatformFaulted,"Original DMA payload custody unavailable; absence is not closure.");
                 request.CleanupPayload=payload; // retain original before partial retirement may remove routing
+                // Surviving caller custody can repair only the same original route.
+                // This is warm cleanup, never permission to submit again.
+                if(routed is null && !payload.Consumed)
+                {
+                    _dmaCopyPayloads.EnsureCapacity(_dmaCopyPayloads.Count+1);
+                    _dmaCopyPayloads.Add(request.SourceGrant.GrantId,payload);
+                }
             }
             var source=RetirePlatformDmaGrantAndOriginalPeer(request.SourceGrant,request.SourceGrant.DeviceLease.DomainBinding.Subject);
             if(!source.IsSuccess)return source;

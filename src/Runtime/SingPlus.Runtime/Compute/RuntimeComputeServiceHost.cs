@@ -474,6 +474,11 @@ public sealed class RuntimeComputeServiceHost
             CancellationRequested = true,
             CancelledBeforeProviderInvocation = true
         };
+        if (invocation is { } originalInvocation)
+        {
+            var bound = _kernel.BindComputeCopyInvocation(originalInvocation, _service, _pending);
+            if (!bound.IsSuccess) return bound;
+        }
         return AdvancePendingCopyCore();
     }
 
@@ -509,6 +514,11 @@ public sealed class RuntimeComputeServiceHost
 
     private KernelResult PrepareAndSubmit(PendingCopy pending)
     {
+        if (pending.Invocation is { } invocation)
+        {
+            var bound = _kernel.BindComputeCopyInvocation(invocation, _service, pending);
+            if (!bound.IsSuccess) return bound;
+        }
         if (pending.SourceBorrow.Length != pending.Destination.Length)
         {
             return KernelResult.Fail(
@@ -671,6 +681,12 @@ public sealed class RuntimeComputeServiceHost
                 pending.Destination);
             if (!released.IsSuccess) return released;
             pending.DestinationReleased = true;
+        }
+
+        if (pending.Invocation is { } invocation)
+        {
+            var contained = _kernel.ConsumeComputeCopyInvocationClosure(invocation, _service, pending);
+            if (!contained.IsSuccess) return contained;
         }
 
         return KernelResult.Ok();

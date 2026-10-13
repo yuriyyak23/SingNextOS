@@ -4,6 +4,12 @@ namespace SingPlus.Runtime;
 
 public sealed partial class RuntimeKernel
 {
+    internal KernelResult BindComputeCopyInvocation(EndpointSessionInvocationHandle invocation, ProcessHandle service, object original) =>
+        SessionInvocations.BindComputeCopy(invocation, service, original);
+
+    internal KernelResult ConsumeComputeCopyInvocationClosure(EndpointSessionInvocationHandle invocation, ProcessHandle service, object original) =>
+        SessionInvocations.ConsumeComputeCopyClosure(invocation, service, original);
+
     public KernelResult AcceptSessionInvocation(
         ProcessHandle service,
         EndpointSessionInvocationHandle invocation,

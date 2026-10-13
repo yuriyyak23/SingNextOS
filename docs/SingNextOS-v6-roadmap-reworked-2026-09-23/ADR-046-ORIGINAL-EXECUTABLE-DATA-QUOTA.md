@@ -1,0 +1,15 @@
+# ADR-046: Original executable private data quota
+
+Accepted for implementation, 2026-10-11. Actual RuntimeKernel executable artifacts materialize private native data pages in addition to logical mapped guest bytes. GuestMemoryBytes cannot admit that private capacity.
+
+The existing guest→parent mapping reservation holds optional MaximumPrivateExecutableDataBytes as OwnedMemoryBytes, together with GuestMemoryBytes and PinnedMappedMemoryBytes, before provider Map. The service Map payload forwards the same page-aligned bound. A nonzero quota requires an executable provider mapping; invalid bounds and capacity shortage deny before provider effects. No new budget dimension, ledger, permission or artifact release owner.
+
+The original mapping record retains the admission limit and same ResourceBudgetAuthority reservation reference. Bind checks original mapping/charge identity, active reservation/attachment and exact OwnedMemoryBytes quota before invocation and publication. Attached budget with missing quota denies before native Bind. An unbudgeted V1/V3 caller with zero quota keeps its compatible default extent. A later attachment or foreign/copied charge cannot authorize that legacy path.
+
+Additive optional quota producer interfaces at platform/neutral/native layers guarantee enforcement in actual materialization and execution. Immutable Bind requests/receipts carry MaximumPrivateDataBytes. Each caller refuses incapable producers before possible allocation and validates the exact returned bound, alongside existing original request/raw/source/generation/history facts. Lost replies use existing same-original pure reconciliation; foreign/copy/malformed quota facts pin and do not repeat effect.
+
+Native retains the original backing owner before loader effects. Its private data dictionary enforces the declared bound across all loader/runner physical writes, with capacity refusal before write mutation. Partial materialization remains an original cleanup lifetime. Existing artifact release waits for terminal execution and retires these pages; guest→parent closure consumes the existing entire mapping charge only after allowed original closure. Capacity remains conservatively held through mapping lifetime even after artifact release. Completed exact consumption does not require new active execution permission, re-reserve or repin.
+
+This is a private data-page capacity reservation, not measured total host allocation. Package snapshots, annotations, CPU/CLR/model overhead and physical GC reclaim remain outside that measure. Original inventory/history loss, incapable containment and independent users remain pinned. Trusted cold continuation and general B2/B3/all-fact-loss are open.
+
+Actual adopted tuple: Contracts1.32.0, Runtime1.23.6, operationSchema1.4.0/manifestContract1.3 unchanged. No machine/ISA semantics edits. [Consumer evidence](../../artifacts/v6/iteration-20261011-private-data-quota/report.md). Gates OFF; ProductionQualified false; Java-only skipped; ISA NONE. Next dependency-ready local consumer: model-only guest quantitative admission/closure; trap requires typed actual CPU outcome refinement.

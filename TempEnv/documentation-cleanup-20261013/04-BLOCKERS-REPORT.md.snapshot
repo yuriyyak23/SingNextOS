@@ -1,0 +1,42 @@
+# Оставшиеся blockers и boundaries
+
+Актуально на 2026-10-13, Europe/Moscow. Единственная очередь — [01](01-STATE-AND-BACKLOG.md); этот документ объясняет свойства и зависимости. Actual source/callers и terminal evidence имеют приоритет над датой. Общий root scope Partial/Open; blocker одной property не останавливает независимых local consumers.
+
+## Реализованное и первая оставшаяся boundary
+
+Canonical root continuity secure/device, original root/mapping/child/guest/artifact routing, inventory и exact consumed closure/charge guards имеют bounded exits. Не начинать их заново без defect/drift; relevant records перечислены в 01.
+
+[Unpublished Bind/Map cleanup](../../artifacts/v6/iteration-20261010-unpublished-admission-resolution/report.md) завершил surviving-known reconciliation через immutable request до effect, same original owner, native producing source fence, retained response и actual teardown. Distinct exact no-effect разрешает staged Region/budget rollback, а не fake Closed. Unknown/malformed original outcome сохраняет pins/no-repeat. Native/affected/main exits относятся только к recorded inputs; commands/counts/failed history находятся в report/audit.
+
+**Native root Close source continuity — bounded fix verified.** [ADR-016 producing-owner fence и actual kernel consequences](../../artifacts/v6/iteration-20261010-native-root-close-fence/report.md) закрыли этот defect; original repro exit1 сохранён. Общий root scope остаётся Partial. Следующий local consumer установлен в 01.
+
+**Native IRQ — bounded exit verified.** [ADR-030/report](../../artifacts/v6/iteration-20261011-native-original-irq-fence/report.md): original Bind/Close/Poll/Complete adoption и exact unknown native delivery containment потребляются actual kernel cleanup с endpoint/Region/charge consequences. Independent endpoint/backing/history users и incapable/general/all-fact-loss paths сохраняют pins; unchanged consumer не повторять.
+
+**Managed guest execution и original result — bounded exits verified.** [Allocation/retire](../../artifacts/v6/iteration-20261011-managed-guest-allocation/report.md) и [Completed result](../../artifacts/v6/iteration-20261011-original-completed-result/report.md): compiler-produced guest→CPU execution→exact original result42/255→kernel read/cleanup→pages/Region/charges. Это внешний provider/.NET-host contour, не whole-OS HybridCPU binary.
+
+Current assets Runtime1.24.0/Contracts1.35.0/schema1.4.0. Software DSC1/ComputeService и DMA adoption установлены; current pending block — DMA caller original payload retention/routing-loss cleanup. Latest recorded ComputeService main exit1 на отсутствовавших historical inputs; возвращённая документация не меняет этот результат. P08 не ready без actual staged predecessor/acquisition/backing; current executing DMA не подменяет его. Detailed current state — в01.
+
+## Зависимости
+
+| ID | Classification / concrete gap | Последствие и необходимая работа |
+|---|---|---|
+| B1 | Missing: actual durable original-invocation producer/replay | Existing effect callers есть, но нет доказанной цепочки call → durable original fact → recovery consumer после потери всех records/reboot. Нужны persistence/rollback/freshness semantics, authenticated original lifetime continuation и exact consumption без выдачи capabilities или второго ledger |
+| B2 | Partial локально; general/incapable/production containment contract не установлен | ADR-012/013 разрешают surviving-known region/native mapping responses, ADR-015 — fenced Bind/Map cleanup. Для неизвестного original effect нужны request identity до effect и exact source/generation/acceptance/no-effect/contained evidence у реального producer. NotFound, generic failure, terminal response и returned-object compensation не освобождают backing |
+| B3 | Partial: optional exact admitted artifact release producer/consumer implemented | [ADR-017 dev exit](../../artifacts/v6/iteration-20261010-exact-artifact-release/report.md) потребляет exact no-further-use через adopted ExternalRuntime/Contracts и kernel Region/charge consequences. Surviving-original failed/unknown Start и Bind cleanup имеют bounded adoption (records в01); general unknown/all-fact-loss, incapable/production providers и independent fault pins открыты; fake closure/metadata cleanup запрещены |
+| B4 | Partial: concrete concurrent consumer gaps; general proof отдельно | Исправлять actual operation-specific owner/source/interlock/publication defects и проверять последствия. Отсутствие общей formal theorem не отдельный implementation blocker; general atomicity не заявляется. Crash durability — отдельная property |
+| B5 | Missing/Partial: external executing implementations; production claim FutureGated | Bounded external managed nested/event/Virtual-I/O/DMA и CPU guest producers уже исполняются (current records в01); это не physical/ProductionSecure qualification. Remaining exact unknown/history/independent users и новые producer/client gaps брать по source. Machine fault-kind и ProductionSecure producers отсутствуют; admission/refinement/legality независимы |
+| B6 | Not dependency-ready: deferred API consumers | SubmitV6Restart, SettleResourceExternalOperation, standalone AssignPool, BindCoherentAccess не становятся задачей по наличию API. Сначала actual producing caller и зависимый owner/contract need; P03/P08/multi-host/physical scope не расширять автоматически |
+
+B2/B3 — зависимые implementation/contract gaps, не запрет менять разрешённый sibling scope. [Cross-project authorization](../SingNextOS-v6-roadmap-reworked-2026-09-23/38-CROSS-PROJECT-DELTA.md) допускает ExternalRuntime/Contracts/Tests/Tools и external tools в NonRTL. До API расширения установить actual producer, guarantee и applicable ADR; затем принять resolved packages/toolchain в SingNextOS. Sibling source edit сам dependency не обновляет. Без доказанной guarantee fallback остаётся pinned/quarantined/no-repeat.
+
+## B1/B2: пределы текущей recovery evidence
+
+RuntimeKernel создаёт новый bridge/owners. In-memory original references и восстановление того же CLR record подтверждают только surviving-runtime retry. [Budget recovery snapshot](../../artifacts/v6/iteration-20261010-budget-recovery-original-snapshot/report.md) защищает наблюдённый startup prefix от signed fork и сохраняет conservative charge; он не восстанавливает root/mapping authority. Integrity/HMAC не доказывает freshness первого cold snapshot и не защищает автоматически от rollback/torn write/provider history loss.
+
+Для durable consumer отдельно установить write-ahead порядок и crash windows до submit, после effect до response/publication, после receipt до local consumption, duplicate replay и потерю provider history. Prepared/NotFound не означают ProvenNeverAccepted. Не переносить эту property на обычный managed guard и не требовать hardware campaign для его bounded dev exit.
+
+## Evidence и дисциплина
+
+Внешний аудит: [решения](05-EXTERNAL-AUDIT-DISPOSITION.md). Historical reports/failed runs сохранены в artifacts; не копировать их журнал и suite counts сюда. Ordinary documentation review не запускает build/restore/P00/runtime report/manifest refresh. Runtime changes проверяются по [03](03-DEV-VALIDATION.md); strict qualification/security integrity не ослабляются.
+
+Все новые gates OFF; no ProductionQualified. SingPlus.Boot/Samples исключены; Java-only skipped; ISA NONE. Общий scope закрывается requirement-by-requirement по actual consequences, а не одним green suite или handoff.

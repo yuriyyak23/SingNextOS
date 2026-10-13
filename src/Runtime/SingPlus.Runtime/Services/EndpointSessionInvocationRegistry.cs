@@ -32,6 +32,13 @@ internal sealed class EndpointSessionInvocationRegistry
         public bool AcceptedResponseCancelled { get; set; }
         public object? OriginalVirtualIoTransfer { get; set; }
         public bool VirtualIoTransferContained { get; set; }
+        public object? OriginalVirtualIoBind { get; set; }
+        public bool VirtualIoBindContained { get; set; }
+        public object? OriginalComputeCopy { get; set; }
+        public bool ComputeCopyContained { get; set; }
+        public object? OriginalVirtualArtifactOwner { get; set; }
+        public GuestRegionMappingHandle? VirtualArtifactMapping { get; set; }
+        public bool VirtualArtifactContained { get; set; }
         public bool FailedSettlementMayHaveEffect { get; set; }
         public bool DonationReturnInProgress { get; set; }
         public bool DonationBindingInProgress { get; set; } // Admission only.
@@ -737,7 +744,9 @@ internal sealed class EndpointSessionInvocationRegistry
                 if (record.ResourceDonation is { State: ResourceDonationState.Bound or ResourceDonationState.Active } live)
                     record.ResourceDonation = live with { State = ResourceDonationState.Quarantined };
                 if (!HasUnclosedPossibleEffect(record) &&
-                    (record.OriginalVirtualIoTransfer is null || record.VirtualIoTransferContained))
+                    (record.OriginalVirtualIoTransfer is null || record.VirtualIoTransferContained) &&
+                    (record.OriginalVirtualIoBind is null || record.VirtualIoBindContained) &&
+                    (record.OriginalVirtualArtifactOwner is null || record.VirtualArtifactContained))
                 {
                     _ownedRecords.Remove(key);
                     if (_records.TryGetValue(key, out var routed) && ReferenceEquals(routed, record))
@@ -752,9 +761,84 @@ internal sealed class EndpointSessionInvocationRegistry
         record.DonationReturnInProgress ||
         record.SettlementInProgress is not null ||
         record.ServiceAccepted && record.TerminalStatus is null ||
-        record.AcceptedResponseCancelled && !record.VirtualIoTransferContained ||
+        record.AcceptedResponseCancelled && !record.VirtualIoTransferContained && !record.VirtualIoBindContained && !record.ComputeCopyContained && !record.VirtualArtifactContained ||
+        record.OriginalComputeCopy is not null && !record.ComputeCopyContained ||
         record.FailedSettlementMayHaveEffect ||
         record.ResourceDonation?.State == ResourceDonationState.Quarantined;
+
+    internal KernelResult BindVirtualIoAdmission(EndpointSessionInvocationHandle invocation,ProcessHandle caller,object original)
+    {
+        lock(_gate)
+        {
+            var resolved=ResolveForCaller(invocation,caller);
+            if(!resolved.IsSuccess)return KernelResult.Fail(resolved.Error,resolved.Message!);
+            var record=resolved.Value!;
+            if(original is null || record.MessageId!=SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_BindIoAsync ||
+                !record.ServiceAccepted || record.TerminalStatus is not null || record.VirtualIoBindContained ||
+                record.OriginalVirtualIoBind is { } prior && !ReferenceEquals(prior,original))
+                return KernelResult.Fail(KernelError.InvalidTransition,"Original invocation cannot admit this IO Bind.");
+            record.OriginalVirtualIoBind=original;return KernelResult.Ok();
+        }
+    }
+
+    internal KernelResult ConsumeVirtualIoAdmissionClosure(EndpointSessionInvocationHandle invocation,ProcessHandle caller,object original)
+    {
+        lock(_gate)
+        {
+            var resolved=ResolveForCaller(invocation,caller);
+            if(!resolved.IsSuccess)return KernelResult.Fail(resolved.Error,resolved.Message!);
+            if(original is null || !ReferenceEquals(resolved.Value!.OriginalVirtualIoBind,original))
+                return KernelResult.Fail(KernelError.PlatformFaulted,"Original IO Bind invocation owner changed.");
+            resolved.Value.VirtualIoBindContained=true;return KernelResult.Ok();
+        }
+    }
+
+    internal KernelResult BindVirtualArtifact(EndpointSessionInvocationHandle invocation, ProcessHandle caller,
+        object originalDomain, GuestRegionMappingHandle mapping)
+        => BindVirtualGuestEffect(invocation,caller,originalDomain,mapping,false);
+
+    internal KernelResult BindVirtualGuestMapping(EndpointSessionInvocationHandle invocation,ProcessHandle caller,
+        object originalDomain,GuestRegionMappingHandle mapping)
+        => BindVirtualGuestEffect(invocation,caller,originalDomain,mapping,true);
+
+    private KernelResult BindVirtualGuestEffect(EndpointSessionInvocationHandle invocation,ProcessHandle caller,
+        object originalDomain,GuestRegionMappingHandle mapping,bool mappingAdmission)
+    {
+        lock(_gate)
+        {
+            var resolved=ResolveForCaller(invocation,caller);
+            if(!resolved.IsSuccess)return KernelResult.Fail(resolved.Error,resolved.Message!);
+            var record=resolved.Value!;
+            var protocol=record.MessageId;
+            if(originalDomain is null || !record.ServiceAccepted || record.TerminalStatus is not null || record.VirtualArtifactContained ||
+                (mappingAdmission ? protocol!=SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_MapGuestRegionAsync :
+                protocol != SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_BindExecutableArtifactAsync &&
+                protocol != SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_BindExecutablePackageAsync &&
+                protocol != SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_StartAsync) ||
+                record.OriginalVirtualArtifactOwner is { } prior && (!ReferenceEquals(prior,originalDomain) || record.VirtualArtifactMapping!=mapping))
+                return KernelResult.Fail(KernelError.InvalidTransition,"Original invocation cannot admit this artifact mapping.");
+            record.OriginalVirtualArtifactOwner=originalDomain;record.VirtualArtifactMapping=mapping;
+            return KernelResult.Ok();
+        }
+    }
+
+    // Called only by exact guest + parent mapping cleanup, after artifact release
+    // and quantitative mapping closure. Correlation is not a closure producer.
+    internal KernelResult ConsumeVirtualArtifactMappingClosure(ProcessHandle caller,object originalDomain,GuestRegionMappingHandle mapping)
+    {
+        lock(_gate)
+        {
+            var records=_ownedRecords.Values.Where(record=>record.VirtualArtifactMapping==mapping).ToArray();
+            foreach(var record in records)
+            {
+                var resolved=ResolveForCaller(record.Handle,caller);
+                if(!resolved.IsSuccess || !ReferenceEquals(resolved.Value,record) || !ReferenceEquals(record.OriginalVirtualArtifactOwner,originalDomain))
+                    return KernelResult.Fail(KernelError.PlatformFaulted,"Original artifact invocation route changed.");
+            }
+            foreach(var record in records)record.VirtualArtifactContained=true;
+            return KernelResult.Ok();
+        }
+    }
 
     // Existing invocation owns its correlation; the kernel IO owner supplies the
     // same original fact before effect and only consumes it inside exact IO closure.
@@ -786,6 +870,40 @@ internal sealed class EndpointSessionInvocationRegistry
             if(!ReferenceEquals(record.OriginalVirtualIoTransfer,original))
                 return KernelResult.Fail(KernelError.PlatformFaulted,"Original invocation IO transfer owner changed.");
             record.VirtualIoTransferContained=true;
+            return KernelResult.Ok();
+        }
+    }
+
+    internal KernelResult BindComputeCopy(EndpointSessionInvocationHandle invocation, ProcessHandle service, object original)
+    {
+        if (original is null) return KernelResult.Fail(KernelError.PlatformFaulted, "Original compute copy owner is required.");
+        lock (_gate)
+        {
+            var resolved = ResolveForService(invocation, service);
+            if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+            var record = resolved.Value!;
+            if (record.MessageId != SingPlus.Sip.Compute.IComputeServiceProtocol.Message_CopyAsync ||
+                !record.Delivered || record.TerminalStatus is not null || record.ComputeCopyContained ||
+                record.OriginalComputeCopy is { } prior && !ReferenceEquals(prior, original))
+                return KernelResult.Fail(KernelError.InvalidTransition, "Original invocation cannot admit this compute copy.");
+            record.OriginalComputeCopy = original;
+            return KernelResult.Ok();
+        }
+    }
+
+    // Only the trusted composition consumes its retained original after DSC1,
+    // mappings, borrow and destination custody have all finished exact cleanup.
+    internal KernelResult ConsumeComputeCopyClosure(EndpointSessionInvocationHandle invocation, ProcessHandle service, object original)
+    {
+        if (original is null) return KernelResult.Fail(KernelError.PlatformFaulted, "Original compute copy owner is required.");
+        lock (_gate)
+        {
+            var resolved = ResolveForService(invocation, service);
+            if (!resolved.IsSuccess) return KernelResult.Fail(resolved.Error, resolved.Message!);
+            var record = resolved.Value!;
+            if (!ReferenceEquals(record.OriginalComputeCopy, original))
+                return KernelResult.Fail(KernelError.PlatformFaulted, "Original invocation compute copy owner changed.");
+            record.ComputeCopyContained = true;
             return KernelResult.Ok();
         }
     }

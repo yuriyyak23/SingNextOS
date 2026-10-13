@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "phase": "P18",
+  "recorded_at_local_date": "2026-09-23",
+  "singnextos": {
+    "head": "a0f70bc2bd031bd2b1138b2a01984309814bba5c",
+    "tree": "c9e667fda0605d993c01060b7d7dc04b73cfac80",
+    "start_user_owned_dirty_changes": [],
+    "worktree_state": "uncommitted roadmap implementation; no user-owned baseline changes"
+  },
+  "runtime": {
+    "dotnet_sdk": "11.0.100-rc.1.26425.128",
+    "os": "Microsoft Windows 10.0.26200",
+    "rid": "win-x64",
+    "mode": "JIT",
+    "tlc": "Unavailable"
+  },
+  "artifacts": [
+    { "path": "contracts/SingPlus.Contracts/OperationObligations.cs", "bytes": 9303, "sha256": "f8a029995995dfb0f3f657a5ef140404dc1a01085230a2df3203ee2dbf565f36" },
+    { "path": "contracts/SingPlus.Contracts/ExecutionGuarantees.cs", "bytes": 8862, "sha256": "22a4fc7845f0aeb4994c03dfc8e6223d672102d9f02c030ecd7dcc97a2a85d7f" },
+    { "path": "contracts/SingPlus.Contracts/SemanticRefinementContracts.cs", "bytes": 8508, "sha256": "3a11e80ba65a47bfcdbb0c28f284d02ab72fc4131bc2cf5d54ffb6ffa8552edc" },
+    { "path": "contracts/SingPlus.Contracts/ProviderBehaviorContracts.cs", "bytes": 6720, "sha256": "d2d414afade6d06431175271187292a8dcec81566675f5db4316b18142df644e" },
+    { "path": "contracts/SingPlus.Contracts/ResourceMeasurementContracts.cs", "bytes": 4953, "sha256": "7e9a3780a4722f17e6f767f85da349d713614a29a4848901a95b1d675f386fcc" },
+    { "path": "contracts/SingPlus.Contracts/FaultReconciliationContracts.cs", "bytes": 2937, "sha256": "a77a6db1d5ca31192f6bf383b258496bff7b26ceb2b47da7dd256eb67a397bfc" },
+    { "path": "contracts/SingPlus.Contracts/ComputePlanning.cs", "bytes": 4246, "sha256": "56186ec6bde883c50ad363413719c92ed0336b9ee5c4d3c152239de8e597204b" },
+    { "path": "src/Runtime/SingPlus.Runtime/VNext/SemanticAdmissionSentry.cs", "bytes": 12396, "sha256": "933371e6715f30a5502103b7cbf7c4c8050af46451453aff9d606a6d5d0c56ef" },
+    { "path": "src/Runtime/SingPlus.Runtime/VNext/RuntimeKernel.SemanticObligations.cs", "bytes": 7632, "sha256": "e4231003b73ae40ba2497f0dbe59e572ab03f319efc0f8e4672769a0bf376f81" },
+    { "path": "src/Runtime/SingPlus.Runtime/VNext/RuntimeKernel.SemanticExecutionBinding.cs", "bytes": 6716, "sha256": "10ba068da9c91b7e47b7ec468ef368f651149f15194d913423180243649ff652" },
+    { "path": "src/Runtime/SingPlus.Runtime/ExternalOperations/ExternalOperationAuthority.cs", "bytes": 34211, "sha256": "dc9591abc4c7e16904f9ecf57273a44f8a6eb0d5476e15e7bf67a7047a26b5cd" },
+    { "path": "src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetRecoveryJournal.cs", "bytes": 21653, "sha256": "2255698e183271211e49da6d8e11f6b068932196915101ba467630b6f3f74414" },
+    { "path": "src/Runtime/SingPlus.Runtime/Compute/ComputePlanner.cs", "bytes": 22590, "sha256": "08b8087f8eeb08afa414c1055ce5934d5054bc7fbf952f74fe7731f570330d56" },
+    { "path": "src/Runtime/SingPlus.Runtime/VNext/VNextFeatureGates.cs", "bytes": 9507, "sha256": "393bc923c145d4b5efe20ef846ce816162d02af37a5e4e8c27cf76bbb5fef2d3" },
+    { "path": "tests/SingPlus.Tests/Runtime/Phase17MatrixMultiplySemanticTests.cs", "bytes": 5771, "sha256": "0c09cc1bd35b391c86b5c2bf4f27f2a81441bfc07d3f332f85fa281e1b0ed407" },
+    { "path": "src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.Dsc1.cs", "bytes": 27346, "sha256": "1d3da72b0d25efca52f92049864d7dec5082b8e97b3fba34b650172b60d995dc" },
+    { "path": "tests/SingPlus.Tests/Platform/PlatformDsc1ComputeTests.cs", "bytes": 72767, "sha256": "8796a00698b3e230b204eabc2600d712560a96510ca1b90c46bb752ab7758a4e" },
+    { "path": ".packages/HybridCPU.ExternalRuntime.Contracts.1.14.0.nupkg", "bytes": 74244, "sha256": "b96e99bda066ee585b26a11cbfa7b68ce6bf44fc0006679483ccc1a4eeb678c2" }
+  ],
+  "tests": {
+    "selected_adversarial": { "passed": 84, "failed": 0, "skipped": 0 },
+    "pre_remediation_full_core": { "passed": 1667, "failed": 1, "skipped": 2 },
+    "focused_dsc1_after_remediation": { "passed": 30, "failed": 0, "skipped": 0 },
+    "full_core": { "passed": 1668, "failed": 0, "skipped": 2 },
+    "platform_contract": { "passed": 60, "failed": 0, "skipped": 0 },
+    "host_adapter": { "passed": 90, "failed": 0, "skipped": 0 },
+    "neutral_host": { "passed": 58, "failed": 0, "skipped": 0 },
+    "aggregate_non_gui": { "passed": 1876, "failed": 0, "skipped": 2 }
+  },
+  "gates": { "vnext_known": 21, "vnext_enabled": [], "sipjob_enabled": [], "matrix": "OFF" },
+  "claims": {
+    "matrix_planning": "StaticAdmission",
+    "local_host_orchestration_subsets": "RuntimeEnforced",
+    "hybridcpu_provider_ise": "Unsupported",
+    "native_aot": "NotQualified",
+    "production_qualified": false,
+    "guaranteed_reservation": false,
+    "enforced_upper_bound": false
+  },
+  "rollback": "OFF; ordinary fallback; drain/reconcile/quarantine exact generations",
+  "hybridcpu_scope": "CONTRACTS_EXTERNAL_TOOL_ONLY_NO_ISE_SOURCE",
+  "isa_impact": "NONE"
+}

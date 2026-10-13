@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "phase": "P10",
+  "recorded_at_local_date": "2026-09-22",
+  "singnextos": {
+    "head": "a0f70bc2bd031bd2b1138b2a01984309814bba5c",
+    "tree": "c9e667fda0605d993c01060b7d7dc04b73cfac80",
+    "start_user_owned_dirty_changes": []
+  },
+  "artifacts": [
+    { "path": "src/Runtime/SingPlus.Runtime/VNext/ResourceEnvelopeBudgetMapping.cs", "bytes": 2581, "sha256": "414e16852f3a527b1ac3bfb39d2fbd5679ba5d0d820cae7ad39e9d7b82c9b416" },
+    { "path": "src/Runtime/SingPlus.Runtime/VNext/ResourceAdmissionProtocol.cs", "bytes": 23326, "sha256": "bb1e869f7b74882334482a0834e5f992930895a344ebf2c43ec71e307310758c" },
+    { "path": "src/Runtime/SingPlus.Runtime/VNext/ResourceDonationProtocol.cs", "bytes": 16682, "sha256": "9ca089467d375de3c220560797a945eaf192920be43442129641d038da3f0a8e" },
+    { "path": "src/Runtime/SingPlus.Runtime/VNext/RuntimeKernel.SemanticExecutionBinding.cs", "bytes": 6716, "sha256": "10ba068da9c91b7e47b7ec468ef368f651149f15194d913423180243649ff652" },
+    { "path": "src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetAuthority.cs", "bytes": 30857, "sha256": "8b48d88befe9798a467b6c8abf1b3c4bb238ea55409162e00fa2bb593f1ffdc2" },
+    { "path": "tests/SingPlus.Tests/Runtime/ResourceEnvelopeBudgetMappingTests.cs", "bytes": 3063, "sha256": "cccdda566180d9772426ffa9c5097bda0e8a6e5d15c3806e3a3c1ac2054554ae" },
+    { "path": "tests/SingPlus.Tests/Runtime/VNextPhase10ResourceSchedulerTests.cs", "bytes": 5454, "sha256": "8e94406ae1a967892e3436581b726c791109fad8eae3d46a302397bc5cfe27e6" }
+  ],
+  "tests": {
+    "focused_atomic_mapping_donation_scheduler": { "passed": 44, "failed": 0, "skipped": 0 },
+    "full_non_gui": { "passed": 1841, "failed": 0, "skipped": 2 }
+  },
+  "solution_build": { "exit_code": 0, "warnings": 0, "errors": 0 },
+  "claims": {
+    "existing_atomic_budget_owner": "RuntimeEnforced",
+    "exact_compute_time_mapping": "StaticAdmission",
+    "scheduler_policy_revalidation": "RuntimeEnforced non-authoritative",
+    "provider_local_atomic_acquisition": "FutureGated"
+  },
+  "gates": { "all_vnext": "OFF" },
+  "hybridcpu_scope": "local external-tool/package boundary only",
+  "isa_impact": "NONE"
+}

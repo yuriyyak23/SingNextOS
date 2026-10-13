@@ -391,7 +391,7 @@ internal sealed partial class VirtualDomainAuthority
     }
 
     internal KernelResult RemovePlatformMapping(Record record, GuestRegionMapping expectedMapping,
-        (PlatformGuestMapping Guest, PlatformRegionMapping Parent) expectedPlatform)
+        (PlatformGuestMapping Guest, PlatformRegionMapping Parent) expectedPlatform, Func<KernelResult>? closureConsumer=null)
     {
         lock (_gate)
         {
@@ -400,6 +400,8 @@ internal sealed partial class VirtualDomainAuthority
                 !record.Mappings.TryGetValue(id, out var mapping) || mapping != expectedMapping || !HasOriginalMapping(record, mapping) ||
                 !record.PlatformMappings.TryGetValue(id, out var platform) || platform != expectedPlatform)
                 return KernelResult.Fail(KernelError.StaleGeneration, "Original platform mapping cleanup owner or tuple changed.");
+            var consumed=closureConsumer?.Invoke()??KernelResult.Ok(); // Trusted local invocation consumption, no callback/effect.
+            if(!consumed.IsSuccess)return consumed;
             record.PlatformMappings.Remove(id);
             record.Mappings.Remove(id);
             record.OriginalMappings.Remove(id);
@@ -515,6 +517,19 @@ internal sealed partial class VirtualDomainAuthority
                 !record.PlatformMappings.TryGetValue(expected.Mapping.MappingId, out var platform) || platform != expectedPlatform)
                 return KernelResult.Fail(KernelError.StaleGeneration, "Original executable local mapping or platform correlation changed.");
             return commit(); // Trusted pure admission/publication mutation; no provider callback.
+        }
+    }
+
+    internal KernelResult CommitStagedGuestInvocation(Record record,GuestRegionMapping expected,Func<KernelResult> commit)
+    {
+        lock(_gate)
+        {
+            if(!HasCurrentOriginalRecord(record) || record.ChildBinding is null ||
+                record.State is not (VirtualDomainState.Configured or VirtualDomainState.Parked) ||
+                !record.Mappings.TryGetValue(expected.Mapping.MappingId,out var mapping) || mapping!=expected ||
+                !HasOriginalMapping(record,mapping) || !record.StagedMappings.Contains(expected.Mapping.MappingId))
+                return KernelResult.Fail(KernelError.StaleGeneration,"Original staged guest mapping invocation source changed.");
+            return commit(); // Trusted local invocation correlation; no external callback.
         }
     }
 

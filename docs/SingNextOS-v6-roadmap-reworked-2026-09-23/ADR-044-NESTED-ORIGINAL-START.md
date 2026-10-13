@@ -1,0 +1,15 @@
+# ADR-044: Original nested Start admission and cleanup
+
+Accepted for implementation, 2026-10-11. Actual RuntimeKernel.StartVirtualDomain consumes a nested artifact through SDK/provider/native CPU execution. Existing Start retained original leaf/artifact/mapping facts but did not reserve or validate the full original ancestor lifetime with its possible CPU effect.
+
+Native Start and typed Start/pure resolution now take root→immutable ancestors→leaf locks, verify original factory/grant/history and admission readiness before invocation, and preserve original fact/generation before ExecuteToTerminal. Pure completed lookup checks original identity/history without new execution readiness permission. No ISA, register, memory model, pipeline, retire, reset or firmware semantics change.
+
+SDK/provider/bridge reserve ancestor interlocks around actual Start and pure reconciliation, then balance them in finally. Bridge captures original revisions before effect and rechecks before publication. Only its validated owned Running publication advances the captured leaf revision; captured ancestors remain unchanged. Independent leaf ABA/exhaustion is latched before writing owned quarantine. Release validates the Start ancestor inventory as well as Bind ancestry.
+
+Nested typed responses, including NoEffect, must match the same native original Start fact/raw. Lost reply uses pure same-original lookup; copied raw cannot be replaced by an equal canonical response. Before nested Release, unknown invocation raw is reconciled without effect and matched against any retained invocation raw. Unknown lookup does not invoke Release; retry uses the same original request. Foreign/copied or contradictory facts latch independent uncertainty. Fresh source loss/generation ABA before publication remains pinned.
+
+NoEffect proves only absence of this invocation's CPU effect. It does not prove artifact/guest/parent closure. Completed NoEffect lifetime cleanup does not need new native ancestor execution readiness. Actual exact artifact Release→guest unmap→parent closure uses existing Region and ResourceBudgetAuthority owners, including GuestMemoryBytes. Independent KernelEventRegistry, backing/history/all-fact-loss users remain outside this bounded exit.
+
+Actual immutable Runtime1.23.4 adopted with Contracts1.31.0; operationSchema1.4.0 and manifestContract1.3 unchanged. Evidence: [consumer record](../../artifacts/v6/iteration-20261011-nested-start-lineage/report.md). Compiler-produced software image is used for actual CPU receipts; no performance or program-result qualification claim. Gates OFF; no ProductionQualified; Java-only skipped; ISA NONE.
+
+Next producing need: native private executable backing cost/quota and actual budget adoption. Loader/runner consume Processor.MainMemoryArea, so an external provider implementation can be used without machine memory semantics changes. Existing guest charge measures logical mapped guest bytes; it does not account for private sparse allocation or all host model memory. B1 trusted cold original continuation remains absent; general B2/B3 scope remains Partial.

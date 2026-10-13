@@ -286,6 +286,7 @@ public sealed class SingPlusGenerator : IIncrementalGenerator
         return (ns, type.Name) switch
         {
             ("SingPlus.Sip.Native", "BoundedBytes") => true,
+            ("SingPlus.Sip.Virtualization", "BoundedExecutablePackage") => true,
             ("SingPlus.Contracts", "SurfacePlaneSet") => true,
             ("SingPlus.Sip.Process", "ProcessManifestValue") => true,
             ("SingPlus.Sip.Process", "InitialCapabilitySet") => true,

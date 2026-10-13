@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 1,
+  "phase": "P00",
+  "claim": "ModelOnly",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "b86cc33c16a77760c6971cc1a656c34b6cf2a10d",
+  "initialDirtyWorktree": [],
+  "toolchain": {
+    "dotnetSdk": "11.0.100-rc.1.26425.128",
+    "runtimeProfile": "host-JIT"
+  },
+  "localExternalRuntimeArtifact": {
+    "package": "HybridCPU.ExternalRuntime.Contracts",
+    "version": "1.14.0",
+    "sha256": "b96e99bda066ee585b26a11cbfa7b68ce6bf44fc0006679483ccc1a4eeb678c2",
+    "qualification": "inventory-only"
+  },
+  "hybridCpuSource": {
+    "roadmapReferenceSha": "794c4a53494f503855ac8cf209efab23fde083b2",
+    "locallyVerified": false
+  },
+  "enabledFeatureGates": [],
+  "tests": [
+    {
+      "lane": "P00-focused",
+      "command": "dotnet test tests/SingPlus.Tests/SingPlus.Tests.csproj --no-restore --filter FullyQualifiedName~VNextPhase00ArchitecturalFreezeTests --verbosity minimal",
+      "passed": 9,
+      "failed": 0,
+      "skipped": 0
+    },
+    {
+      "lane": "P00-owner-architecture-budget",
+      "command": "dotnet test tests/SingPlus.Tests/SingPlus.Tests.csproj --no-build --no-restore --filter P00/architecture/budget selectors --verbosity minimal",
+      "passed": 52,
+      "failed": 0,
+      "skipped": 0
+    },
+    {
+      "lane": "full-non-gui",
+      "command": "dotnet test SingNextOS.slnx --no-build --no-restore --filter FullyQualifiedName!~SingPlus.Tests.Gui --verbosity minimal",
+      "passed": 1568,
+      "failed": 9,
+      "skipped": 2,
+      "disposition": "failed on pre-existing historical evidence/profile/P14 tuple drift; no failure is in the P00 test class"
+    }
+  ],
+  "builds": [
+    { "target": "src/Runtime/SingPlus.Runtime/SingPlus.Runtime.csproj", "warnings": 0, "errors": 0 },
+    { "target": "SingNextOS.slnx", "warnings": 0, "errors": 0 }
+  ],
+  "fullSuiteFailureIdentities": [
+    "SingCapPhase13ClosureTests.SecurityMatrixNamesEveryMandatoryCrossAuthorityRace",
+    "SingCapPhase13ClosureTests.ClaimMatrixWithholdsProductionAndHardwareClaims",
+    "SingCapPhase13ClosureTests.DefinitionOfDoneMatrixMapsEveryItemAndDoesNotHideFutureGatedWork",
+    "SingCapPhase13ClosureTests.PerformanceReportContainsEveryRequiredWorkerAndContentionCombination",
+    "SingCapPhase01ToolchainTests.EveryProjectHasExactlyOneOwnedSecurityProfile",
+    "Phase148QualificationClosureTests.TupleAndClaimMatrixCloseAllRequirementsWithoutEnablingProductionGate",
+    "HybridBootQualificationMatrixTests.MatrixCoversT001ThroughT050WithoutUnsupportedClaims",
+    "SingCapPhase12ProviderMappingTests.ProviderMappingPinsExactArtifactAndKeepsEveryReceiptNonAuthoritative",
+    "SingCapPhase11MigrationReviewTests.ConfusedDeputyReviewIsCompleteAndDeterministicForMigratedFamilies"
+  ],
+  "artifacts": [
+    {
+      "path": "EVIDENCE_P00_ARCHITECTURAL_FREEZE.md",
+      "sha256": "5fb648d60acca290e75f8852086981f4cd8faeed4fb8afd80cccf36983c2f67d"
+    }
+  ],
+  "exclusions": [
+    "no NativeAOT qualification",
+    "no HybridCPU executable/provider qualification",
+    "no hardware, QEMU, firmware, or CXL boot execution",
+    "no ISA or microarchitecture change",
+    "no RuntimeEnforced resource contour"
+  ]
+}

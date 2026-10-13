@@ -63,7 +63,7 @@ public sealed partial class RuntimeKernel
         internal bool SessionClosureConsumed;
         internal bool SourceChanged;
     }
-    internal KernelResult<SingPlus.Sip.Virtualization.VirtualIoHandleResponse> BindSessionVirtualIo(ProcessHandle owner,SingPlus.Sip.Virtualization.BindVirtualIoRequest request)
+    internal KernelResult<SingPlus.Sip.Virtualization.VirtualIoHandleResponse> BindSessionVirtualIo(ProcessHandle owner,EndpointSessionInvocationHandle invocation,SingPlus.Sip.Virtualization.BindVirtualIoRequest request)
     {
         if(request.Access==0 || (request.Access & ~(SingPlus.Sip.Virtualization.VirtualIoAccess.Read | SingPlus.Sip.Virtualization.VirtualIoAccess.Write))!=0 ||
             request.MaximumTransferBytes is <=0 or >1048576)
@@ -78,7 +78,7 @@ public sealed partial class RuntimeKernel
         var rights=PlatformDeviceRights.None;
         if(request.Access.HasFlag(SingPlus.Sip.Virtualization.VirtualIoAccess.Read))rights|=PlatformDeviceRights.Read;
         if(request.Access.HasFlag(SingPlus.Sip.Virtualization.VirtualIoAccess.Write))rights|=PlatformDeviceRights.Write;
-        var bound=BindVirtualIo(owner,request.Domain,device,new(rights,request.MaximumTransferBytes));
+        var bound=BindVirtualIo(owner,request.Domain,device,new(rights,request.MaximumTransferBytes),sessionInvocation:invocation);
         return bound.IsSuccess?KernelResult<SingPlus.Sip.Virtualization.VirtualIoHandleResponse>.Ok(new(bound.Value.Id,bound.Value.Generation)):
             KernelResult<SingPlus.Sip.Virtualization.VirtualIoHandleResponse>.Fail(bound.Error,bound.Message!);
     }

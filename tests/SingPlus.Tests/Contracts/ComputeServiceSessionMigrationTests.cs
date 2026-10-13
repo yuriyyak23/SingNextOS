@@ -85,6 +85,17 @@ public sealed class ComputeServiceSessionMigrationTests
         Assert.Equal(64UL,Used());
         Assert.False(scenario.Host.AdvancePendingCopy().IsSuccess);
         Assert.False(pending.IsCompleted);
+        var original=typeof(RuntimeComputeServiceHost).GetField("_pending",
+            global::System.Reflection.BindingFlags.Instance|global::System.Reflection.BindingFlags.NonPublic)!.GetValue(scenario.Host)!;
+        var invocation=(EndpointSessionInvocationHandle)original.GetType().GetProperty("Invocation")!.GetValue(original)!;
+        var copy=typeof(object).GetMethod("MemberwiseClone",
+            global::System.Reflection.BindingFlags.Instance|global::System.Reflection.BindingFlags.NonPublic)!.Invoke(original,null)!;
+        Assert.Equal(KernelError.PlatformFaulted,
+            scenario.Kernel.ConsumeComputeCopyInvocationClosure(invocation,scenario.Service,copy).Error);
+        Assert.Equal(KernelError.WrongSessionOwner,
+            scenario.Kernel.ConsumeComputeCopyInvocationClosure(invocation,scenario.Caller,original).Error);
+        Assert.True(scenario.Kernel.SnapshotSessionInvocationConsequence(invocation).Value.UnclosedPossibleEffect);
+        Assert.Equal(64UL,Used());
         spy.LoseQuery=false;
         var settled=scenario.Host.AdvancePendingCopy();
         Assert.Equal(KernelError.PlatformFaulted,settled.Error); // original request failure remains failure
@@ -99,6 +110,9 @@ public sealed class ComputeServiceSessionMigrationTests
         Assert.True(teardown.IsSuccess,teardown.Message);
         Assert.Equal(0,spy.Native.ActiveOwnedRegionMappingCount);
         Assert.Equal(0,spy.Native.ActiveBindingCount);
+        var callerTeardown=scenario.Kernel.TerminateProcess(scenario.Caller);
+        Assert.True(callerTeardown.IsSuccess,callerTeardown.Message);
+        Assert.False(scenario.Source.IsValid);
     }
     [Theory]
     [InlineData(false)] [InlineData(true)]

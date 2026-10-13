@@ -1,0 +1,1871 @@
+Разобрал весь `SingCap-Refactoring`: technical spec, ADR Phase 00, roadmap P00–P13, traceability/CI gates и implementation evidence P00/P01. Дополнительно сверил ключевые предпосылки с кодом SingNextOS на зафиксированном в плане commit `a67ee...`: `CapabilityAuthority`, `RegionAuthority`, `AdmissionVerifier` и `HybridCpuExternalOperationProvider`.
+
+Мой общий вывод: **архитектурно план очень сильный — примерно 8.7/10 как design/refactoring plan**, но есть 3–4 места, которые надо закрыть до того, как можно будет делать серьёзное security claim. Самые важные из них — транзакционность между несколькими authority state machines, роль sealed handles, concurrency внутри `RegionAuthority` и реальная enforceability ManagedCap поверх большого .NET/BCL.
+
+## 1. Что именно меняет этот refactoring
+
+Сейчас `CapabilityAuthority` достаточно простой:
+
+```text
+CapabilityId
+    ↓
+CapabilityRecord
+    Descriptor
+    DelegatedFrom?
+    Revoked
+```
+
+А `CapabilityDescriptorV1` содержит примерно:
+
+```text
+issuer
+subject
+resource kind/id
+rights
+generation
+revocation epoch
+```
+
+При этом текущий implementation действительно использует одну таблицу `_records`, один `_gate`, прямой revoke и domain epoch. Делегация проверяет subset прав.
+
+SingCap-M превращает это в гораздо более строгую модель:
+
+```text
+CapabilityRecord
+ ├─ AuthorityRealm
+ ├─ opaque 128-bit token
+ ├─ SubjectId
+ ├─ SubjectGeneration
+ ├─ ResourceIdentity
+ ├─ ResourceGeneration
+ ├─ EffectiveConstraints
+ ├─ ParentRevocationNode
+ ├─ DelegationDepth
+ ├─ shared QuotaAccount
+ ├─ SessionConstraint
+ ├─ LifetimeConstraint
+ └─ Active / Consumed / Revoked / Retired
+```
+
+То есть фактически capabilities становятся не DTO с правами, а **reference на authoritative runtime record**.
+
+Это важнейший шаг.
+
+В терминах security:
+
+```text
+before:
+
+descriptor ≈ capability representation
+
+
+after:
+
+opaque token
+     ↓
+authoritative live record
+     ↓
+current context validation
+```
+
+Именно второй вариант правильнее.
+
+---
+
+# 2. Самое правильное решение плана: не делать Software-CHERI
+
+В документе есть критически правильное ограничение:
+
+```text
+no per-load/per-store SingCap lookup
+```
+
+После того как Region/borrow проверен:
+
+```text
+authority validation
+        ↓
+bounded managed view
+        ↓
+Span<T>
+        ↓
+обычные load/store
+```
+
+а не:
+
+```text
+for each memory access:
+    lookup capability table
+    check bounds
+    check generation
+```
+
+Это очень хороший выбор.
+
+Иначе SingNextOS получил бы чрезвычайно дорогую software-эмуляцию CHERI без hardware guarantees.
+
+SingCap-M вместо этого защищает **границы authority acquisition**, а не каждую инструкцию доступа к памяти.
+
+Это честная архитектурная позиция:
+
+```text
+CHERI:
+pointer-level safety
+
+SingCap-M:
+authority/lifecycle boundary safety
+```
+
+И документация не пытается назвать это CHERI-equivalent.
+
+За это архитектуре большой плюс.
+
+---
+
+# 3. Второе очень сильное решение — `Validate()` больше не считается разрешением на effect
+
+Это, на мой взгляд, **самая важная часть всего refactoring**.
+
+Проблема классическая:
+
+```text
+T0 Validate(cap) -> OK
+
+T1 Revoke(cap)
+
+T2 perform irreversible effect
+```
+
+Если T2 доверяет результату T0 — revoke фактически дырявый.
+
+План вводит:
+
+```text
+AcquireOperationAuthority(...)
+        ↓
+OperationAuthorityLease
+```
+
+И linearization point становится:
+
+```text
+check:
+   capability alive
+   ancestry alive
+   subject generation
+   resource generation
+   constraints
+   quota
+   one-shot state
+        +
+register in-flight operation
+        ↓
+atomic admission
+```
+
+После этого revoke разделяется правильно:
+
+```text
+new effect
+    → forbidden
+
+already admitted effect
+    → follows explicit effect lifecycle
+
+publication
+    → separate decision where applicable
+```
+
+Это намного зрелее простой capability-check модели.
+
+Я бы назвал это переходом от:
+
+> access-control capability
+
+к:
+
+> **effect-admission capability system**.
+
+Это одна из наиболее оригинальных частей SingCap-M.
+
+---
+
+# 4. Особенно хорошо это состыковано с HybridCPU
+
+Здесь SingNextOS и HybridCPU начинают выглядеть действительно как единый архитектурный стек.
+
+Получается:
+
+```text
+Sing capability
+       │
+       ▼
+OperationAuthorityLease
+       │
+       ▼
+Region / Session / Resource state
+       │
+       ▼
+SingNext external-operation admission
+       │
+       ▼
+HybridCPU CPU guard
+       │
+       +
+HybridCPU provider admission
+       │
+       ▼
+execution
+       │
+       ▼
+DeviceComplete
+       │
+       ▼
+Visible
+       │
+       ▼
+provider publication evidence
+       │
+       +
+SingNext publication decision
+       │
+       ▼
+Release / Region reclaim
+```
+
+И план совершенно правильно сохраняет:
+
+```text
+HybridCPU receipt != SingNext capability
+
+CPU guard != OS authority
+
+provider admission != OS authority
+
+completion != publication
+
+publication != release
+
+release != Region reuse
+```
+
+Это очень сильная часть проекта.
+
+### Оценка HybridCPU alignment: **9.5/10**
+
+Особенно хорош P12: он не пытается протащить HybridCPU domain/tag/token наверх как capability.
+
+---
+
+# 5. Single Authority Ledger — правильно, но название немного обманчиво
+
+План говорит:
+
+> one local capability ledger
+
+Это хорошо.
+
+Но в системе всё равно существуют разные authoritative state machines:
+
+```text
+CapabilityAuthority
+RegionAuthority
+EndpointSessionRegistry
+Sealed-object table
+ExternalOperationAuthority
+Service lifecycle
+Provider lifecycle
+```
+
+И это **правильно**.
+
+Не надо пытаться собрать всё в одну гигантскую таблицу.
+
+Истина скорее такая:
+
+```text
+ONE capability ledger
+
+but
+
+MULTIPLE orthogonal authoritative state machines
+```
+
+Например:
+
+```text
+CapabilityAuthority
+    owns permission
+
+RegionAuthority
+    owns memory ownership/use
+
+EndpointSession
+    owns invocation/session lifecycle
+
+ExternalOperationAuthority
+    owns external effect lifecycle
+```
+
+Это намного лучше, чем universal object manager.
+
+---
+
+# 6. Но здесь находится главный нерешённый вопрос плана
+
+Проблема возникает, когда одна операция зависит от **нескольких** authority state machines.
+
+Например:
+
+```text
+WriteFile(
+    FileCapability,
+    SealedFileHandle,
+    Region,
+    EndpointSession)
+```
+
+Для разрешения эффекта одновременно нужны:
+
+```text
+CapabilityAuthority == valid
+
+Sealed object == current
+
+Session == current
+
+Region == current/use allowed
+
+ProcessGeneration == current
+```
+
+В плане `AcquireOperationAuthority` линейризуется под capability-ledger gate.
+
+Но остальные истины принадлежат другим registries.
+
+И появляется race:
+
+```text
+Capability gate:
+    capability valid
+    resourceGeneration snapshot = 42
+        ↓
+
+RegionAuthority:
+    region transferred / generation -> 43
+        ↓
+
+OperationAuthorityLease created
+        ↓
+
+effect?
+```
+
+Сам по себе capability lock эту гонку не устраняет.
+
+Это **самая важная архитектурная дыра, которую я вижу в плане**.
+
+Не в текущем коде даже — именно в specification boundary.
+
+---
+
+# 7. Нужна модель cross-authority admission
+
+Я бы не стал делать один глобальный lock.
+
+Это убьёт scaling и создаст lock inversion с provider paths.
+
+Нужна модель примерно:
+
+```text
+1. Resolve subject/session
+2. Acquire capability operation lease
+3. Acquire exact resource-use pin
+4. Bind session generation
+5. Bind resource generation
+6. Construct immutable EffectAdmissionSnapshot
+7. final revalidation / commit admission
+8. release authority locks
+9. call provider
+```
+
+Например:
+
+```text
+EffectAdmission
+{
+    OperationLeaseId
+
+    CapabilityLineageEpoch
+
+    SubjectGeneration
+
+    SessionId
+    SessionGeneration
+
+    RegionUseHandle
+    RegionGeneration
+    MutationEpoch
+
+    ResourceGeneration
+
+    ProviderGenerationSnapshot
+}
+```
+
+После этого каждый authoritative subsystem не теряет ownership своей истины.
+
+Важно:
+
+```text
+OperationAuthorityLease
+    не должен копировать authority из RegionAuthority.
+
+Он должен pin/bind её.
+```
+
+Иначе опять получится второй ledger.
+
+---
+
+# 8. Поэтому я бы добавил ещё один фундаментальный invariant
+
+В текущую spec:
+
+```text
+No effect may begin solely from a capability-ledger decision
+when the effect depends on another authoritative state machine.
+```
+
+Или формально:
+
+```text
+EffectAllowed =
+    CapabilityAdmission
+  ∧ SubjectCurrent
+  ∧ SessionCurrent
+  ∧ ResourceCurrent
+  ∧ RegionUseCurrent
+  ∧ ProviderAdmission
+```
+
+Причём все snapshots должны принадлежать **одному admission attempt**.
+
+Это должно стать чем-то вроде:
+
+```text
+REV-008 — cross-authority effect snapshot
+```
+
+---
+
+# 9. Вторая серьёзная проблема — что именно такое `SealedHandle`
+
+Software sealing сам по себе очень хороший ход.
+
+Например:
+
+```csharp
+SealedHandle<SocketSeal>
+```
+
+вместо публичного:
+
+```text
+SocketObjectId = 713
+```
+
+с generic resolver.
+
+Отлично.
+
+И хорошо, что запрещается:
+
+```csharp
+Resolve<T>(anything)
+```
+
+а unseal делается только operation-specific trusted sentry.
+
+Но в документации есть небольшое архитектурное противоречие.
+
+С одной стороны:
+
+```text
+CapabilityAuthority = only capability ledger
+```
+
+С другой:
+
+Phase 11 хочет иногда заменить:
+
+```text
+FileObjectHandle + Capability
+```
+
+одним sealed handle.
+
+Тогда возникает вопрос:
+
+> sealed handle — identity или authority?
+
+Если:
+
+```text
+possession of SealedHandle<File>
+        =>
+may perform Read
+```
+
+то seal table фактически стал **вторым authority ledger**.
+
+---
+
+# 10. Я бы жёстко выбрал одну модель
+
+Наиболее чистый вариант:
+
+```text
+SealedHandle
+     =
+opaque service-object identity
++
+binding to exact capability lineage
+```
+
+Авторитетные rights всё равно находятся в:
+
+```text
+CapabilityAuthority
+```
+
+Service-private table хранит:
+
+```text
+token -> internal object resolver
+service incarnation
+object generation
+type
+```
+
+но не самостоятельную arbitrary rights model.
+
+То есть:
+
+```text
+Sealed handle:
+    "which object?"
+
+Capability:
+    "what may you do?"
+
+Session:
+    "in which relationship?"
+
+Region:
+    "with which memory?"
+
+Operation lease:
+    "may this exact effect start now?"
+```
+
+Это очень чистое разделение.
+
+Если хочется настоящего object-capability style, тогда тоже можно — но надо честно изменить claim:
+
+```text
+CapabilityAuthority is not the only local authority store.
+```
+
+Сейчас specification стоит между этими двумя моделями.
+
+### Это я бы исправил до P06.
+
+---
+
+# 11. Region refactoring — концептуально очень хороший
+
+Три разных generation/epoch:
+
+```text
+RegionGeneration
+BorrowGeneration
+MutationEpoch
+```
+
+— это правильное решение.
+
+Они обозначают три совершенно разные вещи:
+
+```text
+RegionGeneration
+    lifetime / ownership identity
+
+BorrowGeneration
+    exact loan instance
+
+MutationEpoch
+    content/coherence version
+```
+
+Особенно хорошо, что spec запрещает использовать `MutationEpoch` как generic lifetime generation.
+
+Это частая архитектурная ошибка.
+
+---
+
+# 12. MOVE спроектирован правильно
+
+Хороший invariant:
+
+```text
+MOVE != delegate
+```
+
+MOVE означает:
+
+```text
+Owner A, generation N
+        ↓
+atomic transition
+        ↓
+Owner B, generation N+1
+```
+
+а старый managed object становится логически invalid:
+
+```text
+CLR object still exists
+        ≠
+authority still exists
+```
+
+Это одна из наиболее сильных идей SingNextOS вообще.
+
+---
+
+# 13. Но текущий RegionAuthority показывает серьёзную implementation-задачу
+
+На закреплённом baseline `CapabilityAuthority` имеет `_gate`.
+
+Но `RegionAuthority`, который я посмотрел, собственной аналогичной синхронизации не имеет.
+
+При этом он изменяет:
+
+```text
+_regions
+RegionRecord.Generation
+Owner
+BorrowGeneration
+Borrower
+State
+MutationEpoch
+Uses
+backing state
+```
+
+а `RuntimeKernel.Regions` вызывает эти методы непосредственно.
+
+То есть текущему коду **нельзя автоматически приписывать linearizable concurrent Region semantics**.
+
+Plan об этом косвенно знает — в P07 есть:
+
+```text
+double MOVE with barriers => one winner
+read/write conflicts
+pool reuse
+async lease
+```
+
+Но я бы сделал synchronization model explicit requirement P07, а не просто test requirement.
+
+Например:
+
+```text
+REG-010
+
+Every Region state transition has one documented
+linearization domain.
+
+Implement as:
+  per-region lock
+or
+  lock striping
+or
+  validated atomic state machine.
+
+No Region operation relies on caller serialization.
+```
+
+Это важно.
+
+---
+
+# 14. Я бы предпочёл per-region locking, а не global Region lock
+
+Потому что операции над:
+
+```text
+Region A
+```
+
+и:
+
+```text
+Region B
+```
+
+обычно независимы.
+
+Модель:
+
+```text
+RegionId → RegionRecord
+               │
+               └── gate
+```
+
+позволит:
+
+```text
+MOVE(A)
+MOVE(B)
+```
+
+выполняться параллельно.
+
+Но multi-region operation уже требует deterministic ordering:
+
+```text
+lock region min(id)
+lock region max(id)
+```
+
+или admission/pinning protocol.
+
+Особенно это станет важно для:
+
+```text
+DSC Add(A,B,C)
+FMA(A,B,C,D)
+DMA Copy(src,dst)
+```
+
+---
+
+# 15. Третья сильнейшая часть плана — cancellation semantics
+
+В plan явно запрещено:
+
+```text
+Cancel requested
+      =>
+memory may be reused
+```
+
+Правильно:
+
+```text
+Cancel requested
+
+≠ provider cancelled
+≠ effect didn't happen
+≠ provider closed
+≠ Region safe to reuse
+```
+
+При ambiguous cancellation:
+
+```text
+quarantine
+```
+
+Это очень правильное решение для:
+
+* DMA;
+* storage;
+* accelerators;
+* network;
+* device operations.
+
+В обычных API cancellation слишком часто означает только:
+
+> caller больше не ждёт.
+
+SingNextOS моделирует это значительно точнее.
+
+### Effect lifecycle design: **9.5/10**
+
+---
+
+# 16. Но revoke semantics нужно сделать ещё более формальным
+
+Сейчас написано примерно:
+
+```text
+already admitted effect follows operation/cancellation policy
+publication separately revalidated where required
+```
+
+Фраза `where required` слишком слабая для security spec.
+
+Для каждого effect class должна существовать таблица:
+
+| Effect            | revoke after Admit | revoke after Submit   | revoke before Publish      |
+| ----------------- | ------------------ | --------------------- | -------------------------- |
+| staged compute    | no new submit      | try cancel            | publication may be denied  |
+| network send      | no new send        | irreversible possible | no fake rollback           |
+| file write        | no new write       | provider-specific     | maybe already durable      |
+| staged DMA output | cancel/contain     | quarantine            | deny publish when possible |
+
+Иначе разные services реализуют revoke по-разному.
+
+Я бы ввёл:
+
+```text
+EffectRevocationPolicy
+```
+
+например:
+
+```text
+AdmissionOnly
+
+CancelIfPossible
+
+PublicationRevocable
+
+GrandfatherAdmitted
+```
+
+Не как user-selectable flag, а как статическое свойство operation class.
+
+---
+
+# 17. Constraint algebra сделана очень хорошо
+
+Мне нравится, что план не делает:
+
+```text
+Dictionary<string,string> constraints
+```
+
+как ядро безопасности.
+
+А требует типизированные:
+
+```text
+RightsConstraint
+ResourceConstraint
+RangeConstraint
+OperationSetConstraint
+LifetimeConstraint
+TargetSubjectConstraint
+SessionConstraint
+DelegationDepthConstraint
+QuotaConstraint
+```
+
+И главное:
+
+```text
+IsSubset(child,parent)
+```
+
+Это правильная формализация delegation.
+
+Основной invariant:
+
+```text
+Authority(child) ⊆ Authority(parent)
+```
+
+---
+
+# 18. Особенно правильно запрещена sibling union amplification
+
+Представим:
+
+```text
+Cap A = bytes [0..100]
+
+Cap B = bytes [100..200]
+```
+
+Untrusted code не должно иметь:
+
+```text
+Union(A,B)
+    ↓
+[0..200]
+```
+
+просто потому, что оно владеет двумя sibling caps.
+
+Это тонкий, но важный момент.
+
+---
+
+# 19. Shared quota account — хороший выбор для v1
+
+ADR выбрал:
+
+```text
+root
+ ├─ child A ─┐
+ ├─ child B ─┼── SharedQuotaAccount
+ └─ child C ─┘
+```
+
+вместо:
+
+```text
+root=100
+child A=100
+child B=100
+child C=100
+```
+
+что позволяло бы получить 300 authority из 100.
+
+Это архитектурно верно.
+
+Но есть производственный trade-off:
+
+```text
+shared atomic quota
+        ↓
+contention hotspot
+```
+
+Особенно если capability применяется на каждом SIP call.
+
+---
+
+# 20. Performance risk №1 — один global capability gate
+
+Сегодня `CapabilityAuthority` имеет:
+
+```csharp
+private readonly object _gate
+```
+
+и все mint/delegate/validate/revoke работают через него.
+
+P04 добавит сюда:
+
+```text
+AcquireOperationAuthority
+revocation graph
+quota
+one-shot
+constraints
+```
+
+Если весь system effect admission будет проходить через один global `_gate`, throughput может быстро стать bottleneck.
+
+Даже если lookup:
+
+```text
+O(1)
+```
+
+lock contention может сделать фактическую стоимость:
+
+```text
+O(number of contenders)
+```
+
+по latency.
+
+---
+
+# 21. В P13 не хватает scaling benchmark
+
+Сейчас performance matrix хорошая:
+
+```text
+cap lookup
+SIP empty call
+SIP N capabilities
+seal/unseal
+borrow
+MOVE
+external operation
+```
+
+Но надо добавить:
+
+```text
+1 concurrent thread
+2
+4
+8
+16
+32
+```
+
+и измерять:
+
+```text
+throughput
+median
+p95
+p99
+max lock wait
+```
+
+Особенно при:
+
+```text
+Validate/AcquireOperationAuthority
+
+unrelated capabilities
+unrelated subjects
+```
+
+Если две совершенно независимые SIP операции сериализуются через global lock — это станет заметно сразу.
+
+### Performance architecture сейчас: **~7/10**
+
+Correctness-first подход хороший, но scaling strategy пока не определена.
+
+---
+
+# 22. Хорошая эволюция после v1
+
+Не начинать сразу с lock-free структуры.
+
+Сначала:
+
+```text
+single gate
++ prove semantics
+```
+
+После qualification:
+
+```text
+sharded ledger
+or
+per-record synchronization
+or
+immutable record + revocation epochs + atomic state
+```
+
+при сохранении **той же formal semantics**.
+
+Это намного разумнее, чем сразу делать lock-free capability system.
+
+---
+
+# 23. ManagedCap — самая рискованная часть всего проекта
+
+Идея правильная:
+
+```text
+source analyzer
++
+post-build IL verification
++
+dependency closure
++
+native asset closure
++
+NativeAOT evidence
++
+runtime checks
+```
+
+Особенно правильно:
+
+> source analyzer is not security proof.
+
+Потому что attacker может предоставить уже собранную assembly.
+
+Полный module scan для v1 тоже разумен.
+
+---
+
+# 24. Но blacklist по BCL недостаточно силён
+
+Сейчас направление P09 примерно:
+
+```text
+forbid:
+Unsafe
+Marshal
+NativeMemory
+Reflection.Emit
+Assembly.Load
+P/Invoke
+calli
+dangerous reflection
+host FS/network/process
+...
+```
+
+Проблема .NET — поверхность огромна.
+
+Каждая новая версия BCL может добавить другой путь к:
+
+```text
+native pointer
+
+reflection
+
+dynamic code
+
+ambient host resource
+
+runtime loading
+
+object graph escape
+```
+
+Поэтому denylist будет постоянно догонять платформу.
+
+---
+
+# 25. Для действительно сильного ManagedCap я бы добавил positive capability-safe BCL
+
+То есть не только:
+
+```text
+deny dangerous API
+```
+
+но и:
+
+```text
+ManagedCap reference surface
+        =
+explicit allowed framework surface
+```
+
+Концептуально:
+
+```text
+SingPlus.Managed.Profile
+
+allowed:
+ System.Int32
+ Span<T>
+ ReadOnlySpan<T>
+ ValueTask
+ selected collections
+ selected numerics
+ ...
+
+not present:
+ System.IO
+ System.Net
+ Process
+ Reflection
+ Runtime.InteropServices
+ AssemblyLoadContext
+ ...
+```
+
+Тогда AdmissionVerifier становится:
+
+```text
+positive contract
++
+negative verifier
+```
+
+а не только growing blacklist.
+
+Это значительно сильнее.
+
+---
+
+# 26. Особенно важно для future .NET versions
+
+План правильно делает:
+
+```text
+SDK/runtime/compiler version drift
+        =>
+requalification
+```
+
+Но allowlist дополнительно уменьшает риск:
+
+```text
+new BCL API
+automatically accessible
+```
+
+Принцип лучше:
+
+```text
+new API is denied until classified
+```
+
+чем:
+
+```text
+new API is allowed until somebody notices it is dangerous
+```
+
+Это почти идеальный fail-closed подход для ManagedCap.
+
+---
+
+# 27. NativeAOT используется правильно
+
+Мне нравится, что план не говорит:
+
+```text
+NativeAOT == security
+```
+
+Он говорит:
+
+```text
+NativeAOT =
+closed-world evidence
++
+attack-surface reduction
+```
+
+Authority всё равно runtime-owned.
+
+Это правильная трактовка.
+
+Точно так же C# 15 memory safety improvements не считаются security proof.
+
+---
+
+# 28. SIP sentries — очень сильная идея
+
+Архитектура:
+
+```text
+caller
+  ↓
+generated sentry
+  ↓
+exact InvocationAuthorityContext
+  ↓
+service implementation
+```
+
+где service получает не:
+
+```text
+all capabilities of process
+```
+
+а:
+
+```text
+only capability projection required for this method
+```
+
+очень хороша.
+
+Например вместо:
+
+```csharp
+context.GetCapability(id)
+```
+
+генерируется что-то вроде:
+
+```text
+WriteFileInvocationAuthority
+    FileObject
+    DestinationRange
+```
+
+Это значительно уменьшает confused-deputy surface.
+
+---
+
+# 29. Запрет ambient authority — один из лучших пунктов плана
+
+Правильно запрещаются:
+
+```text
+ServiceLocator.Current
+
+AsyncLocal<AuthorityContext>
+
+GlobalCapabilityManager
+
+process-wide enumerable capability collections
+```
+
+Потому что иначе explicit capability system быстро превращается обратно в:
+
+```text
+call global service
+```
+
+и architecture теряет смысл.
+
+### SIP/security-transition design: **9/10**
+
+---
+
+# 30. Deep-value validation тоже очень важна
+
+Правильное наблюдение:
+
+```csharp
+record Foo(List<Bar> Items)
+```
+
+не является immutable trust-boundary object только потому, что это `record`.
+
+То же самое:
+
+```text
+readonly
+init
+```
+
+не гарантирует immutable reachable graph.
+
+План требует рекурсивную schema closure.
+
+Это правильно.
+
+Но я бы сделал policy строго allowlist-based:
+
+```text
+Primitive
+Enum
+BoundedString
+BoundedBytes
+GeneratedValueRecord
+BoundedImmutableVector<T>
+ExplicitHandle
+```
+
+А не пытался определять «кажется immutable».
+
+---
+
+# 31. Один очень важный принцип: CLR object graph = authority
+
+Этот пункт в плане заслуживает отдельного внимания:
+
+> mutable raw CLR reference cannot cross ManagedCap boundary.
+
+Это очень сильная концепция.
+
+Потому что reference на объект фактически даёт:
+
+```text
+reachable object graph
+```
+
+а значит implicit capabilities.
+
+То есть вместо:
+
+```text
+serviceA.Object -> objectB -> objectC -> hostResource
+```
+
+граница заставляет делать:
+
+```text
+value copy
+or
+sealed handle
+or
+Region
+or
+explicit capability
+```
+
+Это реально приближает managed runtime к object-capability discipline.
+
+---
+
+# 32. Service migration план хороший
+
+Особенно правильно разделено:
+
+```text
+ProcessHandle = identity
+
+ProcessControlCapability = authority
+```
+
+Потому что одна из типичных ошибок:
+
+```text
+I know PID
+    =>
+I can kill/debug/process-control
+```
+
+SingCap это запрещает архитектурно.
+
+То же самое file/socket objects.
+
+---
+
+# 33. P11 confused-deputy checklist очень удачный
+
+Для каждого метода спрашивается:
+
+```text
+who is caller?
+
+what exact resource?
+
+which authority?
+
+which target subject?
+
+does delegation happen?
+
+does external effect happen?
+
+does ownership change?
+
+what closes it on failure?
+```
+
+Это я бы вообще сделал обязательной автоматически генерируемой частью API review.
+
+---
+
+# 34. Supply-chain часть плана сильнее обычного OS research prototype
+
+Особенно мне нравится, что:
+
+```text
+package version 1.14.0
+```
+
+не считается достаточным identity.
+
+Фиксируются:
+
+```text
+package ID
+version
+SHA-256
+source commit
+schema version
+SDK/runtime/compiler
+AdmissionVerifier policy digest
+```
+
+Это правильно.
+
+Потому что:
+
+```text
+same SemVer != same binary
+```
+
+И в HybridCPU как раз обнаружен такой практически важный случай: source evolved при том же package version.
+
+### Evidence/supply-chain discipline: **9.5/10**
+
+---
+
+# 35. Claim levels — тоже очень удачное решение
+
+```text
+ModelOnly
+StaticAdmission
+RuntimeEnforced
+QualifiedManaged
+ProductionCandidate
+```
+
+Это хорошая научная дисциплина.
+
+Особенно правило:
+
+> соседняя subsystem не повышает автоматически claim level другой subsystem.
+
+Например:
+
+```text
+AOT works
+```
+
+не означает:
+
+```text
+ManagedCap is secure
+```
+
+и:
+
+```text
+provider receipt exists
+```
+
+не означает:
+
+```text
+external operation is safely published
+```
+
+Это очень сильная сторона документации SingNext/HybridCPU вообще.
+
+---
+
+# 36. Текущая maturity: важно не путать plan и implementation
+
+В архиве implementation evidence есть для:
+
+```text
+P00
+P01
+```
+
+Но P02+ — пока roadmap/spec.
+
+То есть нельзя сказать:
+
+> SingCap-M уже реализован.
+
+Реальная ситуация примерно:
+
+```text
+existing SingNext foundation
+        ████████████████
+
+SingCap architectural specification
+        ████████████████████
+
+actual SingCap-M-specific implementation
+        ███░░░░░░░░░░░░░░░░
+```
+
+P00/P01 в основном:
+
+* architecture freeze;
+* source pinning;
+* toolchain classification;
+* profile inventory;
+* AOT qualification skeleton.
+
+Основные новые security semantics начинаются в **P02–P09**.
+
+---
+
+# 37. Что бы я изменил в ordering
+
+В основном порядок фаз хороший:
+
+```text
+ledger
+ → constraints
+ → revocation/effect lease
+ → public V2
+ → sealing/regions
+ → SIP
+ → ManagedCap
+ → manifest
+ → services
+ → HybridCPU
+ → qualification
+```
+
+Это правильнее, чем сначала выпускать красивый API.
+
+Но dependency graph имеет маленькую логическую неточность.
+
+P08 использует:
+
+```text
+sealed handle validation
+```
+
+следовательно он зависит от P06.
+
+И использует Region state из P07.
+
+Получается реально:
+
+```text
+       P06 sealing
+      /
+P05
+      \
+       P07 Regions
+        \ /
+         P08
+```
+
+а не просто P08 после P07.
+
+Это мелочь, но для roadmap стоит исправить.
+
+---
+
+# 38. Я бы добавил отдельную фазу или ADR: Authority Composition
+
+Сейчас самые сложные вопросы разбросаны между P04/P07/P08/P12.
+
+Я бы оформил самостоятельный cross-cutting contract:
+
+```text
+Authority Composition Protocol
+```
+
+где были бы определены:
+
+```text
+CapabilityAuthority
+SessionAuthority
+RegionAuthority
+SealedObjectAuthority
+ExternalOperationAuthority
+ProviderAuthority
+```
+
+и правила:
+
+```text
+who snapshots whom
+
+who pins whom
+
+lock ordering
+
+linearization point
+
+generation binding
+
+release ordering
+
+rollback/compensation
+
+provider-call boundaries
+```
+
+Это стало бы центральным formal bridge системы.
+
+---
+
+# 39. Я бы особенно зафиксировал правило lock/provider calls
+
+Никогда:
+
+```text
+lock capability
+  lock region
+    call provider
+```
+
+Иначе можно получить:
+
+```text
+provider callback
+   ↓
+RuntimeKernel
+   ↓
+needs capability lock
+```
+
+и deadlock.
+
+Нужна discipline:
+
+```text
+under authoritative locks:
+    validate
+    acquire pins/leases
+    record admitted state
+
+release locks
+
+call provider
+
+later:
+    correlate exact completion
+    re-enter authoritative state machines
+```
+
+HybridCPU/external-operation модель уже очень близка к этому.
+
+Стоит распространить правило на SingCap-M целиком.
+
+---
+
+# 40. Особенно это важно из-за текущего HybridCPU adapter
+
+Там уже есть собственный:
+
+```text
+gate
+```
+
+и при разных переходах вызывается RuntimeKernel.
+
+После добавления capability/Region/session leases количество nested state machines увеличится.
+
+Поэтому P04/P12 должны иметь formal lock-order audit, а не только race tests.
+
+---
+
+# 41. Я бы усилил P13 ещё тремя классами тестов
+
+Существующая qualification matrix хороша, но особенно нужны:
+
+```text
+deadlock / lock-order stress
+
+high-concurrency unrelated-capability scaling
+
+cross-authority generation races
+```
+
+Например:
+
+```text
+AcquireOperationAuthority
+vs Region MOVE
+
+AcquireOperationAuthority
+vs session close
+
+seal validation
+vs service restart
+
+publication
+vs capability revoke
+
+publication
+vs Region reclaim
+
+provider completion
+vs service restart
+```
+
+Последние несколько частично есть, но их надо рассматривать именно как cross-ledger atomicity tests.
+
+---
+
+# 42. Моя оценка по направлениям
+
+| Область                         |     Оценка | Комментарий                                                                |
+| ------------------------------- | ---------: | -------------------------------------------------------------------------- |
+| Архитектурная цельность         |   **9/10** | Очень последовательная authority philosophy                                |
+| Single-ledger design            |   **9/10** | Правильная миграция V1→V2 без parallel capability DB                       |
+| Revocation/effect admission     | **9.5/10** | Один из лучших элементов плана                                             |
+| Constraint algebra              |   **9/10** | Хорошая монотонная модель                                                  |
+| Region/ownership model          | **8.5/10** | Сильная семантика, но concurrency implementation надо формализовать        |
+| Software sealing                | **7.5/10** | Хорошая идея, но надо жёстко определить identity vs authority              |
+| SIP sentry model                |   **9/10** | Exact projection и no ambient authority очень сильны                       |
+| ManagedCap/.NET isolation       |   **7/10** | Наиболее сложная/рискованная часть; нужен positive safe-BCL profile        |
+| External effects                | **9.5/10** | Completion/visibility/publication/release разделены правильно              |
+| HybridCPU integration           | **9.5/10** | Authority inversion хорошо предотвращена                                   |
+| Supply-chain/evidence           | **9.5/10** | Необычно строгий уровень для research OS                                   |
+| Performance strategy            |   **7/10** | O(1) есть, но contention/scaling пока недостаточно определены              |
+| Current implementation maturity |  **~4/10** | Сильный baseline существует, но основная SingCap-M работа P02+ ещё впереди |
+| Production readiness сейчас     |  **~3/10** | Пока точно не ProductionCandidate                                          |
+
+---
+
+# 43. Итоговая архитектурная оценка
+
+**План я считаю правильным направлением развития SingNextOS.**
+
+Причём самое ценное в нём — он не пытается «добавить capabilities» к ОС.
+
+Он переделывает модель в:
+
+```text
+identity
+    ≠ authority
+
+descriptor
+    ≠ authority
+
+manifest
+    ≠ authority
+
+handle
+    ≠ authoritative state
+
+validation
+    ≠ effect admission
+
+effect completion
+    ≠ publication
+
+publication
+    ≠ resource release
+
+resource release
+    ≠ physical confidentiality cleanup
+
+provider admission
+    ≠ OS authority
+```
+
+А положительная модель становится:
+
+```text
+explicit intent
+        ↓
+opaque capability
+        ↓
+live authoritative record
+        ↓
+monotonic constraints
+        ↓
+current subject/resource/session generations
+        ↓
+exact operation admission
+        ↓
+resource-use pin
+        ↓
+effect execution
+        ↓
+completion / visibility
+        ↓
+publication
+        ↓
+closure
+        ↓
+reclaim
+```
+
+Это уже не обычная ACL/capability system.
+
+Это **lifecycle-aware authority architecture**.
+
+---
+
+# 44. Самая важная рекомендация
+
+Если сейчас выбирать **одну вещь**, которую надо формально закрыть до реализации P04–P08, я бы выбрал не новый API и не новый тип capability.
+
+Я бы зафиксировал:
+
+> **Cross-authority linearization model.**
+
+То есть доказать, что:
+
+```text
+CapabilityAuthority
+RegionAuthority
+EndpointSession
+Sealed object state
+ProcessGeneration
+ExternalOperationAuthority
+```
+
+могут вместе принять **один effect**, не создавая TOCTOU между своими независимыми state machines.
+
+Именно это отделит красивую capability-модель от действительно сильной OS authority architecture.
+
+Если этот слой будет сделан правильно, я бы поднял архитектурную оценку SingCap-M примерно с **8.7 до 9.3/10**. Главные оставшиеся риски тогда будут уже не концептуальные, а инженерные: .NET closed-world enforcement и производительность authority fast path.

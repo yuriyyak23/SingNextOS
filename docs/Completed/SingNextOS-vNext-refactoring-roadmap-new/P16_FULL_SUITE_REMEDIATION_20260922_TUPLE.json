@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "phase": "P16",
+  "phaseDisposition": "Open",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "executionHead": "1890a8e921cfe903b5b44857e4661168bf7bbceb",
+  "runtimeContour": "Windows-x64/.NET-11.0.0-preview/Debug/JIT-host/full-non-GUI",
+  "claim": "StaticAdmission",
+  "productionQualified": false,
+  "enabledFeatureGates": [],
+  "isaChangeCategory": [],
+  "artifacts": [
+    {
+      "path": "eng/singcap-security-profiles-v1.json",
+      "bytes": 5485,
+      "sha256": "c7d2fca67fd92602c0847dfc22850fd6ceb423c81b81b2f4cf3cd8d9db63be35"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Architecture/HybridBootQualificationMatrixTests.cs",
+      "bytes": 2409,
+      "sha256": "c28c601635b993337f498fa9a345289b2d135f6237bbf1a1d7152ae3ab304f73"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Architecture/SingCapPhase11MigrationReviewTests.cs",
+      "bytes": 2042,
+      "sha256": "e5faaf752280f6e95423a1f68b63465558e656e9848c57810e1991228685912c"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Architecture/SingCapPhase12ProviderMappingTests.cs",
+      "bytes": 1833,
+      "sha256": "460fe6f71c4245a802bdb72a10a27fb234c9d429f594cb6f9963008a53894561"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Architecture/SingCapPhase13ClosureTests.cs",
+      "bytes": 6318,
+      "sha256": "91f96c1ddffebf707e6b204fb897f99db095296705cfc79e23596855ccc48953"
+    },
+    {
+      "path": "tests/SingPlus.Tests/SipJobs/Phase148QualificationClosureTests.cs",
+      "bytes": 5907,
+      "sha256": "fd553bb7e2ab32fd5bc7f325a83f66cc626aec8894a8c5765953e1684efaa14c"
+    },
+    {
+      "path": "tests/SingPlus.Tests/Architecture/VNextPhase16FullSuiteRemediationTests.cs",
+      "bytes": 1474,
+      "sha256": "647629b978364b6003447ca31144757007ea0a87bbe81aa522b846d0a13a8e76"
+    }
+  ],
+  "fullNonGuiResult": {
+    "passed": 1703,
+    "failed": 0,
+    "skipped": 2
+  },
+  "exclusions": [
+    "completed-roadmap mutable build-output hashes are historical and not re-derived",
+    "no provider or controlled-SMT qualification",
+    "no durable cold restart or live gate rollback",
+    "no ProductionQualified claim"
+  ]
+}

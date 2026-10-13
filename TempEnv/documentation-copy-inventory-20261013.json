@@ -1,0 +1,1306 @@
+[
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-modernize",
+    "Name": "00-README.md",
+    "Length": 2541,
+    "Modified": "2026-10-09T21:38:26",
+    "Hash": "1581FF7CEAC03F5DFBA16A07B32B9A02ADD3E533761F625F541873CD0F9EAD43"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-modernize",
+    "Name": "01-STATE-AND-BACKLOG.md",
+    "Length": 16149,
+    "Modified": "2026-10-13T16:45:42",
+    "Hash": "65CA7D14DBA9FE087F7E76EBDB9B734C949C3C4E4B81ABE155C14CD2B231AC9E"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-modernize",
+    "Name": "02-IMPLEMENTATION-ORDER.md",
+    "Length": 3499,
+    "Modified": "2026-10-08T16:51:33",
+    "Hash": "825FD32692969C34997800504C251A4851718376A2897B47F7ED64263F9B66E3"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-modernize",
+    "Name": "03-DEV-VALIDATION.md",
+    "Length": 10192,
+    "Modified": "2026-10-08T16:51:33",
+    "Hash": "5670595FAFBBA9E8D878C45FE22286D71350768F4CC2850AE566DC60262DEFB7"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-modernize",
+    "Name": "04-BLOCKERS-REPORT.md",
+    "Length": 16395,
+    "Modified": "2026-10-09T22:39:26",
+    "Hash": "31025834397D2FE31D7BEC0648FBE044C2849B176A34ABC40CDA82DD5CBB5FE7"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-modernize",
+    "Name": "04-ROOT-CONTINUATION-PROMPT.md",
+    "Length": 16780,
+    "Modified": "2026-10-09T22:51:17",
+    "Hash": "D766A3B664A636D83377E51858A4EA8A2342161F91888A5E2997F95F8C93CA3E"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "00-README.md",
+    "Length": 2004,
+    "Modified": "2026-10-09T03:16:12",
+    "Hash": "EC6401E62991537957689FEC1EBCC8D211CEB48F1B8095606C661A64CE3778FB"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "01-TECHNICAL-SPECIFICATION.md",
+    "Length": 9978,
+    "Modified": "2026-10-07T15:39:50",
+    "Hash": "08C2783CBBC3DE020821AA7A3A963F71CC89FE48AD2BB1BB9D5FAEB077097E35"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "02-AUTHORITY-OWNER-MAP.md",
+    "Length": 6516,
+    "Modified": "2026-10-07T15:39:50",
+    "Hash": "BE0318A72BF7F02870F468B14F5479945A5AAEBB58C6BC9DE708FFD3795EF0BC"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "03-PHASE-DAG-AND-MIGRATION.md",
+    "Length": 4666,
+    "Modified": "2026-10-07T15:43:51",
+    "Hash": "9D9D6062329C31FFF39C1F25A51FE5CD0C0DE2D1CC6C53C7A9DCB2F68B169EC5"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "04-NORMATIVE-INVARIANTS.md",
+    "Length": 4345,
+    "Modified": "2026-10-07T15:41:37",
+    "Hash": "BCEEF97410A5C0796991C7543E41651ACA87CA8AF1AF9655C82AE4309A588E49"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "05-FEATURE-GATES-AND-CLAIMS.md",
+    "Length": 4152,
+    "Modified": "2026-10-09T21:38:26",
+    "Hash": "322DFE988CB1D394CF715E73001B2A75D9202D971208C456C72231F13B62E5F5"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "06-BASELINE-FREEZE.md",
+    "Length": 1652,
+    "Modified": "2026-10-09T03:16:12",
+    "Hash": "552EBF8F63E2C61341FEB2D3E400CD5C7C822EF32C3FCEC2D4F497DCB01F6231"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "07-GLOBAL-CONTRACT-EVOLUTION.md",
+    "Length": 3688,
+    "Modified": "2026-10-07T15:40:59",
+    "Hash": "0DB9A9E1896FA25BDD7525BA884438F52FF7336FC75CD12A7295B0DE654166C0"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "08-FORMAL-SEMANTICS-CORE.md",
+    "Length": 3561,
+    "Modified": "2026-10-07T15:39:50",
+    "Hash": "5DF0240BC1F895422F6DA03DC1FC7C5312C09BC5B002E1BD3B4331B650CACDC4"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "09-AUDIT-CORRECTION-LOG.md",
+    "Length": 2279,
+    "Modified": "2026-09-24T00:17:54",
+    "Hash": "C218A77D0DEE40E0B26CFD5D568C5B4CD6CF69F376692E9BA3527530593FAD51"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "10-P01-UNIFIED-MEMORY-SEMANTICS.md",
+    "Length": 5327,
+    "Modified": "2026-10-07T15:43:50",
+    "Hash": "D90ABA8155C1799CC7EE8CCC0BF8EB340B95BD0FA6858E7A4ECF3380DD698547"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "11-P02-DURABILITY-PERSISTENT-MEMORY.md",
+    "Length": 4471,
+    "Modified": "2026-10-07T15:43:50",
+    "Hash": "EE183F23E38C2ACAB5AD8FAA4CDA239D6DA4BDC7E70CE7CD89F4A87AEDFAF10C"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "12-P03-TEMPORAL-EXECUTION-CONTRACTS.md",
+    "Length": 4504,
+    "Modified": "2026-10-07T15:43:50",
+    "Hash": "D9B4E46D8E4BA6E0280736ACDA9BA9B343BCEB47080C2EB9E80CBB30E4B3EF4A"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "13-P04-TRANSLATION-DMA-AUTHORITY.md",
+    "Length": 5035,
+    "Modified": "2026-10-07T15:43:50",
+    "Hash": "BAE2B76458DF9F0DA5E920A797F708B9FB5648BBCD0E6A893D981C7B2F55B58E"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "14-P05-MACHINE-CHECKABLE-REFINEMENT.md",
+    "Length": 4635,
+    "Modified": "2026-10-07T15:43:50",
+    "Hash": "80639AAF15AFDC024FB6CE92A895B0AE8A8C92280E51012E8D587DED5F552A91"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "15-P06-INFORMATION-FLOW-CONTROL.md",
+    "Length": 4234,
+    "Modified": "2026-10-07T15:43:50",
+    "Hash": "BCF049224D0ADA7410C852BB1371839CC5E4187345D679EE34947593E403BBAF"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "16-P07-LOCALITY-DATA-MOTION.md",
+    "Length": 3812,
+    "Modified": "2026-10-07T15:43:50",
+    "Hash": "C9FA9B484F6375A2A2E02ABEBD41006AB7167A18B0E1AA0D5A5F5EF493827C63"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "17-P08-PREEMPTIBLE-HETEROGENEOUS-EXECUTION.md",
+    "Length": 4542,
+    "Modified": "2026-10-07T15:43:50",
+    "Hash": "C1E0F26E085865895242B7D1E155DDBC3338F0F1402C551A7C7B0B7047D837C2"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "18-P09-DEVICE-TRUST-ATTESTATION.md",
+    "Length": 3959,
+    "Modified": "2026-10-07T15:43:50",
+    "Hash": "23929FCA8A1DEF3FB22BB933302AF63F9F9D9BC860790E74A18377A06DB1BA08"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "19-P10-RAS-FAILURE-DOMAINS.md",
+    "Length": 4210,
+    "Modified": "2026-10-07T15:43:50",
+    "Hash": "C34AF0C07AB8721E6852B7D9F5C2742CB64977A95E8DE2D83AE56E06CB388AA2"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "20-P11-MULTIHOST-AUTHORITY-LEASES.md",
+    "Length": 4389,
+    "Modified": "2026-10-07T15:43:51",
+    "Hash": "7102A9D2F08E866FDA3D5C9D0DE912E68BD36785C7F1F52A7522B22AE2120BA2"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "21-P12-ENERGY-THERMAL-RESOURCES.md",
+    "Length": 3740,
+    "Modified": "2026-10-07T15:43:51",
+    "Hash": "24A355A4047ACA78C534C67F990504A2B9AC02B848B237A28E46B1AB8FAA7CF5"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "22-PROOF-CARRYING-LOWERING.md",
+    "Length": 5504,
+    "Modified": "2026-10-07T15:43:51",
+    "Hash": "709E2F97638F9566C78618531EB10639F811D6D11700CEC4FBC01EAA97C154C0"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "23-FIRST-QUALIFICATION-VERTICAL.md",
+    "Length": 4161,
+    "Modified": "2026-10-07T15:39:50",
+    "Hash": "BDAD5EFF63B5AE0BDCBE25B37D2D3AC58713E6528DA98475AF337DF275A141A8"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "30-CROSS-PROJECT-CONTRACTS.md",
+    "Length": 4415,
+    "Modified": "2026-10-07T15:43:51",
+    "Hash": "411407B2ACD8823FD5D851950016C9B611DDDDED326D213A0BC5C19FFC0855A8"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "31-QUALIFICATION-AND-TEST-MATRIX.md",
+    "Length": 3379,
+    "Modified": "2026-10-07T15:41:37",
+    "Hash": "242BC99CD4E77B2518D4B637CFA9EDAA80DAE1E19FC42490507A20074379CD0E"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "32-TRACEABILITY-MATRIX.md",
+    "Length": 3773,
+    "Modified": "2026-10-09T03:16:12",
+    "Hash": "2CA506858595DDFFF0E30646B68830EE4D8E8B40C014FBF69DE056B4F17E5C1F"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "33-PR-SLICING-AND-CUTOVER.md",
+    "Length": 2000,
+    "Modified": "2026-10-07T15:44:46",
+    "Hash": "FF20805D99A87566FBBFC146D1952F12764865E86F06015C9EFF013B3EF0FCF5"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "34-NON-GOALS-AND-OPEN-QUESTIONS.md",
+    "Length": 2789,
+    "Modified": "2026-10-07T15:40:59",
+    "Hash": "EA626B9CCD30F206A506A03354B13363CA0C85BBEEADFD9BC63ABF15EEDFEA09"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "35-LIVE-SOURCE-ANCHORS.md",
+    "Length": 3132,
+    "Modified": "2026-10-07T15:44:25",
+    "Hash": "A1916870FD1D4F08B451F0A844DE835A0E907CF6C3691E7FA5A171F81A76E93B"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "36-FULL-GAP-MATRIX.md",
+    "Length": 1037,
+    "Modified": "2026-10-07T15:42:41",
+    "Hash": "C6987CFE0AAF3F072A720C3DFC9582B88449E6EB5E41D9CDB1346E0F6A1BE821"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "37-CLAIM-MATRIX.md",
+    "Length": 617,
+    "Modified": "2026-10-07T15:42:41",
+    "Hash": "48D267A0FFF814E03097E2C5F5A6759B5F7B16F9088185F103871AC40FEC2E46"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "38-CROSS-PROJECT-DELTA.md",
+    "Length": 4286,
+    "Modified": "2026-10-09T03:16:12",
+    "Hash": "18F9DE08921E958EFBB9D38D5328F2E7351902C5E6B650F51809D6920FD7213A"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "39-FINAL-ARCHITECTURE-VERDICT.md",
+    "Length": 1062,
+    "Modified": "2026-10-04T20:51:34",
+    "Hash": "F1B2B8247E5E746239D8AA9FE3A791CC706DA0B25029A084AA41FD8A88CF759D"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "40-IMPLEMENTATION-ORDER.md",
+    "Length": 498,
+    "Modified": "2026-10-06T00:04:25",
+    "Hash": "C302A57774E30DDF22C7CB41644B44A0F36A2E07D747F7E9341F372AE8A87D11"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "41-CURRENT-STATE-AND-OPEN-SLICES.md",
+    "Length": 1021,
+    "Modified": "2026-10-09T21:38:26",
+    "Hash": "A173612142D913063D7EF54B5DFED38AF0F122E70C1FD2AA5564EF66C6F1DB5E"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "42-RESEARCH-DEV-VERIFICATION.md",
+    "Length": 596,
+    "Modified": "2026-10-06T00:04:24",
+    "Hash": "56E421EEC4A8DB4163E04CE329030BC92C95A86EB1388C0CBD739BDBF2730FDC"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "43-PARALLEL-WAVE-1.md",
+    "Length": 741,
+    "Modified": "2026-10-06T00:04:26",
+    "Hash": "23E9284EB6891E54FC9AC9CA7DA46979916EF84601C14000896839B3E3DCF8C1"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "45-PROOF-EVIDENCE-INDEX.md",
+    "Length": 2270,
+    "Modified": "2026-10-07T15:43:51",
+    "Hash": "7F8C47DA5C877F3F239FC7B7B9C74A88D9C7339F155FF617842A3B2024329ADC"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-001-MEMORY-ORDER-INCOMPARABILITY.md",
+    "Length": 2060,
+    "Modified": "2026-09-27T05:18:45",
+    "Hash": "10CDD6EDF459134AF42EEF541C3388BD6589900A31ACCA81D0994E85AEF7C683"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-002-RESOURCE-RESERVATION-AND-UPPER-BOUND.md",
+    "Length": 1900,
+    "Modified": "2026-10-07T15:40:59",
+    "Hash": "6E41197FE903B34A360A7A3847F9B3B24754EF0EB0F2517BE2AA29988609E019"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-003-DMA-GRANT-CLOSURE-OBSERVATION.md",
+    "Length": 3593,
+    "Modified": "2026-09-30T20:06:04",
+    "Hash": "300F9CD1FAFA9EB6FF3F8EEF62369F2924A5AC8509BFF47B2485E665A7248C4C"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-004-LATE-COMPLETION-UNDER-QUARANTINE.md",
+    "Length": 2599,
+    "Modified": "2026-10-02T02:55:42",
+    "Hash": "4BC397CE828CE1492ABF7AD415B8053C2CDBA4B724C3E20FF7C593E33DF0A18E"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-005-RESOURCE-ACCOUNTING-QUARANTINE-TRACE.md",
+    "Length": 2445,
+    "Modified": "2026-10-02T09:20:54",
+    "Hash": "A5331362F05F6E7F29BCD0DA3934665A79B1261C848A30B871E17EADE900A5CB"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-006-PRE-SUBMIT-LOCAL-RELEASE-TRACE.md",
+    "Length": 2613,
+    "Modified": "2026-10-07T15:41:00",
+    "Hash": "61730FCDB66E6588CDCFD73EDCA76B70DF2AA18946ED958FC93874D9B42AEDE7"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-007-NON-RESOURCE-LOCAL-RELEASE-TRACE.md",
+    "Length": 2858,
+    "Modified": "2026-10-07T15:41:00",
+    "Hash": "AE8E547283CF220CF27E9DA8A4F62D9C3E1FE2BA41342F6F628FD421DB3DEA06"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-008-PRE-SUBMIT-ACCOUNTING-QUARANTINE-TRACE.md",
+    "Length": 2770,
+    "Modified": "2026-10-02T10:58:07",
+    "Hash": "A0F99CDB90206E6044AB815B04EDDD78470D7A92F7A96EAD3CD3FC1E9DFFD012"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-009-HOST-DEBUG-STATIC-VERIFIER-COMPOSITION.md",
+    "Length": 2449,
+    "Modified": "2026-10-07T15:43:51",
+    "Hash": "962167FF783F0DD2F25803DAA8BE6BBB56EC770BE3EADBD92534F988043D04B2"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-010-CHILD-START-NOT-ACCEPTED.md",
+    "Length": 5611,
+    "Modified": "2026-10-07T15:41:00",
+    "Hash": "B42FF4A44E34AC5131981D9F973F276ABE13B58A255DB3ABF664C984821A28A1"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-011-CHILD-CREATE-INVOCATION-DISPOSITION.md",
+    "Length": 1687,
+    "Modified": "2026-10-08T03:50:21",
+    "Hash": "2054DD0A04716B3AC698791C0F4C79608EDA0565DF17BDD3BD40301ECD242D45"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-011-VERIFIED-PRE-SUBMIT-JOURNAL-CANCELLATION.md",
+    "Length": 2316,
+    "Modified": "2026-10-06T02:09:05",
+    "Hash": "DE6A4101DFC81BDAEE9858C20C2F2812BC82E22FE5E11206AFE8CCD3843F162E"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "MANIFEST.md",
+    "Length": 4795,
+    "Modified": "2026-10-04T20:52:21",
+    "Hash": "18B1D4962C6F2B94BEBB44FF6E2A16445134606EAE1A887E2C3EC1B57E579B67"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/SingNextOS/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "SHA256SUMS.txt",
+    "Length": 4389,
+    "Modified": "2026-10-04T20:14:22",
+    "Hash": "149155AA06D67AB0CC3F2EE9F9A368E994C310DB5C047835A1C494593AB312A3"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-modernize",
+    "Name": "00-README.md",
+    "Length": 2674,
+    "Modified": "2026-10-12T16:06:37",
+    "Hash": "562C0DFFD2D54EE198289241E0782B49DDB8DC4E1D1621F7FFAFA05646BE7457"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-modernize",
+    "Name": "01-STATE-AND-BACKLOG.md",
+    "Length": 36725,
+    "Modified": "2026-10-13T12:53:04",
+    "Hash": "6EF9DB7376AE92C3132A6D3C000B43D4C8F09AD123D24119E2349466EF2177D9"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-modernize",
+    "Name": "02-IMPLEMENTATION-ORDER.md",
+    "Length": 3860,
+    "Modified": "2026-10-11T02:40:09",
+    "Hash": "BD2642C7F7B4F6A23F4D49FAC461F3FD1CF7C882919C6FE6BA9587527D1EAD4C"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-modernize",
+    "Name": "03-DEV-VALIDATION.md",
+    "Length": 11249,
+    "Modified": "2026-10-11T23:11:17",
+    "Hash": "109D14963256133F53EDAF1B27396D4BE011CB5145A9F805AADFD1973D4D786A"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-modernize",
+    "Name": "04-BLOCKERS-REPORT.md",
+    "Length": 8682,
+    "Modified": "2026-10-12T16:05:16",
+    "Hash": "D725BF083A775EB8C0B0C18DCBB3227742DFFC7775AB146170809E0559C8B1CE"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-modernize",
+    "Name": "04-ROOT-CONTINUATION-PROMPT.md",
+    "Length": 14082,
+    "Modified": "2026-10-12T16:06:37",
+    "Hash": "9D3BD744C2445726B5BA048626900458F4B668BA1C90019A506838947D7E5ADE"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-modernize",
+    "Name": "05-EXTERNAL-AUDIT-DISPOSITION.md",
+    "Length": 6024,
+    "Modified": "2026-10-11T03:11:13",
+    "Hash": "833F5B8F2EAA2E7363DCF833A361F9FFF210960FCF8496F1E8C8FC54A4FB8BD6"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-modernize",
+    "Name": "06-CXL-EXTERNAL-AUDIT-DISPOSITION.md",
+    "Length": 6042,
+    "Modified": "2026-10-13T02:31:22",
+    "Hash": "C1720149AF73D8D3DCAB580EA9127F08E3F5ABE82F11E28712CFD9D13CAD78C7"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "00-README.md",
+    "Length": 3536,
+    "Modified": "2026-10-12T16:05:16",
+    "Hash": "4ADA806DED785276AFEAE5D054FB8E5A45123FB5D0E571D582347DB6BC0BE113"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "01-TECHNICAL-SPECIFICATION.md",
+    "Length": 9978,
+    "Modified": "2026-10-07T15:39:50",
+    "Hash": "08C2783CBBC3DE020821AA7A3A963F71CC89FE48AD2BB1BB9D5FAEB077097E35"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "02-AUTHORITY-OWNER-MAP.md",
+    "Length": 6516,
+    "Modified": "2026-10-07T15:39:50",
+    "Hash": "BE0318A72BF7F02870F468B14F5479945A5AAEBB58C6BC9DE708FFD3795EF0BC"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "03-PHASE-DAG-AND-MIGRATION.md",
+    "Length": 4666,
+    "Modified": "2026-10-07T15:43:51",
+    "Hash": "9D9D6062329C31FFF39C1F25A51FE5CD0C0DE2D1CC6C53C7A9DCB2F68B169EC5"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "04-NORMATIVE-INVARIANTS.md",
+    "Length": 4345,
+    "Modified": "2026-10-07T15:41:37",
+    "Hash": "BCEEF97410A5C0796991C7543E41651ACA87CA8AF1AF9655C82AE4309A588E49"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "05-FEATURE-GATES-AND-CLAIMS.md",
+    "Length": 4152,
+    "Modified": "2026-10-09T21:38:26",
+    "Hash": "322DFE988CB1D394CF715E73001B2A75D9202D971208C456C72231F13B62E5F5"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "06-BASELINE-FREEZE.md",
+    "Length": 1652,
+    "Modified": "2026-10-09T03:16:12",
+    "Hash": "552EBF8F63E2C61341FEB2D3E400CD5C7C822EF32C3FCEC2D4F497DCB01F6231"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "07-GLOBAL-CONTRACT-EVOLUTION.md",
+    "Length": 3688,
+    "Modified": "2026-10-07T15:40:59",
+    "Hash": "0DB9A9E1896FA25BDD7525BA884438F52FF7336FC75CD12A7295B0DE654166C0"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "08-FORMAL-SEMANTICS-CORE.md",
+    "Length": 3561,
+    "Modified": "2026-10-07T15:39:50",
+    "Hash": "5DF0240BC1F895422F6DA03DC1FC7C5312C09BC5B002E1BD3B4331B650CACDC4"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "09-AUDIT-CORRECTION-LOG.md",
+    "Length": 2279,
+    "Modified": "2026-09-24T00:17:54",
+    "Hash": "C218A77D0DEE40E0B26CFD5D568C5B4CD6CF69F376692E9BA3527530593FAD51"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "10-P01-UNIFIED-MEMORY-SEMANTICS.md",
+    "Length": 5327,
+    "Modified": "2026-10-07T15:43:50",
+    "Hash": "D90ABA8155C1799CC7EE8CCC0BF8EB340B95BD0FA6858E7A4ECF3380DD698547"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "11-P02-DURABILITY-PERSISTENT-MEMORY.md",
+    "Length": 4471,
+    "Modified": "2026-10-07T15:43:50",
+    "Hash": "EE183F23E38C2ACAB5AD8FAA4CDA239D6DA4BDC7E70CE7CD89F4A87AEDFAF10C"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "12-P03-TEMPORAL-EXECUTION-CONTRACTS.md",
+    "Length": 4504,
+    "Modified": "2026-10-07T15:43:50",
+    "Hash": "D9B4E46D8E4BA6E0280736ACDA9BA9B343BCEB47080C2EB9E80CBB30E4B3EF4A"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "13-P04-TRANSLATION-DMA-AUTHORITY.md",
+    "Length": 5035,
+    "Modified": "2026-10-07T15:43:50",
+    "Hash": "BAE2B76458DF9F0DA5E920A797F708B9FB5648BBCD0E6A893D981C7B2F55B58E"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "14-P05-MACHINE-CHECKABLE-REFINEMENT.md",
+    "Length": 4635,
+    "Modified": "2026-10-07T15:43:50",
+    "Hash": "80639AAF15AFDC024FB6CE92A895B0AE8A8C92280E51012E8D587DED5F552A91"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "15-P06-INFORMATION-FLOW-CONTROL.md",
+    "Length": 4234,
+    "Modified": "2026-10-07T15:43:50",
+    "Hash": "BCF049224D0ADA7410C852BB1371839CC5E4187345D679EE34947593E403BBAF"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "16-P07-LOCALITY-DATA-MOTION.md",
+    "Length": 3812,
+    "Modified": "2026-10-07T15:43:50",
+    "Hash": "C9FA9B484F6375A2A2E02ABEBD41006AB7167A18B0E1AA0D5A5F5EF493827C63"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "17-P08-PREEMPTIBLE-HETEROGENEOUS-EXECUTION.md",
+    "Length": 4542,
+    "Modified": "2026-10-07T15:43:50",
+    "Hash": "C1E0F26E085865895242B7D1E155DDBC3338F0F1402C551A7C7B0B7047D837C2"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "18-P09-DEVICE-TRUST-ATTESTATION.md",
+    "Length": 3959,
+    "Modified": "2026-10-07T15:43:50",
+    "Hash": "23929FCA8A1DEF3FB22BB933302AF63F9F9D9BC860790E74A18377A06DB1BA08"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "19-P10-RAS-FAILURE-DOMAINS.md",
+    "Length": 4210,
+    "Modified": "2026-10-07T15:43:50",
+    "Hash": "C34AF0C07AB8721E6852B7D9F5C2742CB64977A95E8DE2D83AE56E06CB388AA2"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "20-P11-MULTIHOST-AUTHORITY-LEASES.md",
+    "Length": 4389,
+    "Modified": "2026-10-07T15:43:51",
+    "Hash": "7102A9D2F08E866FDA3D5C9D0DE912E68BD36785C7F1F52A7522B22AE2120BA2"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "21-P12-ENERGY-THERMAL-RESOURCES.md",
+    "Length": 3740,
+    "Modified": "2026-10-07T15:43:51",
+    "Hash": "24A355A4047ACA78C534C67F990504A2B9AC02B848B237A28E46B1AB8FAA7CF5"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "22-PROOF-CARRYING-LOWERING.md",
+    "Length": 5504,
+    "Modified": "2026-10-07T15:43:51",
+    "Hash": "709E2F97638F9566C78618531EB10639F811D6D11700CEC4FBC01EAA97C154C0"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "23-FIRST-QUALIFICATION-VERTICAL.md",
+    "Length": 4161,
+    "Modified": "2026-10-07T15:39:50",
+    "Hash": "BDAD5EFF63B5AE0BDCBE25B37D2D3AC58713E6528DA98475AF337DF275A141A8"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "30-CROSS-PROJECT-CONTRACTS.md",
+    "Length": 4415,
+    "Modified": "2026-10-07T15:43:51",
+    "Hash": "411407B2ACD8823FD5D851950016C9B611DDDDED326D213A0BC5C19FFC0855A8"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "31-QUALIFICATION-AND-TEST-MATRIX.md",
+    "Length": 3379,
+    "Modified": "2026-10-07T15:41:37",
+    "Hash": "242BC99CD4E77B2518D4B637CFA9EDAA80DAE1E19FC42490507A20074379CD0E"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "32-TRACEABILITY-MATRIX.md",
+    "Length": 3773,
+    "Modified": "2026-10-09T03:16:12",
+    "Hash": "2CA506858595DDFFF0E30646B68830EE4D8E8B40C014FBF69DE056B4F17E5C1F"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "33-PR-SLICING-AND-CUTOVER.md",
+    "Length": 2000,
+    "Modified": "2026-10-07T15:44:46",
+    "Hash": "FF20805D99A87566FBBFC146D1952F12764865E86F06015C9EFF013B3EF0FCF5"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "34-NON-GOALS-AND-OPEN-QUESTIONS.md",
+    "Length": 2789,
+    "Modified": "2026-10-07T15:40:59",
+    "Hash": "EA626B9CCD30F206A506A03354B13363CA0C85BBEEADFD9BC63ABF15EEDFEA09"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "35-LIVE-SOURCE-ANCHORS.md",
+    "Length": 3132,
+    "Modified": "2026-10-07T15:44:25",
+    "Hash": "A1916870FD1D4F08B451F0A844DE835A0E907CF6C3691E7FA5A171F81A76E93B"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "36-FULL-GAP-MATRIX.md",
+    "Length": 1037,
+    "Modified": "2026-10-07T15:42:41",
+    "Hash": "C6987CFE0AAF3F072A720C3DFC9582B88449E6EB5E41D9CDB1346E0F6A1BE821"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "37-CLAIM-MATRIX.md",
+    "Length": 617,
+    "Modified": "2026-10-07T15:42:41",
+    "Hash": "48D267A0FFF814E03097E2C5F5A6759B5F7B16F9088185F103871AC40FEC2E46"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "38-CROSS-PROJECT-DELTA.md",
+    "Length": 5076,
+    "Modified": "2026-10-11T02:35:50",
+    "Hash": "0BC9E51AEA4315A4796ED5344F30093071E61F27B57FB8CB953B4B607E28E04E"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "39-FINAL-ARCHITECTURE-VERDICT.md",
+    "Length": 1062,
+    "Modified": "2026-10-04T20:51:34",
+    "Hash": "F1B2B8247E5E746239D8AA9FE3A791CC706DA0B25029A084AA41FD8A88CF759D"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "40-IMPLEMENTATION-ORDER.md",
+    "Length": 498,
+    "Modified": "2026-10-06T00:04:25",
+    "Hash": "C302A57774E30DDF22C7CB41644B44A0F36A2E07D747F7E9341F372AE8A87D11"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "41-CURRENT-STATE-AND-OPEN-SLICES.md",
+    "Length": 1021,
+    "Modified": "2026-10-09T21:38:26",
+    "Hash": "A173612142D913063D7EF54B5DFED38AF0F122E70C1FD2AA5564EF66C6F1DB5E"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "42-RESEARCH-DEV-VERIFICATION.md",
+    "Length": 596,
+    "Modified": "2026-10-06T00:04:24",
+    "Hash": "56E421EEC4A8DB4163E04CE329030BC92C95A86EB1388C0CBD739BDBF2730FDC"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "43-PARALLEL-WAVE-1.md",
+    "Length": 741,
+    "Modified": "2026-10-06T00:04:26",
+    "Hash": "23E9284EB6891E54FC9AC9CA7DA46979916EF84601C14000896839B3E3DCF8C1"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "45-PROOF-EVIDENCE-INDEX.md",
+    "Length": 2270,
+    "Modified": "2026-10-07T15:43:51",
+    "Hash": "7F8C47DA5C877F3F239FC7B7B9C74A88D9C7339F155FF617842A3B2024329ADC"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-001-MEMORY-ORDER-INCOMPARABILITY.md",
+    "Length": 2060,
+    "Modified": "2026-09-27T05:18:45",
+    "Hash": "10CDD6EDF459134AF42EEF541C3388BD6589900A31ACCA81D0994E85AEF7C683"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-002-RESOURCE-RESERVATION-AND-UPPER-BOUND.md",
+    "Length": 1900,
+    "Modified": "2026-10-07T15:40:59",
+    "Hash": "6E41197FE903B34A360A7A3847F9B3B24754EF0EB0F2517BE2AA29988609E019"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-003-DMA-GRANT-CLOSURE-OBSERVATION.md",
+    "Length": 3593,
+    "Modified": "2026-09-30T20:06:04",
+    "Hash": "300F9CD1FAFA9EB6FF3F8EEF62369F2924A5AC8509BFF47B2485E665A7248C4C"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-004-LATE-COMPLETION-UNDER-QUARANTINE.md",
+    "Length": 2599,
+    "Modified": "2026-10-02T02:55:42",
+    "Hash": "4BC397CE828CE1492ABF7AD415B8053C2CDBA4B724C3E20FF7C593E33DF0A18E"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-005-RESOURCE-ACCOUNTING-QUARANTINE-TRACE.md",
+    "Length": 2445,
+    "Modified": "2026-10-02T09:20:54",
+    "Hash": "A5331362F05F6E7F29BCD0DA3934665A79B1261C848A30B871E17EADE900A5CB"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-006-PRE-SUBMIT-LOCAL-RELEASE-TRACE.md",
+    "Length": 2613,
+    "Modified": "2026-10-07T15:41:00",
+    "Hash": "61730FCDB66E6588CDCFD73EDCA76B70DF2AA18946ED958FC93874D9B42AEDE7"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-007-NON-RESOURCE-LOCAL-RELEASE-TRACE.md",
+    "Length": 2858,
+    "Modified": "2026-10-07T15:41:00",
+    "Hash": "AE8E547283CF220CF27E9DA8A4F62D9C3E1FE2BA41342F6F628FD421DB3DEA06"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-008-PRE-SUBMIT-ACCOUNTING-QUARANTINE-TRACE.md",
+    "Length": 2770,
+    "Modified": "2026-10-02T10:58:07",
+    "Hash": "A0F99CDB90206E6044AB815B04EDDD78470D7A92F7A96EAD3CD3FC1E9DFFD012"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-009-HOST-DEBUG-STATIC-VERIFIER-COMPOSITION.md",
+    "Length": 2449,
+    "Modified": "2026-10-07T15:43:51",
+    "Hash": "962167FF783F0DD2F25803DAA8BE6BBB56EC770BE3EADBD92534F988043D04B2"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-010-CHILD-START-NOT-ACCEPTED.md",
+    "Length": 5611,
+    "Modified": "2026-10-07T15:41:00",
+    "Hash": "B42FF4A44E34AC5131981D9F973F276ABE13B58A255DB3ABF664C984821A28A1"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-011-CHILD-CREATE-INVOCATION-DISPOSITION.md",
+    "Length": 1687,
+    "Modified": "2026-10-08T03:50:21",
+    "Hash": "2054DD0A04716B3AC698791C0F4C79608EDA0565DF17BDD3BD40301ECD242D45"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-011-VERIFIED-PRE-SUBMIT-JOURNAL-CANCELLATION.md",
+    "Length": 2316,
+    "Modified": "2026-10-06T02:09:05",
+    "Hash": "DE6A4101DFC81BDAEE9858C20C2F2812BC82E22FE5E11206AFE8CCD3843F162E"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-012-ORIGINAL-REGION-REVOCATION-RESOLUTION.md",
+    "Length": 3376,
+    "Modified": "2026-10-10T03:39:04",
+    "Hash": "453A483D6EB91682D5CE81FB38D3C42188E8AB99216E712C6768C5BB18B39F10"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-013-MODEL-ORIGINAL-MAPPING-CLOSE-RESOLUTION.md",
+    "Length": 2930,
+    "Modified": "2026-10-10T03:57:05",
+    "Hash": "A570896C9C48957E70D0FB810EC2800FC24E35BF95F37CF0B8EA1FDCB102005C"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-014-ORIGINAL-NATIVE-REALM-AND-REVOCATION-NOT-ACCEPTED.md",
+    "Length": 3004,
+    "Modified": "2026-10-10T05:11:54",
+    "Hash": "6072FC63104B5BC977FC31F7187D9F13B15E09A4C153712638D4AC493D650CCB"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-015-ORIGINAL-ADMISSION-CLEANUP-RESOLUTION.md",
+    "Length": 4218,
+    "Modified": "2026-10-10T13:59:25",
+    "Hash": "090BDF725645539D3C13E9C4762DFD9C9D36AE7D90BE7CB5208A593DACA6841B"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-016-ORIGINAL-ROOT-CLOSE.md",
+    "Length": 2624,
+    "Modified": "2026-10-10T14:41:29",
+    "Hash": "53C6E8B4C454B3E48F9CDC12044943CC1803E1808DAE3CAC2F3A23F6321C0E0F"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-017-EXACT-ARTIFACT-RELEASE.md",
+    "Length": 3264,
+    "Modified": "2026-10-11T06:13:43",
+    "Hash": "47A7689909DBA0A6E4ABFB1CF69D5100408D6E0A988C7B2C92602BE1972442EC"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-018-ORIGINAL-ARTIFACT-BIND-CLEANUP.md",
+    "Length": 4293,
+    "Modified": "2026-10-11T07:04:49",
+    "Hash": "10E8F77D1639002653D7A8F0048160346F6B89764C1B6CE0CFD9F5B4EB5FE0EA"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-019-EXTERNAL-PARENT-ROOT-CLOSE.md",
+    "Length": 2658,
+    "Modified": "2026-10-10T16:46:15",
+    "Hash": "50AA8564EBDC528FC853170C9462A5DC334314FA95A5AB56785AF5F480366066"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-020-ORIGINAL-CHILD-CLOSE.md",
+    "Length": 1996,
+    "Modified": "2026-10-10T17:29:38",
+    "Hash": "B2853409AFCDA5E4337DD8F93B7CC4D2D625E9F34131A05191119E8D42F12078"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-021-ORIGINAL-GUEST-UNMAP.md",
+    "Length": 1316,
+    "Modified": "2026-10-10T18:10:37",
+    "Hash": "4840632F024C437ED17ED982C1174A7B8A274D874214F5627C1FDB196A91A8C7"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-022-ORIGINAL-GUEST-MAP.md",
+    "Length": 1411,
+    "Modified": "2026-10-10T18:39:42",
+    "Hash": "2C13785ADC78476473332E188DBB70CE22A96FDC13E77E1F6D0445AFE6E920DF"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-023-ORIGINAL-CHILD-CREATE.md",
+    "Length": 1528,
+    "Modified": "2026-10-10T19:23:16",
+    "Hash": "8CF96E75CE22132084F9A2833D10F646F673B575AD39FFDEE8014BDCFCB874A4"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-024-ORIGINAL-EXTERNAL-PARENT-BIND.md",
+    "Length": 1709,
+    "Modified": "2026-10-10T19:55:16",
+    "Hash": "A364479F6EAE9D49320DB0F891564963DEC968BCD1DB49B9D15B0680C67ABE3B"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-025-PREPARED-ORIGINAL-PARENT-BIND-RETIREMENT.md",
+    "Length": 1714,
+    "Modified": "2026-10-10T20:54:30",
+    "Hash": "8EFAFA43BFD3517773C4763F24DD525D2DB9BA61D474A9D13D02AAA9B9CF79CF"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-026-ORIGINAL-NATIVE-DMA-GRANT.md",
+    "Length": 4026,
+    "Modified": "2026-10-12T17:36:35",
+    "Hash": "7D1EBDEBE3200FA448A168740E897526071759A286F754E75515CE8A88B516F5"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-027-ORIGINAL-NATIVE-DMA-VISIBILITY.md",
+    "Length": 2310,
+    "Modified": "2026-10-11T00:57:58",
+    "Hash": "E4E0F8FB1669D63EDFFB345E677E2E5851BCD6148E79C612B7152AA77334932C"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-028-ORIGINAL-NATIVE-DEVICE.md",
+    "Length": 1904,
+    "Modified": "2026-10-11T01:09:19",
+    "Hash": "BF10FAA54BAB42115582F9527E09B035E631E5D6934EB9146A0681D792878E7F"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-029-ORIGINAL-NATIVE-MMIO.md",
+    "Length": 1577,
+    "Modified": "2026-10-11T01:47:04",
+    "Hash": "4FE9E03171BF7646880ECBD3E75DC94A092C346E49C40EE32527AE611970859A"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-030-ORIGINAL-NATIVE-IRQ.md",
+    "Length": 3556,
+    "Modified": "2026-10-11T02:58:01",
+    "Hash": "96D9F7500CE7997CB0ED7E8925BCA6812D4651CC879C485143E85A0B813D8C1C"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-031-DMA-COPY-BACKING.md",
+    "Length": 2495,
+    "Modified": "2026-10-11T03:23:28",
+    "Hash": "EE251AEF0DD749A47BA07FAA6D1F8B1D3F632ECA228D51F10F13CE1F92CBC459"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-032-ORIGINAL-NATIVE-DMA-COPY.md",
+    "Length": 9000,
+    "Modified": "2026-10-11T04:46:28",
+    "Hash": "4703B1742F751C2663AA02F8F9A30AFE9F2C6DF1496AD0DECA9A0050ADA4C247"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-033-ORIGINAL-ARTIFACT-START-ATTEMPT.md",
+    "Length": 2055,
+    "Modified": "2026-10-11T05:12:55",
+    "Hash": "C5FE564FD28A06CBCE5E3A73E341E569EA8A3FA418C097B0110373B50554CB8A"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-034-ORIGINAL-NATIVE-ARTIFACT-START.md",
+    "Length": 3603,
+    "Modified": "2026-10-11T06:01:16",
+    "Hash": "FA4FC39B2D5FFD78F8CDA736134E5792C1C2A83E580EAAF83B34BF00FB83F678"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-035-ORIGINAL-VIRTUAL-IO-BACKING.md",
+    "Length": 3941,
+    "Modified": "2026-10-11T08:13:57",
+    "Hash": "CF347FC726FCD5D434EAB812F33E62DEB8A0354E192FFC686DF931B1E8347123"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-036-ORIGINAL-VIRTUAL-IO-CLOSE-CONTINUATION.md",
+    "Length": 2239,
+    "Modified": "2026-10-11T08:32:22",
+    "Hash": "A78240A08B6FEE7B239A5DB933078C76D29241F81DA5272A2DF7618EBA86AF3E"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-037-ORIGINAL-VIRTUAL-IO-BIND-CONTAINMENT.md",
+    "Length": 3122,
+    "Modified": "2026-10-11T08:53:31",
+    "Hash": "3BC19C2CC546D1E63F68AE16373D6572C16CFA876B13D27C7266C4C2F805FA93"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-038-ORIGINAL-PARENT-DEVICE-NO-EFFECT.md",
+    "Length": 2009,
+    "Modified": "2026-10-11T09:11:32",
+    "Hash": "4332ED924786453661235C50E4F38C34BF23BEFD95815D9E9D84E3535B8200FC"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-039-ORIGINAL-CHILD-SOFTWARE-EVENT.md",
+    "Length": 3331,
+    "Modified": "2026-10-11T09:58:38",
+    "Hash": "43179A6A2EEBACD1E94C89DDA5E7B4D526889435F5379E3C54BBB21B1AC35D22"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-040-ORIGINAL-EXTERNAL-NESTED-CHILD.md",
+    "Length": 3992,
+    "Modified": "2026-10-11T11:16:46",
+    "Hash": "1E1F91E7499E99D49B54B12E9310FC26AD26082916AF985A079B105EE33AB1E2"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-041-NESTED-GUEST-LINEAGE.md",
+    "Length": 2610,
+    "Modified": "2026-10-11T12:02:08",
+    "Hash": "8908B27DFEAB14C6B225018043EC71CA1C74D317D72DF950A968167CABB710A0"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-042-NESTED-ARTIFACT-BIND-CLEANUP.md",
+    "Length": 3039,
+    "Modified": "2026-10-11T12:46:14",
+    "Hash": "E973EE0D9DC09EA91113B9D9DA16E537096CA3C340B9A833095C8B73625E1B51"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-043-ORIGINAL-GUEST-MAPPING-QUANTITATIVE-CHARGE.md",
+    "Length": 1705,
+    "Modified": "2026-10-11T13:02:44",
+    "Hash": "D4F6CF6D8546E6F2FA570CF470BB516D636E0F097A9081F62B4571C2B37D7691"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-044-NESTED-ORIGINAL-START.md",
+    "Length": 3123,
+    "Modified": "2026-10-11T14:05:10",
+    "Hash": "C4C4A652EBBCE69715BF1BABC11B5059DD08BE6BBD7D91C9B60A8090D65D29B4"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-045-OWNED-EXECUTABLE-DATA-PAGES.md",
+    "Length": 2555,
+    "Modified": "2026-10-11T14:27:57",
+    "Hash": "E6619583DC3BDDC4011DE1DCF75C6962519547CCE823B41464679AAB399E1847"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-046-ORIGINAL-EXECUTABLE-DATA-QUOTA.md",
+    "Length": 3148,
+    "Modified": "2026-10-11T14:47:58",
+    "Hash": "9ACFB19BB34DEEBC270187FF0A64A2DD3F159B5FE4029823EE3F943D139CAF19"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-047-ORIGINAL-LOCAL-GUEST-BUDGET.md",
+    "Length": 2573,
+    "Modified": "2026-10-11T15:22:23",
+    "Hash": "0312B8FFF0C84F1B6E34EEF041941BCE697F9D46EE4666AF3D9044638F1328D6"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-048-ORIGINAL-EXECUTION-TERMINAL-OBSERVATION.md",
+    "Length": 3553,
+    "Modified": "2026-10-11T16:12:50",
+    "Hash": "BFE444FF8F6BFAE39BFA595D543C0CC120B07E400E7DC0F65C3F50C0F7DD36FC"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-049-ORIGINAL-START-TERMINAL-PUBLICATION.md",
+    "Length": 2698,
+    "Modified": "2026-10-11T16:24:26",
+    "Hash": "D774DED84045FF3143661AE1BE2B718F6062BC8CAAB025599766946C0BC36318"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-050-ORIGINAL-TERMINAL-FAILURE-READ.md",
+    "Length": 2986,
+    "Modified": "2026-10-11T22:12:49",
+    "Hash": "9D6BD1E520880289A3AFB5787EC2817402F2ACCB506F03C9005CBFB56EBDA7BB"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-051-OWNED-CORE-TERMINAL-RETIRE.md",
+    "Length": 2594,
+    "Modified": "2026-10-11T22:46:24",
+    "Hash": "554D5F57AFBADE926F13360A265694D1C35BE19C87C3FD18EE094BF5AE459481"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-052-ORIGINAL-COMPLETED-PROGRAM-RESULT.md",
+    "Length": 2435,
+    "Modified": "2026-10-11T22:52:46",
+    "Hash": "A669E592368B3345DE50491B6ED1FD5453AC11EA602CC5E052D67CC35C5D91C8"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-053-ORIGINAL-IMAGE-GC-ROOTS.md",
+    "Length": 2493,
+    "Modified": "2026-10-12T00:33:24",
+    "Hash": "3100B1D86778FFA3CBD5B456E824B9F936291AB8E20F4851229979D84A571ED7"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "ADR-054-ORIGINAL-SOFTWARE-DSC1-BACKING.md",
+    "Length": 4498,
+    "Modified": "2026-10-13T07:25:12",
+    "Hash": "DC29800AF9B27B33053EDEE2A440C318FFA8740AB86FE9A4B5BC9109B7B7FCF1"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "MANIFEST.md",
+    "Length": 4795,
+    "Modified": "2026-10-04T20:52:21",
+    "Hash": "18B1D4962C6F2B94BEBB44FF6E2A16445134606EAE1A887E2C3EC1B57E579B67"
+  },
+  {
+    "Root": "C:/Users/Yuriy Kurnosov/Desktop/singos  temp/docs",
+    "Group": "SingNextOS-v6-roadmap-reworked-2026-09-23",
+    "Name": "SHA256SUMS.txt",
+    "Length": 4389,
+    "Modified": "2026-10-04T20:14:22",
+    "Hash": "149155AA06D67AB0CC3F2EE9F9A368E994C310DB5C047835A1C494593AB312A3"
+  }
+]

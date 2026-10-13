@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "phase": "P11",
+  "claim": "ModelOnly",
+  "contour": "negative qualification; no temporal enforcement contour",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "reviewedHead": "800027893dcf1ed23d8d7fe775841dd9d01a9fff",
+  "enabledFeatureGates": [],
+  "temporalUpperBound": "FutureGated",
+  "guaranteedReservation": "FutureGated",
+  "tests": [
+    { "lane": "P03-P10-P11-negative-boundary", "passed": 14, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui-current-code", "passed": 1765, "failed": 0, "skipped": 2 }
+  ],
+  "defectsConfirmed": 0,
+  "evidence": { "path": "P11_REAUDIT_20260922.md", "sha256": "a847e4806d020854916826ee8f1d4f610297c01b2a6f5e24b678c981acca433a" },
+  "ordinaryFallback": "unchanged",
+  "futureGated": [{ "owner": "ResourceBudgetAuthority temporal extension plus qualified runtime/provider adapter", "missing": "clock, replenishment, preemption, overrun, restart and controlled SMT/provider evidence", "requiredGateState": "OFF" }],
+  "exclusions": ["no EnforcedUpperBound", "no GuaranteedReservation", "no NativeAOT/provider/hardware/ProductionQualified claim", "no ISA change"]
+}

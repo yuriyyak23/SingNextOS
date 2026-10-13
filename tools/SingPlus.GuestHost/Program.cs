@@ -1,0 +1,160 @@
+using SingPlus.Contracts;
+using SingPlus.Runtime;
+using SingPlus.Platform.HybridCpu;
+using YAKSys_Hybrid_CPU.Core;
+using YAKSys_Hybrid_CPU.ExecutableAdapter;
+
+// Host orchestration -> external provider -> CPU model -> compiler-produced HCEXE.
+// The second mapping is an independent live user, not an execution predecessor.
+var startLoss=args.Contains("--service-start-loss",StringComparer.Ordinal);
+var mapLoss=args.Contains("--service-map-loss",StringComparer.Ordinal);
+var serviceMode=startLoss || args.Contains("--service-bind-loss",StringComparer.Ordinal);
+var lossMode=mapLoss || serviceMode || args.Contains("--lost-release-reply",StringComparer.Ordinal);
+var packageArgument=args.SingleOrDefault(arg=>!arg.StartsWith("--",StringComparison.Ordinal));
+var packagePath=packageArgument is null?Path.Combine(AppContext.BaseDirectory,"guest.hcexe"):Path.GetFullPath(packageArgument);
+var package=File.ReadAllBytes(packagePath);
+var native=new NeutralDomainRuntimeFacade();
+GuestReplyLossRuntime? responseLoss=null;
+var adapter=new HybridCpuExecutableChildAdapter();
+if(lossMode)
+{
+    var external=new HybridCPU.ExternalRuntime.HybridCpuExternalRuntime();
+    var proxy=global::System.Reflection.DispatchProxy.Create<IGuestReplyLossRuntime,GuestReplyLossRuntime>();
+    responseLoss=(GuestReplyLossRuntime)(object)proxy;responseLoss.Inner=external;
+    var constructor=typeof(HybridCpuExecutableChildAdapter).GetConstructor(global::System.Reflection.BindingFlags.Instance|global::System.Reflection.BindingFlags.NonPublic,null,
+        [typeof(HybridCPU.ExternalRuntime.Contracts.IHybridCpuExternalRuntime),typeof(HybridCPU.ExternalRuntime.Contracts.IHybridCpuChildDomainRuntimeV3),typeof(ISemanticTraceSinkV1)],null)!;
+    adapter=(HybridCpuExecutableChildAdapter)constructor.Invoke([external,proxy,null]);
+}
+var kernel=new RuntimeKernel(new HybridCpuPlatformAuthorityProvider(native,adapter));
+void Check(bool value,string operation){if(!value)throw new InvalidOperationException(operation);}
+ProcessHandle Create(ulong id,ulong domain)
+{
+    var manifest=new SingProcessManifestV1(new(id),new(domain),1,$"guest-host-{id}",ExecutionRole.Sip,MemoryProfile.SipRegion);
+    var created=kernel.CreateProcess(manifest);Check(created.IsSuccess,created.Message??"process create");return new(manifest.ProcessId,manifest.Generation);
+}
+const ulong bytes=1024*1024;
+var owner=Create(2301,23010);var admin=Create(2302,23020);var foreign=Create(2303,23030);
+var adminCapability=kernel.MintCapability(new(23020),admin,ResourceKind.KernelService,CapabilityResourceIds.BudgetAdministration,CapabilityRights.Configure).Value!.CapabilityId;
+var budget=kernel.AdmitProcessBudget(admin,adminCapability,owner,"guest-host",
+    [new(ServiceBudgetDimension.OwnedMemoryBytes,bytes*3),new(ServiceBudgetDimension.PinnedMappedMemoryBytes,bytes*2),
+     new(ServiceBudgetDimension.GuestMemoryBytes,bytes*2),new(ServiceBudgetDimension.RegionUses,8)]).Value!.ProcessBudget;
+ulong Used(ServiceBudgetDimension dimension)=>kernel.QueryBudget(budget).Value!.Usage.Single(u=>u.Dimension==dimension).Used;
+var code=kernel.AllocateBuffer<byte>(owner,(int)bytes).Value!;
+var peer=kernel.AllocateBuffer<byte>(owner,(int)bytes).Value!;peer.Span[0]=0x6B;
+var create=kernel.MintCapability(new(23010),owner,ResourceKind.Virtualization,VirtualizationResourceIds.Create,CapabilityRights.Configure).Value!.CapabilityId;
+var domain=kernel.CreateVirtualDomain(owner,create,new(1,(long)bytes*2)).Value!;
+Check(kernel.ConfigureVirtualDomain(owner,domain.Domain,domain.ConfigureCapability).IsSuccess,"configure guest");
+CapabilityId Memory(SingPlus.Sip.OwnedBuffer<byte> buffer,bool executable)=>kernel.MintCapability(new(23010),owner,ResourceKind.MemoryRegion,
+    CapabilityResourceIds.MemoryRegion(buffer.Handle.RegionId),CapabilityRights.Map|CapabilityRights.Read|(executable?CapabilityRights.Execute:CapabilityRights.None)).Value!.CapabilityId;
+if(mapLoss)
+{
+    var protocol=SingPlus.Sip.Virtualization.VirtualizationServiceClient.CreateProtocol();
+    var descriptor=kernel.RegisterService(foreign,"guest-map-host",new(protocol.ContractName,"1",protocol.ContractDigest),protocol,
+        SingPlus.Sip.Virtualization.VirtualizationServiceClient.ResponseProtocol,[]).Value!;
+    var session=kernel.OpenSession(owner,descriptor,[]).Value;
+    var host=RuntimeVirtualizationServiceHost.CreateForSession(kernel,foreign,session).Value!;
+    var client=SingPlus.Sip.Virtualization.VirtualizationServiceClient.Create(new RuntimeSipClientTransport(kernel,owner,session));
+    responseLoss!.LoseMapResponses=true;
+    var pending=client.MapGuestRegionAsync(new(domain.Domain,domain.MemoryCapability,Memory(code,true),code.Handle,new(0,(long)bytes),GuestMemoryAccess.Read|GuestMemoryAccess.Execute){MaximumPrivateExecutableDataBytes=bytes});
+    Check(!host.ProcessNext().IsSuccess,"unknown Map not published");
+    var denied=false;try{await pending;}catch(Exception){denied=true;}Check(denied,"failed accepted Map response");
+    Check(responseLoss.MapCalls==1 && Used(ServiceBudgetDimension.OwnedMemoryBytes)==bytes*3,"original Map/quota retained");
+    Check(!kernel.AcquireRegionUse(owner,code.Handle,RegionUseMode.ExclusiveRead,new(0,(long)bytes)).IsSuccess,"unknown Map acquisition guard");
+    responseLoss.LoseMapResponses=false;
+    var teardown=kernel.TerminateProcess(owner);Check(teardown.IsSuccess,teardown.Message??"original guest Map caller closure");
+    Check(kernel.QueryBudget(budget).Value!.Usage.All(u=>u.Used==0),"original mapping charges reclaimed");
+    Check(responseLoss.MapCalls==1 && responseLoss.BindCalls==0 && responseLoss.StartCalls==0,"Map reconciliation no-repeat/no execution");
+    Check(native.ActiveOwnedRegionMappingCount==0 && native.ActiveBindingCount==0,"original native backing/root closure");
+    Check(kernel.Processes.Resolve(foreign).IsSuccess,"service survives Map cleanup");
+    Console.WriteLine("Guest service Map loss: Map1/Bind0/Start0; original Region/quota closure; charges0; native maps/roots0; service alive; gatesOFF; ISA NONE; ProductionQualified=false");
+    return;
+}
+var codeMap=kernel.MapGuestRegion(owner,domain.Domain,domain.MemoryCapability,Memory(code,true),code.Handle,new(0,(long)bytes),GuestMemoryAccess.Read|GuestMemoryAccess.Execute,bytes);
+Check(codeMap.IsSuccess,codeMap.Message??"code mapping");
+var peerMap=kernel.MapGuestRegion(owner,domain.Domain,domain.MemoryCapability,Memory(peer,false),peer.Handle,new((long)bytes,(long)bytes),GuestMemoryAccess.Read);
+Check(peerMap.IsSuccess,peerMap.Message??"independent mapping");
+Check(!kernel.AcquireRegionUse(owner,code.Handle,RegionUseMode.ExclusiveRead,new(0,(long)bytes)).IsSuccess,"mapped acquisition guard");
+Check(Used(ServiceBudgetDimension.OwnedMemoryBytes)==bytes*3 && Used(ServiceBudgetDimension.GuestMemoryBytes)==bytes*2,"pre-effect Region/private quota and guest charges");
+if(serviceMode)
+{
+    var protocol=SingPlus.Sip.Virtualization.VirtualizationServiceClient.CreateProtocol();
+    var descriptor=kernel.RegisterService(foreign,"guest-host",new(protocol.ContractName,"1",protocol.ContractDigest),protocol,
+        SingPlus.Sip.Virtualization.VirtualizationServiceClient.ResponseProtocol,[]).Value!;
+    var session=kernel.OpenSession(owner,descriptor,[]).Value;
+    var host=RuntimeVirtualizationServiceHost.CreateForSession(kernel,foreign,session).Value!;
+    var client=SingPlus.Sip.Virtualization.VirtualizationServiceClient.Create(new RuntimeSipClientTransport(kernel,owner,session));
+    responseLoss!.LoseBindResponses=!startLoss;
+    var pending=client.BindExecutablePackageAsync(new(domain.Domain,domain.ExecuteCapability,codeMap.Value!.Mapping,new SingPlus.Sip.Virtualization.BoundedExecutablePackage(package),256));
+    var dispatch=host.ProcessNext();
+    if(startLoss)
+    {
+        Check(dispatch.IsSuccess,"service Bind publication");await pending;
+        responseLoss.LoseStartResponses=true;
+        pending=client.StartAsync(new(domain.Domain,domain.ExecuteCapability));
+        dispatch=host.ProcessNext();
+    }
+    Check(!dispatch.IsSuccess,"unknown artifact effect not published");
+    var refused=false;try{await pending;}catch(Exception){refused=true;}Check(refused,"failed accepted Bind response");
+    Check(Used(ServiceBudgetDimension.OwnedMemoryBytes)==bytes*3,"unknown service Bind retains quota");
+    responseLoss.LoseBindResponses=false;
+    responseLoss.LoseStartResponses=false;
+    if(args.Contains("--lost-release-reply",StringComparer.Ordinal))
+    {
+        responseLoss.LoseReleaseResponses=true;
+        Check(!kernel.TerminateProcess(owner).IsSuccess,"unknown artifact Release retains service invocation");
+        Check(Used(ServiceBudgetDimension.OwnedMemoryBytes)==bytes*3,"partial retirement retains charges");
+        responseLoss.LoseReleaseResponses=false;
+    }
+    var teardown=kernel.TerminateProcess(owner);Check(teardown.IsSuccess,teardown.Message??"service artifact original caller closure");
+    Check(kernel.QueryBudget(budget).Value!.Usage.All(u=>u.Used==0),"service artifact quantitative reclaim");
+    Check(kernel.Processes.Resolve(foreign).IsSuccess,"service survives caller teardown");
+    Check(responseLoss.BindCalls==1 && responseLoss.StartCalls==(startLoss?1:0) && responseLoss.ReleaseCalls==1,"original artifact effects no-repeat");
+    Console.WriteLine($"Guest service {(startLoss?"Start":"Bind")} lost reply: Bind1/Start{responseLoss.StartCalls}/Release1; exact artifact/guest cleanup; caller closed; charges0; service survives; gates=OFF; ISA=NONE; ProductionQualified=false");
+    return;
+}
+var bound=kernel.BindVirtualDomainExecutable(owner,domain.Domain,domain.ExecuteCapability,codeMap.Value!.Mapping,package,256);
+Check(bound.IsSuccess,bound.Message??"bind compiler-produced guest");
+var started=kernel.StartVirtualDomain(owner,domain.Domain,domain.ExecuteCapability);
+Check(started.IsSuccess,started.Message??"execute guest");
+Check(kernel.QueryVirtualDomain(owner,domain.Domain).Value==VirtualDomainState.Completed,"original completed lifetime");
+var result=kernel.ObserveVirtualExecutionResult(owner,domain.Domain,domain.TrapCapability);
+Check(result.IsSuccess,result.Message??"original result");
+Check(result.Value.ProcessExitCode==42,"compiler-produced result42");
+Check(!kernel.ObserveVirtualExecutionResult(foreign,domain.Domain,domain.TrapCapability).IsSuccess,"foreign result denied");
+Check(!kernel.StartVirtualDomain(owner,domain.Domain,domain.ExecuteCapability).IsSuccess,"completed Start no-repeat");
+Check(Used(ServiceBudgetDimension.OwnedMemoryBytes)==bytes*3,"result does not reclaim private quota");
+if(responseLoss is not null)responseLoss.LoseReleaseResponses=true;
+var closed=kernel.CloseGuestRegionMapping(owner,domain.Domain,domain.MemoryCapability,codeMap.Value.Mapping);
+if(responseLoss is not null)
+{
+    Check(!closed.IsSuccess,"unknown release cannot close guest mapping");
+    Check(responseLoss.StartCalls==1 && responseLoss.ReleaseCalls==1,"original Start and Release invoked once");
+    Check(Used(ServiceBudgetDimension.OwnedMemoryBytes)==bytes*3 && Used(ServiceBudgetDimension.GuestMemoryBytes)==bytes*2,
+        "unknown release retains code/peer/quota charges");
+    Check(code.IsValid && peer.IsValid,"unknown release retains both Regions");
+    Check(!kernel.ReleaseRegion(owner,peer).IsSuccess,"independent mapping survives unknown release");
+    responseLoss.LoseReleaseResponses=false;
+    var teardown=kernel.TerminateProcess(owner);Check(teardown.IsSuccess,teardown.Message??"same original release teardown");
+    Check(responseLoss.StartCalls==1 && responseLoss.ReleaseCalls==1,"teardown no-repeat");
+    Check(kernel.QueryBudget(budget).Value!.Usage.All(u=>u.Used==0),"exact original and independent quantitative reclaim");
+    Check(!code.IsValid && !peer.IsValid && native.ActiveOwnedRegionMappingCount==0 && native.ActiveBindingCount==0,"Region/native lifetime closure");
+    Check(kernel.Processes.Resolve(foreign).IsSuccess,"foreign process survives release reconciliation");
+    Console.WriteLine($"Guest lost release: result42; Start1/Release1; OwnedMemory={bytes*3}->retained->{0}; GuestMemory={bytes*2}->retained->0; Regions/nativeMaps/roots closed; foreign survives; gates=OFF; ISA=NONE; ProductionQualified=false");
+    return;
+}
+Check(closed.IsSuccess,closed.Message??"exact artifact release and code guest closure");
+Check(Used(ServiceBudgetDimension.OwnedMemoryBytes)==bytes*2 && Used(ServiceBudgetDimension.GuestMemoryBytes)==bytes &&
+    Used(ServiceBudgetDimension.PinnedMappedMemoryBytes)==bytes,"independent guest mapping retained after artifact release");
+Check(kernel.ReleaseRegion(owner,code).IsSuccess,"closed code Region reclaim");
+Check(Used(ServiceBudgetDimension.OwnedMemoryBytes)==bytes,"only code Region charge consumed");
+Check(!kernel.ReleaseRegion(owner,peer).IsSuccess,"independent mapped Region cannot release");
+Check(peer.IsValid && Used(ServiceBudgetDimension.OwnedMemoryBytes)==bytes,"independent Region charge survives");
+Check(kernel.CloseGuestRegionMapping(owner,domain.Domain,domain.MemoryCapability,peerMap.Value!.Mapping).IsSuccess,"independent mapping closure");
+Check(peer.Span[0]==0x6B,"independent backing data survives artifact cleanup");
+Check(Used(ServiceBudgetDimension.GuestMemoryBytes)==0 && Used(ServiceBudgetDimension.PinnedMappedMemoryBytes)==0,"both exact mapping charges consumed");
+Check(kernel.ReleaseRegion(owner,peer).IsSuccess,"independent Region reclaim");
+Check(kernel.TerminateProcess(owner).IsSuccess,"guest/root/process teardown");
+Check(kernel.QueryBudget(budget).Value!.Usage.All(u=>u.Used==0),"all quantitative reclaim");
+Check(native.ActiveOwnedRegionMappingCount==0 && native.ActiveBindingCount==0,"native mappings/root closure");
+Check(kernel.Processes.Resolve(foreign).IsSuccess,"foreign process survives");
+Console.WriteLine($"Guest software host: result={result.Value.ProcessExitCode}; retired={result.Value.Sequence}; OwnedMemory={bytes*3}->{bytes*2}->{bytes}->0; GuestMemory={bytes*2}->{bytes}->0; independent byte=6B; nativeMaps/roots=0; gates=OFF; ISA=NONE; ProductionQualified=false");
