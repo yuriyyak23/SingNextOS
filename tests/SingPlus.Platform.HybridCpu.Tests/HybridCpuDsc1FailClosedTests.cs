@@ -9,15 +9,15 @@ namespace SingPlus.Platform.HybridCpu.Tests;
 public sealed class HybridCpuDsc1FailClosedTests
 {
     [Fact]
-    public void HybridCpuProviderReportsDsc1UnavailableAndDoesNotImplementModelContract()
+    public void HybridCpuProviderReportsDsc1AdmissionOnlyAndDoesNotImplementModelContract()
     {
         var provider = new HybridCpuPlatformAuthorityProvider(
             new NeutralDomainRuntimeFacade());
         var feature = provider.QueryFeatures().Resolve(
             PlatformFeatureFamily.Dsc1BulkCompute);
 
-        Assert.Equal(0u, feature.ContractVersion);
-        Assert.Equal(PlatformFeatureAvailability.Unavailable, feature.Availability);
+        Assert.Equal(PlatformOriginalDsc1CopyBackingContract.ContractVersion, feature.ContractVersion);
+        Assert.Equal(PlatformFeatureAvailability.RuntimeAdmission, feature.Availability);
         Assert.DoesNotContain(
             typeof(IPlatformDsc1ComputeProvider),
             provider.GetType().GetInterfaces());
@@ -85,14 +85,14 @@ public sealed class HybridCpuDsc1FailClosedTests
             new PlatformDsc1RegionRange(destinationMapping, 0, destination.Length));
 
         Assert.False(rejected.IsSuccess);
-        Assert.Equal(KernelError.PlatformUnsupported, rejected.Error);
-        Assert.All(destination.Span.ToArray(), value => Assert.Equal((byte)0xA4, value));
-        source.Span[0] = 0x42;
+        Assert.Equal(KernelError.PlatformFaulted, rejected.Error);
         Assert.Equal(2, neutralRuntime.ActiveOwnedRegionMappingCount);
         Assert.Equal(1, neutralRuntime.ActiveBindingCount);
 
-        Assert.True(kernel.RevokePlatformRegionMapping(subject, sourceMapping).IsSuccess);
-        Assert.True(kernel.RevokePlatformRegionMapping(subject, destinationMapping).IsSuccess);
-        Assert.True(kernel.RevokePlatformDomain(subject, binding).IsSuccess);
+        Assert.False(kernel.RevokePlatformRegionMapping(subject, sourceMapping).IsSuccess);
+        Assert.False(kernel.RevokePlatformRegionMapping(subject, destinationMapping).IsSuccess);
+        Assert.False(kernel.RevokePlatformDomain(subject, binding).IsSuccess);
+        Assert.Equal(2, neutralRuntime.ActiveOwnedRegionMappingCount);
+        Assert.Equal(1, neutralRuntime.ActiveBindingCount);
     }
 }

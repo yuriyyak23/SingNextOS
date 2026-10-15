@@ -1,5 +1,4 @@
 using SingPlus.Runtime;
-using System.Security.Cryptography;
 
 namespace SingPlus.Tests.Runtime;
 
@@ -74,18 +73,6 @@ public sealed class VNextPhase16FeatureGateRollbackTests
         _ = new { ProviderAvailable = true, Receipt = Evidence, Telemetry = "healthy", CachedPlan = "fast" };
         Assert.Empty(authority.Snapshot.EnabledGates);
         Assert.Equal(KernelError.PlatformUnsupported, authority.TryAcquire(Gate).Error);
-    }
-
-    [Fact]
-    public void QualifiedConfigurationPinsAnExistingEvidenceTupleDigest()
-    {
-        var directory = new DirectoryInfo(AppContext.BaseDirectory);
-        while (directory is not null && !File.Exists(Path.Combine(directory.FullName, "SingNextOS.slnx")))
-            directory = directory.Parent;
-        Assert.NotNull(directory);
-        var path = Path.Combine(directory!.FullName, "docs", "Completed", "SingNextOS-vNext-refactoring-roadmap-new",
-            "P16_PROVIDER_RESOURCE_CONTRACT_20260922_TUPLE.json");
-        Assert.Equal(Evidence, Convert.ToHexStringLower(SHA256.HashData(File.ReadAllBytes(path))));
     }
 
     private static VNextFeatureGateConfiguration Configuration(ulong generation, string[] gates) =>

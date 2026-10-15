@@ -5,7 +5,11 @@ namespace SingPlus.Runtime;
 public sealed partial class PlatformAuthorityBridge
 {
     internal KernelResult ResolveOriginalAdmissionsForCleanup(PlatformDomainIdentity subject)
+        =>ResolveOriginalAdmissionsForCleanup(subject,out _);
+
+    internal KernelResult ResolveOriginalAdmissionsForCleanup(PlatformDomainIdentity subject,out bool originalRootNoEffectConsumed)
     {
+        originalRootNoEffectConsumed=false;
         if (_provider is not IPlatformOriginalAdmissionResolutionProvider provider) return KernelResult.Ok();
         RootBindInvocationFact? bind;
         lock (_secureDomainLifecycleGate)
@@ -48,6 +52,9 @@ public sealed partial class PlatformAuthorityBridge
                         {
                             if (_activeSubjects.ContainsKey(subject) || _pendingDomainBinds.ContainsKey(subject))
                                 return KernelResult.Fail(KernelError.PlatformFaulted, "Original no-effect Bind cannot consume a foreign root/admission.");
+                            var consumed=bind.LocalCreationNoEffectConsumer?.Invoke()??KernelResult.Ok();
+                            if(!consumed.IsSuccess)return consumed;
+                            originalRootNoEffectConsumed=true;
                             _unresolvedDomainBinds.Remove(subject);
                             return KernelResult.Ok(); // Exact no-effect consumption, no provider Close or synthetic lease.
                         }

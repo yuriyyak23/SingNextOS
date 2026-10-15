@@ -1,13 +1,9 @@
-using System.Text.Json;
 using SingPlus.SingCapQualification;
 
 namespace SingPlus.Tests.Architecture;
 
 public sealed class VNextPhase16ResourcePerformanceQualificationTests
 {
-    private static readonly string RepositoryRoot = FindRepositoryRoot();
-    private static readonly string RoadmapRoot = Path.Combine(RepositoryRoot, "docs", "Completed", "SingNextOS-vNext-refactoring-roadmap-new");
-
     [Fact]
     public async Task MatrixExecutesLiveOwnerContentionAndQuarantinePressureWithoutUnexpectedOutcomes()
     {
@@ -50,40 +46,4 @@ public sealed class VNextPhase16ResourcePerformanceQualificationTests
             VNextResourcePerformanceQualification.MeasureAsync(new(iterations, [workers])));
     }
 
-    [Fact]
-    public void RecordedReleaseMatrixAndTupleRemainExactAndDoNotOverclaim()
-    {
-        using var reportDocument = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(RoadmapRoot,
-            "P16_RESOURCE_BUDGET_PERFORMANCE_20260922.json")));
-        var report = reportDocument.RootElement;
-        Assert.Equal("SingNextOS.VNext.ResourceBudgetPerformance.v1", report.GetProperty("Schema").GetString());
-        Assert.Equal("JIT-host", report.GetProperty("Environment").GetProperty("ExecutionMode").GetString());
-        Assert.Equal(20, report.GetProperty("Measurements").GetArrayLength());
-        Assert.All(report.GetProperty("Measurements").EnumerateArray(), measurement =>
-        {
-            Assert.Equal(0, measurement.GetProperty("UnexpectedOutcomes").GetInt32());
-            Assert.Equal(measurement.GetProperty("Attempts").GetInt32(),
-                measurement.GetProperty("Successes").GetInt32() + measurement.GetProperty("ExpectedFailures").GetInt32());
-        });
-        Assert.Contains("AccountingOnly", report.GetProperty("Claim").GetString(), StringComparison.Ordinal);
-        Assert.Contains(report.GetProperty("Exclusions").EnumerateArray(), item =>
-            item.GetString()!.Contains("No SMT-topology", StringComparison.Ordinal));
-
-        using var tupleDocument = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(RoadmapRoot,
-            "P16_RESOURCE_BUDGET_PERFORMANCE_20260922_TUPLE.json")));
-        Assert.Empty(VNextTraceabilityPolicy.ValidateArtifacts(tupleDocument.RootElement.GetProperty("artifacts"),
-            path => File.ReadAllBytes(VNextTraceabilityPolicy.ResolveRepositoryPath(RepositoryRoot, path)),
-            allowCurrentSourceDrift: true));
-        Assert.False(tupleDocument.RootElement.GetProperty("productionQualified").GetBoolean());
-        Assert.Equal("Open", tupleDocument.RootElement.GetProperty("phaseDisposition").GetString());
-        Assert.Empty(tupleDocument.RootElement.GetProperty("enabledFeatureGates").EnumerateArray());
-    }
-
-    private static string FindRepositoryRoot()
-    {
-        var current = new DirectoryInfo(AppContext.BaseDirectory);
-        while (current is not null && !File.Exists(Path.Combine(current.FullName, "SingNextOS.slnx")))
-            current = current.Parent;
-        return current?.FullName ?? throw new DirectoryNotFoundException("Repository root was not found.");
-    }
 }

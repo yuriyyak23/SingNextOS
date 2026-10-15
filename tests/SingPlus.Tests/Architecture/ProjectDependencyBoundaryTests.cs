@@ -82,10 +82,7 @@ public sealed class ProjectDependencyBoundaryTests
     public void ActiveProjectMetadataDoesNotReferenceTheFutureArchiveRoot()
     {
         string[] forbidden = ["HybridCPU ISE\\Legacy", "HybridCPU ISE/Legacy"];
-        var violations = Directory.EnumerateFiles(RepositoryRoot, "*.csproj", SearchOption.AllDirectories)
-            .Concat(Directory.EnumerateFiles(RepositoryRoot, "*.props", SearchOption.AllDirectories))
-            .Concat(Directory.EnumerateFiles(RepositoryRoot, "*.targets", SearchOption.AllDirectories))
-            .Concat(Directory.EnumerateFiles(RepositoryRoot, "*.slnx", SearchOption.AllDirectories))
+        var violations = ActiveMetadataFiles(RepositoryRoot)
             .Where(path => !path.Contains("\\bin\\", StringComparison.OrdinalIgnoreCase) &&
                            !path.Contains("\\obj\\", StringComparison.OrdinalIgnoreCase) &&
                            !path.Contains("\\TempEnv\\", StringComparison.OrdinalIgnoreCase))
@@ -94,6 +91,19 @@ public sealed class ProjectDependencyBoundaryTests
             .ToArray();
 
         Assert.Empty(violations);
+    }
+
+    private static IEnumerable<string> ActiveMetadataFiles(string root)
+    {
+        foreach(var path in Directory.EnumerateFiles(root))
+            if(Path.GetExtension(path) is ".csproj" or ".props" or ".targets" or ".slnx")yield return path;
+        foreach(var directory in Directory.EnumerateDirectories(root))
+        {
+            var name=Path.GetFileName(directory);
+            if(name.Equals("bin",StringComparison.OrdinalIgnoreCase) || name.Equals("obj",StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("TempEnv",StringComparison.OrdinalIgnoreCase))continue;
+            foreach(var path in ActiveMetadataFiles(directory))yield return path;
+        }
     }
 
     [Fact]

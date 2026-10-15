@@ -1,5 +1,0 @@
-# Gap navigation
-
-Current bounded implementation status and remaining exits are maintained in [41](41-CURRENT-STATE-AND-OPEN-SLICES.md), with original artifact links. Claims use [05](05-FEATURE-GATES-AND-CLAIMS.md) and [31](31-QUALIFICATION-AND-TEST-MATRIX.md). Historical 2026-09-23 matrix is archived in artifacts/v6/iteration-20261004-roadmap-dev-workflow/history/36-FULL-GAP-MATRIX.md; its absent-schema/trace/canonicalization assertions must not be reapplied to later implemented code.
-
-Before selecting a gap, inspect actual owner/callers and last exact-contour report. Full P04/P05/P10 Partial; original unknown-invocation settlement and artifact release consumers remain open; implemented retention/negative guards are not Missing, physical/stateful/multi-host contours FutureGated. A0 full replacement architecture policy remains open independently of verified non-Boot library compatibility; Boot is excluded. No blanket phase claim; every new gate OFF. Research/dev verification follows [42](42-RESEARCH-DEV-VERIFICATION.md).

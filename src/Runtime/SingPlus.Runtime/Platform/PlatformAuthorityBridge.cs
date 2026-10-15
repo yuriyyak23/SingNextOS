@@ -55,6 +55,7 @@ public sealed partial class PlatformAuthorityBridge
         public PlatformAuthorityResult<PlatformProviderDomainLease>? Observation { get; set; }
         public PlatformAuthorityResult? ReturnedCleanupObservation { get; set; }
         public Func<KernelResult>? LocalCreationClosureConsumer { get; set; }
+        public Func<KernelResult>? LocalCreationNoEffectConsumer { get; set; }
     }
     private enum DomainAuthorityState
     {
@@ -219,7 +220,9 @@ public sealed partial class PlatformAuthorityBridge
         Func<Func<KernelResult>, KernelResult>? sourceCommitConsumer = null,
         Func<KernelResult>? invocationConsumer = null,
         Func<object,KernelResult>? originalCreationConsumer=null,
-        Func<object,KernelResult>? originalCreationClosureConsumer=null)
+        Func<object,KernelResult>? originalCreationClosureConsumer=null,
+        Func<object,KernelResult>? originalCreationNeverInvokedConsumer=null,
+        Func<object,KernelResult>? originalCreationNoEffectConsumer=null)
     {
         if (_backendEpochExhausted)
             return KernelResult<PlatformDomainBinding>.Fail(KernelError.CapacityExhausted,
@@ -271,6 +274,15 @@ public sealed partial class PlatformAuthorityBridge
             {
                 backendEpoch = BackendEpoch;
                 originalInvocation = new(subject, backendEpoch);
+                if (_provider is IPlatformOriginalAdmissionResolutionProvider)
+                    originalInvocation.Request = new(Guid.NewGuid(), subject);
+                if(originalCreationConsumer is not null)
+                {
+                    var retained=originalCreationConsumer(originalInvocation);
+                    if(!retained.IsSuccess)return retained;
+                    originalInvocation.LocalCreationClosureConsumer=()=>originalCreationClosureConsumer?.Invoke(originalInvocation)??KernelResult.Ok();
+                }
+                originalInvocation.LocalCreationNoEffectConsumer=()=>originalCreationNoEffectConsumer?.Invoke(originalInvocation)??KernelResult.Ok();
                 _pendingDomainBinds.Add(subject, originalInvocation);
                 return KernelResult.Ok();
             }
@@ -292,23 +304,25 @@ public sealed partial class PlatformAuthorityBridge
         }
         var invocation = invocationConsumer?.Invoke() ?? KernelResult.Ok();
         if (!invocation.IsSuccess) return KernelResult<PlatformDomainBinding>.Fail(invocation.Error, invocation.Message!);
+        KernelResult AdmitEffect()
+        {
         lock (_secureDomainLifecycleGate)
         {
             if (_backendEpochExhausted || BackendEpoch != backendEpoch ||
                 !_pendingDomainBinds.TryGetValue(subject, out var pending) || !ReferenceEquals(pending, originalInvocation))
-                return KernelResult<PlatformDomainBinding>.Fail(KernelError.PlatformFaulted,
+                return KernelResult.Fail(KernelError.PlatformFaulted,
                     "Original root admission changed before effect; no provider invocation occurred.");
-            originalInvocation.ProviderIncarnation = providerIncarnation;
-            if(originalCreationConsumer is not null)
+            KernelResult Commit()
             {
-                var retained=originalCreationConsumer(originalInvocation); // Trusted local correlation, no provider callback.
-                if(!retained.IsSuccess)return KernelResult<PlatformDomainBinding>.Fail(retained.Error,retained.Message!);
-                originalInvocation.LocalCreationClosureConsumer=()=>originalCreationClosureConsumer?.Invoke(originalInvocation)??KernelResult.Ok();
+                originalInvocation.ProviderIncarnation = providerIncarnation;
+                originalInvocation.EffectMayHaveOccurred = true;
+                return KernelResult.Ok();
             }
-            if (_provider is IPlatformOriginalAdmissionResolutionProvider)
-                originalInvocation.Request = new(Guid.NewGuid(), subject);
-            originalInvocation.EffectMayHaveOccurred = true;
+            return sourceCommitConsumer is null?Commit():sourceCommitConsumer(Commit);
         }
+        }
+        var effectAdmission=admissionConsumer is null?AdmitEffect():admissionConsumer(AdmitEffect);
+        if(!effectAdmission.IsSuccess)return KernelResult<PlatformDomainBinding>.Fail(effectAdmission.Error,effectAdmission.Message!);
         PlatformAuthorityResult<PlatformProviderDomainLease> providerResult;
         try { providerResult = originalInvocation.Request is { } request && _provider is IPlatformOriginalAdmissionResolutionProvider capable
                 ? capable.BindDomain(request) : _provider.BindDomain(subject); }
@@ -413,7 +427,22 @@ public sealed partial class PlatformAuthorityBridge
         }
         return KernelResult<PlatformDomainBinding>.Ok(published);
         }
-        finally { lock (_secureDomainLifecycleGate) _pendingDomainBinds.Remove(subject); }
+        finally
+        {
+            lock(_secureDomainLifecycleGate)
+            {
+                if(_pendingDomainBinds.TryGetValue(subject,out var pending) && ReferenceEquals(pending,originalInvocation))
+                {
+                    if(!originalInvocation.EffectMayHaveOccurred)
+                    {
+                        var consumed=originalCreationNeverInvokedConsumer?.Invoke(originalInvocation)??KernelResult.Ok();
+                        if(!consumed.IsSuccess)_unresolvedDomainBinds.TryAdd(subject,originalInvocation);
+                    }
+                    _pendingDomainBinds.Remove(subject);
+                }
+                else _unresolvedDomainBinds.TryAdd(subject,originalInvocation);
+            }
+        }
     }
 
     // Called outside kernel/capability/owner commit locks after consumer callbacks.

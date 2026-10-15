@@ -9,6 +9,7 @@ public sealed partial class NeutralDomainRuntimeFacade : INeutralOriginalDomainC
         public NeutralOriginalDomainBindRequest Request {get;}
         public NeutralOriginalDomainBindObservation? Raw;
         public NeutralOriginalDomainAdmissionFact? Admission;
+        public bool NoEffect;
     }
     private readonly List<OriginalBindInvocation> _originalBindInvocations=[];
     private ulong _originalBindsIssued;
@@ -64,14 +65,15 @@ public sealed partial class NeutralDomainRuntimeFacade : INeutralOriginalDomainC
                 return new(request, true, refused);
             var invocation=new OriginalBindInvocation(request);
             _originalBindInvocations.Add(invocation);_originalBindsIssued++;
-            var result = Bind(request.Profile);
+            var result = BindCore(request.Profile,out var noEffect);
+            invocation.NoEffect=noEffect;
             if (result is { IsBound: true, Decision: NeutralDomainBindDecision.Bound })
             {
                 var source = _dependencies.Domains[result.Lease.Handle];
                 source.OriginalAdmission = new(request, source);
                 invocation.Admission=source.OriginalAdmission;
             }
-            var raw=new NeutralOriginalDomainBindObservation(request,true,result);
+            var raw=new NeutralOriginalDomainBindObservation(request,true,result){ProvenNoEffect=noEffect};
             invocation.Raw=raw;return raw;
         }
     }
@@ -86,6 +88,9 @@ public sealed partial class NeutralDomainRuntimeFacade : INeutralOriginalDomainC
                 _originalBindInvocations.Distinct(ReferenceEqualityComparer.Instance).Count()!=_originalBindInvocations.Count)return null;
             var facts=_originalBindInvocations.Where(f=>f.Request.InvocationId==request.InvocationId).ToArray();
             if(facts.Length!=1 || facts[0].Request!=request || facts[0].Raw is not { } raw || raw.Request!=request)return null;
+            if(raw.ProvenNoEffect!=facts[0].NoEffect || raw.ProvenNoEffect &&
+                (!raw.SourceFenceMatched || raw.Observation.IsBound || raw.Observation.Lease!=default || facts[0].Admission is not null ||
+                raw.Observation.Decision is not (NeutralDomainBindDecision.Faulted or NeutralDomainBindDecision.UnsupportedProfile)))return null;
             if(raw.Observation.IsBound)
             {
                 var fact=facts[0].Admission;
@@ -119,14 +124,15 @@ public sealed partial class NeutralDomainRuntimeFacade : INeutralOriginalDomainC
                 return new(request,true,refused);
             var invocation=new NeutralOriginalMapInvocation(request,parent.State);
             parent.State.OriginalMaps.Add(invocation);parent.State.OriginalMapsIssued++;
-            var result = MapOwnedRegion(request.Domain, request.Slice);
+            var result = MapOwnedRegionCore(request.Domain, request.Slice,out var noEffect);
+            invocation.NoEffect=noEffect;
             if (result is { IsMapped: true, Decision: NeutralOwnedRegionMapDecision.Mapped })
             {
                 var source = _dependencies.Mappings[result.Lease.Handle];
                 source.OriginalAdmission = new(request, source, parent.State);
                 invocation.Admission=source.OriginalAdmission;
             }
-            var raw=new NeutralOriginalOwnedRegionMapObservation(request,true,result);
+            var raw=new NeutralOriginalOwnedRegionMapObservation(request,true,result){ProvenNoEffect=noEffect};
             invocation.Raw=raw;
             return raw;
         }
@@ -145,6 +151,9 @@ public sealed partial class NeutralDomainRuntimeFacade : INeutralOriginalDomainC
                 parent.OriginalMaps.Distinct(ReferenceEqualityComparer.Instance).Count()!=parent.OriginalMaps.Count)return null;
             var facts=parent.OriginalMaps.Where(f=>f.Request.InvocationId==request.InvocationId).ToArray();
             if(facts.Length!=1 || facts[0].Request!=request || facts[0].Raw is not { } raw || raw.Request!=request)return null;
+            if(raw.ProvenNoEffect!=facts[0].NoEffect || raw.ProvenNoEffect &&
+                (!raw.SourceFenceMatched || raw.Observation.IsMapped || raw.Observation.Lease!=default ||
+                raw.Observation.Decision!=NeutralOwnedRegionMapDecision.Faulted || facts[0].Admission is not null))return null;
             if(raw.Observation.IsMapped)
             {
                 var admission=facts[0].Admission;

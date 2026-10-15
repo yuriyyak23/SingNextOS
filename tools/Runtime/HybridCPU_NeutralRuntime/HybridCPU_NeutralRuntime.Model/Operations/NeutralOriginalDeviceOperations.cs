@@ -2,6 +2,16 @@
 
 public sealed partial class NeutralDomainRuntimeFacade : INeutralOriginalDeviceProvider
 {
+    private static bool OriginalDeviceHistory(NeutralDomainState parent) =>
+        (ulong)parent.OriginalDeviceAdmissions.Count==parent.OriginalDevicesIssued &&
+        parent.OriginalDeviceAdmissions.Distinct(ReferenceEqualityComparer.Instance).Count()==parent.OriginalDeviceAdmissions.Count &&
+        parent.OriginalDeviceAdmissions.All(f=>ReferenceEquals(f.OwnerSelf,f) && ReferenceEquals(f.Parent,parent) &&
+            ReferenceEquals(f.RootAdmission,parent.OriginalAdmission) && ReferenceEquals(f.RootAdmission.Original,f.RootAdmission) &&
+            ReferenceEquals(f.RootAdmission.Source,parent) && f.Request.Domain==parent.Lease &&
+            f.Request.DomainBindInvocationId==f.RootAdmission.Request.InvocationId && f.Request.RuntimeIncarnation==f.RootAdmission.Request.RuntimeIncarnation);
+    private static bool OriginalDeviceNoEffect(NeutralOriginalDeviceAdmissionFact fact,NeutralOriginalDeviceBindObservation raw) =>
+        fact.NoEffect && raw.NoEffectGuaranteed && raw.SourceFenceMatched && raw.Request==fact.Request && fact.Source is null &&
+        raw.Observation is {IsBound:false} result && result.Lease==default && Enum.IsDefined(result.Decision) && result.Decision!=NeutralDeviceBindDecision.Bound;
     public NeutralOriginalDeviceBindObservation BindDevice(NeutralOriginalDeviceBindRequest request)
     {
         lock (_lifecycleGate)
@@ -10,20 +20,21 @@ public sealed partial class NeutralDomainRuntimeFacade : INeutralOriginalDeviceP
             if (request.RuntimeIncarnation != MappingClosureIncarnation) return Refuse(false,true);
             if (_dependencies.Domains.TryGetValue(request.Domain.Handle,out var retained))
             {
-                if ((ulong)retained.OriginalDeviceAdmissions.Count != retained.OriginalDevicesIssued || retained.OriginalDeviceAdmissions.Any(old => !ReferenceEquals(old.OwnerSelf,old) || !ReferenceEquals(old.Parent,retained))) return Refuse(true,false);
+                if (!OriginalDeviceHistory(retained)) return Refuse(true,false);
                 var old = retained.OriginalDeviceAdmissions.Where(old => old.Request.InvocationId == request.InvocationId).ToArray();
                 if (old.Length != 0) return old.Length == 1 && old[0].Request == request && old[0].Observation is { } known &&
-                    (known.NoEffectGuaranteed && old[0].Source is null || old[0].Source is { } source && OriginalDeviceSources(source,old[0],request.RuntimeIncarnation,false)) ? known : Refuse(true,false);
+                    (OriginalDeviceNoEffect(old[0],known) || old[0].Source is { } source && OriginalDeviceSources(source,old[0],request.RuntimeIncarnation,false)) ? known : Refuse(true,false);
             }
             var valid = _leases.Validate(request.Domain);
             if (request.InvocationId == Guid.Empty || !valid.IsValid || valid.State!.OriginalAdmission is not { } root ||
                 !ReferenceEquals(root.Source,valid.State) || root.Request.InvocationId != request.DomainBindInvocationId || root.Request.RuntimeIncarnation != request.RuntimeIncarnation || valid.State.OriginalDevicesIssued == ulong.MaxValue) return Refuse(true,true);
             var fact = new NeutralOriginalDeviceAdmissionFact(request,valid.State,root);
             valid.State.OriginalDeviceAdmissions.Add(fact); valid.State.OriginalDevicesIssued++; // Before possible device effect.
-            var result = BindDeviceCore(request.Domain,request.Device,request.Rights,fact);
+            var result = BindDeviceCore(request.Domain,request.Device,request.Rights,fact,out var noEffect);
+            fact.NoEffect=noEffect;
             if (result is { IsBound: true, Decision: NeutralDeviceBindDecision.Bound })
             { fact.Source = _dependencies.Devices[result.Lease.Handle]; fact.Source.OriginalAdmission = fact; }
-            var raw = new NeutralOriginalDeviceBindObservation(request,true,!result.IsBound && result.Lease == default,result);
+            var raw = new NeutralOriginalDeviceBindObservation(request,true,noEffect,result);
             fact.Observation = raw; return raw;
         }
     }
@@ -32,10 +43,11 @@ public sealed partial class NeutralDomainRuntimeFacade : INeutralOriginalDeviceP
     {
         lock (_lifecycleGate)
         {
-            if (request.RuntimeIncarnation != MappingClosureIncarnation || request.InvocationId == Guid.Empty || !_dependencies.Domains.TryGetValue(request.Domain.Handle,out var parent)) return null;
+            if (request.RuntimeIncarnation != MappingClosureIncarnation || request.InvocationId == Guid.Empty || !_dependencies.Domains.TryGetValue(request.Domain.Handle,out var parent) ||
+                parent.Lease!=request.Domain || !OriginalDeviceHistory(parent)) return null;
             var history = parent.OriginalDeviceAdmissions.Where(old => old.Request.InvocationId == request.InvocationId).ToArray();
             if (history.Length != 1 || history[0].Request != request || !ReferenceEquals(history[0].OwnerSelf,history[0]) || !ReferenceEquals(history[0].Parent,parent) || history[0].Observation is not { } raw || raw.Request != request) return null;
-            if (raw.NoEffectGuaranteed && raw.Observation is { IsBound: false } && raw.Observation.Lease == default && history[0].Source is null) return raw;
+            if (OriginalDeviceNoEffect(history[0],raw)) return raw;
             return history[0].Source is { } source && _dependencies.Devices.TryGetValue(source.Handle,out var routed) && ReferenceEquals(source,routed) &&
                 OriginalDeviceSources(source,history[0],request.RuntimeIncarnation,false) ? raw : null;
         }

@@ -7,7 +7,8 @@ public sealed record DriverMmioResourcePlan(
     string CapabilityResourceId,
     long Offset,
     long Length,
-    PlatformMmioAccess Access);
+    PlatformMmioAccess Access,
+    bool SoftwareRegisterBacking = false);
 
 public sealed record DriverIrqResourcePlan(string CapabilityResourceId);
 
@@ -67,6 +68,8 @@ public sealed class ComponentDriverResourcePlan
                 resource.Access == PlatformMmioAccess.None ||
                 (resource.Access & ~(PlatformMmioAccess.Read | PlatformMmioAccess.Write)) != 0)
                 throw new ArgumentException("Driver MMIO plans require an exact semantic resource, bounded range, and defined access.", nameof(mmio));
+            if(resource.SoftwareRegisterBacking && (!CapabilityResourceIds.TryParseMmioRegion(resource.CapabilityResourceId,out var region) || region.ByteLength>int.MaxValue))
+                throw new ArgumentException("Software register backing requires a canonical bounded managed Region size.",nameof(mmio));
         }
         if (_irqs.Any(static resource => string.IsNullOrWhiteSpace(resource.CapabilityResourceId)))
             throw new ArgumentException("Driver IRQ plans require exact semantic capability resources.", nameof(irqs));
@@ -86,7 +89,8 @@ public sealed class ComponentDriverResourcePlan
 public sealed record MmioResourceGrant(
     string CapabilityResourceId,
     CapabilityId CapabilityId,
-    PlatformMmioLease Lease);
+    PlatformMmioLease Lease,
+    RegionHandle? BackingRegion = null);
 
 public sealed record IrqResourceGrant(
     string CapabilityResourceId,

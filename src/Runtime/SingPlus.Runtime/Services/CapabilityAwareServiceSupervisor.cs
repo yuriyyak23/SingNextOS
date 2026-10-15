@@ -458,6 +458,7 @@ public sealed class CapabilityAwareServiceSupervisor
         ServiceInstanceHandle? instance;
         long? eligible;
         bool restartAfterDrain;
+        ManagedServiceDefinition definitionAtObservation;
         lock (_gate)
         {
             if (!_records.TryGetValue(identity, out var record))
@@ -466,6 +467,22 @@ public sealed class CapabilityAwareServiceSupervisor
             instance = record.Instance;
             eligible = record.RestartEligibleTimestamp;
             restartAfterDrain = record.RestartAfterDrain;
+            definitionAtObservation = record.Definition;
+        }
+
+        // Failed admission has no published service instance. Its original plan
+        // still identifies the existing component owner and retained rollback.
+        if (state == ServiceLifecycleState.Failed && instance is null)
+        {
+            var cleanup = _kernel.ObserveFailedComponentAdmission(definitionAtObservation.Admission);
+            if (!cleanup.IsSuccess) return KernelResult<ServiceSupervisorSnapshot>.Fail(cleanup.Error, cleanup.Message!);
+            lock (_gate)
+            {
+                if (!_records.TryGetValue(identity, out var current) ||
+                    !ReferenceEquals(current.Definition, definitionAtObservation) || current.State != state || current.Instance is not null)
+                    return KernelResult<ServiceSupervisorSnapshot>.Fail(KernelError.StaleGeneration, "Failed admission changed during cleanup observation.");
+                return KernelResult<ServiceSupervisorSnapshot>.Ok(Snapshot(current));
+            }
         }
 
         if (state == ServiceLifecycleState.Stopped && restartAfterDrain)

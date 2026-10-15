@@ -669,7 +669,15 @@ public sealed class RuntimeComputeServiceHost
                 publish,
                 publish ? pending.Destination : null);
             if (!response.IsSuccess)
-                return KernelResult.Fail(response.Error, response.Message!);
+            {
+                if(!publish || pending.Invocation is not { } failedInvocation)
+                    return KernelResult.Fail(response.Error,response.Message!);
+                var cleanup=_kernel.CleanupFailedSessionOwnershipResponse(_service,failedInvocation,pending.Destination);
+                if(!cleanup.IsSuccess)return KernelResult.Fail(response.Error,response.Message!);
+                pending.AbortError=KernelError.PlatformFaulted;
+                pending.AbortMessage="Original ownership response closed without publication after failed quantitative composition.";
+                pending.DestinationReleased=true;
+            }
 
             pending.ResponseFinalized = true;
         }

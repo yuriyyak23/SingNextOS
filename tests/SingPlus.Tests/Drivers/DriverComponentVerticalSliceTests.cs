@@ -371,8 +371,9 @@ public sealed class DriverComponentVerticalSliceTests
         }
     }
 
-    [Fact]
-    public async Task AdmittedDriverOwnsBoundedResourcesAndServesInterruptWithoutDelegatingAuthority()
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public async Task AdmittedDriverOwnsBoundedResourcesAndServesInterruptWithoutDelegatingAuthority(int publicationFault)
     {
         var provider = new DriverProvider();
         var kernel = new RuntimeKernel(provider);
@@ -401,8 +402,33 @@ public sealed class DriverComponentVerticalSliceTests
         provider.QueueInterrupt();
 
         var poll = client.PollAsync().AsTask();
+        if(publicationFault!=0)
+        {
+            kernel.SessionInvocationSettlementReservedHook=()=>
+            {
+                Assert.False(host.ProcessNext().IsSuccess); // Overlap cannot Poll again.
+                if(publicationFault==2)
+                {
+                    var invocation=(EndpointSessionInvocationHandle)typeof(RuntimeDriverInterruptServiceHost).GetField("_pending",global::System.Reflection.BindingFlags.Instance|global::System.Reflection.BindingFlags.NonPublic)!.GetValue(host)!;
+                    var payload=typeof(RuntimeDriverInterruptServiceHost).GetField("_pendingResponse",global::System.Reflection.BindingFlags.Instance|global::System.Reflection.BindingFlags.NonPublic)!.GetValue(host)!;
+                    var endpoint=kernel.EndpointSessions.ResolveForService(session,admitted.Value.Process).Value!.ServiceEndpoint;
+                    Assert.True(kernel.PublishResponse(admitted.Value.Process,endpoint,invocation.InvocationId.Value,payload).IsSuccess);
+                }
+                throw new IOException("Response action not started after committed IRQ delivery");
+            };
+            Assert.Throws<IOException>(()=>host.ProcessNext());
+            kernel.SessionInvocationSettlementReservedHook=null;
+        }
         Assert.True(host.ProcessNext().IsSuccess);
         var delivery = await poll.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.True(host.ReconcileLastPublication().IsSuccess);
+        var publication=(EndpointSessionInvocationRegistry.OriginalPublication)typeof(RuntimeDriverInterruptServiceHost)
+            .GetField("_publication",global::System.Reflection.BindingFlags.Instance|global::System.Reflection.BindingFlags.NonPublic)!.GetValue(host)!;
+        var copied=(EndpointSessionInvocationRegistry.OriginalPublication)typeof(object).GetMethod("MemberwiseClone",global::System.Reflection.BindingFlags.Instance|global::System.Reflection.BindingFlags.NonPublic)!.Invoke(publication,null)!;
+        Assert.False(kernel.ReadOriginalSessionPublication(copied).IsSuccess);
+        Assert.False(new RuntimeKernel().ReadOriginalSessionPublication(publication).IsSuccess);
+        Assert.True(kernel.CloseSession(caller,session).IsSuccess);
+        Assert.True(host.ReconcileLastPublication().IsSuccess); // Original published fact, not current routing/permission.
 
         Assert.Equal(DriverInterruptPollStatus.Delivered, delivery.Status);
         Assert.Equal(KernelEventClass.ExternalSignal, delivery.Event.EventClass);

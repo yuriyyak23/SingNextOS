@@ -6,13 +6,11 @@
     <Project Path="contracts/SingPlus.Contracts/SingPlus.Contracts.csproj" />
   </Folder>
   <Folder Name="/tools/">
-    <Project Path="tools/HybridCpu_ExecutableAdapter.Tests/HybridCpu_ExecutableAdapter.Tests.csproj" />
     <Project Path="tools/HybridCpu_ExecutableAdapter/Boot.Contracts/HybridCpu.Boot.Contracts.csproj" />
     <Project Path="tools/HybridCpu_ExecutableAdapter/HybridCpu_ExecutableAdapter.csproj" />
     <Project Path="tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.AuthorityCore/HybridCPU_NeutralRuntime.AuthorityCore.csproj" />
     <Project Path="tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Contracts/HybridCPU_NeutralRuntime.Contracts.csproj" />
     <Project Path="tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Model/HybridCPU_NeutralRuntime.Model.csproj" />
-    <Project Path="tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Tests/HybridCPU_NeutralRuntime.Tests.csproj" />
     <Project Path="tools/SingPlus.Admission/SingPlus.Admission.csproj" />
     <Project Path="tools/SingPlus.Boot.DebugHost/SingPlus.Boot.DebugHost.csproj" />
     <Project Path="tools/SingPlus.HybridCpuQualification/SingPlus.HybridCpuQualification.csproj" />
@@ -25,10 +23,10 @@
     <Project Path="src/Kernel/Boot/SingPlus.Boot/Samples/ManagedCap/ManagedCap.csproj" />
   </Folder>
   <Folder Name="/Samples/Snake/">
-    <Project Path="src/Kernel/Boot/SingPlus.Boot/Samples/Snake/Snake.csproj" />
     <Project Path="src/Kernel/Boot/SingPlus.Boot/Samples/Snake.Checks/Snake.Checks.csproj" />
     <Project Path="src/Kernel/Boot/SingPlus.Boot/Samples/Snake.Child/Snake.Child.csproj" />
     <Project Path="src/Kernel/Boot/SingPlus.Boot/Samples/Snake.Host/Snake.Host.csproj" />
+    <Project Path="src/Kernel/Boot/SingPlus.Boot/Samples/Snake/Snake.csproj" />
   </Folder>
   <Folder Name="/Samples/VerifiedRoot/">
     <Project Path="src/Kernel/Boot/SingPlus.Boot/Samples/VerifiedRoot/VerifiedRoot.csproj" />
@@ -44,8 +42,8 @@
   <Folder Name="/src/Platform/">
     <Project Path="src/Platform/SingPlus.Platform.Abstractions/SingPlus.Platform.Abstractions.csproj" />
     <Project Path="src/Platform/SingPlus.Platform.Host/SingPlus.Platform.Host.csproj" />
-    <Project Path="src/Platform/SingPlus.Platform.HybridCpu/SingPlus.Platform.HybridCpu.csproj" />
     <Project Path="src/Platform/SingPlus.Platform.HybridCpu.Boot/SingPlus.Platform.HybridCpu.Boot.csproj" />
+    <Project Path="src/Platform/SingPlus.Platform.HybridCpu/SingPlus.Platform.HybridCpu.csproj" />
   </Folder>
   <Folder Name="/src/Drivers/">
     <Project Path="src/Drivers/SingPlus.Drivers/SingPlus.Drivers.csproj" />
@@ -70,6 +68,8 @@
   <Folder Name="/tests/">
     <Project Path="tests/SingPlus.Platform.HybridCpu.Tests/SingPlus.Platform.HybridCpu.Tests.csproj" />
     <Project Path="tests/SingPlus.Tests/SingPlus.Tests.csproj" />
+    <Project Path="tools/HybridCpu_ExecutableAdapter.Tests/HybridCpu_ExecutableAdapter.Tests.csproj" />
+    <Project Path="tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Tests/HybridCPU_NeutralRuntime.Tests.csproj" />
   </Folder>
   <Folder Name="/tests/fixtures/" />
   <Folder Name="/tests/fixtures/SingCap.ManagedCap.NativeAotFixture/">

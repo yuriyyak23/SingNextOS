@@ -658,6 +658,8 @@ public sealed partial class PlatformAuthorityBridge
             else record.Closure = PlatformExternalClosureState.Faulted;
             return KernelResult.Fail(KernelError.PlatformFaulted, "Exact guest source/owner continuity changed; original receipt and parent pin are retained.");
         }
-        return ValidateMappingIdentity(mapping.ParentMapping, mapping.Child.ParentBinding.Subject);
+        // Exact original Unmap is cleanup of this admitted guest/parent lifetime.
+        // Root quarantine withdraws new permission, not this original closure path.
+        return ValidateMappingIdentity(mapping.ParentMapping, mapping.Child.ParentBinding.Subject,requireActiveDomain:false);
     }
 }

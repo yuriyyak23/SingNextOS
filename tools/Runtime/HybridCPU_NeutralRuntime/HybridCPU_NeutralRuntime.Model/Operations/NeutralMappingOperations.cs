@@ -5,7 +5,11 @@ public sealed partial class NeutralDomainRuntimeFacade
     public int ActiveOwnedRegionMappingCount { get { lock (_lifecycleGate) return _dependencies.ActiveMappingCount; } }
 
     public NeutralOwnedRegionMapResult MapOwnedRegion(NeutralDomainBindingLease domain, NeutralOwnedRegionSlice slice)
+        =>MapOwnedRegionCore(domain,slice,out _);
+
+    private NeutralOwnedRegionMapResult MapOwnedRegionCore(NeutralDomainBindingLease domain, NeutralOwnedRegionSlice slice,out bool noEffect)
     {
+        noEffect=false;
         lock (_lifecycleGate)
         {
             var parent = _leases.Validate(domain);
@@ -13,7 +17,7 @@ public sealed partial class NeutralDomainRuntimeFacade
             if (slice.Offset < 0 || slice.Length <= 0 || slice.Offset > long.MaxValue - slice.Length) return new() { Decision = NeutralOwnedRegionMapDecision.InvalidRange };
             if (slice.Access == NeutralMemoryAccess.None || !NeutralRuntimeValidation.IsDefinedFlags(slice.Access, NeutralMemoryAccess.Read | NeutralMemoryAccess.Write)) return new() { Decision = NeutralOwnedRegionMapDecision.InvalidAccess };
             if (!Enum.IsDefined(slice.Coherence)) return new() { Decision = NeutralOwnedRegionMapDecision.InvalidRange, Reason = "Mapping coherence model is invalid." };
-            if (!TryAllocate(ref _nextResource, out var handle)) return new() { Decision = NeutralOwnedRegionMapDecision.Faulted, Reason = "Neutral resource handle space is exhausted." };
+            if (!TryAllocate(ref _nextResource, out var handle)) {noEffect=true;return new() { Decision = NeutralOwnedRegionMapDecision.Faulted, Reason = "Neutral resource handle space is exhausted." };}
             var lease = new NeutralOwnedRegionMappingLease(domain, slice, slice.Coherence, new(handle), new(1));
             _dependencies.RegisterMapping(lease);
             return new() { IsMapped = true, Lease = lease, Decision = NeutralOwnedRegionMapDecision.Mapped };

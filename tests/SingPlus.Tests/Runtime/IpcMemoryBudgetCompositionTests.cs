@@ -78,12 +78,12 @@ public sealed class IpcMemoryBudgetCompositionTests
         Task<KernelResult>? revoke = null;
         using var started = new ManualResetEventSlim();
         var sent = kernel.Channels.Send(kernel.Processes.Resolve(sender).Value!, kernel.Processes.Resolve(receiver).Value!, endpoints.Left, 1, payload, [capability],
-            transferRegion: (source, target, region, _) =>
+            transferRegion: (source, target, region, _, noEffect, prepared) =>
             {
                 revoke = Task.Run(() => { started.Set(); return kernel.CapabilityAuthority.Revoke(capability); });
                 Assert.True(started.Wait(TimeSpan.FromSeconds(5)));
                 Assert.False(revoke.Wait(TimeSpan.FromMilliseconds(150)));
-                return kernel.Regions.Transfer(region, new(source.DomainId, source.Generation), new(target.DomainId, target.Generation));
+                return kernel.Regions.Transfer(region, new(source.DomainId, source.Generation), new(target.DomainId, target.Generation),prepared.Source,prepared);
             });
         Assert.True(sent.IsSuccess);
         Assert.True((await revoke!.WaitAsync(TimeSpan.FromSeconds(5))).IsSuccess);
@@ -390,6 +390,115 @@ public sealed class IpcMemoryBudgetCompositionTests
         if (!exitSource) Assert.True(s.Payload.IsValid);
     }
 
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void LostSendTransferReplyRetainsOriginalProjectionAndIndependentCharges(int path)
+    {
+        var s=Create(path,0);
+        var independent=path==2 ? s.Borrowed! : s.Kernel.AllocateBuffer<byte>(s.Source,4).Value!;
+        independent.Span.Fill(99);
+        s.Payload.Span.Fill(42);
+        PreparedOwnedTransfer? original=null;
+        var effects=0;
+        var producer=typeof(RuntimeKernel).GetMethod("TransferPreparedRegionForIpc",BindingFlags.Instance|BindingFlags.NonPublic)!;
+        KernelResult<RegionHandle> LostReply(SingProcess source,SingProcess target,RegionHandle region,Func<KernelResult>? admission,Action noEffect,PreparedOwnedTransfer prepared)
+        {
+            original=prepared;
+            effects++;
+            var moved=(KernelResult<RegionHandle>)producer.Invoke(s.Kernel,[source,target,region,admission,noEffect,prepared])!;
+            Assert.True(moved.IsSuccess,moved.Message);
+            throw new IOException("lost-original-transfer-reply");
+        }
+        Assert.Throws<IOException>(() =>
+        {
+            if(path==1) s.Kernel.Channels.BeginInlineMoveInvocation(s.SourceProcess,s.TargetProcess,s.Endpoints.Left,1,s.Payload,LostReply);
+            else if(path==2) s.Kernel.Channels.SendOwnershipPair(s.SourceProcess,s.TargetProcess,s.Endpoints.Left,1,s.Borrowed!,s.Payload,null,LostReply);
+            else s.Kernel.Channels.Send(s.SourceProcess,s.TargetProcess,s.Endpoints.Left,1,s.Payload,null,transferRegion:LostReply);
+        });
+        Assert.Same(s.Payload,original!.Source);
+        Assert.False(s.Payload.IsValid);
+        var moved=Assert.IsType<OwnedBuffer<byte>>(original.Projection);
+        Assert.Equal((byte)42,moved.Span[0]);
+        Assert.Equal(KernelError.RegionUseConflict,Transfer(s).Error);
+        Assert.Equal(1,effects);
+        Assert.Equal(4UL,Used(s.Kernel,s.SourceBudget));
+        Assert.Equal(4UL,Used(s.Kernel,s.TargetBudget!.Value));
+        Assert.True(s.Kernel.ReleaseRegion(s.Target,moved).IsSuccess);
+        Assert.Equal(0UL,Used(s.Kernel,s.TargetBudget.Value));
+        Assert.Equal(4UL,Used(s.Kernel,s.SourceBudget));
+        Assert.True(independent.IsValid);
+        if(path!=2)
+        {
+            Assert.Equal((byte)99,independent.Span[0]);
+            Assert.True(s.Kernel.ReleaseRegion(s.Source,independent).IsSuccess);
+            Assert.Equal(0UL,Used(s.Kernel,s.SourceBudget));
+        }
+        else Assert.Equal(RegionState.Loaned,s.Kernel.Regions.Snapshot().Single(r=>r.Handle==independent.Handle).State);
+        Assert.Equal(KernelError.RegionUseConflict,Transfer(s).Error); // Result/release is not pending publication closure.
+    }
+    [Fact]
+    public void ActualSendLateCorrelationFailureRetainsOriginalIpcChargeAndForeignQueue()
+    {
+        var s=Create(0,0);
+        var foreignProtocol=new ProtocolDefinitionV1("foreign-queue","1","Ready",null,[new(1,"Ping")],[new(1,"Ready","Ready")]);
+        var foreign=s.Kernel.CreateChannel(s.Source,s.Target,foreignProtocol,4).Value;
+        Assert.True(s.Kernel.Send(s.Source,s.Target,foreign.Left,1).IsSuccess);
+        var routes=(IDictionary)typeof(RuntimeKernel).GetField("_ipcBudgetReservations",BindingFlags.Instance|BindingFlags.NonPublic)!.GetValue(s.Kernel)!;
+        var foreignKey=(foreign.Left.ChannelId,1UL);
+        var collidedKey=(s.Endpoints.Left.ChannelId,1UL);
+        var foreignFact=routes[foreignKey]!;
+        routes[collidedKey]=foreignFact; // Existing foreign routing cannot justify compensation.
+        Assert.Throws<ArgumentException>(()=>s.Kernel.Send(s.Source,s.Target,s.Endpoints.Left,1,s.Payload));
+        Assert.Equal(foreignFact,routes[foreignKey]);
+        Assert.Equal(foreignFact,routes[collidedKey]);
+        Assert.False(s.Payload.IsValid);
+        var records=(IDictionary)typeof(ChannelRegistry).GetField("_ownedChannels",BindingFlags.Instance|BindingFlags.NonPublic)!.GetValue(s.Kernel.Channels)!;
+        var original=records[s.Endpoints.Left.ChannelId]!;
+        var pending=((ProcessHandle Owner,BudgetReservationHandle Reservation))original.GetType().GetProperty("PendingSendBudget")!.GetValue(original)!;
+        Assert.Equal(s.Source,pending.Owner);
+        Assert.Equal(BudgetReservationState.Quarantined,s.Kernel.QueryBudget(pending.Reservation).Value!.State);
+        Assert.Equal(KernelError.RegionUseConflict,s.Kernel.Send(s.Source,s.Target,s.Endpoints.Left,1,s.Payload).Error);
+        Assert.Equal(4UL,Used(s.Kernel,s.TargetBudget!.Value));
+        var region=s.Kernel.Regions.Snapshot().Single(r=>r.Owner==new RegionOwner(s.TargetProcess.DomainId,s.Target.Generation));
+        var moved=Assert.IsType<OwnedBuffer<byte>>(s.Kernel.Regions.CaptureTransferPayload(region.Handle,region.Owner).Value);
+        Assert.True(s.Kernel.ReleaseRegion(s.Target,moved).IsSuccess);
+        Assert.Equal(0UL,Used(s.Kernel,s.TargetBudget.Value));
+        Assert.True(s.Kernel.Receive(s.Target,foreign.Right).IsSuccess);
+        Assert.Equal(BudgetReservationState.Quarantined,s.Kernel.QueryBudget(pending.Reservation).Value!.State);
+        Assert.NotNull(original.GetType().GetProperty("PendingSendBudget")!.GetValue(original));
+    }
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void TargetQuantitativeRouteCollisionCannotPublishTransferOrEraseSourceCharge(int path)
+    {
+        var s=Create(path,0);
+        var old=s.Payload.Handle;
+        var sourceCharge=Charges(s.Kernel)[old];
+        var next=new RegionHandle(old.RegionId,new RegionGeneration(old.Generation.Value+1));
+        Charges(s.Kernel)[next]=sourceCharge;
+        var foreign=TestFixtures.Create(s.Kernel,617,6170).Handle;
+        var independent=s.Kernel.AllocateBuffer<byte>(foreign,4).Value!;
+        independent.Span.Fill(99);
+        var result=Transfer(s);
+        Assert.Equal(KernelError.PlatformFaulted,result.Error);
+        Assert.False(s.Payload.IsValid); // Region effect happened; failed composition is not no-effect.
+        Assert.Equal(sourceCharge,Charges(s.Kernel)[old]);
+        Assert.Equal(sourceCharge,Charges(s.Kernel)[next]);
+        Assert.Equal(BudgetReservationState.Active,s.Kernel.QueryBudget(sourceCharge.Reservation).Value!.State);
+        Assert.Equal(path==2 ? 8UL : 4UL,Used(s.Kernel,s.SourceBudget));
+        Assert.Equal(4UL,Used(s.Kernel,s.TargetBudget!.Value));
+        var target=Assert.Single(s.Kernel.Budgets.OriginalRegionCharges(next));
+        Assert.Equal(s.Target,target.Owner);
+        Assert.Equal(BudgetReservationState.Quarantined,s.Kernel.QueryBudget(target.Reservation).Value!.State);
+        var actual=s.Kernel.Regions.Snapshot().Single(r=>r.Handle.RegionId==old.RegionId);
+        Assert.Equal(next,actual.Handle);
+        Assert.False(Transfer(s).IsSuccess);
+        Assert.Equal(actual,s.Kernel.Regions.Snapshot().Single(r=>r.Handle.RegionId==old.RegionId));
+        Assert.Equal((byte)99,independent.Span[0]);
+        Assert.True(s.Kernel.ReleaseRegion(foreign,independent).IsSuccess);
+        Assert.Equal(4UL,Used(s.Kernel,s.TargetBudget.Value));
+        Assert.Equal(sourceCharge,Charges(s.Kernel)[next]);
+    }
     private static Scenario Create(int path, int targetMode)
     {
         var kernel = new RuntimeKernel();
@@ -461,3 +570,8 @@ public sealed class IpcMemoryBudgetCompositionTests
         BudgetAccountHandle SourceBudget, BudgetAccountHandle? TargetBudget, OwnedBuffer<byte> Payload, OwnedBuffer<byte>? Borrowed,
         (ChannelEndpointHandle Left, ChannelEndpointHandle Right) Endpoints, int Path, ulong Sequence);
 }
+
+
+
+
+

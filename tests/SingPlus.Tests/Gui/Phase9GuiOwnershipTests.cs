@@ -13,6 +13,226 @@ namespace SingPlus.Tests.Gui;
 
 public sealed class Phase9GuiOwnershipTests
 {
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)] [InlineData(4)] [InlineData(5)]
+    public async Task ActualReturningBudgetRefusalClosesOriginalSourceWithoutRegionTransferOrRereserve(int failure)
+    {
+        var s=CreateScenario(4170);
+        var flags=BindingFlags.Instance|BindingFlags.NonPublic;
+        var client=ICompositorServiceRuntimeClient.Create(new RuntimeSipClientTransport(s.Kernel,s.Caller,s.Session));
+        var pixels=s.Kernel.AllocateBuffer<byte>(s.Caller,16).Value!;
+        var foreign=s.Kernel.AllocateBuffer<byte>(s.Caller,16).Value!;foreign.Span.Fill(99);
+        var registering=client.RegisterSurfaceAsync(new(s.Capability,pixels.Handle,Metadata())).AsTask();
+        Assert.True(s.Host.ProcessNext().IsSuccess);var surface=(await registering).Authority.Surface;
+        var preparing=client.PreparePresentAsync(new(surface,PresentTransferMode.Move)).AsTask();
+        Assert.True(s.Host.ProcessNext().IsSuccess);await preparing;
+        var reply=client.PresentMoveAsync(pixels).AsTask();Assert.True(s.Host.AcceptNext().IsSuccess);
+        var old=s.Kernel.Regions.Snapshot().Single(r=>r.Handle.RegionId==pixels.Handle.RegionId).Handle;
+        var sourceCharge=Assert.Single(s.Kernel.Budgets.OriginalRegionCharges(old));
+        var filler=s.Kernel.AllocateBuffer<byte>(s.Caller,failure>=4 ? 16 : 240).Value!;filler.Span.Fill(77);
+        RegionUseDescriptor? use=null;
+        if(failure!=0)
+            s.Kernel.SessionInvocationSettlementReservedHook=()=>
+            {
+                s.Kernel.SessionInvocationSettlementReservedHook=null;
+                use=s.Kernel.Regions.AcquireUse(old,new RegionOwner(s.Kernel.Processes.Resolve(s.Service).Value!.DomainId,s.Service.Generation),RegionUseMode.ExclusiveWrite,new(0,16)).Value!;
+            };
+        Assert.Equal(KernelError.PlatformFaulted,s.Host.CompleteAccepted().Error);
+        if(failure!=0)
+        {
+            Assert.False(reply.IsCompleted);
+            var invocations=(EndpointSessionInvocationRegistry)typeof(RuntimeKernel).GetProperty("SessionInvocations",flags)!.GetValue(s.Kernel)!;
+            var records=(global::System.Collections.IDictionary)typeof(EndpointSessionInvocationRegistry).GetField("_ownedRecords",flags)!.GetValue(invocations)!;
+            var record=records[(s.Session.SessionId,s.Session.Generation,new EndpointSessionInvocationId(3))]!;
+            var publication=(ResponseRegistry.OriginalPublication)record.GetType().GetProperty("OriginalResponse")!.GetValue(record)!;
+            var property=publication.Completion.GetType().GetProperty("OriginalTransferProducer")!;
+            var producer=(ResponseRegistry.TransferProducer)property.GetValue(publication.Completion)!;
+            if(failure<4)
+            {
+                Assert.Equal(KernelError.BudgetExceeded,producer.BudgetRefusal);
+                Assert.Null(producer.Raw);Assert.Null(producer.TargetReservation);Assert.Null(producer.TargetBudgetOwner);
+            }
+            else
+            {
+                Assert.Null(producer.BudgetRefusal);
+                Assert.Equal(KernelError.RegionUseConflict,producer.Raw!.Value.Error);
+                Assert.False(producer.Raw.Value.IsSuccess);
+                Assert.Equal(BudgetReservationState.Released,s.Kernel.QueryBudget(producer.TargetReservation!.Value).Value!.State);
+                if(failure==5)
+                {
+                    var saved=producer.Raw;producer.Raw=null;
+                    Assert.False(s.Host.CompleteAccepted().IsSuccess);Assert.False(reply.IsCompleted);
+                    producer.Raw=saved;
+                }
+            }
+            Assert.Equal(BudgetReservationState.Active,s.Kernel.QueryBudget(sourceCharge.Reservation).Value!.State);
+            Assert.Equal(old,s.Kernel.Regions.Snapshot().Single(r=>r.Handle.RegionId==old.RegionId).Handle);
+            Assert.True(s.Kernel.Regions.ReleaseUse(use!.Handle,use.Principal).IsSuccess);
+            if(failure==2)
+            {
+                var clone=typeof(object).GetMethod("MemberwiseClone",flags)!.Invoke(producer,null)!;
+                property.SetValue(publication.Completion,clone);
+                Assert.False(s.Host.CompleteAccepted().IsSuccess);Assert.False(reply.IsCompleted);
+                property.SetValue(publication.Completion,producer);
+            }
+            if(failure==3)
+            {
+                producer.BudgetAdmissionKnown=false;
+                Assert.False(s.Host.CompleteAccepted().IsSuccess);Assert.False(reply.IsCompleted);
+                producer.BudgetAdmissionKnown=true;
+            }
+            Assert.True(s.Kernel.RevokeCapability(s.Capability).IsSuccess);
+            Assert.Equal(KernelError.PlatformFaulted,s.Host.CompleteAccepted().Error);
+        }
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(()=>reply.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(old,s.Kernel.Regions.Snapshot().Single(r=>r.Handle.RegionId==old.RegionId).Handle);
+        Assert.Equal(RegionState.Released,s.Kernel.Regions.Snapshot().Single(r=>r.Handle==old).State);
+        Assert.Empty(s.Kernel.Budgets.OriginalRegionCharges(new(old.RegionId,new(old.Generation.Value+1))));
+        Assert.Equal(BudgetReservationState.Released,s.Kernel.QueryBudget(sourceCharge.Reservation).Value!.State);
+        Assert.Equal(0UL,s.Kernel.QueryBudget(s.ServiceBudget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.Equal(failure>=4 ? 32UL : 256UL,s.Kernel.QueryBudget(s.CallerBudget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.Equal(SurfaceLifecycleState.Closed,s.Host.GetSurfaceState(surface));
+        Assert.Equal((byte)99,foreign.Span[0]);Assert.Equal((byte)77,filler.Span[0]);
+        Assert.Equal(KernelError.PlatformBindingNotFound,s.Host.CompleteAccepted().Error);
+        Assert.True(s.Kernel.CloseSession(s.Caller,s.Session).IsSuccess);
+        Assert.True(s.Kernel.ReleaseRegion(s.Caller,foreign).IsSuccess);Assert.True(s.Kernel.ReleaseRegion(s.Caller,filler).IsSuccess);
+        Assert.Equal(0UL,s.Kernel.QueryBudget(s.CallerBudget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)] [InlineData(3)]
+    [InlineData(4)] [InlineData(5)] [InlineData(6)] [InlineData(7)]
+    public async Task ActualCompositorFailedReturnClosesOriginalSurfaceAndQuantitiesWithoutRepeat(int failure)
+    {
+        var s=CreateScenario(4050);
+        var flags=BindingFlags.Instance|BindingFlags.NonPublic;
+        var client=ICompositorServiceRuntimeClient.Create(new RuntimeSipClientTransport(s.Kernel,s.Caller,s.Session));
+        var pixels=s.Kernel.AllocateBuffer<byte>(s.Caller,16).Value!;
+        var foreign=s.Kernel.AllocateBuffer<byte>(s.Caller,16).Value!;foreign.Span.Fill(99);
+        async Task<SurfaceHandle> Register(OwnedBuffer<byte> buffer)
+        {
+            var task=client.RegisterSurfaceAsync(new(s.Capability,buffer.Handle,Metadata())).AsTask();
+            Assert.True(s.Host.ProcessNext().IsSuccess);
+            return (await task).Authority.Surface;
+        }
+        var surface=await Register(pixels);
+        var foreignSurface=await Register(foreign);
+        var prepare=client.PreparePresentAsync(new(surface,PresentTransferMode.Move)).AsTask();
+        Assert.True(s.Host.ProcessNext().IsSuccess);await prepare;
+        var present=client.PresentMoveAsync(pixels).AsTask();
+        Assert.True(s.Host.AcceptNext().IsSuccess);
+        var old=s.Kernel.Regions.Snapshot().Single(r=>r.Handle.RegionId==pixels.Handle.RegionId).Handle;
+        var next=new RegionHandle(old.RegionId,new(old.Generation.Value+1));
+        var sourceCharge=Assert.Single(s.Kernel.Budgets.OriginalRegionCharges(old));
+        var routes=(global::System.Collections.IDictionary)typeof(RuntimeKernel).GetField("_regionBudgetReservations",flags)!.GetValue(s.Kernel)!;
+        routes[next]=(sourceCharge.Owner,sourceCharge.Reservation);
+        var acceptedField=typeof(RuntimeCompositorServiceHost).GetField("_accepted",flags)!;
+        var accepted=acceptedField.GetValue(s.Host)!;
+        var originalSurface=accepted.GetType().GetProperty("Surface")!.GetValue(accepted)!;
+        var surfaces=(global::System.Collections.IDictionary)typeof(RuntimeCompositorServiceHost).GetField("_surfaces",flags)!.GetValue(s.Host)!;
+        var foreignRecord=surfaces[foreign.Handle.RegionId]!;
+        var clone=typeof(object).GetMethod("MemberwiseClone",flags)!;
+        ulong Used(bool service)=>s.Kernel.QueryBudget(service?s.ServiceBudget:s.CallerBudget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used;
+        if(failure!=0)
+        {
+            var invocation=(EndpointSessionInvocationHandle)accepted.GetType().GetProperty("Invocation")!.GetValue(accepted)!;
+            var input=accepted.GetType().GetProperty("Payload")!.GetValue(accepted)!;
+            var endpoint=s.Kernel.EndpointSessions.Resolve(s.Session,s.Caller).Value!.ServiceEndpoint;
+            s.Kernel.SessionInvocationSettlementReservedHook=()=>
+            {
+                s.Kernel.SessionInvocationSettlementReservedHook=null;
+                Assert.Equal(KernelError.SessionDraining,s.Host.CompleteAccepted().Error);
+                Assert.Equal(KernelError.PlatformFaulted,s.Kernel.PublishResponse(s.Service,endpoint,invocation.InvocationId.Value,input).Error);
+                throw new IOException("Original compositor return effect retained across lost outer action");
+            };
+            Assert.Throws<IOException>(()=>s.Host.CompleteAccepted());
+            Assert.Equal(next,s.Kernel.Regions.Snapshot().Single(r=>r.Handle.RegionId==old.RegionId).Handle);
+            Assert.Equal(16UL,Used(true));Assert.Equal(32UL,Used(false));
+            if(failure==1)surfaces.Remove(old.RegionId);
+            if(failure==2)surfaces[old.RegionId]=foreignRecord;
+            if(failure==3)acceptedField.SetValue(s.Host,clone.Invoke(accepted,null));
+            if(failure==4)surfaces[old.RegionId]=clone.Invoke(originalSurface,null);
+            var generation=originalSurface.GetType().GetProperty("RegisteredRegionGeneration")!;
+            var originalGeneration=generation.GetValue(originalSurface)!;
+            if(failure==5)generation.SetValue(originalSurface,new RegionGeneration(old.Generation.Value));
+            var invocations=(EndpointSessionInvocationRegistry)typeof(RuntimeKernel).GetProperty("SessionInvocations",flags)!.GetValue(s.Kernel)!;
+            var records=(global::System.Collections.IDictionary)typeof(EndpointSessionInvocationRegistry).GetField("_ownedRecords",flags)!.GetValue(invocations)!;
+            var record=records[(s.Session.SessionId,s.Session.Generation,invocation.InvocationId)]!;
+            var publication=(ResponseRegistry.OriginalPublication)record.GetType().GetProperty("OriginalResponse")!.GetValue(record)!;
+            var producer=(ResponseRegistry.TransferProducer)publication.Completion.GetType().GetProperty("OriginalTransferProducer")!.GetValue(publication.Completion)!;
+            var raw=producer.Raw;
+            if(failure==7)producer.Raw=null;
+            RegionUseDescriptor? use=failure==6 ? s.Kernel.Regions.AcquireUse(next,producer.TargetOwner,RegionUseMode.ExclusiveWrite,new(0,16)).Value : null;
+            Assert.False(s.Host.CompleteAccepted().IsSuccess);
+            Assert.False(present.IsCompleted);
+            Assert.Equal(failure==6 ? 0UL : 16UL,Used(true));Assert.Equal(32UL,Used(false));
+            Assert.Equal(BudgetReservationState.Quarantined,s.Kernel.QueryBudget(producer.TargetReservation!.Value).Value!.State);
+            Assert.Equal(SurfaceLifecycleState.Writable,s.Host.GetSurfaceState(foreignSurface));
+            Assert.Equal((byte)99,foreign.Span[0]);
+            surfaces[old.RegionId]=originalSurface;
+            acceptedField.SetValue(s.Host,accepted);
+            generation.SetValue(originalSurface,originalGeneration);
+            producer.Raw=raw;
+            if(use is not null)
+            {
+                Assert.True(s.Kernel.RevokeCapability(s.Capability).IsSuccess);
+                Assert.True(s.Kernel.Regions.ReleaseUse(use.Handle,producer.TargetOwner).IsSuccess);
+            }
+        }
+        Assert.Equal(KernelError.PlatformFaulted,s.Host.CompleteAccepted().Error);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(()=>present.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(SurfaceLifecycleState.Closed,s.Host.GetSurfaceState(surface));
+        Assert.Equal(SurfaceLifecycleState.Writable,s.Host.GetSurfaceState(foreignSurface));
+        Assert.Equal(RegionState.Released,s.Kernel.Regions.Snapshot().Single(r=>r.Handle==next).State);
+        Assert.Equal(BudgetReservationState.Released,s.Kernel.QueryBudget(sourceCharge.Reservation).Value!.State);
+        Assert.Equal(BudgetReservationState.Released,s.Kernel.QueryBudget(Assert.Single(s.Kernel.Budgets.OriginalRegionCharges(next)).Reservation).Value!.State);
+        Assert.Equal(0UL,Used(true));Assert.Equal(16UL,Used(false));
+        Assert.Equal((sourceCharge.Owner,sourceCharge.Reservation),routes[next]);
+        Assert.Equal((byte)99,foreign.Span[0]);
+        Assert.Equal(KernelError.PlatformBindingNotFound,s.Host.CompleteAccepted().Error);
+        Assert.Equal(next,s.Kernel.Regions.Snapshot().Single(r=>r.Handle.RegionId==old.RegionId).Handle);
+        Assert.True(s.Kernel.CloseSession(s.Caller,s.Session).IsSuccess);
+        Assert.True(s.Kernel.ReleaseRegion(s.Caller,foreign).IsSuccess);
+        Assert.Equal(0UL,Used(false));
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public async Task GeneratedSingleMoveRetainsOriginalCustodyForFailedQuantitativeComposition(bool loseSourceRoute)
+    {
+        var s=CreateScenario(3950);
+        var transport=new RuntimeSipClientTransport(s.Kernel,s.Caller,s.Session);
+        var client=ICompositorServiceRuntimeClient.Create(transport);
+        var pixels=s.Kernel.AllocateBuffer<byte>(s.Caller,16).Value!;
+        var old=pixels.Handle;
+        var charge=Assert.Single(s.Kernel.Budgets.OriginalRegionCharges(old));
+        var next=new RegionHandle(old.RegionId,new(old.Generation.Value+1));
+        var routes=(global::System.Collections.IDictionary)typeof(RuntimeKernel).GetField("_regionBudgetReservations",BindingFlags.Instance|BindingFlags.NonPublic)!.GetValue(s.Kernel)!;
+        routes[next]=(charge.Owner,charge.Reservation);
+        var independent=s.Kernel.AllocateBuffer<byte>(s.Caller,16).Value!;
+        independent.Span.Fill(99);
+        await Assert.ThrowsAsync<InvalidOperationException>(()=>client.PresentMoveAsync(pixels).AsTask());
+        Assert.True(transport.HasPendingOwnershipSend);
+        Assert.Equal(next,s.Kernel.Regions.Snapshot().Single(r=>r.Handle.RegionId==old.RegionId).Handle);
+        Assert.False(s.Host.AcceptNext().IsSuccess);
+        await Assert.ThrowsAsync<InvalidOperationException>(()=>client.PresentMoveAsync(independent).AsTask());
+        Assert.Equal((byte)99,independent.Span[0]);
+        if(loseSourceRoute) routes.Remove(old);
+        Assert.True(transport.CleanupPendingOwnershipSend().IsSuccess);
+        Assert.True(transport.CleanupPendingOwnershipSend().IsSuccess);
+        Assert.False(transport.HasPendingOwnershipSend);
+        Assert.Equal(0,s.Kernel.EndpointSessions.ActivePinCount(s.Session));
+        Assert.Equal(RegionState.Released,s.Kernel.Regions.Snapshot().Single(r=>r.Handle==next).State);
+        Assert.Equal(BudgetReservationState.Released,s.Kernel.QueryBudget(charge.Reservation).Value!.State);
+        Assert.Equal(BudgetReservationState.Released,s.Kernel.QueryBudget(Assert.Single(s.Kernel.Budgets.OriginalRegionCharges(next)).Reservation).Value!.State);
+        Assert.Equal(16UL,s.Kernel.QueryBudget(s.CallerBudget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.Equal(0UL,s.Kernel.QueryBudget(s.ServiceBudget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.Equal((charge.Owner,charge.Reservation),routes[next]);
+        var registration=client.RegisterSurfaceAsync(new(s.Capability,independent.Handle,Metadata())).AsTask();
+        Assert.True(s.Host.ProcessNext().IsSuccess);
+        Assert.NotNull((await registration).Authority);
+    }
+
     [Fact]
     public async Task CompositorSurfaceLastIdentityPublishesOnceAndNextAdmissionHasNoEffect()
     {
@@ -268,15 +488,19 @@ public sealed class Phase9GuiOwnershipTests
         Assert.Equal(9, surface.WritablePixels[0]);
     }
 
-    [Fact]
-    public async Task MoveAdvancesRegionGenerationAndReturnsExclusiveAuthorityOnlyThroughResponse()
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public async Task MoveAdvancesRegionGenerationAndReturnsExclusiveAuthorityOnlyThroughResponse(bool publicationThrow)
     {
         var scenario = CreateScenario();
+        var foreign=CreateScenario(3900);var foreignPixels=foreign.Kernel.AllocateBuffer<byte>(foreign.Caller,16).Value!;foreignPixels.Span.Fill(99);
+        ulong Used(Scenario owner,bool service=false)=>owner.Kernel.QueryBudget(service?owner.ServiceBudget:owner.CallerBudget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used;
         var compositor = new Compositor(ICompositorServiceRuntimeClient.Create(new RuntimeSipClientTransport(scenario.Kernel, scenario.Caller, scenario.Session)), scenario.Capability);
         var register = compositor.RegisterAsync(scenario.Kernel.AllocateBuffer<byte>(scenario.Caller, 16).Value!, Metadata()).AsTask();
         var registrationResult = scenario.Host.ProcessNext();
         Assert.True(registrationResult.IsSuccess, registrationResult.Message);
         var surface = await register;
+        Assert.Equal(16UL,Used(scenario));Assert.Equal(0UL,Used(scenario,true));
         var before = surface.Pixels.Handle.Generation;
 
         var present = compositor.PresentMoveAsync(surface).AsTask();
@@ -292,13 +516,34 @@ public sealed class Phase9GuiOwnershipTests
                 acceptance.Message != "Channel queue is empty.";
         }, 1000), "The moved present request was not delivered within the test bound.");
         Assert.True(acceptance.IsSuccess, acceptance.Message);
+        Assert.Equal(0UL,Used(scenario));Assert.Equal(16UL,Used(scenario,true));
         Assert.Throws<InvalidOperationException>(() => _ = surface.WritablePixels.Length);
         Assert.False(present.IsCompleted);
+        if(publicationThrow)
+        {
+            scenario.Kernel.SessionInvocationSettlementReservedHook=()=>
+            {
+                var work=typeof(RuntimeCompositorServiceHost).GetField("_accepted",BindingFlags.Instance|BindingFlags.NonPublic)!.GetValue(scenario.Host)!;
+                var invocation=(EndpointSessionInvocationHandle)work.GetType().GetProperty("Invocation")!.GetValue(work)!;
+                var payload=work.GetType().GetProperty("Payload")!.GetValue(work)!;
+                var service=(ProcessHandle)typeof(RuntimeCompositorServiceHost).GetField("_service",BindingFlags.Instance|BindingFlags.NonPublic)!.GetValue(scenario.Host)!;
+                var endpoint=scenario.Kernel.EndpointSessions.ResolveForService(scenario.Session,service).Value!.ServiceEndpoint;
+                Assert.True(scenario.Kernel.PublishResponse(service,endpoint,invocation.InvocationId.Value,payload).IsSuccess);
+                throw new IOException("Committed original ownership return acknowledgement lost");
+            };
+            Assert.Throws<IOException>(()=>scenario.Host.CompleteAccepted());
+            scenario.Kernel.SessionInvocationSettlementReservedHook=null;
+        }
         Assert.True(scenario.Host.CompleteAccepted().IsSuccess);
         await present;
 
         Assert.Equal(before.Value + 2, surface.Pixels.Handle.Generation.Value);
         surface.WritablePixels.Fill(3);
+        Assert.Equal(16UL,Used(scenario));Assert.Equal(0UL,Used(scenario,true));
+        Assert.All(foreignPixels.Span.ToArray(),value=>Assert.Equal((byte)99,value));Assert.Equal(16UL,Used(foreign));
+        Assert.True(scenario.Kernel.ReleaseRegion(scenario.Caller,surface.Pixels).IsSuccess);
+        Assert.Equal(0UL,Used(scenario));Assert.Equal(0UL,Used(scenario,true));
+        Assert.True(foreign.Kernel.ReleaseRegion(foreign.Caller,foreignPixels).IsSuccess);Assert.Equal(0UL,Used(foreign));
     }
 
     [Fact]
@@ -504,7 +749,8 @@ public sealed class Phase9GuiOwnershipTests
         var capability = Mint(kernel, caller, ResourceKind.Compositor, CapabilityResourceIds.CompositorPresent, CapabilityRights.Read | CapabilityRights.Write);
         var session = kernel.OpenSession(caller, admitted.Descriptor, [capability]).Value;
         var host = RuntimeCompositorServiceHost.CreateForSession(kernel, admitted.Process, session).Value!;
-        return new(kernel, admitted.Process, caller, admitted.Descriptor, capability, session, host);
+        return new(kernel, admitted.Process, caller, admitted.Descriptor, capability, session, host,budget.Value!.ProcessBudget,
+            kernel.QueryComponent(new($"phase9-compositor-{seed}")).Value!.ProcessBudget);
     }
 
     private static CapabilityId Mint(RuntimeKernel kernel, ProcessHandle owner, ResourceKind kind, string resource, CapabilityRights rights) =>
@@ -523,5 +769,5 @@ public sealed class Phase9GuiOwnershipTests
     }
 
     private static string FindRoot() { var directory = new DirectoryInfo(AppContext.BaseDirectory); while (directory is not null && !File.Exists(Path.Combine(directory.FullName, "SingNextOS.slnx"))) directory = directory.Parent; return directory!.FullName; }
-    private sealed record Scenario(RuntimeKernel Kernel, ProcessHandle Service, ProcessHandle Caller, ServiceEndpointDescriptor Descriptor, CapabilityId Capability, EndpointSessionHandle Session, RuntimeCompositorServiceHost Host);
+    private sealed record Scenario(RuntimeKernel Kernel, ProcessHandle Service, ProcessHandle Caller, ServiceEndpointDescriptor Descriptor, CapabilityId Capability, EndpointSessionHandle Session, RuntimeCompositorServiceHost Host,BudgetAccountHandle CallerBudget,BudgetAccountHandle ServiceBudget);
 }

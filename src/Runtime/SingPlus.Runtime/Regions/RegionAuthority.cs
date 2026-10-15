@@ -23,7 +23,7 @@ internal sealed record RegionAuthorityInspectionRecord(
     IReadOnlyList<RegionUseDescriptor> Uses,
     IReadOnlyList<RegionDamageDescriptorV1> Damage);
 
-public sealed class RegionAuthority
+public sealed partial class RegionAuthority
 {
     private sealed class RegionUseRecord
     {
@@ -35,6 +35,7 @@ public sealed class RegionAuthority
         public required MutationEpoch MutationEpoch { get; init; }
         public required RegionUseState State { get; set; }
         public ExternalOperationHandle? ReleaseOwnerOperation { get; init; }
+        public MmioBufferPayload? ReleaseOwnerMmio { get; init; }
         public BorrowLeaseHandle? OriginalBorrowLease { get; init; }
     }
 
@@ -51,7 +52,9 @@ public sealed class RegionAuthority
         public RegionOwner? Borrower { get; set; }
         public BorrowLeaseGeneration BorrowGeneration { get; set; }
         public BorrowLeaseLifetime? BorrowLifetime { get; set; }
+        public BorrowLeaseLifetime? OriginalWithdrawnBorrow { get; set; }
         public ITransferableOwnedPayload? Payload { get; set; }
+        public ITransferableOwnedPayload? OriginalWithdrawnPayload { get; set; }
         public bool PlatformMappingReserved { get; set; }
         public bool ExternalBorrowReadGrantReserved { get; set; }
         public RegionBackingLeaseDescriptor? BackingLease { get; set; }
@@ -602,7 +605,7 @@ public sealed class RegionAuthority
         if (!mutation.IsSuccess) return KernelResult<BorrowLeaseGrant>.Fail(mutation.Error, mutation.Message!);
 
         var generation = new BorrowLeaseGeneration(record.BorrowGeneration.Value + 1);
-        var lifetime = new BorrowLeaseLifetime();
+        var lifetime = new BorrowLeaseLifetime(record);
         var lease = new BorrowLeaseHandle(new RegionHandle(record.Id, record.Generation), generation);
         record.BorrowGeneration = generation;
         record.Borrower = borrower;
@@ -880,14 +883,19 @@ public sealed class RegionAuthority
             return ValidateCore(record, handle, owner, RegionState.Owned).IsSuccess && record.PlatformMappingReserved;
     }
 
-    internal KernelResult<RegionHandle> Transfer(RegionHandle handle, RegionOwner source, RegionOwner target)
+    internal KernelResult<RegionHandle> Transfer(RegionHandle handle, RegionOwner source, RegionOwner target,
+        ITransferableOwnedPayload? originalPayload = null,PreparedOwnedTransfer? prepared = null)
     {
         if (!_regions.TryGetValue(handle.RegionId, out var record))
             return KernelResult<RegionHandle>.Fail(KernelError.RegionNotFound, "Region was not found.");
         lock (record.Gate)
         {
+        lock(prepared?.CustodyGate ?? record.Gate)
+        {
         var validation = ValidateCore(record, handle, source, RegionState.Owned);
         if (!validation.IsSuccess) return KernelResult<RegionHandle>.Fail(validation.Error, validation.Message!);
+        if(originalPayload is not null && !ReferenceEquals(record.Payload,originalPayload))
+            return KernelResult<RegionHandle>.Fail(KernelError.StaleHandle,"Original Region payload changed before transfer effect.");
         if (record.Damage.Count != 0) return KernelResult<RegionHandle>.Fail(KernelError.Quarantined,
             "A Region with quarantined subrange damage cannot be transferred before authoritative replacement.");
         if (record.PlatformMappingReserved) return KernelResult<RegionHandle>.Fail(KernelError.PlatformBindingActive, "An owned region with an active platform mapping cannot be transferred.");
@@ -902,19 +910,33 @@ public sealed class RegionAuthority
         if (record.Generation.Value == ulong.MaxValue) return KernelResult<RegionHandle>.Fail(KernelError.CapacityExhausted, "Region generation is exhausted.");
         if (record.ProtectedLabel?.LabelGeneration == ulong.MaxValue)
             return KernelResult<RegionHandle>.Fail(KernelError.CapacityExhausted, "Protected label generation is exhausted.");
+        if(prepared is not null)
+        {
+            if(originalPayload is null || !ReferenceEquals(prepared.Source,originalPayload) || prepared.SourceHandle!=handle || prepared.Projection is not ITransferableOwnedPayload)
+                return KernelResult<RegionHandle>.Fail(KernelError.StaleHandle,"Prepared transfer requires original payload/projection.");
+            try { prepared.Validate(); }
+            catch(InvalidOperationException exception){return KernelResult<RegionHandle>.Fail(KernelError.RegionUseConflict,exception.Message);}
+        }
+        var nextHandle=new RegionHandle(record.Id,new RegionGeneration(record.Generation.Value+1));
+        var nextLabel=record.ProtectedLabel is { } label ? label with
+        {
+            Region=nextHandle,
+            LabelGeneration=label.LabelGeneration+1,
+        } : null; // Allocate projection before irreversible owner/generation mutation.
         var mutation = AdvanceMutation(record);
         if (!mutation.IsSuccess) return KernelResult<RegionHandle>.Fail(mutation.Error, mutation.Message!);
         record.State = RegionState.Transferred;
         record.Owner = target;
         record.Generation = new RegionGeneration(record.Generation.Value + 1);
-        if (record.ProtectedLabel is { } protectedLabel)
-            record.ProtectedLabel = protectedLabel with
-            {
-                Region = new RegionHandle(record.Id, record.Generation),
-                LabelGeneration = protectedLabel.LabelGeneration + 1,
-            };
+        record.ProtectedLabel=nextLabel;
         record.State = RegionState.Owned;
-        return KernelResult<RegionHandle>.Ok(new RegionHandle(record.Id, record.Generation));
+        if(prepared is not null)
+        {
+            prepared.Commit(nextHandle); // Trusted managed custody only, no external callbacks.
+            record.Payload=(ITransferableOwnedPayload)prepared.Projection;
+        }
+        return KernelResult<RegionHandle>.Ok(nextHandle);
+        }
         }
     }
 
@@ -944,10 +966,61 @@ public sealed class RegionAuthority
         }
     }
 
+    internal KernelResult CleanupWithdrawnBorrow(IOriginalBorrowPayload original,RegionOwner borrower)
+    {
+        var handle=original.RuntimeHandle;
+        if(!_regions.TryGetValue(handle.Region.RegionId,out var record)) return KernelResult.Fail(KernelError.RegionNotFound,"Original loan owner absent.");
+        lock(record.Gate)
+        {
+            if(!original.RuntimeIsOriginal || !original.RuntimeLifetime.IsOriginal ||
+                !ReferenceEquals(original.RuntimeLifetime.OriginalRegionOwner,record))
+                return KernelResult.Fail(KernelError.InvalidRegionState,"Original loan factory/Region owner changed.");
+            if(record.Generation!=handle.Region.Generation || record.BorrowGeneration!=handle.Generation)
+                return KernelResult.Fail(KernelError.StaleGeneration,"Original loan generation changed.");
+            if(ReferenceEquals(record.OriginalWithdrawnBorrow,original.RuntimeLifetime) && record.State==RegionState.Owned) return KernelResult.Ok();
+            if(!ReferenceEquals(record.BorrowLifetime,original.RuntimeLifetime) || record.Borrower!=borrower)
+                return KernelResult.Fail(KernelError.InvalidRegionState,"Original loan continuity changed.");
+            var result=ReturnLoan(handle,borrower);
+            if(result.IsSuccess) record.OriginalWithdrawnBorrow=original.RuntimeLifetime;
+            return result;
+        }
+    }
+
+    internal KernelResult CleanupWithdrawnPayload(ITransferableOwnedPayload original,RegionOwner owner,object originalRegionOwner)
+    {
+        var handle=original.Handle;
+        if(!_regions.TryGetValue(handle.RegionId,out var record)) return KernelResult.Fail(KernelError.RegionNotFound,"Original payload owner absent.");
+        lock(record.Gate)
+        {
+            if(!ReferenceEquals(record,originalRegionOwner))
+                return KernelResult.Fail(KernelError.PlatformFaulted,"Original consumed Region owner was replaced.");
+            if(record.Generation!=handle.Generation || record.Owner!=owner) return KernelResult.Fail(KernelError.StaleGeneration,"Original payload owner changed.");
+            if(record.State==RegionState.Released && ReferenceEquals(record.OriginalWithdrawnPayload,original)) return KernelResult.Ok();
+            if(!ReferenceEquals(record.Payload,original)) return KernelResult.Fail(KernelError.InvalidRegionState,"Original payload continuity changed.");
+            record.OriginalWithdrawnPayload=original;
+            var result=Release(handle,owner);
+            if(result.IsSuccess) original.InvalidateForRuntime();
+            return result;
+        }
+    }
+
     internal void RegisterPayload(RegionHandle handle, ITransferableOwnedPayload payload)
     {
         var record = _regions[handle.RegionId];
         lock (record.Gate) record.Payload = payload;
+    }
+
+    internal KernelResult<ITransferableOwnedPayload> CaptureTransferPayload(RegionHandle handle,RegionOwner owner)
+    {
+        if(!_regions.TryGetValue(handle.RegionId,out var record))
+            return KernelResult<ITransferableOwnedPayload>.Fail(KernelError.RegionNotFound,"Transfer Region absent.");
+        lock(record.Gate)
+        {
+            var valid=ValidateCore(record,handle,owner,RegionState.Owned);
+            if(!valid.IsSuccess)return KernelResult<ITransferableOwnedPayload>.Fail(valid.Error,valid.Message!);
+            return record.Payload is { } payload?KernelResult<ITransferableOwnedPayload>.Ok(payload):
+                KernelResult<ITransferableOwnedPayload>.Fail(KernelError.InvalidRegionState,"Original transfer payload absent.");
+        }
     }
 
     internal void ReplacePayload(RegionHandle oldHandle, RegionHandle newHandle, ITransferableOwnedPayload payload)
@@ -1189,9 +1262,9 @@ public sealed class RegionAuthority
         if (use.Principal != principal)
             return KernelResult.Fail(KernelError.WrongRegionOwner, "Region use principal does not match.");
         if (use.State == RegionUseState.Released) return KernelResult.Ok();
-        if (use.ReleaseOwnerOperation is not null)
+        if (use.ReleaseOwnerOperation is not null || use.ReleaseOwnerMmio is not null)
             return KernelResult.Fail(KernelError.RegionUseConflict,
-                "An external operation owns release of this Region use.");
+                "An external operation or original MMIO owns release of this Region use.");
 
         if (IsWriteMode(use.Mode))
         {
@@ -1369,7 +1442,7 @@ public sealed class RegionAuthority
             if (record.ExternalBorrowReadGrantReserved) continue;
             foreach (var use in record.Uses.Values)
                 if (use.Principal.DomainId == domainId && use.State != RegionUseState.Released &&
-                    use.ReleaseOwnerOperation is null && !IsWriteMode(use.Mode) &&
+                    use.ReleaseOwnerOperation is null && use.ReleaseOwnerMmio is null && !IsWriteMode(use.Mode) &&
                     use.OriginalBorrowLease is { } original && original.Region == use.Region &&
                     original.Region.RegionId == record.Id)
                     use.State = RegionUseState.Released;
@@ -1406,7 +1479,7 @@ public sealed class RegionAuthority
                 if (record.BackingLease is not null) return KernelResult<IReadOnlyList<RegionHandle>>.Fail(KernelError.PlatformBindingDraining, "External backing leases must reach verified closure before domain reclaim.");
                 if (record.Damage.Count != 0) return KernelResult<IReadOnlyList<RegionHandle>>.Fail(KernelError.Quarantined, "Damaged Region subranges must remain quarantined until authoritative replacement.");
                 if (record.Uses.Values.Any(use => use.State != RegionUseState.Released &&
-                        (use.State == RegionUseState.Invalidated || use.ReleaseOwnerOperation is not null)))
+                        (use.State == RegionUseState.Invalidated || use.ReleaseOwnerOperation is not null || use.ReleaseOwnerMmio is not null)))
                     return KernelResult<IReadOnlyList<RegionHandle>>.Fail(KernelError.PlatformBindingDraining,
                         "Invalidated or external-operation-bound Region uses must reach owner release before domain reclaim.");
                 if (record.MutationEpoch.Value == ulong.MaxValue)
@@ -1499,7 +1572,8 @@ public sealed class RegionAuthority
         RegionUseRange range,
         bool allowPlatformMappingReservation = false,
         ExternalOperationHandle? releaseOwnerOperation = null,
-        BorrowLeaseHandle? originalBorrowLease = null)
+        BorrowLeaseHandle? originalBorrowLease = null,
+        MmioBufferPayload? releaseOwnerMmio = null)
     {
         var requestValidation = ValidateUseRequest(record, mode, range, allowPlatformMappingReservation);
         if (!requestValidation.IsSuccess)
@@ -1525,6 +1599,7 @@ public sealed class RegionAuthority
             MutationEpoch = record.MutationEpoch,
             State = RegionUseState.Active,
             ReleaseOwnerOperation = releaseOwnerOperation,
+            ReleaseOwnerMmio = releaseOwnerMmio,
             OriginalBorrowLease = originalBorrowLease
         };
         record.Uses.Add(use.Handle.UseId, use);

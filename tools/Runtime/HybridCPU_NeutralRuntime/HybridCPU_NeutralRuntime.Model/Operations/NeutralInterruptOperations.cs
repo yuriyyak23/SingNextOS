@@ -5,18 +5,19 @@ public sealed partial class NeutralDomainRuntimeFacade
     public int ActiveInterruptLeaseCount { get { lock (_lifecycleGate) return _dependencies.ActiveInterruptCount; } }
 
     public NeutralInterruptBindResult BindInterrupt(NeutralDeviceLease device, NeutralInterruptSourceIdentity source)
-        => BindInterruptCore(device,source,null);
+        => BindInterruptCore(device,source,null,out _);
 
-    private NeutralInterruptBindResult BindInterruptCore(NeutralDeviceLease device,NeutralInterruptSourceIdentity source,NeutralOriginalIrqAdmissionFact? intent)
+    private NeutralInterruptBindResult BindInterruptCore(NeutralDeviceLease device,NeutralInterruptSourceIdentity source,NeutralOriginalIrqAdmissionFact? intent,out bool noEffect)
     {
+        noEffect=false;
         lock (_lifecycleGate)
         {
             var parent = _leases.Validate(device);
-            if (!parent.IsValid) return new() { Decision = ToInterruptBind(parent.Status) };
-            if (string.IsNullOrWhiteSpace(source.ResourceId) || !Enum.IsDefined(source.Trigger)) return new() { Decision = NeutralInterruptBindDecision.InvalidSource };
-            if (!NeutralRuntimeValidation.Has(parent.State!.Rights, NeutralDeviceRights.Configure)) return new() { Decision = NeutralInterruptBindDecision.InsufficientDeviceRights };
-            if (_dependencies.HasActiveInterruptBinding(device, source,intent)) return new() { Decision = NeutralInterruptBindDecision.AlreadyBound };
-            if (!TryAllocate(ref _nextResource, out var handle)) return new() { Decision = NeutralInterruptBindDecision.Faulted, Reason = "Neutral resource handle space is exhausted." };
+            if (!parent.IsValid) {noEffect=true;return new() { Decision = ToInterruptBind(parent.Status) };}
+            if (string.IsNullOrWhiteSpace(source.ResourceId) || !Enum.IsDefined(source.Trigger)) {noEffect=true;return new() { Decision = NeutralInterruptBindDecision.InvalidSource };}
+            if (!NeutralRuntimeValidation.Has(parent.State!.Rights, NeutralDeviceRights.Configure)) {noEffect=true;return new() { Decision = NeutralInterruptBindDecision.InsufficientDeviceRights };}
+            if (_dependencies.HasActiveInterruptBinding(device, source,intent)) {noEffect=true;return new() { Decision = NeutralInterruptBindDecision.AlreadyBound };}
+            if (!TryAllocate(ref _nextResource, out var handle)) {noEffect=true;return new() { Decision = NeutralInterruptBindDecision.Faulted, Reason = "Neutral resource handle space is exhausted." };}
             var lease = new NeutralInterruptLease(device, source, new(handle), new(1));
             _dependencies.RegisterInterrupt(lease);
             return new() { IsBound = true, Lease = lease, Decision = NeutralInterruptBindDecision.Bound };

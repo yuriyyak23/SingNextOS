@@ -67,6 +67,7 @@ internal sealed class NeutralOriginalIrqAdmissionFact
     public NeutralOriginalDeviceAdmissionFact DeviceAdmission { get; }
     public NeutralInterruptState? Source { get; set; }
     public NeutralOriginalIrqBindObservation? Observation { get; set; }
+    public bool NoEffect { get; set; }
 }
 internal sealed class NeutralOriginalIrqCloseFact
 {

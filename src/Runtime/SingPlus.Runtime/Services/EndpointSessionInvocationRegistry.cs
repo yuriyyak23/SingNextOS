@@ -19,13 +19,36 @@ internal sealed class EndpointSessionInvocationRegistry
 
     private sealed class Record
     {
+        public Record? OriginalSelf { get; set; }
         public required EndpointSessionInvocationHandle Handle { get; init; }
         public required ProcessHandle Caller { get; init; }
         public required ProcessHandle Service { get; init; }
         public required uint MessageId { get; init; }
         public CancellationScopeHandle? CancellationScope { get; set; }
         public bool Delivered { get; set; }
+        public bool OriginalSendPending { get; set; }
+        public bool OriginalSendNoEffect { get; set; }
+        public bool OriginalSendCleanupCompleted { get; set; }
+        public OriginalSend? OriginalSendFact { get; set; }
+        public object? OriginalSendInput { get; set; }
+        public object? OriginalSendSecondInput { get; set; }
+        public EndpointSessionPin? OriginalSendPin { get; set; }
+        public ChannelEnvelope? OriginalSendReply { get; set; }
+        public SingPlus.Sip.PreparedOwnedTransfer? OriginalSendTransfer { get; set; }
+        public KernelResult<RegionHandle>? OriginalSendTransferResult { get; set; }
+        public KernelResult<RegionHandle>? OriginalSendRegionRaw { get; set; }
+        public object? OriginalSendTargetReservationOwner { get; set; }
+        public bool OriginalSendTargetBudgetExpected { get; set; }
+        public bool OriginalSendSourceBudgetExpected { get; set; }
+        public BudgetReservationHandle? OriginalSendTargetReservation { get; set; }
+        public bool OriginalSendProducerPrepared { get; set; }
+        public RegionHandle OriginalSendSourceRegion { get; set; }
+        public DomainId OriginalSendSourceRegionDomain { get; set; }
+        public RegionOwner OriginalSendTargetRegionOwner { get; set; }
+        public object? OriginalSendRegionAccountingOwner { get; set; }
+        public (object Fact, object? RegionOwner, ProcessHandle Owner, BudgetReservationHandle Reservation)[]? OriginalSendSourceCharges { get; set; }
         public bool ServiceAccepted { get; set; }
+        public ChannelEnvelope? OriginalAcceptedRequest { get; set; }
         public bool InFlightCancellationAllowed { get; set; }
         public bool CancellationRequested { get; set; }
         public bool CancellationAccepted { get; set; }
@@ -43,12 +66,19 @@ internal sealed class EndpointSessionInvocationRegistry
         public object? OriginalVirtualArtifactOwner { get; set; }
         public GuestRegionMappingHandle? VirtualArtifactMapping { get; set; }
         public bool VirtualArtifactContained { get; set; }
+        public object? OriginalVirtualTransitionOwner { get; set; }
+        public VirtualDomainHandle? VirtualTransitionDomain { get; set; }
+        public bool VirtualTransitionContained { get; set; }
+        public bool VirtualTransitionNeverInvoked { get; set; }
+        public bool VirtualTransitionNoEffect { get; set; }
         public bool FailedSettlementMayHaveEffect { get; set; }
         public bool DonationReturnInProgress { get; set; }
         public bool DonationBindingInProgress { get; set; } // Admission only.
         public ResponsePublicationStatus? SettlementInProgress { get; set; }
         public ResponsePublicationStatus? TerminalStatus { get; set; }
         public ResponseEnvelope? SettlementOutcome { get; set; } // Retained outcome, never permission.
+        public bool SettlementNeverStarted { get; set; } // Exact local response no-effect, not external closure.
+        public ResponseRegistry.OriginalPublication? OriginalResponse { get; set; }
         public ResourceDonationBinding? ResourceDonation { get; set; }
     }
 
@@ -68,6 +98,211 @@ internal sealed class EndpointSessionInvocationRegistry
         _settlementAdmissionGate = settlementAdmissionGate ?? _gate;
     }
 
+    internal sealed class OriginalSend
+    {
+        internal readonly object Record;
+        internal readonly EndpointSessionInvocationRegistry Owner;
+        internal readonly OriginalSend Self;
+        internal OriginalSend(EndpointSessionInvocationRegistry owner,object record) { Owner=owner; Record=record; Self=this; }
+    }
+
+    internal OriginalSend PrepareOriginalSend(EndpointSessionHandle session,ProcessHandle caller,ProcessHandle service,
+        ulong sequence,uint messageId,EndpointSessionPin pin,object? input,object? second,CancellationScopeHandle? scope)
+    {
+        lock(_gate)
+        {
+
+            var handle=new EndpointSessionInvocationHandle(session,new(sequence),new(1));
+            if(_ownedRecords.ContainsKey(Key(handle))) throw new InvalidOperationException("Original send identity already exists.");
+            Register(session,caller,service,sequence,messageId,scope);
+            var record=_ownedRecords[Key(handle)];
+            var original=new OriginalSend(this,record);
+            record.OriginalSendFact=original;
+            record.OriginalSendInput=input;
+            record.OriginalSendSecondInput=second;
+            record.OriginalSendPin=pin;
+            record.OriginalSendPending=true;
+            return original;
+        }
+    }
+
+    internal bool CompleteOriginalSend(OriginalSend original,ChannelEnvelope? reply,bool finalPublication=true)
+    {
+        lock(_gate)
+        {
+            if(!ReferenceEquals(original.Self,original) || !ReferenceEquals(original.Owner,this) || original.Record is not Record record ||
+                !ReferenceEquals(record.OriginalSelf,record) || !_ownedRecords.TryGetValue(Key(record.Handle),out var owned) ||
+                !ReferenceEquals(owned,record) || !ReferenceEquals(record.OriginalSendFact,original) || !record.OriginalSendPending) return false;
+            if(record.OriginalSendReply is { } raw && !ReferenceEquals(raw,reply)) return false;
+            if(reply is not null && (reply.Sequence!=record.Handle.InvocationId.Value || reply.MessageId!=record.MessageId)) return false;
+            record.OriginalSendReply=reply;
+            if(!finalPublication) return true;
+            record.OriginalSendPending=false;
+            if(reply is null) record.OriginalSendNoEffect=true;
+            return true;
+        }
+    }
+
+    internal bool OriginalSendIsPending(OriginalSend original)
+    {
+        lock(_gate)
+        {
+            if(ReferenceEquals(original.Self,original) && ReferenceEquals(original.Owner,this) && original.Record is Record terminal &&
+                ReferenceEquals(terminal.OriginalSelf,terminal) && ReferenceEquals(terminal.OriginalSendFact,original) && terminal.OriginalSendCleanupCompleted) return false;
+            // Absence/foreign routing is not a completed original send. Keep
+            // caller admission pinned unless this exact owner proves completion.
+            if(!ReferenceEquals(original.Self,original) || !ReferenceEquals(original.Owner,this) ||
+                original.Record is not Record record || !ReferenceEquals(record.OriginalSelf,record) ||
+                !ReferenceEquals(record.OriginalSendFact,original) || !_ownedRecords.TryGetValue(Key(record.Handle),out var owned) ||
+                !ReferenceEquals(owned,record)) return true;
+            return record.OriginalSendPending;
+        }
+    }
+
+    internal bool OriginalSendCleanupIsCompleted(OriginalSend original)
+    {
+        lock(_gate) return ReferenceEquals(original.Self,original) && ReferenceEquals(original.Owner,this) &&
+            original.Record is Record record && ReferenceEquals(record.OriginalSelf,record) &&
+            ReferenceEquals(record.OriginalSendFact,original) && record.OriginalSendCleanupCompleted;
+    }
+
+    internal bool BindOriginalSendTransfer(OriginalSend original,SingPlus.Sip.PreparedOwnedTransfer prepared)
+    {
+        lock(_gate)
+        {
+            if(!OriginalSendIsPending(original) || !ReferenceEquals(original.Self,original) || !ReferenceEquals(original.Owner,this) ||
+                original.Record is not Record record || !ReferenceEquals(record.OriginalSendFact,original) ||
+                !_ownedRecords.TryGetValue(Key(record.Handle),out var owned) || !ReferenceEquals(owned,record) ||
+                record.OriginalSendTransfer is not null ||
+                !ReferenceEquals(prepared.Source,record.OriginalSendInput) && !ReferenceEquals(prepared.Source,record.OriginalSendSecondInput)) return false;
+            record.OriginalSendTransfer=prepared;
+            return true;
+        }
+    }
+
+    internal void RetainOriginalSendTransferResult(OriginalSend original,SingPlus.Sip.PreparedOwnedTransfer prepared,KernelResult<RegionHandle> result)
+    {
+        lock(_gate)
+        {
+            if(original.Record is not Record record || !ReferenceEquals(original.Self,original) || !ReferenceEquals(original.Owner,this) ||
+                !ReferenceEquals(record.OriginalSendFact,original) || !ReferenceEquals(record.OriginalSendTransfer,prepared) || record.OriginalSendTransferResult is not null)
+                throw new InvalidOperationException("Original transfer result owner continuity changed.");
+            record.OriginalSendTransferResult=result;
+        }
+    }
+
+    internal void RetainOriginalTransferProducerAdmission(OriginalSend original,SingPlus.Sip.PreparedOwnedTransfer prepared,BudgetReservationHandle? reservation,object? budgetOwner,
+        RegionHandle sourceRegion, DomainId sourceDomain, RegionOwner targetOwner,
+        (object Fact, object? RegionOwner, ProcessHandle Owner, BudgetReservationHandle Reservation)[] sourceCharges, object regionAccountingOwner)
+    {
+        lock(_gate)
+        {
+            if(!ReferenceEquals(original.Self,original) || !ReferenceEquals(original.Owner,this) || original.Record is not Record record ||
+                !ReferenceEquals(record.OriginalSendFact,original) || !ReferenceEquals(record.OriginalSendTransfer,prepared) ||
+                record.OriginalSendProducerPrepared || reservation is not null && budgetOwner is null)
+                throw new InvalidOperationException("Original producer admission continuity changed.");
+            record.OriginalSendTargetReservation=reservation;
+            record.OriginalSendTargetBudgetExpected=reservation is not null;
+            record.OriginalSendSourceBudgetExpected=sourceCharges.Length!=0;
+            record.OriginalSendTargetReservationOwner=budgetOwner;
+            record.OriginalSendSourceRegion=sourceRegion;
+            record.OriginalSendSourceRegionDomain=sourceDomain;
+            record.OriginalSendTargetRegionOwner=targetOwner;
+            record.OriginalSendSourceCharges=sourceCharges.ToArray();
+            record.OriginalSendRegionAccountingOwner=regionAccountingOwner;
+            record.OriginalSendProducerPrepared=true;
+        }
+    }
+
+    internal KernelResult<(RegionHandle Source, DomainId SourceDomain, RegionOwner TargetOwner, object RegionOwner, SingPlus.Sip.PreparedOwnedTransfer Prepared,
+        (object Fact, object? RegionOwner, ProcessHandle Owner, BudgetReservationHandle Reservation)[] Charges)>
+        ReadOriginalTransferCleanupFacts(OriginalSend original)
+    {
+        lock(_gate)
+        {
+            var producer=ReadOriginalTransferProducer(original);
+            if(!producer.IsSuccess || original.Record is not Record record || record.OriginalSendSourceCharges is null ||
+                record.OriginalSendSourceBudgetExpected!=(record.OriginalSendSourceCharges.Length!=0) ||
+                record.OriginalSendSourceCharges.Length>1 || record.OriginalSendRegionAccountingOwner is null || record.OriginalSendTransfer is null)
+                return KernelResult<(RegionHandle,DomainId,RegionOwner,object,SingPlus.Sip.PreparedOwnedTransfer,(object,object?,ProcessHandle,BudgetReservationHandle)[])>.Fail(
+                    KernelError.PlatformFaulted,"Original quantitative admission facts unavailable.");
+            return KernelResult<(RegionHandle,DomainId,RegionOwner,object,SingPlus.Sip.PreparedOwnedTransfer,(object,object?,ProcessHandle,BudgetReservationHandle)[])>.Ok(
+                (record.OriginalSendSourceRegion,record.OriginalSendSourceRegionDomain,record.OriginalSendTargetRegionOwner,record.OriginalSendRegionAccountingOwner,record.OriginalSendTransfer,record.OriginalSendSourceCharges.ToArray()));
+        }
+    }
+
+    internal void RetainOriginalTransferRegionRaw(OriginalSend original,SingPlus.Sip.PreparedOwnedTransfer prepared,KernelResult<RegionHandle> raw)
+    {
+        lock(_gate)
+        {
+            if(!ReferenceEquals(original.Self,original) || !ReferenceEquals(original.Owner,this) || original.Record is not Record record ||
+                !ReferenceEquals(record.OriginalSendFact,original) || !ReferenceEquals(record.OriginalSendTransfer,prepared) ||
+                !record.OriginalSendProducerPrepared || record.OriginalSendRegionRaw is not null)
+                throw new InvalidOperationException("Original Region producer raw continuity changed.");
+            record.OriginalSendRegionRaw=raw;
+        }
+    }
+
+    internal KernelResult<(KernelResult<RegionHandle>? Raw,BudgetReservationHandle? Reservation,object? BudgetOwner)> ReadOriginalTransferProducer(OriginalSend original)
+    {
+        lock(_gate)
+        {
+            if(!ReferenceEquals(original.Self,original) || !ReferenceEquals(original.Owner,this) || original.Record is not Record record ||
+                !ReferenceEquals(record.OriginalSelf,record) || !ReferenceEquals(record.OriginalSendFact,original) || !record.OriginalSendProducerPrepared)
+                return KernelResult<(KernelResult<RegionHandle>?,BudgetReservationHandle?,object?)>.Fail(KernelError.PlatformFaulted,"Original Region producer fact unavailable.");
+            if(record.OriginalSendTargetBudgetExpected!=(record.OriginalSendTargetReservation is not null) ||
+                record.OriginalSendTargetBudgetExpected!=(record.OriginalSendTargetReservationOwner is not null))
+                return KernelResult<(KernelResult<RegionHandle>?,BudgetReservationHandle?,object?)>.Fail(KernelError.PlatformFaulted,"Original target quantitative fact absent or malformed.");
+            return KernelResult<(KernelResult<RegionHandle>?,BudgetReservationHandle?,object?)>.Ok((record.OriginalSendRegionRaw,record.OriginalSendTargetReservation,record.OriginalSendTargetReservationOwner));
+        }
+    }
+
+    internal KernelResult<(ChannelEndpointHandle Channel,ulong Sequence,ProcessHandle Service,SingPlus.Sip.PreparedOwnedTransfer Prepared)> ReadOriginalCompletedSendTransfer(OriginalSend original,ProcessHandle caller)
+    {
+        lock(_gate)
+        {
+            if(!ReferenceEquals(original.Self,original) || !ReferenceEquals(original.Owner,this) || original.Record is not Record record ||
+                !ReferenceEquals(record.OriginalSelf,record) || !ReferenceEquals(record.OriginalSendFact,original) ||
+                !_ownedRecords.TryGetValue(Key(record.Handle),out var owned) || !ReferenceEquals(owned,record) ||
+                record.Caller!=caller || !record.OriginalSendPending || record.Delivered || record.ServiceAccepted || record.OriginalSendReply is not null ||
+                record.OriginalSendTransfer is not { } prepared || record.OriginalSendTransferResult is not { } composition ||
+                record.OriginalSendRegionRaw is not { IsSuccess:true } result ||
+                !Enum.IsDefined(composition.Error) || composition.IsSuccess && composition.Value!=result.Value ||
+                !prepared.IsOriginal || prepared.SourceHandle!=record.OriginalSendSourceRegion ||
+                !ReferenceEquals(prepared.Source,record.OriginalSendInput) && !ReferenceEquals(prepared.Source,record.OriginalSendSecondInput) ||
+                prepared.Projection is not SingPlus.Sip.ITransferableOwnedPayload projection || projection.Handle!=result.Value)
+                return KernelResult<(ChannelEndpointHandle,ulong,ProcessHandle,SingPlus.Sip.PreparedOwnedTransfer)>.Fail(KernelError.ResponseNotPending,"Exact completed original transfer result unavailable.");
+            return KernelResult<(ChannelEndpointHandle,ulong,ProcessHandle,SingPlus.Sip.PreparedOwnedTransfer)>.Ok((record.OriginalSendPin!.OriginalRecord.Channel,record.Handle.InvocationId.Value,record.Service,prepared));
+        }
+    }
+
+    internal KernelResult<(EndpointSessionInvocationHandle Invocation,ProcessHandle Service,ChannelEnvelope Raw,ChannelEndpointHandle Channel)> ReadPendingOriginalSend(OriginalSend original,ProcessHandle caller)
+    {
+        lock(_gate)
+        {
+            if(!OriginalSendIsPending(original) || !ReferenceEquals(original.Self,original) || !ReferenceEquals(original.Owner,this) ||
+                original.Record is not Record record || !ReferenceEquals(record.OriginalSelf,record) ||
+                !ReferenceEquals(record.OriginalSendFact,original) || !_ownedRecords.TryGetValue(Key(record.Handle),out var owned) ||
+                !ReferenceEquals(owned,record) || record.Caller!=caller || record.Delivered || record.ServiceAccepted || record.OriginalSendReply is not { } raw)
+                return KernelResult<(EndpointSessionInvocationHandle,ProcessHandle,ChannelEnvelope,ChannelEndpointHandle)>.Fail(KernelError.ResponseNotPending,"Exact undelivered original send raw is unavailable; cleanup remains pinned.");
+            return KernelResult<(EndpointSessionInvocationHandle,ProcessHandle,ChannelEnvelope,ChannelEndpointHandle)>.Ok((record.Handle,record.Service,raw,record.OriginalSendPin!.OriginalRecord.Channel));
+        }
+    }
+
+    internal KernelResult<EndpointSessionPin> CompleteWithdrawnOriginalSend(OriginalSend original,ProcessHandle caller)
+    {
+        lock(_gate)
+        {
+            var pending=ReadPendingOriginalSend(original,caller);
+            if(!pending.IsSuccess && !ReadOriginalCompletedSendTransfer(original,caller).IsSuccess)
+                return KernelResult<EndpointSessionPin>.Fail(pending.Error,pending.Message!);
+            var record=(Record)original.Record;
+            record.OriginalSendCleanupCompleted=true;
+            record.OriginalSendPending=false;
+            record.OriginalSendNoEffect=true; // No service invocation effect; ownership cleanup was separately completed.
+            return KernelResult<EndpointSessionPin>.Ok(record.OriginalSendPin!);
+        }
+    }
     internal EndpointSessionInvocationHandle Register(
         EndpointSessionHandle session,
         ProcessHandle caller,
@@ -111,6 +346,7 @@ internal sealed class EndpointSessionInvocationRegistry
                 MessageId = messageId,
                 CancellationScope = cancellationScope
             };
+            record.OriginalSelf=record;
             _ownedRecords.Add(key, record);
             _records.Add(key, record);
         }
@@ -137,7 +373,7 @@ internal sealed class EndpointSessionInvocationRegistry
             if (record.Caller != caller || record.MessageId != messageId)
                 return KernelResult<EndpointSessionInvocationHandle>.Fail(KernelError.PlatformFaulted,
                     "Queued request does not match its original invocation owner.");
-            if (record.Delivered || record.TerminalStatus is not null ||
+            if (record.OriginalSendPending || record.OriginalSendNoEffect || record.Delivered || record.TerminalStatus is not null ||
                 record.SettlementInProgress is not null || record.FailedSettlementMayHaveEffect)
                 return KernelResult<EndpointSessionInvocationHandle>.Fail(KernelError.ResponseNotPending,
                     "Original invocation is no longer eligible for queued delivery.");
@@ -159,7 +395,7 @@ internal sealed class EndpointSessionInvocationRegistry
             var resolved = ResolveForService(handle, service);
             if (!resolved.IsSuccess)
                 return KernelResult<EndpointSessionInvocationHandle>.Fail(resolved.Error, resolved.Message!);
-            if (resolved.Value!.TerminalStatus is not null)
+            if (resolved.Value!.OriginalSendPending || resolved.Value.OriginalSendNoEffect || resolved.Value.TerminalStatus is not null)
                 return KernelResult<EndpointSessionInvocationHandle>.Fail(KernelError.ResponseNotPending, "Endpoint session invocation is already terminal.");
             resolved.Value.Delivered = true;
             return KernelResult<EndpointSessionInvocationHandle>.Ok(handle);
@@ -413,6 +649,7 @@ internal sealed class EndpointSessionInvocationRegistry
             lock (_gate)
             {
                 reservation.SettlementInProgress = null;
+                if(!actionStarted && OwnsOriginalRecord(reservation))reservation.SettlementNeverStarted=true;
                 if (actionStarted && reservation.TerminalStatus is null)
                     reservation.FailedSettlementMayHaveEffect = true;
             }
@@ -434,7 +671,8 @@ internal sealed class EndpointSessionInvocationRegistry
                 return KernelResult<Record>.Fail(resolved.Error, resolved.Message!);
             var record = resolved.Value!;
             if (record.TerminalStatus is not null || record.SettlementInProgress is not null ||
-                record.DonationReturnInProgress || record.FailedSettlementMayHaveEffect && !localCompletionOnly)
+                record.OriginalSendPending ||
+        record.DonationReturnInProgress || record.FailedSettlementMayHaveEffect && !localCompletionOnly)
                 return KernelResult<Record>.Fail(KernelError.ResponseNotPending, "Endpoint session invocation is already terminal or settlement is in progress.");
             if (!record.Delivered)
                 return KernelResult<Record>.Fail(KernelError.ResponseNotDelivered, "Endpoint session invocation has not been delivered to the service.");
@@ -442,6 +680,7 @@ internal sealed class EndpointSessionInvocationRegistry
                 return KernelResult<Record>.Fail(KernelError.InvalidTransition, "The service accepted cancellation and must settle the invocation as Cancelled.");
 
             record.SettlementInProgress = status;
+            record.SettlementNeverStarted=false;
             return KernelResult<Record>.Ok(record);
         }
     }
@@ -505,7 +744,7 @@ internal sealed class EndpointSessionInvocationRegistry
         {
             return _ownedRecords.Values.Count(record =>
                 record.Handle.Session == session &&
-                (HasUnclosedPossibleEffect(record) || record.TerminalStatus is null ||
+                (HasUnclosedPossibleEffect(record) || record.TerminalStatus is null && !record.OriginalSendNoEffect ||
                  record.ResourceDonation?.State == ResourceDonationState.Active));
         }
     }
@@ -663,7 +902,8 @@ internal sealed class EndpointSessionInvocationRegistry
             var resolved = ResolveForService(invocation, service);
             if (!resolved.IsSuccess) return KernelResult<ResourceDonationBinding>.Fail(resolved.Error, resolved.Message!);
             record = resolved.Value!;
-            if (record.DonationReturnInProgress || record.SettlementInProgress is not null ||
+            if (record.OriginalSendPending ||
+        record.DonationReturnInProgress || record.SettlementInProgress is not null ||
                 record.FailedSettlementMayHaveEffect || record.ResourceDonation is not
                 { State: ResourceDonationState.Bound or ResourceDonationState.Returned } current)
                 return KernelResult<ResourceDonationBinding>.Fail(KernelError.InvalidTransition,
@@ -751,7 +991,8 @@ internal sealed class EndpointSessionInvocationRegistry
                     (record.OriginalVirtualIoTransfer is null || record.VirtualIoTransferContained) &&
                     (record.OriginalVirtualIoBind is null || record.VirtualIoBindContained) &&
                     (record.OriginalVirtualCreate is null || record.VirtualCreateContained || record.VirtualCreateNoEffect || record.VirtualCreateNeverInvoked) &&
-                    (record.OriginalVirtualArtifactOwner is null || record.VirtualArtifactContained))
+                    (record.OriginalVirtualArtifactOwner is null || record.VirtualArtifactContained) &&
+                    (record.OriginalVirtualTransitionOwner is null || record.VirtualTransitionContained || record.VirtualTransitionNeverInvoked || record.VirtualTransitionNoEffect))
                 {
                     _ownedRecords.Remove(key);
                     if (_records.TryGetValue(key, out var routed) && ReferenceEquals(routed, record))
@@ -763,13 +1004,74 @@ internal sealed class EndpointSessionInvocationRegistry
     }
 
     private static bool HasUnclosedPossibleEffect(Record record) =>
+        record.OriginalSendPending ||
         record.DonationReturnInProgress ||
         record.SettlementInProgress is not null ||
         record.ServiceAccepted && record.TerminalStatus is null ||
-        record.AcceptedResponseCancelled && !record.VirtualIoTransferContained && !record.VirtualIoBindContained && !record.VirtualCreateContained && !record.VirtualCreateNeverInvoked && !record.VirtualCreateNoEffect && !record.ComputeCopyContained && !record.VirtualArtifactContained ||
+        record.AcceptedResponseCancelled && !record.VirtualIoTransferContained && !record.VirtualIoBindContained && !record.VirtualCreateContained && !record.VirtualCreateNeverInvoked && !record.VirtualCreateNoEffect && !record.ComputeCopyContained && !record.VirtualArtifactContained && !record.VirtualTransitionContained && !record.VirtualTransitionNeverInvoked && !record.VirtualTransitionNoEffect ||
         record.OriginalComputeCopy is not null && !record.ComputeCopyContained ||
         record.FailedSettlementMayHaveEffect ||
         record.ResourceDonation?.State == ResourceDonationState.Quarantined;
+
+    private static bool IsVirtualControlTransition(uint message) => message is
+        SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_ConfigureAsync or
+        SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_ParkAsync or
+        SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_ResumeAsync or
+        SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_DestroyAsync or
+        SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_CloseGuestRegionMappingAsync;
+
+    internal KernelResult BindVirtualTransition(EndpointSessionInvocationHandle invocation,ProcessHandle caller,object original,VirtualDomainHandle domain)
+    {
+        lock(_gate)
+        {
+            var found=ResolveForCaller(invocation,caller);
+            if(!found.IsSuccess)return KernelResult.Fail(found.Error,found.Message!);
+            var record=found.Value!;
+            if(original is null || !IsVirtualControlTransition(record.MessageId) || !record.ServiceAccepted || record.TerminalStatus is not null ||
+                record.VirtualTransitionContained || record.VirtualTransitionNeverInvoked || record.VirtualTransitionNoEffect ||
+                record.OriginalVirtualTransitionOwner is { } prior && (!ReferenceEquals(prior,original) || record.VirtualTransitionDomain!=domain))
+                return KernelResult.Fail(KernelError.InvalidTransition,"Original invocation cannot admit this domain transition.");
+            record.OriginalVirtualTransitionOwner=original;record.VirtualTransitionDomain=domain;
+            return KernelResult.Ok();
+        }
+    }
+
+    // Trusted local validation or producer's exact NotAccepted consequence;
+    // neither permits freeing the independently existing domain/backing.
+    internal KernelResult ConsumeVirtualTransitionNoEffect(EndpointSessionInvocationHandle invocation,ProcessHandle caller,
+        object? original,bool neverInvoked=false)
+    {
+        lock(_gate)
+        {
+            var found=ResolveForCaller(invocation,caller);
+            if(!found.IsSuccess)return KernelResult.Fail(found.Error,found.Message!);
+            var record=found.Value!;
+            if(!IsVirtualControlTransition(record.MessageId) || !record.ServiceAccepted || record.VirtualTransitionContained ||
+                !ReferenceEquals(record.OriginalVirtualTransitionOwner,original) || !neverInvoked && original is null ||
+                original is null && (record.TerminalStatus is not null || record.SettlementInProgress is not null))
+                return KernelResult.Fail(KernelError.PlatformFaulted,"Original transition no-effect owner changed.");
+            if(neverInvoked)record.VirtualTransitionNeverInvoked=true;else record.VirtualTransitionNoEffect=true;
+            return KernelResult.Ok();
+        }
+    }
+
+    // Only the exact domain owner calls this inside validated provider closure
+    // and local mapping/backing cleanup, before its original record retires.
+    internal KernelResult ConsumeVirtualTransitionDomainClosure(ProcessHandle caller,object original,VirtualDomainHandle domain)
+    {
+        lock(_gate)
+        {
+            var records=_ownedRecords.Values.Where(r=>r.VirtualTransitionDomain==domain).ToArray();
+            foreach(var record in records)
+            {
+                var current=ResolveForCaller(record.Handle,caller);
+                if(!current.IsSuccess || !ReferenceEquals(current.Value,record) || !ReferenceEquals(record.OriginalVirtualTransitionOwner,original))
+                    return KernelResult.Fail(KernelError.PlatformFaulted,"Original domain transition invocation route changed.");
+            }
+            foreach(var record in records)record.VirtualTransitionContained=true;
+            return KernelResult.Ok();
+        }
+    }
 
     internal KernelResult BindVirtualCreation(EndpointSessionInvocationHandle invocation,ProcessHandle caller,object original)
     {
@@ -778,7 +1080,8 @@ internal sealed class EndpointSessionInvocationRegistry
             var resolved=ResolveForCaller(invocation,caller);
             if(!resolved.IsSuccess)return KernelResult.Fail(resolved.Error,resolved.Message!);
             var record=resolved.Value!;
-            if(original is null || record.MessageId!=SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_CreateAsync ||
+            if(original is null || record.MessageId is not (SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_CreateAsync or
+                SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_CreateNestedAsync) ||
                 !record.ServiceAccepted || record.TerminalStatus is not null || record.VirtualCreateContained || record.VirtualCreateNeverInvoked || record.VirtualCreateNoEffect ||
                 record.OriginalVirtualCreate is { } prior && !ReferenceEquals(prior,original))
                 return KernelResult.Fail(KernelError.InvalidTransition,"Original invocation cannot admit this virtual creation.");
@@ -794,7 +1097,8 @@ internal sealed class EndpointSessionInvocationRegistry
             var resolved=ResolveForCaller(invocation,caller);
             if(!resolved.IsSuccess)return KernelResult.Fail(resolved.Error,resolved.Message!);
             var record=resolved.Value!;
-            if(record.MessageId!=SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_CreateAsync ||
+            if(record.MessageId is not (SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_CreateAsync or
+                SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_CreateNestedAsync) ||
                 !record.ServiceAccepted || original is null && (record.TerminalStatus is not null || record.SettlementInProgress is not null) ||
                 !ReferenceEquals(record.OriginalVirtualCreate,original) || record.VirtualCreateContained || record.VirtualCreateNoEffect)
                 return KernelResult.Fail(KernelError.InvalidTransition,"Create no-effect requires its own never-invoked validation branch.");
@@ -811,6 +1115,26 @@ internal sealed class EndpointSessionInvocationRegistry
             if(original is null || !ReferenceEquals(resolved.Value!.OriginalVirtualCreate,original))
                 return KernelResult.Fail(KernelError.PlatformFaulted,"Original creation invocation owner changed.");
             resolved.Value.VirtualCreateContained=true;return KernelResult.Ok();
+        }
+    }
+    // Trusted teardown consumption after original channel closure, before a failed reply action.
+    internal KernelResult RetireNoEffectVirtualCreationReply(EndpointSessionInvocationHandle invocation,ProcessHandle caller)
+    {
+        lock(_gate)
+        {
+            var resolved=ResolveForCaller(invocation,caller);
+            if(!resolved.IsSuccess)return KernelResult.Fail(resolved.Error,resolved.Message!);
+            var record=resolved.Value!;
+            if(!(record.VirtualCreateNeverInvoked || record.VirtualCreateNoEffect) || record.OriginalVirtualCreate is null ||
+                record.SettlementInProgress is not null || record.FailedSettlementMayHaveEffect ||
+                record.ResourceDonation is not null)
+                return KernelResult.Fail(KernelError.InvalidTransition,"Original never-invoked creation and closed reply lifetime required.");
+            if(record.TerminalStatus is null)
+            {
+                record.TerminalStatus=ResponsePublicationStatus.Cancelled;
+                record.AcceptedResponseCancelled=true;
+            }
+            return KernelResult.Ok();
         }
     }
     internal KernelResult ConsumeVirtualCreationNoEffect(EndpointSessionInvocationHandle invocation,ProcessHandle caller,object original)
@@ -874,6 +1198,7 @@ internal sealed class EndpointSessionInvocationRegistry
                 (mappingAdmission ? protocol!=SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_MapGuestRegionAsync :
                 protocol != SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_BindExecutableArtifactAsync &&
                 protocol != SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_BindExecutablePackageAsync &&
+                protocol != SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_CloseGuestRegionMappingAsync &&
                 protocol != SingPlus.Sip.Virtualization.IVirtualizationServiceProtocol.Message_StartAsync) ||
                 record.OriginalVirtualArtifactOwner is { } prior && (!ReferenceEquals(prior,originalDomain) || record.VirtualArtifactMapping!=mapping))
                 return KernelResult.Fail(KernelError.InvalidTransition,"Original invocation cannot admit this artifact mapping.");
@@ -990,6 +1315,182 @@ internal sealed class EndpointSessionInvocationRegistry
             : KernelResult<Record>.Fail(KernelError.WrongSessionOwner, "Service does not own the endpoint session invocation peer.");
     }
 
+    internal KernelResult ReadPublishedOutcome(EndpointSessionInvocationHandle handle,ProcessHandle service,object originalPayload)
+    {
+        lock(_gate)
+        {
+            if(!_ownedRecords.TryGetValue(Key(handle),out var record) || record.Handle!=handle || record.Service!=service ||
+                !OwnsOriginalRecord(record) || _records.TryGetValue(Key(handle),out var routed) && !ReferenceEquals(routed,record))
+                return KernelResult.Fail(KernelError.WrongSessionOwner,"Original settlement owner absent/foreign.");
+            if(record.TerminalStatus is null && record.SettlementInProgress is null && record.SettlementNeverStarted && !record.FailedSettlementMayHaveEffect)
+                return KernelResult.Fail(KernelError.ResponseNotDelivered,"Original response action never started; response-only replay is allowed.");
+            if(record.TerminalStatus!=ResponsePublicationStatus.Published || record.SettlementOutcome is not { } outcome ||
+                outcome.RequestSequence!=handle.InvocationId.Value || outcome.MessageId!=record.MessageId ||
+                outcome.Status!=ResponsePublicationStatus.Published || !ReferenceEquals(outcome.Payload,originalPayload))
+                return KernelResult.Fail(KernelError.ResponseNotPending,"Exact original publication remains unresolved; no repeat.");
+            return KernelResult.Ok(); // Publication metadata only, never external closure.
+        }
+    }
+
+    internal sealed class OriginalPublication
+    {
+        internal OriginalPublication(EndpointSessionInvocationRegistry owner,object record,ProcessHandle service,object payload)
+        { Owner=owner;Record=record;Service=service;Payload=payload;Original=this; }
+        internal readonly EndpointSessionInvocationRegistry Owner;
+        internal readonly object Record,Payload;
+        internal readonly ProcessHandle Service;
+        internal readonly OriginalPublication Original;
+    }
+
+    internal KernelResult<OriginalPublication> CapturePublication(EndpointSessionInvocationHandle handle,ProcessHandle service,object payload)
+    {
+        lock(_gate)
+        {
+            var found=ResolveForService(handle,service);
+            return found.IsSuccess?KernelResult<OriginalPublication>.Ok(new(this,found.Value!,service,payload)):
+                KernelResult<OriginalPublication>.Fail(found.Error,found.Message!);
+        }
+    }
+
+    // Response lifetime only. Provider, Region and budget facts remain owned here
+    // and are independently consumed by their original cleanup producers.
+    internal KernelResult BindOriginalAcceptedRequest(EndpointSessionInvocationHandle invocation,ProcessHandle service,ChannelEnvelope request)
+    {
+        lock(_gate)
+        {
+            var found=ResolveForService(invocation,service);
+            if(!found.IsSuccess)return KernelResult.Fail(found.Error,found.Message!);
+            var record=found.Value!;
+            if(!record.ServiceAccepted || record.TerminalStatus is not null || request.Sequence!=invocation.InvocationId.Value ||
+                request.MessageId!=record.MessageId || record.OriginalAcceptedRequest is { } prior && !ReferenceEquals(prior,request))
+                return KernelResult.Fail(KernelError.InvalidTransition,"Original accepted request cannot be replaced.");
+            record.OriginalAcceptedRequest=request;
+            return KernelResult.Ok();
+        }
+    }
+
+    internal KernelResult ReadOriginalCancelledLifetime(OriginalPublication original,EndpointSessionInvocationHandle invocation,ProcessHandle service,ChannelEnvelope request)
+    {
+        lock(_gate)
+        {
+            if(!ReferenceEquals(original.Original,original) || !ReferenceEquals(original.Owner,this) ||
+                original.Record is not Record record || !ReferenceEquals(record.OriginalSelf,record) || record.Service!=original.Service ||
+                record.Handle!=invocation || record.Service!=service || !ReferenceEquals(record.OriginalAcceptedRequest,request))
+                return KernelResult.Fail(KernelError.WrongSessionOwner,"Original cancelled invocation absent/copied/foreign.");
+            var key=(record.Handle.Session.SessionId,record.Handle.Session.Generation,record.Handle.InvocationId);
+            if(_records.TryGetValue(key,out var routed) && !ReferenceEquals(routed,record) ||
+                _ownedRecords.TryGetValue(key,out var owned) && !ReferenceEquals(owned,record))
+                return KernelResult.Fail(KernelError.WrongSessionOwner,"Original cancelled invocation route substituted.");
+            var cancellation=record.OriginalResponse?.Owner.ReadOriginalCancellation(record.OriginalResponse);
+            return cancellation is { IsSuccess:true,Value:{ } rawCancellation } && record.TerminalStatus==ResponsePublicationStatus.Cancelled && record.SettlementInProgress is null &&
+                !record.FailedSettlementMayHaveEffect && record.SettlementOutcome is { } outcome &&
+                outcome.Status==ResponsePublicationStatus.Cancelled && outcome.RequestSequence==record.Handle.InvocationId.Value &&
+                outcome.MessageId==record.MessageId && ReferenceEquals(rawCancellation,outcome) ? KernelResult.Ok() :
+                KernelResult.Fail(KernelError.ExternalEffectUncontained,"Original response lifetime remains unresolved.");
+        }
+    }
+
+    internal KernelResult ReadPublication(OriginalPublication original)
+    {
+        lock(_gate)
+        {
+            if(!ReferenceEquals(original.Original,original) || !ReferenceEquals(original.Owner,this) ||
+                original.Record is not Record record || !ReferenceEquals(record.OriginalSelf,record) || record.Service!=original.Service)
+                return KernelResult.Fail(KernelError.WrongSessionOwner,"Original publication absent/copied/foreign.");
+            if(record.TerminalStatus==ResponsePublicationStatus.Published && record.SettlementOutcome is { } outcome &&
+                outcome.Status==ResponsePublicationStatus.Published && outcome.RequestSequence==record.Handle.InvocationId.Value &&
+                outcome.MessageId==record.MessageId && ReferenceEquals(outcome.Payload,original.Payload))
+                return KernelResult.Ok(); // Surviving fact after legitimate routing retirement; no permission/reclaim.
+            return ReadPublishedOutcome(record.Handle,original.Service,original.Payload);
+        }
+    }
+
+    internal KernelResult BindOriginalResponse(EndpointSessionInvocationHandle handle,ProcessHandle service,ResponseRegistry.OriginalPublication original)
+    {
+        lock(_gate)
+        {
+            var found=ResolveForService(handle,service);
+            if(!found.IsSuccess)return KernelResult.Fail(found.Error,found.Message!);
+            var record=found.Value!;
+            if(record.OriginalResponse is { } prior)
+                return ReferenceEquals(prior.Owner,original.Owner) && ReferenceEquals(prior.Completion,original.Completion) &&
+                    prior.Responder==original.Responder && prior.Endpoint==original.Endpoint && prior.Sequence==original.Sequence?
+                    KernelResult.Ok():KernelResult.Fail(KernelError.InvalidTransition,"Original response producer changed; no repeat.");
+            record.OriginalResponse=original;
+            return KernelResult.Ok();
+        }
+    }
+
+    internal KernelResult<ResponseRegistry.OriginalPublication> ReadFailedOriginalResponse(
+        EndpointSessionInvocationHandle handle,ProcessHandle service)
+    {
+        lock(_gate)
+        {
+            var found=ResolveForService(handle,service);
+            if(!found.IsSuccess || found.Value!.SettlementInProgress is not null ||
+                found.Value.TerminalStatus is not null && found.Value.TerminalStatus!=ResponsePublicationStatus.Cancelled ||
+                !found.Value.FailedSettlementMayHaveEffect && !found.Value.SettlementNeverStarted && found.Value.TerminalStatus is null ||
+                found.Value.OriginalResponse is not { } original)
+                return KernelResult<ResponseRegistry.OriginalPublication>.Fail(KernelError.ResponseNotPending,"Original failed response settlement unavailable.");
+            return KernelResult<ResponseRegistry.OriginalPublication>.Ok(original);
+        }
+    }
+
+    internal KernelResult CompleteFailedOriginalResponse(EndpointSessionInvocationHandle handle,ProcessHandle service,
+        ResponseRegistry.OriginalPublication original,ResponseEnvelope cancelled)
+    {
+        lock(_gate)
+        {
+            var found=ReadFailedOriginalResponse(handle,service);
+            if(!found.IsSuccess || !ReferenceEquals(found.Value,original) || cancelled.Status!=ResponsePublicationStatus.Cancelled ||
+                !original.Owner.IsOriginalFailedTransferCompletion(original,cancelled) ||
+                cancelled.RequestSequence!=handle.InvocationId.Value || cancelled.Payload is not null)
+                return KernelResult.Fail(KernelError.PlatformFaulted,"Original cancelled response continuity changed.");
+            var record=ResolveForService(handle,service).Value!;
+            record.SettlementOutcome=cancelled;
+            record.TerminalStatus=ResponsePublicationStatus.Cancelled;
+            record.FailedSettlementMayHaveEffect=false; // Independent provider/copy/donation pins remain.
+            record.SettlementNeverStarted=false; // Nested same-original response effect is independently closed.
+            return KernelResult.Ok();
+        }
+    }
+    internal KernelResult ReconcileResponse(OriginalPublication original,ResponseEnvelope raw,bool exactProducerPayload=false)
+    {
+        lock(_gate)
+        {
+            if(!ReferenceEquals(original.Owner,this) || !ReferenceEquals(original.Original,original) || original.Record is not Record record ||
+                !ReferenceEquals(record.OriginalSelf,record) || record.Service!=original.Service || record.SettlementInProgress is not null ||
+                raw.RequestSequence!=record.Handle.InvocationId.Value || raw.MessageId!=record.MessageId || raw.Status!=ResponsePublicationStatus.Published ||
+                !ReferenceEquals(raw.Payload,original.Payload) && !exactProducerPayload || record.SettlementOutcome is { } prior && !ReferenceEquals(prior,raw))
+                return KernelResult.Fail(KernelError.PlatformFaulted,"Original response settlement continuation mismatch.");
+            record.SettlementOutcome=raw;record.TerminalStatus=ResponsePublicationStatus.Published;
+            // Independent uncertainty/donation/closure pins are not consumed by publication metadata.
+            return KernelResult.Ok();
+        }
+    }
+    internal ResponseRegistry.OriginalPublication? OriginalResponse(OriginalPublication original)
+        => ReferenceEquals(original.Owner,this) && ReferenceEquals(original.Original,original) && original.Record is Record record &&
+            ReferenceEquals(record.OriginalSelf,record) ? record.OriginalResponse : null;
+
+    internal KernelResult ReconcileOriginalChannelCancellation(OriginalPublication original,ResponseEnvelope cancelled)
+    {
+        lock(_gate)
+        {
+            if(!ReferenceEquals(original.Original,original) || !ReferenceEquals(original.Owner,this) ||
+                original.Record is not Record record || !ReferenceEquals(record.OriginalSelf,record) || record.Service!=original.Service ||
+                record.OriginalResponse is not { } response || !response.Owner.ReadOriginalChannelCancellation(response).IsSuccess ||
+                !ReferenceEquals(response.Owner.ReadOriginalChannelCancellation(response).Value,cancelled) ||
+                record.SettlementInProgress is not null || record.TerminalStatus==ResponsePublicationStatus.Published)
+                return KernelResult.Fail(KernelError.PlatformFaulted,"Original channel cancellation continuity differs.");
+            record.TerminalStatus=ResponsePublicationStatus.Cancelled;
+            record.SettlementOutcome=cancelled;
+            record.FailedSettlementMayHaveEffect=false;
+            record.SettlementNeverStarted=false;
+            record.AcceptedResponseCancelled=record.ServiceAccepted;
+            return KernelResult.Ok(); // Provider/Region/donation closure pins remain independent.
+        }
+    }
+
     private KernelResult<Record> Resolve(EndpointSessionInvocationHandle handle)
     {
         if (handle.Generation.Value != 1)
@@ -1002,8 +1503,11 @@ internal sealed class EndpointSessionInvocationRegistry
     }
 
     private bool OwnsOriginalRecord(Record record) =>
-        _ownedRecords.TryGetValue(Key(record.Handle), out var original) && ReferenceEquals(original, record);
+        ReferenceEquals(record.OriginalSelf,record) && _ownedRecords.TryGetValue(Key(record.Handle), out var original) && ReferenceEquals(original, record);
 
     private static (EndpointSessionId, EndpointSessionGeneration, EndpointSessionInvocationId) Key(EndpointSessionInvocationHandle handle) =>
         (handle.Session.SessionId, handle.Session.Generation, handle.InvocationId);
 }
+
+
+

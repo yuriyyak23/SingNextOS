@@ -6,11 +6,15 @@ public sealed partial class NeutralDomainRuntimeFacade : INeutralDomainRuntime
     public int ActiveBindingCount { get { lock (_lifecycleGate) return _dependencies.ActiveDomainCount; } }
 
     public NeutralDomainBindResult Bind(NeutralDomainProfile profile)
+        => BindCore(profile,out _);
+
+    private NeutralDomainBindResult BindCore(NeutralDomainProfile profile,out bool noEffect)
     {
+        noEffect=false;
         lock (_lifecycleGate)
         {
-            if (profile != NeutralDomainProfile.OrdinaryService) return new(false, NeutralDomainBindDecision.UnsupportedProfile, default, "Unsupported neutral domain profile.");
-            if (!TryAllocate(ref _nextHandle, out var handle)) return new(false, NeutralDomainBindDecision.Faulted, default, "Neutral domain handle space is exhausted.");
+            if (profile != NeutralDomainProfile.OrdinaryService) {noEffect=true;return new(false, NeutralDomainBindDecision.UnsupportedProfile, default, "Unsupported neutral domain profile.");}
+            if (!TryAllocate(ref _nextHandle, out var handle)) {noEffect=true;return new(false, NeutralDomainBindDecision.Faulted, default, "Neutral domain handle space is exhausted.");}
             var lease = new NeutralDomainBindingLease(new(handle), new(1));
             _dependencies.RegisterDomain(lease);
             return NeutralDomainBindResult.Bound(lease);

@@ -50,7 +50,7 @@ public sealed partial class RuntimeKernel
         Regions = new RegionAuthority();
         ExternalOperations = new ExternalOperationAuthority(Regions);
         ComputePlanner = new ComputePlanner(Regions);
-        Channels = new ChannelRegistry(CapabilityAuthority, Regions, TransferRegionForIpc);
+        Channels = new ChannelRegistry(CapabilityAuthority, Regions, TransferPreparedRegionForIpc);
         PlatformAuthority = new PlatformAuthorityBridge(platformProvider);
         Services = new ServiceRegistry();
         EndpointSessions = new EndpointSessionRegistry(selectedTimeProvider);
@@ -586,6 +586,7 @@ public sealed partial class RuntimeKernel
 
     private static KernelResult InvalidTransition(ProcessState actual, ProcessState requested) => KernelResult.Fail(KernelError.InvalidTransition, $"Cannot transition from {actual} to {requested}.");
 }
+
 
 
 

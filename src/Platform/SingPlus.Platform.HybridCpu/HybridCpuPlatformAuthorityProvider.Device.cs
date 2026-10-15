@@ -108,7 +108,7 @@ public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformDevice
                 lock (_childCreateCommitGate) { if (fact.Invoked && fact.NativeObservation is null) return PlatformAuthorityResult<PlatformProviderDeviceLease>.Fail(PlatformAuthorityStatus.Faulted,"Original device Bind reply unknown; no repeat."); fact.Invoked = true; }
                 var raw = fact.NativeObservation ?? original.BindDevice(nativeRequest);
                 lock (_childCreateCommitGate) { fact.NativeObservation = raw; fact.Observation = raw.Observation; }
-                if (raw.Request != nativeRequest || raw.Observation is null || !Enum.IsDefined(raw.Observation.Decision) || !raw.SourceFenceMatched && !raw.NoEffectGuaranteed || raw.NoEffectGuaranteed && (raw.Observation.IsBound || raw.Observation.Lease != default))
+                if (raw.Request != nativeRequest || raw.Observation is null || !Enum.IsDefined(raw.Observation.Decision) || !raw.SourceFenceMatched && !raw.NoEffectGuaranteed || raw.NoEffectGuaranteed && (raw.Observation.IsBound || raw.Observation.Lease != default || raw.Observation.Decision==NeutralDeviceBindDecision.Bound))
                     return PlatformAuthorityResult<PlatformProviderDeviceLease>.Fail(PlatformAuthorityStatus.Faulted,"Original device Bind raw foreign/malformed; pinned.");
                 if (raw.NoEffectGuaranteed)
                 {

@@ -34,12 +34,17 @@ public sealed class ProviderDmaDataMotionRequest<T> where T : unmanaged
     internal bool InFlight, CleanupConsumed;
     internal object? CleanupPayload;
     internal ProviderDmaDataMotionResult<T>? Result;
+    internal CancellationToken Cancellation;
 }
 
 public sealed partial class RuntimeKernel
 {
     public KernelResult<ProviderDmaDataMotionResult<T>> MoveProviderDmaBuffers<T>(ProviderDmaDataMotionRequest<T> request,
         IV6LocalityCostEvidenceProvider costProvider) where T : unmanaged
+        => MoveProviderDmaBuffers(request,costProvider,CancellationToken.None);
+
+    public KernelResult<ProviderDmaDataMotionResult<T>> MoveProviderDmaBuffers<T>(ProviderDmaDataMotionRequest<T> request,
+        IV6LocalityCostEvidenceProvider costProvider,CancellationToken cancellation) where T : unmanaged
     {
         ArgumentNullException.ThrowIfNull(request);ArgumentNullException.ThrowIfNull(costProvider);
         lock(request)
@@ -49,6 +54,7 @@ public sealed partial class RuntimeKernel
             if(request.Result is { } result)return KernelResult<ProviderDmaDataMotionResult<T>>.Ok(result);
             if(request.Entered)return KernelResult<ProviderDmaDataMotionResult<T>>.Fail(KernelError.PlatformFaulted,"Unknown original DMA invocation is not repeated.");
             request.Owner=this;request.Entered=true;request.InFlight=true;
+            request.Cancellation=cancellation;
         }
         // Existing executing path performs all admission and original closure.
         // No provider callbacks under the caller correlation monitor.

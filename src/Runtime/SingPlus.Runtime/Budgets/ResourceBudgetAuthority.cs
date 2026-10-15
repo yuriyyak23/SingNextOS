@@ -41,6 +41,7 @@ public sealed partial class ResourceBudgetAuthority
         public RegionHandle? OriginalRegion { get; set; }
         public DomainId OriginalRegionDomain { get; set; }
         public object? OriginalRegionOwner { get; set; }
+        public SingPlus.Sip.PreparedOwnedTransfer? OriginalTransferPreparation { get; set; }
         public bool RegionLifetimeBound { get; set; }
         public object? OriginalVirtualIoOwner { get; set; }
         public object? OriginalLocalGuestOwner { get; init; }
@@ -392,6 +393,47 @@ public sealed partial class ResourceBudgetAuthority
                 : null;
     }
 
+    internal object? CaptureOriginalTransferReservationOwner(ProcessHandle owner,BudgetReservationHandle? reservation,
+        SingPlus.Sip.PreparedOwnedTransfer prepared)
+    {
+        lock(_gate)
+        {
+            if(reservation is not { } exact) return null;
+            var resolved=ResolveReservation(owner,exact);
+            if(!resolved.IsSuccess || !resolved.Value!.RuntimeAttached || resolved.Value.Lifetime!=BudgetReservationLifetime.LocalResource ||
+                resolved.Value.OriginalTransferPreparation is { } prior && !ReferenceEquals(prior,prepared)) return null;
+            resolved.Value.OriginalTransferPreparation=prepared;
+            return resolved.Value;
+        }
+    }
+
+    // Called only after RegionAuthority independently closes the exact producer raw.
+    internal KernelResult ConsumeClosedTransferReservation(object original, ProcessHandle owner,
+        BudgetReservationHandle reservation, SingPlus.Sip.PreparedOwnedTransfer prepared,
+        RegionHandle region, object regionOwner, DomainId domain)
+    {
+        lock(_gate)
+        {
+            var valid=ValidateOriginalRegionCharge(original,owner,reservation);
+            if(!valid.IsSuccess) return valid;
+            var record=(ReservationRecord)original;
+            if(!record.RuntimeAttached || record.Lifetime!=BudgetReservationLifetime.LocalResource ||
+                !ReferenceEquals(record.OriginalTransferPreparation,prepared) || record.TemporalComposition is not null ||
+                record.RegionLifetimeBound!=(record.OriginalRegion is not null) ||
+                (record.OriginalRegion is not null)!=(record.OriginalRegionOwner is not null) ||
+                record.OriginalRegion is { } bound && (bound!=region || record.OriginalRegionDomain!=domain || !ReferenceEquals(record.OriginalRegionOwner,regionOwner)) ||
+                record.OriginalVirtualIoOwner is not null || record.OriginalLocalGuestOwner is not null)
+                return KernelResult.Fail(KernelError.InvalidTransition,"Closed transfer quantitative identity differs.");
+            if(record.State==BudgetReservationState.Released) return KernelResult.Ok();
+            if(record.State is not (BudgetReservationState.Active or BudgetReservationState.Quarantined))
+                return KernelResult.Fail(KernelError.InvalidTransition,"Transfer reservation has another consumer.");
+            var released=ReleaseAmounts(record,record.Amounts);
+            if(!released.IsSuccess) return released;
+            record.State=BudgetReservationState.Released;
+            return KernelResult.Ok();
+        }
+    }
+
     internal (object Fact, object? RegionOwner, ProcessHandle Owner, BudgetReservationHandle Reservation)[]
         OriginalRegionCharges(RegionHandle region)
     {
@@ -430,6 +472,20 @@ public sealed partial class ResourceBudgetAuthority
         }
     }
 
+    internal KernelResult ValidateOriginalRegionChargeBinding(object original, ProcessHandle owner,
+        BudgetReservationHandle reservation, RegionHandle region, object regionOwner, DomainId domain)
+    {
+        lock(_gate)
+        {
+            var valid=ValidateOriginalRegionCharge(original,owner,reservation);
+            if(!valid.IsSuccess) return valid;
+            var record=(ReservationRecord)original;
+            return record.RuntimeAttached && record.Lifetime==BudgetReservationLifetime.LocalResource && record.RegionLifetimeBound && record.OriginalRegionDomain==domain &&
+                record.OriginalRegion==region && ReferenceEquals(record.OriginalRegionOwner,regionOwner)
+                ? KernelResult.Ok() : KernelResult.Fail(KernelError.PlatformFaulted,"Original Region charge association changed.");
+        }
+    }
+
     internal KernelResult<object> BindOriginalQueuedCharge(ProcessHandle sender, ProcessHandle receiver,
         BudgetReservationHandle reservation, ChannelId channel, ulong sequence, object lifetime)
     {
@@ -446,6 +502,25 @@ public sealed partial class ResourceBudgetAuthority
             record.OriginalIpcReceiver = receiver;
             record.OriginalQueuedLifetime = lifetime;
             return KernelResult<object>.Ok(record);
+        }
+    }
+
+    internal KernelResult<BudgetReservationSnapshot> ConsumeWithdrawnQueuedCharge(object original,object lifetime,ProcessHandle sender,BudgetReservationHandle reservation)
+    {
+        lock(_gate)
+        {
+            var valid=ValidateOriginalRegionCharge(original,sender,reservation);
+            if(!valid.IsSuccess) return KernelResult<BudgetReservationSnapshot>.Fail(valid.Error,valid.Message!);
+            var record=(ReservationRecord)original;
+            if(record.Lifetime!=BudgetReservationLifetime.IpcQueued || !ReferenceEquals(record.OriginalQueuedLifetime,lifetime) || record.TemporalComposition is not null)
+                return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.InvalidTransition,"Original withdrawn queue charge differs.");
+            if(record.State==BudgetReservationState.Released) return KernelResult<BudgetReservationSnapshot>.Ok(Snapshot(record));
+            if(record.State is not (BudgetReservationState.Active or BudgetReservationState.Quarantined))
+                return KernelResult<BudgetReservationSnapshot>.Fail(KernelError.InvalidTransition,"Queue charge has another consumer.");
+            var released=ReleaseAmounts(record,record.Amounts);
+            if(!released.IsSuccess) return KernelResult<BudgetReservationSnapshot>.Fail(released.Error,released.Message!);
+            record.State=BudgetReservationState.Released;
+            return KernelResult<BudgetReservationSnapshot>.Ok(Snapshot(record));
         }
     }
 

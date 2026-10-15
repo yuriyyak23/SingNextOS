@@ -177,7 +177,11 @@ public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformNested
             if (!result.IsSuccess && !pure)
             {
                 bool invoke;
-                lock (_childCreateCommitGate) { invoke = !fact.ContainInvoked && fact.CleanupRaw is null; if (invoke) fact.ContainInvoked = true; }
+                // This is continuation of the same original SDK cleanup request,
+                // not another child Create/Close. The SDK owns the actual Close
+                // invocation and resolves its original outcome after possible
+                // effect. A wrapper call can fail on query before Close starts.
+                lock (_childCreateCommitGate) { invoke = fact.CleanupRaw is null; if (invoke) fact.ContainInvoked = true; }
                 if (invoke) result = native.ContainOriginalNestedDomain(fact.NativeRequest);
             }
             lock (_childCreateCommitGate) if (result.IsSuccess) fact.CleanupRaw ??= result.Value;

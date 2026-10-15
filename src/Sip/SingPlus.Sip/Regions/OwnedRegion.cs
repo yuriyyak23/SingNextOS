@@ -30,6 +30,16 @@ public sealed class OwnedRegion<T> : ITransferableOwnedPayload where T : unmanag
     bool ITransferableOwnedPayload.IsValidForRuntime => _buffer.IsValid;
     void ITransferableOwnedPayload.ValidateTransferForRuntime() => ((ITransferableOwnedPayload)_buffer).ValidateTransferForRuntime();
     object ITransferableOwnedPayload.TransferForRuntime(RegionHandle newHandle) => new OwnedRegion<T>((OwnedBuffer<T>)((ITransferableOwnedPayload)_buffer).TransferForRuntime(newHandle));
+    PreparedOwnedTransfer ITransferableOwnedPayload.PrepareTransferForRuntime()
+    {
+        var prepared=((ITransferableOwnedPayload)_buffer).PrepareTransferForRuntime();
+        try
+        {
+            var projection=new OwnedRegion<T>((OwnedBuffer<T>)prepared.Projection);
+            return new PreparedOwnedTransfer(this,projection,prepared.CustodyGate,prepared.Commit,prepared.Dispose,prepared.Validate);
+        }
+        catch { prepared.Dispose();throw; } // No Region effect occurred during wrapper allocation.
+    }
     object ITransferableOwnedPayload.CreateBorrowLeaseForRuntime(BorrowLeaseHandle handle, BorrowLeaseLifetime lifetime) => ((ITransferableOwnedPayload)_buffer).CreateBorrowLeaseForRuntime(handle, lifetime);
     void ITransferableOwnedPayload.InvalidateOwnerAccessForRuntime() => ((ITransferableOwnedPayload)_buffer).InvalidateOwnerAccessForRuntime();
     void ITransferableOwnedPayload.InvalidateForRuntime() => ((ITransferableOwnedPayload)_buffer).InvalidateForRuntime();

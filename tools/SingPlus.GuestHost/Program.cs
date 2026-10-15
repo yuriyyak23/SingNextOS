@@ -10,6 +10,9 @@ var startLoss=args.Contains("--service-start-loss",StringComparer.Ordinal);
 var mapLoss=args.Contains("--service-map-loss",StringComparer.Ordinal);
 var childCreateLoss=args.Contains("--service-cached-create-loss",StringComparer.Ordinal);
 var freshChildLoss=args.Contains("--service-child-create-loss",StringComparer.Ordinal);
+var sourceRefusal=args.Contains("--service-create-source-refusal",StringComparer.Ordinal);
+var capacityRefusal=args.Contains("--service-create-capacity-refusal",StringComparer.Ordinal);
+var parentMapCapacity=args.Contains("--service-parent-map-capacity-refusal",StringComparer.Ordinal);
 var serviceMode=startLoss || args.Contains("--service-bind-loss",StringComparer.Ordinal);
 var lossMode=freshChildLoss || childCreateLoss || mapLoss || serviceMode || args.Contains("--lost-release-reply",StringComparer.Ordinal);
 var packageArgument=args.SingleOrDefault(arg=>!arg.StartsWith("--",StringComparison.Ordinal));
@@ -19,10 +22,16 @@ var native=new NeutralDomainRuntimeFacade();
 var createLoss=args.Contains("--service-create-loss",StringComparer.Ordinal);
 GuestCreateReplyLossRuntime? createResponseLoss=null;
 INeutralDomainRuntime rootRuntime=native;
-if(createLoss)
+if(createLoss || capacityRefusal || parentMapCapacity)
 {
     var proxy=global::System.Reflection.DispatchProxy.Create<IGuestCreateReplyLossRuntime,GuestCreateReplyLossRuntime>();
     createResponseLoss=(GuestCreateReplyLossRuntime)(object)proxy;createResponseLoss.Inner=native;rootRuntime=proxy;
+    if(parentMapCapacity)createResponseLoss.Lose=false;
+    if(capacityRefusal)
+    {
+        typeof(NeutralDomainRuntimeFacade).GetField("_nextHandle",global::System.Reflection.BindingFlags.Instance|global::System.Reflection.BindingFlags.NonPublic)!.SetValue(native,ulong.MaxValue);
+        createResponseLoss.Lose=args.Contains("--lost-capacity-reply",StringComparer.Ordinal);
+    }
 }
 GuestReplyLossRuntime? responseLoss=null;
 var adapter=new HybridCpuExecutableChildAdapter();
@@ -35,7 +44,15 @@ if(lossMode)
         [typeof(HybridCPU.ExternalRuntime.Contracts.IHybridCpuExternalRuntime),typeof(HybridCPU.ExternalRuntime.Contracts.IHybridCpuChildDomainRuntimeV3),typeof(ISemanticTraceSinkV1)],null)!;
     adapter=(HybridCpuExecutableChildAdapter)constructor.Invoke([external,proxy,null]);
 }
-var kernel=new RuntimeKernel(new HybridCpuPlatformAuthorityProvider(rootRuntime,adapter));
+var actualProvider=new HybridCpuPlatformAuthorityProvider(rootRuntime,adapter);
+SingPlus.Platform.IPlatformAuthorityProvider provider=actualProvider;
+GuestSourceRefusalProvider? sourceProbe=null;
+if(sourceRefusal)
+{
+    var proxy=global::System.Reflection.DispatchProxy.Create<IGuestSourceRefusalProvider,GuestSourceRefusalProvider>();
+    sourceProbe=(GuestSourceRefusalProvider)(object)proxy;sourceProbe.Inner=actualProvider;provider=proxy;
+}
+var kernel=new RuntimeKernel(provider);
 void Check(bool value,string operation){if(!value)throw new InvalidOperationException(operation);}
 ProcessHandle Create(ulong id,ulong domain)
 {
@@ -52,7 +69,7 @@ ulong Used(ServiceBudgetDimension dimension)=>kernel.QueryBudget(budget).Value!.
 var code=kernel.AllocateBuffer<byte>(owner,(int)bytes).Value!;
 var peer=kernel.AllocateBuffer<byte>(owner,(int)bytes).Value!;peer.Span[0]=0x6B;
 var create=kernel.MintCapability(new(23010),owner,ResourceKind.Virtualization,VirtualizationResourceIds.Create,CapabilityRights.Configure).Value!.CapabilityId;
-if(createLoss || childCreateLoss || freshChildLoss)
+if(createLoss || childCreateLoss || freshChildLoss || sourceRefusal || capacityRefusal)
 {
     if(childCreateLoss)
     {
@@ -66,9 +83,45 @@ if(createLoss || childCreateLoss || freshChildLoss)
     var session=kernel.OpenSession(owner,descriptor,[]).Value;
     var host=RuntimeVirtualizationServiceHost.CreateForSession(kernel,foreign,session).Value!;
     var client=SingPlus.Sip.Virtualization.VirtualizationServiceClient.Create(new RuntimeSipClientTransport(kernel,owner,session));
+    var serviceRegion=sourceRefusal || capacityRefusal?kernel.AllocateBuffer<byte>(foreign,32).Value:null;
+    if(sourceRefusal)sourceProbe!.BeforeSource=()=>
+    {
+        if(args.Contains("--early-create-teardown",StringComparer.Ordinal))Check(!kernel.TerminateProcess(owner).IsSuccess,"pending root must retain caller");
+        if(args.Contains("--revoke-create-source",StringComparer.Ordinal))Check(kernel.RevokeCapability(create).IsSuccess,"revoke source before root effect");
+        else throw new IOException("Root source observation unavailable before provider Bind");
+    };
     var pending=client.CreateAsync(new(create,new(1,(long)bytes*2)));
     Check(!host.ProcessNext().IsSuccess,"unknown Create not published");
     var denied=false;try{await pending;}catch(Exception){denied=true;}Check(denied,"failed accepted Create response");
+    if(capacityRefusal)
+    {
+        Check(createResponseLoss!.Binds==1 && native.ActiveBindingCount==0,"original capacity refusal invoked once without root");
+        Check(Used(ServiceBudgetDimension.OwnedMemoryBytes)==bytes*2,"caller capacity refusal charges retained");
+        if(createResponseLoss.Lose)
+        {
+            Check(!kernel.TerminateProcess(owner).IsSuccess,"unobserved original capacity disposition remains pinned");
+            Check(Used(ServiceBudgetDimension.OwnedMemoryBytes)==bytes*2,"unknown original retains charges");
+            createResponseLoss.Lose=false;
+        }
+        var capacityTeardown=kernel.TerminateProcess(owner);Check(capacityTeardown.IsSuccess,capacityTeardown.Message??"exact capacity no-effect cleanup");
+        Check(kernel.QueryBudget(budget).Value!.Usage.All(u=>u.Used==0),"capacity refusal exact quantitative reclaim");
+        Check(kernel.Regions.Snapshot().Single(r=>r.Handle==code.Handle).State==RegionState.Released && kernel.Regions.Snapshot().Single(r=>r.Handle==peer.Handle).State==RegionState.Released,"capacity caller Regions released");
+        Check(kernel.Regions.Snapshot().Single(r=>r.Handle==serviceRegion!.Handle).State==RegionState.Owned && kernel.Processes.Resolve(foreign).IsSuccess,"capacity foreign backing survives");
+        Check(createResponseLoss.Binds==1 && native.ActiveBindingCount==0,"capacity same-original no repeat");
+        Console.WriteLine("Create capacity refusal: nativeBind1; nativeRoots0; OwnedMemory2097152->0; callerRegionsReleased2; serviceRegionOwned; gatesOFF; ISA NONE; ProductionQualified=false");
+        return;
+    }
+    if(sourceRefusal)
+    {
+        Check(sourceProbe!.RootBinds==0 && sourceProbe.ChildCreates==0 && native.ActiveBindingCount==0,"source refusal before any root/child effect");
+        Check(Used(ServiceBudgetDimension.OwnedMemoryBytes)==bytes*2,"original caller charges retained before reclaim");
+        var sourceTeardown=kernel.TerminateProcess(owner);Check(sourceTeardown.IsSuccess,sourceTeardown.Message??"never-invoked caller closure");
+        Check(kernel.QueryBudget(budget).Value!.Usage.All(u=>u.Used==0),"exact quantitative caller reclaim");
+        Check(kernel.Regions.Snapshot().Single(r=>r.Handle==code.Handle).State==RegionState.Released && kernel.Regions.Snapshot().Single(r=>r.Handle==peer.Handle).State==RegionState.Released,"both original caller Regions released");
+        Check(kernel.Regions.Snapshot().Single(r=>r.Handle==serviceRegion!.Handle).State==RegionState.Owned && kernel.Processes.Resolve(foreign).IsSuccess,"foreign service/backing survives");
+        Console.WriteLine("Create source refusal: RootBind0; ChildCreate0; nativeRoots0; OwnedMemory2097152->0; callerRegionsReleased2; serviceRegionOwned; gatesOFF; ISA NONE; ProductionQualified=false");
+        return;
+    }
     if(childCreateLoss)
     {
         Check(responseLoss!.ChildCreates==0 && native.ActiveBindingCount==1,"existing root refusal before child effect");
@@ -99,6 +152,40 @@ var domain=kernel.CreateVirtualDomain(owner,create,new(1,(long)bytes*2)).Value!;
 Check(kernel.ConfigureVirtualDomain(owner,domain.Domain,domain.ConfigureCapability).IsSuccess,"configure guest");
 CapabilityId Memory(SingPlus.Sip.OwnedBuffer<byte> buffer,bool executable)=>kernel.MintCapability(new(23010),owner,ResourceKind.MemoryRegion,
     CapabilityResourceIds.MemoryRegion(buffer.Handle.RegionId),CapabilityRights.Map|CapabilityRights.Read|(executable?CapabilityRights.Execute:CapabilityRights.None)).Value!.CapabilityId;
+if(parentMapCapacity)
+{
+    var independent=kernel.MapGuestRegion(owner,domain.Domain,domain.MemoryCapability,Memory(peer,false),peer.Handle,new((long)bytes,(long)bytes),GuestMemoryAccess.Read);
+    Check(independent.IsSuccess,independent.Message??"independent parent/guest mapping");
+    var serviceRegion=kernel.AllocateBuffer<byte>(foreign,32).Value!;
+    typeof(NeutralDomainRuntimeFacade).GetField("_nextResource",global::System.Reflection.BindingFlags.Instance|global::System.Reflection.BindingFlags.NonPublic)!.SetValue(native,ulong.MaxValue);
+    createResponseLoss!.LoseMap=args.Contains("--lost-parent-map-reply",StringComparer.Ordinal);
+    var protocol=SingPlus.Sip.Virtualization.VirtualizationServiceClient.CreateProtocol();
+    var descriptor=kernel.RegisterService(foreign,"parent-capacity",new(protocol.ContractName,"1",protocol.ContractDigest),protocol,SingPlus.Sip.Virtualization.VirtualizationServiceClient.ResponseProtocol,[]).Value!;
+    var session=kernel.OpenSession(owner,descriptor,[]).Value;
+    var host=RuntimeVirtualizationServiceHost.CreateForSession(kernel,foreign,session).Value!;
+    var client=SingPlus.Sip.Virtualization.VirtualizationServiceClient.Create(new RuntimeSipClientTransport(kernel,owner,session));
+    var pending=client.MapGuestRegionAsync(new(domain.Domain,domain.MemoryCapability,Memory(code,true),code.Handle,new(0,(long)bytes),GuestMemoryAccess.Read|GuestMemoryAccess.Execute){MaximumPrivateExecutableDataBytes=bytes});
+    Check(!host.ProcessNext().IsSuccess,"capacity Map not published");
+    var denied=false;try{await pending;}catch(Exception){denied=true;}Check(denied,"accepted capacity Map failure");
+    Check(createResponseLoss.Maps==2 && native.ActiveOwnedRegionMappingCount==1,"one independent map and one original refusal");
+    Check(Used(ServiceBudgetDimension.GuestMemoryBytes)==(createResponseLoss.LoseMap?bytes*2:bytes) && peer.Span[0]==0x6B,"independent guest/data survives refusal");
+    Check(!kernel.AcquireRegionUse(owner,peer.Handle,RegionUseMode.ExclusiveRead,new(0,(long)bytes)).IsSuccess,"independent mapped acquisition guard");
+    if(createResponseLoss.LoseMap)
+    {
+        Check(Used(ServiceBudgetDimension.OwnedMemoryBytes)==bytes*3,"unknown original quota retained");
+        Check(!kernel.AcquireRegionUse(owner,code.Handle,RegionUseMode.ExclusiveRead,new(0,(long)bytes)).IsSuccess,"unknown parent reservation guard");
+        Check(!kernel.TerminateProcess(owner).IsSuccess,"unknown parent Map blocks teardown");
+        createResponseLoss.LoseMap=false;
+    }
+    else Check(Used(ServiceBudgetDimension.OwnedMemoryBytes)==bytes*2,"known no-effect quota consumed without independent closure");
+    var parentTeardown=kernel.TerminateProcess(owner);Check(parentTeardown.IsSuccess,parentTeardown.Message??"exact parent no-effect closure");
+    Check(kernel.QueryBudget(budget).Value!.Usage.All(u=>u.Used==0),"parent capacity quantitative reclaim");
+    Check(createResponseLoss.Maps==2 && native.ActiveOwnedRegionMappingCount==0 && native.ActiveBindingCount==0,"parent no-repeat/original users closure");
+    Check(kernel.Regions.Snapshot().Single(r=>r.Handle==code.Handle).State==RegionState.Released && kernel.Regions.Snapshot().Single(r=>r.Handle==peer.Handle).State==RegionState.Released,"caller Regions released");
+    Check(kernel.Regions.Snapshot().Single(r=>r.Handle==serviceRegion.Handle).State==RegionState.Owned && kernel.Processes.Resolve(foreign).IsSuccess,"foreign backing survives parent cleanup");
+    Console.WriteLine("Parent Map capacity: nativeMap2 (independent1/refusal1); no repeat; independent mapping/data/guard retained; quota3145728->2097152->0; callerRegionsReleased2; foreignRegionOwned; gatesOFF; ISA NONE; ProductionQualified=false");
+    return;
+}
 if(mapLoss)
 {
     var protocol=SingPlus.Sip.Virtualization.VirtualizationServiceClient.CreateProtocol();

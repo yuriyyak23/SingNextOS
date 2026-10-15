@@ -8,6 +8,138 @@ namespace SingPlus.Tests.Virtualization;
 
 public sealed class VirtualizationServiceSessionTests
 {
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public async Task NativeDrainRetainsOriginalResultAndStopsNewDispatchUntilPublicationFinishes(bool terminate)
+    {
+        var provider=new HostPlatformAuthorityProvider();var kernel=new RuntimeKernel(provider);
+        var caller=TestFixtures.Create(kernel,2951,29510).Handle;var service=TestFixtures.Create(kernel,2952,29520).Handle;
+        var independent=kernel.AllocateBuffer<byte>(service,16).Value!;independent.Span.Fill(99);
+        var capability=kernel.MintCapability(new(29510),caller,ResourceKind.Virtualization,VirtualizationResourceIds.Create,CapabilityRights.Configure).Value!.CapabilityId;
+        var protocol=VirtualizationServiceClient.CreateProtocol();
+        var descriptor=kernel.RegisterService(service,"drain-result",new(protocol.ContractName,"1",protocol.ContractDigest),protocol,VirtualizationServiceClient.ResponseProtocol,[]).Value!;
+        var session=kernel.OpenSession(caller,descriptor,[]).Value;
+        var host=RuntimeVirtualizationServiceHost.CreateForSession(kernel,service,session).Value!;
+        var client=VirtualizationServiceClient.Create(new RuntimeSipClientTransport(kernel,caller,session));
+        var reply=client.CreateAsync(new(capability,new(1,4096)));
+        kernel.SessionInvocationSettlementReservedHook=()=>
+        {
+            kernel.SessionInvocationSettlementReservedHook=null;
+            Assert.Equal(KernelError.SessionDraining,kernel.CloseSession(caller,session).Error);
+            throw new IOException("Original result pending while native drain is requested");
+        };
+        Assert.Throws<IOException>(()=>host.ProcessNext());
+        Assert.True(host.HasPendingResult);Assert.False(reply.IsCompleted);
+        var blocked=terminate ? kernel.TerminateProcess(caller) : kernel.CloseSession(caller,session);
+        if(terminate)
+        {
+            Assert.True(blocked.IsSuccess,blocked.Message);
+            await Assert.ThrowsAnyAsync<Exception>(async()=>await reply);
+            Assert.False(host.HasPendingResult);Assert.Equal(1,provider.CreateVirtualDomainCallCount);
+            Assert.Equal(1,provider.RevokeVirtualDomainCallCount);
+            Assert.Equal(KernelError.SessionDraining,host.ProcessNext().Error);
+            Assert.Equal((byte)99,independent.Span[0]);
+            Assert.True(kernel.ReleaseRegion(service,independent).IsSuccess);
+            return;
+        }
+        Assert.False(blocked.IsSuccess);Assert.Equal(1,provider.CreateVirtualDomainCallCount);Assert.Equal(0,provider.RevokeVirtualDomainCallCount);
+        Assert.Equal((byte)99,independent.Span[0]);
+        Assert.True(host.AdvancePendingResult().IsSuccess);
+        var authority=(await reply).Authority;
+        Assert.Equal(KernelError.SessionDraining,host.ProcessNext().Error);
+        Assert.False(host.HasPendingResult);Assert.Equal(1,provider.CreateVirtualDomainCallCount);
+        if(terminate)
+        {
+            var closed=kernel.TerminateProcess(caller);Assert.True(closed.IsSuccess,closed.Message);
+            Assert.Equal(1,provider.RevokeVirtualDomainCallCount);
+        }
+        else
+        {
+            Assert.True(kernel.CloseSession(caller,session).IsSuccess);
+            Assert.Equal(0,provider.RevokeVirtualDomainCallCount);
+            Assert.True(kernel.DestroyVirtualDomain(caller,authority.Domain,authority.ConfigureCapability).IsSuccess);
+            Assert.Equal(1,provider.RevokeVirtualDomainCallCount);
+        }
+        Assert.Equal((byte)99,independent.Span[0]);
+        Assert.True(kernel.ReleaseRegion(service,independent).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public async Task SuccessfulCreateResultSurvivesPublicationThrowAndOriginalOnlyContinuation(bool committed)
+    {
+        var provider=new HostPlatformAuthorityProvider();var kernel=new RuntimeKernel(provider);
+        var caller=TestFixtures.Create(kernel,2941,29410).Handle;var service=TestFixtures.Create(kernel,2942,29420).Handle;
+        var capability=kernel.MintCapability(new(29410),caller,ResourceKind.Virtualization,VirtualizationResourceIds.Create,CapabilityRights.Configure).Value!.CapabilityId;
+        var protocol=VirtualizationServiceClient.CreateProtocol();
+        var descriptor=kernel.RegisterService(service,"result-continuation",new(protocol.ContractName,"1",protocol.ContractDigest),protocol,VirtualizationServiceClient.ResponseProtocol,[]).Value!;
+        var session=kernel.OpenSession(caller,descriptor,[]).Value;
+        var host=RuntimeVirtualizationServiceHost.CreateForSession(kernel,service,session).Value!;
+        var client=VirtualizationServiceClient.Create(new RuntimeSipClientTransport(kernel,caller,session));
+        var pending=client.CreateAsync(new(capability,new(1,1<<20)));
+        var flags=global::System.Reflection.BindingFlags.Instance|global::System.Reflection.BindingFlags.NonPublic;
+        var field=typeof(RuntimeVirtualizationServiceHost).GetField("_pendingResult",flags)!;
+        object? originalPayload=null;
+        kernel.SessionInvocationSettlementReservedHook=()=>
+        {
+            kernel.SessionInvocationSettlementReservedHook=null;
+            Assert.Equal(KernelError.InvalidTransition,host.ProcessNext().Error);
+            Assert.Equal(1,provider.CreateVirtualDomainCallCount);
+            var retained=field.GetValue(host)!;
+            originalPayload=retained.GetType().GetField("Payload",flags)!.GetValue(retained);
+            if(committed)
+            {
+                var endpoint=kernel.EndpointSessions.ResolveForService(session,service).Value!.ServiceEndpoint;
+                Assert.True(kernel.PublishResponse(service,endpoint,1,originalPayload).IsSuccess);
+            }
+            throw new IOException("Original create result publication acknowledgement lost");
+        };
+        Assert.Throws<IOException>(()=>host.ProcessNext());
+        Assert.True(host.HasPendingResult);Assert.Equal(1,provider.CreateVirtualDomainCallCount);
+        var original=field.GetValue(host)!;
+        field.SetValue(host,typeof(object).GetMethod("MemberwiseClone",flags)!.Invoke(original,null));
+        Assert.False(host.AdvancePendingResult().IsSuccess);Assert.True(host.HasPendingResult);
+        field.SetValue(host,original);
+        Assert.True(host.AdvancePendingResult().IsSuccess);
+        var authority=(await pending).Authority;
+        Assert.Equal(((VirtualDomainAuthorityResponse)originalPayload!).Authority,authority);
+        Assert.False(host.HasPendingResult);Assert.Equal(1,provider.CreateVirtualDomainCallCount);
+        Assert.Equal(0,provider.RevokeVirtualDomainCallCount); // Publication is not domain closure.
+        Assert.False(host.AdvancePendingResult().IsSuccess);
+        var configuring=client.ConfigureAsync(new(authority.Domain,authority.ConfigureCapability));
+        Assert.True(host.ProcessNext().IsSuccess);await configuring;
+        var buffer=kernel.AllocateBuffer<byte>(caller,4096).Value!;buffer.Span.Fill(99);
+        var memory=kernel.MintCapability(new(29410),caller,ResourceKind.MemoryRegion,CapabilityResourceIds.MemoryRegion(buffer.Handle.RegionId),CapabilityRights.Map|CapabilityRights.Read|CapabilityRights.Write).Value!.CapabilityId;
+        var mappingTask=client.MapGuestRegionAsync(new(authority.Domain,authority.MemoryCapability,memory,buffer.Handle,new(0x2000,4096),GuestMemoryAccess.Read|GuestMemoryAccess.Write));
+        kernel.SessionInvocationSettlementReservedHook=()=>
+        {
+            kernel.SessionInvocationSettlementReservedHook=null;
+            throw new IOException("Map result retained before response");
+        };
+        Assert.Throws<IOException>(()=>host.ProcessNext());Assert.True(host.HasPendingResult);
+        Assert.Equal((byte)99,buffer.Span[0]);
+        var mapContinuation=host.AdvancePendingResult();
+        Assert.True(mapContinuation.IsSuccess,$"{mapContinuation.Error}: {mapContinuation.Message}");var mapping=(await mappingTask).Mapping;
+        Assert.Equal((byte)99,buffer.Span[0]); // ModelOnly projection is not executable backing closure.
+        var starting=client.StartAsync(new(authority.Domain,authority.ExecuteCapability));
+        kernel.SessionInvocationSettlementReservedHook=()=>
+        {
+            kernel.SessionInvocationSettlementReservedHook=null;
+            throw new IOException("Start null response retained");
+        };
+        Assert.Throws<IOException>(()=>host.ProcessNext());Assert.True(host.HasPendingResult);
+        Assert.True(host.AdvancePendingResult().IsSuccess);await starting;
+        Assert.Equal(1,provider.CreateVirtualDomainCallCount);
+        var parking=client.ParkAsync(new(authority.Domain,authority.ExecuteCapability));
+        Assert.True(host.ProcessNext().IsSuccess);await parking;
+        var closing=client.CloseGuestRegionMappingAsync(new(authority.Domain,authority.MemoryCapability,mapping.Mapping));
+        Assert.True(host.ProcessNext().IsSuccess);await closing;
+        Assert.True(kernel.ReleaseRegion(caller,buffer).IsSuccess);
+        Assert.True(kernel.DestroyVirtualDomain(caller,authority.Domain,authority.ConfigureCapability).IsSuccess);
+        Assert.Equal(1,provider.RevokeVirtualDomainCallCount);
+        Assert.True(kernel.CloseSession(caller,session).IsSuccess);
+    }
+
     [Fact]
     public async Task AcceptedModelCreateCapacityRefusalConsumesOriginalNoEffect()
     {

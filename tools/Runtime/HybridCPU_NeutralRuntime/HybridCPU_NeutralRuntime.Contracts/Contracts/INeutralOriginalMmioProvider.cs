@@ -1,5 +1,5 @@
 ﻿namespace YAKSys_Hybrid_CPU.Core;
-public readonly record struct NeutralOriginalMmioMapRequest(Guid InvocationId,Guid RuntimeIncarnation,Guid DeviceBindInvocationId,NeutralDeviceLease Device,NeutralMmioRegionIdentity Region,NeutralMmioRange Range,NeutralMmioAccess Access);
+public readonly record struct NeutralOriginalMmioMapRequest(Guid InvocationId,Guid RuntimeIncarnation,Guid DeviceBindInvocationId,NeutralDeviceLease Device,NeutralMmioRegionIdentity Region,NeutralMmioRange Range,NeutralMmioAccess Access,NeutralMmioBacking? Backing = null);
 public readonly record struct NeutralOriginalMmioMapObservation(NeutralOriginalMmioMapRequest Request,bool SourceFenceMatched,bool NoEffectGuaranteed,NeutralMmioMapResult Observation);
 public readonly record struct NeutralOriginalMmioCloseRequest(Guid InvocationId,Guid RuntimeIncarnation,Guid MapInvocationId,NeutralMmioLease Mapping);
 public readonly record struct NeutralOriginalMmioCloseObservation(NeutralOriginalMmioCloseRequest Request,bool SourceFenceMatched,bool NoEffectGuaranteed,NeutralMmioCloseResult Observation);

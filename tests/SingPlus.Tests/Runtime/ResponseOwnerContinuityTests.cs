@@ -8,6 +8,113 @@ namespace SingPlus.Tests.Runtime;
 
 public sealed class ResponseOwnerContinuityTests
 {
+    [Fact]
+    public void CommittedOwnershipResponseProvesExactOriginalInputProjectionWithoutRetransfer()
+    {
+        var x=Create();var foreign=Create();
+        var responses=(ResponseRegistry)typeof(RuntimeKernel).GetProperty("Responses",BindingFlags.Instance|BindingFlags.NonPublic)!.GetValue(x.Kernel)!;
+        var original=responses.CapturePublication(x.Responder,x.Channel.Right,x.Sequence).Value!;
+        Assert.False(responses.ReadPublication(original).IsSuccess);
+        var published=x.Kernel.PublishResponse(x.Responder,x.Channel.Right,x.Sequence,x.Payload);Assert.True(published.IsSuccess);
+        var projection=Assert.IsType<OwnedBuffer<byte>>(published.Value!.Payload);
+        Assert.False(x.Payload.IsValid);Assert.True(projection.IsValid);
+        Assert.True(responses.MatchesOriginalPublicationPayload(original,x.Payload,published.Value));
+        Assert.False(responses.MatchesOriginalPublicationPayload(original,foreign.Payload,published.Value));
+        Assert.False(responses.MatchesOriginalPublicationPayload(original,projection,published.Value with {Payload=foreign.Payload}));
+        Assert.True(x.Kernel.ReleaseRegion(x.Requester,projection).IsSuccess);
+        Assert.True(x.Kernel.Channels.Close(x.Channel.Left).IsSuccess);
+        Assert.Same(published.Value,responses.ReadPublication(original).Value);
+        Assert.True(responses.MatchesOriginalPublicationPayload(original,x.Payload,published.Value));
+        Assert.False(projection.IsValid);Assert.True(foreign.Payload.IsValid);
+    }
+    [Fact]
+    public void ForeignOrCopiedPreparationCannotTransferAnotherOriginalRegion()
+    {
+        var x=Create();var other=x.Kernel.AllocateBuffer<byte>(x.Responder,4).Value!;
+        var source=(ITransferableOwnedPayload)x.Payload;var preparation=source.PrepareTransferForRuntime();
+        var owner=new RegionOwner(new DomainId(912_100),x.Responder.Generation);var target=new RegionOwner(new DomainId(912_000),x.Requester.Generation);
+        var refused=x.Kernel.Regions.Transfer(other.Handle,owner,target,(ITransferableOwnedPayload)other,preparation);
+        Assert.False(refused.IsSuccess);Assert.Equal(owner,x.Kernel.Regions.Snapshot().Single(r=>r.Handle==other.Handle).Owner);
+        var copy=(PreparedOwnedTransfer)typeof(object).GetMethod("MemberwiseClone",BindingFlags.Instance|BindingFlags.NonPublic)!.Invoke(preparation,null)!;
+        Assert.False(x.Kernel.Regions.Transfer(x.Payload.Handle,owner,target,source,copy).IsSuccess);
+        Assert.Throws<InvalidOperationException>(()=>copy.Dispose());
+        Assert.Throws<InvalidOperationException>(()=>{_=x.Payload.Span.Length;});
+        Assert.Equal(owner,x.Kernel.Regions.Snapshot().Single(r=>r.Handle==x.Payload.Handle).Owner);
+        Assert.False(((ITransferableOwnedPayload)preparation.Projection).IsValidForRuntime);
+        preparation.Dispose();Assert.Equal(4,x.Payload.Span.Length);Assert.True(other.IsValid);
+        Assert.True(x.Kernel.PublishResponse(x.Responder,x.Channel.Right,x.Sequence,x.Payload).IsSuccess);
+    }
+    [Fact]
+    public void ResponseBudgetRefusalBeforeRegionEffectReleasesOnlyPreparedManagedCustody()
+    {
+        var x=Create(budgetRequester:true);
+        var independent=x.Kernel.AllocateBuffer<byte>(x.Requester,4).Value!;independent.Span.Fill(99);
+        var result=x.Kernel.PublishResponse(x.Responder,x.Channel.Right,x.Sequence,x.Payload);
+        Assert.False(result.IsSuccess);
+        Assert.True(x.Payload.IsValid);Assert.Equal(4,x.Payload.Span.Length);
+        Assert.Equal(new RegionOwner(new DomainId(912_100),x.Responder.Generation),x.Kernel.Regions.Snapshot().Single(r=>r.Handle==x.Payload.Handle).Owner);
+        Assert.All(independent.Span.ToArray(),b=>Assert.Equal((byte)99,b));
+        Assert.Equal(4UL,x.Kernel.QueryBudget(x.Budget!.Value).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.True(x.Kernel.ReleaseRegion(x.Requester,independent).IsSuccess);
+        Assert.False(x.Kernel.PublishResponse(x.Responder,x.Channel.Right,x.Sequence,x.Payload).IsSuccess); // No implicit retry guarantee.
+        Assert.Equal(4,x.Payload.Span.Length);
+        Assert.True(x.Kernel.ReleaseRegion(x.Responder,x.Payload).IsSuccess);
+        Assert.Equal(0UL,x.Kernel.QueryBudget(x.Budget.Value).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+    }
+    [Fact]
+    public void EqualOwnershipWrapperIsNotTheRegisteredResponsePayload()
+    {
+        var x=Create();var copy=(OwnedBuffer<byte>)typeof(object).GetMethod("MemberwiseClone",BindingFlags.Instance|BindingFlags.NonPublic)!.Invoke(x.Payload,null)!;
+        var refused=x.Kernel.PublishResponse(x.Responder,x.Channel.Right,x.Sequence,copy);
+        Assert.Equal(KernelError.StaleHandle,refused.Error);
+        Assert.True(x.Payload.IsValid);Assert.Equal(4,x.Payload.Span.Length);
+        Assert.Equal(new RegionOwner(new DomainId(912_100),x.Responder.Generation),x.Kernel.Regions.Snapshot().Single(r=>r.Handle==x.Payload.Handle).Owner);
+        Assert.Empty((IEnumerable)Routes(x.Kernel)[x.Channel.Left.ChannelId]!.GetType().GetProperty("LeftResponses")!.GetValue(Routes(x.Kernel)[x.Channel.Left.ChannelId])!);
+    }
+    [Fact]
+    public void RegionTransferRefusesChangedOriginalPayloadBeforeOwnerOrGenerationMutation()
+    {
+        var x=Create();var handle=x.Payload.Handle;var owner=new RegionOwner(new DomainId(912_100),x.Responder.Generation);
+        var captured=x.Kernel.Regions.CaptureTransferPayload(handle,owner);Assert.True(captured.IsSuccess);
+        var replacement=x.Payload.Move();
+        x.Kernel.Regions.ReplacePayload(handle,handle,(ITransferableOwnedPayload)replacement);
+        var refused=x.Kernel.Regions.Transfer(handle,owner,new RegionOwner(new DomainId(912_000),x.Requester.Generation),captured.Value);
+        Assert.Equal(KernelError.StaleHandle,refused.Error);
+        Assert.True(replacement.IsValid);Assert.Equal(handle,replacement.Handle);
+        Assert.Equal(owner,x.Kernel.Regions.Snapshot().Single(r=>r.Handle==handle).Owner);
+        Assert.True(x.Kernel.PublishResponse(x.Responder,x.Channel.Right,x.Sequence,replacement).IsSuccess);
+        Assert.False(replacement.IsValid);
+    }
+    [Fact]
+    public void PreparedResponseCustodyBlocksCompetingMoveAndBorrowWithoutChangingRegionOwner()
+    {
+        var x=Create();var source=(ITransferableOwnedPayload)x.Payload;
+        var prepared=source.PrepareTransferForRuntime();
+        Assert.False(((ITransferableOwnedPayload)prepared.Projection).IsValidForRuntime);
+        Assert.Throws<InvalidOperationException>(()=>x.Payload.Move());
+        Assert.Throws<InvalidOperationException>(()=>{_=x.Payload.Span.Length;});
+        Assert.Equal(new RegionOwner(new DomainId(912_100),x.Responder.Generation),x.Kernel.Regions.Snapshot().Single(r=>r.Handle==x.Payload.Handle).Owner);
+        prepared.Dispose();
+        Assert.True(x.Payload.IsValid);Assert.Equal(4,x.Payload.Span.Length);
+        Assert.False(((ITransferableOwnedPayload)prepared.Projection).IsValidForRuntime);
+        Assert.Throws<InvalidOperationException>(()=>prepared.Commit(x.Payload.Handle));
+        Assert.True(x.Kernel.PublishResponse(x.Responder,x.Channel.Right,x.Sequence,x.Payload).IsSuccess);
+        Assert.False(x.Payload.IsValid);
+    }
+    [Fact]
+    public void AlreadyFinalizedCompletionCannotTransferOwnershipOrQueueDuplicateResponse()
+    {
+        var x=Create();var owner=Routes(x.Kernel)[x.Channel.Left.ChannelId]!;
+        var completions=(IDictionary)owner.GetType().GetProperty("OwnedCompletions")!.GetValue(owner)!;
+        var completion=completions[x.Sequence]!;
+        var source=(TaskCompletionSource<ResponseEnvelope>)completion.GetType().GetProperty("Source")!.GetValue(completion)!;
+        source.SetResult(new(x.Sequence,1,ResponsePublicationStatus.Cancelled,null));
+        var published=x.Kernel.PublishResponse(x.Responder,x.Channel.Right,x.Sequence,x.Payload);
+        Assert.False(published.IsSuccess);Assert.True(x.Payload.IsValid);
+        Assert.Equal(new RegionOwner(new DomainId(912_100),x.Responder.Generation),x.Kernel.Regions.Snapshot().Single(r=>r.Handle==x.Payload.Handle).Owner);
+        Assert.Empty((IEnumerable)owner.GetType().GetProperty("LeftResponses")!.GetValue(owner)!);
+        Assert.Single((IDictionary)owner.GetType().GetProperty("Pending")!.GetValue(owner)!);
+    }
     [Theory]
     [InlineData(false)] [InlineData(true)]
     public async Task OriginalResponseDeliveryRefusesBeforeQueueConsumptionWhenRequestIndexIsLost(bool completionIndex)

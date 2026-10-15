@@ -1,5 +1,6 @@
 using SingPlus.Contracts;
 using SingPlus.Platform;
+using SingPlus.Sip;
 
 namespace SingPlus.Runtime;
 
@@ -638,6 +639,13 @@ public sealed partial class RuntimeKernel
         return ObserveComponentTeardownRecord(record);
     }
 
+    internal KernelResult<ComponentLifecycleSnapshot> ObserveFailedComponentAdmission(ComponentAdmissionPlan original)
+    {
+        if (!_components.TryGetValue(original.Manifest.Identity, out var record) || !ReferenceEquals(record.Plan, original))
+            return KernelResult<ComponentLifecycleSnapshot>.Fail(KernelError.StaleGeneration, "Original failed admission owner is unavailable.");
+        return ObserveComponentTeardownRecord(record);
+    }
+
     private KernelResult<ComponentLifecycleSnapshot> ObserveComponentTeardownRecord(ComponentAdmissionRecord record)
     {
         if (record.State == ComponentLifecycleState.Reclaimable)
@@ -975,10 +983,35 @@ public sealed partial class RuntimeKernel
             var capability = FindComponentCapability(record, ResourceKind.MmioRegion, mmio.CapabilityResourceId, rights);
             if (!capability.IsSuccess) return KernelResult.Fail(capability.Error, capability.Message!);
             BeforeComponentDriverMmioQualificationHook?.Invoke();
-            var lease = BindPlatformMmioCore(record.Process, resources.DeviceLease, capability.Value, mmio.Offset, mmio.Length, mmio.Access, source, sourceCommit: restoreCommit);
+            RegionHandle? backingRegion=null;
+            KernelResult<PlatformMmioLease> lease;
+            if(mmio.SoftwareRegisterBacking)
+            {
+                CapabilityResourceIds.TryParseMmioRegion(mmio.CapabilityResourceId,out var description);
+                var observations = new List<BudgetTraceObservation>();
+                KernelResult<OwnedBuffer<byte>> buffer = default;
+                KernelResult AllocateBacking()
+                {
+                    buffer = AllocateBufferCore<byte>(record.Process, checked((int)description.ByteLength), observations);
+                    return buffer.IsSuccess ? KernelResult.Ok() : KernelResult.Fail(buffer.Error, buffer.Message!);
+                }
+                KernelResult authorized;
+                try
+                {
+                    authorized = CommitComponentAdmissionTracking(record, () => restoreCommit is null
+                        ? CommitControllerMmio(source, AllocateBacking)
+                        : restoreCommit(AllocateBacking));
+                }
+                finally { EmitBudgetObservations(observations); }
+                if (!authorized.IsSuccess) return authorized;
+                if(!buffer.IsSuccess)return KernelResult.Fail(buffer.Error,buffer.Message!);
+                backingRegion=buffer.Value!.Handle;
+                lease=BindPlatformMmioBackingCore(record.Process,resources.DeviceLease,capability.Value,mmio.Offset,mmio.Length,mmio.Access,buffer.Value,source,sourceCommit:restoreCommit);
+            }
+            else lease = BindPlatformMmioCore(record.Process, resources.DeviceLease, capability.Value, mmio.Offset, mmio.Length, mmio.Access, source, sourceCommit: restoreCommit);
             if (!lease.IsSuccess) return KernelResult.Fail(lease.Error, lease.Message!);
             tracked = CommitComponentDriverTracking(record, resources,
-                () => resources.AddMmio(new MmioResourceGrant(mmio.CapabilityResourceId, capability.Value, lease.Value!)), restoreCommit);
+                () => resources.AddMmio(new MmioResourceGrant(mmio.CapabilityResourceId, capability.Value, lease.Value!,backingRegion)), restoreCommit);
             if (!tracked.IsSuccess) return tracked;
         }
 

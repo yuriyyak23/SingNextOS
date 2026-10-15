@@ -1,9 +1,0 @@
-﻿# ADR-028 — Original native device producing fence and cleanup
-
-Accepted for actual additive ModelOnly producer/consumer, 2026-10-11; gates OFF, ISA NONE.
-
-Actual kernel TerminateProcess repro closes a foreign native device with equal numeric lease. Original device Bind/Close request identity, captured realm, canonical device/source and original root admission factory must be checked atomically with effect at the existing native owners. Root owns Bind intent/history before effect; admitted device references the same fact; device owns Close intent/raw. Existing dependent inventories remain mandatory. Pure surviving-original Bind/Close lookup cannot effect or infer no-effect/closure from absence. Known exact no-effect is consumed separately; unfinished/lost/malformed outcome does not repeat.
-
-Add an opaque platform original Bind request retained before effect, pure cleanup-only adoption and optional exact no-effect/pure Close resolution only for producing need. Existing bridge root/device owners retain original facts/raw before callbacks and exact local consumption; malformed foreign returned-object compensation is prohibited. Unknown admission pins root/backing until exact original lookup and cleanup. Completed original device closure can hand off to kernel cleanup without new active permission or repeated effect; independent source/generation/backing users remain pinned.
-
-No new authority/ledger, public enum/V2/schema, sibling package or machine changes. Actual adoption uses local native project references and existing HybridCPU provider/kernel consumers. Verify foreign realm alive, original realm closed, Region/attached charge, canonical/source/history/owner copies, no-effect/unknown/malformed/lost reply/reentry/overlap/partial consumption and terminal native/affected/main exits. All-fact-loss/production/physical/stateful/multi-host scopes remain separate.

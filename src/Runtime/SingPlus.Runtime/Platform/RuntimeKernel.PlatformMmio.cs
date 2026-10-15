@@ -16,7 +16,7 @@ public sealed partial class RuntimeKernel
     private KernelResult<PlatformMmioLease> BindPlatformMmioCore(ProcessHandle subject, PlatformDeviceLease deviceLease,
         CapabilityId mmioCapabilityId, long offset, long length, PlatformMmioAccess access,
         (ProcessHandle Principal, CapabilityId Capability)? source,
-        Func<Func<KernelResult>, KernelResult>? sourceCommit = null)
+        Func<Func<KernelResult>, KernelResult>? sourceCommit = null,MmioBufferPayload? backing = null)
     {
         KernelResult CommitSource(Func<KernelResult> commit) => sourceCommit is null
             ? CommitControllerMmio(source, commit) : sourceCommit(commit);
@@ -31,7 +31,7 @@ public sealed partial class RuntimeKernel
             });
             if (!pending.IsSuccess) return KernelResult<PlatformMmioLease>.Fail(pending.Error, pending.Message!);
         }
-        try { return BindPlatformMmioAdmitted(subject, deviceLease, mmioCapabilityId, offset, length, access, source, sourceCommit); }
+        try { return BindPlatformMmioAdmitted(subject, deviceLease, mmioCapabilityId, offset, length, access, source, sourceCommit,backing); }
         finally { lock (_platformMemoryUseGate) _pendingPlatformMmioCapabilities.Remove(mmioCapabilityId); }
     }
 
@@ -42,7 +42,7 @@ public sealed partial class RuntimeKernel
         long offset,
         long length,
         PlatformMmioAccess access, (ProcessHandle Principal, CapabilityId Capability)? source,
-        Func<Func<KernelResult>, KernelResult>? sourceCommit)
+        Func<Func<KernelResult>, KernelResult>? sourceCommit,MmioBufferPayload? backing)
     {
         KernelResult CommitSource(Func<KernelResult> commit) => sourceCommit is null
             ? CommitControllerMmio(source, commit) : sourceCommit(commit);
@@ -140,6 +140,12 @@ public sealed partial class RuntimeKernel
                         if (!ReferenceEquals(current.Value, process))
                             return KernelResult.Fail(KernelError.StaleGeneration, "Exact MMIO process incarnation changed.");
                         var accepting = EnsureProcessAcceptsNewEffects(current.Value!);
+                        if(accepting.IsSuccess && backing is not null)
+                        {
+                            if(!ReferenceEquals(backing.Original,backing) || backing.Use is not { } use || backing.Reservation?.IsActive!=true || backing.Backing?.ByteLength!=region.ByteLength)
+                                return KernelResult.Fail(KernelError.StaleGeneration,"Original MMIO backing changed before admission/publication.");
+                            var live=Regions.ValidateUse(use,backing.Owner);if(!live.IsSuccess)return KernelResult.Fail(live.Error,live.Message!);
+                        }
                         return accepting.IsSuccess ? commit() : accepting;
                     }));
         }
@@ -154,7 +160,7 @@ public sealed partial class RuntimeKernel
                 var result = commit();
                 if (result.IsSuccess) TrackPlatformMmioLease(subject, candidate);
                 return result;
-            }), admissionConsumer: source is null && sourceCommit is null ? null : Authorize);
+            }), admissionConsumer: source is null && sourceCommit is null ? null : Authorize,backing:backing);
         return lease;
     }
 
@@ -180,7 +186,10 @@ public sealed partial class RuntimeKernel
         var identity = PlatformIdentity(resolved.Value!);
         var revoke = PlatformAuthority.RevokeMmio(lease, identity);
         if (revoke.IsSuccess)
+        {
             UntrackPlatformMmioLease(lease);
+            return PlatformAuthority.ConsumeOriginalMmioBacking(identity,Regions);
+        }
         return revoke;
     }
 
@@ -199,6 +208,8 @@ public sealed partial class RuntimeKernel
             }
 
             UntrackPlatformMmioLease(lease);
+            var backing=PlatformAuthority.ConsumeOriginalMmioBacking(lease.DeviceLease.DomainBinding.Subject,Regions);
+            if(!backing.IsSuccess)firstFailure ??= backing;
         }
 
         if (firstFailure is { } failed) return failed;
@@ -231,7 +242,8 @@ public sealed partial class RuntimeKernel
             UntrackPlatformMmioLease(lease);
         }
 
-        return firstFailure ?? KernelResult.Ok();
+        var consumed=PlatformAuthority.ConsumeOriginalMmioBacking(deviceLease.DomainBinding.Subject,Regions);
+        return firstFailure ?? consumed;
     }
 
     private KernelResult AdvancePlatformMmioLeasesForProcess(
@@ -257,7 +269,8 @@ public sealed partial class RuntimeKernel
             UntrackPlatformMmioLease(lease);
         }
 
-        return firstFailure ?? KernelResult.Ok();
+        var consumed=PlatformAuthority.ConsumeOriginalMmioBacking(identity,Regions);
+        return firstFailure ?? consumed;
     }
 
     private void TrackPlatformMmioLease(ProcessHandle process, PlatformMmioLease lease)

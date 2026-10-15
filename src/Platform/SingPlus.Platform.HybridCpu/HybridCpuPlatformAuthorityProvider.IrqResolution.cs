@@ -29,7 +29,7 @@ public sealed partial class HybridCpuPlatformAuthorityProvider
                 !_domains.TryGetValue(request.Device.DomainLease.LeaseId,out var parent) || !ReferenceEquals(parent,device.BindParent) ||
                 raw is not { } value || value.Request != expected || value.Observation is null || !Enum.IsDefined(value.Observation.Decision) || !value.SourceFenceMatched && !value.NoEffectGuaranteed)
                 return Refuse("Original IRQ lookup/raw source lost or malformed.");
-            if (value.NoEffectGuaranteed && !value.Observation.IsBound && value.Observation.Lease == default && binding is null)
+            if (value.NoEffectGuaranteed && !value.Observation.IsBound && value.Observation.Decision!=NeutralInterruptBindDecision.Bound && value.Observation.Lease == default && binding is null)
             {
                 if (!ReferenceEquals(device.FailedIrqBind,fact)) return Refuse("Original IRQ no-effect owner changed.");
                 device.FailedIrqBind = null;

@@ -39,6 +39,17 @@ internal sealed class ResponseRegistry
         public TaskCompletionSource<ResponseEnvelope> Source { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool Waiting { get; set; }
+        public ResponseEnvelope? RawPublication { get; set; }
+        public CompletionRecord? OriginalSelf { get; set; }
+        public bool PublicationCommitted { get; set; }
+        public object? OriginalOwnershipInput { get; set; }
+        public object? OwnershipProjection { get; set; }
+        public bool OwnershipTransferAttempted { get; set; }
+        public PreparedOwnedTransfer? PreparedOwnership { get; set; }
+        public TransferProducer? OriginalTransferProducer { get; set; }
+        public InitialOwnership? OriginalInitialOwnership { get; set; }
+        public bool FailedTransferCleanupCompleted { get; set; }
+        public ResponseEnvelope? OriginalChannelCancellation { get; set; }
     }
 
     private sealed class ChannelRecord(
@@ -59,14 +70,14 @@ internal sealed class ResponseRegistry
     }
 
     private readonly RegionAuthority _regions;
-    private readonly Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>> _transferRegion;
+    private readonly Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, Action, PreparedOwnedTransfer, KernelResult<RegionHandle>> _transferRegion;
     private readonly ChannelRegistry _requestChannels;
     private readonly Dictionary<ChannelId, ChannelRecord> _channels = [];
     // Same authoritative records retained independently from the response routing index.
     private readonly Dictionary<ChannelId, ChannelRecord> _ownedChannels = [];
 
     internal ResponseRegistry(RegionAuthority regions, ChannelRegistry channels,
-        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>> transferRegion)
+        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, Action, PreparedOwnedTransfer, KernelResult<RegionHandle>> transferRegion)
     {
         _regions = regions;
         _transferRegion = transferRegion;
@@ -163,6 +174,7 @@ internal sealed class ResponseRegistry
         channel.Completions.EnsureCapacity(channel.Completions.Count + 1);
         var pending = new PendingRecord(request.Sequence, response, requester, requesterEndpoint, responder, responderEndpoint);
         var completion = new CompletionRecord(requester, requesterEndpoint, pending);
+        completion.OriginalSelf=completion;
         channel.OwnedCompletions.Add(request.Sequence, completion);
         channel.Pending.Add(request.Sequence, pending);
         channel.Completions.Add(request.Sequence, completion);
@@ -215,7 +227,7 @@ internal sealed class ResponseRegistry
         ChannelEndpointHandle endpoint,
         ulong requestSequence,
         object? payload,
-        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>>? transferRegion = null)
+        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, Action, PreparedOwnedTransfer, KernelResult<RegionHandle>>? transferRegion = null)
     {
         if (!TryResolveChannel(endpoint.ChannelId, out var channel))
             return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseProtocolUnavailable, "The channel was not created with response protocol metadata.");
@@ -230,6 +242,9 @@ internal sealed class ResponseRegistry
             return KernelResult<ResponseEnvelope>.Fail(KernelError.WrongEndpointOwner, "The original requester generation no longer matches the pending response.");
         if (pending.State != PendingState.Delivered)
             return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseNotDelivered, "A response cannot be published before the request is delivered to the responder.");
+        if(!TryResolveCompletion(channel,requestSequence,out var originalCompletion) ||
+            originalCompletion.Source.Task.IsCompleted || originalCompletion.RawPublication is not null)
+            return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseNotPending,"Original completion already finalized; ownership transfer/publication denied.");
 
         var shape = ValidatePayload(pending.Response.Payload, payload);
         if (!shape.IsSuccess)
@@ -238,10 +253,15 @@ internal sealed class ResponseRegistry
         object? publishedPayload = payload;
         if (pending.Response.Payload.Kind == ResponsePayloadKind.Ownership)
         {
-            var transferred = TransferOwnership(responder, requester, (ITransferableOwnedPayload)payload!, transferRegion: transferRegion);
+            if(originalCompletion.OwnershipTransferAttempted)
+                return KernelResult<ResponseEnvelope>.Fail(KernelError.PlatformFaulted,"Original ownership response transfer already attempted; no repeat.");
+            originalCompletion.OriginalOwnershipInput=payload;
+            originalCompletion.OwnershipTransferAttempted=true; // Existing completion owner before possible transfer.
+            var transferred = TransferOwnership(responder, requester, (ITransferableOwnedPayload)payload!, transferRegion: transferRegion,completionOwner:originalCompletion);
             if (!transferred.IsSuccess)
                 return KernelResult<ResponseEnvelope>.Fail(transferred.Error, transferred.Message!);
             publishedPayload = transferred.Value;
+            originalCompletion.OwnershipProjection=publishedPayload; // Original returned projection before envelope/publication.
         }
 
         var envelope = new ResponseEnvelope(
@@ -263,7 +283,7 @@ internal sealed class ResponseRegistry
         uint messageId,
         OwnedBuffer<T> payload,
         Func<KernelResult>? finalAdmission = null,
-        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>>? transferRegion = null) where T : unmanaged
+        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, Action, PreparedOwnedTransfer, KernelResult<RegionHandle>>? transferRegion = null) where T : unmanaged
     {
         ArgumentNullException.ThrowIfNull(payload);
         if (!TryResolveChannel(endpoint.ChannelId, out var channel))
@@ -292,21 +312,65 @@ internal sealed class ResponseRegistry
         SingProcess requester,
         ITransferableOwnedPayload owned,
         Func<KernelResult>? finalAdmission = null,
-        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>>? transferRegion = null)
+        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, Action, PreparedOwnedTransfer, KernelResult<RegionHandle>>? transferRegion = null,
+        CompletionRecord? completionOwner = null)
     {
+        KernelResult<object> RefuseInitialPayload(KernelError error,string message)
+        {
+            if(completionOwner is { OriginalInitialOwnership: { } initial } &&
+                ReferenceEquals(completionOwner.OriginalSelf,completionOwner) && ReferenceEquals(initial.Original,initial) &&
+                ReferenceEquals(initial.Payload,owned) && ReferenceEquals(completionOwner.OriginalOwnershipInput,owned) &&
+                completionOwner.PreparedOwnership is null && completionOwner.OriginalTransferProducer is null && initial.Refusal is null)
+                initial.Refusal=error; // Own checked refusal before preparation/Region invocation.
+            return KernelResult<object>.Fail(error,message);
+        }
         if (!owned.IsValidForRuntime)
-            return KernelResult<object>.Fail(KernelError.InvalidRegionState, "Ownership response requires a valid owned payload.");
+            return RefuseInitialPayload(KernelError.InvalidRegionState,"Ownership response requires a valid owned payload.");
         var oldHandle = owned.Handle;
         var source = new RegionOwner(responder.DomainId, responder.Generation);
         var target = new RegionOwner(requester.DomainId, requester.Generation);
         var regionValidation = _regions.Validate(oldHandle, source);
         if (!regionValidation.IsSuccess)
-            return KernelResult<object>.Fail(regionValidation.Error, regionValidation.Message!);
-        var transfer = (transferRegion ?? _transferRegion)(responder, requester, oldHandle, finalAdmission);
+            return RefuseInitialPayload(regionValidation.Error,regionValidation.Message!);
+        var captured=_regions.CaptureTransferPayload(oldHandle,source);
+        if(!captured.IsSuccess || !ReferenceEquals(captured.Value,owned))
+            return RefuseInitialPayload(KernelError.StaleHandle,"Ownership response caller is not the original registered Region payload.");
+        PreparedOwnedTransfer prepared;
+        try { prepared=owned.PrepareTransferForRuntime(); }
+        catch(InvalidOperationException exception){return RefuseInitialPayload(KernelError.RegionUseConflict,exception.Message);}
+        if(completionOwner is not null)
+        {
+            if(!ReferenceEquals(completionOwner.OriginalSelf,completionOwner) || !ReferenceEquals(completionOwner.OriginalOwnershipInput,owned) ||
+                completionOwner.PreparedOwnership is not null)
+            {
+                prepared.Dispose();
+                return KernelResult<object>.Fail(KernelError.PlatformFaulted,"Original prepared ownership owner changed; no transfer.");
+            }
+            completionOwner.PreparedOwnership=prepared;
+            completionOwner.OwnershipProjection=prepared.Projection; // Invalid until exact token commit, not ownership proof.
+        }
+        var refusedBeforeEffect=false;
+        KernelResult AdmitOriginal()
+        {
+            var admitted=finalAdmission?.Invoke()??KernelResult.Ok();
+            if(!admitted.IsSuccess){refusedBeforeEffect=true;return admitted;}
+            var current=_regions.CaptureTransferPayload(oldHandle,source);
+            if(!current.IsSuccess || !ReferenceEquals(current.Value,owned))
+            {
+                refusedBeforeEffect=true;
+                return KernelResult.Fail(KernelError.StaleHandle,"Original response payload changed during transfer preparation.");
+            }
+            return KernelResult.Ok();
+        }
+        var transfer = (transferRegion ?? _transferRegion)(responder, requester, oldHandle, AdmitOriginal, () => refusedBeforeEffect=true,prepared);
         if (!transfer.IsSuccess)
+        {
+            if(refusedBeforeEffect)prepared.Dispose(); // Exact trusted admission refusal, never inferred from generic failure.
             return KernelResult<object>.Fail(transfer.Error, transfer.Message!);
-        var moved = owned.TransferForRuntime(transfer.Value);
-        _regions.ReplacePayload(oldHandle, transfer.Value, (ITransferableOwnedPayload)moved);
+        }
+        // Region owner commits prepared custody/payload atomically with transfer.
+        var moved = prepared.Projection;
+
         responder.RemoveRegion(oldHandle);
         requester.AddRegion(transfer.Value);
         return KernelResult<object>.Ok(moved);
@@ -415,6 +479,9 @@ internal sealed class ResponseRegistry
             !ReferenceEquals(originalPending, pending) ||
             !TryResolveCompletion(channel, pending.RequestSequence, out var completion))
             throw new InvalidOperationException("Pending response completion state disappeared before publication.");
+        if(completion.Source.Task.IsCompleted || completion.RawPublication is not null)
+            throw new InvalidOperationException("Original response completion was already finalized before publication.");
+        completion.RawPublication=envelope; // Existing owner retains raw before observable queue/notification.
 
         if (!completion.Waiting)
             ResponseQueue(channel, pending.RequesterEndpoint).Enqueue(envelope);
@@ -422,6 +489,290 @@ internal sealed class ResponseRegistry
         channel.Pending.Remove(pending.RequestSequence);
         if (!completion.Source.TrySetResult(envelope))
             throw new InvalidOperationException("Pending response completion was already finalized.");
+        completion.PublicationCommitted=true;
+    }
+
+    internal sealed class OriginalPublication
+    {
+        internal OriginalPublication(ResponseRegistry owner,object completion,ProcessHandle responder,ChannelEndpointHandle endpoint,ulong sequence)
+        { Owner=owner;Completion=completion;Responder=responder;Endpoint=endpoint;Sequence=sequence;Original=this; }
+        internal readonly ResponseRegistry Owner;
+        internal readonly object Completion;
+        internal readonly ProcessHandle Responder;
+        internal readonly ChannelEndpointHandle Endpoint;
+        internal readonly ulong Sequence;
+        internal readonly OriginalPublication Original;
+    }
+
+    // Original producer correlation in the existing response completion owner.
+    internal sealed class InitialOwnership
+    {
+        internal readonly InitialOwnership Original;
+        internal readonly OriginalPublication Publication;
+        internal readonly ITransferableOwnedPayload Payload;
+        internal readonly RegionHandle Region;
+        internal readonly RegionOwner Owner;
+        internal readonly object RegionOwner;
+        internal readonly (object Fact,object? RegionOwner,ProcessHandle Owner,BudgetReservationHandle Reservation)[] Charges;
+        internal KernelError? Refusal;
+        internal InitialOwnership(OriginalPublication publication,ITransferableOwnedPayload payload,RegionHandle region,
+            RegionOwner owner,object regionOwner,(object Fact,object? RegionOwner,ProcessHandle Owner,BudgetReservationHandle Reservation)[] charges)
+        { Original=this;Publication=publication;Payload=payload;Region=region;Owner=owner;RegionOwner=regionOwner;Charges=charges.ToArray(); }
+    }
+
+    internal KernelResult RetainInitialOwnership(InitialOwnership fact)
+    {
+        var original=fact.Publication;
+        if(!ReferenceEquals(fact.Original,fact) || !ReferenceEquals(original.Original,original) || !ReferenceEquals(original.Owner,this) ||
+            original.Completion is not CompletionRecord completion || !ReferenceEquals(completion.OriginalSelf,completion) ||
+            completion.OriginalTransferProducer is not null || completion.OwnershipTransferAttempted || completion.RawPublication is not null ||
+            completion.OriginalPending.Responder!=original.Responder || completion.OriginalPending.Response.Payload.Kind!=ResponsePayloadKind.Ownership ||
+            fact.Owner.ProcessGeneration!=original.Responder.Generation)
+            return KernelResult.Fail(KernelError.PlatformFaulted,"Original initial response ownership differs.");
+        if(completion.OriginalInitialOwnership is { } prior)
+            return ReferenceEquals(prior.Payload,fact.Payload) && prior.Region==fact.Region && prior.Owner==fact.Owner &&
+                ReferenceEquals(prior.RegionOwner,fact.RegionOwner) && prior.Refusal is null ? KernelResult.Ok() :
+                KernelResult.Fail(KernelError.PlatformFaulted,"Initial original response already refused; no repeat.");
+        completion.OriginalInitialOwnership=fact;
+        return KernelResult.Ok();
+    }
+
+    internal void RetainInitialRefusal(OriginalPublication original,KernelError error)
+    {
+        if(original.Completion is not CompletionRecord completion || !ReferenceEquals(original.Owner,this) ||
+            !ReferenceEquals(original.Original,original) || !ReferenceEquals(completion.OriginalSelf,completion) ||
+            completion.OriginalInitialOwnership is not { } fact || !ReferenceEquals(fact.Original,fact) ||
+            completion.OwnershipTransferAttempted || fact.Refusal is not null || error==KernelError.None || !Enum.IsDefined(error))
+            throw new InvalidOperationException("Initial response refusal continuity differs.");
+        fact.Refusal=error;
+    }
+
+    internal KernelResult<InitialOwnership> ReadInitialRefusal(OriginalPublication original,object input)
+    {
+        if(!ReferenceEquals(original.Owner,this) || !ReferenceEquals(original.Original,original) || original.Completion is not CompletionRecord completion ||
+            !ReferenceEquals(completion.OriginalSelf,completion) || completion.OriginalInitialOwnership is not { } fact ||
+            !ReferenceEquals(fact.Original,fact) || !ReferenceEquals(fact.Payload,input) || fact.Refusal is not { } error ||
+            !ReferenceEquals(fact.Publication.Original,fact.Publication) || !ReferenceEquals(fact.Publication.Owner,this) ||
+            !ReferenceEquals(fact.Publication.Completion,completion) || fact.Publication.Responder!=original.Responder ||
+            fact.Publication.Endpoint!=original.Endpoint || fact.Publication.Sequence!=original.Sequence ||
+            fact.Charges.Length!=1 || fact.Charges[0].Owner!=original.Responder ||
+            fact.Owner.ProcessGeneration!=original.Responder.Generation ||
+            !ReferenceEquals(fact.Charges[0].RegionOwner,fact.RegionOwner) || fact.Payload.Handle!=fact.Region ||
+            error==KernelError.None || !Enum.IsDefined(error) || completion.PreparedOwnership is not null || completion.OriginalTransferProducer is not null ||
+            !completion.FailedTransferCleanupCompleted && (!TryResolveChannel(original.Endpoint.ChannelId,out var channel) ||
+                !TryResolveCompletion(channel,original.Sequence,out var routed) || !ReferenceEquals(routed,completion) || completion.RawPublication is not null || completion.Source.Task.IsCompleted))
+            return KernelResult<InitialOwnership>.Fail(KernelError.PlatformFaulted,"Original initial ownership refusal unavailable.");
+        return KernelResult<InitialOwnership>.Ok(fact);
+    }
+    // Mutable Region/accounting truth remains in those authorities.
+    internal sealed class TransferProducer
+    {
+        internal readonly TransferProducer Original;
+        internal readonly OriginalPublication Publication;
+        internal readonly PreparedOwnedTransfer Prepared;
+        internal readonly RegionHandle SourceRegion;
+        internal readonly DomainId SourceDomain;
+        internal readonly RegionOwner TargetOwner;
+        internal readonly object RegionOwner;
+        internal readonly ProcessHandle Target;
+        internal BudgetReservationHandle? TargetReservation;
+        internal object? TargetBudgetOwner;
+        internal bool TargetBudgetExpected;
+        internal readonly bool SourceBudgetExpected;
+        internal bool BudgetAdmissionKnown;
+        internal KernelError? BudgetRefusal;
+        internal KernelError? PreRegionRefusal;
+        internal readonly (object Fact, object? RegionOwner, ProcessHandle Owner, BudgetReservationHandle Reservation)[] SourceCharges;
+        internal KernelResult<RegionHandle>? Raw, Composition;
+        internal TransferProducer(OriginalPublication publication,PreparedOwnedTransfer prepared,RegionHandle sourceRegion,
+            DomainId sourceDomain,RegionOwner targetOwner,object regionOwner,ProcessHandle target,
+            BudgetReservationHandle? targetReservation,object? targetBudgetOwner,
+            (object Fact,object? RegionOwner,ProcessHandle Owner,BudgetReservationHandle Reservation)[] sourceCharges)
+        {
+            Original=this;Publication=publication;Prepared=prepared;SourceRegion=sourceRegion;SourceDomain=sourceDomain;
+            TargetOwner=targetOwner;RegionOwner=regionOwner;Target=target;TargetReservation=targetReservation;
+            TargetBudgetOwner=targetBudgetOwner;SourceCharges=sourceCharges.ToArray();
+            TargetBudgetExpected=targetReservation is not null;SourceBudgetExpected=sourceCharges.Length!=0;
+        }
+    }
+
+    internal void RetainTransferProducer(TransferProducer producer)
+    {
+        var original=producer.Publication;
+        if(!ReferenceEquals(producer.Original,producer) || !ReferenceEquals(original.Original,original) ||
+            !ReferenceEquals(original.Owner,this) || original.Completion is not CompletionRecord completion ||
+            !ReferenceEquals(completion.OriginalSelf,completion) || !ReferenceEquals(completion.PreparedOwnership,producer.Prepared) ||
+            !ReferenceEquals(completion.OriginalOwnershipInput,producer.Prepared.Source) || completion.OriginalTransferProducer is not null ||
+            completion.Requester!=producer.Target || producer.TargetReservation is not null && producer.TargetBudgetOwner is null)
+            throw new InvalidOperationException("Original response transfer admission differs.");
+        completion.OriginalTransferProducer=producer;
+    }
+
+    internal void RetainTransferRaw(OriginalPublication original,PreparedOwnedTransfer prepared,KernelResult<RegionHandle> raw,bool composition=false)
+    {
+        if(!ReferenceEquals(original.Original,original) || !ReferenceEquals(original.Owner,this) ||
+            original.Completion is not CompletionRecord completion || !ReferenceEquals(completion.OriginalSelf,completion) ||
+            completion.OriginalTransferProducer is not { } producer || !ReferenceEquals(producer.Original,producer) ||
+            !ReferenceEquals(producer.Prepared,prepared) || !ReferenceEquals(completion.PreparedOwnership,prepared) ||
+            (composition ? producer.Composition : producer.Raw) is not null)
+            throw new InvalidOperationException("Original response transfer outcome differs.");
+        if(composition)producer.Composition=raw;else producer.Raw=raw;
+    }
+
+    internal void RetainTransferBudget(OriginalPublication original,PreparedOwnedTransfer prepared,
+        KernelResult<BudgetReservationHandle?> result,object? budgetOwner)
+    {
+        if(!ReferenceEquals(original.Original,original) || !ReferenceEquals(original.Owner,this) ||
+            original.Completion is not CompletionRecord completion || !ReferenceEquals(completion.OriginalSelf,completion) ||
+            completion.OriginalTransferProducer is not { } producer || !ReferenceEquals(producer.Original,producer) ||
+            !ReferenceEquals(producer.Prepared,prepared) || producer.BudgetAdmissionKnown || producer.Raw is not null ||
+            result.IsSuccess && result.Value is not null && budgetOwner is null)
+            throw new InvalidOperationException("Original response budget admission differs.");
+        producer.TargetReservation=result.IsSuccess ? result.Value : null;
+        producer.TargetBudgetOwner=result.IsSuccess ? budgetOwner : null;
+        producer.TargetBudgetExpected=producer.TargetReservation is not null;
+        producer.BudgetRefusal=result.IsSuccess ? null : result.Error;
+        producer.BudgetAdmissionKnown=true;
+    }
+
+    private static bool HasExactFailedTransferOutcome(TransferProducer producer)
+    {
+        if(!producer.BudgetAdmissionKnown)return false;
+        if(producer.Composition is null || producer.Composition is { IsSuccess:true })
+            return producer.BudgetRefusal is null && producer.PreRegionRefusal is null &&
+                producer.Raw is { IsSuccess:true } retained && retained.Value.RegionId==producer.SourceRegion.RegionId &&
+                retained.Value.Generation.Value==producer.SourceRegion.Generation.Value+1 &&
+                (producer.Composition is null || producer.Composition.Value.Value==retained.Value) &&
+                producer.Prepared.Projection is ITransferableOwnedPayload original && original.Handle==retained.Value;
+        if(producer.Composition is not { IsSuccess:false } failed || !Enum.IsDefined(failed.Error))return false;
+        if(producer.BudgetRefusal is { } refusal)
+            return Enum.IsDefined(refusal) && refusal!=KernelError.None && failed.Error==refusal &&
+                producer.Raw is null && producer.TargetReservation is null && producer.TargetBudgetOwner is null;
+        if(producer.PreRegionRefusal is { } admissionRefusal)
+            return admissionRefusal!=KernelError.None && Enum.IsDefined(admissionRefusal) &&
+                failed.Error==admissionRefusal && producer.Raw is null;
+        // Raw is retained directly from RegionAuthority.Transfer, whose checked
+        // refusal precedes mutation. It proves only this operation's no-effect.
+        if(producer.Raw is { IsSuccess:false } refused)
+            return refused.Error!=KernelError.None && Enum.IsDefined(refused.Error) && failed.Error==refused.Error;
+        return producer.Raw is { IsSuccess:true } raw && raw.Value.RegionId==producer.SourceRegion.RegionId &&
+            raw.Value.Generation.Value==producer.SourceRegion.Generation.Value+1 &&
+            producer.Prepared.Projection is ITransferableOwnedPayload projection && projection.Handle==raw.Value;
+    }
+
+    internal void RetainPreRegionRefusal(OriginalPublication original,PreparedOwnedTransfer prepared,KernelError error)
+    {
+        if(!ReferenceEquals(original.Original,original) || !ReferenceEquals(original.Owner,this) ||
+            original.Completion is not CompletionRecord completion || !ReferenceEquals(completion.OriginalSelf,completion) ||
+            completion.OriginalTransferProducer is not { } producer || !ReferenceEquals(producer.Original,producer) ||
+            !ReferenceEquals(producer.Prepared,prepared) || !producer.BudgetAdmissionKnown || producer.BudgetRefusal is not null ||
+            producer.PreRegionRefusal is not null || producer.Raw is not null || producer.Composition is not null ||
+            error==KernelError.None || !Enum.IsDefined(error))
+            throw new InvalidOperationException("Original pre-Region admission refusal differs.");
+        producer.PreRegionRefusal=error;
+    }
+
+    internal KernelResult<TransferProducer> ReadFailedTransfer(OriginalPublication original,object input)
+    {
+        if(!ReferenceEquals(original.Original,original) || !ReferenceEquals(original.Owner,this) ||
+            original.Completion is not CompletionRecord completion || !ReferenceEquals(completion.OriginalSelf,completion) ||
+            completion.OriginalTransferProducer is not { } producer || !ReferenceEquals(producer.Original,producer) ||
+            !ReferenceEquals(producer.Publication.Original,producer.Publication) || !ReferenceEquals(producer.Publication.Owner,this) ||
+            !ReferenceEquals(producer.Publication.Completion,completion) || producer.Publication.Responder!=original.Responder ||
+            producer.Publication.Endpoint!=original.Endpoint || producer.Publication.Sequence!=original.Sequence ||
+            producer.Target!=completion.Requester || producer.TargetBudgetExpected!=(producer.TargetReservation is not null) ||
+            producer.TargetBudgetExpected!=(producer.TargetBudgetOwner is not null) ||
+            producer.SourceBudgetExpected!=(producer.SourceCharges.Length!=0) || producer.SourceCharges.Length>1 ||
+            !ReferenceEquals(completion.OriginalOwnershipInput,input) || !ReferenceEquals(producer.Prepared.Source,input) ||
+            !producer.Prepared.IsOriginal || !ReferenceEquals(completion.PreparedOwnership,producer.Prepared) ||
+            !ReferenceEquals(completion.OwnershipProjection,producer.Prepared.Projection) || producer.Prepared.SourceHandle!=producer.SourceRegion ||
+            !HasExactFailedTransferOutcome(producer) ||
+            !completion.FailedTransferCleanupCompleted && (!TryResolveChannel(original.Endpoint.ChannelId,out var channel) ||
+                !TryResolveCompletion(channel,original.Sequence,out var routed) || !ReferenceEquals(routed,completion) ||
+                completion.RawPublication is not null || completion.Source.Task.IsCompleted))
+            return KernelResult<TransferProducer>.Fail(KernelError.PlatformFaulted,"Original failed ownership response remains unresolved.");
+        return KernelResult<TransferProducer>.Ok(producer);
+    }
+
+    internal void RetainTransferComposition(OriginalPublication original,PreparedOwnedTransfer prepared,KernelResult<RegionHandle> result)
+    {
+        if(original.Completion is CompletionRecord completion && completion.OriginalTransferProducer is not null)
+            RetainTransferRaw(original,prepared,result,composition:true);
+    }
+
+    internal KernelResult<ResponseEnvelope> CompleteFailedTransfer(OriginalPublication original,object input)
+    {
+        var known=ReadFailedTransfer(original,input);
+        if(!known.IsSuccess && !ReadInitialRefusal(original,input).IsSuccess)
+            return KernelResult<ResponseEnvelope>.Fail(known.Error,known.Message!);
+        var completion=(CompletionRecord)original.Completion;
+        if(completion.FailedTransferCleanupCompleted)
+            return KernelResult<ResponseEnvelope>.Ok(completion.RawPublication!);
+        if(!TryResolveChannel(original.Endpoint.ChannelId,out var channel) ||
+            !TryResolvePending(channel,original.Sequence,out var pending) || !ReferenceEquals(pending,completion.OriginalPending))
+            return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseNotPending,"Original failed response pending route differs.");
+        var cancelled=new ResponseEnvelope(original.Sequence,pending.Response.MessageId,ResponsePublicationStatus.Cancelled,null);
+        Complete(channel,pending,cancelled);
+        completion.FailedTransferCleanupCompleted=true;
+        return KernelResult<ResponseEnvelope>.Ok(cancelled);
+    }
+
+    internal bool IsOriginalFailedTransferCompletion(OriginalPublication original,ResponseEnvelope cancelled) =>
+        ReferenceEquals(original.Owner,this) && ReferenceEquals(original.Original,original) &&
+        original.Completion is CompletionRecord completion && ReferenceEquals(completion.OriginalSelf,completion) &&
+        completion.FailedTransferCleanupCompleted && ReferenceEquals(completion.RawPublication,cancelled) &&
+        cancelled.Status==ResponsePublicationStatus.Cancelled;
+    internal KernelResult<OriginalPublication> CapturePublication(ProcessHandle responder,ChannelEndpointHandle endpoint,ulong sequence)
+    {
+        if(!TryResolveChannel(endpoint.ChannelId,out var channel) || !TryResolveCompletion(channel,sequence,out var completion) ||
+            !ReferenceEquals(completion.OriginalSelf,completion) || completion.OriginalPending.Responder!=responder ||
+            completion.OriginalPending.ResponderEndpoint!=endpoint.EndpointId)
+            return KernelResult<OriginalPublication>.Fail(KernelError.ResponseNotPending,"Original response completion absent/foreign.");
+        return KernelResult<OriginalPublication>.Ok(new(this,completion,responder,endpoint,sequence));
+    }
+    internal KernelResult<ResponseEnvelope> ReadPublication(OriginalPublication original)
+    {
+        if(!ReferenceEquals(original.Owner,this) || !ReferenceEquals(original.Original,original) || original.Completion is not CompletionRecord completion ||
+            !ReferenceEquals(completion.OriginalSelf,completion) || !completion.PublicationCommitted || completion.RawPublication is not { } raw ||
+            completion.OriginalPending.Responder!=original.Responder || completion.OriginalPending.ResponderEndpoint!=original.Endpoint.EndpointId ||
+            raw.RequestSequence!=original.Sequence || raw.MessageId!=completion.OriginalPending.Response.MessageId || raw.Status!=ResponsePublicationStatus.Published)
+            return KernelResult<ResponseEnvelope>.Fail(KernelError.PlatformFaulted,"Exact original committed response unavailable; no repeat.");
+        return KernelResult<ResponseEnvelope>.Ok(raw); // Metadata only; survives legitimate routing retirement.
+    }
+
+    internal KernelResult<ResponseEnvelope> ReadOriginalCancellation(OriginalPublication original)
+    {
+        if(!ReferenceEquals(original.Owner,this) || !ReferenceEquals(original.Original,original) ||
+            original.Completion is not CompletionRecord completion || !ReferenceEquals(completion.OriginalSelf,completion) ||
+            completion.OwnershipTransferAttempted || completion.OriginalPending.Responder!=original.Responder ||
+            completion.OriginalPending.ResponderEndpoint!=original.Endpoint.EndpointId ||
+            !completion.PublicationCommitted || completion.RawPublication is not { Status:ResponsePublicationStatus.Cancelled } raw ||
+            raw.RequestSequence!=original.Sequence || raw.MessageId!=completion.OriginalPending.Response.MessageId ||
+            !completion.Source.Task.IsCompletedSuccessfully || !ReferenceEquals(completion.Source.Task.Result,raw))
+            return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseNotPending,"Exact original response cancellation unavailable.");
+        return KernelResult<ResponseEnvelope>.Ok(raw);
+    }
+
+    internal KernelResult<ResponseEnvelope> ReadOriginalChannelCancellation(OriginalPublication original)
+    {
+        if(!ReferenceEquals(original.Owner,this) || !ReferenceEquals(original.Original,original) ||
+            original.Completion is not CompletionRecord completion || !ReferenceEquals(completion.OriginalSelf,completion) ||
+            completion.OwnershipTransferAttempted || completion.OriginalPending.Responder!=original.Responder ||
+            completion.OriginalPending.ResponderEndpoint!=original.Endpoint.EndpointId ||
+            completion.OriginalChannelCancellation is not { Status:ResponsePublicationStatus.Cancelled } cancelled ||
+            cancelled.RequestSequence!=original.Sequence || !completion.Source.Task.IsCompletedSuccessfully ||
+            !ReferenceEquals(completion.Source.Task.Result,cancelled))
+            return KernelResult<ResponseEnvelope>.Fail(KernelError.ResponseNotPending,"Exact original channel cancellation unavailable.");
+        return KernelResult<ResponseEnvelope>.Ok(cancelled);
+    }
+    internal bool MatchesOriginalPublicationPayload(OriginalPublication original,object input,ResponseEnvelope outcome)
+    {
+        var known=ReadPublication(original);
+        if(!known.IsSuccess || !ReferenceEquals(known.Value,outcome) || original.Completion is not CompletionRecord completion)return false;
+        return ReferenceEquals(input,outcome.Payload) || completion.OwnershipTransferAttempted &&
+            ReferenceEquals(completion.OriginalOwnershipInput,input) && completion.PreparedOwnership is { } prepared &&
+            ReferenceEquals(prepared.Source,input) && ReferenceEquals(prepared.Projection,completion.OwnershipProjection) &&
+            ReferenceEquals(completion.OwnershipProjection,outcome.Payload);
     }
 
     private void CloseChannel(ChannelId channelId)
@@ -433,11 +784,16 @@ internal sealed class ResponseRegistry
         foreach (var completion in channel.OwnedCompletions.Values.OrderBy(static completion => completion.OriginalPending.RequestSequence))
         {
             var pending = completion.OriginalPending;
-            _ = completion.Source.TrySetResult(new ResponseEnvelope(
+            var cancelled=new ResponseEnvelope(
                 pending.RequestSequence,
                 pending.Response.MessageId,
                 ResponsePublicationStatus.Cancelled,
-                null));
+                null);
+            if(!completion.Source.Task.IsCompleted)
+            {
+                completion.OriginalChannelCancellation=cancelled;
+                _=completion.Source.TrySetResult(cancelled);
+            }
         }
 
         channel.Pending.Clear();

@@ -8,10 +8,17 @@ public readonly record struct NeutralOriginalOwnedRegionMapRequest(
     NeutralDomainBindingLease Domain, NeutralOwnedRegionSlice Slice);
 
 public readonly record struct NeutralOriginalDomainBindObservation(
-    NeutralOriginalDomainBindRequest Request, bool SourceFenceMatched, NeutralDomainBindResult Observation);
+    NeutralOriginalDomainBindRequest Request, bool SourceFenceMatched, NeutralDomainBindResult Observation)
+{
+    // Explicit original-owner disposition; generic failure/default lease is not no-effect.
+    public bool ProvenNoEffect { get; init; }
+}
 
 public readonly record struct NeutralOriginalOwnedRegionMapObservation(
-    NeutralOriginalOwnedRegionMapRequest Request, bool SourceFenceMatched, NeutralOwnedRegionMapResult Observation);
+    NeutralOriginalOwnedRegionMapRequest Request, bool SourceFenceMatched, NeutralOwnedRegionMapResult Observation)
+{
+    public bool ProvenNoEffect { get; init; }
+}
 
 /// <summary>Optional producing-owner fence. Source comparison and admission execute
 /// under the same lifecycle lock. A false SourceFenceMatched proves this request

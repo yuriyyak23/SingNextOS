@@ -52,8 +52,9 @@ public sealed partial class PlatformAuthorityBridge
     }
     private sealed class NestedCreateInvocationFact
     {
-        public NestedCreateInvocationFact(ChildBindingRecord source, PlatformNestedDomainRequest request)
-        { OriginalOwner = this; Source = source; Request = request; OriginalRequest = new(request); AdmittedState = source.State; AdmittedRevision = source.LifecycleRevision; OriginalRoot = source.CreateRoot; AdmissionEpoch = source.CreateRoot?.BackendEpoch ?? default; }
+        public NestedCreateInvocationFact(ChildBindingRecord source, PlatformNestedDomainRequest request,
+            Func<object,KernelResult>? closureConsumer,Func<object?,KernelResult>? neverInvokedConsumer)
+        { OriginalOwner = this; Source = source; Request = request; OriginalRequest = new(request); AdmittedState = source.State; AdmittedRevision = source.LifecycleRevision; OriginalRoot = source.CreateRoot; AdmissionEpoch = source.CreateRoot?.BackendEpoch ?? default; ClosureConsumer=closureConsumer;NeverInvokedConsumer=neverInvokedConsumer; }
         public NestedCreateInvocationFact OriginalOwner { get; }
         public ChildBindingRecord Source { get; }
         public PlatformNestedDomainRequest Request { get; }
@@ -66,6 +67,10 @@ public sealed partial class PlatformAuthorityBridge
         public DomainRecord? OriginalRoot { get; }
         public PlatformBackendEpoch AdmissionEpoch { get; }
         public PlatformAuthorityResult<PlatformProviderNestedDomainLease>? Observation { get; set; }
+        public readonly Func<object,KernelResult>? ClosureConsumer;
+        public readonly Func<object?,KernelResult>? NeverInvokedConsumer;
+        public bool Invoked;
+        public ChildBindingRecord? Child;
     }
     private sealed class ChildBindingRecord(
         PlatformChildBinding binding,
@@ -74,6 +79,7 @@ public sealed partial class PlatformAuthorityBridge
     {
         public DomainRecord? CreateRoot { get; init; }
         public ChildBindingRecord? CreateParentChild { get; init; }
+        public NestedCreateInvocationFact? OriginalNestedCreation { get; init; }
         public PlatformChildBinding Binding { get; } = binding;
         public PlatformProviderChildDomainLease ProviderLease { get; } = providerLease;
         public PlatformChildBinding? ParentChild { get; } = parentChild;
@@ -975,29 +981,50 @@ public sealed partial class PlatformAuthorityBridge
         PlatformChildDomainIntent intent,
         Func<Func<KernelResult>, KernelResult>? admissionConsumer = null,
         Func<Func<KernelResult>, KernelResult>? sourceCommitConsumer = null,
-        Action<PlatformChildBinding>? cleanupConsumer = null)
+        Action<PlatformChildBinding>? cleanupConsumer = null,
+        Func<object,KernelResult>? originalCreationConsumer = null,
+        Func<object,KernelResult>? originalCreationClosureConsumer = null,
+        Func<object,KernelResult>? originalCreationNoEffectConsumer = null,
+        Func<object?,KernelResult>? originalCreationNeverInvokedConsumer = null)
     {
+        NestedCreateInvocationFact? invocation = null;
+        KernelResult<PlatformChildBinding> RefuseBeforeInvocation(KernelError error,string message)
+        {
+            var consumed=originalCreationNeverInvokedConsumer?.Invoke(invocation) ?? KernelResult.Ok();
+            if(!consumed.IsSuccess)return KernelResult<PlatformChildBinding>.Fail(consumed.Error,consumed.Message!);
+            if(invocation is { } original)
+                lock(_secureDomainLifecycleGate)
+                {
+                    if(!ReferenceEquals(original.OriginalOwner,original) || original.Invoked ||
+                        !original.Source.NestedCreateInvocations.Remove(original))
+                        return KernelResult<PlatformChildBinding>.Fail(KernelError.PlatformFaulted,"Original never-invoked nested request changed.");
+                    original.Source.NestedCreatesConsumed++;
+                }
+            return KernelResult<PlatformChildBinding>.Fail(error,message);
+        }
         var parent = ResolveChild(parentChild);
         if (!parent.IsSuccess)
-            return KernelResult<PlatformChildBinding>.Fail(parent.Error, parent.Message!);
+            return RefuseBeforeInvocation(parent.Error, parent.Message!);
         if (parentChild.Owner != expectedOwner)
-            return KernelResult<PlatformChildBinding>.Fail(KernelError.WrongPlatformDomain,
+            return RefuseBeforeInvocation(KernelError.WrongPlatformDomain,
                 "Nested-domain owner does not match the exact live parent child.");
         var feature = _featureManifest.Resolve(PlatformFeatureFamily.NestedDomains);
         if (feature.ContractVersion < PlatformNestedDomainContract.ContractVersion ||
             feature.Availability is not (PlatformFeatureAvailability.RuntimeAdmission or PlatformFeatureAvailability.Executable) ||
             _provider is not IPlatformNestedDomainProvider provider)
-            return KernelResult<PlatformChildBinding>.Fail(KernelError.PlatformUnsupported,
+            return RefuseBeforeInvocation(KernelError.PlatformUnsupported,
                 "Nested-domain provider admission is unavailable.");
 
         var request = new PlatformNestedDomainRequest(parent.Value!.ProviderLease, intent);
         var validation = PlatformNestedDomainContract.ValidateRequest(request, parent.Value.State);
         if (!validation.IsSuccess)
-            return FromProviderFailure<PlatformChildBinding>(validation.Status, validation.Message);
+        {
+            var refused=FromProviderFailure<PlatformChildBinding>(validation.Status, validation.Message);
+            return RefuseBeforeInvocation(refused.Error,refused.Message!);
+        }
         var parentRecord = parent.Value!;
         PlatformChildBindingId reservedBindingId = default;
         DomainRecord originalRoot = null!;
-        NestedCreateInvocationFact? invocation = null;
         var originalAncestors = new List<ChildBindingRecord>();
         var sourceRevisions = new Dictionary<ChildBindingRecord, long>();
         long rootRevision = 0;
@@ -1052,7 +1079,7 @@ public sealed partial class PlatformAuthorityBridge
         }
         }
         var admitted = admissionConsumer is null ? Begin() : admissionConsumer(Begin);
-        if (!admitted.IsSuccess) return KernelResult<PlatformChildBinding>.Fail(admitted.Error, admitted.Message!);
+        if (!admitted.IsSuccess) return RefuseBeforeInvocation(admitted.Error, admitted.Message!);
         try
         {
         KernelResult ValidateSource(PlatformProviderIncarnation source)
@@ -1096,7 +1123,7 @@ public sealed partial class PlatformAuthorityBridge
         PlatformProviderIncarnation source;
         try { source = CurrentProviderIncarnation(); }
         catch (Exception exception) when (exception is not StackOverflowException)
-        { return KernelResult<PlatformChildBinding>.Fail(KernelError.PlatformFaulted, "Nested source unavailable before invocation."); }
+        { return RefuseBeforeInvocation(KernelError.PlatformFaulted, "Nested source unavailable before invocation."); }
         KernelResult FinalAdmission()
         {
             lock (_secureDomainLifecycleGate)
@@ -1114,20 +1141,41 @@ public sealed partial class PlatformAuthorityBridge
             }
         }
         var final = admissionConsumer is null ? FinalAdmission() : admissionConsumer(FinalAdmission);
-        if (!final.IsSuccess) return KernelResult<PlatformChildBinding>.Fail(final.Error, final.Message!);
+        if (!final.IsSuccess) return RefuseBeforeInvocation(final.Error, final.Message!);
         PlatformAuthorityResult<PlatformProviderNestedDomainLease> result;
         try
         {
+            KernelResult PrepareOriginalInvocation()
+            {
             lock (_secureDomainLifecycleGate)
             {
                 var fresh = ValidateSource(source);
-                if (!fresh.IsSuccess) return KernelResult<PlatformChildBinding>.Fail(fresh.Error, fresh.Message!);
+                if (!fresh.IsSuccess) return fresh;
                 if (parentRecord.NestedCreatesIssued == ulong.MaxValue)
-                    return KernelResult<PlatformChildBinding>.Fail(KernelError.CapacityExhausted, "Nested invocation capacity changed before effect.");
-                invocation = new(parentRecord, request);
+                    return KernelResult.Fail(KernelError.CapacityExhausted, "Nested invocation capacity changed before effect.");
+                invocation = new(parentRecord, request,originalCreationClosureConsumer,originalCreationNeverInvokedConsumer);
                 parentRecord.NestedCreateInvocations.Add(invocation);
                 parentRecord.NestedCreatesIssued++;
+                return KernelResult.Ok();
             }
+            }
+            var preparedOriginal=PrepareOriginalInvocation();
+            if(!preparedOriginal.IsSuccess)return RefuseBeforeInvocation(preparedOriginal.Error,preparedOriginal.Message!);
+            var originalAccepted=originalCreationConsumer?.Invoke(invocation!) ?? KernelResult.Ok();
+            if(!originalAccepted.IsSuccess)return RefuseBeforeInvocation(originalAccepted.Error,originalAccepted.Message!);
+            source=CurrentProviderIncarnation();
+            KernelResult BeforeEffect()
+            {
+                lock(_secureDomainLifecycleGate)
+                {
+                    var fresh=ValidateSource(source);
+                    if(!fresh.IsSuccess)return fresh;
+                    return sourceCommitConsumer is null ? KernelResult.Ok() : sourceCommitConsumer(KernelResult.Ok);
+                }
+            }
+            var finalEffect=admissionConsumer is null ? BeforeEffect() : admissionConsumer(BeforeEffect);
+            if(!finalEffect.IsSuccess)return RefuseBeforeInvocation(finalEffect.Error,finalEffect.Message!);
+            lock(_secureDomainLifecycleGate)invocation!.Invoked=true; // Before the possible external effect.
             if (provider is IPlatformOriginalNestedDomainProvider { SupportsOriginalNestedDomains: true } originalProvider)
             {
                 try { result = originalProvider.CreateOriginalNestedDomain(invocation!.OriginalRequest); }
@@ -1138,6 +1186,8 @@ public sealed partial class PlatformAuthorityBridge
         }
         catch (Exception exception) when (exception is not StackOverflowException)
         {
+            if(invocation is not { Invoked:true })
+                return RefuseBeforeInvocation(KernelError.PlatformFaulted,"Nested source/admission unavailable before provider effect.");
             PinNestedCreate();
             return KernelResult<PlatformChildBinding>.Fail(KernelError.PlatformFaulted,
                 $"Nested child creation may have taken effect without a receipt: {exception.Message}");
@@ -1163,13 +1213,23 @@ public sealed partial class PlatformAuthorityBridge
                 {
                     var resolved = originalProvider.ResolveOriginalNestedDomain(invocation!.OriginalRequest);
                     var currentSource = CurrentProviderIncarnation();
+                    bool knownNoEffect;
                     lock (_secureDomainLifecycleGate)
                     {
-                        if (resolved.Status == PlatformAuthorityStatus.NotAccepted && currentSource == originalRoot.ProviderIncarnation &&
+                        knownNoEffect=resolved.Status == PlatformAuthorityStatus.NotAccepted && currentSource == originalRoot.ProviderIncarnation &&
                             BackendEpoch == backendEpoch && !_backendEpochExhausted && HasCurrentChildCreateSources(parentRecord) &&
                             HasOriginalNestedHistory(parentRecord) && parentRecord.NestedCreateInvocations.Contains(invocation) &&
-                            ReferenceEquals(invocation.OriginalOwner, invocation))
+                            ReferenceEquals(invocation.OriginalOwner, invocation);
+                    }
+                    if(knownNoEffect)
+                    {
+                        var consumed=originalCreationNoEffectConsumer?.Invoke(invocation!) ?? KernelResult.Ok();
+                        if(!consumed.IsSuccess){PinNestedCreate();return KernelResult<PlatformChildBinding>.Fail(consumed.Error,consumed.Message!);}
+                        currentSource=CurrentProviderIncarnation();
+                        lock(_secureDomainLifecycleGate)
                         {
+                            if(!OriginalNestedCleanupSources(parentRecord,invocation!,currentSource))
+                                return KernelResult<PlatformChildBinding>.Fail(KernelError.PlatformFaulted,"Original nested no-effect source changed before consumption.");
                             parentRecord.NestedCreateInvocations.Remove(invocation); parentRecord.NestedCreatesConsumed++;
                             return FromProviderFailure<PlatformChildBinding>(result.Status, result.Message);
                         }
@@ -1209,7 +1269,8 @@ public sealed partial class PlatformAuthorityBridge
             }
             binding = new PlatformChildBinding(reservedBindingId, new(1),
                 parentChild.ParentBinding, expectedOwner);
-            childRecord = new(binding, lease, parentChild) { CreationPublished = false, CreateRoot = originalRoot, CreateParentChild = parentRecord };
+            childRecord = new(binding, lease, parentChild) { CreationPublished = false, CreateRoot = originalRoot, CreateParentChild = parentRecord,OriginalNestedCreation=invocation };
+            invocation!.Child=childRecord;
             _childBindings.Add(binding.BindingId, childRecord);
             _originalChildOwners.Add(binding.BindingId, childRecord);
             childRecord.NestedCreateObservation = invocation!.Observation;
@@ -1334,7 +1395,8 @@ public sealed partial class PlatformAuthorityBridge
         bool allowCommittedDrain = false,
         Func<Func<KernelResult>, KernelResult>? admissionConsumer = null,
         Func<Func<KernelResult>, KernelResult>? sourceCommitConsumer = null,
-        Func<Func<Func<KernelResult>, KernelResult>, KernelResult>? completionConsumer = null)
+        Func<Func<Func<KernelResult>, KernelResult>, KernelResult>? completionConsumer = null,
+        Func<KernelResult>? noEffectConsumer = null)
     {
         if (_provider is not IPlatformChildDomainProvider provider)
             return KernelResult.Fail(KernelError.PlatformUnsupported, "Child-domain provider is unavailable.");
@@ -1497,8 +1559,22 @@ public sealed partial class PlatformAuthorityBridge
                         var lineage = ValidateActiveChildLineage(record);
                         if (!lineage.IsSuccess) return lineage;
                     }
-                    return FromProviderFailure(result.Status, result.Message);
+                    if(noEffectConsumer is not null && (record.TransitionIntent!=transition || record.TransitionObservation!=result))
+                        return KernelResult.Fail(KernelError.PlatformFaulted,"Original refused transition fact unavailable.");
                 }
+                var consumed=noEffectConsumer?.Invoke() ?? KernelResult.Ok();
+                if(!consumed.IsSuccess)return consumed;
+                if(noEffectConsumer is not null)
+                {
+                    source=CurrentProviderIncarnation();
+                    lock(_secureDomainLifecycleGate)
+                    {
+                        var current=ValidateSource(source);
+                        if(!current.IsSuccess || record.State!=admittedState || record.TransitionIntent!=transition || record.TransitionObservation!=result)
+                            return KernelResult.Fail(KernelError.PlatformFaulted,"Original refused transition changed after no-effect consumption.");
+                    }
+                }
+                return FromProviderFailure(result.Status,result.Message);
             }
             lock (_secureDomainLifecycleGate)
             {
@@ -1585,6 +1661,21 @@ public sealed partial class PlatformAuthorityBridge
     }
 
     internal KernelResult CloseChildDomain(PlatformChildBinding binding, bool allowCommittedClosure = false,
+        Func<Func<Func<KernelResult>, KernelResult>, KernelResult>? cleanupCompletionConsumer = null)
+    {
+        // Invocation consumption must precede local destruction. A failed
+        // delivery keeps the already closed original child available to retry.
+        if(cleanupCompletionConsumer is not null)
+        {
+            var delivered=ConsumeKnownNestedCreationClosure(binding);
+            if(!delivered.IsSuccess)return delivered;
+            return CloseChildDomainCore(binding,allowCommittedClosure,cleanupCompletionConsumer);
+        }
+        var closed=CloseChildDomainCore(binding,allowCommittedClosure);
+        return closed.IsSuccess ? ConsumeKnownNestedCreationClosure(binding) : closed;
+    }
+
+    private KernelResult CloseChildDomainCore(PlatformChildBinding binding, bool allowCommittedClosure = false,
         Func<Func<Func<KernelResult>, KernelResult>, KernelResult>? cleanupCompletionConsumer = null)
     {
         if (cleanupCompletionConsumer is not null)

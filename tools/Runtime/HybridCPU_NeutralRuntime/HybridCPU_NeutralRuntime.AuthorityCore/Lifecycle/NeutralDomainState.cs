@@ -26,6 +26,7 @@ internal sealed class NeutralOriginalMapInvocation
     public NeutralOriginalDomainAdmissionFact? ParentAdmission { get; }
     public NeutralOriginalOwnedRegionMapObservation? Raw { get; set; }
     public NeutralOriginalMappingAdmissionFact? Admission { get; set; }
+    public bool NoEffect { get; set; }
 }
 
 internal sealed class NeutralOriginalDomainCloseFact(NeutralOriginalDomainCloseRequest request, NeutralDomainState source)

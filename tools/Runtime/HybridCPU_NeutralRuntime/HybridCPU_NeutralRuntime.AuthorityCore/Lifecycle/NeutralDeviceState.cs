@@ -60,6 +60,7 @@ internal sealed class NeutralOriginalDeviceAdmissionFact
     public NeutralOriginalDomainAdmissionFact RootAdmission { get; }
     public NeutralDeviceState? Source { get; set; }
     public NeutralOriginalDeviceBindObservation? Observation { get; set; }
+    public bool NoEffect { get; set; }
 }
 internal sealed class NeutralOriginalDeviceCloseFact
 {

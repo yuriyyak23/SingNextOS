@@ -1,4 +1,4 @@
-﻿namespace YAKSys_Hybrid_CPU.Core;
+namespace YAKSys_Hybrid_CPU.Core;
 
 internal sealed class NeutralMmioState
 {
@@ -6,6 +6,8 @@ internal sealed class NeutralMmioState
     public NeutralMmioState OwnerSelf { get; }
     public NeutralOriginalMmioAdmissionFact? OriginalAdmission { get; set; }
     public NeutralOriginalMmioCloseFact? OriginalClose { get; set; }
+    public List<NeutralOriginalMmio32Fact> Accesses { get; } = [];
+    public ulong AccessesIssued { get; set; }
     public bool HasExactOriginalClosure => ReferenceEquals(OwnerSelf,this) && OriginalAdmission is { } admission && ReferenceEquals(admission.OwnerSelf,admission) && ReferenceEquals(admission.Source,this) &&
         OriginalClose is { } close && ReferenceEquals(close.OwnerSelf,close) && ReferenceEquals(close.Source,this) && ReferenceEquals(close.Admission,admission) &&
         close.Request.Mapping == Lease && close.Request.MapInvocationId == admission.Request.InvocationId && close.Observation is { SourceFenceMatched: true,NoEffectGuaranteed: false } raw && raw.Request == close.Request && raw.Observation.Decision == NeutralMmioCloseDecision.Closed;
@@ -17,6 +19,17 @@ internal sealed class NeutralMmioState
     public bool IsActive => Lifecycle == NeutralResourceLifecycle.Active && !HasExactOriginalClosure;
 }
 
+internal sealed class NeutralOriginalMmio32Fact
+{
+    public NeutralOriginalMmio32Fact(NeutralOriginalMmio32Request request,NeutralMmioState source)
+    { Original=this;Request=request;Source=source;Admission=source.OriginalAdmission!; }
+    public NeutralOriginalMmio32Fact Original { get; }
+    public NeutralOriginalMmio32Request Request { get; }
+    public NeutralMmioState Source { get; }
+    public NeutralOriginalMmioAdmissionFact Admission { get; }
+    public NeutralOriginalMmio32Observation? Raw { get; set; }
+}
+
 internal sealed class NeutralOriginalMmioAdmissionFact
 {
     public NeutralOriginalMmioAdmissionFact(NeutralOriginalMmioMapRequest request,NeutralDeviceState parent,NeutralOriginalDeviceAdmissionFact factory)
@@ -25,6 +38,7 @@ internal sealed class NeutralOriginalMmioAdmissionFact
     public NeutralOriginalMmioMapRequest Request { get; }
     public NeutralDeviceState Parent { get; }
     public NeutralOriginalDeviceAdmissionFact DeviceAdmission { get; }
+    public bool NoEffect { get; set; }
     public NeutralMmioState? Source { get; set; }
     public NeutralOriginalMmioMapObservation? Observation { get; set; }
 }

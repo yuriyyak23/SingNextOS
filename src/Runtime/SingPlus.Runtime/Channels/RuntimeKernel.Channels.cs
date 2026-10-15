@@ -108,7 +108,7 @@ public sealed partial class RuntimeKernel
         SendCore(sender, receiver, endpoint, messageId, firstOwnershipPayload, secondOwnershipPayload, capabilities, qosHint, traceContext);
 
     private sealed record SessionSendPublication(EndpointSessionHandle Session,
-        EndpointSessionPin Pin, CapabilityRequirementV1[] Requirements, CancellationScopeHandle? Scope = null);
+        EndpointSessionPin Pin, CapabilityRequirementV1[] Requirements, CancellationScopeHandle? Scope = null,OriginalSessionSendCustody? Custody=null);
 
     private KernelResult<ChannelEnvelope> SendCore(
         ProcessHandle sender,
@@ -183,6 +183,61 @@ public sealed partial class RuntimeKernel
                 qosHint, observations);
             if (!budget.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(budget.Error, budget.Message!);
 
+            if(budget.Value is { } originalBudget)
+            {
+                var retained=Channels.RetainSendBudget(endpoint,sender,originalBudget);
+                if(!retained.IsSuccess)
+                {
+                    _=ReleaseAttachedBudget(sender,originalBudget,observations);
+                    return KernelResult<ChannelEnvelope>.Fail(retained.Error,retained.Message!);
+                }
+            }
+            if(sessionPublication is { } originalSession)
+            {
+                var retainedPin=EndpointSessions.RetainOriginalSendPin(originalSession.Pin);
+                if(!retainedPin.IsSuccess)
+                {
+                    _=ReleaseAttachedBudget(sender,budget.Value,observations);
+                    if(budget.Value is { } refused) Channels.ConsumeSendBudgetCorrelation(endpoint,sender,refused);
+                    return KernelResult<ChannelEnvelope>.Fail(retainedPin.Error,retainedPin.Message!);
+                }
+            }
+            EndpointSessionInvocationRegistry.OriginalSend? originalSend=null;
+            ulong originalSequence=0;
+            if(sessionPublication is { } preparedSession)
+            {
+                var channel=Channels.GetEndpoint(endpoint);
+                if(!channel.IsSuccess || channel.Value!.Sequence==ulong.MaxValue)
+                {
+                    _=ReleaseAttachedBudget(sender,budget.Value,observations);
+                    if(budget.Value is { } refused) Channels.ConsumeSendBudgetCorrelation(endpoint,sender,refused);
+                    EndpointSessions.ConsumeOriginalSendPinCorrelation(preparedSession.Pin);
+                    return KernelResult<ChannelEnvelope>.Fail(KernelError.CapacityExhausted,"Original session send sequence unavailable.");
+                }
+                originalSequence=channel.Value.Sequence+1;
+                originalSend=SessionInvocations.PrepareOriginalSend(preparedSession.Session,sender,receiver,
+                    originalSequence,messageId,preparedSession.Pin,payload,secondaryPayload,preparedSession.Scope);
+                preparedSession.Custody?.Retain(this,sender,preparedSession.Session,originalSend);
+                if(budget.Value is { } originalReservation)
+                {
+                    var lifetime=Channels.PrepareOriginalQueuedLifetime(endpoint);
+                    if(!lifetime.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(lifetime.Error,lifetime.Message!);
+                    var bound=Budgets.BindOriginalQueuedCharge(sender,receiver,originalReservation,endpoint.ChannelId,originalSequence,lifetime.Value!);
+                    if(!bound.IsSuccess || !Channels.BindOriginalQueuedBudgetOwner(lifetime.Value!,bound.Value!))
+                        return KernelResult<ChannelEnvelope>.Fail(KernelError.PlatformFaulted,"Original queued charge preparation failed.");
+                    Channels.CaptureQueuedLifetime(endpoint.ChannelId,originalSequence);
+                }
+            }
+            try
+            {
+            KernelResult<RegionHandle> TransferOriginal(SingProcess source,SingProcess target,RegionHandle region,Func<KernelResult>? admission,Action noEffect,PreparedOwnedTransfer prepared)
+            {
+                if(originalSend is not null && !SessionInvocations.BindOriginalSendTransfer(originalSend,prepared))
+                    return KernelResult<RegionHandle>.Fail(KernelError.PlatformFaulted,"Original transfer preparation cannot bind.");
+                var result=TransferRegionForIpcCore(source,target,region,admission,observations,noEffect,prepared,originalSend);
+                if(originalSend is not null) SessionInvocations.RetainOriginalSendTransferResult(originalSend,prepared,result);
+                return result;
+            }
             var send = secondaryPayload is null
                 ? Channels.Send(
                     senderProcess.Value!,
@@ -192,7 +247,7 @@ public sealed partial class RuntimeKernel
                     payload,
                     capabilitySnapshot,
                     boundedSnapshot,
-                    (source, target, region, admission) => TransferRegionForIpcCore(source, target, region, admission, observations))
+                    TransferOriginal)
                 : Channels.SendOwnershipPair(
                     senderProcess.Value!,
                     receiverProcess.Value!,
@@ -201,16 +256,30 @@ public sealed partial class RuntimeKernel
                     payload!,
                     secondaryPayload,
                     capabilitySnapshot,
-                    (source, target, region, admission) => TransferRegionForIpcCore(source, target, region, admission, observations));
+                    TransferOriginal);
             if (!send.IsSuccess)
             {
-                _ = ReleaseAttachedBudget(sender, budget.Value, observations);
+                if(Channels.SendOwnershipIsPending(endpoint))
+                {
+                    if(budget.Value is { } uncertain) _=Budgets.QuarantineLease(sender,uncertain);
+                }
+                else
+                {
+                    Channels.EndRefusedQueuedPreparation(endpoint);
+                    _ = ReleaseAttachedBudget(sender,budget.Value,observations);
+                    if(budget.Value is { } refused) Channels.ConsumeSendBudgetCorrelation(endpoint,sender,refused);
+                    if(originalSend is not null && (!Channels.RetireUnpublishedSequence(endpoint,originalSequence) || !SessionInvocations.CompleteOriginalSend(originalSend,null)))
+                        return KernelResult<ChannelEnvelope>.Fail(KernelError.PlatformFaulted,"Original no-effect send identity could not retire.");
+                    if(sessionPublication is { } noEffectSession) EndpointSessions.ConsumeOriginalSendPinCorrelation(noEffectSession.Pin);
+                }
                 return send;
             }
 
             // A response-capable request must not become observable by the receiver
             // until its exact response correlation is registered. Receive uses the
             // same gate, so enqueue + correlation publication are one visibility step.
+            if(originalSend is not null && !SessionInvocations.CompleteOriginalSend(originalSend,send.Value!,false))
+                return KernelResult<ChannelEnvelope>.Fail(KernelError.PlatformFaulted,"Original send raw continuity failed.");
             Responses.RegisterRequest(endpoint, send.Value!, sender, receiver);
             if (sessionPublication is { } publication)
                 SessionInvocations.Register(publication.Session, sender, receiver,
@@ -225,7 +294,17 @@ public sealed partial class RuntimeKernel
                 if (!Channels.BindOriginalQueuedBudgetOwner(lifetime, bound.Value!))
                     return KernelResult<ChannelEnvelope>.Fail(KernelError.PlatformFaulted, "Original queued budget owner continuity was lost after enqueue.");
             }
+            if(originalSend is not null && !SessionInvocations.CompleteOriginalSend(originalSend,send.Value!))
+                return KernelResult<ChannelEnvelope>.Fail(KernelError.PlatformFaulted,"Original send final publication failed.");
+            if(budget.Value is { } published) Channels.ConsumeSendBudgetCorrelation(endpoint,sender,published);
+            if(sessionPublication is { } publishedSession) EndpointSessions.ConsumeOriginalSendPinCorrelation(publishedSession.Pin);
             return send;
+            }
+            catch
+            {
+                if(budget.Value is { } uncertain) _=Budgets.QuarantineLease(sender,uncertain);
+                throw;
+            }
             }
         }
         }
@@ -285,3 +364,7 @@ public sealed partial class RuntimeKernel
         return checked(32UL + One(payload) + One(secondaryPayload));
     }
 }
+
+
+
+

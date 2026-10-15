@@ -377,7 +377,7 @@ public sealed partial class RuntimeKernel
         }
         participants = _cxlTeardownParticipants.AsEnumerable().Reverse().ToArray();
         }
-        var admissionResolution = PlatformAuthority.ResolveOriginalAdmissionsForCleanup(identity);
+        var admissionResolution = PlatformAuthority.ResolveOriginalAdmissionsForCleanup(identity,out var originalRootNoEffect);
         lock (_platformMemoryUseGate)
         {
             var afterResolution = Processes.Resolve(record.Handle);
@@ -390,6 +390,9 @@ public sealed partial class RuntimeKernel
                 record.BlockingError = admissionResolution.Error;
                 return KernelResult<ProcessTeardownSnapshot>.Ok(record.Snapshot);
             }
+            if(originalRootNoEffect && record.DomainBinding is null && !_processPlatformBindings.ContainsKey(record.Handle) &&
+                !PlatformAuthority.HasActiveAuthority(identity) && !PlatformAuthority.HasUnresolvedDomainBindEffect(identity))
+                record.PlatformDomainClosed=true;
             if (record.DomainBinding is null && PlatformAuthority.TryGetOriginalDomainCleanupBinding(identity, out var recovered))
             {
                 if (_processPlatformBindings.TryGetValue(record.Handle, out var routed) && routed != recovered)

@@ -1,6 +1,16 @@
 namespace YAKSys_Hybrid_CPU.Core;
 public sealed partial class NeutralDomainRuntimeFacade : INeutralOriginalIrqProvider
 {
+    private bool OriginalIrqHistory(NeutralDeviceState parent) =>
+        (ulong)parent.OriginalIrqAdmissions.Count==parent.OriginalIrqIssued &&
+        parent.OriginalIrqAdmissions.Distinct(ReferenceEqualityComparer.Instance).Count()==parent.OriginalIrqAdmissions.Count &&
+        parent.OriginalIrqAdmissions.All(f=>ReferenceEquals(f.OwnerSelf,f) && ReferenceEquals(f.Parent,parent) &&
+            ReferenceEquals(f.DeviceAdmission,parent.OriginalAdmission) && f.Request.Device==parent.Lease &&
+            f.Request.DeviceBindInvocationId==f.DeviceAdmission.Request.InvocationId &&
+            OriginalDeviceSources(parent,f.DeviceAdmission,f.Request.RuntimeIncarnation,false));
+    private static bool OriginalIrqNoEffect(NeutralOriginalIrqAdmissionFact fact,NeutralOriginalIrqBindObservation raw) =>
+        fact.NoEffect && raw.NoEffectGuaranteed && raw.SourceFenceMatched && raw.Request==fact.Request && fact.Source is null &&
+        raw.Observation is {IsBound:false} result && result.Lease==default && Enum.IsDefined(result.Decision) && result.Decision!=NeutralInterruptBindDecision.Bound;
     public NeutralOriginalIrqContainObservation ContainInterrupt(NeutralOriginalIrqContainRequest request)
     {
         lock (_lifecycleGate)
@@ -37,19 +47,20 @@ public sealed partial class NeutralDomainRuntimeFacade : INeutralOriginalIrqProv
             if (request.RuntimeIncarnation != MappingClosureIncarnation) return Refuse(false,true);
             if (_dependencies.Devices.TryGetValue(request.Device.Handle,out var retained))
             {
-                if ((ulong)retained.OriginalIrqAdmissions.Count != retained.OriginalIrqIssued || retained.OriginalIrqAdmissions.Any(old => !ReferenceEquals(old.OwnerSelf,old) || !ReferenceEquals(old.Parent,retained))) return Refuse(true,false);
+                if (!OriginalIrqHistory(retained)) return Refuse(true,false);
                 var previous = retained.OriginalIrqAdmissions.Where(old => old.Request.InvocationId == request.InvocationId).ToArray();
                 if (previous.Length != 0) return previous.Length == 1 && previous[0].Request == request && previous[0].Observation is { } raw &&
-                    (raw.NoEffectGuaranteed && previous[0].Source is null || previous[0].Source is { } source && OriginalIrqSources(source,previous[0],request.RuntimeIncarnation,false)) ? raw : Refuse(true,false);
+                    (OriginalIrqNoEffect(previous[0],raw) || previous[0].Source is { } source && OriginalIrqSources(source,previous[0],request.RuntimeIncarnation,false)) ? raw : Refuse(true,false);
             }
             var valid = _leases.Validate(request.Device);
             if (request.InvocationId == Guid.Empty || !valid.IsValid || valid.State!.OriginalAdmission is not { } factory || factory.Request.InvocationId != request.DeviceBindInvocationId ||
                 !OriginalDeviceSources(valid.State,factory,request.RuntimeIncarnation) || valid.State.OriginalIrqIssued == ulong.MaxValue) return Refuse(true,true);
             var fact = new NeutralOriginalIrqAdmissionFact(request,valid.State,factory);
             valid.State.OriginalIrqAdmissions.Add(fact); valid.State.OriginalIrqIssued++; // Original intent before effect.
-            var result = BindInterruptCore(request.Device,request.Source,fact);
+            var result = BindInterruptCore(request.Device,request.Source,fact,out var noEffect);
+            fact.NoEffect=noEffect;
             if (result is { IsBound: true,Decision: NeutralInterruptBindDecision.Bound }) { fact.Source = _dependencies.Interrupts[result.Lease.Handle]; fact.Source.OriginalAdmission = fact; }
-            var observation = new NeutralOriginalIrqBindObservation(request,true,!result.IsBound && result.Lease == default,result); fact.Observation = observation; return observation;
+            var observation = new NeutralOriginalIrqBindObservation(request,true,noEffect,result); fact.Observation = observation; return observation;
         }
     }
     public bool ValidateIrqAdmission(NeutralOriginalIrqBindRequest request)
@@ -65,10 +76,11 @@ public sealed partial class NeutralDomainRuntimeFacade : INeutralOriginalIrqProv
     {
         lock (_lifecycleGate)
         {
-            if (request.RuntimeIncarnation != MappingClosureIncarnation || !_dependencies.Devices.TryGetValue(request.Device.Handle,out var parent)) return null;
+            if (request.RuntimeIncarnation != MappingClosureIncarnation || request.InvocationId==Guid.Empty || !_dependencies.Devices.TryGetValue(request.Device.Handle,out var parent) ||
+                parent.Lease!=request.Device || !OriginalIrqHistory(parent)) return null;
             var facts = parent.OriginalIrqAdmissions.Where(old => old.Request == request).ToArray();
             if (facts.Length != 1 || !ReferenceEquals(facts[0].OwnerSelf,facts[0]) || !ReferenceEquals(facts[0].Parent,parent) || facts[0].Observation is not { } raw || raw.Request != request) return null;
-            if (raw.NoEffectGuaranteed && facts[0].Source is null && !raw.Observation.IsBound && raw.Observation.Lease == default) return raw;
+            if (OriginalIrqNoEffect(facts[0],raw)) return raw;
             return facts[0].Source is { } source && _dependencies.Interrupts.TryGetValue(source.Handle,out var route) && ReferenceEquals(route,source) && OriginalIrqSources(source,facts[0],request.RuntimeIncarnation,false) ? raw : null;
         }
     }

@@ -124,7 +124,7 @@ public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformIrqBin
                 {
                     var raw = producing.BindInterrupt(nativeRequest);
                     lock (_childCreateCommitGate) device.FailedIrqBind!.NativeObservation = raw;
-                    if (raw.Request != nativeRequest || raw.Observation is null || !Enum.IsDefined(raw.Observation.Decision) || !raw.SourceFenceMatched && !raw.NoEffectGuaranteed || raw.NoEffectGuaranteed && raw.Observation.IsBound)
+                    if (raw.Request != nativeRequest || raw.Observation is null || !Enum.IsDefined(raw.Observation.Decision) || !raw.SourceFenceMatched && !raw.NoEffectGuaranteed || raw.NoEffectGuaranteed && (raw.Observation.IsBound || raw.Observation.Lease!=default || raw.Observation.Decision==NeutralInterruptBindDecision.Bound))
                         return PlatformAuthorityResult<PlatformProviderIrqBinding>.Fail(PlatformAuthorityStatus.Faulted,"Original IRQ Bind raw malformed/foreign.");
                     if (raw.NoEffectGuaranteed) { lock (_childCreateCommitGate) { Retain(raw.Observation); if (originalRequest is null) device.FailedIrqBind = null; } return PlatformAuthorityResult<PlatformProviderIrqBinding>.Fail(PlatformAuthorityStatus.NotAccepted,"Exact original IRQ Bind no effect."); }
                     external = raw.Observation;

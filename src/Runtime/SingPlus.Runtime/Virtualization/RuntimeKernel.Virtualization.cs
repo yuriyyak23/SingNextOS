@@ -5,6 +5,34 @@ namespace SingPlus.Runtime;
 
 public sealed partial class RuntimeKernel
 {
+    internal KernelResult<EndpointSessionInvocationRegistry.OriginalPublication> CaptureOriginalVirtualizationRequestLifetime(
+        EndpointSessionInvocationHandle invocation,ProcessHandle service,ChannelEnvelope request)
+    {
+        lock(_requestResponseCorrelationGate)
+        {
+            var accepted=SessionInvocations.BindOriginalAcceptedRequest(invocation,service,request);
+            if(!accepted.IsSuccess)return KernelResult<EndpointSessionInvocationRegistry.OriginalPublication>.Fail(accepted.Error,accepted.Message!);
+            var session=EndpointSessions.ResolveForService(invocation.Session,service);
+            if(!session.IsSuccess)return KernelResult<EndpointSessionInvocationRegistry.OriginalPublication>.Fail(session.Error,session.Message!);
+            var response=Responses.CapturePublication(service,session.Value!.ServiceEndpoint,invocation.InvocationId.Value);
+            if(!response.IsSuccess)return KernelResult<EndpointSessionInvocationRegistry.OriginalPublication>.Fail(response.Error,response.Message!);
+            var bound=SessionInvocations.BindOriginalResponse(invocation,service,response.Value!);
+            return bound.IsSuccess ? SessionInvocations.CapturePublication(invocation,service,null!) :
+                KernelResult<EndpointSessionInvocationRegistry.OriginalPublication>.Fail(bound.Error,bound.Message!);
+        }
+    }
+
+    internal KernelResult ReadOriginalSessionCancelledLifetime(EndpointSessionInvocationRegistry.OriginalPublication original,
+        EndpointSessionInvocationHandle invocation,ProcessHandle service,ChannelEnvelope request)
+    {
+        lock(_requestResponseCorrelationGate)
+        {
+        var cancelled=SessionInvocations.ReadOriginalCancelledLifetime(original,invocation,service,request);
+        return cancelled.IsSuccess || cancelled.Error!=KernelError.ExternalEffectUncontained ? cancelled :
+            ReadOriginalSessionChannelCancellation(original);
+        }
+    }
+
     /// <summary>Returns this caller's existing admitted parent correlation; not permission.</summary>
     public KernelResult<PlatformDomainBinding> QueryVirtualDomainPlatformBinding(ProcessHandle owner,VirtualDomainHandle domain)
     {
@@ -65,6 +93,8 @@ public sealed partial class RuntimeKernel
         using var creation = prepared.Value!;
         var identity = PlatformIdentity(process);
         VirtualDomainAuthority.Record? record = null;
+        var originalNeverInvoked=false;
+        var originalNoEffect=false;
         KernelResult FreshSubject()
         {
             var current = Processes.Resolve(owner);
@@ -106,9 +136,21 @@ public sealed partial class RuntimeKernel
                         return fresh.IsSuccess ? commit(() => SourceCommit(KernelResult.Ok)) : fresh;
                     }
                 },originalCreationConsumer:sessionInvocation is { } invocation?original=>SessionInvocations.BindVirtualCreation(invocation,owner,original):null,
-                originalCreationClosureConsumer:sessionInvocation is { } cleanupInvocation?original=>SessionInvocations.ConsumeVirtualCreationClosure(cleanupInvocation,owner,original):null);
+                originalCreationClosureConsumer:sessionInvocation is { } cleanupInvocation?original=>SessionInvocations.ConsumeVirtualCreationClosure(cleanupInvocation,owner,original):null,
+                originalCreationNeverInvokedConsumer:original=>
+                {
+                    var consumed=sessionInvocation is { } neverInvocation?SessionInvocations.ConsumeVirtualCreationNeverInvoked(neverInvocation,owner,original):KernelResult.Ok();
+                    if(consumed.IsSuccess)originalNeverInvoked=true;
+                    return consumed;
+                },originalCreationNoEffectConsumer:original=>
+                {
+                    var consumed=sessionInvocation is { } noEffectInvocation?SessionInvocations.ConsumeVirtualCreationNoEffect(noEffectInvocation,owner,original):KernelResult.Ok();
+                    if(consumed.IsSuccess)originalNoEffect=true;
+                    return consumed;
+                });
             if (!parent.IsSuccess)
             {
+                _=PlatformAuthority.ResolveOriginalAdmissionsForCleanup(identity);
                 if (PlatformAuthority.TryGetQuarantinedDomainBinding(identity, out var cleanup))
                     TrackPlatformBinding(owner, cleanup, executionAttached: false);
                 return KernelResult<VirtualDomainAuthoritySet>.Fail(parent.Error, parent.Message!);
@@ -154,7 +196,14 @@ public sealed partial class RuntimeKernel
             return KernelResult<VirtualDomainAuthoritySet>.Fail(KernelError.PlatformFaulted,
                 $"Virtual creation did not publish a complete result; known cleanup remains tracked: {exception.Message}");
         }
-        finally { lock (_platformMemoryUseGate) _pendingPlatformDomainBinds.Remove(owner); }
+        finally
+        {
+            lock(_platformMemoryUseGate)
+            {
+                if(originalNeverInvoked || originalNoEffect)ConsumeNeverInvokedVirtualCreationTeardown(owner,process,sessionInvocation);
+                _pendingPlatformDomainBinds.Remove(owner);
+            }
+        }
     }
 
     private KernelResult<VirtualDomainAuthoritySet> CreateModelVirtualDomain(
@@ -231,15 +280,22 @@ public sealed partial class RuntimeKernel
         {
             lock (_platformMemoryUseGate)
             {
-                // Teardown captured pending model creation as a potential root lifetime.
-                // The same original never-invoked retirement discharges only that interlock.
-                if(originalNeverInvoked && _processTeardowns.TryGetValue(owner,out var teardown) &&
-                    teardown.DomainBinding is null && !_processPlatformBindings.ContainsKey(owner) &&
-                    !PlatformAuthority.HasUnresolvedDomainBindEffect(PlatformIdentity(process)) &&
-                    !PlatformAuthority.HasActiveAuthority(PlatformIdentity(process)))
-                    teardown.PlatformDomainClosed=true;
+                if(originalNeverInvoked)ConsumeNeverInvokedVirtualCreationTeardown(owner,process,sessionInvocation);
                 _pendingPlatformDomainBinds.Remove(owner);
             }
+        }
+    }
+
+    // Caller holds platformMemoryUseGate; invoked only from same-original pre-effect retirement.
+    private void ConsumeNeverInvokedVirtualCreationTeardown(ProcessHandle owner,SingPlus.Sip.SingProcess process,EndpointSessionInvocationHandle? invocation)
+    {
+        if(_processTeardowns.TryGetValue(owner,out var teardown) && teardown.DomainBinding is null &&
+            !_processPlatformBindings.ContainsKey(owner) && !PlatformAuthority.HasUnresolvedDomainBindEffect(PlatformIdentity(process)) &&
+            !PlatformAuthority.HasActiveAuthority(PlatformIdentity(process)))
+        {
+            teardown.PlatformDomainClosed=true;
+            if(teardown.ChannelsClosed && invocation is { } stoppedInvocation)
+                _=SessionInvocations.RetireNoEffectVirtualCreationReply(stoppedInvocation,owner);
         }
     }
 
@@ -371,41 +427,51 @@ public sealed partial class RuntimeKernel
     public KernelResult<VirtualDomainAuthoritySet> CreateNestedVirtualDomain(
         ProcessHandle owner, VirtualDomainHandle parentDomain, CapabilityId parentCapability,
         NestedVirtualDomainRequestProfile requested)
+        => CreateNestedVirtualDomainCore(owner,parentDomain,parentCapability,requested,null);
+
+    internal KernelResult<VirtualDomainAuthoritySet> CreateSessionNestedVirtualDomain(ProcessHandle owner,
+        EndpointSessionInvocationHandle invocation,VirtualDomainHandle parentDomain,CapabilityId parentCapability,
+        NestedVirtualDomainRequestProfile requested)
+        => CreateNestedVirtualDomainCore(owner,parentDomain,parentCapability,requested,invocation);
+
+    private KernelResult<VirtualDomainAuthoritySet> CreateNestedVirtualDomainCore(
+        ProcessHandle owner,VirtualDomainHandle parentDomain,CapabilityId parentCapability,
+        NestedVirtualDomainRequestProfile requested,EndpointSessionInvocationHandle? sessionInvocation)
     {
         using var composedUse = PinComposedDomain(owner, virtualDomain: parentDomain);
-        if (!composedUse.Result.IsSuccess) return KernelResult<VirtualDomainAuthoritySet>.Fail(composedUse.Result.Error, composedUse.Result.Message!);
+        if (!composedUse.Result.IsSuccess) return RefuseBeforeProvider(composedUse.Result.Error, composedUse.Result.Message!);
         var parent = ResolveVirtualCapability(owner, parentDomain, parentCapability,
             VirtualizationResourceIds.Domain(parentDomain.DomainId), CapabilityRights.Configure);
         if (!parent.IsSuccess)
-            return KernelResult<VirtualDomainAuthoritySet>.Fail(parent.Error, parent.Message!);
+            return RefuseBeforeProvider(parent.Error, parent.Message!);
         if (composedUse.HasBindings)
-            return KernelResult<VirtualDomainAuthoritySet>.Fail(KernelError.PlatformUnsupported, "Nested secure execution is not admitted by Phase 00.");
+            return RefuseBeforeProvider(KernelError.PlatformUnsupported, "Nested secure execution is not admitted by Phase 00.");
         if (parent.Value!.State is not VirtualDomainState.Configured and not VirtualDomainState.Parked)
-            return KernelResult<VirtualDomainAuthoritySet>.Fail(KernelError.InvalidTransition,
+            return RefuseBeforeProvider(KernelError.InvalidTransition,
                 "Nested domains may be admitted only while the exact parent is configured or parked.");
         if (parent.Value.ChildBinding is not { } parentChild || parent.Value.ParentBinding is null)
-            return KernelResult<VirtualDomainAuthoritySet>.Fail(KernelError.PlatformUnsupported,
+            return RefuseBeforeProvider(KernelError.PlatformUnsupported,
                 "The exact parent has no provider child authority for nesting.");
 
         var nestedFeature = PlatformAuthority.FeatureManifest.Resolve(PlatformFeatureFamily.NestedDomains);
         if (nestedFeature.ContractVersion < PlatformNestedDomainContract.ContractVersion ||
             nestedFeature.Availability is not (PlatformFeatureAvailability.RuntimeAdmission or PlatformFeatureAvailability.Executable))
-            return KernelResult<VirtualDomainAuthoritySet>.Fail(KernelError.PlatformUnsupported,
+            return RefuseBeforeProvider(KernelError.PlatformUnsupported,
                 "Nested-domain provider admission is unavailable.");
         if (requested.Profile.VirtualProcessorCount <= 0 || requested.Profile.VirtualProcessorCount > 256 ||
             requested.Profile.MaximumGuestMemoryBytes <= 0 ||
             requested.Profile.MaximumGuestMemoryBytes > parent.Value.Profile.MaximumGuestMemoryBytes)
-            return KernelResult<VirtualDomainAuthoritySet>.Fail(KernelError.PlatformDenied,
+            return RefuseBeforeProvider(KernelError.PlatformDenied,
                 "Nested-domain profile exceeds the exact parent bounds.");
 
         const VirtualDomainAuthorityClass knownAuthority = VirtualDomainAuthorityClass.Lifecycle | VirtualDomainAuthorityClass.Execution |
             VirtualDomainAuthorityClass.GuestMemory | VirtualDomainAuthorityClass.Events | VirtualDomainAuthorityClass.Traps | VirtualDomainAuthorityClass.Io;
         if ((requested.Authority & ~knownAuthority) != 0)
-            return KernelResult<VirtualDomainAuthoritySet>.Fail(KernelError.PlatformDenied, "Unknown mandatory nested authority.");
+            return RefuseBeforeProvider(KernelError.PlatformDenied, "Unknown mandatory nested authority.");
         PlatformChildAuthorityClass authority = ToPlatformAuthority(requested.Authority);
         if ((authority & PlatformChildAuthorityClass.Lifecycle) == 0 ||
             (authority & parent.Value.Authority) != authority)
-            return KernelResult<VirtualDomainAuthoritySet>.Fail(KernelError.PlatformDenied,
+            return RefuseBeforeProvider(KernelError.PlatformDenied,
                 "Nested-domain authority must include lifecycle and remain an exact parent subset.");
 
         var intent = new PlatformChildDomainIntent(
@@ -413,19 +479,19 @@ public sealed partial class RuntimeKernel
             new(authority, authority));
         SingPlus.Sip.SingProcess process;
         var preparedIdentity = _virtualDomains.PrepareIdentity(owner);
-        if (!preparedIdentity.IsSuccess) return KernelResult<VirtualDomainAuthoritySet>.Fail(preparedIdentity.Error, preparedIdentity.Message!);
+        if (!preparedIdentity.IsSuccess) return RefuseBeforeProvider(preparedIdentity.Error, preparedIdentity.Message!);
         using var creation = preparedIdentity.Value!;
         var capturedParent = parent.Value;
         var parentState = capturedParent.State;
         var effectSource = _virtualDomains.CaptureEffectSource(capturedParent, parentState);
-        if (!effectSource.IsSuccess) return KernelResult<VirtualDomainAuthoritySet>.Fail(effectSource.Error, effectSource.Message!);
+        if (!effectSource.IsSuccess) return RefuseBeforeProvider(effectSource.Error, effectSource.Message!);
         lock (_platformMemoryUseGate)
         {
             var current = Processes.Resolve(owner);
-            if (!current.IsSuccess) return KernelResult<VirtualDomainAuthoritySet>.Fail(current.Error, current.Message!);
+            if (!current.IsSuccess) return RefuseBeforeProvider(current.Error, current.Message!);
             process = current.Value!;
             if (!_pendingPlatformDomainBinds.Add(owner))
-                return KernelResult<VirtualDomainAuthoritySet>.Fail(KernelError.PlatformBindingActive, "Virtual creation is pending for this owner.");
+                return RefuseBeforeProvider(KernelError.PlatformBindingActive, "Virtual creation is pending for this owner.");
         }
         KernelResult Fresh(Func<KernelResult> commit)
         {
@@ -456,7 +522,10 @@ public sealed partial class RuntimeKernel
                 {
                     lock (_platformMemoryUseGate)
                         record = _virtualDomains.AddNested(creation, owner, capturedParent, binding, requested.Profile, [], authority, authorityPublished: false);
-                });
+                },originalCreationConsumer:sessionInvocation is { } admittedInvocation ? original=>SessionInvocations.BindVirtualCreation(admittedInvocation,owner,original):null,
+                originalCreationClosureConsumer:sessionInvocation is { } cleanupInvocation ? original=>SessionInvocations.ConsumeVirtualCreationClosure(cleanupInvocation,owner,original):null,
+                originalCreationNoEffectConsumer:sessionInvocation is { } noEffectInvocation ? original=>SessionInvocations.ConsumeVirtualCreationNoEffect(noEffectInvocation,owner,original):null,
+                originalCreationNeverInvokedConsumer:sessionInvocation is { } neverInvocation ? original=>SessionInvocations.ConsumeVirtualCreationNeverInvoked(neverInvocation,owner,original):null);
             if (!nested.IsSuccess)
             {
                 if (record is not null) record.State = VirtualDomainState.Quarantined;
@@ -469,24 +538,42 @@ public sealed partial class RuntimeKernel
             return IssueVirtualDomainAuthority(owner, process, parentCapability, record, BindingCommit, SourceCommit);
         }
         finally { lock (_platformMemoryUseGate) _pendingPlatformDomainBinds.Remove(owner); }
+
+        KernelResult<VirtualDomainAuthoritySet> RefuseBeforeProvider(KernelError error,string message)
+        {
+            var consumed=sessionInvocation is { } original ? SessionInvocations.ConsumeVirtualCreationNeverInvoked(original,owner) : KernelResult.Ok();
+            return consumed.IsSuccess ? KernelResult<VirtualDomainAuthoritySet>.Fail(error,message) :
+                KernelResult<VirtualDomainAuthoritySet>.Fail(consumed.Error,consumed.Message!);
+        }
     }
 
     public KernelResult ConfigureVirtualDomain(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId configureCapability)
+        => ConfigureVirtualDomainCore(owner,domain,configureCapability,null);
+
+    internal KernelResult ConfigureSessionVirtualDomain(ProcessHandle owner,EndpointSessionInvocationHandle invocation,
+        VirtualDomainHandle domain,CapabilityId capability) => ConfigureVirtualDomainCore(owner,domain,capability,invocation);
+
+    private KernelResult ConfigureVirtualDomainCore(ProcessHandle owner,VirtualDomainHandle domain,CapabilityId configureCapability,
+        EndpointSessionInvocationHandle? invocation)
     {
+        KernelResult Refuse(KernelError error,string message) => RefuseVirtualTransitionBeforeEffect(owner,invocation,null,error,message);
         using var composedUse = PinComposedDomain(owner, virtualDomain: domain);
-        if (!composedUse.Result.IsSuccess) return KernelResult.Fail(composedUse.Result.Error, composedUse.Result.Message!);
+        if (!composedUse.Result.IsSuccess) return Refuse(composedUse.Result.Error, composedUse.Result.Message!);
         var record = ResolveVirtualCapability(owner, domain, configureCapability, VirtualizationResourceIds.Domain(domain.DomainId), CapabilityRights.Configure);
-        if (!record.IsSuccess) return KernelResult.Fail(record.Error, record.Message!);
-        if (record.Value!.State != VirtualDomainState.Created) return KernelResult.Fail(KernelError.InvalidTransition, "Virtual domain can only be configured from Created.");
+        if (!record.IsSuccess) return Refuse(record.Error, record.Message!);
+        if (record.Value!.State != VirtualDomainState.Created) return Refuse(KernelError.InvalidTransition, "Virtual domain can only be configured from Created.");
+        if(record.Value.ModelBinding is null && record.Value.ChildBinding is null)return Refuse(KernelError.PlatformBindingNotFound,"Virtual domain has no child binding.");
+        var bound=invocation is { } original ? SessionInvocations.BindVirtualTransition(original,owner,record.Value,domain) : KernelResult.Ok();
+        if(!bound.IsSuccess)return bound;
         if (record.Value.ModelBinding is { } model)
         {
             return TransitionModelVirtualDomain(owner, domain, configureCapability, record.Value, model,
-                VirtualDomainState.Created, VirtualDomainState.Configured, PlatformVirtualDomainTransition.Configure, CapabilityRights.Configure);
+                VirtualDomainState.Created, VirtualDomainState.Configured, PlatformVirtualDomainTransition.Configure, CapabilityRights.Configure,invocation);
         }
         if (record.Value.ChildBinding is not { } child)
             return KernelResult.Fail(KernelError.PlatformBindingNotFound, "Virtual domain has no child binding.");
         return TransitionChildVirtualDomain(owner, domain, configureCapability, record.Value, child,
-            VirtualDomainState.Created, VirtualDomainState.Configured, null);
+            VirtualDomainState.Created, VirtualDomainState.Configured, null,invocation);
     }
 
     public KernelResult<GuestRegionMapping> MapGuestRegion(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId memoryCapability, CapabilityId regionCapability, RegionHandle region, GuestAddressRange range, GuestMemoryAccess access)
@@ -648,6 +735,23 @@ public sealed partial class RuntimeKernel
                 else
                 {
                     if(parentCleanup is { } cleanup)BindGuestParentCharge(owner,cleanup,budget.Value,originalBudgetOwner,maximumPrivateExecutableDataBytes);
+                    if(parentCleanup is { } originalParent)
+                    {
+                        var resolved=PlatformAuthority.ResolveOriginalAdmissionsForCleanup(PlatformIdentity(process));
+                        var state=resolved.IsSuccess?PlatformAuthority.QueryRegionMappingLifecycle(originalParent,PlatformIdentity(process)):
+                            KernelResult<PlatformRegionMappingLifecycle>.Fail(resolved.Error,resolved.Message!);
+                        if(state.IsSuccess && state.Value!.AdmissionNoEffectProven)
+                        {
+                            var closed=CloseParentPlatformMapping(originalParent,PlatformIdentity(process));
+                            if(!closed.IsSuccess)return KernelResult<GuestRegionMapping>.Fail(closed.Error,closed.Message!);
+                            var observations=new List<BudgetTraceObservation>();
+                            var consumed=ConsumeProviderGuestParent(record.Value,local,owner,new(process.DomainId,owner.Generation),observations);
+                            EmitBudgetObservations(observations);
+                            if(!consumed.IsSuccess)return KernelResult<GuestRegionMapping>.Fail(consumed.Error,consumed.Message!);
+                            _=_virtualDomains.RemoveMapping(record.Value,local.Mapping,local);
+                            return KernelResult<GuestRegionMapping>.Fail(parentMap.Error,parentMap.Message!);
+                        }
+                    }
                     record.Value.State = VirtualDomainState.Quarantined;
                 }
                 return KernelResult<GuestRegionMapping>.Fail(parentMap.Error, parentMap.Message!);
@@ -705,7 +809,7 @@ public sealed partial class RuntimeKernel
                     record.Value.State = VirtualDomainState.Quarantined;
                     return KernelResult<GuestRegionMapping>.Fail(
                         KernelError.PlatformFaulted,
-                        $"Child guest mapping was rejected and exact parent-mapping cleanup was not proven: {cleanup.Message}");
+                        $"Child guest mapping was rejected ({guestMap.Message}) and exact parent-mapping cleanup was not proven: {cleanup.Message}");
                 }
                 _ = _virtualDomains.RemoveMapping(record.Value, local.Mapping);
                 return KernelResult<GuestRegionMapping>.Fail(guestMap.Error, guestMap.Message!);
@@ -728,19 +832,31 @@ public sealed partial class RuntimeKernel
     }
 
     public KernelResult CloseGuestRegionMapping(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId memoryCapability, GuestRegionMappingHandle mapping)
+        => CloseGuestRegionMappingCore(owner,domain,memoryCapability,mapping,null);
+
+    internal KernelResult CloseSessionGuestRegionMapping(ProcessHandle owner,EndpointSessionInvocationHandle invocation,
+        VirtualDomainHandle domain,CapabilityId memoryCapability,GuestRegionMappingHandle mapping)
+        => CloseGuestRegionMappingCore(owner,domain,memoryCapability,mapping,invocation);
+
+    private KernelResult CloseGuestRegionMappingCore(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId memoryCapability,
+        GuestRegionMappingHandle mapping,EndpointSessionInvocationHandle? invocation)
     {
+        KernelResult Refuse(KernelError error,string message) => RefuseVirtualTransitionBeforeEffect(owner,invocation,null,error,message);
         using var composedUse = PinComposedDomain(owner, virtualDomain: domain, allowDraining: true);
-        if (!composedUse.Result.IsSuccess) return KernelResult.Fail(composedUse.Result.Error, composedUse.Result.Message!);
+        if (!composedUse.Result.IsSuccess) return Refuse(composedUse.Result.Error, composedUse.Result.Message!);
         var record = ResolveVirtualCapability(owner, domain, memoryCapability, VirtualizationResourceIds.Memory(domain.DomainId), CapabilityRights.Map);
-        if (!record.IsSuccess) return KernelResult.Fail(record.Error, record.Message!);
+        if (!record.IsSuccess) return Refuse(record.Error, record.Message!);
         if (record.Value!.State is VirtualDomainState.Quarantined or VirtualDomainState.Faulted)
-            return KernelResult.Fail(KernelError.PlatformFaulted, "A quarantined virtual-domain mapping remains pinned and cannot be locally reclaimed.");
+            return Refuse(KernelError.PlatformFaulted, "A quarantined virtual-domain mapping remains pinned and cannot be locally reclaimed.");
 
         var exactMapping = _virtualDomains.ResolveMapping(record.Value, mapping, allowLocalCleanup: true);
         if (!exactMapping.IsSuccess)
-            return KernelResult.Fail(exactMapping.Error, exactMapping.Message!);
+            return Refuse(exactMapping.Error, exactMapping.Message!);
         if (HasVirtualComputePin(mapping))
-            return KernelResult.Fail(KernelError.PlatformBindingDraining, "Guest mapping remains pinned by virtualized provider work.");
+            return Refuse(KernelError.PlatformBindingDraining, "Guest mapping remains pinned by virtualized provider work.");
+
+        var bound=invocation is { } original ? SessionInvocations.BindVirtualArtifact(original,owner,record.Value,exactMapping.Value!.Mapping) : KernelResult.Ok();
+        if(!bound.IsSuccess)return bound;
 
         var secureClose = CloseSecureGuestRegionsForGuestMapping(owner, mapping);
         if (!secureClose.IsSuccess) return secureClose;
@@ -891,6 +1007,11 @@ public sealed partial class RuntimeKernel
     public KernelResult ParkVirtualDomain(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId executeCapability) => TransitionVirtualDomain(owner, domain, executeCapability, VirtualDomainState.Running, VirtualDomainState.Parked, PlatformVirtualDomainTransition.Park);
     public KernelResult ResumeVirtualDomain(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId executeCapability) => TransitionVirtualDomain(owner, domain, executeCapability, VirtualDomainState.Parked, VirtualDomainState.Running, PlatformVirtualDomainTransition.Resume);
 
+    internal KernelResult ParkSessionVirtualDomain(ProcessHandle owner,EndpointSessionInvocationHandle invocation,VirtualDomainHandle domain,CapabilityId capability)
+        => TransitionVirtualDomain(owner,domain,capability,VirtualDomainState.Running,VirtualDomainState.Parked,PlatformVirtualDomainTransition.Park,invocation);
+    internal KernelResult ResumeSessionVirtualDomain(ProcessHandle owner,EndpointSessionInvocationHandle invocation,VirtualDomainHandle domain,CapabilityId capability)
+        => TransitionVirtualDomain(owner,domain,capability,VirtualDomainState.Parked,VirtualDomainState.Running,PlatformVirtualDomainTransition.Resume,invocation);
+
     public KernelResult InjectVirtualEvent(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId eventCapability, KernelEventEndpoint endpoint)
         => InjectVirtualEvent(owner, domain, eventCapability, endpoint, null);
 
@@ -1002,9 +1123,22 @@ public sealed partial class RuntimeKernel
     }
 
     public KernelResult DestroyVirtualDomain(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId configureCapability)
+        => DestroyVirtualDomainCore(owner,domain,configureCapability,null);
+
+    internal KernelResult DestroySessionVirtualDomain(ProcessHandle owner,EndpointSessionInvocationHandle invocation,
+        VirtualDomainHandle domain,CapabilityId configureCapability)
+        => DestroyVirtualDomainCore(owner,domain,configureCapability,invocation);
+
+    private KernelResult DestroyVirtualDomainCore(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId configureCapability,
+        EndpointSessionInvocationHandle? invocation)
     {
         var record = ResolveVirtualCapability(owner, domain, configureCapability, VirtualizationResourceIds.Domain(domain.DomainId), CapabilityRights.Configure);
-        if (!record.IsSuccess) return KernelResult.Fail(record.Error, record.Message!);
+        if (!record.IsSuccess) return RefuseVirtualTransitionBeforeEffect(owner,invocation,null,record.Error,record.Message!);
+        // Correlate the accepted request before any dependent drain can have an
+        // effect. Only validated domain cleanup consumes this existing lifetime;
+        // a failed response or an unknown provider reply cannot close it.
+        var bound=invocation is { } original ? SessionInvocations.BindVirtualTransition(original,owner,record.Value!,domain) : KernelResult.Ok();
+        if(!bound.IsSuccess)return bound;
         lock (_secureExecutionGate)
             if (record.Value!.State is not (VirtualDomainState.Quarantined or VirtualDomainState.Faulted or VirtualDomainState.Closed))
                 record.Value.State = VirtualDomainState.Draining;
@@ -1051,16 +1185,21 @@ public sealed partial class RuntimeKernel
         return record.IsSuccess ? KernelResult<VirtualDomainState>.Ok(record.Value!.State) : KernelResult<VirtualDomainState>.Fail(record.Error, record.Message!);
     }
 
-    private KernelResult TransitionVirtualDomain(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId capability, VirtualDomainState from, VirtualDomainState to, PlatformVirtualDomainTransition transition)
+    private KernelResult TransitionVirtualDomain(ProcessHandle owner, VirtualDomainHandle domain, CapabilityId capability, VirtualDomainState from, VirtualDomainState to, PlatformVirtualDomainTransition transition,
+        EndpointSessionInvocationHandle? invocation=null)
     {
+        KernelResult Refuse(KernelError error,string message) => RefuseVirtualTransitionBeforeEffect(owner,invocation,null,error,message);
         using var composedUse = PinComposedDomain(owner, virtualDomain: domain);
-        if (!composedUse.Result.IsSuccess) return KernelResult.Fail(composedUse.Result.Error, composedUse.Result.Message!);
+        if (!composedUse.Result.IsSuccess) return Refuse(composedUse.Result.Error, composedUse.Result.Message!);
         var record = ResolveVirtualCapability(owner, domain, capability, VirtualizationResourceIds.Domain(domain.DomainId), CapabilityRights.Execute);
-        if (!record.IsSuccess) return KernelResult.Fail(record.Error, record.Message!);
-        if (record.Value!.State != from) return KernelResult.Fail(KernelError.InvalidTransition, $"Virtual domain cannot transition from {record.Value.State} to {to}.");
+        if (!record.IsSuccess) return Refuse(record.Error, record.Message!);
+        if (record.Value!.State != from) return Refuse(KernelError.InvalidTransition, $"Virtual domain cannot transition from {record.Value.State} to {to}.");
+        if(record.Value.ModelBinding is null && record.Value.ChildBinding is null)return Refuse(KernelError.PlatformBindingNotFound,"Virtual domain has no executable child binding.");
+        var bound=invocation is { } original ? SessionInvocations.BindVirtualTransition(original,owner,record.Value,domain) : KernelResult.Ok();
+        if(!bound.IsSuccess)return bound;
         if (record.Value.ModelBinding is { } model)
             return TransitionModelVirtualDomain(owner, domain, capability, record.Value, model,
-                from, to, transition, CapabilityRights.Execute);
+                from, to, transition, CapabilityRights.Execute,invocation);
         if (record.Value.ChildBinding is not { } child)
             return KernelResult.Fail(KernelError.PlatformBindingNotFound, "Virtual domain has no executable child binding.");
         return TransitionChildVirtualDomain(owner, domain, capability, record.Value, child, from, to,
@@ -1070,25 +1209,25 @@ public sealed partial class RuntimeKernel
                 PlatformVirtualDomainTransition.Park => PlatformChildDomainTransition.Park,
                 PlatformVirtualDomainTransition.Resume => PlatformChildDomainTransition.Resume,
                 _ => PlatformChildDomainTransition.BeginDrain,
-            });
+            },invocation);
     }
 
     private KernelResult TransitionChildVirtualDomain(ProcessHandle owner, VirtualDomainHandle domain,
         CapabilityId source, VirtualDomainAuthority.Record record, PlatformChildBinding binding,
-        VirtualDomainState from, VirtualDomainState to, PlatformChildDomainTransition? transition)
+        VirtualDomainState from, VirtualDomainState to, PlatformChildDomainTransition? transition,EndpointSessionInvocationHandle? invocation=null)
     {
         var secureSources = CaptureComposedSecureSources(owner, domain);
-        if (!secureSources.IsSuccess) return KernelResult.Fail(secureSources.Error, secureSources.Message!);
+        if (!secureSources.IsSuccess) return RefuseVirtualTransitionBeforeEffect(owner,invocation,record,secureSources.Error, secureSources.Message!);
         var effectSource = _virtualDomains.CaptureEffectSource(record, from);
-        if (!effectSource.IsSuccess) return KernelResult.Fail(effectSource.Error, effectSource.Message!);
+        if (!effectSource.IsSuccess) return RefuseVirtualTransitionBeforeEffect(owner,invocation,record,effectSource.Error, effectSource.Message!);
         SingPlus.Sip.SingProcess process;
         lock (_platformMemoryUseGate)
         {
             var current = Processes.Resolve(owner);
-            if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
+            if (!current.IsSuccess) return RefuseVirtualTransitionBeforeEffect(owner,invocation,record,current.Error, current.Message!);
             process = current.Value!;
             if (!_pendingVirtualTransitions.Add(domain))
-                return KernelResult.Fail(KernelError.PlatformBindingActive, "A virtual state transaction is pending.");
+                return RefuseVirtualTransitionBeforeEffect(owner,invocation,record,KernelError.PlatformBindingActive, "A virtual state transaction is pending.");
         }
         KernelResult Fresh(Func<KernelResult> commit)
         {
@@ -1115,12 +1254,19 @@ public sealed partial class RuntimeKernel
         try
         {
             if (transition is null)
-                return Fresh(() => PlatformAuthority.CommitActiveChildDomainConsumer(binding, () =>
-                    SourceCommit(() => _virtualDomains.CommitStateTransition(record, from, to))));
+            {
+                var possibleEffect=false;
+                var configured=Fresh(() => PlatformAuthority.CommitActiveChildDomainConsumer(binding, () =>
+                    SourceCommit(() => {possibleEffect=true;return _virtualDomains.CommitStateTransition(record, from, to);} )));
+                if(!configured.IsSuccess && !possibleEffect)
+                    return RefuseVirtualTransitionBeforeEffect(owner,invocation,record,configured.Error,configured.Message!);
+                return configured;
+            }
             return PlatformAuthority.TransitionChildDomain(binding, transition.Value,
                 admissionConsumer: Fresh, sourceCommitConsumer: SourceCommit,
                 completionConsumer: commit => Fresh(() => commit(() =>
-                    SourceCommit(() => _virtualDomains.CommitStateTransition(record, from, to)))));
+                    SourceCommit(() => _virtualDomains.CommitStateTransition(record, from, to)))),
+                noEffectConsumer:invocation is { } original ? ()=>SessionInvocations.ConsumeVirtualTransitionNoEffect(original,owner,record):null);
         }
         finally { lock (_platformMemoryUseGate) _pendingVirtualTransitions.Remove(domain); }
     }
@@ -1221,18 +1367,18 @@ public sealed partial class RuntimeKernel
 
     private KernelResult TransitionModelVirtualDomain(ProcessHandle owner, VirtualDomainHandle domain,
         CapabilityId source, VirtualDomainAuthority.Record record, PlatformAuthorityBridge.VirtualDomainBinding binding,
-        VirtualDomainState from, VirtualDomainState to, PlatformVirtualDomainTransition transition, CapabilityRights rights)
+        VirtualDomainState from, VirtualDomainState to, PlatformVirtualDomainTransition transition, CapabilityRights rights,EndpointSessionInvocationHandle? invocation=null)
     {
         var effectSource = _virtualDomains.CaptureEffectSource(record, from);
-        if (!effectSource.IsSuccess) return KernelResult.Fail(effectSource.Error, effectSource.Message!);
+        if (!effectSource.IsSuccess) return RefuseVirtualTransitionBeforeEffect(owner,invocation,record,effectSource.Error, effectSource.Message!);
         SingPlus.Sip.SingProcess process;
         lock (_platformMemoryUseGate)
         {
             var current = Processes.Resolve(owner);
-            if (!current.IsSuccess) return KernelResult.Fail(current.Error, current.Message!);
+            if (!current.IsSuccess) return RefuseVirtualTransitionBeforeEffect(owner,invocation,record,current.Error, current.Message!);
             process = current.Value!;
             if (!_pendingVirtualTransitions.Add(domain))
-                return KernelResult.Fail(KernelError.PlatformBindingActive, "A model state transaction is pending.");
+                return RefuseVirtualTransitionBeforeEffect(owner,invocation,record,KernelError.PlatformBindingActive, "A model state transaction is pending.");
         }
         KernelResult Fresh(Func<KernelResult> commit)
         {
@@ -1258,7 +1404,8 @@ public sealed partial class RuntimeKernel
         {
             return PlatformAuthority.TransitionVirtualDomain(binding, transition, Fresh, SourceCommit,
                 completionConsumer: commit => Fresh(() => commit(() =>
-                    SourceCommit(() => _virtualDomains.CommitStateTransition(record, from, to)))));
+                    SourceCommit(() => _virtualDomains.CommitStateTransition(record, from, to)))),
+                noEffectConsumer:invocation is { } original ? ()=>SessionInvocations.ConsumeVirtualTransitionNoEffect(original,owner,record):null);
         }
         finally { lock (_platformMemoryUseGate) _pendingVirtualTransitions.Remove(domain); }
     }
@@ -1364,6 +1511,7 @@ public sealed partial class RuntimeKernel
         {
             PlatformExternalClosureState.Active => PlatformAuthority.BeginRegionMappingRevocation(
                 mapping, identity, PlatformRegionRevocationPolicy.DrainBeforeRevoke),
+            PlatformExternalClosureState.Faulted when existing.Value.AdmissionNoEffectProven => existing,
             PlatformExternalClosureState.Draining => PlatformAuthority.ObserveRegionMappingRevocation(mapping, identity),
             // Exact existing cleanup fact only; finalizer still observes source
             // and revalidates local owners before any reclaim.
@@ -1416,12 +1564,25 @@ public sealed partial class RuntimeKernel
         }
         if (record.ModelBinding is { } model)
             return PlatformAuthority.RevokeVirtualDomain(model, cleanupConsumer: commit =>
-                Fresh(() => commit(release => _virtualDomains.CommitVirtualCleanup(record, release))));
+                Fresh(() => commit(release => _virtualDomains.CommitVirtualCleanup(record,()=>Consume(release)))));
         if (record.ChildBinding is { } child)
             return PlatformAuthority.CloseChildDomain(child, allowCommittedClosure: true,
                 cleanupCompletionConsumer: commit => Fresh(() =>
-                    commit(() => _virtualDomains.CommitVirtualCleanup(record, KernelResult.Ok))));
+                    commit(() => _virtualDomains.CommitVirtualCleanup(record,()=>Consume(KernelResult.Ok)))));
         return KernelResult.Fail(KernelError.PlatformFaulted, "Exact virtual cleanup binding is unavailable.");
+
+        KernelResult Consume(Func<KernelResult> release)
+        {
+            var consumed=SessionInvocations.ConsumeVirtualTransitionDomainClosure(record.Owner,record,record.Handle);
+            return consumed.IsSuccess ? release() : consumed;
+        }
+    }
+
+    private KernelResult RefuseVirtualTransitionBeforeEffect(ProcessHandle owner,EndpointSessionInvocationHandle? invocation,
+        object? original,KernelError error,string message)
+    {
+        var consumed=invocation is { } handle ? SessionInvocations.ConsumeVirtualTransitionNoEffect(handle,owner,original,neverInvoked:true) : KernelResult.Ok();
+        return consumed.IsSuccess ? KernelResult.Fail(error,message) : consumed;
     }
 
     private static PlatformGuestMemoryAccess ToPlatformAccess(GuestMemoryAccess access) =>

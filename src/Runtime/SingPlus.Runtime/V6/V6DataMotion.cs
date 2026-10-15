@@ -336,6 +336,8 @@ public sealed partial class RuntimeKernel
         }
         if (!cleanup.Value)
         {
+            if(originalRequest?.Cancellation.IsCancellationRequested==true)
+                return KernelResult<V6DataMotionExecution<T>>.Fail(KernelError.CancellationPending,"Original DMA cancelled before Copy; granted resources still require exact cleanup.");
             var submitted = SubmitV6PlatformDmaCopy(source, sourceGrant, sourcePrepare,
                 destination, destinationGrant, destinationPrepare, sourceTraceSink, destinationTraceSink,payload.Backing,
                 () => payload.EffectPossible = true, () => payload.EffectPossible = false);
@@ -355,6 +357,8 @@ public sealed partial class RuntimeKernel
             var completed = CompleteV6PlatformDmaCopy(source, destination, execution);
             if (!completed.IsSuccess)
                 return KernelResult<V6DataMotionExecution<T>>.Fail(completed.Error, completed.Message!);
+            if(originalRequest?.Cancellation.IsCancellationRequested==true)
+                return KernelResult<V6DataMotionExecution<T>>.Fail(KernelError.CancellationPending,"Original DMA cancelled after possible Copy; completion protocol observed, payload retained for exact cleanup.");
 
         }
 
@@ -385,6 +389,8 @@ public sealed partial class RuntimeKernel
              DataMotionLifecycleStateV1.Completed]).Validate();
         var preparedResult = new V6DataMotionExecution<T>(output, receipt)
         { PreparedProviderResult = new ProviderDmaDataMotionResult<T>(output, receipt) };
+        if(originalRequest?.Cancellation.IsCancellationRequested==true)
+            return KernelResult<V6DataMotionExecution<T>>.Fail(KernelError.CancellationPending,"Original DMA cancelled before source consumption; cleanup remains separate.");
         lock (_platformMemoryUseGate) payload.ReleaseSourceAfterClosure();
         var releasedSource = ReleaseRegion(source, input);
         if (!releasedSource.IsSuccess)
@@ -402,6 +408,8 @@ public sealed partial class RuntimeKernel
         lock (_platformMemoryUseGate)
         {
             var current = Processes.Resolve(destination);
+            if(originalRequest?.Cancellation.IsCancellationRequested==true)
+                return RefuseClosedPublication(KernelError.CancellationPending,"Original DMA cancelled before final publication after source callbacks.");
             if (!current.IsSuccess) return RefuseClosedPublication(current.Error,current.Message!);
             if (!ReferenceEquals(current.Value,destinationProcess.Value))
                 return RefuseClosedPublication(KernelError.StaleGeneration,"Original DMA destination incarnation changed before publication.");

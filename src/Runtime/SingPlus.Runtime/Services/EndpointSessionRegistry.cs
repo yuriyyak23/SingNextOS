@@ -14,6 +14,7 @@ internal sealed class EndpointSessionRegistry
         public required ChannelEndpointHandle Channel { get; init; }
         public required DateTimeOffset? ExpiresAt { get; init; }
         public int ActivePins { get; set; }
+        public HashSet<EndpointSessionPin> PendingSendPins { get; } = [];
         public bool CloseRequested { get; set; }
         public bool CloseCleanupClaimed { get; set; }
         // Three transitions are possible: Active, optional Draining, Closed.
@@ -300,6 +301,30 @@ internal sealed class EndpointSessionRegistry
         }
     }
 
+    internal KernelResult RetainOriginalSendPin(EndpointSessionPin pin)
+    {
+        lock(_gate)
+        {
+            var current=RevalidatePin(pin);
+            if(!current.IsSuccess) return current;
+            if(!pin.OriginalRecord.PendingSendPins.Add(pin))
+                return KernelResult.Fail(KernelError.RegionUseConflict,"Original session send is already pending.");
+            return KernelResult.Ok();
+        }
+    }
+
+    internal void ConsumeOriginalSendPinCorrelation(EndpointSessionPin pin)
+    {
+        lock(_gate)
+            if(pin.IsOwnedBy(this) && OwnsOriginalRecord(pin.OriginalRecord))
+                pin.OriginalRecord.PendingSendPins.Remove(pin);
+    }
+
+    internal bool OriginalSendPinIsPending(EndpointSessionPin pin)
+    {
+        lock(_gate) return pin.IsOwnedBy(this) && OwnsOriginalRecord(pin.OriginalRecord) &&
+            pin.OriginalRecord.PendingSendPins.Contains(pin);
+    }
     internal void ReleasePin(EndpointSessionPin pin)
     {
         lock (_gate)
@@ -310,6 +335,15 @@ internal sealed class EndpointSessionRegistry
             record.ActivePins--;
             if (record.ActivePins == 0 && record.CloseRequested)
                 Transition(record, EndpointSessionState.Closed, SessionLifecycleTraceCauseV1.PinReleased);
+        }
+    }
+
+    internal void DisposeOriginalPin(EndpointSessionPin pin)
+    {
+        lock (_gate)
+        {
+            if (!pin.IsOwnedBy(this) || pin.OriginalRecord.PendingSendPins.Contains(pin)) return;
+            if (pin.DetachOriginalOwner(this)) ReleasePin(pin);
         }
     }
 
@@ -356,12 +390,18 @@ internal sealed class EndpointSessionRegistry
 internal sealed class EndpointSessionPin : IDisposable
 {
     private EndpointSessionRegistry? _owner;
+    private readonly EndpointSessionPin _original;
     internal EndpointSessionPin(EndpointSessionRegistry owner, EndpointSessionRegistry.Record original)
-        => (_owner, OriginalRecord, Handle, Caller, Service) = (owner, original, original.Handle, original.Caller, original.Service);
+    {
+        _original = this;
+        (_owner, OriginalRecord, Handle, Caller, Service) = (owner, original, original.Handle, original.Caller, original.Service);
+    }
     internal EndpointSessionRegistry.Record OriginalRecord { get; }
     internal EndpointSessionHandle Handle { get; }
     internal ProcessHandle Caller { get; }
     internal ProcessHandle Service { get; }
-    internal bool IsOwnedBy(EndpointSessionRegistry owner) => ReferenceEquals(Volatile.Read(ref _owner), owner);
-    public void Dispose() => Interlocked.Exchange(ref _owner, null)?.ReleasePin(this);
+    internal bool IsOwnedBy(EndpointSessionRegistry owner) => ReferenceEquals(this, _original) && ReferenceEquals(Volatile.Read(ref _owner), owner);
+    internal bool DetachOriginalOwner(EndpointSessionRegistry owner) => IsOwnedBy(owner) && ReferenceEquals(Interlocked.CompareExchange(ref _owner, null, owner), owner);
+    public void Dispose() => Volatile.Read(ref _owner)?.DisposeOriginalPin(this);
 }
+

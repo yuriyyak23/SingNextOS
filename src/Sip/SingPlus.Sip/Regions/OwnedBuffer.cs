@@ -9,13 +9,44 @@ internal interface ITransferableOwnedPayload
     bool IsValidForRuntime { get; }
     void ValidateTransferForRuntime();
     object TransferForRuntime(RegionHandle newHandle);
+    PreparedOwnedTransfer PrepareTransferForRuntime();
     object CreateBorrowLeaseForRuntime(BorrowLeaseHandle handle, BorrowLeaseLifetime lifetime);
     void InvalidateOwnerAccessForRuntime();
     void InvalidateForRuntime();
 }
 
+internal sealed class PreparedOwnedTransfer : IDisposable
+{
+    private readonly PreparedOwnedTransfer _original;
+    private readonly Action<RegionHandle> commit;
+    private readonly Action? cancel,validate;
+    internal PreparedOwnedTransfer(ITransferableOwnedPayload source,object projection,object custodyGate,Action<RegionHandle> commit,Action? cancel=null,Action? validate=null)
+    { _original=this;Source=source;SourceHandle=source.Handle;Projection=projection;CustodyGate=custodyGate;this.commit=commit;this.cancel=cancel;this.validate=validate; }
+    internal object CustodyGate { get; }
+    internal ITransferableOwnedPayload Source { get; }
+    internal RegionHandle SourceHandle { get; }
+    internal bool IsOriginal => ReferenceEquals(_original,this);
+    internal object Projection { get; }
+    internal void Commit(RegionHandle handle){Validate();commit(handle);}
+    public void Dispose()
+    {
+        if(!ReferenceEquals(_original,this))throw new InvalidOperationException("Copied preparation cannot cancel original custody.");
+        cancel?.Invoke();
+    }
+    internal void Validate()
+    {
+        if(!ReferenceEquals(_original,this))throw new InvalidOperationException("Copied prepared transfer denied.");
+        validate?.Invoke();
+    }
+}
+
 internal sealed class BorrowLeaseLifetime
 {
+    private readonly BorrowLeaseLifetime _original;
+    internal object? OriginalRegionOwner { get; }
+    internal bool IsOriginal => ReferenceEquals(_original,this);
+    internal BorrowLeaseLifetime(object? originalRegionOwner=null)
+    { _original=this; OriginalRegionOwner=originalRegionOwner; }
     private int _active = 1;
     private int _localAccessActive = 1;
 
@@ -128,6 +159,7 @@ public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanag
     private readonly Storage _storage;
     private readonly object _ownerGate = new();
     private bool _valid;
+    private object? _preparedTransfer;
 
     internal OwnedBuffer(RegionHandle handle, T[] data) : this(handle, new Storage(data))
     {
@@ -238,6 +270,37 @@ public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanag
         }
     }
 
+    PreparedOwnedTransfer ITransferableOwnedPayload.PrepareTransferForRuntime()
+    {
+        lock(_ownerGate)
+        {
+            EnsureOwnerAccessCore();
+            var originalHandle=Handle;
+            var projection=new OwnedBuffer<T>(originalHandle,_storage){_valid=false};
+            var token=new object();
+            var prepared=new PreparedOwnedTransfer(this,projection,_ownerGate,handle=>
+            {
+                lock(_ownerGate)
+                {
+                    EnsureValidCore();
+                    if(!ReferenceEquals(_preparedTransfer,token) || Handle!=originalHandle || projection._valid || _storage.IsBorrowed || _storage.IsRuntimeReserved)
+                        throw new InvalidOperationException("Original prepared ownership changed.");
+                    projection.Handle=handle;_valid=false;projection._valid=true;_preparedTransfer=null;
+                }
+            },()=>{lock(_ownerGate){if(ReferenceEquals(_preparedTransfer,token))_preparedTransfer=null;}},()=>
+            {
+                lock(_ownerGate)
+                {
+                    EnsureValidCore();
+                    if(!ReferenceEquals(_preparedTransfer,token) || Handle!=originalHandle || projection._valid || _storage.IsBorrowed || _storage.IsRuntimeReserved)
+                        throw new InvalidOperationException("Original prepared ownership unavailable before Region mutation.");
+                }
+            });
+            _preparedTransfer=token; // Local managed custody, not Region authority.
+            return prepared;
+        }
+    }
+
     object ITransferableOwnedPayload.CreateBorrowLeaseForRuntime(BorrowLeaseHandle handle, BorrowLeaseLifetime lifetime)
     {
         lock (_ownerGate)
@@ -280,6 +343,7 @@ public sealed class OwnedBuffer<T> : ITransferableOwnedPayload where T : unmanag
     private void EnsureOwnerAccessCore()
     {
         EnsureValidCore();
+        if(_preparedTransfer is not null)throw new InvalidOperationException("OwnedBuffer is reserved for an original ownership transfer.");
         if (_storage.IsBorrowed) throw new InvalidOperationException("OwnedBuffer is temporarily inaccessible while a runtime borrow lease is active.");
         if (_storage.IsRuntimeReserved) throw new InvalidOperationException("OwnedBuffer is temporarily inaccessible while a runtime operation owns its CPU-access reservation.");
     }
@@ -324,6 +388,7 @@ internal sealed class RuntimeBufferLease<T> : IDisposable where T : unmanaged
 
     internal ReadOnlyMemory<byte> ReadOnlyBytes { get { EnsureAccess(RuntimeBufferAccess.Read); return new ByteMemory(this).Memory; } }
     internal Memory<byte> WritableBytes { get { EnsureAccess(RuntimeBufferAccess.Write); return new ByteMemory(this).Memory; } }
+    internal T[] WritableArray { get { EnsureAccess(RuntimeBufferAccess.Write); return _storage.Data; } }
 
     internal ReadOnlySpan<T> ReadOnlySpan
     {

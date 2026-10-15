@@ -89,6 +89,6 @@ public sealed partial class RuntimeKernel
                 if (!consumed.IsSuccess) return consumed;
                 lifetime.ChargeConsumed = true;
             }
-            return KernelResult.Ok();
+            return SessionInvocations.ConsumeVirtualArtifactMappingClosure(owner,record,mapping.Mapping);
         });
 }

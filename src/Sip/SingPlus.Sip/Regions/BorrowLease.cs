@@ -2,19 +2,31 @@ using SingPlus.Contracts;
 
 namespace SingPlus.Sip;
 
-public sealed class BorrowLease<T> where T : unmanaged
+internal interface IOriginalBorrowPayload
+{
+    BorrowLeaseHandle RuntimeHandle { get; }
+    BorrowLeaseLifetime RuntimeLifetime { get; }
+    bool RuntimeIsOriginal { get; }
+}
+
+public sealed class BorrowLease<T> : IOriginalBorrowPayload where T : unmanaged
 {
     private readonly OwnedBuffer<T>.Storage _storage;
     private readonly BorrowLeaseLifetime _lifetime;
+    private readonly BorrowLease<T> _original;
 
     internal BorrowLease(BorrowLeaseHandle handle, OwnedBuffer<T>.Storage storage, BorrowLeaseLifetime lifetime)
     {
         Handle = handle;
         _storage = storage;
         _lifetime = lifetime;
+        _original = this;
     }
 
     public BorrowLeaseHandle Handle { get; }
+    BorrowLeaseHandle IOriginalBorrowPayload.RuntimeHandle => Handle;
+    BorrowLeaseLifetime IOriginalBorrowPayload.RuntimeLifetime => _lifetime;
+    bool IOriginalBorrowPayload.RuntimeIsOriginal => ReferenceEquals(_original,this);
     public bool IsValid => _lifetime.IsLocalAccessActive && _storage.IsAlive;
 
     public int Length

@@ -35,10 +35,12 @@ public sealed partial class PlatformAuthorityBridge
         public bool TransitionMayHaveEffect { get; set; }
         public PlatformVirtualDomainTransition? TransitionIntent { get; set; }
         public PlatformAuthorityResult? TransitionObservation { get; set; }
+        public OriginalModelTransitionFact? OriginalTransition {get;set;}
         public bool CloseInFlight { get; set; }
         public bool CloseMayHaveEffect { get; set; }
         public bool ProviderClosureConfirmed { get; set; }
         public PlatformAuthorityResult? CloseObservation { get; set; }
+        public OriginalModelRevokeFact? OriginalClose {get;set;}
     }
 
     private readonly Dictionary<VirtualDomainBindingId, VirtualDomainRecord> _virtualDomainBindings = [];
@@ -268,10 +270,22 @@ public sealed partial class PlatformAuthorityBridge
     internal KernelResult TransitionVirtualDomain(VirtualDomainBinding binding, PlatformVirtualDomainTransition transition,
         Func<Func<KernelResult>, KernelResult>? admissionConsumer = null,
         Func<Func<KernelResult>, KernelResult>? sourceCommitConsumer = null,
-        Func<Func<Func<KernelResult>, KernelResult>, KernelResult>? completionConsumer = null)
+        Func<Func<Func<KernelResult>, KernelResult>, KernelResult>? completionConsumer = null,
+        Func<KernelResult>? noEffectConsumer = null)
     {
         if (_provider is not IPlatformVirtualizationProvider provider)
             return KernelResult.Fail(KernelError.PlatformUnsupported, "Platform virtualization provider is unavailable.");
+        var originalProvider=_provider as IPlatformOriginalVirtualDomainTransitionProvider;
+        var originalSupported=originalProvider is {SupportsOriginalVirtualDomainTransitions:true};
+        if(originalSupported && _provider is not IPlatformProviderIncarnationSource)
+            return KernelResult.Fail(KernelError.PlatformFaulted,"Original model transition requires explicit provider incarnation.");
+        if(transition==PlatformVirtualDomainTransition.BeginDrain)
+        {
+            var closed=ResolveOriginalModelRevokeForCleanup(binding);
+            if(!closed.IsSuccess)return closed;
+            var resolved=ResolveOriginalModelTransitionForCleanup(binding);
+            if(!resolved.IsSuccess)return resolved;
+        }
         if (!Enum.IsDefined(transition))
             return KernelResult.Fail(KernelError.PlatformDenied, "Unknown mandatory model transition.");
         VirtualDomainRecord record = null!;
@@ -311,6 +325,7 @@ public sealed partial class PlatformAuthorityBridge
             {
                 record.Quarantined = true;
                 record.TransitionMayHaveEffect = true;
+                if(record.OriginalTransition is {Invoked:true} fact && ReferenceEquals(fact.Owner,record))fact.OwnUnknown=true;
                 if (CurrentOriginalModelOwnerLocked(record) is { } current)
                 {
                     current.Quarantined = true;
@@ -338,6 +353,7 @@ public sealed partial class PlatformAuthorityBridge
                     {
                         record.TransitionIntent = transition;
                         record.TransitionObservation = null;
+                        record.OriginalTransition=originalSupported ? new(record,new(record.ProviderLease,transition,source),record.CreatedInEpoch,noEffectConsumer) : null;
                         return KernelResult.Ok();
                     }
                     return sourceCommitConsumer is null ? RecordIntent() : sourceCommitConsumer(RecordIntent);
@@ -345,7 +361,16 @@ public sealed partial class PlatformAuthorityBridge
             }
             var final = admissionConsumer is null ? FinalAdmission() : admissionConsumer(FinalAdmission);
             if (!final.IsSuccess) return final;
-            var result = provider.TransitionVirtualDomain(record.ProviderLease, transition);
+            PlatformAuthorityResult result;
+            if(originalSupported)
+            {
+                var fact=record.OriginalTransition!;
+                lock(_secureDomainLifecycleGate)fact.Invoked=true;
+                var original=InvokeOriginalModelTransition(fact,originalProvider!);
+                if(!original.IsSuccess){PinUnknown();return KernelResult.Fail(original.Error,original.Message!);}
+                result=original.Value;
+            }
+            else result=provider.TransitionVirtualDomain(record.ProviderLease,transition);
             lock (_secureDomainLifecycleGate)
             {
                 // Preserve the original returned outcome before routing/publication checks.
@@ -366,7 +391,8 @@ public sealed partial class PlatformAuthorityBridge
                 {
                     record.Quarantined = true;
                     if (result.Status != PlatformAuthorityStatus.NotAccepted) PinUnknown();
-                    return FromProviderFailure(result.Status, result.Message);
+                    if(result.Status!=PlatformAuthorityStatus.NotAccepted || noEffectConsumer is null)
+                        return FromProviderFailure(result.Status, result.Message);
                 }
             }
             try { source = CurrentProviderIncarnation(); }
@@ -377,6 +403,22 @@ public sealed partial class PlatformAuthorityBridge
             }
             exact = ValidateSource(source);
             if (!exact.IsSuccess) return exact;
+            if(!result.IsSuccess)
+            {
+                lock(_secureDomainLifecycleGate)
+                    if(record.TransitionIntent!=transition || record.TransitionObservation!=result)
+                        return KernelResult.Fail(KernelError.PlatformFaulted,"Original refused model transition fact unavailable.");
+                var consumed=noEffectConsumer!();
+                if(!consumed.IsSuccess)return consumed;
+                source=CurrentProviderIncarnation();
+                lock(_secureDomainLifecycleGate)
+                {
+                    exact=ValidateSource(source);
+                    if(!exact.IsSuccess || record.TransitionIntent!=transition || record.TransitionObservation!=result)
+                        return KernelResult.Fail(KernelError.PlatformFaulted,"Original refused model transition changed after no-effect consumption.");
+                }
+                return FromProviderFailure(result.Status,result.Message);
+            }
             KernelResult CommitCurrent(Func<KernelResult> commit)
             {
                 lock (_secureDomainLifecycleGate)
@@ -432,6 +474,10 @@ public sealed partial class PlatformAuthorityBridge
         Func<Func<Func<Func<KernelResult>, KernelResult>, KernelResult>, KernelResult>? cleanupConsumer = null)
     {
         if (_provider is not IPlatformVirtualizationProvider provider) return KernelResult.Fail(KernelError.PlatformUnsupported, "Platform virtualization provider is unavailable.");
+        var reconciled=ResolveOriginalModelTransitionForCleanup(binding);
+        if(!reconciled.IsSuccess)return reconciled;
+        var originalClosed=ResolveOriginalModelRevokeForCleanup(binding);
+        if(!originalClosed.IsSuccess)return originalClosed;
         VirtualDomainRecord record;
         lock (_secureDomainLifecycleGate)
         {
@@ -462,7 +508,22 @@ public sealed partial class PlatformAuthorityBridge
             if (invokeRevoke)
             {
                 PlatformAuthorityResult result;
-                try { result = provider.RevokeVirtualDomain(record.ProviderLease); }
+                try
+                {
+                    if(_provider is IPlatformOriginalVirtualDomainRevokeProvider {SupportsOriginalVirtualDomainRevocation:true} originalProvider)
+                    {
+                        if(_provider is not IPlatformProviderIncarnationSource)return KernelResult.Fail(KernelError.PlatformFaulted,"Original model close requires explicit incarnation.");
+                        lock(_secureDomainLifecycleGate)
+                        {
+                            record.OriginalClose ??=new(record,new(record.ProviderLease,source),record.CreatedInEpoch);
+                            record.OriginalClose.Invoked=true;
+                        }
+                        var original=InvokeOriginalModelRevoke(record.OriginalClose,originalProvider);
+                        if(!original.IsSuccess)return original;
+                        result=PlatformAuthorityResult.Ok();
+                    }
+                    else result = provider.RevokeVirtualDomain(record.ProviderLease);
+                }
                 catch (Exception exception) when (exception is not StackOverflowException)
                 {
                     lock (_secureDomainLifecycleGate) record.CloseMayHaveEffect = true;

@@ -6,6 +6,34 @@ namespace SingPlus.Tests.Platform;
 public sealed partial class OriginalRegionRevocationResolutionTests
 {
     [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void OriginalDmaCancellationSeparatesNoCopyCompletionAndSourceConsumption(int point)
+    {
+        var x=CopyKernel(true);var costs=new V6ManagedLocalityCostProvider();var now=DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        Assert.True(costs.Publish(new(1,"source",3,now,now+60000,64,1,0,0)).IsSuccess);
+        Assert.True(costs.Publish(new(1,"destination",5,now,now+60000,64,1,0,0)).IsSuccess);
+        var sp=x.Kernel.PreparePlatformDmaForDevice(x.Owner,x.Source).Value;
+        var dp=x.Kernel.PreparePlatformDmaForDevice(x.DestinationOwner,x.Destination).Value;
+        var original=new ProviderDmaDataMotionRequest<byte>(x.Owner,x.DestinationOwner,x.Input,x.Output,x.Plan,x.SourceMap,x.Source,sp,x.DestinationMap,x.Destination,dp);
+        using var cancellation=new CancellationTokenSource();var copies=0;
+        if(point==0)cancellation.Cancel();
+        x.Spy.AfterOperation=name=>{if(name=="CopyDma"){copies++;if(point==1)cancellation.Cancel();}};
+        if(point==2)x.Kernel.BeforeRegionReleaseQualificationHook=()=>cancellation.Cancel();
+        var moved=x.Kernel.MoveProviderDmaBuffers(original,costs,cancellation.Token);
+        Assert.Equal(KernelError.CancellationPending,moved.Error);Assert.Equal(point==0?0:1,copies);
+        Assert.False(x.Kernel.MoveProviderDmaBuffers(original,costs).IsSuccess);
+        Assert.False(x.Kernel.ReadProviderDmaDataMotionResult(original).IsSuccess);
+        Assert.Equal(point!=2,x.Input.IsValid);
+        Assert.Equal(64UL,x.Kernel.QueryBudget(x.DestinationBudget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        x.Kernel.BeforeRegionReleaseQualificationHook=null;x.Spy.AfterOperation=null;
+        Assert.True(x.Kernel.CleanupProviderDmaDataMotion(original).IsSuccess);
+        Assert.True(x.Kernel.TerminateProcess(x.Owner).IsSuccess);
+        Assert.True(x.Kernel.TerminateProcess(x.DestinationOwner).IsSuccess);
+        Assert.All(x.Kernel.QueryBudget(x.DestinationBudget).Value!.Usage,u=>Assert.Equal(0UL,u.Used));
+        Assert.Equal(0,x.Native.ActiveDmaGrantCount);Assert.Equal(0,x.Native.ActiveOwnedRegionMappingCount);
+        Assert.False(x.Kernel.ReadProviderDmaDataMotionResult(original).IsSuccess);
+    }
+    [Theory]
     [InlineData(false,false)] [InlineData(true,false)] [InlineData(true,true)]
     public void PublicOriginalDmaRequestRejectsReentryAndNeverRepeatsUnknownEffect(bool unknown,bool partialClose)
     {

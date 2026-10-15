@@ -31,6 +31,9 @@ public sealed partial class PlatformAuthorityBridge
         public CapabilityId AuthorityCapabilityId { get; }
         public OriginalMmioMapInvocation? OriginalMap { get; init; }
         public OriginalMmioCloseInvocation? OriginalClose { get; set; }
+        public List<OriginalMmio32Fact> Accesses { get; } = [];
+        public ulong AccessesIssued { get; set; }
+        public bool AccessInFlight { get; set; }
         public List<OriginalMmioCloseInvocation> CloseHistory { get; } = [];
         public bool CleanupOnly { get; init; }
         public bool OwnCloseUncertain { get; set; }
@@ -60,7 +63,8 @@ public sealed partial class PlatformAuthorityBridge
         PlatformMmioAccess access,
         Func<Func<KernelResult>, KernelResult> authorize,
         Func<PlatformMmioLease, Func<KernelResult>, KernelResult> publish,
-        Func<Func<KernelResult>, KernelResult>? admissionConsumer = null)
+        Func<Func<KernelResult>, KernelResult>? admissionConsumer = null,
+        MmioBufferPayload? backing = null)
     {
         DeviceLeaseRecord device = null!;
         DomainRecord domain = null!;
@@ -84,7 +88,7 @@ public sealed partial class PlatformAuthorityBridge
         }
         var admitted = admissionConsumer is null ? Begin() : admissionConsumer(Begin);
         if (!admitted.IsSuccess) return KernelResult<PlatformMmioLease>.Fail(admitted.Error, admitted.Message!);
-        try { return BindMmioCore(deviceLease, expectedSubject, authorityCapabilityId, region, range, access, device, domain, localId, authorize, publish); }
+        try { return BindMmioCore(deviceLease, expectedSubject, authorityCapabilityId, region, range, access, device, domain, localId, authorize, publish,backing); }
         catch (Exception exception) when (exception is not StackOverflowException)
         {
             lock (_secureDomainLifecycleGate) device.FaultPinned = true;
@@ -106,7 +110,7 @@ public sealed partial class PlatformAuthorityBridge
         PlatformDeviceLease deviceLease, PlatformDomainIdentity expectedSubject, CapabilityId authorityCapabilityId,
         PlatformMmioRegionIdentity region, PlatformMmioRange range, PlatformMmioAccess access,
         DeviceLeaseRecord deviceRecord, DomainRecord domainRecord, ulong localId, Func<Func<KernelResult>, KernelResult> authorize,
-        Func<PlatformMmioLease, Func<KernelResult>, KernelResult> publish)
+        Func<PlatformMmioLease, Func<KernelResult>, KernelResult> publish,MmioBufferPayload? backing)
     {
         var deviceValidation = ValidateDeviceLease(deviceLease, expectedSubject);
         if (!deviceValidation.IsSuccess)
@@ -144,7 +148,9 @@ public sealed partial class PlatformAuthorityBridge
         }
 
         if (mmioProvider is IPlatformOriginalMmioProvider original)
-            return BindOriginalMmio(deviceLease,expectedSubject,authorityCapabilityId,region,range,access,deviceRecord,domainRecord,localId,authorize,publish,original);
+            return BindOriginalMmio(deviceLease,expectedSubject,authorityCapabilityId,region,range,access,deviceRecord,domainRecord,localId,authorize,publish,original,backing);
+
+        if(backing is not null)return KernelResult<PlatformMmioLease>.Fail(KernelError.PlatformUnsupported,"Register backing requires an original MMIO producer.");
 
         lock (_secureDomainLifecycleGate)
         {
@@ -290,7 +296,7 @@ public sealed partial class PlatformAuthorityBridge
                 return KernelResult.Fail(KernelError.PlatformBindingRevoked, "Exact MMIO lease is closed.");
             if (record.FaultPinned)
                 return KernelResult.Fail(KernelError.PlatformFaulted, "Exact MMIO closure is ambiguous.");
-            if (record.ClosureInFlight)
+            if (record.ClosureInFlight || record.AccessInFlight)
                 return KernelResult.Fail(KernelError.PlatformBindingActive, "Exact MMIO closure is already in flight.");
             if (record.RevokeMayHaveEffect && !record.ProviderClosureConfirmed && _provider is not IPlatformOriginalMmioProvider)
                 return KernelResult.Fail(KernelError.PlatformFaulted, "Original MMIO closure remains ambiguous; repeat refused.");

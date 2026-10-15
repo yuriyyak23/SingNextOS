@@ -199,12 +199,23 @@ public sealed partial class RuntimeKernel
     // The pair preparation callback only acquires its separate local Region loan.
     private KernelResult<RegionHandle> TransferRegionForIpc(
         SingProcess source, SingProcess target, RegionHandle region, Func<KernelResult>? preparePairBorrow)
-        => TransferRegionForIpcCore(source, target, region, preparePairBorrow, null);
+        => TransferRegionForIpcCore(source,target,region,preparePairBorrow,null);
+    private KernelResult<RegionHandle> TransferPreparedRegionForIpc(
+        SingProcess source, SingProcess target, RegionHandle region, Func<KernelResult>? preparePairBorrow, Action noEffect, PreparedOwnedTransfer prepared) => TransferRegionForIpcCore(source, target, region, preparePairBorrow, null,noEffect,prepared);
+
+    private KernelResult<RegionHandle> TransferResponseRegionForIpc(SingProcess source,SingProcess target,RegionHandle region,
+        Func<KernelResult>? admission,Action noEffect,PreparedOwnedTransfer prepared)
+        => TransferRegionForIpcCore(source,target,region,admission,null,noEffect,prepared);
 
     private KernelResult<RegionHandle> TransferRegionForIpcCore(
         SingProcess source, SingProcess target, RegionHandle region, Func<KernelResult>? preparePairBorrow,
-        List<BudgetTraceObservation>? observations)
+        List<BudgetTraceObservation>? observations,Action? originalRegionNoEffect = null,PreparedOwnedTransfer? preparedOwnership = null,
+        EndpointSessionInvocationRegistry.OriginalSend? originalSend = null,
+        ResponseRegistry.OriginalPublication? originalResponse = null)
     {
+        var regionEffectPossible=false;
+        try
+        {
         lock (_platformMemoryUseGate)
         {
             var sourceHandle = new ProcessHandle(source.ProcessId, source.Generation);
@@ -222,18 +233,53 @@ public sealed partial class RuntimeKernel
             var owner = new RegionOwner(source.DomainId, source.Generation);
             var valid = Regions.Validate(region, owner);
             if (!valid.IsSuccess) return KernelResult<RegionHandle>.Fail(valid.Error, valid.Message!);
+            var originalPayload=Regions.CaptureTransferPayload(region,owner);
+            if(!originalPayload.IsSuccess)return KernelResult<RegionHandle>.Fail(originalPayload.Error,originalPayload.Message!);
+            if(originalResponse is not null)
+            {
+                if(preparedOwnership is null)throw new InvalidOperationException("Original response requires its prepared payload.");
+                var regionOwner=Regions.CaptureOriginalAccountingOwner(region);
+                if(regionOwner is null)throw new InvalidOperationException("Original response Region owner absent before budget admission.");
+                Responses.RetainTransferProducer(new(originalResponse,preparedOwnership,region,source.DomainId,
+                    new RegionOwner(target.DomainId,targetHandle.Generation),regionOwner,targetHandle,null,null,
+                    Budgets.OriginalRegionCharges(region)));
+            }
             var budget = PrepareRegionBudgetTransfer(sourceHandle, targetHandle, region, observations);
-            if (!budget.IsSuccess) return KernelResult<RegionHandle>.Fail(budget.Error, budget.Message!);
+            if (!budget.IsSuccess)
+            {
+                if(originalResponse is not null)Responses.RetainTransferBudget(originalResponse,preparedOwnership!,budget,null);
+                return KernelResult<RegionHandle>.Fail(budget.Error, budget.Message!);
+            }
             KernelResult<RegionHandle> moved;
             try
             {
+                if(originalSend is not null)
+                {
+                    if(preparedOwnership is null) throw new InvalidOperationException("Original send producer requires its prepared payload.");
+                    var originalBudget=Budgets.CaptureOriginalTransferReservationOwner(targetHandle,budget.Value,preparedOwnership);
+                    SessionInvocations.RetainOriginalTransferProducerAdmission(originalSend,preparedOwnership,budget.Value,originalBudget,
+                        region,source.DomainId,new RegionOwner(target.DomainId,targetHandle.Generation),Budgets.OriginalRegionCharges(region),
+                        Regions.CaptureOriginalAccountingOwner(region)!);
+                }
+                if(originalResponse is not null)
+                {
+                    var originalBudget=Budgets.CaptureOriginalTransferReservationOwner(targetHandle,budget.Value,preparedOwnership!);
+                    Responses.RetainTransferBudget(originalResponse,preparedOwnership!,budget,originalBudget);
+                }
+                KernelResult<RegionHandle> RefuseBeforeRegion(KernelError error,string message)
+                {
+                    // Own checked producer refusal; never inferred from absent raw
+                    // or an exception. Retain before quantitative consumption.
+                    if(originalResponse is not null)Responses.RetainPreRegionRefusal(originalResponse,preparedOwnership!,error);
+                    _=ReleaseAttachedBudget(targetHandle,budget.Value,observations);
+                    return KernelResult<RegionHandle>.Fail(error,message);
+                }
                 if (preparePairBorrow is not null)
                 {
                   var prepared = preparePairBorrow();
                   if (!prepared.IsSuccess)
                   {
-                      _ = ReleaseAttachedBudget(targetHandle, budget.Value, observations);
-                      return KernelResult<RegionHandle>.Fail(prepared.Error, prepared.Message!);
+                      return RefuseBeforeRegion(prepared.Error,prepared.Message!);
                   }
                 }
                 // Pair preparation can reenter kernel lifecycle code. Its result
@@ -243,24 +289,24 @@ public sealed partial class RuntimeKernel
                 if (!freshSource.IsSuccess || !freshTarget.IsSuccess ||
                     !ReferenceEquals(freshSource.Value, source) || !ReferenceEquals(freshTarget.Value, target))
                 {
-                    _ = ReleaseAttachedBudget(targetHandle, budget.Value, observations);
-                    return KernelResult<RegionHandle>.Fail(KernelError.StaleHandle, "IPC transfer process incarnation changed during preparation.");
+                    return RefuseBeforeRegion(KernelError.StaleHandle,"IPC transfer process incarnation changed during preparation.");
                 }
                 var freshSourceEffect = EnsureProcessAcceptsNewEffects(source);
                 var freshTargetEffect = EnsureProcessAcceptsNewEffects(target);
                 if (!freshSourceEffect.IsSuccess || !freshTargetEffect.IsSuccess)
                 {
-                    _ = ReleaseAttachedBudget(targetHandle, budget.Value, observations);
                     var refused = !freshSourceEffect.IsSuccess ? freshSourceEffect : freshTargetEffect;
-                    return KernelResult<RegionHandle>.Fail(refused.Error, refused.Message!);
+                    return RefuseBeforeRegion(refused.Error,refused.Message!);
                 }
                 var freshCharge = ValidateOriginalRegionBudgetRouting(region, out _);
                 if (!freshCharge.IsSuccess)
                 {
-                    _ = ReleaseAttachedBudget(targetHandle, budget.Value, observations);
-                    return KernelResult<RegionHandle>.Fail(freshCharge.Error, freshCharge.Message!);
+                    return RefuseBeforeRegion(freshCharge.Error,freshCharge.Message!);
                 }
-                moved = Regions.Transfer(region, owner, new RegionOwner(target.DomainId, target.Generation));
+                regionEffectPossible=true; // From here failure/exception is not a pre-effect proof.
+                moved = Regions.Transfer(region, owner, new RegionOwner(target.DomainId, target.Generation),originalPayload.Value,preparedOwnership);
+                if(originalSend is not null) SessionInvocations.RetainOriginalTransferRegionRaw(originalSend,preparedOwnership!,moved);
+                if(originalResponse is not null) Responses.RetainTransferRaw(originalResponse,preparedOwnership!,moved);
             }
             catch (Exception exception)
             {
@@ -270,15 +316,19 @@ public sealed partial class RuntimeKernel
             }
             if (!moved.IsSuccess)
             {
+                regionEffectPossible=false; // Exact RegionAuthority refusal occurs before mutation.
                 _ = ReleaseAttachedBudget(targetHandle, budget.Value, observations);
                 return moved;
             }
-            CompleteRegionBudgetTransfer(sourceHandle, targetHandle, region, moved.Value, budget.Value, observations);
+            var completed=CompleteRegionBudgetTransfer(sourceHandle, targetHandle, region, moved.Value, budget.Value, observations);
+            if(!completed.IsSuccess) return KernelResult<RegionHandle>.Fail(completed.Error,completed.Message!);
             return moved;
         }
+        }
+        finally { if(!regionEffectPossible)originalRegionNoEffect?.Invoke(); }
     }
 
-    private void CompleteRegionBudgetTransfer(
+    private KernelResult CompleteRegionBudgetTransfer(
         ProcessHandle source,
         ProcessHandle target,
         RegionHandle oldRegion,
@@ -288,14 +338,32 @@ public sealed partial class RuntimeKernel
     {
         // V1 Region authorization is domain/generation scoped. A valid cohort
         // peer may transfer a Region whose quantitative payer is another process.
-        ReleaseOriginalRegionBudget(oldRegion, observations);
         if (targetReservation is { } exact)
         {
-            lock (_regionBudgetReservationsGate)
-                _regionBudgetReservations.Add(newRegion, (target, exact));
             var process = Processes.Resolve(target);
-            if (process.IsSuccess) _ = BindOriginalRegionBudget(target, exact, newRegion, process.Value!.DomainId);
+            if(!process.IsSuccess)
+            {
+                _=Budgets.QuarantineLease(target,exact);
+                return KernelResult.Fail(process.Error,process.Message!);
+            }
+            var bound=BindOriginalRegionBudget(target,exact,newRegion,process.Value!.DomainId);
+            if(!bound.IsSuccess)
+            {
+                _=Budgets.QuarantineLease(target,exact);
+                return bound;
+            }
+            lock (_regionBudgetReservationsGate)
+            {
+                if(_regionBudgetReservations.TryGetValue(newRegion,out var existing) && existing!=(target,exact))
+                {
+                    _=Budgets.QuarantineLease(target,exact);
+                    return KernelResult.Fail(KernelError.PlatformFaulted,"Target Region route conflicts with its original quantitative owner.");
+                }
+                _regionBudgetReservations.TryAdd(newRegion,(target,exact));
+            }
         }
+        ReleaseOriginalRegionBudget(oldRegion, observations);
+        return KernelResult.Ok();
     }
 
     private KernelResult BindOriginalRegionBudget(ProcessHandle owner, BudgetReservationHandle reservation,
@@ -495,3 +563,6 @@ public sealed partial class RuntimeKernel
         }
     }
 }
+
+
+

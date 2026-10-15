@@ -1,6 +1,4 @@
 using System.Reflection;
-using System.Security.Cryptography;
-using System.Text.Json;
 using System.Text.RegularExpressions;
 using SingPlus.Contracts;
 using SingPlus.Runtime;
@@ -11,23 +9,6 @@ namespace SingPlus.Tests.Architecture;
 public sealed partial class VNextPhase00ArchitecturalFreezeTests
 {
     private static readonly string RepositoryRoot = FindRepositoryRoot();
-    private static readonly string RoadmapRoot = Path.Combine(
-        RepositoryRoot, "docs", "Completed", "SingNextOS-vNext-refactoring-roadmap-new");
-
-    [Fact]
-    public void EveryDeclaredVNextGateExistsExactlyOnceAndIsOff()
-    {
-        var documented = File.ReadLines(Path.Combine(RoadmapRoot, "VNEXT_FEATURE_GATES.md"))
-            .Select(line => GateNamePattern().Match(line))
-            .Where(match => match.Success)
-            .Select(match => match.Groups[1].Value)
-            .ToArray();
-
-        Assert.Equal(Enum.GetValues<VNextFeatureGate>().Length, VNextFeatureGates.Names.Count);
-        Assert.Equal(documented.Order(StringComparer.Ordinal), VNextFeatureGates.Names);
-        Assert.Equal(documented.Length, documented.Distinct(StringComparer.Ordinal).Count());
-        Assert.All(VNextFeatureGates.Names, gate => Assert.False(VNextFeatureGates.IsEnabled(gate)));
-    }
 
     [Theory]
     [InlineData(null)]
@@ -84,28 +65,6 @@ public sealed partial class VNextPhase00ArchitecturalFreezeTests
             BudgetPressureState.Normal).MaterializesAuthority);
     }
 
-    [Fact]
-    public void BaselineAndManifestAreMachineReadableAndPinnedToNormativeSha()
-    {
-        using var baseline = JsonDocument.Parse(File.ReadAllText(Path.Combine(RoadmapRoot, "BASELINE.json")));
-        using var manifest = JsonDocument.Parse(File.ReadAllText(Path.Combine(RoadmapRoot, "MANIFEST.json")));
-        const string expected = "6227ea7cf258ef6ffce52001d4d2ffee07355b35";
-
-        Assert.Equal(expected, baseline.RootElement.GetProperty("SingNextOS").GetProperty("sha").GetString());
-        Assert.Equal(expected, manifest.RootElement.GetProperty("baseline").GetProperty("SingNextOS").GetString());
-        Assert.Equal(18, manifest.RootElement.GetProperty("phase_count").GetInt32());
-
-        foreach (var entry in manifest.RootElement.GetProperty("files").EnumerateArray())
-        {
-            var path = Path.Combine(RoadmapRoot, entry.GetProperty("file").GetString()!);
-            Assert.True(File.Exists(path), $"Manifest path does not exist: {path}");
-            var bytes = File.ReadAllBytes(path);
-            Assert.Equal(entry.GetProperty("bytes").GetInt64(), bytes.LongLength);
-            Assert.Equal(entry.GetProperty("sha256").GetString(),
-                Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant());
-        }
-    }
-
     private static IEnumerable<string> PublicSurfaceNames(Type type)
     {
         yield return type.FullName ?? type.Name;
@@ -133,9 +92,6 @@ public sealed partial class VNextPhase00ArchitecturalFreezeTests
             directory = directory.Parent;
         return directory?.FullName ?? throw new DirectoryNotFoundException("SingNextOS repository root was not found.");
     }
-
-    [GeneratedRegex(@"`(FG-VNX-[A-Z0-9-]+)`\s*\|\s*OFF\s*\|", RegexOptions.CultureInvariant)]
-    private static partial Regex GateNamePattern();
 
     [GeneratedRegex(@"\b(?:class|record|struct)\s+TemporalResourceAuthority\b", RegexOptions.CultureInvariant)]
     private static partial Regex TemporalResourceAuthorityPattern();

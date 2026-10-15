@@ -31,7 +31,7 @@ public sealed partial class HybridCpuPlatformAuthorityProvider
                 !parent.OriginalDeviceAdmissions.Any(old => ReferenceEquals(old,fact)) || fact.NativeRequest is not { } expected || fact.NativeObservation is not { } raw || raw.Request != expected ||
                 raw.Observation is null || !Enum.IsDefined(raw.Observation.Decision) || !raw.SourceFenceMatched && !raw.NoEffectGuaranteed)
                 return PlatformAuthorityResult<PlatformOriginalDeviceBindResolution>.Fail(PlatformAuthorityStatus.Faulted,"Original device outcome/source unknown.");
-            if (raw.NoEffectGuaranteed && !raw.Observation.IsBound && raw.Observation.Lease == default && fact.OriginalLease is null)
+            if (raw.NoEffectGuaranteed && !raw.Observation.IsBound && raw.Observation.Decision!=NeutralDeviceBindDecision.Bound && raw.Observation.Lease == default && fact.OriginalLease is null)
             { fact.NoEffectConsumed = true; if (ReferenceEquals(parent.FailedDeviceBind,fact)) parent.FailedDeviceBind = null; return PlatformAuthorityResult<PlatformOriginalDeviceBindResolution>.Ok(new(request,true,null)); }
             var native = raw.Observation.Lease;
             if (raw.NoEffectGuaranteed || !raw.Observation.IsBound || raw.Observation.Decision != NeutralDeviceBindDecision.Bound || native.Handle.Value == 0 || native.Epoch.Value == 0 ||

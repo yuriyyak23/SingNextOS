@@ -26,12 +26,17 @@ public sealed partial class HybridCpuPlatformAuthorityProvider
                 if(!owner.InFlight && owner.Request==request && owner.NativeObservation is null &&
                     _originalRootBinds.TryGetValue(owner.Lease.LeaseId,out var originalBind) && ReferenceEquals(originalBind,owner) &&
                     queried is {SourceFenceMatched:true} raw && raw.Request==pendingNativeBind &&
-                    raw.Observation is {IsBound:true,Decision:NeutralDomainBindDecision.Bound} bound &&
-                    bound.Lease.Handle.Value!=0 && bound.Lease.Epoch.Value!=0)
+                    (raw.Observation is {IsBound:true,Decision:NeutralDomainBindDecision.Bound} bound &&
+                    bound.Lease.Handle.Value!=0 && bound.Lease.Epoch.Value!=0 ||
+                    raw.ProvenNoEffect && !raw.Observation.IsBound && raw.Observation.Lease==default &&
+                    raw.Observation.Decision is NeutralDomainBindDecision.Faulted or NeutralDomainBindDecision.UnsupportedProfile))
                 {
-                    owner.NativeObservation=raw;owner.Observation=bound;
-                    output=new(owner.Lease,bound.Lease){BindSource=owner,CleanupOnly=true};
-                    owner.OriginalDomain=output;owner.PublishedDomain=output;
+                    owner.NativeObservation=raw;owner.Observation=raw.Observation;
+                    if(raw.Observation.IsBound)
+                    {
+                        output=new(owner.Lease,raw.Observation.Lease){BindSource=owner,CleanupOnly=true};
+                        owner.OriginalDomain=output;owner.PublishedDomain=output;
+                    }
                 }
             }
             source=ValidateOriginalNativeMappingSource();
@@ -40,9 +45,10 @@ public sealed partial class HybridCpuPlatformAuthorityProvider
         lock (_childCreateCommitGate)
         {
             if (!owner.InFlight && owner.Request == request && owner.NativeRequest is { } rejectedRequest &&
-                owner.NativeObservation is { SourceFenceMatched: false } rejected && rejected.Request == rejectedRequest &&
+                owner.NativeObservation is { } rejected && (!rejected.SourceFenceMatched || rejected.ProvenNoEffect) && rejected.Request == rejectedRequest &&
                 rejectedRequest.InvocationId == request.InvocationId && rejectedRequest.RuntimeIncarnation == _originalNativeMappingIncarnation &&
                 rejected.Observation is { IsBound: false, Lease: var rejectedLease } && rejectedLease == default &&
+                rejected.Observation.Decision is NeutralDomainBindDecision.Faulted or NeutralDomainBindDecision.UnsupportedProfile &&
                 owner.OriginalDomain is null && owner.PublishedDomain is null &&
                 _originalRootBinds.TryGetValue(owner.Lease.LeaseId, out var noEffectOwner) && ReferenceEquals(noEffectOwner, owner) &&
                 !_activeSubjects.ContainsKey(request.Subject) && !_domains.ContainsKey(owner.Lease.LeaseId) &&
@@ -114,6 +120,11 @@ public sealed partial class HybridCpuPlatformAuthorityProvider
                     mapping=new(new(lease,request.Slice),observed.Lease){MapParent=parent,CleanupOnly=true,AdmissionRequest=request,MapAdmissionSource=owner};
                     owner.OriginalMapping=mapping;owner.CleanupMapping=mapping;
                 }
+                else if(!parent.OwnedMapInFlight && ReferenceEquals(parent.OwnedMapAdmissionOwner,owner) &&
+                    ReferenceEquals(parent.FailedOwnedMap,owner) && owner.NativeObservation is null &&
+                    queried is {SourceFenceMatched:true,ProvenNoEffect:true} rejected && rejected.Request==pending &&
+                    rejected.Observation is {IsMapped:false,Decision:NeutralOwnedRegionMapDecision.Faulted} && rejected.Observation.Lease==default)
+                {owner.NativeObservation=rejected;owner.Observation=rejected.Observation;}
             }
             source=ValidateOriginalNativeMappingSource();
             if(!source.IsSuccess)return PlatformAuthorityResult<PlatformOwnedRegionMapResolution>.Fail(source.Status,source.Message!);
@@ -121,7 +132,8 @@ public sealed partial class HybridCpuPlatformAuthorityProvider
         lock (_childCreateCommitGate)
         {
             if (!parent.OwnedMapInFlight && owner is not null && owner.Request == request &&
-                owner.NativeRequest is { } rejectedRequest && owner.NativeObservation is { SourceFenceMatched: false } rejected &&
+                owner.NativeRequest is { } rejectedRequest && owner.NativeObservation is { } rejected &&
+                (!rejected.SourceFenceMatched || rejected.ProvenNoEffect && rejected.Observation.Decision==NeutralOwnedRegionMapDecision.Faulted) &&
                 rejected.Request == rejectedRequest && rejectedRequest.InvocationId == request.InvocationId &&
                 rejectedRequest.RuntimeIncarnation == _originalNativeMappingIncarnation &&
                 rejected.Observation is { IsMapped: false, Lease: var rejectedLease } && rejectedLease == default &&

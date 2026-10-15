@@ -141,17 +141,25 @@ public sealed partial class RuntimeKernel
         var oldHandle = buffer.Handle;
         var targetBudget = PrepareRegionBudgetTransfer(source, target, oldHandle, observations);
         if (!targetBudget.IsSuccess) return KernelResult<OwnedBuffer<T>>.Fail(targetBudget.Error, targetBudget.Message!);
-        var transfer = Regions.Transfer(oldHandle, new RegionOwner(sourceProcess.Value!.DomainId, source.Generation), new RegionOwner(targetProcess.Value!.DomainId, target.Generation));
+        PreparedOwnedTransfer prepared;
+        try { prepared=transferable.PrepareTransferForRuntime(); }
+        catch(InvalidOperationException exception)
+        {
+            _=ReleaseAttachedBudget(target,targetBudget.Value,observations);
+            return KernelResult<OwnedBuffer<T>>.Fail(KernelError.RegionUseConflict,exception.Message);
+        }
+        var transfer = Regions.Transfer(oldHandle, new RegionOwner(sourceProcess.Value!.DomainId, source.Generation), new RegionOwner(targetProcess.Value!.DomainId, target.Generation),transferable,prepared);
         if (!transfer.IsSuccess)
         {
+            prepared.Dispose(); // Region owner refusal precedes its mutation; exceptions remain separate.
             _ = ReleaseAttachedBudget(target, targetBudget.Value, observations);
             return KernelResult<OwnedBuffer<T>>.Fail(transfer.Error, transfer.Message!);
         }
-        var moved = (OwnedBuffer<T>)transferable.TransferForRuntime(transfer.Value);
-        Regions.ReplacePayload(oldHandle, transfer.Value, moved);
+        var moved = (OwnedBuffer<T>)prepared.Projection;
         sourceProcess.Value.RemoveRegion(oldHandle);
         targetProcess.Value.AddRegion(transfer.Value);
-        CompleteRegionBudgetTransfer(source, target, oldHandle, transfer.Value, targetBudget.Value, observations);
+        var completed=CompleteRegionBudgetTransfer(source, target, oldHandle, transfer.Value, targetBudget.Value, observations);
+        if(!completed.IsSuccess) return KernelResult<OwnedBuffer<T>>.Fail(completed.Error,completed.Message!);
         return KernelResult<OwnedBuffer<T>>.Ok(moved);
         }
     }
@@ -236,17 +244,25 @@ public sealed partial class RuntimeKernel
         var oldHandle = region.Handle;
         var targetBudget = PrepareRegionBudgetTransfer(source, target, oldHandle, observations);
         if (!targetBudget.IsSuccess) return KernelResult<OwnedRegion<T>>.Fail(targetBudget.Error, targetBudget.Message!);
-        var transfer = Regions.Transfer(oldHandle, new RegionOwner(sourceProcess.Value!.DomainId, source.Generation), new RegionOwner(targetProcess.Value!.DomainId, target.Generation));
+        PreparedOwnedTransfer prepared;
+        try { prepared=transferable.PrepareTransferForRuntime(); }
+        catch(InvalidOperationException exception)
+        {
+            _=ReleaseAttachedBudget(target,targetBudget.Value,observations);
+            return KernelResult<OwnedRegion<T>>.Fail(KernelError.RegionUseConflict,exception.Message);
+        }
+        var transfer = Regions.Transfer(oldHandle, new RegionOwner(sourceProcess.Value!.DomainId, source.Generation), new RegionOwner(targetProcess.Value!.DomainId, target.Generation),transferable,prepared);
         if (!transfer.IsSuccess)
         {
+            prepared.Dispose();
             _ = ReleaseAttachedBudget(target, targetBudget.Value, observations);
             return KernelResult<OwnedRegion<T>>.Fail(transfer.Error, transfer.Message!);
         }
-        var moved = (OwnedRegion<T>)transferable.TransferForRuntime(transfer.Value);
-        Regions.ReplacePayload(oldHandle, transfer.Value, moved);
+        var moved = (OwnedRegion<T>)prepared.Projection;
         sourceProcess.Value.RemoveRegion(oldHandle);
         targetProcess.Value.AddRegion(transfer.Value);
-        CompleteRegionBudgetTransfer(source, target, oldHandle, transfer.Value, targetBudget.Value, observations);
+        var completed=CompleteRegionBudgetTransfer(source, target, oldHandle, transfer.Value, targetBudget.Value, observations);
+        if(!completed.IsSuccess) return KernelResult<OwnedRegion<T>>.Fail(completed.Error,completed.Message!);
         return KernelResult<OwnedRegion<T>>.Ok(moved);
         }
     }

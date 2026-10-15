@@ -1,4 +1,4 @@
-﻿using YAKSys_Hybrid_CPU.Core;
+using YAKSys_Hybrid_CPU.Core;
 namespace SingPlus.Platform.HybridCpu;
 public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformOriginalMmioProvider, IPlatformMmioRevocationNoEffectProvider
 {
@@ -51,6 +51,9 @@ public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformOrigin
         public NeutralMmioCloseResult? CloseObservation { get; set; }
         public MmioCloseInvocation? OriginalClose { get; set; }
         public List<MmioCloseInvocation> CloseHistory { get; } = [];
+        public List<Mmio32Fact> Accesses { get; } = [];
+        public ulong AccessesIssued { get; set; }
+        public bool AccessInFlight { get; set; }
     }
     private readonly Dictionary<PlatformProviderMmioLeaseId,MmioLeaseRecord> _mmioLeases = [];
     private readonly Dictionary<PlatformProviderMmioLeaseId,MmioLeaseRecord> _originalMmioLeases = [];
@@ -86,11 +89,11 @@ public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformOrigin
             NeutralMmioMapResult external;
             if (_runtime is INeutralOriginalMmioProvider original && fact.DeviceFactory?.NativeRequest is { } bind && _originalNativeMappingIncarnation is { } incarnation)
             {
-                fact.NativeRequest ??= new(Guid.NewGuid(),incarnation,bind.InvocationId,fact.NeutralDevice,new(region.ResourceId,region.ByteLength),new(range.Offset,range.Length),ToNeutralMmioAccess(access));
+                fact.NativeRequest ??= new(Guid.NewGuid(),incarnation,bind.InvocationId,fact.NeutralDevice,new(region.ResourceId,region.ByteLength),new(range.Offset,range.Length),ToNeutralMmioAccess(access),request?.Backing is { } bytes ? new NeutralMmioBacking(bytes.Bytes) : null);
                 if (fact.Invoked && fact.NativeObservation is null) return PlatformAuthorityResult<PlatformProviderMmioLease>.Fail(PlatformAuthorityStatus.Faulted,"Original MMIO reply unknown; pure lookup only.");
                 fact.Invoked = true; var raw = fact.NativeObservation ?? original.MapMmio(fact.NativeRequest.Value);
                 lock (_childCreateCommitGate) { fact.NativeObservation = raw; fact.Observation = raw.Observation; }
-                if (raw.Request != fact.NativeRequest || raw.Observation is null || !Enum.IsDefined(raw.Observation.Decision) || !raw.SourceFenceMatched && !raw.NoEffectGuaranteed || raw.NoEffectGuaranteed && (raw.Observation.IsMapped || raw.Observation.Lease != default)) return PlatformAuthorityResult<PlatformProviderMmioLease>.Fail(PlatformAuthorityStatus.Faulted,"Original MMIO raw missing/foreign/malformed.");
+                if (raw.Request != fact.NativeRequest || raw.Observation is null || !Enum.IsDefined(raw.Observation.Decision) || !raw.SourceFenceMatched && !raw.NoEffectGuaranteed || raw.NoEffectGuaranteed && (raw.Observation.IsMapped || raw.Observation.Lease != default || raw.Observation.Decision == NeutralMmioMapDecision.Mapped)) return PlatformAuthorityResult<PlatformProviderMmioLease>.Fail(PlatformAuthorityStatus.Faulted,"Original MMIO raw missing/foreign/malformed.");
                 if (raw.NoEffectGuaranteed) { lock (_childCreateCommitGate) { fact.NoEffectConsumed = true; if (ReferenceEquals(device.FailedMmioMap,fact)) device.FailedMmioMap = null; } return PlatformAuthorityResult<PlatformProviderMmioLease>.Fail(PlatformAuthorityStatus.NotAccepted,"Exact original MMIO Map no-effect."); }
                 external = raw.Observation;
                 var fresh = ValidateOriginalNativeMappingSource(); if (!fresh.IsSuccess) return PlatformAuthorityResult<PlatformProviderMmioLease>.Fail(fresh.Status,fresh.Message!);
@@ -132,7 +135,7 @@ public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformOrigin
         lock (_childCreateCommitGate)
         {
             if (!CurrentMmioSources(fact) || !ReferenceEquals(fact.OriginalRequest,request) || fact.NativeRequest is not { } expectedNative || fact.NativeObservation is not { } raw || raw.Request != expectedNative || raw.Observation is null || !Enum.IsDefined(raw.Observation.Decision) || !raw.SourceFenceMatched && !raw.NoEffectGuaranteed) return PlatformAuthorityResult<PlatformOriginalMmioMapResolution>.Fail(PlatformAuthorityStatus.Faulted,"Original MMIO lookup unknown/source changed.");
-            if (raw.NoEffectGuaranteed && !raw.Observation.IsMapped && raw.Observation.Lease == default && fact.OriginalLease is null)
+            if (raw.NoEffectGuaranteed && !raw.Observation.IsMapped && raw.Observation.Lease == default && raw.Observation.Decision != NeutralMmioMapDecision.Mapped && fact.OriginalLease is null)
             { fact.NoEffectConsumed = true; if (ReferenceEquals(fact.DeviceSource.FailedMmioMap,fact)) fact.DeviceSource.FailedMmioMap = null; return PlatformAuthorityResult<PlatformOriginalMmioMapResolution>.Ok(new(request,true,null)); }
             if (raw.NoEffectGuaranteed || !ExactMmioMap(fact,raw.Observation)) return PlatformAuthorityResult<PlatformOriginalMmioMapResolution>.Fail(PlatformAuthorityStatus.Faulted,"Original MMIO lookup malformed.");
             var owner = AdoptMmio(fact,raw.Observation.Lease,true);
@@ -163,7 +166,7 @@ public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformOrigin
         lock (_childCreateCommitGate)
         {
             if (!_mmioLeases.TryGetValue(lease.LeaseId,out record!) || !_originalMmioLeases.TryGetValue(lease.LeaseId,out var originalOwner) || !ReferenceEquals(originalOwner,record) || !ReferenceEquals(record.OwnerSelf,record) || record.Lease != lease) return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted,"Original MMIO owner absent/foreign.");
-            if (record.CloseInFlight || lookup && record.OriginalClose is not { Invoked: true }) return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted,"Original MMIO Close pending/not invoked.");
+            if (record.CloseInFlight || record.AccessInFlight || lookup && record.OriginalClose is not { Invoked: true }) return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted,"Original MMIO Close pending/not invoked.");
             if (record.Revoked) return lookup && HasConsumedNativeMmio(record) ? PlatformAuthorityResult.Ok() : PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Revoked,"Original MMIO revoked.");
             if (!CurrentMmioSources(record.MapSource)) return PlatformAuthorityResult.Fail(PlatformAuthorityStatus.Faulted,"Original MMIO source changed.");
             record.CloseInFlight = true;
@@ -214,7 +217,7 @@ public sealed partial class HybridCpuPlatformAuthorityProvider : IPlatformOrigin
          record.MapSource.NativeRequest is null && record.Revoked && record.CloseObservation is { Decision: NeutralMmioCloseDecision.Closed });
     private static bool HasConsumedProviderMmioMap(MmioMapFailure fact) => ReferenceEquals(fact.OwnerSelf,fact) &&
         (fact.NoEffectConsumed && fact.OriginalLease is null &&
-            (fact.NativeRequest is { } request && fact.NativeObservation is { NoEffectGuaranteed: true } raw && raw.Request == request && !raw.Observation.IsMapped && raw.Observation.Lease == default ||
+            (fact.NativeRequest is { } request && fact.NativeObservation is { NoEffectGuaranteed: true } raw && raw.Request == request && !raw.Observation.IsMapped && raw.Observation.Lease == default && Enum.IsDefined(raw.Observation.Decision) && raw.Observation.Decision != NeutralMmioMapDecision.Mapped ||
              fact.NativeRequest is null && fact.Observation is { IsMapped: false } known && known.Lease == default && known.Decision is NeutralMmioMapDecision.InvalidRegion or NeutralMmioMapDecision.InvalidRange or NeutralMmioMapDecision.InvalidAccess or NeutralMmioMapDecision.InsufficientDeviceRights or NeutralMmioMapDecision.AlreadyMapped) ||
          fact.OriginalLease is { } record && ReferenceEquals(record.MapSource,fact) && HasConsumedNativeMmio(record));
     internal bool HasActiveProviderMmioLeases(PlatformProviderDeviceLease deviceLease) =>

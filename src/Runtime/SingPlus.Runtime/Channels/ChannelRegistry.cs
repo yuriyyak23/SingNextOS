@@ -39,6 +39,12 @@ public sealed class ChannelRegistry
         public required string State { get; set; }
         public ulong Sequence { get; set; }
         public bool Closed { get; set; }
+        public PreparedOwnedTransfer? PendingOwnership { get; set; }
+        public (ProcessHandle Owner, BudgetReservationHandle Reservation)? PendingSendBudget { get; set; }
+        public object? PendingBorrowOriginal { get; set; }
+        public object? PendingBorrowProjection { get; set; }
+        public BorrowLeaseHandle? PendingBorrowHandle { get; set; }
+        public QueuedLifetime? PreparedLifetime { get; set; }
         public Queue<ChannelEnvelope> Queue { get; } = new();
         public Dictionary<ulong, QueuedLifetime> Lifetimes { get; } = [];
     }
@@ -48,27 +54,137 @@ public sealed class ChannelRegistry
         public ChannelRecord Owner { get; } = owner;
         public ulong Sequence { get; } = sequence;
         public bool Ended { get; set; }
+        public ChannelEnvelope? OriginalWithdrawal { get; set; }
+        public bool WithdrawalCommitted { get; set; }
+        public PreparedOwnedTransfer? OriginalTransferWithdrawal { get; set; }
+        public bool Enqueued { get; set; }
         public bool BudgetAttached { get; set; }
         public object? OriginalBudgetOwner { get; set; }
     }
 
     private readonly CapabilityAuthority _capabilities;
     private readonly RegionAuthority _regions;
-    private readonly Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>> _transferRegion;
+    private readonly Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, Action, PreparedOwnedTransfer, KernelResult<RegionHandle>> _transferRegion;
     private readonly Dictionary<ChannelId, ChannelRecord> _channels = [];
     // Existing owner retains the same records; _channels is the endpoint routing index.
     private readonly Dictionary<ChannelId, ChannelRecord> _ownedChannels = [];
     private ulong _nextChannelId = 1;
 
     internal ChannelRegistry(CapabilityAuthority capabilities, RegionAuthority regions,
-        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>> transferRegion)
+        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, Action, PreparedOwnedTransfer, KernelResult<RegionHandle>> transferRegion)
     {
         _capabilities = capabilities;
         _regions = regions;
         _transferRegion = transferRegion;
     }
 
+    // Reservation truth remains in ResourceBudgetAuthority. This is original
+    // publication correlation retained by the existing channel owner before effect.
+    internal KernelResult RetainSendBudget(ChannelEndpointHandle endpoint, ProcessHandle owner, BudgetReservationHandle reservation)
+    {
+        var resolved=Resolve(endpoint);
+        if(!resolved.IsSuccess) return KernelResult.Fail(resolved.Error,resolved.Message!);
+        var record=resolved.Value!;
+        var expected=endpoint.EndpointId.Value==1 ? record.LeftOwner : record.RightOwner;
+        if(expected!=owner) return KernelResult.Fail(KernelError.WrongEndpointOwner,"Original send budget owner differs.");
+        if(record.PendingSendBudget is not null || record.PendingOwnership is not null)
+            return KernelResult.Fail(KernelError.RegionUseConflict,"Original send publication remains pending.");
+        record.PendingSendBudget=(owner,reservation);
+        return KernelResult.Ok();
+    }
+
+    internal bool SendOwnershipIsPending(ChannelEndpointHandle endpoint) =>
+        _ownedChannels.TryGetValue(endpoint.ChannelId,out var record) && OwnsOriginalChannel(record) && record.PendingOwnership is not null;
+
+    internal void ConsumeSendBudgetCorrelation(ChannelEndpointHandle endpoint, ProcessHandle owner, BudgetReservationHandle reservation)
+    {
+        if(_ownedChannels.TryGetValue(endpoint.ChannelId,out var record) && OwnsOriginalChannel(record) &&
+            record.PendingSendBudget is { } original && original.Owner==owner && original.Reservation==reservation)
+            record.PendingSendBudget=null;
+    }
     internal event Action<ChannelId>? ChannelClosed;
+
+    internal KernelResult<object[]> WithdrawUnpublishedOriginalTransfer(ChannelEndpointHandle endpoint,ulong sequence,PreparedOwnedTransfer prepared,object lifetime,object budgetOwner)
+    {
+        if(lifetime is not QueuedLifetime fact || !OwnsOriginalChannel(fact.Owner) || fact.Owner.Id!=endpoint.ChannelId || fact.Sequence!=sequence ||
+            !ReferenceEquals(fact.OriginalBudgetOwner,budgetOwner) || !fact.Owner.Lifetimes.TryGetValue(sequence,out var owned) || !ReferenceEquals(owned,fact) ||
+            fact.Enqueued || !ReferenceEquals(fact.Owner.PendingOwnership,prepared) ||
+            fact.OriginalTransferWithdrawal is { } previous && !ReferenceEquals(previous,prepared))
+            return KernelResult<object[]>.Fail(KernelError.PlatformFaulted,"Unpublished original transfer lifetime differs.");
+        if(fact.OriginalTransferWithdrawal is null)
+        {
+            if(!ReferenceEquals(fact.Owner.PreparedLifetime,fact) || fact.Owner.Sequence!=sequence-1)
+                return KernelResult<object[]>.Fail(KernelError.ResponseNotPending,"Original unpublished identity changed.");
+            fact.OriginalTransferWithdrawal=prepared;
+            fact.Owner.Sequence=sequence;
+            fact.Ended=true;
+        }
+        return KernelResult<object[]>.Ok(fact.Owner.PendingBorrowProjection is { } borrow ? [borrow,prepared.Projection] : [prepared.Projection]);
+    }
+
+    internal bool CompleteUnpublishedOriginalTransfer(object lifetime,PreparedOwnedTransfer prepared,object budgetOwner)
+    {
+        if(lifetime is not QueuedLifetime fact || !OwnsOriginalChannel(fact.Owner) || !fact.Ended || fact.Enqueued ||
+            !ReferenceEquals(fact.OriginalTransferWithdrawal,prepared) || !ReferenceEquals(fact.OriginalBudgetOwner,budgetOwner) ||
+            fact.Owner.PendingOwnership is { } pending && !ReferenceEquals(pending,prepared)) return false;
+        fact.Owner.PendingOwnership=null;
+        fact.Owner.PendingBorrowOriginal=null;
+        fact.Owner.PendingBorrowProjection=null;
+        fact.Owner.PendingBorrowHandle=null;
+        if(ReferenceEquals(fact.Owner.PreparedLifetime,fact)) fact.Owner.PreparedLifetime=null;
+        return true;
+    }
+
+    internal KernelResult WithdrawOriginalQueuedEnvelope(ChannelEndpointHandle endpoint,ChannelEnvelope raw,object lifetime,object budgetOwner)
+    {
+        if(lifetime is not QueuedLifetime fact || !OwnsOriginalChannel(fact.Owner) || fact.Owner.Id!=endpoint.ChannelId ||
+            fact.Sequence!=raw.Sequence || !ReferenceEquals(fact.OriginalBudgetOwner,budgetOwner) ||
+            !fact.Owner.Lifetimes.TryGetValue(fact.Sequence,out var owned) || !ReferenceEquals(owned,fact))
+            return KernelResult.Fail(KernelError.PlatformFaulted,"Original queue lifetime continuity unavailable.");
+        if(fact.WithdrawalCommitted)
+            return ReferenceEquals(fact.OriginalWithdrawal,raw) && fact.Ended ? KernelResult.Ok() :
+                KernelResult.Fail(KernelError.PlatformFaulted,"Original withdrawal raw continuity changed.");
+        if(fact.Ended) return KernelResult.Fail(KernelError.ResponseNotPending,"Ended queue lifetime is not withdrawal proof.");
+        var record=fact.Owner;
+        if(record.Queue.Count==0 || !ReferenceEquals(record.Queue.Peek(),raw))
+            return KernelResult.Fail(KernelError.ResponseNotPending,"Exact original envelope is not at the queue head.");
+        if(fact.OriginalWithdrawal is { } previous && !ReferenceEquals(previous,raw))
+            return KernelResult.Fail(KernelError.PlatformFaulted,"Original withdrawal was replaced.");
+        fact.OriginalWithdrawal=raw; // Retain original raw before the queue effect.
+        record.Queue.Dequeue();
+        fact.Ended=true;
+        fact.WithdrawalCommitted=true;
+        return KernelResult.Ok();
+    }
+
+    internal KernelResult<object> PrepareOriginalQueuedLifetime(ChannelEndpointHandle endpoint)
+    {
+        var resolved=Resolve(endpoint);
+        if(!resolved.IsSuccess) return KernelResult<object>.Fail(resolved.Error,resolved.Message!);
+        var record=resolved.Value!;
+        if(record.PreparedLifetime is not null || record.Sequence==ulong.MaxValue || record.Queue.Count>=record.Capacity)
+            return KernelResult<object>.Fail(KernelError.CapacityExhausted,"Original queue publication is pending or exhausted.");
+        record.Lifetimes.EnsureCapacity(record.Lifetimes.Count+1);
+        record.Queue.EnsureCapacity(record.Queue.Count+1);
+        var fact=new QueuedLifetime(record,record.Sequence+1);
+        record.Lifetimes.Add(fact.Sequence,fact);
+        record.PreparedLifetime=fact;
+        return KernelResult<object>.Ok(fact);
+    }
+
+    internal void EndRefusedQueuedPreparation(ChannelEndpointHandle endpoint)
+    {
+        if(_ownedChannels.TryGetValue(endpoint.ChannelId,out var record) && OwnsOriginalChannel(record) && record.PreparedLifetime is { } fact)
+        { fact.Ended=true; record.PreparedLifetime=null; }
+    }
+
+    internal bool RetireUnpublishedSequence(ChannelEndpointHandle endpoint,ulong sequence)
+    {
+        var resolved=Resolve(endpoint);
+        if(!resolved.IsSuccess || sequence==0 || resolved.Value!.Sequence!=sequence-1 || resolved.Value.PendingOwnership is not null) return false;
+        resolved.Value.Sequence=sequence;
+        return true; // Identity consumed; protocol state and Region effect unchanged.
+    }
 
     internal TelemetrySummary InspectionSummary(ProcessHandle owner)
     {
@@ -155,7 +271,7 @@ public sealed class ChannelRegistry
         object? payload,
         IReadOnlyCollection<CapabilityId>? capabilityIds,
         BoundedPayloadSnapshot? boundedSnapshot = null,
-        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>>? transferRegion = null) =>
+        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, Action, PreparedOwnedTransfer, KernelResult<RegionHandle>>? transferRegion = null) =>
         SendCore(sender, receiver, endpoint, messageId, payload, secondaryPayload: null, capabilityIds, boundedSnapshot, transferRegion);
 
     internal KernelResult<ChannelEnvelope> SendOwnershipPair(
@@ -166,7 +282,7 @@ public sealed class ChannelRegistry
         object firstOwnershipPayload,
         object secondOwnershipPayload,
         IReadOnlyCollection<CapabilityId>? capabilityIds,
-        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>>? transferRegion = null) =>
+        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, Action, PreparedOwnedTransfer, KernelResult<RegionHandle>>? transferRegion = null) =>
         SendCore(sender, receiver, endpoint, messageId, firstOwnershipPayload, secondOwnershipPayload, capabilityIds, transferRegion: transferRegion);
 
     // Owner-side transport-elision primitive for the narrow synchronous copied-value
@@ -246,6 +362,7 @@ public sealed class ChannelRegistry
         if (record.Sequence == ulong.MaxValue)
             return KernelResult<InlineBorrowProjection<T>>.Fail(KernelError.CapacityExhausted, "Channel sequence is exhausted.");
 
+        if(record.PendingOwnership is not null) return KernelResult<InlineBorrowProjection<T>>.Fail(KernelError.RegionUseConflict,"Original ownership publication is still pending.");
         var transferable = (ITransferableOwnedPayload)payload;
         if (!transferable.IsValidForRuntime)
             return KernelResult<InlineBorrowProjection<T>>.Fail(KernelError.InvalidRegionState, "Inline BORROW requires a live owned payload.");
@@ -284,7 +401,7 @@ public sealed class ChannelRegistry
         ChannelEndpointHandle endpoint,
         uint messageId,
         OwnedBuffer<T> payload,
-        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>>? transferRegion = null) where T : unmanaged
+        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, Action, PreparedOwnedTransfer, KernelResult<RegionHandle>>? transferRegion = null) where T : unmanaged
     {
         ArgumentNullException.ThrowIfNull(payload);
         var validation = Resolve(endpoint);
@@ -312,6 +429,7 @@ public sealed class ChannelRegistry
         if (record.Sequence == ulong.MaxValue)
             return KernelResult<InlineMoveProjection<T>>.Fail(KernelError.CapacityExhausted, "Channel sequence is exhausted.");
 
+        if(record.PendingOwnership is not null) return KernelResult<InlineMoveProjection<T>>.Fail(KernelError.RegionUseConflict,"Original ownership publication is still pending.");
         var transferable = (ITransferableOwnedPayload)payload;
         if (!transferable.IsValidForRuntime)
             return KernelResult<InlineMoveProjection<T>>.Fail(KernelError.InvalidRegionState, "Inline MOVE requires a live owned payload.");
@@ -329,17 +447,21 @@ public sealed class ChannelRegistry
         {
             return KernelResult<InlineMoveProjection<T>>.Fail(KernelError.InvalidRegionState, exception.Message);
         }
-        var transfer = (transferRegion ?? _transferRegion)(sender, receiver, oldHandle, null);
+        var transfer = TransferPrepared(record, sender, receiver, transferable, null, transferRegion);
         if (!transfer.IsSuccess)
             return KernelResult<InlineMoveProjection<T>>.Fail(transfer.Error, transfer.Message!);
-        var moved = (OwnedBuffer<T>)transferable.TransferForRuntime(transfer.Value);
-        _regions.ReplacePayload(oldHandle, transfer.Value, moved);
+        var moved = (OwnedBuffer<T>)record.PendingOwnership!.Projection;
         sender.RemoveRegion(oldHandle);
         receiver.AddRegion(transfer.Value);
 
         record.Sequence++;
         record.State = transition.ToState;
-        return KernelResult<InlineMoveProjection<T>>.Ok(new(record.Sequence, moved));
+        var result = KernelResult<InlineMoveProjection<T>>.Ok(new(record.Sequence, moved));
+        record.PendingOwnership = null;
+        record.PendingBorrowOriginal = null;
+        record.PendingBorrowProjection = null;
+        record.PendingBorrowHandle = null;
+        return result;
     }
 
     private KernelResult<ChannelEnvelope> SendCore(
@@ -351,7 +473,7 @@ public sealed class ChannelRegistry
         object? secondaryPayload,
         IReadOnlyCollection<CapabilityId>? capabilityIds,
         BoundedPayloadSnapshot? boundedSnapshot = null,
-        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>>? transferRegion = null)
+        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, Action, PreparedOwnedTransfer, KernelResult<RegionHandle>>? transferRegion = null)
     {
         var validation = Resolve(endpoint);
         if (!validation.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(validation.Error, validation.Message!);
@@ -360,13 +482,16 @@ public sealed class ChannelRegistry
         var expectedReceiver = endpoint.EndpointId.Value == 1 ? record.RightOwner : record.LeftOwner;
         if (expectedSender != new ProcessHandle(sender.ProcessId, sender.Generation)) return KernelResult<ChannelEnvelope>.Fail(KernelError.WrongEndpointOwner, "Endpoint is not owned by the sender.");
         if (expectedReceiver != new ProcessHandle(receiver.ProcessId, receiver.Generation)) return KernelResult<ChannelEnvelope>.Fail(KernelError.WrongEndpointOwner, "Peer process does not own the opposite endpoint.");
+        if(record.PendingOwnership is not null) return KernelResult<ChannelEnvelope>.Fail(KernelError.RegionUseConflict,"Original ownership publication is still pending.");
         if (record.Queue.Count >= record.Capacity) return KernelResult<ChannelEnvelope>.Fail(KernelError.CapacityExhausted, "Channel capacity is exhausted.");
         if (!record.Protocol.TryGetMessage(messageId, out var message)) return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidMessage, $"Message {messageId} is not part of the protocol.");
         if (!record.Protocol.TryTransition(record.State, messageId, out var transition)) return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidProtocolTransition, $"Message {messageId} is illegal in state '{record.State}'.");
         if (record.Sequence == ulong.MaxValue || record.Lifetimes.Count == int.MaxValue)
             return KernelResult<ChannelEnvelope>.Fail(KernelError.CapacityExhausted, "Queued lifetime identity/capacity is exhausted before transfer.");
         record.Lifetimes.EnsureCapacity(record.Lifetimes.Count + 1);
-        var queuedLifetime = new QueuedLifetime(record, record.Sequence + 1);
+        var queuedLifetime = record.PreparedLifetime ?? new QueuedLifetime(record, record.Sequence + 1);
+        if(queuedLifetime.Sequence!=record.Sequence+1 || queuedLifetime.Ended)
+            return KernelResult<ChannelEnvelope>.Fail(KernelError.PlatformFaulted,"Original queue preparation changed before effect.");
         if (message.RequiredCapabilities.Count != 0)
             return _capabilities.CommitSessionPublication(sender.DomainId, sender.Generation,
                 capabilityIds?.ToArray() ?? [], message.RequiredCapabilities.ToArray(), CommitMessage);
@@ -385,7 +510,7 @@ public sealed class ChannelRegistry
         object? queuedSecondaryPayload = secondaryPayload;
         if (message.RequestPayload.Kind == RequestPayloadKind.OwnershipPair)
         {
-            var pair = PrepareOwnershipPair(sender, receiver, message.RequestPayload, payload!, secondaryPayload!, transferRegion);
+            var pair = PrepareOwnershipPair(record, sender, receiver, message.RequestPayload, payload!, secondaryPayload!, transferRegion);
             if (!pair.IsSuccess)
                 return KernelResult<ChannelEnvelope>.Fail(pair.Error, pair.Message!);
             queuedPayload = pair.Value!.First;
@@ -431,10 +556,8 @@ public sealed class ChannelRegistry
                 {
                     return KernelResult<ChannelEnvelope>.Fail(KernelError.InvalidRegionState, exception.Message);
                 }
-                var transfer = (transferRegion ?? _transferRegion)(sender, receiver, oldHandle, null);
-                if (!transfer.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(transfer.Error, transfer.Message!);
-                queuedPayload = owned.TransferForRuntime(transfer.Value);
-                _regions.ReplacePayload(oldHandle, transfer.Value, (ITransferableOwnedPayload)queuedPayload);
+                var transfer = TransferPrepared(record, sender, receiver, owned, null, transferRegion); if (!transfer.IsSuccess) return KernelResult<ChannelEnvelope>.Fail(transfer.Error, transfer.Message!);
+                queuedPayload = record.PendingOwnership!.Projection;
                 sender.RemoveRegion(oldHandle);
                 receiver.AddRegion(transfer.Value);
             }
@@ -443,19 +566,41 @@ public sealed class ChannelRegistry
         record.Sequence++;
         var envelope = new ChannelEnvelope(record.Sequence, messageId, queuedPayload, queuedSecondaryPayload);
         record.Queue.Enqueue(envelope);
-        record.Lifetimes.Add(envelope.Sequence, queuedLifetime);
+        queuedLifetime.Enqueued=true;
+        if(record.PreparedLifetime is null) record.Lifetimes.Add(envelope.Sequence, queuedLifetime);
+        record.PreparedLifetime=null;
         record.State = transition.ToState;
+        record.PendingOwnership = null;
+        record.PendingBorrowOriginal = null;
+        record.PendingBorrowProjection = null;
+        record.PendingBorrowHandle = null;
         return KernelResult<ChannelEnvelope>.Ok(envelope);
         }
     }
 
-    private KernelResult<(object First, object Second)> PrepareOwnershipPair(
-        SingProcess sender,
+    private KernelResult<RegionHandle> TransferPrepared(
+        ChannelRecord record, SingProcess sender, SingProcess receiver, ITransferableOwnedPayload original,
+        Func<KernelResult>? admission,
+        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, Action, PreparedOwnedTransfer, KernelResult<RegionHandle>>? transfer,
+        Action? noEffect = null)
+    {
+        PreparedOwnedTransfer prepared;
+        try { prepared = original.PrepareTransferForRuntime(); }
+        catch(InvalidOperationException exception) { return KernelResult<RegionHandle>.Fail(KernelError.InvalidRegionState,exception.Message); }
+        record.PendingOwnership = prepared; // Retain exact source/projection before possible effect.
+        return (transfer ?? _transferRegion)(sender,receiver,prepared.SourceHandle,admission, () =>
+        {
+            prepared.Dispose();
+            if(ReferenceEquals(record.PendingOwnership,prepared)) record.PendingOwnership=null;
+            noEffect?.Invoke();
+        },prepared);
+    }
+    private KernelResult<(object First, object Second)> PrepareOwnershipPair( ChannelRecord record, SingProcess sender,
         SingProcess receiver,
         RequestPayloadDescriptorV1 expected,
         object firstPayload,
         object secondPayload,
-        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, KernelResult<RegionHandle>>? transferRegion = null)
+        Func<SingProcess, SingProcess, RegionHandle, Func<KernelResult>?, Action, PreparedOwnedTransfer, KernelResult<RegionHandle>>? transferRegion = null)
     {
         var slots = expected.OwnershipPair;
         if (slots.Count != 2 || firstPayload is not ITransferableOwnedPayload first || secondPayload is not ITransferableOwnedPayload second)
@@ -495,27 +640,27 @@ public sealed class ChannelRegistry
         var oldConsumedHandle = consumed.Handle;
         BorrowLeaseHandle? acquiredLease = null;
         object? borrowedLease = null;
-        var transfer = (transferRegion ?? _transferRegion)(sender, receiver, oldConsumedHandle, () =>
+        var exactNoEffect = false;
+        record.PendingBorrowOriginal = borrowed;
+        var transfer = TransferPrepared(record, sender, receiver, consumed, () =>
         {
             var acquired = _regions.AcquireLoan(borrowed.Handle, owner, borrower);
             if (!acquired.IsSuccess) return KernelResult.Fail(acquired.Error, acquired.Message!);
             var grant = acquired.Value!;
             acquiredLease = grant.Handle;
-            try { borrowedLease = borrowed.CreateBorrowLeaseForRuntime(grant.Handle, grant.Lifetime); }
+            record.PendingBorrowHandle = grant.Handle;
+            try { borrowedLease = borrowed.CreateBorrowLeaseForRuntime(grant.Handle, grant.Lifetime); record.PendingBorrowProjection = borrowedLease; }
             catch (InvalidOperationException exception)
             {
                 return KernelResult.Fail(KernelError.InvalidRegionState, exception.Message);
             }
-            return KernelResult.Ok();
-        });
-        if (!transfer.IsSuccess)
+            return KernelResult.Ok(); }, transferRegion, () => exactNoEffect = true); if (!transfer.IsSuccess)
         {
-            if (acquiredLease is { } lease) _ = _regions.RevokeLoan(lease, owner);
+            if (exactNoEffect && acquiredLease is { } lease) _ = _regions.RevokeLoan(lease, owner);
             return KernelResult<(object, object)>.Fail(transfer.Error, transfer.Message!);
         }
 
-        var moved = consumed.TransferForRuntime(transfer.Value);
-        _regions.ReplacePayload(oldConsumedHandle, transfer.Value, (ITransferableOwnedPayload)moved);
+        var moved = record.PendingOwnership!.Projection;
         sender.RemoveRegion(oldConsumedHandle);
         receiver.AddRegion(transfer.Value);
 
@@ -736,3 +881,10 @@ public sealed class ChannelRegistry
         }
     }
 }
+
+
+
+
+
+
+

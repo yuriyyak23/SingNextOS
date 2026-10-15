@@ -380,6 +380,11 @@ public sealed partial class RuntimeKernel
         {
         var session = EndpointSessions.ResolveForService(invocation.Session, service);
         if (!session.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(session.Error, session.Message!);
+        KernelResult<ResponseRegistry.OriginalPublication> original;
+        lock(_requestResponseCorrelationGate)original=Responses.CapturePublication(service,session.Value!.ServiceEndpoint,invocation.InvocationId.Value);
+        if(!original.IsSuccess)return KernelResult<ResponseEnvelope>.Fail(original.Error,original.Message!);
+        var bound=SessionInvocations.BindOriginalResponse(invocation,service,original.Value!);
+        if(!bound.IsSuccess)return KernelResult<ResponseEnvelope>.Fail(bound.Error,bound.Message!);
         return SessionInvocations.Publish(
             invocation,
             service,
@@ -732,7 +737,7 @@ public sealed partial class RuntimeKernel
         var moved = Responses.TransferInlineOwnership(
             serviceProcess.Value!, callerProcess.Value!, session.Value!.ServiceEndpoint, invocation.MessageId, payload,
             () => RevalidateInlineSessionInvocation(invocation),
-            (source, target, region, admission) => TransferRegionForIpcCore(source, target, region, admission, observations));
+            (source, target, region, admission, noEffect, prepared) => TransferRegionForIpcCore(source, target, region, admission, observations,noEffect,prepared));
         if (!moved.IsSuccess)
             return KernelResult<ResponseEnvelope>.Fail(moved.Error, moved.Message!);
         return KernelResult<ResponseEnvelope>.Ok(new(context.Invocation.InvocationId.Value,
@@ -791,7 +796,7 @@ public sealed partial class RuntimeKernel
                 {
                 var begun = Channels.BeginInlineMoveInvocation(
                     callerProcess.Value!, serviceProcess.Value!, session.Value.Channel, messageId, payload,
-                    (source, target, region, admission) => TransferRegionForIpcCore(source, target, region, admission, observations));
+                    (source, target, region, admission, noEffect, prepared) => TransferRegionForIpcCore(source, target, region, admission, observations,noEffect,prepared));
                 if (!begun.IsSuccess)
                     return KernelResult<InlineMoveSipInvocationLease<T>>.Fail(begun.Error, begun.Message!);
                 var invocation = SessionInvocations.Register(
@@ -880,6 +885,7 @@ public sealed partial class RuntimeKernel
 
     private void FinalizeSessionPin(EndpointSessionPin pin, EndpointSessionHandle session)
     {
+        if (EndpointSessions.OriginalSendPinIsPending(pin)) return;
         pin.Dispose();
         CompleteDeferredSessionCleanup(session);
     }
@@ -999,13 +1005,19 @@ public sealed partial class RuntimeKernel
         object? payload) =>
         InvokeSessionAsync(caller, handle, messageId, payload, CancellationToken.None);
 
-    internal async ValueTask<KernelResult<ResponseEnvelope>> InvokeSessionAsync(
+    internal ValueTask<KernelResult<ResponseEnvelope>> InvokeSessionAsync(
         ProcessHandle caller,
         EndpointSessionHandle handle,
         uint messageId,
         object? payload,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken) => InvokeSessionAsync(caller,handle,messageId,payload,cancellationToken,null);
+
+    internal async ValueTask<KernelResult<ResponseEnvelope>> InvokeSessionAsync(
+        ProcessHandle caller, EndpointSessionHandle handle, uint messageId, object? payload,
+        CancellationToken cancellationToken, OriginalSessionSendCustody? custody)
     {
+        if(custody is not null && !custody.Matches(this,caller,handle))
+            return KernelResult<ResponseEnvelope>.Fail(KernelError.WrongSessionOwner,"Original send custody is copied or foreign.");
         var session = ResolveSession(caller, handle);
         if (!session.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(session.Error, session.Message!);
         var current = session.Value!;
@@ -1017,7 +1029,7 @@ public sealed partial class RuntimeKernel
         var currentPin = EndpointSessions.RevalidatePin(sessionPin);
         if (!currentPin.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(currentPin.Error, currentPin.Message!);
         var send = SendCore(caller, current.Service, current.Channel, messageId, payload, null,
-            current.Capabilities, AdmissionQosHint.None, null, new(handle, sessionPin, current.Requirements.ToArray()));
+            current.Capabilities, AdmissionQosHint.None, null, new(handle, sessionPin, current.Requirements.ToArray(),Custody:custody));
         if (!send.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(send.Error, send.Message!);
         var invocation = SessionInvocations.Register(handle, caller, current.Service, send.Value!.Sequence, messageId);
         FinalizeSessionPin(sessionPin, handle);
@@ -1095,14 +1107,167 @@ public sealed partial class RuntimeKernel
         object second) =>
         InvokeSessionOwnershipPairAsync(caller, handle, messageId, first, second, CancellationToken.None);
 
-    internal async ValueTask<KernelResult<ResponseEnvelope>> InvokeSessionOwnershipPairAsync(
+    internal ValueTask<KernelResult<ResponseEnvelope>> InvokeSessionOwnershipPairAsync(
         ProcessHandle caller,
         EndpointSessionHandle handle,
         uint messageId,
         object first,
         object second,
         CancellationToken cancellationToken)
+        => InvokeSessionOwnershipPairAsync(caller,handle,messageId,first,second,cancellationToken,null);
+
+    internal bool OriginalSessionSendIsPending(OriginalSessionSendCustody custody) =>
+        custody.Read(this) is { } original && SessionInvocations.OriginalSendIsPending(original);
+
+    internal KernelResult WithdrawOriginalSessionSend(OriginalSessionSendCustody custody)
     {
+        lock(_platformMemoryUseGate)
+        lock(_requestResponseCorrelationGate)
+        {
+            var original=custody.Read(this);
+            if(original is null) return KernelResult.Fail(KernelError.WrongSessionOwner,"Original send custody is copied or foreign.");
+            var pending=SessionInvocations.ReadPendingOriginalSend(original,custody.Caller);
+            if(!pending.IsSuccess) return KernelResult.Fail(pending.Error,pending.Message!);
+            var charges=Budgets.OriginalQueuedCharges().Where(charge=>charge.Channel==pending.Value.Channel.ChannelId && charge.Sequence==pending.Value.Raw.Sequence && charge.Sender==custody.Caller).ToArray();
+            if(charges.Length!=1 || charges[0].Lifetime is null)
+                return KernelResult.Fail(KernelError.PlatformFaulted,"Exact original queued charge unavailable.");
+            var charge=charges[0];
+            return Channels.WithdrawOriginalQueuedEnvelope(pending.Value.Channel,pending.Value.Raw,charge.Lifetime!,charge.Fact);
+        }
+    }
+
+    internal KernelResult CleanupOriginalSessionSend(OriginalSessionSendCustody custody)
+    {
+        EndpointSessionPin? completedPin=null;
+        List<BudgetTraceObservation> observations=[];
+        try
+        {
+        lock(_platformMemoryUseGate)
+        lock(_requestResponseCorrelationGate)
+        {
+            var original=custody.Read(this);
+            if(original is null) return KernelResult.Fail(KernelError.WrongSessionOwner,"Original custody is copied or foreign.");
+            if(SessionInvocations.OriginalSendCleanupIsCompleted(original)) return KernelResult.Ok();
+            var pending=SessionInvocations.ReadPendingOriginalSend(original,custody.Caller);
+            var transfer=SessionInvocations.ReadOriginalCompletedSendTransfer(original,custody.Caller);
+            if(!pending.IsSuccess && !transfer.IsSuccess) return KernelResult.Fail(pending.Error,pending.Message!);
+            var channel=pending.IsSuccess ? pending.Value.Channel : transfer.Value.Channel;
+            var sequence=pending.IsSuccess ? pending.Value.Raw.Sequence : transfer.Value.Sequence;
+            var serviceHandle=pending.IsSuccess ? pending.Value.Service : transfer.Value.Service;
+            var charges=Budgets.OriginalQueuedCharges().Where(item=>item.Channel==channel.ChannelId && item.Sequence==sequence && item.Sender==custody.Caller).ToArray();
+            if(charges.Length!=1 || charges[0].Lifetime is null) return KernelResult.Fail(KernelError.PlatformFaulted,"Original queued charge missing.");
+            var charge=charges[0];
+            object?[] payloads;
+            if(pending.IsSuccess)
+            {
+                var withdrawn=Channels.WithdrawOriginalQueuedEnvelope(channel,pending.Value.Raw,charge.Lifetime!,charge.Fact);
+                if(!withdrawn.IsSuccess) return withdrawn;
+                payloads=[pending.Value.Raw.Payload,pending.Value.Raw.SecondaryPayload];
+            }
+            else
+            {
+                var withdrawn=Channels.WithdrawUnpublishedOriginalTransfer(channel,sequence,transfer.Value.Prepared,charge.Lifetime!,charge.Fact);
+                if(!withdrawn.IsSuccess) return KernelResult.Fail(withdrawn.Error,withdrawn.Message!);
+                payloads=withdrawn.Value!;
+            }
+            var service=Processes.Resolve(serviceHandle);
+            var transferFacts=SessionInvocations.ReadOriginalTransferCleanupFacts(original);
+            if(!transferFacts.IsSuccess) return KernelResult.Fail(transferFacts.Error,transferFacts.Message!);
+            var producer=SessionInvocations.ReadOriginalTransferProducer(original);
+            if(!producer.IsSuccess || producer.Value.Raw is not { IsSuccess:true } raw ||
+                !transferFacts.Value.Prepared.IsOriginal || transferFacts.Value.Prepared.SourceHandle!=transferFacts.Value.Source ||
+                raw.Value.RegionId!=transferFacts.Value.Source.RegionId ||
+                raw.Value.Generation.Value!=transferFacts.Value.Source.Generation.Value+1)
+                return KernelResult.Fail(KernelError.PlatformFaulted,"Exact original Region effect unavailable.");
+            var owner=transferFacts.Value.TargetOwner;
+            var cleanup=KernelResult.Ok();
+            foreach(var payload in payloads)
+            {
+                if(payload is SingPlus.Sip.IOriginalBorrowPayload loan)
+                {
+                    var closed=Regions.CleanupWithdrawnBorrow(loan,owner);
+                    if(!closed.IsSuccess) cleanup=closed;
+                }
+                else if(payload is SingPlus.Sip.ITransferableOwnedPayload moved)
+                {
+                    if(moved.Handle!=raw.Value || !ReferenceEquals(moved,transferFacts.Value.Prepared.Projection))
+                        return KernelResult.Fail(KernelError.PlatformFaulted,"Withdrawn payload differs from original Region raw.");
+                    var closed=Regions.CleanupWithdrawnPayload(moved,owner,transferFacts.Value.RegionOwner);
+                    if(!closed.IsSuccess) cleanup=closed;
+                    else if(service.IsSuccess) service.Value!.RemoveRegion(moved.Handle);
+                }
+                else return KernelResult.Fail(KernelError.UnsupportedPayload,"Original pair resource is not a sealed ownership payload.");
+            }
+            var ended=Regions.HasEndedOriginalAccountingLifetime(transferFacts.Value.RegionOwner,raw.Value);
+            if((!ended.IsSuccess || !ended.Value) && cleanup.IsSuccess)
+                cleanup=KernelResult.Fail(KernelError.PlatformFaulted,"Original Region closure remains pinned.");
+            if(ended.IsSuccess && ended.Value && producer.Value.Reservation is { } targetReservation)
+            {
+                if(producer.Value.BudgetOwner is null) return KernelResult.Fail(KernelError.PlatformFaulted,"Original target charge absent.");
+                var priorTarget=Budgets.Query(targetReservation);
+                var consumedTarget=Budgets.ConsumeClosedTransferReservation(producer.Value.BudgetOwner,serviceHandle,targetReservation,
+                    transferFacts.Value.Prepared,
+                    raw.Value,transferFacts.Value.RegionOwner,owner.DomainId);
+                if(!consumedTarget.IsSuccess) cleanup=consumedTarget;
+                else
+                {
+                    RetireExactRegionBudgetRoute(raw.Value,serviceHandle,targetReservation);
+                    if(priorTarget.IsSuccess && priorTarget.Value!.State!=BudgetReservationState.Released)
+                        observations.Add(new(serviceHandle,TraceEventKind.BudgetReleased,targetReservation));
+                }
+            }
+            foreach(var sourceCharge in transferFacts.Value.Charges)
+            {
+                if(sourceCharge.RegionOwner is null || !ReferenceEquals(sourceCharge.RegionOwner,transferFacts.Value.RegionOwner))
+                    return KernelResult.Fail(KernelError.PlatformFaulted,"Original source accounting owner changed.");
+                var sourceEnded=Regions.HasEndedOriginalAccountingLifetime(sourceCharge.RegionOwner,transferFacts.Value.Source);
+                if(!sourceEnded.IsSuccess || !sourceEnded.Value) return KernelResult.Fail(KernelError.PlatformFaulted,"Original source charge lifetime remains pinned.");
+                var sourceBinding=Budgets.ValidateOriginalRegionChargeBinding(sourceCharge.Fact,sourceCharge.Owner,sourceCharge.Reservation,
+                    transferFacts.Value.Source,sourceCharge.RegionOwner,transferFacts.Value.SourceDomain);
+                if(!sourceBinding.IsSuccess) return sourceBinding;
+                var priorSource=Budgets.Query(sourceCharge.Reservation);
+                var consumedSource=Budgets.ReleaseOriginalRegionCharge(sourceCharge.Fact,sourceCharge.Owner,sourceCharge.Reservation);
+                if(!consumedSource.IsSuccess || consumedSource.Value!.State!=BudgetReservationState.Released)
+                    return KernelResult.Fail(KernelError.PlatformFaulted,"Original source charge remains pinned.");
+                RetireExactRegionBudgetRoute(transferFacts.Value.Source,sourceCharge.Owner,sourceCharge.Reservation);
+                if(priorSource.IsSuccess && priorSource.Value!.State!=BudgetReservationState.Released)
+                    observations.Add(new(sourceCharge.Owner,TraceEventKind.BudgetReleased,sourceCharge.Reservation));
+            }
+            if(!cleanup.IsSuccess) return cleanup;
+            if(!Channels.HasEndedOriginalQueuedLifetime(charge.Lifetime,charge.Channel,charge.Sequence,charge.Fact))
+                return KernelResult.Fail(KernelError.PlatformFaulted,"Original withdrawal lifetime changed.");
+            var consumed=Budgets.ConsumeWithdrawnQueuedCharge(charge.Fact,charge.Lifetime!,charge.Sender,charge.Reservation);
+            if(!consumed.IsSuccess) return KernelResult.Fail(consumed.Error,consumed.Message!);
+            if(!pending.IsSuccess && !Channels.CompleteUnpublishedOriginalTransfer(charge.Lifetime!,transfer.Value.Prepared,charge.Fact))
+                return KernelResult.Fail(KernelError.PlatformFaulted,"Original unpublished transfer cleanup continuity changed.");
+            Channels.ConsumeSendBudgetCorrelation(channel,charge.Sender,charge.Reservation);
+            var completed=SessionInvocations.CompleteWithdrawnOriginalSend(original,custody.Caller);
+            if(!completed.IsSuccess) return KernelResult.Fail(completed.Error,completed.Message!);
+            completedPin=completed.Value!;
+            EndpointSessions.ConsumeOriginalSendPinCorrelation(completedPin);
+            return KernelResult.Ok();
+        }
+        }
+        finally
+        {
+            if(completedPin is not null) FinalizeSessionPin(completedPin,custody.Session);
+            EmitBudgetObservations(observations);
+        }
+    }
+
+    private void RetireExactRegionBudgetRoute(RegionHandle region,ProcessHandle owner,BudgetReservationHandle reservation)
+    {
+        lock(_regionBudgetReservationsGate)
+            if(_regionBudgetReservations.TryGetValue(region,out var route) && route==(owner,reservation))
+                _regionBudgetReservations.Remove(region);
+    }
+
+    internal async ValueTask<KernelResult<ResponseEnvelope>> InvokeSessionOwnershipPairAsync(
+        ProcessHandle caller,EndpointSessionHandle handle,uint messageId,object first,object second,
+        CancellationToken cancellationToken,OriginalSessionSendCustody? custody)
+    {
+        if(custody is not null && !custody.Matches(this,caller,handle))
+            return KernelResult<ResponseEnvelope>.Fail(KernelError.WrongSessionOwner,"Original send custody is copied or foreign.");
         var session = ResolveSession(caller, handle);
         if (!session.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(session.Error, session.Message!);
         var current = session.Value!;
@@ -1114,7 +1279,7 @@ public sealed partial class RuntimeKernel
         var currentPin = EndpointSessions.RevalidatePin(sessionPin);
         if (!currentPin.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(currentPin.Error, currentPin.Message!);
         var send = SendCore(caller, current.Service, current.Channel, messageId, first, second,
-            current.Capabilities, AdmissionQosHint.None, null, new(handle, sessionPin, current.Requirements.ToArray()));
+            current.Capabilities, AdmissionQosHint.None, null, new(handle, sessionPin, current.Requirements.ToArray(),Custody:custody));
         if (!send.IsSuccess) return KernelResult<ResponseEnvelope>.Fail(send.Error, send.Message!);
         var invocation = SessionInvocations.Register(handle, caller, current.Service, send.Value!.Sequence, messageId);
         FinalizeSessionPin(sessionPin, handle);
@@ -1126,3 +1291,9 @@ public sealed partial class RuntimeKernel
         finally { FinalizeSessionPin(sessionPin, handle); }
     }
 }
+
+
+
+
+
+

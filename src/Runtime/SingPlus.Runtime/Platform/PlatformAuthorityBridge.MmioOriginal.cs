@@ -24,6 +24,7 @@ public sealed partial class PlatformAuthorityBridge
         public PlatformAuthorityResult<PlatformProviderMmioLease>? RawObservation { get; set; }
         public PlatformAuthorityResult<PlatformOriginalMmioMapResolution>? RawResolution { get; set; }
         public MmioLeaseRecord? LocalMapping { get; set; }
+        public MmioBufferPayload? Payload { get; init; }
     }
     private sealed class OriginalMmioCloseInvocation
     {
@@ -71,7 +72,7 @@ public sealed partial class PlatformAuthorityBridge
         fact.Parent.MmioSources.Remove(fact.Source);
     }
     private KernelResult<PlatformMmioLease> BindOriginalMmio(PlatformDeviceLease lease,PlatformDomainIdentity subject,CapabilityId capability,PlatformMmioRegionIdentity region,PlatformMmioRange range,PlatformMmioAccess access,
-        DeviceLeaseRecord device,DomainRecord parent,ulong localId,Func<Func<KernelResult>,KernelResult> authorize,Func<PlatformMmioLease,Func<KernelResult>,KernelResult> publish,IPlatformOriginalMmioProvider provider)
+        DeviceLeaseRecord device,DomainRecord parent,ulong localId,Func<Func<KernelResult>,KernelResult> authorize,Func<PlatformMmioLease,Func<KernelResult>,KernelResult> publish,IPlatformOriginalMmioProvider provider,MmioBufferPayload? backing)
     {
         OriginalMmioMapInvocation fact = null!;
         var admission = authorize(() =>
@@ -82,7 +83,8 @@ public sealed partial class PlatformAuthorityBridge
                 if ((ulong)device.OriginalMmioMaps.Count != device.OriginalMmioMapsIssued || device.OriginalMmioMaps.Any(old => !ReferenceEquals(old.OwnerSelf,old))) return KernelResult.Fail(KernelError.PlatformFaulted,"Original MMIO history lost/copied; no repeat.");
                 if (device.OriginalMmioMapsIssued == ulong.MaxValue) return KernelResult.Fail(KernelError.CapacityExhausted,"Original MMIO history exhausted before effect.");
                 if (device.OriginalMmioMaps.Any(old => !HasConsumedOriginalMmioMap(old) && old.Lease.Region.ResourceId == region.ResourceId)) return KernelResult.Fail(KernelError.PlatformBindingActive,"Original MMIO lifetime already admitted/pending.");
-                fact = new(device,parent,new(device.ProviderLease,region,range,access),new(new(localId),new(1),lease,region,range,access),capability);
+                fact = new(device,parent,new(device.ProviderLease,region,range,access,backing?.Backing),new(new(localId),new(1),lease,region,range,access),capability) {Payload=backing};
+                if(backing is not null)backing.AdmissionOwner=fact;
                 device.OriginalMmioMaps.Add(fact); device.OriginalMmioMapsIssued++; parent.MmioSources.Add(device); device.MmioMapMayHaveEffect = true; device.UnresolvedMmioCapabilityId = capability; device.MmioMapParent = parent;
                 device.MmioMapRegion = region; device.MmioMapRange = range; device.MmioMapAccess = access; return KernelResult.Ok();
             }
@@ -91,7 +93,9 @@ public sealed partial class PlatformAuthorityBridge
         try
         {
             var source = CurrentProviderIncarnation();
-            lock (_secureDomainLifecycleGate) { if (!OriginalMmioMapSources(fact,source)) return Refuse("Original MMIO source changed before effect."); fact.Invoked = true; }
+            var effectAdmission=authorize(() =>
+            { lock (_secureDomainLifecycleGate) { if (!OriginalMmioMapSources(fact,source)) return KernelResult.Fail(KernelError.PlatformFaulted,"Original MMIO source changed before effect."); fact.Invoked = true;return KernelResult.Ok(); } });
+            if(!effectAdmission.IsSuccess)return Refuse(effectAdmission.Message!);
             var raw = provider.MapMmio(fact.Request);
             lock (_secureDomainLifecycleGate) { fact.RawObservation = raw; device.MmioMapObservation = raw; }
             source = CurrentProviderIncarnation();

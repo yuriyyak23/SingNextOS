@@ -31,7 +31,8 @@ internal sealed class NeutralDependencyRegistry
         (fact.Source is null && fact.Observation is { NoEffectGuaranteed: true } raw && raw.Request == fact.Request && !raw.Observation.IsBound && raw.Observation.Lease == default ||
          fact.Source is { } source && ReferenceEquals(source.OriginalAdmission,fact) && source.HasExactOriginalClosure);
     private static bool ConsumedOriginalMmioAdmission(NeutralOriginalMmioAdmissionFact fact) => ReferenceEquals(fact.OwnerSelf,fact) &&
-        (fact.Source is null && fact.Observation is { NoEffectGuaranteed: true } raw && raw.Request == fact.Request && !raw.Observation.IsMapped && raw.Observation.Lease == default ||
+        (fact.NoEffect && fact.Source is null && fact.Observation is { SourceFenceMatched: true, NoEffectGuaranteed: true } raw && raw.Request == fact.Request &&
+         raw.Observation is { IsMapped: false } result && result.Lease == default && Enum.IsDefined(result.Decision) && result.Decision != NeutralMmioMapDecision.Mapped ||
          fact.Source is { } source && ReferenceEquals(source.OriginalAdmission,fact) && source.HasExactOriginalClosure);
     private static bool ConsumedOriginalDmaAdmission(NeutralOriginalDmaAdmissionFact fact) => ReferenceEquals(fact.OwnerSelf,fact) &&
         (fact.Source is null && fact.Observation is { NoEffectGuaranteed: true } noEffect && noEffect.Request == fact.Request && !noEffect.Observation.IsGranted && noEffect.Observation.Grant == default ||
