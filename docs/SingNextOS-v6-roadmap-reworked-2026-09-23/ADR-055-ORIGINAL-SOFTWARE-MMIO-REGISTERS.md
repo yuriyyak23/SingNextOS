@@ -1,9 +1,0 @@
-# ADR-055 — Original software MMIO registers and Region backing
-
-Additive local software producer/actual client, 2026-10-14; gates OFF, ISA NONE.
-
-Existing MMIO Map/Close is extended with optional managed backing and original 32-bit little-endian read/write requests. Runtime caller retains original invocation before possible effect; existing bridge/provider/native MMIO owners retain immutable intent and raw before callbacks/consumption. Native source checks realm, mapping/admission/device/root factories and single-original backing under lifecycle gate. Software register storage uses the original managed array; no pointer, new machine instruction, or hardware claim.
-
-RegionAuthority owns the exact exclusive use and its original MMIO release owner. Acquisition keeps the existing mapped-region guard. Runtime storage reservation excludes owner access; ResourceBudgetAuthority retains the existing Region charge. No second admission ledger or ExternalOperation predecessor. Native Close requires intact original access history and detaches byte storage; local consumption releases use/reservation and drops buffer references only after exact original no-effect/closure. Lost replies/queries retain dependency; pure original lookup never repeats a read/write or grants permission. Result metadata is separate from byte lifetime closure and Region reclaim.
-
-Actual VirtualIoHost register mode writes command17/status42 and reads status42 through kernel → HybridCPU provider → native software producer. Independent native backing, quantitative charge, reentry/overlap, changed source, malformed/lost reply and history loss are verified at their consumers. B1 cold continuation and general B2/B3 independent/history users remain open. ProductionSecure, physical CXL/MMIO and machine fault-kind qualification are outside this claim. Java-only skipped; no ProductionQualified.

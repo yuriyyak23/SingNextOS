@@ -1,6 +1,0 @@
-{
-  "ProcessId": 3036,
-  "ParentProcessId": 32668,
-  "Name": "MSBuild.exe",
-  "CommandLine": "\"C:\\Program Files\\dotnet\\sdk\\11.0.100-rc.1.26425.128\\MSBuild.exe\" /nologo /nodemode:8"
-}
