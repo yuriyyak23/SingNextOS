@@ -1,0 +1,23 @@
+{
+  "schema": "SingCapSecurityQualificationMatrixV1",
+  "categories": [
+    { "requirement": "capability algebra properties", "tests": ["SingCapPhase03ConstraintAlgebraTests"] },
+    { "requirement": "forgery replay restart old realm", "tests": ["SingCapPhase02CapabilityLedgerTests", "SingCapPhase05OpaqueV2Tests"] },
+    { "requirement": "subtree revoke derive/revoke effect races", "tests": ["SingCapPhase04EffectAdmissionTests.ConcurrentDeriveAndRevokeNeverLeavesValidDescendant"] },
+    { "requirement": "quota concurrency and exhaustion", "tests": ["SingCapPhase03ConstraintAlgebraTests.ConcurrentSiblingConsumeNeverExceedsSharedRootQuota", "SingCapPhase02CapabilityLedgerTests.ConcurrentMintCannotOvershootPerSubjectLiveQuota"] },
+    { "requirement": "sealed object type service session incarnation", "tests": ["SingCapPhase06SoftwareSealingTests", "NativeSystemServiceVerticalSliceTests"] },
+    { "requirement": "Region range lifetime MOVE quarantine", "tests": ["SingCapPhase07RegionHardeningTests", "Phase07IpcV2Tests", "ExternalOperationLifecycleTests"] },
+    { "requirement": "SIP raw object deep value temporary authority", "tests": ["SingCapPhase08GeneratedSentryTests", "GeneratorTests", "AnalyzerTests"] },
+    { "requirement": "ManagedCap precompiled bypass", "tests": ["AdmissionVerifierTests"] },
+    { "requirement": "manifest audit provenance", "tests": ["SingCapPhase10ManifestAuditTests"] },
+    { "requirement": "HybridCPU lifecycle matrix", "tests": ["HybridCpuExternalOperationProviderTests", "Phase10ProviderConformanceTests", "SingCapPhase12ProviderMappingTests"] },
+    { "requirement": "admission versus Region MOVE reclaim", "tests": ["SingCapPhase13CrossAuthorityRaceTests.PrepareVersusRegionMoveHasOneWinnerAndNoLeakedPins"] },
+    { "requirement": "admission versus session close", "tests": ["SingCapPhase04EffectAdmissionTests.SessionCloseBetweenPrepareAndCommitDeniesAndCompensatesInReverse"] },
+    { "requirement": "seal resolution versus object close service restart", "tests": ["SingCapPhase06SoftwareSealingTests.CloseRaceHasPinnedWinnerThenDeterministicClosure", "SingCapPhase06SoftwareSealingTests.ServiceRestartGenerationRejectsOldHandleEvenWithReusedObjectKey"] },
+    { "requirement": "publication versus capability revoke Region reclaim", "tests": ["SingCapPhase13CrossAuthorityRaceTests.PublicationVersusCapabilityRevokeAndRegionReclaimHonorsAdmittedPolicy"] },
+    { "requirement": "provider completion versus service restart", "tests": ["SingCapPhase13CrossAuthorityRaceTests.ProviderCompletionVersusProcessRestartCannotFakeClosureOrLeakPins"] },
+    { "requirement": "adapter callback reentry lock order", "tests": ["HybridCpuExternalOperationProviderTests.PublicationCallbackReentryIsFailClosedAndGenerationChangeWaitsForBoundaryExit", "PlatformDsc1ComputeTests.ConcurrentEventObserversCallProviderAndPublishOnlyOnce"] }
+  ],
+  "winnerAndLeakRule": "Every mandatory cross-authority race asserts the permitted winner/outcome and no active authority pins or fabricated provider closure.",
+  "claim": "Mixed claim: project-wide maximum RuntimeEnforced; ManagedCap verifier lane QualifiedManaged; no hardware or ProductionCandidate claim"
+}

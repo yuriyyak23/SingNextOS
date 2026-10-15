@@ -1,0 +1,24 @@
+# Решения внешних аудитов
+
+Current disposition — 2026-10-11. Единственная очередь — [01](01-STATE-AND-BACKLOG.md); dependencies — [04](04-BLOCKERS-REPORT.md).
+
+Источники: `C:\Users\Yuriy Kurnosov\Downloads\ChatGPT-проведианализблокеро.md` (review 2026-10-09) и `C:\Users\Yuriy Kurnosov\Downloads\deep-research-report (1).md` (анализ 2026-10-10). Новый аудит прямо сообщает, что local modernize/backlog/blockers не был доступен и новые tests не запускались. Web master и citation IDs не подтверждают dirty local tuple; design sketches не resolved contracts. Внешние exports не копировать целиком в обязательный контекст.
+
+| Пункт аудита | Решение по actual local state |
+|---|---|
+| B1 persistent original identity до effect и reboot reconciliation | Принять как implementation gap для эффектов, переживающих runtime. Existing owner, cleanup-only recovery, storage freshness/rollback/torn writes и authenticated original lifetime continuation; без capability resurrection и второго ledger. Budget observed prefix — отдельный bounded exit |
+| B2 exact outcome/containment у provider | Принять consumer-first. Optional surviving-original Bind/Close/Map/release и DMA visibility уже adopted. General unknown/history-loss/incapable/production guarantee открыта. Отсутствие объекта/Prepared/NotFound не exact no-effect; pure lookup не effect. Generic ResolveOutcome sketch не готовый общий API |
+| B3 новый artifact owner/release как полностью missing | Устарело для local tree: [ADR-017 exit](../../artifacts/v6/iteration-20261010-exact-artifact-release/report.md), subsequent Bind/Start/guest consumers в 01. Не вводить duplicate owner. Открыты remaining incapable/history-loss/independent backing users; exact release не снимает чужой pin |
+| B4 cross-owner commit model | Concrete source/owner/interlock/publication gaps принять как runtime работу. Общую formal theorem и обязательный model-check каждого протокола не включать в dev очередь. Operation-specific ordering и necessary race tests сохраняются; общая atomicity не заявляется |
+| B5 executing HybridCPU/CXL/DMA/virtualization/SecureCompute | Принять implementation направление при actual consumer и разрешённом external scope. Production claims/physical стенд — отдельная qualification. Не превращать hardware campaign в prerequisite managed fix и не менять core ISA |
+| B6 interfaces без callers | Принять точечно: actual caller/owner need → wiring либо gate OFF. Наличие API не требует автоматического подключения/удаления всех compatibility surfaces |
+| README broken current architecture links | Подтверждены локально и исправлены на существующие v6 owners/invariants/gates/resource-model документы. Не восстанавливать удалённый obsolete каталог |
+| SHA/digest qualification manifest/CI, hardware CXL boot qualification | Не добавлять как implementation tasks этого root scope. Strict qualification остаётся отдельной; selected dev dirty inputs и actual packages/toolchain attribution сохраняются. SingPlus.Boot исключён, distinct SingNext.Boot требует fresh attribution |
+| VS Host/ISE/AOT debug и новый SingNext.Sdk | Conditional developer implementation при concrete application/adapter need. Сначала существующие SDK/tools; новый facade/debugger не обязателен по audit sketch |
+| Lock partitioning/performance, fairness/QoS, remote fabric scheduling | Deferred optimization/расширение после соответствующего actual consumer; не новый root blocker. Budget truth остаётся у ResourceBudgetAuthority, multi-host/stateful FutureGated |
+
+Native root Close terminal failing repro из старого review уже исправлен [ADR-016 block](../../artifacts/v6/iteration-20261010-native-root-close-fence/report.md). Native device/MMIO завершены на своих tuples. Native IRQ Bind/Close/Poll/Complete, typed provider adoption и exact unknown native delivery containment получили [bounded executable exit](../../artifacts/v6/iteration-20261011-native-original-irq-fence/report.md): original endpoint closure, Region release и charge512→0 проверены terminal native/provider/affected/main runs. General/incapable/all-fact-loss scope остаётся Partial; independent endpoint/backing/history pins сохранены. Новый аудит сам эти реализации не проверял.
+
+Original raw сохраняется до callbacks и exact consumption. No-effect, closure, visibility, publication и release различны. Completed exact lifetime не требует новой active permission и не должен repin после consumption. Unknown remains pinned/no-repeat. Durable HMAC/in-memory retention не cold freshness. B1/B2/B3 contract gap — разрешённая implementation работа, а не вечный запрет менять sibling provider.
+
+Dev/qualification разделены по [03](03-DEV-VALIDATION.md). Proof-only рекомендации исключены из implementation очереди; security/canonical/integrity checks применимого consumer сохранены. Gates OFF, no ProductionQualified, Java-only skipped, ISA NONE.

@@ -1,0 +1,40 @@
+{
+  "solution": {
+    "path": "../../SingNextOS.slnx",
+    "projects": [
+      "src/Admission/SingPlus.StaticAdmission/SingPlus.StaticAdmission.csproj",
+      "contracts/SingPlus.Contracts/SingPlus.Contracts.csproj",
+      "tools/HybridCpu_ExecutableAdapter.Tests/HybridCpu_ExecutableAdapter.Tests.csproj",
+      "tools/HybridCpu_ExecutableAdapter/Boot.Contracts/HybridCpu.Boot.Contracts.csproj",
+      "tools/HybridCpu_ExecutableAdapter/HybridCpu_ExecutableAdapter.csproj",
+      "tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.AuthorityCore/HybridCPU_NeutralRuntime.AuthorityCore.csproj",
+      "tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Contracts/HybridCPU_NeutralRuntime.Contracts.csproj",
+      "tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Model/HybridCPU_NeutralRuntime.Model.csproj",
+      "tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Tests/HybridCPU_NeutralRuntime.Tests.csproj",
+      "tools/SingPlus.Admission/SingPlus.Admission.csproj",
+      "tools/SingPlus.HybridCpuQualification/SingPlus.HybridCpuQualification.csproj",
+      "tools/SingPlus.LoweringEvidenceEmitter/SingPlus.LoweringEvidenceEmitter.csproj",
+      "tools/SingPlus.SingCapQualification/SingPlus.SingCapQualification.csproj",
+      "tools/SingPlus.VirtualIoHost/SingPlus.VirtualIoHost.csproj",
+      "sdk/SingPlus.Analyzers/SingPlus.Analyzers.csproj",
+      "sdk/SingPlus.Generators/SingPlus.Generators.csproj",
+      "sdk/SingPlus.Kernel.Sdk/SingPlus.Kernel.Sdk.csproj",
+      "sdk/SingPlus.Sip.Sdk/SingPlus.Sip.Sdk.csproj",
+      "sdk/SingPlus.System/SingPlus.System.csproj",
+      "src/Platform/SingPlus.Platform.Abstractions/SingPlus.Platform.Abstractions.csproj",
+      "src/Platform/SingPlus.Platform.Host/SingPlus.Platform.Host.csproj",
+      "src/Platform/SingPlus.Platform.HybridCpu/SingPlus.Platform.HybridCpu.csproj",
+      "src/Platform/SingPlus.Platform.HybridCpu.Boot/SingPlus.Platform.HybridCpu.Boot.csproj",
+      "src/Drivers/SingPlus.Drivers/SingPlus.Drivers.csproj",
+      "src/Kernel/SingPlus.Kernel/SingPlus.Kernel.csproj",
+      "src/Kernel/Boot/SingNext.Boot.Capsule/SingNext.Boot.Capsule.csproj",
+      "src/Kernel/Boot/SingNext.Boot.Core/SingNext.Boot.Core.csproj",
+      "src/Kernel/Hal/SingPlus.Kernel.Hal.Host/SingPlus.Kernel.Hal.Host.csproj",
+      "src/Runtime/SingPlus.Runtime/SingPlus.Runtime.csproj",
+      "src/Sip/SingPlus.Sip/SingPlus.Sip.csproj",
+      "tests/SingPlus.Platform.HybridCpu.Tests/SingPlus.Platform.HybridCpu.Tests.csproj",
+      "tests/SingPlus.Tests/SingPlus.Tests.csproj",
+      "tests/fixtures/SingCap.ManagedCap.NativeAotFixture/SingCap.ManagedCap.NativeAotFixture.csproj"
+    ]
+  }
+}

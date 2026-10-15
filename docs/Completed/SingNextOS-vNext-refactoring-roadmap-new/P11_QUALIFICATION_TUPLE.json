@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "phase": "P11",
+  "claim": "ModelOnly",
+  "contour": "negative qualification: no exact temporal enforcement contour available",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "phaseEntryHead": "8c3f55e47555b2db99356b861ee404211d072edc",
+  "reviewedHead": "8c3f55e47555b2db99356b861ee404211d072edc",
+  "enabledFeatureGates": [],
+  "temporalUpperBound": "FutureGated",
+  "guaranteedReservation": "FutureGated",
+  "tests": [
+    { "lane": "P03-P10-P11-negative-boundary", "passed": 14, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui", "passed": 1644, "failed": 9, "skipped": 2, "disposition": "same unrelated baseline failures" }
+  ],
+  "build": { "target": "SingNextOS.slnx", "warnings": 0, "errors": 0 },
+  "ordinaryFallback": "unchanged",
+  "exclusions": [
+    "FG-VNX-TEMPORAL-UPPER-BOUND remains OFF",
+    "FG-VNX-GUARANTEED-RESERVATION remains OFF",
+    "no EnforcedUpperBound, guarantee, realtime, hardware or production claim"
+  ]
+}

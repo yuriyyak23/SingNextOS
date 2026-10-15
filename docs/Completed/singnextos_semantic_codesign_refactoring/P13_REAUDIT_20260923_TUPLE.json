@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "phase": "P13",
+  "recorded_at_local_date": "2026-09-23",
+  "singnextos": {
+    "head": "a0f70bc2bd031bd2b1138b2a01984309814bba5c",
+    "tree": "c9e667fda0605d993c01060b7d7dc04b73cfac80",
+    "start_user_owned_dirty_changes": []
+  },
+  "artifacts": [
+    { "path": "contracts/SingPlus.Contracts/FaultReconciliationContracts.cs", "bytes": 2937, "sha256": "a77a6db1d5ca31192f6bf383b258496bff7b26ceb2b47da7dd256eb67a397bfc" },
+    { "path": "src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetRecoveryJournal.cs", "bytes": 21653, "sha256": "2255698e183271211e49da6d8e11f6b068932196915101ba467630b6f3f74414" },
+    { "path": "tests/SingPlus.Tests/Contracts/FaultReconciliationPolicyV1Tests.cs", "bytes": 3431, "sha256": "ace938366e2e9f5ed199177b1606ffeaf1d0ada4e83a97e3268eeab75ce4d8db" },
+    { "path": "tests/SingPlus.Tests/Runtime/VNextPhase16ResourceBudgetRecoveryJournalTests.cs", "bytes": 6441, "sha256": "120ba6e96ba9e1164d8a1fc1b9b875573ceded0c7a16dc751e0b27ef9e3343f7" },
+    { "path": "docs/singnextos_semantic_codesign_refactoring/formal/P13Reconciliation.tla", "bytes": 1581, "sha256": "dc70198be555fadde8ddb598fb55f3a2135d35593a493e11013d489b5d55f0af" }
+  ],
+  "tests": {
+    "focused_fault_recovery_checkpoint": { "passed": 32, "failed": 0, "skipped": 0 },
+    "hash_closure_after_correction": { "passed": 33, "failed": 0, "skipped": 0 },
+    "full_non_gui_final": { "passed": 1869, "failed": 0, "skipped": 2 }
+  },
+  "solution_build": { "exit_code": 0, "warnings": 0, "errors": 0 },
+  "claims": {
+    "fault_trust_retry_policy": "StaticAdmission",
+    "local_authenticated_recovery": "RuntimeEnforced host/JIT",
+    "conditional_liveness_formal": "ModelOnly",
+    "remote_attested_byzantine": "Unsupported"
+  },
+  "gates": { "all_vnext": "OFF" },
+  "hybridcpu_scope": "NONE; local external boundary unchanged",
+  "isa_impact": "NONE"
+}

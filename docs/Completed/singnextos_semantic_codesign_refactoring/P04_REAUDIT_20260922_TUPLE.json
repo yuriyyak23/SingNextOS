@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "phase": "P04",
+  "recorded_at_local_date": "2026-09-22",
+  "singnextos": {
+    "head": "a0f70bc2bd031bd2b1138b2a01984309814bba5c",
+    "tree": "c9e667fda0605d993c01060b7d7dc04b73cfac80",
+    "start_user_owned_dirty_changes": []
+  },
+  "implementation": [
+    "contracts/SingPlus.Contracts/OperationObligations.cs",
+    "src/Runtime/SingPlus.Runtime/VNext/RuntimeKernel.SemanticObligations.cs",
+    "src/Runtime/SingPlus.Runtime/ExternalOperations/ExternalOperationAuthority.cs",
+    "tests/SingPlus.Tests/Contracts/OperationObligationsV1Tests.cs",
+    "tests/SingPlus.Tests/Runtime/SemanticOperationObligationsRuntimeTests.cs"
+  ],
+  "identity_coverage": [
+    "process_generation",
+    "operation_generation",
+    "optional_session_generation",
+    "region_generation",
+    "region_mutation_epoch",
+    "canonical_obligations_digest",
+    "temporal_interval"
+  ],
+  "deferred_to_binding_and_sentry": ["provider_generation", "budget_lease_generation", "mandatory_no_bypass_submit_wiring"],
+  "tests": {
+    "focused_p04": { "passed": 9, "failed": 0, "skipped": 0 },
+    "expanded_semantic_authority": { "passed": 19, "failed": 0, "skipped": 0 },
+    "full_non_gui": {
+      "passed": 1799,
+      "failed": 0,
+      "skipped": 2,
+      "projects": {
+        "SingPlus.Tests": { "passed": 1591, "skipped": 2 },
+        "SingPlus.Platform.HybridCpu.Tests": { "passed": 60, "skipped": 0 },
+        "HybridCpu_ExecutableAdapter.Tests": { "passed": 90, "skipped": 0 },
+        "HybridCPU_NeutralRuntime.Tests": { "passed": 58, "skipped": 0 }
+      }
+    }
+  },
+  "solution_build": { "exit_code": 0, "warnings": 0, "errors": 0 },
+  "gates": { "semantic_codesign": "OFF" },
+  "maximum_claim": "StaticAdmission",
+  "hybridcpu_scope": "local external-tool/package/adapter only",
+  "isa_impact": "NONE"
+}

@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "phase": "P06",
+  "claim": "RuntimeEnforced",
+  "contour": "internal host-JIT ComputeTime/Nanoseconds exact EndpointSession invocation donation",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "phaseEntryHead": "8c3f55e47555b2db99356b861ee404211d072edc",
+  "reviewedHead": "8c3f55e47555b2db99356b861ee404211d072edc",
+  "enabledFeatureGates": [],
+  "resourceDimension": "ComputeTimeNanoseconds",
+  "owners": {
+    "permission": "CapabilityAuthority",
+    "quantity": "ResourceBudgetAuthority",
+    "invocationBinding": "EndpointSessionInvocationRegistry"
+  },
+  "tests": [
+    { "lane": "P06-focused", "passed": 6, "failed": 0, "skipped": 0 },
+    { "lane": "P02-P06-and-invocation-regression", "passed": 44, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui", "passed": 1624, "failed": 9, "skipped": 2, "disposition": "pre-existing unrelated historical artifacts, stale user-owned P14 tuple, and project-profile drift" }
+  ],
+  "build": { "target": "SingNextOS.slnx", "warnings": 0, "errors": 0 },
+  "ordinaryFallback": "unchanged and default; no production SIP operation uses donation",
+  "exclusions": [
+    "FG-VNX-SESSION-DONATION remains OFF",
+    "P07 exact ExternalOperation-to-lease reconciliation is not claimed",
+    "no NativeAOT, provider, hardware, guarantee, or production qualification"
+  ]
+}

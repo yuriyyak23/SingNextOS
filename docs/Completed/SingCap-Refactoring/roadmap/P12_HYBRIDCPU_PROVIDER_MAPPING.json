@@ -1,0 +1,31 @@
+{
+  "schema": "SingCapHybridCpuProviderMappingV1",
+  "singNextOsBaseline": "a67eea1aafc72054d22f1586b62c6883cdc71681",
+  "independentAuditBaseline": "472b7c9345605f1558958f0d00e4e2f1b4177fa4",
+  "hybridCpuSourceCommit": "794c4a53494f503855ac8cf209efab23fde083b2",
+  "contractsPackage": {
+    "id": "HybridCPU.ExternalRuntime.Contracts",
+    "version": "1.14.0",
+    "sha256": "B96E99BDA066EE585B26A11CBFA7B68CE6BF44FC0006679483CCC1A4EEB678C2",
+    "repositoryArtifactEqualsRestoredArtifact": true
+  },
+  "mappings": [
+    { "provider": "external request/generation/correlation", "local": "ExternalOperationHandle and OperationDependencySnapshot", "classification": "correlation evidence" },
+    { "provider": "CPU guard receipt", "local": "none", "classification": "secondary CPU-side evidence only" },
+    { "provider": "provider admission receipt", "local": "none", "classification": "provider gate only" },
+    { "provider": "DeviceComplete receipt", "local": "RecordExternalOperationCompletion", "classification": "completion evidence only" },
+    { "provider": "Visible receipt", "local": "RecordExternalOperationVisibility", "classification": "visibility evidence only" },
+    { "provider": "publication evidence/gate", "local": "PublishExternalOperation", "classification": "additional prerequisite, not local authority" },
+    { "provider": "release receipt", "local": "ReleaseExternalOperation plus Region closure", "classification": "provider closure evidence only" }
+  ],
+  "lockOrder": [
+    "reserve exact adapter entry under adapter gate",
+    "release adapter gate",
+    "invoke RuntimeKernel lifecycle",
+    "reacquire adapter gate and commit or compensate"
+  ],
+  "generationRule": "Reconfigure is deferred while any exact adapter transition is in flight.",
+  "callbackRule": "Completion, visibility, publication and release require the exact full request identity, correlation and generation set. Same-request re-entry while a transition is in flight returns Pending or an explicit fail-closed error.",
+  "authorityRule": "Provider tokens, receipts, domains and generations are never SingNext capabilities.",
+  "hybridCpuCoreModified": false
+}

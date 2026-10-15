@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "phase": "P00",
+  "recorded_at_local_date": "2026-09-22",
+  "singnextos": {
+    "head": "a0f70bc2bd031bd2b1138b2a01984309814bba5c",
+    "tree": "c9e667fda0605d993c01060b7d7dc04b73cfac80",
+    "branch": "master",
+    "start_worktree_dirty": false,
+    "roadmap_baseline": "cb6a94c314055e0712b8d9b8382ca1d146fe1c0e",
+    "roadmap_baseline_tree": "b0a9e343df10a99e26adddbe57669ed2533d1b8e"
+  },
+  "toolchain": {
+    "dotnet_sdk": "11.0.100-rc.1.26425.128",
+    "lang_version": "13.0",
+    "roll_forward": "disable"
+  },
+  "packages": [
+    {
+      "path": ".packages/HybridCPU.ExternalRuntime.Contracts.1.14.0.nupkg",
+      "bytes": 74244,
+      "sha256": "b96e99bda066ee585b26a11cbfa7b68ce6bf44fc0006679483ccc1a4eeb678c2",
+      "git_blob": "2614d43f8a9e2dc8e0fef525c494d7023d4cc806",
+      "nuget_sha512": "wLH8suR5xnj9C0CmqKTvUBSp2fLQsnS18ELZbILGosnGU3KIRJTZykX6bfvL/IWNOFOzGmQVvKI3q7irmjeM/Q==",
+      "lock_match": true
+    },
+    {
+      "path": ".packages/HybridCPU.ExternalRuntime.1.3.0.nupkg",
+      "bytes": 2765291,
+      "sha256": "191a1976decaf607425b3f93378ba11446b32af2ebfd09dff45a26944e7e765f",
+      "git_blob": "d528fd497f141417d18b2bbbd1310dfa0913baa9",
+      "nuget_sha512": "WvyBNw9Mb+VaR6Hy8krNxqVyjFVO376ShGEOr528863p0CWL8endf+3RFs7edynTUO2laU5UkfvHmocrAMWJaQ==",
+      "lock_match": true
+    }
+  ],
+  "tests": {
+    "command": "dotnet test tests/SingPlus.Tests/SingPlus.Tests.csproj --no-restore --filter FullyQualifiedName~SingCapPhase01ToolchainTests|FullyQualifiedName~VNextPhase00ArchitecturalFreezeTests",
+    "exit_code": 0,
+    "passed": 14,
+    "failed": 0,
+    "skipped": 0,
+    "evidence_level": "current executable result"
+  },
+  "gates": {
+    "semantic_codesign": "OFF"
+  },
+  "maximum_claim": "StaticAdmission",
+  "hybridcpu_source_verified": false,
+  "hybridcpu_scope": "local external-tool/package/adapter only",
+  "isa_impact": "NONE"
+}

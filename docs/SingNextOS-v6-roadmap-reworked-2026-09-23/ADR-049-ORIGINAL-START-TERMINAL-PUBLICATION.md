@@ -1,0 +1,13 @@
+# ADR-049: Original terminal outcome at actual Start publication
+
+Accepted for implementation, 2026-10-11. ADR-048 exposes the existing original CPU invocation's typed terminal outcome. Receipt-driven Start must consume it before final local state publication instead of leaving a failed terminal execution logically Running until a separate query.
+
+Actual RuntimeKernel Start opts into the bridge terminal completion consumer. After retaining the exact execution receipt, the bridge performs the optional provider's pure original terminal lookup outside owner commit locks and retains raw before further source callbacks. Failure/unknown enum/foreign execution receipt refuses state publication and retains the original invocation and dependency cleanup facts. No CPU invocation is repeated. Final publication uses existing fresh permission/process/local mapping/lineage and provider source/revision commits.
+
+Exact Completed maps to additive VirtualDomainState.Completed (value8); existing values remain unchanged. Known BudgetExhausted/KernelRejected/ExecutionFailure maps to Faulted. Neither state implies child/guest/artifact closure, Region release, accounting consumption, or absence of independent users. Legacy providers without the optional interface retain receipt-driven Running behavior; internal compatibility callers that omit the terminal consumer retain their existing behavior. A provider advertising the interface but unable to produce the requested fact must deny publication.
+
+Start pending ownership is explicit. Admission without commit cannot invent reservation or invoke native execution. Admission failure/exception after commit balances exactly the retained original ancestor/guest counters; reentry refuses before recapturing owners or incrementing again. The finally path consumes that pending latch once. No second lifecycle owner or ledger is introduced.
+
+Actual CPU failure, copied/malformed/lost lookup, native history and source ABA, independent mailbox pins/containment, and admission no-commit/failure/throw/reentry are verified through the existing runtime callers. Positive actual CPU fixture produces ExecutionFailure; Completed/budget/kernel rejection mappings are not claims of successful guest execution or machine fault decoding. Original backing release remains a separate exact consumer.
+
+Local Contracts project/reference delta only; consumed external Contracts1.34.0/Runtime1.23.8 and operationSchema1.4.0 unchanged. Evidence in [consumer record](../../artifacts/v6/iteration-20261011-start-terminal-publication/report.md). Gates OFF; ProductionQualified false; Java-only skipped; ISA NONE. B1 trusted cold continuation and general B2/B3 remain open.

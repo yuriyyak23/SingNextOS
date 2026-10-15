@@ -1,0 +1,76 @@
+# Блокеры продолжения модернизации
+
+Дата: 2026-10-09, Europe/Moscow. Отчёт относится к выбранному root routing / local publication / pins / owner-interlock scope и его ближайшим зависимостям. Это анализ текущих препятствий, не вторая очередь задач: приоритеты остаются в [01-STATE-AND-BACKLOG.md](01-STATE-AND-BACKLOG.md).
+
+Локальные runtime guards и bounded reclaim consumers реализованы и проверены, но завершение общего scope не доказано. Активный goal отмечен **blocked**, а не complete. Это не означает, что запрещена любая работа по модернизации: независимый consumer можно продолжать после установления его actual producer и применимых contracts. Оставшиеся ниже recovery/production properties не следуют из green suite.
+
+## Сводка
+
+| ID | Препятствие | Classification | Что оно останавливает |
+|---|---|---|---|
+| B1 | Actual durable original-invocation routing producer не установлен | Missing / dependent producer gap | Recovery после потери всех original records/routes и перезапуска; безопасное обнаружение и адресация исходного незавершённого effect |
+| B2 | Resolved exact containment contract для неизвестного исхода original invocation не установлен в общем platform/neutral контуре | ExternalBlocked / contract gap | Reconciliation неизвестного effect, снятие quarantine/pins и последующий actual reclaim |
+| B3 | Exact executable artifact release contract/consumer отсутствует | ExternalBlocked | Завершение lifetime admitted artifact и освобождение его guest/parent backing |
+| B4 | General concurrent atomicity не доказана | Partial / weak evidence | Claim об общей атомарности между owners и внешним provider; автоматическое перенесение bounded race exits на весь runtime |
+| B5 | Producing production execution consumers/providers для ряда контуров не установлены | FutureGated | Production nested/secure/event/trap/Virtual-I/O/DMA execution и соответствующая qualification |
+| B6 | Deferred APIs не имеют dependency-ready producing consumer | Partial / not dependency-ready | Продолжение через restart/settlement/standalone pool/coherent API только по факту существования метода |
+
+## B1. Actual durable original-invocation routing producer
+
+Нужен исполняемый consumer, который связывает конкретную исходную invocation с существующими authoritative owners и сохраняет эту связь через crash/restart. Название producer не означает необходимость нового класса или новой authority: отсутствует установленная цепочка **actual call → durable original fact → replay/reconciliation consumer**.
+
+Текущий [RuntimeKernel](../../src/Runtime/SingPlus.Runtime/RuntimeKernel.cs) создаёт новый PlatformAuthorityBridge. Original root/mapping/child/secure/device и invocation facts хранятся в runtime/provider records. Существующая rematerialization/inventory логика использует surviving original references. `TryGetQuarantinedDomainBinding` в [bridge](../../src/Runtime/SingPlus.Runtime/Platform/PlatformAuthorityBridge.cs) и его kernel callers возвращают cleanup binding из этих сохранившихся фактов; это не восстановление после потери всех facts.
+
+[ResourceBudgetRecoveryJournal](../../src/Runtime/SingPlus.Runtime/Budgets/ResourceBudgetRecoveryJournal.cs) уже существует, но его payload содержит budget lease, process, amounts, provider correlation и transitions. Replay ставит conservative recovery charge/admission block. Он не восстанавливает root leases, mapping owners, исходные invocation и их routing. Journal бюджета нельзя объявить доказательством root recovery или расширить до второго ledger без установленного consumer/owner contract.
+
+**Последствие:** когда surviving original fact есть, отказ на absent/foreign route сохраняет pins и no-repeat. Когда все original references действительно потеряны, совпадение tuple, новый record или найденный provider object не доказывают продолжение исходного lifetime. Восстановление того же record вручную в тесте подтверждает только bounded retry после восстановления маршрута.
+
+**Что требуется для разблокировки:** установить actual crash/restart/reconciliation caller и его владельцев; определить, какой оригинальный факт фиксируется до возможного external effect, как сохраняются request identity, source/generation, original outcomes и exact consumption, и как replay связывает их с owners без нового permission. Затем проверить crash windows до effect, после effect до receipt/publication, после receipt до local consumption, повторный replay, повреждённый/неполный journal и actual Region/budget consequence. Это критерии необходимого контракта, а не утверждённая новая API/schema.
+
+## B2. Resolved exact containment contract
+
+Под resolved contract понимается contract реально используемого project/package/toolchain, а не только изменённый sibling source или предполагаемая возможность backend. Recorded executable adapter inputs разрешают ExternalRuntime **1.6.0**, Contracts **1.14.0**; sibling edits сами по себе этих dependencies не обновляют.
+
+Нужна гарантия, позволяющая адресовать **конкретную original invocation при потерянном/unknown исходе** и получить exact evidence об отсутствии effect либо завершённом containment/closure. Эта гарантия должна определять source/generation continuity, корреляцию original request, отказ на чужой receipt и поведение при retry/lost response. Простое перечисление объектов, NotFound, terminal status, Cancel или повторный Close не заменяет такую гарантию.
+
+Текущий [IPlatformCompletionProvider](../../src/Platform/SingPlus.Platform.Abstractions/PlatformCompletionContracts.cs) имеет `ObserveCompletion(PlatformOperationIdentity operation)`: operation уже должен быть известен. [Region revocation contract](../../src/Platform/SingPlus.Platform.Abstractions/PlatformRegionRevocationContracts.cs) выдаёт ticket после Begin; при потерянном/непригодном исходе Begin exact ticket не установлен. Legacy `RevokeRegionMapping` вообще не выдаёт completion identity. [HybridCPU provider completion lookup](../../src/Platform/SingPlus.Platform.HybridCpu/HybridCpuPlatformAuthorityProvider.Mapping.cs) читает surviving original mapping/CloseOperation; это не unknown-invocation recovery после all-fact-loss.
+
+**Важное ограничение формулировки:** специальный kernel-private [ISecureExecutionProvider](../../src/Runtime/SingPlus.Runtime/SecureCompute/SecureExecutionContracts.cs) уже имеет `CloseSecureExecution(request, receipt-or-null)` с exact original request semantics. Поэтому нельзя утверждать, что exact containment отсутствует во всех API. Этот contract относится к secure composition и не закрывает general root/neutral unknown invocation, child lifetime или artifact release; production implementation также не установлен.
+
+**Последствие:** известный exact original receipt удерживается при late publication refusal; unknown/malformed outcome остаётся quarantined/pinned. Повторный effect запрещён. Returned-object compensation может закрыть возвращённый объект, но не доказывает отсутствие другого effect исходной invocation. Local staged rollback не является provider containment.
+
+**Что требуется для разблокировки:** сначала actual recovery producer из B1 либо конкретный surviving-original reconciliation consumer; затем доказанный need на resolved contract, применимое ADR и точные guarantees provider. Только после этого API/package/toolchain extension. Verification должна включать lost response, wrong/equal-tuple foreign identity, source/epoch change, повтор reconciliation и exact local consumption с реальным reclaim. До этого сохраняются quarantine/no-repeat/pins.
+
+## B3. Exact executable artifact release
+
+Actual [INeutralChildExecutionProvider](../../tools/Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Contracts/Contracts/NeutralChildExecutionContracts.cs) содержит `BindExecutableArtifact` и `StartExecutableArtifact`. Exact release API/consumer не установлен. Admitted artifact остаётся dependency для guest/child/parent backing даже без подтверждённого execution attempt.
+
+Отказ до unmap уже реализован; это безопасный pin, а не завершённый artifact lifetime. Parent/child Close, терминальный Start, отсутствие объекта или local removal не заменяют release original artifact.
+
+**Для продолжения:** actual producer должен завершать exact admitted artifact lifetime, в том числе до Start и после unknown Start; provider contract должен подтверждать отсутствие дальнейшего artifact use/effect. После exact local consumption actual guest unmap/child closure/Region reclaim должны пройти без повторного Bind/Start и без стирания charge по metadata. До установленного contract pins сохраняются.
+
+## B4. General concurrent atomicity
+
+Existing lifecycle/owner commit gates, pending interlocks и fresh post-callback checks дают bounded managed guarantees. Concurrent secure-create overlap, reentry, throw и owner-loss consumers проверены. Однако это не доказательство общей атомарности CapabilityAuthority, ProcessRegistry, VirtualDomainAuthority, RegionAuthority, ExternalOperationAuthority, ResourceBudgetAuthority и provider lifecycle.
+
+**Останавливаемый claim:** «все факты атомарно опубликованы/потреблены» или «все cleanup races закрыты». Этот evidence gap сам по себе не мешает исправлять конкретный dependency-ready local consumer.
+
+**Для продолжения:** выбрать конкретную cross-owner операцию и actual caller, назвать её linearization и effect/publication/consumption boundaries; установить, какие комбинации overlap/owner loss должны сохранять facts. Проверять actual visibility, charges и backing. Provider callbacks остаются вне owner commit locks. Серийная модель callback и один успешный schedule не закрывают общий claim; crash durability оценивается отдельно по B1/B2.
+
+## B5–B6. Production и ещё не готовые consumers
+
+- Production implementations secure compute/secure composition в текущих src/tools не установлены. Models/fakes не подтверждают production isolation/containment. Nested/event/trap execution также не становится qualified из model/emulator tests; HybridCPU event contour остаётся blocked, production trap provider не установлен.
+- Virtual-I/O producing executable consumer не установлен; provider DMA имеет RuntimeAdmission без submit surface. Admission guard не доказывает execution/visibility/closure.
+- У `SubmitV6Restart` и `SettleResourceExternalOperation` actual production caller не установлен. `AssignPool` не имеет установленного caller с original capability/process/device tuple. Внутренний вызов backend `BindCoherentAccess` существует внутри bridge method, но upstream producing caller не установлен. Наличие API и test callback не делает эти seams dependency-ready.
+
+**Для продолжения:** concrete supported execution path, actual caller, независимые SingNext authorization/provider admission/refinement/current HybridCPU legality, precise closure guarantees и applicable evidence. Stateful resume, multi-host и physical properties не входят в текущий local exit и требуют своих contracts/ADR. Новые gates остаются OFF.
+
+## Сохранённое состояние и порядок разблокировки
+
+Локальные fixes не отменять: same original owners, canonical continuity, original outcome retention, balanced interlocks, no-repeat, exact consumed lifetime и actual reclaim guards уже имеют bounded exits. Unknown факты не превращать в closure ради green; completed exact consumption не требует новой active admission и не должно создавать вечный pin.
+
+Наиболее конкретный следующий consumer — **Faulted/unpublished original-effect reconciliation с original invocation routing**. Сначала установить producing caller и persistence/owner need, затем resolved exact containment guarantee. Artifact release — отдельная contract dependency; production execution — отдельный contour. Общая atomicity и durability не выводятся одна из другой.
+
+Evidence текущих runtime blocks: [secure/root requirement-by-requirement report](../../artifacts/v6/iteration-20261009-secure-canonical-root/report.md), [legacy original revoke report](../../artifacts/v6/iteration-20261009-legacy-revoke-original/report.md), [audit](../../artifacts/v6/iteration-20261009-legacy-revoke-original/audit.json). Последний recorded main broad: **7316 passed / 2 opt-in skipped, exit 0**. Он подтверждает свой recorded tuple и не закрывает перечисленные blockers.
+
+Этот отчёт — documentation-only: current queue/source/contracts и evidence просмотрены, ссылки проверены; build/restore/tests, runtime audit/manifest/hash refresh не выполнялись. Runtime inputs не менялись. SingPlus.Boot/Samples исключены; Java-only skipped; ISA impact NONE. ProductionQualified не заявлен. Очередь и runtime code не изменены.

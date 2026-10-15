@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "phase": "P07",
+  "claim": "RuntimeEnforced",
+  "contour": "internal host-JIT ComputeTime/Nanoseconds exact ExternalOperation-to-lease binding",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "phaseEntryHead": "8c3f55e47555b2db99356b861ee404211d072edc",
+  "reviewedHead": "8c3f55e47555b2db99356b861ee404211d072edc",
+  "enabledFeatureGates": [],
+  "owners": {
+    "correlation": "ExternalOperationAuthority",
+    "quantity": "ResourceBudgetAuthority",
+    "memory": "RegionAuthority",
+    "publication": "ExternalOperation publication owner"
+  },
+  "tests": [
+    { "lane": "P07-focused", "passed": 7, "failed": 0, "skipped": 0 },
+    { "lane": "P03-P07-external-provider-regression", "passed": 61, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui", "passed": 1631, "failed": 9, "skipped": 2, "disposition": "same unrelated historical artifacts, stale user-owned P14 tuple, and project-profile drift" }
+  ],
+  "build": { "target": "SingNextOS.slnx", "warnings": 0, "errors": 0 },
+  "ordinaryFallback": "unchanged and default; no production provider path is migrated",
+  "exclusions": [
+    "FG-VNX-EXTOP-RESOURCE-BIND remains OFF",
+    "provider receipts are evidence only",
+    "no ExecutableAdapter, NativeAOT, hardware, guarantee, or production qualification"
+  ]
+}

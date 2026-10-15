@@ -1,0 +1,15 @@
+# Порядок модернизации
+
+Пункты ниже применяются к implementation задаче. При актуализации ordinary docs выполнить semantic/diff/link review по файлу 03 и обновить выявленный drift; runtime очередь остаётся отдельной задачей.
+
+1. Прочитать applicable AGENTS, [состояние](01-STATE-AND-BACKLOG.md) и [dev validation](03-DEV-VALIDATION.md). Для выбранного seam прочитать [owners](../SingNextOS-v6-roadmap-reworked-2026-09-23/02-AUTHORITY-OWNER-MAP.md), [invariants](../SingNextOS-v6-roadmap-reworked-2026-09-23/04-NORMATIVE-INVARIANTS.md), [gates/claims](../SingNextOS-v6-roadmap-reworked-2026-09-23/05-FEATURE-GATES-AND-CLAIMS.md) и relevant contract/phase/ADR. Phase описывает target semantics, а не список отсутствующего кода; полную историю и proof matrix загружать только по необходимости.
+2. Сверить actual owners/callers/DAG и relevant report. Classify requirement: VerifiedExisting, Partial, Missing, Contradicted, ExternalBlocked или FutureGated. VerifiedExisting без drift пропустить. Назвать admission, external effect, final publication и closure/reclaim boundaries.
+3. Завершить связанный consumer блок в existing owners: behavior/fix → необходимая проверка → следующий dependency-ready consumer. Сохранить V1, exact generations, original cleanup facts и pins, callback lock discipline. Helper/API/test callback сам по себе не закрывает production consumer.
+4. Проверить final source по dev policy. Один applicable broad после согласованного shared runtime блока; состав определяется затронутым graph/риском, а не числом фаз; focused compile заменяет отдельный duplicate build. Pending verification не считать exit.
+5. Для substantive runtime блока сохранить короткие report/audit и обновить одну запись backlog. Historical evidence не переписывать.
+
+Текущий приоритет задаёт очередь в файле 01. Dependency order: применимые P04 admission → P05/P10 consequences → P03 charging → P08 restart. Уже проверенные неизменные prerequisites пропускать; зависимый contract/external blocker не останавливает независимые consumers. Остальные направления брать по concrete consumer, а не по числу checklist пунктов.
+
+Перед записью перечитать actual file и scope diff. Dirty user changes/deletions сохранять; не reset/clean/restore/commit без отдельного разрешения. Boot/Samples вне scope. HybridCPU Git использовать только после fresh metadata check; разрешён compiler/External Tools Runtime scope, ISA NONE, Java исключена.
+
+Qualification/promotion — [отдельный контур](../SingNextOS-v6-roadmap-reworked-2026-09-23/45-PROOF-EVIDENCE-INDEX.md), не обязательная кампания каждой dev итерации. Новые gates OFF до exact deployment qualification.

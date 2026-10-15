@@ -1,0 +1,24 @@
+{
+  "schema": "SingCapDefinitionOfDoneLiveMatrixV1",
+  "baseline": "472b7c9345605f1558958f0d00e4e2f1b4177fa4",
+  "items": [
+    { "number": 1, "status": "RuntimeEnforced", "evidence": ["CapabilityAuthority", "SingCapPhase02CapabilityLedgerTests", "SingCapPhase05OpaqueV2Tests"] },
+    { "number": 2, "status": "RuntimeEnforced", "evidence": ["AuthorityRealmId", "SealedObjectAuthority service incarnation tests", "old-realm and restart tests"] },
+    { "number": 3, "status": "RuntimeEnforced", "evidence": ["capability/attempt/seal/Region exhaustion tests", "independent P02-P04 evidence"] },
+    { "number": 4, "status": "RuntimeEnforced", "evidence": ["SingCapPhase03ConstraintAlgebraTests", "shared QuotaAccount"] },
+    { "number": 5, "status": "RuntimeEnforced", "evidence": ["SingCapPhase04EffectAdmissionTests", "SingCapPhase13CrossAuthorityRaceTests"] },
+    { "number": 6, "status": "RuntimeEnforced", "evidence": ["socket/file/process service paths", "SingCapPhase06SoftwareSealingTests", "NativeSystemServiceVerticalSliceTests"] },
+    { "number": 7, "status": "RuntimeEnforced", "evidence": ["RegionAuthority", "SingCapPhase07RegionHardeningTests", "ConcurrentOwnedBufferMoveHasExactlyOneWinner"] },
+    { "number": 8, "status": "RuntimeEnforced", "evidence": ["generated SIP sentries", "SingCapPhase08GeneratedSentryTests"] },
+    { "number": 9, "status": "StaticAdmission", "evidence": ["recursive generator value-schema closure", "GeneratorTests hidden mutable fields"] },
+    { "number": 10, "status": "QualifiedManaged", "evidence": ["AdmissionVerifier V13 full-module closure", "AdmissionVerifierTests", "isolated NativeAOT lane"] },
+    { "number": 11, "status": "FutureGated", "evidence": ["canonical V1/V2 audit intent and policy/package digests exist", "current proof retains only dependency/native closure digest, not itemized native inventory or an explicit AOT compiler identity", "signing/provenance policy is not implemented"] },
+    { "number": 12, "status": "RuntimeEnforced", "evidence": ["RuntimeNativeServiceHosts", "NativeSystemServiceVerticalSliceTests"] },
+    { "number": 13, "status": "RuntimeEnforced", "evidence": ["provider-neutral adapter mapping", "no HybridCPU core change"] },
+    { "number": 14, "status": "StaticAdmission", "evidence": ["HybridCPU.ExternalRuntime.Contracts 1.14.0 SHA-256 B96E99BDA066EE585B26A11CBFA7B68CE6BF44FC0006679483CCC1A4EEB678C2", "local source commit 794c4a53494f503855ac8cf209efab23fde083b2"] },
+    { "number": 15, "status": "RuntimeEnforced", "evidence": ["property/concurrency/adversarial suites", "released managed Region storage is not pooled across domains and replacement storage is zero-initialized", "P13 diagnostic performance report; no SLO or separately instrumented lock-wait claim"] },
+    { "number": 16, "status": "RuntimeEnforced", "evidence": ["P13_CLAIM_EVIDENCE_MATRIX.json", "ProductionCandidate false", "prohibitedClaims"] }
+  ],
+  "singCapMComplete": false,
+  "reasonIncomplete": "Definition-of-Done item 11 remains FutureGated; project-wide claim is not promoted above RuntimeEnforced."
+}

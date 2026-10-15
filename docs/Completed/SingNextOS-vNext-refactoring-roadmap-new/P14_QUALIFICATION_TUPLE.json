@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "phase": "P14",
+  "claim": "RuntimeEnforced",
+  "contour": "ordinary component checkpoint/fresh-generation restore plus in-process ComputeTime/provider quarantine",
+  "normativeBaseline": "6227ea7cf258ef6ffce52001d4d2ffee07355b35",
+  "phaseEntryHead": "cf66d014fd0fc19cdcabca2ef1b5b974805ecda1",
+  "reviewedHead": "cf66d014fd0fc19cdcabca2ef1b5b974805ecda1",
+  "enabledFeatureGates": [],
+  "tests": [
+    { "lane": "checkpoint-resource-provider-ABA", "passed": 26, "failed": 0, "skipped": 0 },
+    { "lane": "full-non-gui", "passed": 1653, "failed": 9, "skipped": 2, "disposition": "same unrelated baseline failures" }
+  ],
+  "build": { "target": "SingNextOS.slnx", "warnings": 0, "errors": 0 },
+  "ordinaryFallback": "unchanged",
+  "exclusions": [
+    "no cold runtime-process recovery or durable quarantine journal",
+    "no authority resurrection or automatic refund/reclaim",
+    "no non-compute family, hardware or production claim"
+  ]
+}
