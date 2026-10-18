@@ -1,0 +1,15 @@
+spawn region-owner
+spawn region-borrower
+alloc 5000 64
+borrow-channel 5000 5001
+borrow 5000 1 1
+recv 5001 1
+why-move 5000 1
+why-free 5000 1
+borrow-return 5001 1
+why-move 5000 1
+why-free 5000 1
+free 1
+stop 5000
+stop 5001
+exit

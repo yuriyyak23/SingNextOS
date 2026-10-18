@@ -1,0 +1,17 @@
+# Fresh session with --budget. No preceding demos.
+spawn external-control
+alloc 5000 64
+external-prepare 5000 1
+external 5000 1
+region-uses 1
+external-admit 5000 1
+region-uses 1
+budget
+external-cancel 5000 1
+region-uses 1
+external-release 5000 1
+region-uses 1
+budget
+free 1
+stop 5000
+exit

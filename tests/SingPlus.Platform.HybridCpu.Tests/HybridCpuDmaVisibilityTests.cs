@@ -1,0 +1,192 @@
+using SingPlus.Contracts;
+using SingPlus.Runtime;
+using YAKSys_Hybrid_CPU.Core;
+
+namespace SingPlus.Platform.HybridCpu.Tests;
+
+public sealed class HybridCpuDmaVisibilityTests
+{
+    [Theory]
+    [InlineData(false, false)][InlineData(true, false)]
+    [InlineData(false, true)][InlineData(true, true)]
+    public void ForeignOrAbsentCycleRouteCannotConsumeOriginalKernelVisibility(bool absent, bool acquire)
+    {
+        var runtime = global::System.Reflection.DispatchProxy.Create<INeutralDomainRuntime, ChildClosureTupleTests.RootCloseRuntimeProxy>();
+        var proxy = (ChildClosureTupleTests.RootCloseRuntimeProxy)(object)runtime;
+        var provider = new HybridCpuPlatformAuthorityProvider(runtime);
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = HybridCpuPlatformAuthorityProviderTests.CreateProcess(kernel, 91, 910, 1);
+        var (device, mapping) = CreateAuthorities(kernel, subject);
+        var grant = kernel.BindPlatformDma(subject, device, mapping, 0, 64, PlatformDmaDirection.Bidirectional).Value!;
+        Assert.True(kernel.PreparePlatformDmaForDevice(subject, grant).IsSuccess);
+        var flags = global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.NonPublic;
+        var states = (global::System.Collections.IDictionary)provider.GetType().GetField("_dmaVisibilityStates", flags)!.GetValue(provider)!;
+        var key = states.Keys.Cast<object>().Single();
+        var original = states[key]!;
+        if (absent) states.Remove(key);
+        else states[key] = typeof(object).GetMethod("MemberwiseClone", flags)!.Invoke(original, null)!;
+        Assert.False(acquire ? kernel.AcquirePlatformDmaForCpu(subject, grant).IsSuccess : kernel.PreparePlatformDmaForDevice(subject, grant).IsSuccess);
+        Assert.Equal(1, proxy.DmaPrepareCalls);
+        Assert.Equal(0, proxy.DmaAcquireCalls);
+        Assert.False((bool)original.GetType().GetProperty("Acquired")!.GetValue(original)!);
+        Assert.Equal(RegionState.Owned, Assert.Single(kernel.Regions.Snapshot()).State);
+        states[key] = original;
+        var grants = (global::System.Collections.IDictionary)provider.GetType().GetField("_dmaGrants", flags)!.GetValue(provider)!;
+        var owner = grants.Values.Cast<object>().Single();
+        var providerGrant = (PlatformProviderDmaGrant)owner.GetType().GetProperty("Grant")!.GetValue(owner)!;
+        Assert.True(provider.AcquireDmaGrantVisibility(providerGrant).IsSuccess);
+        Assert.True((bool)original.GetType().GetProperty("Acquired")!.GetValue(original)!);
+        Assert.Equal(1, proxy.DmaAcquireCalls);
+        Assert.False(provider.AcquireDmaGrantVisibility(providerGrant).IsSuccess);
+        Assert.Equal(1, proxy.DmaAcquireCalls);
+        Assert.True(provider.RevokeDmaGrant(providerGrant).IsSuccess);
+        Assert.Equal(0, proxy.Runtime.ActiveDmaGrantCount);
+    }
+
+    [Fact]
+    public void RealProviderPreparesAndAcquiresExactNonCoherentDmaCycle()
+    {
+        var runtime = new NeutralDomainRuntimeFacade();
+        var provider = new HybridCpuPlatformAuthorityProvider(runtime);
+        var kernel = new RuntimeKernel(provider);
+        var (_, subject) = HybridCpuPlatformAuthorityProviderTests.CreateProcess(kernel, 91, 910, 1);
+        var (device, mapping) = CreateAuthorities(kernel, subject);
+        var grant = kernel.BindPlatformDma(
+            subject,
+            device,
+            mapping,
+            32,
+            128,
+            PlatformDmaDirection.Bidirectional).Value!;
+
+        var prepare = kernel.PreparePlatformDmaForDevice(subject, grant);
+        Assert.True(prepare.IsSuccess, prepare.Message);
+        Assert.True(prepare.Value!.IsSatisfied);
+        Assert.Equal(PlatformMemoryVisibilityRequirement.PublicationFence, prepare.Value.Requirement);
+        Assert.Equal(1, runtime.ActiveDmaGrantCount);
+        Assert.Equal(1, runtime.ActiveOwnedRegionMappingCount);
+
+        var acquire = kernel.AcquirePlatformDmaForCpu(subject, grant);
+        Assert.True(acquire.IsSuccess, acquire.Message);
+        Assert.True(acquire.Value!.IsSatisfied);
+        Assert.Equal(prepare.Value.Cycle, acquire.Value.Cycle);
+        Assert.Equal(PlatformMemoryAcquireRequirement.AcquisitionFence, acquire.Value.Requirement);
+        Assert.Equal(1, runtime.ActiveDmaGrantCount);
+        Assert.Equal(1, runtime.ActiveOwnedRegionMappingCount);
+
+        Assert.NotEqual(typeof(PlatformDmaVisibilityCycle), typeof(PlatformProviderDmaVisibilityCycle));
+        Assert.NotEqual(typeof(PlatformDmaVisibilityCycle), typeof(NeutralDmaVisibilityCycle));
+        Assert.NotEqual(typeof(PlatformProviderDmaVisibilityCycle), typeof(NeutralDmaVisibilityCycle));
+    }
+
+    [Fact]
+    public void RealProviderRequiresPrepareBeforePostWriteAcquireAndReadOnlyNeedsNoAcquire()
+    {
+        var writerRuntime = new NeutralDomainRuntimeFacade();
+        var writerKernel = new RuntimeKernel(new HybridCpuPlatformAuthorityProvider(writerRuntime));
+        var (_, writerSubject) = HybridCpuPlatformAuthorityProviderTests.CreateProcess(writerKernel, 92, 920, 1);
+        var (writerDevice, writerMapping) = CreateAuthorities(writerKernel, writerSubject);
+        var writerGrant = writerKernel.BindPlatformDma(
+            writerSubject,
+            writerDevice,
+            writerMapping,
+            0,
+            64,
+            PlatformDmaDirection.DeviceWritesMemory).Value!;
+        Assert.Equal(
+            KernelError.PlatformDenied,
+            writerKernel.AcquirePlatformDmaForCpu(writerSubject, writerGrant).Error);
+
+        var readerRuntime = new NeutralDomainRuntimeFacade();
+        var readerKernel = new RuntimeKernel(new HybridCpuPlatformAuthorityProvider(readerRuntime));
+        var (_, readerSubject) = HybridCpuPlatformAuthorityProviderTests.CreateProcess(readerKernel, 93, 930, 1);
+        var (readerDevice, readerMapping) = CreateAuthorities(readerKernel, readerSubject);
+        var readerGrant = readerKernel.BindPlatformDma(
+            readerSubject,
+            readerDevice,
+            readerMapping,
+            0,
+            64,
+            PlatformDmaDirection.DeviceReadsMemory).Value!;
+        Assert.True(readerKernel.PreparePlatformDmaForDevice(readerSubject, readerGrant).IsSuccess);
+        Assert.Equal(
+            KernelError.PlatformDenied,
+            readerKernel.AcquirePlatformDmaForCpu(readerSubject, readerGrant).Error);
+    }
+
+    [Fact]
+    public void OriginalCopyV5HasManagedBackingSurfaceWithoutExecutablePromotion()
+    {
+        var provider = new HybridCpuPlatformAuthorityProvider(new NeutralDomainRuntimeFacade());
+        var dma = provider.QueryFeatures().Resolve(PlatformFeatureFamily.DmaMapping);
+
+        Assert.Equal(PlatformDmaCopySubmissionContract.ContractVersion, dma.ContractVersion);
+        Assert.Equal(5U, dma.ContractVersion);
+        Assert.Equal(PlatformFeatureAvailability.RuntimeAdmission, dma.Availability);
+        Assert.NotEqual(PlatformFeatureAvailability.Executable, dma.Availability);
+
+        var providerMethods = typeof(HybridCpuPlatformAuthorityProvider)
+            .GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance)
+            .Select(static method => method.Name)
+            .ToArray();
+        Assert.Contains(nameof(IPlatformDmaVisibilityProvider.PrepareDmaGrantVisibility), providerMethods);
+        Assert.Contains(nameof(IPlatformDmaVisibilityProvider.AcquireDmaGrantVisibility), providerMethods);
+        Assert.Contains(nameof(IPlatformDmaCopyBackingProvider.SubmitDmaCopy),providerMethods);
+        Assert.IsAssignableFrom<IPlatformOriginalDmaCopyProvider>(provider);
+        Assert.IsAssignableFrom<IPlatformDmaCompletionProvider>(provider);
+        Assert.False(provider is IPlatformDmaSubmissionProvider); // No unbound single-leg effect.
+    }
+
+    private static (PlatformDeviceLease Device, PlatformOwnedRegionSliceMapping Mapping)
+        CreateAuthorities(RuntimeKernel kernel, ProcessHandle subject)
+    {
+        var binding = kernel.BindPlatformDomain(subject).Value!;
+        var deviceCapability = Mint(
+            kernel,
+            subject,
+            ResourceKind.Device,
+            "device/dma-visibility0",
+            CapabilityRights.Read | CapabilityRights.Write | CapabilityRights.Configure);
+        var device = kernel.BindPlatformDevice(
+            subject,
+            binding,
+            deviceCapability,
+            PlatformDeviceRights.Read | PlatformDeviceRights.Write | PlatformDeviceRights.Configure).Value!;
+
+        var buffer = kernel.AllocateBuffer<byte>(subject, 1024).Value!;
+        var regionCapability = Mint(
+            kernel,
+            subject,
+            ResourceKind.MemoryRegion,
+            CapabilityResourceIds.MemoryRegion(buffer.Handle.RegionId),
+            CapabilityRights.Map | CapabilityRights.Read | CapabilityRights.Write);
+        var mapping = kernel.MapPlatformOwnedRegionSlice(
+            subject,
+            binding,
+            regionCapability,
+            buffer.Handle,
+            128,
+            512,
+            PlatformMemoryAccess.Read | PlatformMemoryAccess.Write).Value!;
+        return (device, mapping);
+    }
+
+    private static CapabilityId Mint(
+        RuntimeKernel kernel,
+        ProcessHandle subject,
+        ResourceKind kind,
+        string resourceId,
+        CapabilityRights rights)
+    {
+        var process = kernel.Processes.Resolve(subject);
+        Assert.True(process.IsSuccess, process.Message);
+        var minted = kernel.MintCapability(
+            process.Value!.DomainId,
+            subject,
+            kind,
+            resourceId,
+            rights);
+        Assert.True(minted.IsSuccess, minted.Message);
+        return minted.Value!.CapabilityId;
+    }
+}

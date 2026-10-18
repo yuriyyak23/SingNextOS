@@ -1,0 +1,11 @@
+counter-start desktop
+counter-call desktop 41
+counter-call desktop -2
+counters
+ps
+counter-stop desktop
+counter-start desktop
+counter-call desktop 100
+counter-stop desktop
+counters
+exit

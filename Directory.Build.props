@@ -1,0 +1,31 @@
+<Project>
+  <PropertyGroup>
+    <LangVersion>13.0</LangVersion>
+    <!-- Opt-in qualification: dotnet test tests/SingPlus.Tests/SingPlus.Tests.csproj -p:SingPlusPreviewLanguage=true -->
+    <LangVersion Condition="'$(SingPlusPreviewLanguage)' == 'true'">preview</LangVersion>
+    <DefineConstants Condition="'$(SingPlusPreviewLanguage)' == 'true'">$(DefineConstants);SINGPLUS_PREVIEW_LANGUAGE</DefineConstants>
+    <AnalysisLevel>11.0</AnalysisLevel>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+    <SingPlusEnableAnalyzers Condition="'$(SingPlusProfile)' == 'Kernel' or '$(SingPlusProfile)' == 'Sip' or '$(SingPlusProfile)' == 'Driver'">true</SingPlusEnableAnalyzers>
+    <SingPlusEnableGenerators Condition="'$(SingPlusProfile)' == 'Kernel' or '$(SingPlusProfile)' == 'Sip' or '$(SingPlusProfile)' == 'Driver'">true</SingPlusEnableGenerators>
+    <SingPlusEnableAdmission Condition="'$(SingPlusProfile)' == 'Kernel'">true</SingPlusEnableAdmission>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(SingPlusEnableAnalyzers)' == 'true' and '$(MSBuildProjectName)' != 'SingPlus.Analyzers' and '$(MSBuildProjectName)' != 'SingPlus.Generators'">
+    <ProjectReference Include="$(MSBuildThisFileDirectory)sdk/SingPlus.Analyzers/SingPlus.Analyzers.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(SingPlusEnableGenerators)' == 'true' and '$(MSBuildProjectName)' != 'SingPlus.Generators'">
+    <ProjectReference Include="$(MSBuildThisFileDirectory)sdk/SingPlus.Generators/SingPlus.Generators.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(SingPlusEnableAdmission)' == 'true' and '$(SingPlusAdmissionRoot)' != ''">
+    <ProjectReference Include="$(MSBuildThisFileDirectory)tools/SingPlus.Admission/SingPlus.Admission.csproj" ReferenceOutputAssembly="false" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(SingPlusProfile)' != ''">
+    <CompilerVisibleProperty Include="SingPlusProfile" />
+    <CompilerVisibleProperty Include="SingPlusMemoryProfile" />
+  </ItemGroup>
+</Project>

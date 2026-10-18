@@ -1,0 +1,419 @@
+using SingPlus.Contracts;
+using SingPlus.Runtime;
+using SingPlus.Sip;
+
+namespace SingPlus.Tests.Contracts;
+
+public sealed class ResponsePublicationRuntimeTests
+{
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void CohortResponseRetirementRequiresOriginalRegionAndFinalDomainSettlement(bool substitutedEvidence)
+    {
+        var (kernel,left,right,endpoints)=CreateChannel();
+        var peer=TestFixtures.Create(kernel,403,410).Handle;
+        var cap=kernel.MintCapability(new(410),left,ResourceKind.KernelService,CapabilityResourceIds.BudgetAdministration,CapabilityRights.Configure).Value!.CapabilityId;
+        var budget=kernel.AdmitProcessBudget(left,cap,left,"cohort-polling",[new(ServiceBudgetDimension.OwnedMemoryBytes,64)]).Value!.ProcessBudget;
+        var independent=kernel.AllocateBuffer<int>(right,4).Value!;independent.Span.Fill(99);
+        var bytes=kernel.AllocateBuffer<int>(right,4).Value!;bytes.Span.Fill(42);
+        var request=kernel.Send(left,right,endpoints.Left,3).Value!;Assert.True(kernel.Receive(right,endpoints.Right).IsSuccess);
+        var raw=kernel.PublishResponse(right,endpoints.Right,request.Sequence,bytes);Assert.True(raw.IsSuccess);
+        var projection=Assert.IsType<OwnedBuffer<int>>(raw.Value!.Payload);
+        Assert.True(kernel.Channels.Close(endpoints.Left).IsSuccess);
+        const global::System.Reflection.BindingFlags flags=global::System.Reflection.BindingFlags.Instance|global::System.Reflection.BindingFlags.NonPublic;
+        var responses=typeof(RuntimeKernel).GetProperty("Responses",flags)!.GetValue(kernel)!;
+        var retained=(global::System.Collections.IDictionary)responses.GetType().GetField("_ownedChannels",flags)!.GetValue(responses)!;
+        var channel=retained[endpoints.Left.ChannelId]!;
+        var completions=(global::System.Collections.IDictionary)channel.GetType().GetProperty("OwnedCompletions")!.GetValue(channel)!;
+        var completion=completions[request.Sequence]!;
+        var region=completion.GetType().GetProperty("OriginalPublishedRegion")!;var owner=completion.GetType().GetProperty("OriginalPublishedRegionOwner")!;
+        var originalRegion=region.GetValue(completion);var originalOwner=owner.GetValue(completion);
+        if(substitutedEvidence)
+        {
+            var released=kernel.AllocateBuffer<int>(right,4).Value!;var evidence=kernel.Regions.CaptureOriginalAccountingOwner(released.Handle);
+            Assert.True(kernel.ReleaseRegion(right,released).IsSuccess);region.SetValue(completion,released.Handle);owner.SetValue(completion,evidence);
+        }
+        Assert.True(kernel.TerminateProcess(left).IsSuccess);
+        Assert.Equal(RegionState.Owned,kernel.Regions.Snapshot().Single(r=>r.Handle==projection.Handle).State);
+        Assert.Equal(16UL,kernel.QueryBudget(budget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.True(retained.Contains(endpoints.Left.ChannelId));
+        region.SetValue(completion,originalRegion);owner.SetValue(completion,originalOwner);
+        Assert.True(kernel.TerminateProcess(peer).IsSuccess);
+        Assert.Equal(RegionState.Released,kernel.Regions.Snapshot().Single(r=>r.Handle==projection.Handle).State);
+        Assert.Equal(0UL,kernel.QueryBudget(budget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.False(retained.Contains(endpoints.Left.ChannelId));Assert.All(independent.Span.ToArray(),b=>Assert.Equal(99,b));
+    }
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void RequesterExitRetiresOnlyReclaimedClosedOwnershipResponse(bool pinnedUse)
+    {
+        var (kernel,left,right,endpoints)=CreateChannel();
+        var cap=kernel.MintCapability(new(410),left,ResourceKind.KernelService,CapabilityResourceIds.BudgetAdministration,CapabilityRights.Configure).Value!.CapabilityId;
+        var budget=kernel.AdmitProcessBudget(left,cap,left,"exit-polling",[new(ServiceBudgetDimension.OwnedMemoryBytes,64)]).Value!.ProcessBudget;
+        var foreign=kernel.AllocateBuffer<int>(right,4).Value!;foreign.Span.Fill(99);
+        var bytes=kernel.AllocateBuffer<int>(right,4).Value!;bytes.Span.Fill(42);
+        var request=kernel.Send(left,right,endpoints.Left,3).Value!;Assert.True(kernel.Receive(right,endpoints.Right).IsSuccess);
+        var published=kernel.PublishResponse(right,endpoints.Right,request.Sequence,bytes);Assert.True(published.IsSuccess);
+        var projection=Assert.IsType<OwnedBuffer<int>>(published.Value!.Payload);
+        var principal=new RegionOwner(new(410),left.Generation);
+        Assert.True(kernel.Channels.Close(endpoints.Left).IsSuccess);
+        const global::System.Reflection.BindingFlags flags=global::System.Reflection.BindingFlags.Instance|global::System.Reflection.BindingFlags.NonPublic;
+        var responses=typeof(RuntimeKernel).GetProperty("Responses",flags)!.GetValue(kernel)!;
+        var retained=(global::System.Collections.IDictionary)responses.GetType().GetField("_ownedChannels",flags)!.GetValue(responses)!;
+        Assert.True(retained.Contains(endpoints.Left.ChannelId));
+        if(pinnedUse)
+        {
+            var charge=Assert.Single(kernel.Budgets.OriginalRegionCharges(projection.Handle));
+            var reservations=(global::System.Collections.IDictionary)kernel.Budgets.GetType().GetField("_reservations",flags)!.GetValue(kernel.Budgets)!;
+            var original=reservations[charge.Reservation.ReservationId]!;reservations.Remove(charge.Reservation.ReservationId);
+            Assert.False(kernel.TerminateProcess(left).IsSuccess);Assert.True(retained.Contains(endpoints.Left.ChannelId));
+            Assert.Equal(16UL,kernel.QueryBudget(budget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+            reservations[charge.Reservation.ReservationId]=original;
+        }
+        var exited=kernel.TerminateProcess(left);Assert.True(exited.IsSuccess,exited.Message);
+        Assert.Equal(RegionState.Released,kernel.Regions.Snapshot().Single(r=>r.Handle==projection.Handle).State);
+        Assert.Equal(0UL,kernel.QueryBudget(budget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.False(retained.Contains(endpoints.Left.ChannelId));
+        Assert.False(kernel.ReceiveResponse(left,endpoints.Left).IsSuccess);Assert.All(foreign.Span.ToArray(),b=>Assert.Equal(99,b));
+    }
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public void ForeignReleasedRegionEvidenceCannotBypassOriginalExitSettlement(bool substitute)
+    {
+        var (kernel,left,right,endpoints)=CreateChannel();
+        var cap=kernel.MintCapability(new(410),left,ResourceKind.KernelService,CapabilityResourceIds.BudgetAdministration,CapabilityRights.Configure).Value!.CapabilityId;
+        var budget=kernel.AdmitProcessBudget(left,cap,left,"exit-polling",[new(ServiceBudgetDimension.OwnedMemoryBytes,64)]).Value!.ProcessBudget;
+        var foreign=kernel.AllocateBuffer<int>(right,4).Value!;foreign.Span.Fill(99);
+        var bytes=kernel.AllocateBuffer<int>(right,4).Value!;bytes.Span.Fill(42);
+        var request=kernel.Send(left,right,endpoints.Left,3).Value!;Assert.True(kernel.Receive(right,endpoints.Right).IsSuccess);
+        var published=kernel.PublishResponse(right,endpoints.Right,request.Sequence,bytes);Assert.True(published.IsSuccess);
+        var projection=Assert.IsType<OwnedBuffer<int>>(published.Value!.Payload);
+        var principal=new RegionOwner(new(410),left.Generation);
+        Assert.True(kernel.Channels.Close(endpoints.Left).IsSuccess);
+        const global::System.Reflection.BindingFlags flags=global::System.Reflection.BindingFlags.Instance|global::System.Reflection.BindingFlags.NonPublic;
+        var responses=typeof(RuntimeKernel).GetProperty("Responses",flags)!.GetValue(kernel)!;
+        var retained=(global::System.Collections.IDictionary)responses.GetType().GetField("_ownedChannels",flags)!.GetValue(responses)!;
+        Assert.True(retained.Contains(endpoints.Left.ChannelId));
+        if(true)
+        {
+            var record=retained[endpoints.Left.ChannelId]!;
+            var completions=(global::System.Collections.IDictionary)record.GetType().GetProperty("OwnedCompletions")!.GetValue(record)!;
+            var completion=completions[request.Sequence]!;
+            var regionProperty=completion.GetType().GetProperty("OriginalPublishedRegion")!;
+            var ownerProperty=completion.GetType().GetProperty("OriginalPublishedRegionOwner")!;
+            var originalRegion=regionProperty.GetValue(completion);var originalOwner=ownerProperty.GetValue(completion);
+            if(substitute)
+            {
+                var released=kernel.AllocateBuffer<int>(right,4).Value!;
+                var otherOwner=kernel.Regions.CaptureOriginalAccountingOwner(released.Handle);
+                Assert.True(kernel.ReleaseRegion(right,released).IsSuccess);
+                regionProperty.SetValue(completion,released.Handle);ownerProperty.SetValue(completion,otherOwner);
+            }
+            var charge=Assert.Single(kernel.Budgets.OriginalRegionCharges(projection.Handle));
+            var reservations=(global::System.Collections.IDictionary)kernel.Budgets.GetType().GetField("_reservations",flags)!.GetValue(kernel.Budgets)!;
+            var original=reservations[charge.Reservation.ReservationId]!;reservations.Remove(charge.Reservation.ReservationId);
+            Assert.False(kernel.TerminateProcess(left).IsSuccess);Assert.True(retained.Contains(endpoints.Left.ChannelId));
+            Assert.Equal(16UL,kernel.QueryBudget(budget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+            regionProperty.SetValue(completion,originalRegion);ownerProperty.SetValue(completion,originalOwner);
+            reservations[charge.Reservation.ReservationId]=original;
+        }
+        var exited=kernel.TerminateProcess(left);Assert.True(exited.IsSuccess,exited.Message);
+        Assert.Equal(RegionState.Released,kernel.Regions.Snapshot().Single(r=>r.Handle==projection.Handle).State);
+        Assert.Equal(0UL,kernel.QueryBudget(budget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.False(retained.Contains(endpoints.Left.ChannelId));
+        Assert.False(kernel.ReceiveResponse(left,endpoints.Left).IsSuccess);Assert.All(foreign.Span.ToArray(),b=>Assert.Equal(99,b));
+    }
+    [Fact]
+    public void PollingOwnershipResponseRemainsConsumableAfterOriginalChannelClose()
+    {
+        var (kernel,left,right,endpoints)=CreateChannel();
+        var cap=kernel.MintCapability(new(410),left,ResourceKind.KernelService,CapabilityResourceIds.BudgetAdministration,CapabilityRights.Configure).Value!.CapabilityId;
+        var budget=kernel.AdmitProcessBudget(left,cap,left,"closed-polling",[new(ServiceBudgetDimension.OwnedMemoryBytes,64)]).Value!.ProcessBudget;
+        var bytes=kernel.AllocateBuffer<int>(right,4).Value!;bytes.Span.Fill(42);
+        var request=kernel.Send(left,right,endpoints.Left,3).Value!;Assert.True(kernel.Receive(right,endpoints.Right).IsSuccess);
+        Assert.True(kernel.PublishResponse(right,endpoints.Right,request.Sequence,bytes).IsSuccess);
+        Assert.False(kernel.ReceiveResponse(left,endpoints.Left with {Generation=endpoints.Left.Generation+1}).IsSuccess);
+        Assert.True(kernel.Channels.Close(endpoints.Left).IsSuccess);
+        Assert.False(kernel.ReceiveResponse(left,endpoints.Left with {Generation=endpoints.Left.Generation+1}).IsSuccess);
+        Assert.Equal(16UL,kernel.QueryBudget(budget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+        Assert.False(kernel.ReceiveResponse(right,endpoints.Left).IsSuccess);
+        var received=kernel.ReceiveResponse(left,endpoints.Left);Assert.True(received.IsSuccess,received.Message);
+        var output=Assert.IsType<OwnedBuffer<int>>(received.Value!.Payload);Assert.All(output.Span.ToArray(),b=>Assert.Equal(42,b));
+        Assert.False(kernel.ReceiveResponse(left,endpoints.Left).IsSuccess);
+        Assert.True(kernel.ReleaseRegion(left,output).IsSuccess);
+        Assert.Equal(0UL,kernel.QueryBudget(budget).Value!.Usage.Single(u=>u.Dimension==ServiceBudgetDimension.OwnedMemoryBytes).Used);
+    }
+    private readonly record struct Packet(int PayloadSize, int MaxPayloadSize) : IBoundedPayload;
+
+    [Fact]
+    [Trait("Category", "Runtime")]
+    public void PrimitiveResponseIsValidatedBeforeClientVisiblePublication()
+    {
+        var (kernel, left, right, endpoints) = CreateChannel();
+        var sent = kernel.Send(left, right, endpoints.Left, 1);
+        Assert.True(sent.IsSuccess, sent.Message);
+
+        var early = kernel.PublishResponse(right, endpoints.Right, sent.Value!.Sequence, 7);
+        Assert.False(early.IsSuccess);
+        Assert.Equal(KernelError.ResponseNotDelivered, early.Error);
+
+        Assert.True(kernel.Receive(right, endpoints.Right).IsSuccess);
+        var wrongType = kernel.PublishResponse(right, endpoints.Right, sent.Value.Sequence, 7u);
+        Assert.False(wrongType.IsSuccess);
+        Assert.Equal(KernelError.UnsupportedPayload, wrongType.Error);
+
+        var invisible = kernel.ReceiveResponse(left, endpoints.Left);
+        Assert.False(invisible.IsSuccess);
+        Assert.Equal(KernelError.ResponseNotAvailable, invisible.Error);
+
+        var publish = kernel.PublishResponse(right, endpoints.Right, sent.Value.Sequence, 7);
+        Assert.True(publish.IsSuccess, publish.Message);
+        var received = kernel.ReceiveResponse(left, endpoints.Left);
+        Assert.True(received.IsSuccess, received.Message);
+        Assert.Equal(sent.Value.Sequence, received.Value!.RequestSequence);
+        Assert.Equal((uint)1, received.Value.MessageId);
+        Assert.Equal(ResponsePublicationStatus.Published, received.Value.Status);
+        Assert.Equal(7, Assert.IsType<int>(received.Value.Payload));
+    }
+
+    [Fact]
+    [Trait("Category", "Runtime")]
+    public void CancellationIsExplicitAndClientVisible()
+    {
+        var (kernel, left, right, endpoints) = CreateChannel();
+        var sent = kernel.Send(left, right, endpoints.Left, 2);
+        Assert.True(sent.IsSuccess, sent.Message);
+        Assert.True(kernel.Receive(right, endpoints.Right).IsSuccess);
+
+        var cancel = kernel.CancelResponse(right, endpoints.Right, sent.Value!.Sequence);
+        Assert.True(cancel.IsSuccess, cancel.Message);
+
+        var received = kernel.ReceiveResponse(left, endpoints.Left);
+        Assert.True(received.IsSuccess, received.Message);
+        Assert.Equal(ResponsePublicationStatus.Cancelled, received.Value!.Status);
+        Assert.Null(received.Value.Payload);
+
+        var latePublish = kernel.PublishResponse(right, endpoints.Right, sent.Value.Sequence);
+        Assert.False(latePublish.IsSuccess);
+        Assert.Equal(KernelError.ResponseNotPending, latePublish.Error);
+    }
+
+    [Fact]
+    [Trait("Category", "Runtime")]
+    public void DeclaredCancellationTransitionRestoresProtocolStateAtomically()
+    {
+        var kernel = new RuntimeKernel();
+        var (_, left) = TestFixtures.Create(kernel, 421, 4210);
+        var (_, right) = TestFixtures.Create(kernel, 422, 4220);
+        var protocol = new ProtocolDefinitionV1(
+            "CancellationStateProtocol", "cancel-state-digest", "Idle", null,
+            [new ProtocolMessageDescriptorV1(1, "Begin")],
+            [new ProtocolTransitionV1(1, "Idle", "Busy")],
+            [new ProtocolCancellationTransitionV1(1, "Busy", "Idle")]);
+        var responses = new ResponseProtocolDefinitionV1(
+            protocol.ContractName, "cancel-state-response", [new ResponseMessageDescriptorV1(1, "Begin")]);
+        var endpoints = kernel.CreateChannel(left, right, protocol, responses, 8).Value;
+        var sent = kernel.Send(left, right, endpoints.Left, 1).Value!;
+        Assert.Equal("Busy", kernel.Channels.GetEndpoint(endpoints.Left).Value!.ProtocolState);
+        Assert.True(kernel.Receive(right, endpoints.Right).IsSuccess);
+
+        var cancelled = kernel.CancelResponse(right, endpoints.Right, sent.Sequence);
+
+        Assert.True(cancelled.IsSuccess, cancelled.Message);
+        Assert.Equal("Idle", kernel.Channels.GetEndpoint(endpoints.Left).Value!.ProtocolState);
+        Assert.True(kernel.Send(left, right, endpoints.Left, 1).IsSuccess);
+    }
+
+    [Fact]
+    [Trait("Category", "Runtime")]
+    public void OwnershipResponseTransfersOnlyAtPublicationBoundary()
+    {
+        var (kernel, left, right, endpoints) = CreateChannel();
+        var responseBuffer = kernel.AllocateBuffer<int>(right, 4).Value!;
+        responseBuffer.Span[0] = 42;
+        var originalGeneration = responseBuffer.Handle.Generation;
+
+        var sent = kernel.Send(left, right, endpoints.Left, 3);
+        Assert.True(sent.IsSuccess, sent.Message);
+        Assert.True(kernel.Receive(right, endpoints.Right).IsSuccess);
+
+        var publish = kernel.PublishResponse(right, endpoints.Right, sent.Value!.Sequence, responseBuffer);
+        Assert.True(publish.IsSuccess, publish.Message);
+        Assert.False(responseBuffer.IsValid);
+
+        var received = kernel.ReceiveResponse(left, endpoints.Left);
+        Assert.True(received.IsSuccess, received.Message);
+        var moved = Assert.IsType<OwnedBuffer<int>>(received.Value!.Payload);
+        Assert.True(moved.IsValid);
+        Assert.Equal(originalGeneration.Value + 1, moved.Handle.Generation.Value);
+        Assert.Equal(42, moved.Span[0]);
+        Assert.True(kernel.ReleaseRegion(left, moved).IsSuccess);
+    }
+
+    [Fact]
+    public async Task OwnershipResponseAndRequesterTeardownLeaveNoRegionOwnedByExitedRequester()
+    {
+        for (var iteration = 0; iteration < 16; iteration++)
+        {
+            var (kernel, left, right, endpoints) = CreateChannel();
+            var buffer = kernel.AllocateBuffer<int>(right, 4).Value!;
+            var request = kernel.Send(left, right, endpoints.Left, 3).Value!;
+            Assert.True(kernel.Receive(right, endpoints.Right).IsSuccess);
+            var start = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var publish = Task.Run(async () =>
+            {
+                await start.Task;
+                return kernel.PublishResponse(right, endpoints.Right, request.Sequence, buffer);
+            });
+            var teardown = Task.Run(async () =>
+            {
+                await start.Task;
+                return kernel.TerminateProcess(left);
+            });
+            start.SetResult(true);
+            await Task.WhenAll(publish, teardown).WaitAsync(TimeSpan.FromSeconds(5));
+            var closed = await teardown;
+            Assert.True(closed.IsSuccess, closed.Message);
+            Assert.DoesNotContain(kernel.Regions.Snapshot(), item =>
+                item.Owner.DomainId == new DomainId(410) && item.State != RegionState.Released);
+        }
+    }
+
+    [Fact]
+    [Trait("Category", "Runtime")]
+    public void WrongOwnershipResponseKindFailsWithoutOwnershipMutation()
+    {
+        var (kernel, left, right, endpoints) = CreateChannel();
+        var wrongPayload = kernel.AllocateRegion(right, 99).Value!;
+        var originalHandle = wrongPayload.Handle;
+
+        var sent = kernel.Send(left, right, endpoints.Left, 3);
+        Assert.True(sent.IsSuccess, sent.Message);
+        Assert.True(kernel.Receive(right, endpoints.Right).IsSuccess);
+
+        var publish = kernel.PublishResponse(right, endpoints.Right, sent.Value!.Sequence, wrongPayload);
+        Assert.False(publish.IsSuccess);
+        Assert.Equal(KernelError.UnsupportedPayload, publish.Error);
+        Assert.True(wrongPayload.IsValid);
+        Assert.Equal(originalHandle, wrongPayload.Handle);
+
+        Assert.True(kernel.CancelResponse(right, endpoints.Right, sent.Value.Sequence).IsSuccess);
+        Assert.Equal(ResponsePublicationStatus.Cancelled, kernel.ReceiveResponse(left, endpoints.Left).Value!.Status);
+        Assert.True(kernel.ReleaseRegion(right, wrongPayload).IsSuccess);
+    }
+
+    [Fact]
+    [Trait("Category", "Runtime")]
+    public void BoundedResponseMustMatchContractTypeAndLimitBeforePublication()
+    {
+        var (kernel, left, right, endpoints) = CreateChannel();
+        var sent = kernel.Send(left, right, endpoints.Left, 4);
+        Assert.True(sent.IsSuccess, sent.Message);
+        Assert.True(kernel.Receive(right, endpoints.Right).IsSuccess);
+
+        var wrongLimit = kernel.PublishResponse(right, endpoints.Right, sent.Value!.Sequence, new Packet(8, 32));
+        Assert.False(wrongLimit.IsSuccess);
+        Assert.Equal(KernelError.UnsupportedPayload, wrongLimit.Error);
+        Assert.Equal(KernelError.ResponseNotAvailable, kernel.ReceiveResponse(left, endpoints.Left).Error);
+
+        var oversized = kernel.PublishResponse(right, endpoints.Right, sent.Value.Sequence, new Packet(17, 16));
+        Assert.False(oversized.IsSuccess);
+        Assert.Equal(KernelError.UnsupportedPayload, oversized.Error);
+
+        var publish = kernel.PublishResponse(right, endpoints.Right, sent.Value.Sequence, new Packet(8, 16));
+        Assert.True(publish.IsSuccess, publish.Message);
+        Assert.Equal(new Packet(8, 16), Assert.IsType<Packet>(kernel.ReceiveResponse(left, endpoints.Left).Value!.Payload));
+    }
+
+    [Fact]
+    [Trait("Category", "Runtime")]
+    public void OutstandingResponseCapacityAppliesBackpressureAfterRequestDelivery()
+    {
+        var (kernel, left, right, endpoints) = CreateChannel(capacity: 1);
+        var first = kernel.Send(left, right, endpoints.Left, 1);
+        Assert.True(first.IsSuccess, first.Message);
+        Assert.True(kernel.Receive(right, endpoints.Right).IsSuccess);
+
+        var blocked = kernel.Send(left, right, endpoints.Left, 1);
+        Assert.False(blocked.IsSuccess);
+        Assert.Equal(KernelError.CapacityExhausted, blocked.Error);
+
+        Assert.True(kernel.PublishResponse(right, endpoints.Right, first.Value!.Sequence, 1).IsSuccess);
+        Assert.True(kernel.ReceiveResponse(left, endpoints.Left).IsSuccess);
+        Assert.True(kernel.Send(left, right, endpoints.Left, 1).IsSuccess);
+    }
+
+    [Fact]
+    [Trait("Category", "Runtime")]
+    public void ResponseProtocolMustExactlyMatchRequestMessagesAndOwnershipMetadata()
+    {
+        var kernel = new RuntimeKernel();
+        var (_, left) = TestFixtures.Create(kernel, 411, 410);
+        var (_, right) = TestFixtures.Create(kernel, 412, 420);
+        var protocol = RequestProtocol();
+        var incomplete = new ResponseProtocolDefinitionV1(
+            protocol.ContractName,
+            "incomplete-response-digest",
+            new[] { new ResponseMessageDescriptorV1(1, "Read", new ResponsePayloadDescriptorV1(ResponsePayloadKind.Primitive, typeof(int).FullName!)) });
+
+        var create = kernel.CreateChannel(left, right, protocol, incomplete, capacity: 8);
+
+        Assert.False(create.IsSuccess);
+        Assert.Equal(KernelError.ResponseProtocolMismatch, create.Error);
+        Assert.Empty(kernel.Processes.Resolve(left).Value!.Channels);
+        Assert.Empty(kernel.Processes.Resolve(right).Value!.Channels);
+    }
+
+    private static (
+        RuntimeKernel Kernel,
+        ProcessHandle Left,
+        ProcessHandle Right,
+        (ChannelEndpointHandle Left, ChannelEndpointHandle Right) Endpoints) CreateChannel(int capacity = 8)
+    {
+        var kernel = new RuntimeKernel();
+        var (_, left) = TestFixtures.Create(kernel, 401, 410);
+        var (_, right) = TestFixtures.Create(kernel, 402, 420);
+        var protocol = RequestProtocol();
+        var responses = new ResponseProtocolDefinitionV1(
+            protocol.ContractName,
+            "response-publication-digest",
+            new[]
+            {
+                new ResponseMessageDescriptorV1(1, "Read", new ResponsePayloadDescriptorV1(ResponsePayloadKind.Primitive, typeof(int).FullName!)),
+                new ResponseMessageDescriptorV1(2, "Ping"),
+                new ResponseMessageDescriptorV1(3, "Acquire", new ResponsePayloadDescriptorV1(ResponsePayloadKind.Ownership, "SingPlus.Sip.OwnedBuffer", ownershipPayloadKind: OwnershipPayloadKind.OwnedBuffer)),
+                new ResponseMessageDescriptorV1(4, "Packet", new ResponsePayloadDescriptorV1(ResponsePayloadKind.Bounded, typeof(Packet).FullName!, 16))
+            });
+        var channel = kernel.CreateChannel(left, right, protocol, responses, capacity);
+        Assert.True(channel.IsSuccess, channel.Message);
+        return (kernel, left, right, channel.Value);
+    }
+
+    private static ProtocolDefinitionV1 RequestProtocol() =>
+        new(
+            "SingPlus.Tests.IResponsePublicationProtocol",
+            "response-publication-contract-digest",
+            "Idle",
+            terminalStates: null,
+            messages: new[]
+            {
+                new ProtocolMessageDescriptorV1(1, "Read"),
+                new ProtocolMessageDescriptorV1(2, "Ping"),
+                new ProtocolMessageDescriptorV1(
+                    3,
+                    "Acquire",
+                    returnsOwnership: true,
+                    returnOwnershipPayloadKind: OwnershipPayloadKind.OwnedBuffer),
+                new ProtocolMessageDescriptorV1(4, "Packet")
+            },
+            transitions: new[]
+            {
+                new ProtocolTransitionV1(1, "Idle", "Idle"),
+                new ProtocolTransitionV1(2, "Idle", "Idle"),
+                new ProtocolTransitionV1(3, "Idle", "Idle"),
+                new ProtocolTransitionV1(4, "Idle", "Idle")
+            });
+}
+
+
+

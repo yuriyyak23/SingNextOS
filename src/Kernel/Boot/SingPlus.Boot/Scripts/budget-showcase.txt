@@ -1,0 +1,9 @@
+# Start with --budget; explicit local reservation is not effect authority.
+spawn budget-owner
+budget-reserve 5000 OwnedMemoryBytes 4096
+budget-reservations
+budget
+budget-release 5000 1
+budget-reservations
+stop 5000
+exit
