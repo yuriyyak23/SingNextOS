@@ -7,22 +7,20 @@ SingNextOS explores an operating-system architecture in which **semantic authori
 The system is implemented in C#/.NET and uses generated typed **SIP** service protocols instead of a large untyped syscall ABI.
 
 
-
-<table width="100%"> 
-    
+<table width="100%">     
   <tr>
-    <img width="1659" height="948" alt="1" src="https://github.com/user-attachments/assets/925ffa90-34b3-483b-a679-c10532ccab6f" />
-    <img width="1659" height="948" alt="2" src="https://github.com/user-attachments/assets/4c963a6c-90cf-4352-8d29-1311e6b6f86e" />
-    <img width="1659" height="948" alt="3" src="https://github.com/user-attachments/assets/f2d08807-7f4f-4dde-b3e2-5611b1aa3107" />
+ <td>   <img width="1659" height="948" alt="1" src="https://github.com/user-attachments/assets/925ffa90-34b3-483b-a679-c10532ccab6f" /></td>
+ <td>   <img width="1659" height="948" alt="2" src="https://github.com/user-attachments/assets/4c963a6c-90cf-4352-8d29-1311e6b6f86e" /></td>
+ <td>   <img width="1659" height="948" alt="3" src="https://github.com/user-attachments/assets/f2d08807-7f4f-4dde-b3e2-5611b1aa3107" /></td>
  </tr>
   
   <tr>
-    <img width="1659" height="948" alt="4" src="https://github.com/user-attachments/assets/c251e5c3-ba81-4c14-9260-b96b04063038" />
-    <img width="1659" height="948" alt="5" src="https://github.com/user-attachments/assets/59c0e1ec-bdcf-4cd9-a9fb-34b0b595c8e1" />
-    <img width="3318" height="1896" alt="singnextos_virtualization_securecompute_revised" src="https://github.com/user-attachments/assets/068ea6c9-9b46-460c-93fa-a9d87b9aa5de" />
+  <td>  <img width="1659" height="948" alt="4" src="https://github.com/user-attachments/assets/c251e5c3-ba81-4c14-9260-b96b04063038" /></td>
+  <td>  <img width="1659" height="948" alt="5" src="https://github.com/user-attachments/assets/59c0e1ec-bdcf-4cd9-a9fb-34b0b595c8e1" /></td>
+  <td>  <img width="3318" height="1896" alt="singnextos_virtualization_securecompute_revised" src="https://github.com/user-attachments/assets/068ea6c9-9b46-460c-93fa-a9d87b9aa5de" /></td>
   </tr>
-
 </table>
+
 
 SingNextOS is designed around one central rule:
 
