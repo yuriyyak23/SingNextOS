@@ -8,7 +8,6 @@ The system is implemented in C#/.NET and uses generated typed **SIP** service pr
 
 
 
-
 <table width="100%"> 
     
   <tr>
