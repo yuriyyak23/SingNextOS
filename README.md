@@ -11,9 +11,9 @@ The system is implemented in C#/.NET and uses generated typed **SIP** service pr
 <table width="100%">     
   <tr>
 
- <td> <img width="3318" height="1896" alt="singnextos_virtualization_securecompute_revised" src="https://github.com/user-attachments/assets/ae550c79-8048-48a3-afe4-3611713006a1" />/td>
- <td> <img width="1659" height="948" alt="Изображение ChatGPT 23 окт  2026 г , 10_47_07-5" src="https://github.com/user-attachments/assets/7a8add87-2b75-447b-ad58-f5b202af9d6d" />/td>
- <td> <img width="1659" height="948" alt="Изображение ChatGPT 23 окт  2026 г , 10_47_06-4" src="https://github.com/user-attachments/assets/6877ee5a-a567-40e0-93f9-25af68396fd4" />/td>
+ <td> <img width="3318" height="1896" alt="singnextos_virtualization_securecompute_revised" src="https://github.com/user-attachments/assets/ae550c79-8048-48a3-afe4-3611713006a1" /></td>
+ <td> <img width="1659" height="948" alt="Изображение ChatGPT 23 окт  2026 г , 10_47_07-5" src="https://github.com/user-attachments/assets/7a8add87-2b75-447b-ad58-f5b202af9d6d" /></td>
+ <td> <img width="1659" height="948" alt="Изображение ChatGPT 23 окт  2026 г , 10_47_06-4" src="https://github.com/user-attachments/assets/6877ee5a-a567-40e0-93f9-25af68396fd4" /></td>
     
  </tr>
   
