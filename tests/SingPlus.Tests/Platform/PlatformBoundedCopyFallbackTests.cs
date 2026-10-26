@@ -1,0 +1,618 @@
+using System.Reflection;
+using SingPlus.Contracts;
+using SingPlus.Platform;
+using SingPlus.Runtime;
+using SingPlus.Sip;
+
+namespace SingPlus.Tests.Platform;
+
+public sealed class PlatformBoundedCopyFallbackTests
+{
+    [Fact]
+    public void GenericUnsupportedAfterTargetMappingEffectCannotRematerializeOrReclaimBacking()
+    {
+        Scenario s = CreateScenario(bufferLength: 256, rejectTargetMapping: true);
+        s.Provider.TargetRejectionStatus = PlatformAuthorityStatus.Unsupported;
+        object storage = StorageIdentity(s.Buffer);
+        KernelResult<PlatformOwnedBufferMoveResult<byte>> result = s.Kernel.MovePlatformOwnedBuffer(s.Source, s.Target, s.Buffer, s.SourceMapping,
+            s.TargetRequest, new PlatformBoundedCopyFallbackPolicy(256));
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.False(s.Buffer.IsValid);
+        Assert.Equal(PlatformMoveTargetExposureState.LocalOwnershipFallback, result.Value!.TargetExposure);
+        Assert.Equal(KernelError.PlatformBindingActive, result.Value.TargetExposureError);
+        Assert.Null(result.Value.BoundedCopy);
+        Assert.Same(storage, StorageIdentity(result.Value.Buffer));
+        Assert.Equal(1, s.Provider.UnclosedTargetMappings);
+        Assert.True(s.Kernel.Regions.HasPlatformMappingReservation(result.Value.Buffer.Handle,
+            new RegionOwner(new DomainId(1020), s.Target.Generation)));
+        Assert.False(s.Kernel.ReleaseRegion(s.Target, result.Value.Buffer).IsSuccess);
+        Assert.False(s.Kernel.TerminateProcess(s.Target).IsSuccess);
+        Assert.Equal(RegionState.Owned, s.Kernel.Regions.Snapshot().Single(r =>
+            r.Handle == result.Value.Buffer.Handle).State);
+        Assert.Equal(1, s.Provider.TargetMapAttempts);
+        Assert.Equal(0, s.Provider.TargetRevokeCalls);
+    }
+
+    [Fact]
+    public void ActualMappingAdmissionBeforeFallbackPreservesStorageUntilExactRevoke()
+    {
+        Scenario s = CreateScenario(bufferLength: 256, rejectTargetMapping: true);
+        object storage = StorageIdentity(s.Buffer);
+        PlatformOwnedRegionSliceMapping? admitted = null;
+        s.Kernel.BeforeBoundedCopyRematerializationQualificationHook = () =>
+        {
+            s.Provider.RejectTargetDomain = null;
+            RegionDescriptor region = Assert.Single(s.Kernel.Regions.Snapshot(), r => r.Owner.DomainId == new DomainId(1020));
+            KernelResult<PlatformOwnedRegionSliceMapping> mapped = s.Kernel.MapPlatformOwnedRegionSlice(s.Target, s.TargetRequest.Binding,
+                s.TargetRequest.CapabilityId, region.Handle, 0, 256, PlatformMemoryAccess.Read);
+            Assert.True(mapped.IsSuccess, mapped.Message);
+            admitted = mapped.Value!;
+        };
+        KernelResult<PlatformOwnedBufferMoveResult<byte>> moved = s.Kernel.MovePlatformOwnedBuffer(s.Source, s.Target, s.Buffer, s.SourceMapping,
+            s.TargetRequest, new PlatformBoundedCopyFallbackPolicy(256));
+        Assert.True(moved.IsSuccess, moved.Message);
+        Assert.False(s.Buffer.IsValid);
+        Assert.Equal(PlatformMoveTargetExposureState.LocalOwnershipFallback, moved.Value!.TargetExposure);
+        Assert.Equal(KernelError.PlatformBindingActive, moved.Value.TargetExposureError);
+        Assert.Null(moved.Value.BoundedCopy);
+        Assert.Same(storage, StorageIdentity(moved.Value.Buffer));
+        Assert.True(s.Kernel.PlatformAuthority.HasActiveMapping(admitted!.Value.Region));
+        Assert.False(s.Kernel.ReleaseRegion(s.Target, moved.Value.Buffer).IsSuccess);
+        Assert.True(s.Kernel.RevokePlatformRegionMapping(s.Target, admitted.Value).IsSuccess);
+        Assert.True(s.Kernel.ReleaseRegion(s.Target, moved.Value.Buffer).IsSuccess);
+        Assert.False(moved.Value.Buffer.IsValid);
+        Assert.Equal(2, s.Provider.TargetMapAttempts);
+        Assert.Equal(1, s.Provider.TargetRevokeCalls);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ExistingUseOrTargetExitBeforeReplacementCannotPublishCopiedBacking(bool exit)
+    {
+        Scenario s = CreateScenario(bufferLength: 256, rejectTargetMapping: true);
+        object storage = StorageIdentity(s.Buffer);
+        RegionUseDescriptor? held = null;
+        s.Kernel.BeforeBoundedCopyRematerializationQualificationHook = () =>
+        {
+            if (exit) { _ = s.Kernel.TerminateProcess(s.Target); return; }
+            RegionDescriptor region = Assert.Single(s.Kernel.Regions.Snapshot(), r => r.Owner.DomainId == new DomainId(1020));
+            held = s.Kernel.AcquireRegionUse(s.Target, region.Handle, RegionUseMode.ExclusiveRead, new(0, 256)).Value!;
+        };
+        KernelResult<PlatformOwnedBufferMoveResult<byte>> moved = s.Kernel.MovePlatformOwnedBuffer(s.Source, s.Target, s.Buffer, s.SourceMapping,
+            s.TargetRequest, new PlatformBoundedCopyFallbackPolicy(256));
+        Assert.False(s.Buffer.IsValid);
+        if (exit) Assert.False(moved.IsSuccess);
+        else
+        {
+            Assert.True(moved.IsSuccess, moved.Message);
+            Assert.Equal(PlatformMoveTargetExposureState.LocalOwnershipFallback, moved.Value!.TargetExposure);
+            Assert.Equal(KernelError.RegionUseConflict, moved.Value.TargetExposureError);
+            Assert.Null(moved.Value.BoundedCopy);
+            Assert.Same(storage, StorageIdentity(moved.Value.Buffer));
+            Assert.True(s.Kernel.ReleaseRegionUse(s.Target, held!.Handle).IsSuccess);
+            Assert.True(s.Kernel.ReleaseRegion(s.Target, moved.Value.Buffer).IsSuccess);
+        }
+    }
+
+    [Fact]
+    public void CopyFallbackLimitIsRejectedBeforeSourceDrain()
+    {
+        Scenario scenario = CreateScenario(bufferLength: 256, rejectTargetMapping: true);
+
+        KernelResult<PlatformOwnedBufferMoveResult<byte>> result = scenario.Kernel.MovePlatformOwnedBuffer(
+            scenario.Source,
+            scenario.Target,
+            scenario.Buffer,
+            scenario.SourceMapping,
+            scenario.TargetRequest,
+            new PlatformBoundedCopyFallbackPolicy(255));
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(KernelError.CapacityExhausted, result.Error);
+        Assert.Equal(0, scenario.Provider.BeginRevokeCalls);
+        Assert.True(scenario.Buffer.IsValid);
+        Assert.Equal(new RegionGeneration(1), scenario.Buffer.Handle.Generation);
+    }
+
+    [Fact]
+    public void CopyFallbackRequiresExplicitTargetMappingRequest()
+    {
+        Scenario scenario = CreateScenario(bufferLength: 128, rejectTargetMapping: false);
+
+        KernelResult<PlatformOwnedBufferMoveResult<byte>> result = scenario.Kernel.MovePlatformOwnedBuffer(
+            scenario.Source,
+            scenario.Target,
+            scenario.Buffer,
+            scenario.SourceMapping,
+            targetMapping: null,
+            copyFallback: new PlatformBoundedCopyFallbackPolicy(64));
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(KernelError.PlatformDenied, result.Error);
+        Assert.Equal(0, scenario.Provider.BeginRevokeCalls);
+        Assert.True(scenario.Buffer.IsValid);
+    }
+
+    [Fact]
+    public void NotAcceptedTargetMappingRematerializesFullBufferThroughBoundedCopy()
+    {
+        Scenario scenario = CreateScenario(bufferLength: 256, rejectTargetMapping: true);
+        for (int i = 0; i < scenario.Buffer.Length; i++)
+            scenario.Buffer.Span[i] = unchecked((byte)(i * 17 + 3));
+        byte[] expected = scenario.Buffer.Span.ToArray();
+        object sourceStorage = StorageIdentity(scenario.Buffer);
+
+        KernelResult<PlatformOwnedBufferMoveResult<byte>> result = scenario.Kernel.MovePlatformOwnedBuffer(
+            scenario.Source,
+            scenario.Target,
+            scenario.Buffer,
+            scenario.SourceMapping,
+            scenario.TargetRequest,
+            new PlatformBoundedCopyFallbackPolicy(256));
+
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.False(scenario.Buffer.IsValid);
+        Assert.True(result.Value!.Buffer.IsValid);
+        Assert.Equal(new RegionGeneration(2), result.Value.Buffer.Handle.Generation);
+        Assert.Equal(
+            PlatformMoveTargetExposureState.BoundedCopyFallback,
+            result.Value.TargetExposure);
+        Assert.Null(result.Value.TargetMapping);
+        Assert.Null(result.Value.TargetPublication);
+        Assert.Equal(KernelError.PlatformFaulted, result.Value.TargetExposureError);
+
+        PlatformBoundedCopyEvidence copy = Assert.NotNull(result.Value.BoundedCopy);
+        Assert.True(copy.IsExactAndBounded);
+        Assert.Equal(result.Value.Buffer.Handle, copy.Region);
+        Assert.Equal(256, copy.ByteLength);
+        Assert.Equal(256, copy.MaxBytes);
+        Assert.Equal(expected, result.Value.Buffer.Span.ToArray());
+        Assert.NotSame(sourceStorage, StorageIdentity(result.Value.Buffer));
+
+        RegionOwner targetOwner = new RegionOwner(new DomainId(1020), scenario.Target.Generation);
+        Assert.True(scenario.Kernel.Regions.Validate(result.Value.Buffer.Handle, targetOwner).IsSuccess);
+        Assert.Equal(KernelError.StaleGeneration,
+            scenario.Kernel.Regions.Validate(
+                scenario.SourceMapping.Region,
+                new RegionOwner(new DomainId(1010), scenario.Source.Generation)).Error);
+        Assert.Equal(1, scenario.Provider.AcquireCalls);
+        Assert.Equal(1, scenario.Provider.TargetMapAttempts);
+    }
+
+    [Fact]
+    public void CopyFallbackCopiesWholeOwnedBufferNotOnlyMappedSlice()
+    {
+        Scenario scenario = CreateScenario(bufferLength: 512, rejectTargetMapping: true);
+        scenario.Buffer.Span[0] = 11;
+        scenario.Buffer.Span[31] = 22;
+        scenario.Buffer.Span[32] = 33;
+        scenario.Buffer.Span[95] = 44;
+        scenario.Buffer.Span[96] = 55;
+        scenario.Buffer.Span[511] = 66;
+
+        KernelResult<PlatformOwnedBufferMoveResult<byte>> result = scenario.Kernel.MovePlatformOwnedBuffer(
+            scenario.Source,
+            scenario.Target,
+            scenario.Buffer,
+            scenario.SourceMapping,
+            scenario.TargetRequest,
+            new PlatformBoundedCopyFallbackPolicy(512));
+
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.Equal(11, result.Value!.Buffer.Span[0]);
+        Assert.Equal(22, result.Value.Buffer.Span[31]);
+        Assert.Equal(33, result.Value.Buffer.Span[32]);
+        Assert.Equal(44, result.Value.Buffer.Span[95]);
+        Assert.Equal(55, result.Value.Buffer.Span[96]);
+        Assert.Equal(66, result.Value.Buffer.Span[511]);
+        Assert.Equal(512, result.Value.BoundedCopy!.Value.ByteLength);
+    }
+
+    [Fact]
+    public void MissingCopyPolicyPreservesExistingLocalOwnershipFallbackWithoutClaimingCopy()
+    {
+        Scenario scenario = CreateScenario(bufferLength: 128, rejectTargetMapping: true);
+        object sourceStorage = StorageIdentity(scenario.Buffer);
+
+        KernelResult<PlatformOwnedBufferMoveResult<byte>> result = scenario.Kernel.MovePlatformOwnedBuffer(
+            scenario.Source,
+            scenario.Target,
+            scenario.Buffer,
+            scenario.SourceMapping,
+            scenario.TargetRequest);
+
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.Equal(
+            PlatformMoveTargetExposureState.LocalOwnershipFallback,
+            result.Value!.TargetExposure);
+        Assert.Null(result.Value.BoundedCopy);
+        Assert.Same(sourceStorage, StorageIdentity(result.Value.Buffer));
+    }
+
+    [Fact]
+    public void TargetPublicationFailureDoesNotRematerializeWhileTargetMappingLifecycleExisted()
+    {
+        Scenario scenario = CreateScenario(
+            bufferLength: 128,
+            rejectTargetMapping: false,
+            rejectTargetPublication: true);
+        object sourceStorage = StorageIdentity(scenario.Buffer);
+
+        KernelResult<PlatformOwnedBufferMoveResult<byte>> result = scenario.Kernel.MovePlatformOwnedBuffer(
+            scenario.Source,
+            scenario.Target,
+            scenario.Buffer,
+            scenario.SourceMapping,
+            scenario.TargetRequest,
+            new PlatformBoundedCopyFallbackPolicy(128));
+
+        Assert.True(result.IsSuccess, result.Message);
+        Assert.Equal(
+            PlatformMoveTargetExposureState.LocalOwnershipFallback,
+            result.Value!.TargetExposure);
+        Assert.Equal(KernelError.PlatformUnsupported, result.Value.TargetExposureError);
+        Assert.Null(result.Value.BoundedCopy);
+        Assert.Same(sourceStorage, StorageIdentity(result.Value.Buffer));
+        Assert.Equal(1, scenario.Provider.TargetMapAttempts);
+        Assert.True(scenario.Provider.TargetRevokeCalls > 0);
+    }
+
+    [Fact]
+    public void BoundedCopyFallbackSurfaceCarriesNoProviderHybridCpuOrHardwareAuthorityIdentity()
+    {
+        string[] forbidden = new[]
+        {
+            "PlatformProvider",
+            "PlatformOperation",
+            "Neutral",
+            "HybridCPU",
+            "Physical",
+            "Pte",
+            "PageTable",
+            "CacheLine",
+            "Dma",
+            "Iommu",
+            "Vmcs",
+            "Vmx",
+            "Lane",
+            "Opcode",
+        };
+        Type[] surface = new[]
+        {
+            typeof(PlatformBoundedCopyFallbackPolicy),
+            typeof(PlatformBoundedCopyEvidence),
+            typeof(PlatformOwnedBufferMoveResult<byte>),
+        };
+
+        foreach (Type? type in surface)
+        foreach (MemberInfo member in type.GetMembers(
+                     BindingFlags.Public |
+                     BindingFlags.Instance |
+                     BindingFlags.Static))
+        {
+                string signature = member.ToString() ?? member.Name;
+            foreach (string? name in forbidden)
+                Assert.DoesNotContain(name, signature, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    private static object StorageIdentity<T>(OwnedBuffer<T> buffer)
+        where T : unmanaged
+    {
+        FieldInfo? field = typeof(OwnedBuffer<T>).GetField(
+            "_storage",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        Assert.NotNull(field);
+        return Assert.IsType<OwnedBuffer<T>.Storage>(field!.GetValue(buffer));
+    }
+
+    private static Scenario CreateScenario(
+        int bufferLength,
+        bool rejectTargetMapping,
+        bool rejectTargetPublication = false)
+    {
+        CopyFallbackProvider provider = new CopyFallbackProvider
+        {
+            RejectTargetDomain = rejectTargetMapping ? new DomainId(1020) : null,
+            RejectPublicationDomain = rejectTargetPublication ? new DomainId(1020) : null,
+        };
+        RuntimeKernel kernel = new RuntimeKernel(provider);
+        (SingProcess _, ProcessHandle source) = TestFixtures.Create(kernel, 1001, 1010);
+        (SingProcess _, ProcessHandle target) = TestFixtures.Create(kernel, 1002, 1020);
+        OwnedBuffer<byte> buffer = kernel.AllocateBuffer<byte>(source, bufferLength).Value!;
+        PlatformDomainBinding sourceBinding = kernel.BindPlatformDomain(source).Value!;
+        PlatformDomainBinding targetBinding = kernel.BindPlatformDomain(target).Value!;
+        CapabilityId sourceCapability = MintRegionCapability(
+            kernel,
+            source,
+            buffer.Handle,
+            CapabilityRights.Map | CapabilityRights.Read | CapabilityRights.Write);
+        CapabilityId targetCapability = MintRegionCapability(
+            kernel,
+            target,
+            buffer.Handle,
+            CapabilityRights.Map | CapabilityRights.Read);
+        PlatformOwnedRegionSliceMapping sourceMapping = kernel.MapPlatformOwnedRegionSlice(
+            source,
+            sourceBinding,
+            sourceCapability,
+            buffer.Handle,
+            32,
+            64,
+            PlatformMemoryAccess.Read | PlatformMemoryAccess.Write).Value!;
+        PlatformMoveTargetMappingRequest targetRequest = new PlatformMoveTargetMappingRequest(
+            targetBinding,
+            targetCapability,
+            PlatformMemoryAccess.Read);
+        return new Scenario(
+            kernel,
+            provider,
+            source,
+            target,
+            buffer,
+            sourceMapping,
+            targetRequest);
+    }
+
+    private static CapabilityId MintRegionCapability(
+        RuntimeKernel kernel,
+        ProcessHandle subject,
+        RegionHandle region,
+        CapabilityRights rights)
+    {
+        KernelResult<SingProcess> process = kernel.Processes.Resolve(subject);
+        Assert.True(process.IsSuccess, process.Message);
+        KernelResult<CapabilityDescriptorV1> capability = kernel.MintCapability(
+            process.Value!.DomainId,
+            subject,
+            ResourceKind.MemoryRegion,
+            CapabilityResourceIds.MemoryRegion(region.RegionId),
+            rights);
+        Assert.True(capability.IsSuccess, capability.Message);
+        return capability.Value!.CapabilityId;
+    }
+
+    private sealed record Scenario(
+        RuntimeKernel Kernel,
+        CopyFallbackProvider Provider,
+        ProcessHandle Source,
+        ProcessHandle Target,
+        OwnedBuffer<byte> Buffer,
+        PlatformOwnedRegionSliceMapping SourceMapping,
+        PlatformMoveTargetMappingRequest TargetRequest);
+
+    private sealed class CopyFallbackProvider :
+        IPlatformAuthorityProvider,
+        IPlatformFeatureProvider,
+        IPlatformOwnedRegionMappingProvider,
+        IPlatformRegionVisibilityProvider,
+        IPlatformRegionRevocationProvider,
+        IPlatformRegionAcquireProvider
+    {
+        private sealed class MappingRecord(PlatformProviderOwnedRegionMapping mapping)
+        {
+            public PlatformProviderOwnedRegionMapping Mapping { get; } = mapping;
+            public bool RevocationStarted { get; set; }
+            public bool Revoked { get; set; }
+        }
+
+        private readonly Dictionary<PlatformProviderDomainLeaseId, PlatformProviderDomainLease> _domains = [];
+        private readonly Dictionary<PlatformProviderRegionMappingId, MappingRecord> _mappings = [];
+        private readonly Dictionary<PlatformOperationId, (PlatformOperationIdentity Identity, PlatformProviderRegionMappingId MappingId)> _operations = [];
+        private ulong _nextDomain = 1;
+        private ulong _nextMapping = 1;
+        private ulong _nextOperation = 1;
+
+        public DomainId? RejectTargetDomain { get; set; }
+        public PlatformAuthorityStatus TargetRejectionStatus { get; set; } = PlatformAuthorityStatus.NotAccepted;
+        public int UnclosedTargetMappings => _mappings.Values.Count(record =>
+            record.Mapping.Lease.DomainLease.Subject.DomainId == new DomainId(1020) && !record.Revoked);
+        public DomainId? RejectPublicationDomain { get; set; }
+        public int BeginRevokeCalls { get; private set; }
+        public int AcquireCalls { get; private set; }
+        public int TargetMapAttempts { get; private set; }
+        public int TargetRevokeCalls { get; private set; }
+
+        public PlatformProviderDescriptor Descriptor { get; } = new(
+            new PlatformProviderId("bounded-copy-fallback-test"),
+            5,
+            PlatformAuthorityFeatures.NeutralDomainBinding |
+            PlatformAuthorityFeatures.DirectOwnedRegionMapping);
+
+        public PlatformFeatureManifest QueryFeatures() => new(new[]
+        {
+            new PlatformFeatureDescriptor(
+                PlatformFeatureFamily.NeutralDomains,
+                PlatformDomainContract.ContractVersion,
+                PlatformFeatureAvailability.Executable),
+            new PlatformFeatureDescriptor(
+                PlatformFeatureFamily.OwnedRegionMapping,
+                PlatformOwnedRegionMappingContract.ContractVersion,
+                PlatformFeatureAvailability.Executable),
+            new PlatformFeatureDescriptor(
+                PlatformFeatureFamily.ExplicitMemoryVisibility,
+                PlatformRegionAcquireContract.ContractVersion,
+                PlatformFeatureAvailability.Executable),
+        });
+
+        public PlatformAuthorityResult<PlatformProviderDomainLease> BindDomain(
+            PlatformDomainIdentity subject)
+        {
+            PlatformProviderDomainLease lease = new PlatformProviderDomainLease(
+                new PlatformProviderDomainLeaseId(_nextDomain++),
+                new PlatformProviderLeaseGeneration(1),
+                subject);
+            _domains.Add(lease.LeaseId, lease);
+            return PlatformAuthorityResult<PlatformProviderDomainLease>.Ok(lease);
+        }
+
+        public PlatformAuthorityResult RevokeDomain(PlatformProviderDomainLease lease) =>
+            PlatformAuthorityResult.Ok();
+
+        public PlatformAuthorityResult<PlatformProviderRegionMappingLease> MapOwnedRegion(
+            PlatformProviderDomainLease domainLease,
+            PlatformRegionIdentity region,
+            PlatformMemoryAccess access)
+        {
+            PlatformAuthorityResult<PlatformProviderOwnedRegionMapping> mapped = MapOwnedRegionSlice(
+                domainLease,
+                new PlatformRegionSlice(region, 0, region.ByteLength, access));
+            return mapped.IsSuccess
+                ? PlatformAuthorityResult<PlatformProviderRegionMappingLease>.Ok(mapped.Value!.Lease)
+                : PlatformAuthorityResult<PlatformProviderRegionMappingLease>.Fail(
+                    mapped.Status,
+                    mapped.Message!);
+        }
+
+        public PlatformAuthorityResult<PlatformProviderOwnedRegionMapping> MapOwnedRegionSlice(
+            PlatformProviderDomainLease domainLease,
+            PlatformRegionSlice slice)
+        {
+            if (!_domains.TryGetValue(domainLease.LeaseId, out PlatformProviderDomainLease live) || live != domainLease)
+            {
+                return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(
+                    PlatformAuthorityStatus.WrongDomain,
+                    "Unknown domain lease.");
+            }
+
+            if (RejectTargetDomain is { } targetDomain &&
+                domainLease.Subject.DomainId == targetDomain && TargetRejectionStatus == PlatformAuthorityStatus.NotAccepted)
+            {
+                TargetMapAttempts++;
+                return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(
+                    PlatformAuthorityStatus.NotAccepted,
+                    "Target exact mapping was refused before creating a lease.");
+            }
+
+            if (domainLease.Subject.DomainId == new DomainId(1020))
+                TargetMapAttempts++;
+
+            PlatformProviderRegionMappingLease lease = new PlatformProviderRegionMappingLease(
+                new PlatformProviderRegionMappingId(_nextMapping++),
+                new PlatformProviderLeaseGeneration(1),
+                domainLease,
+                slice.Region,
+                slice.Access);
+            PlatformProviderOwnedRegionMapping mapped = new PlatformProviderOwnedRegionMapping(lease, slice);
+            _mappings.Add(lease.MappingId, new MappingRecord(mapped));
+            if (RejectTargetDomain == domainLease.Subject.DomainId)
+                return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Fail(
+                    TargetRejectionStatus, "Generic target rejection after mapping effect.");
+            return PlatformAuthorityResult<PlatformProviderOwnedRegionMapping>.Ok(mapped);
+        }
+
+        public PlatformAuthorityResult<PlatformRegionVisibilityResult> PrepareRegionMappingForConsumer(
+            PlatformRegionVisibilityRequest request)
+        {
+            if (!_mappings.TryGetValue(request.Mapping.MappingId, out MappingRecord? record) ||
+                record.Mapping.Lease != request.Mapping ||
+                record.Mapping.Slice != request.Slice ||
+                record.RevocationStarted)
+            {
+                return PlatformAuthorityResult<PlatformRegionVisibilityResult>.Fail(
+                    PlatformAuthorityStatus.Revoked,
+                    "Mapping is not live.");
+            }
+
+            bool supported = RejectPublicationDomain is not { } rejected ||
+                            request.Mapping.DomainLease.Subject.DomainId != rejected;
+            PlatformMemoryVisibilityOutcome outcome = supported &&
+                          request.Consumer == PlatformMemoryConsumerClass.ExternalExecutionDomain &&
+                          request.Requirement == PlatformMemoryVisibilityRequirement.PublicationFence
+                ? PlatformMemoryVisibilityOutcome.PublicationFenceSatisfied
+                : PlatformMemoryVisibilityOutcome.Unsupported;
+            return PlatformAuthorityResult<PlatformRegionVisibilityResult>.Ok(
+                new PlatformRegionVisibilityResult(
+                    request.Mapping.MappingId,
+                    request.Mapping.Generation,
+                    request.Slice,
+                    request.Consumer,
+                    request.Requirement,
+                    outcome));
+        }
+
+        public PlatformAuthorityResult RevokeRegionMapping(
+            PlatformProviderRegionMappingLease mapping,
+            PlatformRegionRevocationPolicy policy)
+        {
+            if (_mappings.TryGetValue(mapping.MappingId, out MappingRecord? record))
+                record.Revoked = true;
+            if (mapping.DomainLease.Subject.DomainId == new DomainId(1020))
+                TargetRevokeCalls++;
+            return PlatformAuthorityResult.Ok();
+        }
+
+        public PlatformAuthorityResult<PlatformRegionRevocationTicket> BeginRegionMappingRevocation(
+            PlatformProviderRegionMappingLease mapping,
+            PlatformRegionRevocationPolicy policy)
+        {
+            BeginRevokeCalls++;
+            if (!_mappings.TryGetValue(mapping.MappingId, out MappingRecord? record) ||
+                record.Mapping.Lease != mapping || record.Revoked)
+            {
+                return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Fail(
+                    PlatformAuthorityStatus.Denied,
+                    "Unknown mapping.");
+            }
+
+            record.RevocationStarted = true;
+            PlatformOperationIdentity operation = new PlatformOperationIdentity(
+                new PlatformOperationId(_nextOperation++),
+                new PlatformOperationGeneration(1),
+                mapping.DomainLease);
+            _operations.Add(operation.OperationId, (operation, mapping.MappingId));
+            return PlatformAuthorityResult<PlatformRegionRevocationTicket>.Ok(
+                new PlatformRegionRevocationTicket(
+                    mapping.MappingId,
+                    mapping.Generation,
+                    operation));
+        }
+
+        public PlatformAuthorityResult<PlatformCompletionReceipt> ObserveCompletion(
+            PlatformOperationIdentity operation)
+        {
+            if (!_operations.TryGetValue(operation.OperationId, out (PlatformOperationIdentity Identity, PlatformProviderRegionMappingId MappingId) entry) ||
+                entry.Identity != operation)
+            {
+                return PlatformAuthorityResult<PlatformCompletionReceipt>.Fail(
+                    PlatformAuthorityStatus.Denied,
+                    "Unknown operation.");
+            }
+
+            _mappings[entry.MappingId].Revoked = true;
+            if (operation.DomainLease.Subject.DomainId == new DomainId(1020))
+                TargetRevokeCalls++;
+            return PlatformAuthorityResult<PlatformCompletionReceipt>.Ok(
+                new PlatformCompletionReceipt(
+                    operation.OperationId,
+                    operation.Generation,
+                    operation.DomainLease,
+                    PlatformCompletionState.Closed));
+        }
+
+        public PlatformAuthorityResult<PlatformRegionAcquireResult> AcquireRegionMappingFromConsumer(
+            PlatformRegionAcquireRequest request)
+        {
+            AcquireCalls++;
+            if (!_mappings.TryGetValue(request.Mapping.MappingId, out MappingRecord? record) ||
+                record.Mapping.Lease != request.Mapping ||
+                record.Mapping.Slice != request.Slice ||
+                !record.Revoked)
+            {
+                return PlatformAuthorityResult<PlatformRegionAcquireResult>.Fail(
+                    PlatformAuthorityStatus.Denied,
+                    "Mapping is not closed.");
+            }
+
+            return PlatformAuthorityResult<PlatformRegionAcquireResult>.Ok(
+                new PlatformRegionAcquireResult(
+                    request.Mapping.MappingId,
+                    request.Mapping.Generation,
+                    request.Slice,
+                    request.Producer,
+                    request.Requirement,
+                    PlatformMemoryAcquireOutcome.AcquisitionFenceSatisfied));
+        }
+    }
+}

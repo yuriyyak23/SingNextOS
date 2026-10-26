@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net11.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/Runtime/SingPlus.Runtime/SingPlus.Runtime.csproj" />
+    <ProjectReference Include="../../src/Platform/SingPlus.Platform.HybridCpu/SingPlus.Platform.HybridCpu.csproj" />
+    <ProjectReference Include="../HybridCpu_ExecutableAdapter/HybridCpu_ExecutableAdapter.csproj" />
+    <ProjectReference Include="../Runtime/HybridCPU_NeutralRuntime/HybridCPU_NeutralRuntime.Model/HybridCPU_NeutralRuntime.Model.csproj" />
+  </ItemGroup>
+</Project>

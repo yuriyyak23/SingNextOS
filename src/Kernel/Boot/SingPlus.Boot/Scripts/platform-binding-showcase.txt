@@ -1,0 +1,9 @@
+# Requires --platform host-model; start refusal is asserted inside demo platform.
+spawn platform-subject --admitted
+platform-bind 5000
+platform-policy 5000
+inspect 5000
+authority 5000
+stop 5000
+demo platform
+exit

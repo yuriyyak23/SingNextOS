@@ -1,0 +1,219 @@
+[
+  {
+    "file": "call-tree-materialized.hcexe",
+    "method": "CallTreeReturn",
+    "bytes": 24652,
+    "hash": "0a7b1696a329f386bb04129e0e3aee48eff50ab478ebb7e8bb4418a48afb1a6e",
+    "seconds": 13.3477541
+  },
+  {
+    "file": "finite-branch-materialized.hcexe",
+    "method": "FiniteBranchReturn",
+    "bytes": 11008,
+    "hash": "4586de31c57d5653f95c43af3374b87127ce07a414cfa48c5b934672799f3641",
+    "seconds": 0.7830813
+  },
+  {
+    "file": "managed-ancestor-rethrow.hcexe",
+    "method": "ManagedAncestorRethrowReturn",
+    "bytes": 409804,
+    "hash": "c5e110e5736d099b96b3d0bcce97a7c5762cd4252fb8467ae9e1794346002c44",
+    "seconds": 1.742974
+  },
+  {
+    "file": "managed-array-bounds.hcexe",
+    "method": "ManagedArrayBoundsReturn",
+    "bytes": 335956,
+    "hash": "7bd9cda047ae7bdf3d28b358c4efb8e75b7694d37e69fa6970f1340d8187aa15",
+    "seconds": 1.5218234
+  },
+  {
+    "file": "managed-array.hcexe",
+    "method": "ManagedArrayReturn",
+    "bytes": 340060,
+    "hash": "7a54679d34a1238b624e3de97301200c687a73172320d86f9562b753058bbe32",
+    "seconds": 1.6228768
+  },
+  {
+    "file": "managed-callee-catch-finally.hcexe",
+    "method": "ManagedCalleeCatchFinallyReturn",
+    "bytes": 368732,
+    "hash": "7243fd41c310ad57a6cad1bfccdc8842e1065943a620ecd78497ac957e8240a0",
+    "seconds": 1.6431698
+  },
+  {
+    "file": "managed-callee-finally.hcexe",
+    "method": "ManagedCalleeFinallyCatchReturn",
+    "bytes": 389268,
+    "hash": "76466deb4576bafa8baa11ad50df0caaacdf459f66544cc5b16609f66b99d11f",
+    "seconds": 1.6872217
+  },
+  {
+    "file": "managed-catch-finally.hcexe",
+    "method": "ManagedCatchFinallyReturn",
+    "bytes": 356444,
+    "hash": "0c7225b5581c4f965cac4404903cf6b98aa091f43c30d265da2e53b2dc4c4efd",
+    "seconds": 1.6609225
+  },
+  {
+    "file": "managed-finally-replacement.hcexe",
+    "method": "ManagedFinallyReplacementReturn",
+    "bytes": 389308,
+    "hash": "e0438a22402a40a0c8cf7466bb4c0033fc66a3392935592f2b26d5d66ef6ff69",
+    "seconds": 1.6968065
+  },
+  {
+    "file": "managed-finally.hcexe",
+    "method": "ManagedFinallyReturn",
+    "bytes": 315444,
+    "hash": "7eaa325aae6634bb7ac7bfe855999cf6aa26b99da0f2ca428e2c853fe7c528ff",
+    "seconds": 1.5841036
+  },
+  {
+    "file": "managed-instance-call.hcexe",
+    "method": "ManagedInstanceCallReturn",
+    "bytes": 368780,
+    "hash": "d01aaf5eb2a80979aa2a184031a8f694714becbf47bc888aa1fb8c350df655ea",
+    "seconds": 1.7105459
+  },
+  {
+    "file": "managed-nested-foreign-rethrow.hcexe",
+    "method": "ManagedNestedForeignCatchRethrowReturn",
+    "bytes": 389308,
+    "hash": "8d793239fb1e6cdf7c0c70d0dfb58b39cc9587f243fd1662455279893f733b86",
+    "seconds": 1.6993185
+  },
+  {
+    "file": "managed-nested-rethrow.hcexe",
+    "method": "ManagedNestedCatchRethrowReturn",
+    "bytes": 385172,
+    "hash": "7174b681bed079fc29801d8cd0c04a1526700a257cb4dcefcaefde0c6905970b",
+    "seconds": 1.6707362
+  },
+  {
+    "file": "managed-object-field.hcexe",
+    "method": "ManagedObjectFieldReturn",
+    "bytes": 364684,
+    "hash": "fe9c334146b3b2c7b6506fdfd1aa5746450398ca11ca1ed8c1c46ea909664fef",
+    "seconds": 1.5640091
+  },
+  {
+    "file": "managed-rethrow.hcexe",
+    "method": "ManagedRethrowReturn",
+    "bytes": 323636,
+    "hash": "a9891c589d70c4bfff15e65e2419278f55df95fc8fc49b02602a573051e38667",
+    "seconds": 1.5712359
+  },
+  {
+    "file": "managed-slot-deep.hcexe",
+    "method": "ManagedDeepHiddenSlotReturn",
+    "bytes": 397580,
+    "hash": "b4242a02fa9890defe5d7674fda2ddc546344a0f17e8e171fdb446e77cff580b",
+    "seconds": 1.7062179
+  },
+  {
+    "file": "managed-slot-distinct.hcexe",
+    "method": "ManagedDistinctSlotsReturn",
+    "bytes": 418132,
+    "hash": "bc405f90deb2baee654521239ab1a6ee6e4923262be9231f379ba06d566633c8",
+    "seconds": 1.7396478
+  },
+  {
+    "file": "managed-slot-hidden.hcexe",
+    "method": "ManagedHiddenSlotReturn",
+    "bytes": 389348,
+    "hash": "0fb85cf5230c76f051104f3c23a5b9270ec682a37aa2726d5b2e2ba6c9c5f38a",
+    "seconds": 1.7397539
+  },
+  {
+    "file": "managed-slot-inherited.hcexe",
+    "method": "ManagedInheritedSlotReturn",
+    "bytes": 389348,
+    "hash": "c42ca716da1cc0448198df37fadb04cb5af2e9946135466cec43d1700cfe9405",
+    "seconds": 1.6994023
+  },
+  {
+    "file": "managed-slot-null.hcexe",
+    "method": "ManagedNullVirtualReturn",
+    "bytes": 364596,
+    "hash": "cc677fee74ad90d5d678588684054742c5b7720e4d52da66856b450211fb7782",
+    "seconds": 1.7090082
+  },
+  {
+    "file": "managed-virtual-dispatch.hcexe",
+    "method": "ManagedVirtualDispatchReturn",
+    "bytes": 393452,
+    "hash": "6d14456a66681a180a080369bc9ce0b30f17bdfe49ee5da4c9aacbbf187c4246",
+    "seconds": 1.6962463
+  },
+  {
+    "file": "longrun-materialized.hcexe",
+    "method": "LongRun",
+    "bytes": 517632,
+    "hash": "3eacb20da324c3ed706eec68d7fae9affb8cdf2170ee8d827f49db669cc33087",
+    "seconds": 3.1119173
+  },
+  {
+    "file": "managed-slot-nominal.hcexe",
+    "method": "ManagedNominalSlotReturn",
+    "bytes": 389348,
+    "hash": "a0b936798cddbfc66c231201f8a80243e233ea942db5cb0a0bb6dd6cfcf56524",
+    "seconds": 1.695231
+  },
+  {
+    "file": "managed-slot-nominal-overload.hcexe",
+    "method": "ManagedNominalOverloadReturn",
+    "bytes": 414028,
+    "hash": "29ad6e5a393266e9f4b61f36ed1ecb2c985d765ae655920163e2caaed355a6d6",
+    "seconds": 1.7994453
+  },
+  {
+    "file": "managed-slot-reference.hcexe",
+    "method": "ManagedNominalReferenceReturn",
+    "bytes": 446756,
+    "hash": "79e061d625d115e3b79f72993bccc2e8c5f09197108be422474ca0a2b473c78e",
+    "seconds": 1.98248
+  },
+  {
+    "file": "managed-slot-reference-null.hcexe",
+    "method": "ManagedNominalNullReturn",
+    "bytes": 458804,
+    "hash": "0696f0a424b14cd3f2d85fff75732a5f64d1541e5ec2ab79e27bbba0b93384b5",
+    "seconds": 2.1063238
+  },
+  {
+    "file": "managed-cctor-direct.hcexe",
+    "method": "ManagedForeignStaticDirectReturn",
+    "bytes": 422020,
+    "hash": "05e3101944b237848f9b37bc7faceb4d8facc0182361ee6745c756899d08e5ea",
+    "seconds": 1.6922932
+  },
+  {
+    "file": "managed-cctor-method.hcexe",
+    "method": "ManagedForeignStaticMethodReturn",
+    "bytes": 426156,
+    "hash": "0ef2b3441758ee1865bf5f7b47d3f0bfb81a23a91fa8e426e0bcb14392fd8eb2",
+    "seconds": 1.8432579
+  },
+  {
+    "file": "managed-cctor-failed.hcexe",
+    "method": "ManagedFailedStaticReturn",
+    "bytes": 348236,
+    "hash": "55bb9dab2dc6864d6d162d4581f6708262ba652c4d4e656cdee27186365c5e78",
+    "seconds": 1.6142105
+  },
+  {
+    "file": "managed-cctor-multi.hcexe",
+    "method": "ManagedMultiStaticReturn",
+    "bytes": 458940,
+    "hash": "c919409da602e0ea03b719ca45a20af5449af8d0569af8a31733007eb00a8d48",
+    "seconds": 1.8522818
+  },
+  {
+    "file": "managed-cctor-multi-failed.hcexe",
+    "method": "ManagedMultiFailedStaticReturn",
+    "bytes": 426196,
+    "hash": "f4888199dcd2ad0609cef049c2afd552c7dab7045720cc42d46c0cf8eb4ac7f0",
+    "seconds": 1.7405692
+  }
+]

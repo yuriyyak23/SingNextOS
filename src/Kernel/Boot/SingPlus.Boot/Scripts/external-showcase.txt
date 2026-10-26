@@ -1,0 +1,6 @@
+# Real local external-operation admission; no provider submission.
+demo external
+budget
+regions
+status
+exit

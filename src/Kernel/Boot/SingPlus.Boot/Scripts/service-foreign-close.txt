@@ -1,0 +1,7 @@
+# Expected refusal: script exits 1; shutdown must reclaim both processes.
+spawn provider
+spawn caller
+service-register 5000 guarded
+mint 5001 guarded Read
+session-open 5001 guarded 1
+session-close 5000 1

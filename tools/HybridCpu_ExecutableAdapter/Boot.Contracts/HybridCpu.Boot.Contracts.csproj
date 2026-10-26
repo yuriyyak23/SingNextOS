@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>YAKSys_Hybrid_CPU.Boot.Contracts</RootNamespace>
+    <AssemblyName>HybridCpu.Boot.Contracts</AssemblyName>
+    <SingCapSecurityProfile>PlatformExternal</SingCapSecurityProfile>
+  </PropertyGroup>
+</Project>

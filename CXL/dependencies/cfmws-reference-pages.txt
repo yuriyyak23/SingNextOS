@@ -1,0 +1,223 @@
+Reset, Initialization, Configuration, and Manageability
+August 7, 2023  Compute Express Link Specification
+Revision 3.1, Version 1.0 838
+9.18.1.3 CXL Fixed Memory Window Structure (CFMWS)
+The CFMWS structure describes zero or more Host Physical Address (HPA) windows 
+that are associated with each CXL Host Bridge. Each window represents a contiguous 
+HPA range that may be interleaved across one or more targets, some of which are CXL 
+Host Bridges. Associated with each window are a set of restrictions that govern its 
+usage. It is the OSPM’s responsibility to utilize each window for the specified use.
+The HPA ranges described by CFMWS may include addresses that are currently 
+assigned to CXL.mem devices. Before assigning HPAs from a fixed-memory window, 
+the OSPM must check the current assignments and avoid any conflicts.
+For any given HPA, it shall not be described by more than one CFMWS entry.
+Table 9-21. CHBS Structure
+Field Length
+in Bytes Byte Offset Description
+Type 1 00h =0 to indicate that this is a CHBS entry
+Reserved 1 01h Reserved 
+Record Length 2 02h Length of this record (20h).
+UID 4 04h
+CXL Host Bridge Unique ID. Used to associate a CHBS 
+instance with a CXL Host Bridge instance. The value of this 
+field shall match the output of _UID under the associated 
+CXL Host Bridge in ACPI namespace.
+CXL Version 4 08h
+• 0000 0000h: RCH
+• 0000 0001h: Host Bridge that is associated with one or 
+more CXL root ports
+Reserved 4 0Ch Reserved
+Base 8 10h
+• If CXL Version = 0000 0000h, this represents the base 
+address of the RCH Downstream Port RCRB
+• If CXL Version = 0000 0001h, this represents the base 
+address of the CHBCR
+See Table 8-17 for more details.
+Length 8 18h
+• If CXL Version = 0000 0000h, this field must be set to 
+8 KB (2000h)
+• If CXL Version = 0000 0001h, this field must be set to 
+64 KB (1 0000h)
+Table 9-22. CFMWS Structure (Sheet 1 of 4)
+Field Length
+in Bytes
+Byte 
+Offset Description
+Type 1 00h 1 = indicates this is a CFMWS entry
+Reserved 1 01h Reserved
+Record Length 2 02h
+Length of this record = 024h + 4 * NIW.
+NIW is the raw count of Interleave ways whereas ENIW is the encoded value:
+• If ENIW<8, NIW=2**ENIW
+•I f  E N I W≥8, NIW=3* 2**(ENIW-8)
+Reserved 4 04h Reserved
+Base HPA 8 08h Base of this HPA range. This  value shall be a 256-MB-aligned address.
+Window Size 8 10h The total number of consecutive bytes of HPA this window represents. This value 
+shall be a multiple of NIW*256 MB.
+EVALUATION COPY
+Reset, Initialization, Configuration, and Manageability
+August 7, 2023  Compute Express Link Specification
+Revision 3.1, Version 1.0 839
+Encoded Number 
+of Interleave 
+Ways (ENIW)
+1 18h
+The encoded number of targets with which this window is interleaved. The valid 
+encoded values are specified in the Interleave Ways field of the CXL HDM Decoder 
+n Control register (see Section 8.2.4.20.7). This field determines the number of 
+entries in the Interleave Target List, starting at Offset 24h.
+Interleave 
+Arithmetic 1 19h
+This field defines the arithmetic used for mapping HPA to an interleave target in 
+the Interleave Target List:
+• 00h = Standard Modulo arithmetic
+• 01h = Modulo arithmetic combined with XOR
+• All other encodings are reserved
+Reserved 2 1Ah Reserved
+Host Bridge 
+Interleave 
+Granularity 
+(HBIG)
+41 C h
+The number of consecutive bytes within the interleave that are decoded by each 
+target in the Interleave Target List represented in an encoded format. The valid 
+values are specified in the Interleave Granularity field of the CXL HDM Decoder n 
+Control register (see Section 8.2.4.20.7).
+Window 
+Restrictions 2 20h
+A bitmap describing the restrictions being placed on the OSPM’s use of the 
+window. It is the OSPM’s responsibility to adhere to these restrictions. Failure to 
+adhere to these restrictions results in undefined behavior. More than one bit 
+within this field may be set:
+• Bit[0]: Device Coherent: Formerly known as CXL Type 2 Memory: 
+— 1 = Window is configured to expose device-coherent memory (HDM-D 
+if Bit[5]=0 ; HDM-DB if Bit[5]=1).
+• Bit[1]: Host-only Coherent: Formerly known as CXL Type 3 Memory: 
+— 1 = Window is configured to expose host-only coherent memory (HDM-
+H). If an HDM decoder that is mapped to this windows has the BI bit 
+set, it will result in undefined behavior.
+• Bit[2]: Volatile:
+— 1 = Window is configured for use with volatile memory.
+• Bit[3]: Persistent:
+— 1 = Window is configured for use with persistent memory.
+• Bit[4]: Fixed Device Configuration:
+— 1 = Any device ranges that have been assigned an HPA from this 
+window must not be reassigned.
+• Bit[5]: BI:
+— 1 = Window is configured for use with Back-Invalidate flows.
+•B i t s [ 1 5 : 6 ] :  Reserved
+QTG ID 2 22h
+The ID of the QoS Throttling Group associated with this window. The _DSM for 
+retrieving QTG ID is utilized by the OSPM to determine to which QTG a device 
+HDM range should be assigned.
+This field must not exceed the Max Supported QTG ID returned by the _DSM for 
+retrieving QTG.
+Table 9-22. CFMWS Structure (Sheet 2 of 4)
+Field Length
+in Bytes
+Byte 
+Offset Description
+EVALUATION COPY
+Reset, Initialization, Configuration, and Manageability
+August 7, 2023  Compute Express Link Specification
+Revision 3.1, Version 1.0 840
+Interleave Target 
+List 4*NIW 24h
+A list of all the Interleave Targets. The number of entries in this list shall match 
+the Number of Interleave Ways (NIW). The order of the targets reported in this 
+List indicates the order in the Interleave Set.
+For Interleave Sets that only span CXL Host Bridges, this is a list of CXL Host 
+Bridge _UIDs that are part of the Interleave Set. In this case, for each _UID value 
+in this list, there must exist a corresponding CHBS structure.
+If the Interleave Set spans non-CXL domains, this list may contain values that do 
+not match _UID field in any CHBS structures. These entries represent Interleave 
+Targets that are not CXL Host Bridges.
+The set of HPAs decoded by Entry N in the Interleave Target List shall satisfy the 
+following equations:
+1. Base HPA <= HPA < Base HPA + Windows Size: where the Base HPA and 
+Window size shall be multiple of NIW. If (Interleave Arithmetic==0): 
+a. If ENIW=0
+N=0
+b. If ENIW=1
+N= HPA[8+HBIG]
+c. If ENIW<8 AND ENIW>1
+N = HPA[7+HBIG+ENIW:8+HBIG]
+d. If NIW = 8      // 3 way
+N = HPA[51:8+HBIG] MOD 3
+e. If NIW=9        // 6 way
+N = HPA[8+HBIG] 
++ 2* HPA[51:9+HBIG] MOD 3 
+f. If NIW=10      //12 way
+N = HPA[9+HBIG:8+HBIG] 
++ 4* HPA[51:10+HBIG] MOD 3
+2. If (Interleave Arithmetic==1):
+a. If NIW=0   //1 way 
+N=0
+b. If NIW =1    // 2 way 
+N = XORALLBITS (HPA AND XORMAP[0])
+If NIW=2     // 4 way
+N = XORALLBITS (HPA AND XORMAP[0]) +
+2* XORALLBITS (HPA AND XORMAP[1])
+Table 9-22. CFMWS Structure (Sheet 3 of 4)
+Field Length
+in Bytes
+Byte 
+Offset Description
+EVALUATION COPY
+Reset, Initialization, Configuration, and Manageability
+August 7, 2023  Compute Express Link Specification
+Revision 3.1, Version 1.0 841
+9.18.1.4 CXL XOR Interleave  Math Structure (CXIMS)
+If a CFMWS entry reports Interleave Arithmetic=1, there must be one CXIMS entry 
+associated with the HBIG value in the CFMWS. CXIMS carries an array of bitmaps. Each 
+bitmap represents the bits that are XORed together to calculate the individual bits of 
+the Interleave Way as described in the definition of the Interleave Target List field in 
+CFMWS. The host implementation is responsible for selecting an XOR function that 
+generates even distribution of addresses and does not lead to address aliasing.
+Interleave Target 
+List 4*NIW 24h
+c. If NIW=3    // 8 way
+N = XORALLBITS (HPA AND XORMAP[0]) +
+* XORALLBITS (HPA AND XORMAP[1]) +
+* XORALLBITS (HPA AND XORMAP[2])
+d. If NIW=4    //16 way
+N = XORALLBITS (HPA AND XORMAP[0])+
+2* XORALLBITS (HPA AND XORMAP[1]) +
+4* XORALLBITS (HPA AND XORMAP[2]) +
+8* XORALLBITS (HPA AND XORMAP[3])
+e. If NIW =8    // 3 way, same as Interleave Arithmetic=0
+N = HPA[51:8+HBIG] MOD 3
+f. If NIW =9     // 6 way
+N = XORALLBITS (HPA AND XORMAP[0])
++ 2* HPA[51:9+HBIG] MOD 3
+g. If NIW=10     // 12 way
+N = XORALLBITS (HPA AND XORMAP[0])
++ 2* XORALLBITS (HPA AND XORMAP[1])
++ 4* HPA[51:10+HBIG] MOD 3
+N is 0 based (0<= N <NIW).
+Where XORALLBITS is an operation that outputs a single bit by XORing all the bits 
+in the input. AND is a standard bitwise AND operation and XORMAP[m] is the mth 
+element (m is 0 based) in the XORMAP array that is part of the CXIMS entry with 
+the matching HBIG value. 
+Table 9-22. CFMWS Structure (Sheet 4 of 4)
+Field Length
+in Bytes
+Byte 
+Offset Description
+Table 9-23. CXIMS Structure
+Field Length
+in Bytes
+Byte 
+Offset Description
+Type 1 00h 2 = Indicates that this is a CXIMS entry
+Reserved 1 01h Reserved
+Record Length 2 02h Length of this record = 8 + 8 * NIB.
+Reserved 2 04h Reserved
+HBIG 1 06h
+Host Bridge Interleave Granularity to which this CXIMS 
+instance corresponds. See Table 9-22 for the definition of 
+the term HBIG.
+Number of Bitmap 
+Entries (NIB) 1 07h The number of entries in the XORMAP list. 
+XORMAP List 8 * NIB 08h A list of Bitmaps. XORMAP[0] is the first entry.
+EVALUATION COPY
