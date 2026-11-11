@@ -12,17 +12,17 @@ The system is implemented in C#/.NET and uses generated typed **SIP** service pr
 <table width="100%">     
   <tr>
 
-<img width="1659" height="948" alt="Изображение ChatGPT 23 окт  2026 г , 10_47_04-2" src="https://github.com/user-attachments/assets/caf3cb5a-4ea1-4037-8085-48c1e008697c" />
-<img width="1659" height="948" alt="Изображение ChatGPT 23 окт  2026 г , 10_47_04-1" src="https://github.com/user-attachments/assets/15ac03cd-da05-4b03-9515-bd2c4dba8c10" />
-<img width="3318" height="1896" alt="singnextos_virtualization_securecompute_revised" src="https://github.com/user-attachments/assets/d18d01a0-ce67-479e-8e44-4ddc7aa4a576" />
+<td><img width="1659" height="948" alt="Изображение ChatGPT 23 окт  2026 г , 10_47_04-2" src="https://github.com/user-attachments/assets/caf3cb5a-4ea1-4037-8085-48c1e008697c" /></td>
+<td><img width="1659" height="948" alt="Изображение ChatGPT 23 окт  2026 г , 10_47_04-1" src="https://github.com/user-attachments/assets/15ac03cd-da05-4b03-9515-bd2c4dba8c10" /></td>
+<td><img width="3318" height="1896" alt="singnextos_virtualization_securecompute_revised" src="https://github.com/user-attachments/assets/d18d01a0-ce67-479e-8e44-4ddc7aa4a576" /></td>
     
  </tr>
   
   <tr>
 
-<img width="1659" height="948" alt="Изображение ChatGPT 23 окт  2026 г , 10_47_07-5" src="https://github.com/user-attachments/assets/36d4b89c-ed9d-4cde-8862-b40925b1a161" />
-<img width="1659" height="948" alt="Изображение ChatGPT 23 окт  2026 г , 10_47_06-4" src="https://github.com/user-attachments/assets/c82d66a9-bcc2-4ad6-8c63-b6ae2030d640" />
-<img width="1659" height="948" alt="Изображение ChatGPT 23 окт  2026 г , 10_47_05-3" src="https://github.com/user-attachments/assets/556a169e-eda6-44d4-a044-489fb873b667" />
+<td><img width="1659" height="948" alt="Изображение ChatGPT 23 окт  2026 г , 10_47_07-5" src="https://github.com/user-attachments/assets/36d4b89c-ed9d-4cde-8862-b40925b1a161" /></td>
+<td><img width="1659" height="948" alt="Изображение ChatGPT 23 окт  2026 г , 10_47_06-4" src="https://github.com/user-attachments/assets/c82d66a9-bcc2-4ad6-8c63-b6ae2030d640" /></td>
+<td><img width="1659" height="948" alt="Изображение ChatGPT 23 окт  2026 г , 10_47_05-3" src="https://github.com/user-attachments/assets/556a169e-eda6-44d4-a044-489fb873b667" /></td>
 
   </tr>
 </table>
