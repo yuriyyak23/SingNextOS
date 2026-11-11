@@ -1,3 +1,4 @@
+
 # SingNextOS
 
 **Capability-native, ownership-oriented operating-system research platform for typed services, managed isolation, compositional resource authority, and provider-neutral heterogeneous execution.**
@@ -11,20 +12,26 @@ The system is implemented in C#/.NET and uses generated typed **SIP** service pr
 <table width="100%">     
   <tr>
 
- <td> <img width="1659" height="948" alt="1" src="https://github.com/user-attachments/assets/7a8add87-2b75-447b-ad58-f5b202af9d6d" /></td>
-
- <td> <img width="3318" height="1896" alt="singnextos_virtualization_securecompute_revised" src="https://github.com/user-attachments/assets/ae550c79-8048-48a3-afe4-3611713006a1" /></td> <td> <img width="1659" height="948" alt="3" src="https://github.com/user-attachments/assets/6877ee5a-a567-40e0-93f9-25af68396fd4" /></td>
+<img width="1659" height="948" alt="Изображение ChatGPT 23 окт  2026 г , 10_47_04-2" src="https://github.com/user-attachments/assets/caf3cb5a-4ea1-4037-8085-48c1e008697c" />
+<img width="1659" height="948" alt="Изображение ChatGPT 23 окт  2026 г , 10_47_04-1" src="https://github.com/user-attachments/assets/15ac03cd-da05-4b03-9515-bd2c4dba8c10" />
+<img width="3318" height="1896" alt="singnextos_virtualization_securecompute_revised" src="https://github.com/user-attachments/assets/d18d01a0-ce67-479e-8e44-4ddc7aa4a576" />
     
  </tr>
   
   <tr>
 
-  <td> <img width="1659" height="948" alt="Изображение ChatGPT 23 окт  2026 г , 10_47_04-2" src="https://github.com/user-attachments/assets/9e35f59b-c298-4861-a3aa-85baea13b5d8" /></td>
-   <td>    <img width="1659" height="948" alt="Изображение ChatGPT 23 окт  2026 г , 10_47_05-3" src="https://github.com/user-attachments/assets/f91e6098-ebfe-40a2-afea-3a669dcd83cd" /></td>
-  <td> <img width="1659" height="948" alt="Изображение ChatGPT 23 окт  2026 г , 10_47_04-1" src="https://github.com/user-attachments/assets/9f1df727-cfa7-40c0-af1b-201747f2bbcf" /></td>
+<img width="1659" height="948" alt="Изображение ChatGPT 23 окт  2026 г , 10_47_07-5" src="https://github.com/user-attachments/assets/36d4b89c-ed9d-4cde-8862-b40925b1a161" />
+<img width="1659" height="948" alt="Изображение ChatGPT 23 окт  2026 г , 10_47_06-4" src="https://github.com/user-attachments/assets/c82d66a9-bcc2-4ad6-8c63-b6ae2030d640" />
+<img width="1659" height="948" alt="Изображение ChatGPT 23 окт  2026 г , 10_47_05-3" src="https://github.com/user-attachments/assets/556a169e-eda6-44d4-a044-489fb873b667" />
 
   </tr>
 </table>
+
+
+
+
+
+
 
 
 SingNextOS is designed around one central rule:
