@@ -1,0 +1,8 @@
+# Self-scope capture; system-wide scope requires exact inspection capability.
+spawn observed
+alloc 5000 64
+watch 5000 2 10
+free 1
+watch 5000 1
+stop 5000
+exit

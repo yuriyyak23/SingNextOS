@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <SingPlusProfile>Sip</SingPlusProfile>
+    <SingPlusMemoryProfile>SipRegion</SingPlusMemoryProfile>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <EmitCompilerGeneratedFiles>true</EmitCompilerGeneratedFiles>
+    <CompilerGeneratedFilesOutputPath>$(BaseIntermediateOutputPath)generated</CompilerGeneratedFilesOutputPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <CompilerVisibleProperty Include="SingPlusProfile" />
+    <CompilerVisibleProperty Include="SingPlusMemoryProfile" />
+    <ProjectReference Include="../../../../../../sdk/SingPlus.Analyzers/SingPlus.Analyzers.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" PrivateAssets="all" />
+    <ProjectReference Include="../../../../../../sdk/SingPlus.Generators/SingPlus.Generators.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" PrivateAssets="all" />
+    <ProjectReference Include="../../../../../../sdk/SingPlus.Sip.Sdk/SingPlus.Sip.Sdk.csproj" />
+    <ProjectReference Include="../../../../../../src/Sip/SingPlus.Sip/SingPlus.Sip.csproj" />
+    <Compile Include="CounterContract.cs" />
+    <Compile Include="CounterBindings.cs" />
+    <Compile Include="ForbiddenApi.cs" Condition="'$(IncludeForbiddenApi)' == 'true'" />
+  </ItemGroup>
+</Project>

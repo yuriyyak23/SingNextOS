@@ -1,0 +1,17 @@
+# Fresh boot; observe real external operation before and after local release.
+spawn reclaim-subject
+alloc 5000 64
+external-prepare 5000 1
+external-admit 5000 1
+why-reclaim 5000
+why-pinned 5000 1
+external-cancel 5000 1
+why-reclaim 5000
+why-pinned 5000 1
+external-release 5000 1
+region-uses 1
+why-reclaim 5000
+why-pinned 5000 1
+free 1
+stop 5000
+exit

@@ -1,0 +1,14 @@
+spawn service-host
+spawn service-caller
+service-register 5000 shell-service
+service shell-service
+mint 5001 shell-service Read
+session-open 5001 shell-service 1 --lifetime-ms 10000
+service-state shell-service draining
+session-close 5001 1
+service-state shell-service accepting
+session-open 5001 shell-service 1
+session-close 5001 2
+stop 5001
+stop 5000
+exit

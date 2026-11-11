@@ -1,0 +1,6 @@
+# Real service/session admission and draining. No generated client invocation.
+demo sessions
+ps
+channels
+status
+exit

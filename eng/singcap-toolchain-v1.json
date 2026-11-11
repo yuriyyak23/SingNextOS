@@ -1,0 +1,18 @@
+{
+  "schema": "singcap-toolchain-v1",
+  "sdkVersion": "11.0.100",
+  "sdkCommit": "297acf930f",
+  "runtimeVersion": "11.0.0",
+  "runtimeCommit": "297acf930f",
+  "roslynCompilerVersion": "5.12.0-1.26529.118",
+  "roslynCompilerCommit": "297acf930fb0f5c07fd4e51d78e521b4ad2e5d1f",
+  "defaultLanguageVersion": "13.0",
+  "previewOptInProperty": "SingPlusPreviewLanguage",
+  "targetFramework": "net11.0",
+  "nativeAotRuntimeIdentifier": "win-x64",
+  "nativeAotCompilerVersion": "11.0.0",
+  "windowsNativeToolset": "Visual Studio 18 Insiders / MSVC 14.52.37025",
+  "windowsNativeLinkerFileVersion": "14.52.37025.0",
+  "admissionPolicyDigestAlgorithm": "SHA256",
+  "admissionVerifierSourceDigest": "C160D9BBE01818AB9AAACC09AA6B963A997A02921233A138686BFB6B8740376D"
+}

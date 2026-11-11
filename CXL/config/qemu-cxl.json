@@ -1,0 +1,51 @@
+{
+  "SchemaVersion": 1,
+  "QemuPath": "C:\\Program Files\\qemu\\qemu-system-x86_64.exe",
+  "CxlMiB": 256,
+  "LsaMiB": 1,
+  "WindowMiB": 4096,
+  "RamMiB": 4096,
+  "CpuCount": 4,
+  "Accel": "tcg",
+  "BootImage": null,
+  "Firmware": {
+    "Mode": "pflash",
+    "Code": "C:\\Program Files\\qemu\\share\\edk2-x86_64-code.fd",
+    "VarsTemplate": "C:\\Program Files\\qemu\\share\\edk2-i386-vars.fd",
+    "Descriptor": "C:\\Program Files\\qemu\\share\\firmware\\60-edk2-x86_64.json",
+    "SecureDescriptor": "C:\\Program Files\\qemu\\share\\firmware\\50-edk2-x86_64-secure.json",
+    "Metadata": {
+      "description": "UEFI firmware for x86_64",
+      "interface-types": [
+        "uefi"
+      ],
+      "mapping": {
+        "device": "flash",
+        "executable": {
+          "filename": "/usr/local/share//edk2-x86_64-code.fd",
+          "format": "raw"
+        },
+        "nvram-template": {
+          "filename": "/usr/local/share//edk2-i386-vars.fd",
+          "format": "raw"
+        }
+      },
+      "targets": [
+        {
+          "architecture": "x86_64",
+          "machines": [
+            "pc-i440fx-*",
+            "pc-q35-*"
+          ]
+        }
+      ],
+      "features": [
+        "acpi-s3",
+        "amd-sev",
+        "amd-sev-es",
+        "verbose-dynamic"
+      ],
+      "tags": []
+    }
+  }
+}

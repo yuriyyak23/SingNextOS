@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Snake/Snake.csproj" />
+    <ProjectReference Include="../Snake.Child/Snake.Child.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="../../../../../Runtime/SingPlus.Runtime/SingPlus.Runtime.csproj" />
+  </ItemGroup>
+  <Target Name="ExposeSnakeChild" BeforeTargets="GetCopyToOutputDirectoryItems" DependsOnTargets="ResolveProjectReferences">
+    <ItemGroup>
+      <_SnakeChildFiles Include="../Snake.Child/bin/$(Configuration)/net11.0/*.dll;../Snake.Child/bin/$(Configuration)/net11.0/*.json" />
+      <ContentWithTargetPath Include="@(_SnakeChildFiles)">
+        <TargetPath>snake-child/%(_SnakeChildFiles.Filename)%(_SnakeChildFiles.Extension)</TargetPath>
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      </ContentWithTargetPath>
+    </ItemGroup>
+  </Target>
+</Project>

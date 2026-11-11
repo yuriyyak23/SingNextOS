@@ -1,0 +1,5 @@
+# Requires --budget --recovery-journal <path> --recovery-key <32-byte key file>.
+env
+budget
+status
+exit

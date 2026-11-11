@@ -1,0 +1,27 @@
+[
+  {
+    "Path": "C:\\Users\\Yuriy\\Desktop\\SingNextOS\\CXL\\config\\qemu-cxl.json",
+    "Bytes": 1360,
+    "SHA256": "168B8DC4A0CF0371F4433B8D0F8CCE134FEC158F7D354E632CE8C26369476AE8"
+  },
+  {
+    "Path": "C:\\Program Files\\qemu\\share\\edk2-x86_64-code.fd",
+    "Bytes": 3653632,
+    "SHA256": "33090CC07675BAA5190D9F1E84BF5176B33BCBFA9BACAC522961150CDB6DBB2A"
+  },
+  {
+    "Path": "C:\\Program Files\\qemu\\share\\edk2-i386-vars.fd",
+    "Bytes": 540672,
+    "SHA256": "5D2AC383371B408398ACCEE7EC27C8C09EA5B74A0DE0CEEA6513388B15BE5D1E"
+  },
+  {
+    "Path": "C:\\Program Files\\qemu\\share\\firmware\\60-edk2-x86_64.json",
+    "Bytes": 718,
+    "SHA256": "F6756761629339223E398BAD85CFF8DACE5310E9C88876052A0784B16BA7FF5D"
+  },
+  {
+    "Path": "C:\\Program Files\\qemu\\share\\firmware\\50-edk2-x86_64-secure.json",
+    "Bytes": 745,
+    "SHA256": "6E6CC9506AA6D77E4673A9AD081C01854031E3EA8FD993A1E9825D909302EE96"
+  }
+]

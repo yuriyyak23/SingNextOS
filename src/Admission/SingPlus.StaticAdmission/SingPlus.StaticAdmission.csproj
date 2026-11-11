@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- One compilation owner; original paths retained for exact source/digest consumers. -->
+    <Compile Include="../../../tools/SingPlus.Admission/AdmissionVerifier.cs" Link="AdmissionVerifier.cs" />
+    <Compile Include="../../../tools/SingPlus.Admission/AdmissionProof.cs" Link="AdmissionProof.cs" />
+    <Compile Include="../../../tools/SingPlus.Admission/IlReader.cs" Link="IlReader.cs" />
+    <Compile Include="../../../tools/SingPlus.Admission/ManagedAsyncPeQualification.cs" Link="ManagedAsyncPeQualification.cs" />
+    <Compile Include="../../../tools/SingPlus.Admission/ManagedAsyncFrontendContract.cs" Link="ManagedAsyncFrontendContract.cs" />
+  </ItemGroup>
+</Project>

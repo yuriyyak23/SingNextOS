@@ -1,0 +1,5 @@
+# Runtime service generation replacement, not managed image hot reload.
+demo service-restart
+ps
+status
+exit

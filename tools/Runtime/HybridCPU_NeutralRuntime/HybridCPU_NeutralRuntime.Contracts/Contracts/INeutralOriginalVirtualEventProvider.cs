@@ -1,0 +1,10 @@
+namespace YAKSys_Hybrid_CPU.Core;
+
+public sealed record NeutralOriginalVirtualEventRequest(NeutralVirtualEventRequest Request);
+public sealed record NeutralOriginalVirtualEventClosure(NeutralOriginalVirtualEventRequest Admission, bool NoFurtherDelivery, bool NoEffect);
+public interface INeutralOriginalVirtualEventProvider
+{
+    NeutralVirtualizationResult<NeutralVirtualEventReceipt> InjectOriginalVirtualEvent(NeutralOriginalVirtualEventRequest request);
+    NeutralVirtualizationResult<NeutralOriginalVirtualEventClosure> ContainOriginalVirtualEvent(NeutralOriginalVirtualEventRequest originalRequest);
+    NeutralOriginalVirtualEventClosure? ResolveOriginalVirtualEventClosure(NeutralOriginalVirtualEventRequest originalRequest);
+}

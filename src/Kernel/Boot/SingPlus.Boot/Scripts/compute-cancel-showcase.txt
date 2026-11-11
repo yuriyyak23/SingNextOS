@@ -1,0 +1,6 @@
+# --platform host-model --defer-compute; optional --budget --trace.
+env
+platform
+demo compute-cancel
+status
+exit

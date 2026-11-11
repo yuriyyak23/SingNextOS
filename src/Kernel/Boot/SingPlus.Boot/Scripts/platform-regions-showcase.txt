@@ -1,0 +1,6 @@
+# Requires host-model or hybridcpu-model; same semantic operation for both profiles.
+env
+platform
+demo platform-regions
+status
+exit

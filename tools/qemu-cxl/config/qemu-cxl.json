@@ -1,0 +1,11 @@
+{
+  "SchemaVersion": 1,
+  "CxlMiB": 256,
+  "LsaMiB": 1,
+  "WindowMiB": 4096,
+  "RamMiB": 4096,
+  "CpuCount": 4,
+  "Accel": "tcg",
+  "BootImage": null,
+  "Profile": "NativeWindowsFile"
+}

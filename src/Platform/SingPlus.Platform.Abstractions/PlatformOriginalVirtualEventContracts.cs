@@ -1,0 +1,10 @@
+namespace SingPlus.Platform;
+
+public sealed record PlatformOriginalVirtualEventRequest(PlatformVirtualEventRequest Request);
+public sealed record PlatformOriginalVirtualEventClosure(PlatformOriginalVirtualEventRequest Admission, bool NoFurtherDelivery, bool NoEffect);
+public interface IPlatformOriginalVirtualEventProvider
+{
+    PlatformAuthorityResult<PlatformVirtualEventReceipt> InjectOriginalVirtualEvent(PlatformOriginalVirtualEventRequest request);
+    PlatformAuthorityResult<PlatformOriginalVirtualEventClosure> ContainOriginalVirtualEvent(PlatformOriginalVirtualEventRequest originalRequest);
+    PlatformOriginalVirtualEventClosure? ResolveOriginalVirtualEventClosure(PlatformOriginalVirtualEventRequest originalRequest);
+}

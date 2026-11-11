@@ -1,0 +1,16 @@
+# Implemented authority paths. Deliberately omits lifecycle: parked AllocateBuffer remains a runtime defect.
+env
+components
+demo ipc
+demo regions
+demo caps
+demo borrows
+demo sessions
+demo generated-sip
+demo service-restart
+demo supervised-restart
+demo external
+demo compute
+budget
+status
+exit

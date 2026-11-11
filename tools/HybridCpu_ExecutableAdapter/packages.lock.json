@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net11.0": {
+      "HybridCPU.ExternalRuntime": {
+        "type": "Direct",
+        "requested": "[1.37.39-securecompute.memory-cancel.20261021.1, 1.37.39-securecompute.memory-cancel.20261021.1]",
+        "resolved": "1.37.39-securecompute.memory-cancel.20261021.1",
+        "contentHash": "qbiSUxkgu9hbFwhA8BTBygdAy6RMQhJNfukUA6EfW5XEJOroj9jy/AkkmcKF1NIvH2c8li4rDyIydml7tnAnrA==",
+        "dependencies": {
+          "HybridCPU.ExternalRuntime.Contracts": "1.37.3-securecompute.memory-load.20261021.1"
+        }
+      },
+      "HybridCPU.ExternalRuntime.Contracts": {
+        "type": "Direct",
+        "requested": "[1.37.3-securecompute.memory-load.20261021.1, 1.37.3-securecompute.memory-load.20261021.1]",
+        "resolved": "1.37.3-securecompute.memory-load.20261021.1",
+        "contentHash": "4CkI6ckjMdgKUX/30Xhn0ey4PkcfLkDge5x4OuX1olnZeJTIaz3ibG9o2vTUZScetoQnFm9LJazpiEjPECs4Ew=="
+      },
+      "hybridcpu.boot.contracts": {
+        "type": "Project"
+      },
+      "hybridcpu_neutralruntime.contracts": {
+        "type": "Project"
+      },
+      "singplus.contracts": {
+        "type": "Project"
+      }
+    }
+  }
+}
