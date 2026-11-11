@@ -23,8 +23,8 @@ src/Kernel и SingPlus.Runtime не выявил freestanding bootstrap/GC/PAL t
 SingPlus.Kernel.Sdk содержит contracts/attribute, не native linker/runtime target;
 Kernel.csproj задаёт admission root/profile, но не freestanding entry backend.
 
-Связанный ISE также проверен read-only: [NativeAot Adapter project](<../../../../HybridCPU ISE/Compilers/HybridCPU_Compiler/NativeAot/HybridCPU.Compiler.NativeAot.Adapter.csproj>)
-и [SDK targets](<../../../../HybridCPU ISE/Compilers/HybridCPU_Compiler/NativeAot/Packaging/HybridCPU.Sdk.targets>).
+Связанный ISE также проверен read-only: [NativeAot Adapter project](<../../../../HybridCPU Compilers/Compilers/HybridCPU_Compiler/NativeAot/HybridCPU.Compiler.NativeAot.Adapter.csproj>)
+и [SDK targets](<../../../../HybridCPU Compilers/Compilers/HybridCPU_Compiler/NativeAot/Packaging/HybridCPU.Sdk.targets>).
 SDK target RID `hybridcpu` публикует `.hcexe` с explicit restricted compiler profile
 и runtime pack; `SupportedHostRids=[win-x64]` описывает **host compiler RID**, не
 архитектуру emitted guest image. Ни host RID, ни HybridCPU ISA image не являются
